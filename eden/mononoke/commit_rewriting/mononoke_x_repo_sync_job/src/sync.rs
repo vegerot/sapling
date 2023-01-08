@@ -17,6 +17,9 @@ use blobstore::Loadable;
 use bookmarks::BookmarkName;
 use bookmarks::BookmarkUpdateLogEntry;
 use bookmarks::BookmarkUpdateReason;
+use bookmarks::BookmarksRef;
+use changeset_fetcher::ChangesetFetcherArc;
+use changeset_fetcher::ChangesetFetcherRef;
 use cloned::cloned;
 use context::CoreContext;
 use cross_repo_sync::find_toposorted_unsynced_ancestors;
@@ -424,7 +427,7 @@ async fn check_forward_move<M: SyncedCommitMapping + Clone + 'static>(
     if !skiplist_index
         .query_reachability(
             ctx,
-            &commit_syncer.get_source_repo().get_changeset_fetcher(),
+            &commit_syncer.get_source_repo().changeset_fetcher_arc(),
             to_cs_id,
             from_cs_id,
         )
@@ -496,8 +499,12 @@ async fn validate_if_new_repo_merge(
     p1: ChangesetId,
     p2: ChangesetId,
 ) -> Result<Vec<ChangesetId>, Error> {
-    let p1gen = repo.get_generation_number(ctx.clone(), p1);
-    let p2gen = repo.get_generation_number(ctx.clone(), p2);
+    let p1gen = repo
+        .changeset_fetcher()
+        .get_generation_number(ctx.clone(), p1);
+    let p2gen = repo
+        .changeset_fetcher()
+        .get_generation_number(ctx.clone(), p2);
     let (p1gen, p2gen) = try_join!(p1gen, p2gen)?;
     // FIXME: this code has an assumption that parent with a smaller generation number is a
     // parent that introduces a new repo. This is usually the case, however it might not be true
@@ -532,7 +539,7 @@ async fn check_if_independent_branch_and_return(
     branch_tips: Vec<ChangesetId>,
     other_branches: Vec<ChangesetId>,
 ) -> Result<Option<Vec<ChangesetId>>, Error> {
-    let fetcher = repo.get_changeset_fetcher();
+    let fetcher = repo.changeset_fetcher_arc();
     let bcss = DifferenceOfUnionsOfAncestorsNodeStream::new_with_excludes(
         ctx.clone(),
         &fetcher,
@@ -641,6 +648,7 @@ async fn move_or_create_bookmark(
 
 #[cfg(test)]
 mod test {
+    use bookmarks::BookmarkUpdateLogRef;
     use bookmarks::BookmarksMaybeStaleExt;
     use bookmarks::Freshness;
     use cross_repo_sync::validation;
@@ -1037,7 +1045,6 @@ mod test {
 
         let heads: Vec<_> = smallrepo
             .bookmarks()
-            .as_ref()
             .get_heads_maybe_stale(ctx.clone())
             .try_collect()
             .await?;

@@ -20,6 +20,7 @@ use edenapi_types::UploadToken;
 use edenapi_types::UploadTokenMetadata;
 use ephemeral_blobstore::BubbleId;
 use ephemeral_blobstore::StorageLocation;
+use filestore::FilestoreConfigRef;
 use futures::stream;
 use futures::StreamExt;
 use mercurial_types::HgChangesetId;
@@ -66,7 +67,7 @@ async fn maybe_copy_file(
                 blob_repo.get_repoid(),
                 blob_repo.blobstore().clone(),
                 bubble_id,
-                blob_repo.filestore_config(),
+                *blob_repo.filestore_config(),
                 id.into(),
             )
             .await?
@@ -96,7 +97,6 @@ async fn check_file(
         // 1. If content_id is provided, we haven't yet checked it is actually
         // in the blobstore
         // 2. Maybe alias was written to blobstore but the actual blob has not
-        // 3. We want to do a comprehensive lookup here
         if repo.is_file_present(content_id, bubble_id).await? {
             Lookup::Present(Some(
                 FileContentTokenMetadata {

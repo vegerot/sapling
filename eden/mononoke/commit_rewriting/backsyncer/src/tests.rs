@@ -19,10 +19,16 @@ use blobrepo::save_bonsai_changesets;
 use blobrepo::BlobRepo;
 use blobrepo_hg::BlobRepoHg;
 use blobstore::Loadable;
+use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarkName;
+use bookmarks::BookmarkUpdateLogArc;
+use bookmarks::BookmarkUpdateLogRef;
 use bookmarks::BookmarkUpdateReason;
+use bookmarks::BookmarksArc;
 use bookmarks::BookmarksMaybeStaleExt;
+use bookmarks::BookmarksRef;
 use bookmarks::Freshness;
+use changeset_fetcher::ChangesetFetcherArc;
 use cloned::cloned;
 use commit_transformation::upload_commits;
 use context::CoreContext;
@@ -682,8 +688,8 @@ async fn backsync_change_mapping(fb: FacebookInit) -> Result<(), Error> {
     // Create commit syncer with two version - current and new
     let target_repo_dbs = TargetRepoDbs {
         connections: factory.metadata_db().clone().into(),
-        bookmarks: target_repo.bookmarks().clone(),
-        bookmark_update_log: target_repo.bookmark_update_log().clone(),
+        bookmarks: target_repo.bookmarks_arc(),
+        bookmark_update_log: target_repo.bookmark_update_log_arc(),
         counters: target_repo.mutable_counters_arc(),
     };
     init_target_repo(&ctx, &target_repo_dbs, source_repo_id).await?;
@@ -947,7 +953,7 @@ async fn verify_mapping_and_all_wc(
     println!("checking all source commits");
     let all_source_commits = DifferenceOfUnionsOfAncestorsNodeStream::new_union(
         ctx.clone(),
-        &source_repo.get_changeset_fetcher(),
+        &source_repo.changeset_fetcher_arc(),
         Arc::new(SkiplistIndex::new()),
         heads,
     )
@@ -1271,8 +1277,8 @@ async fn init_repos(
 
     let target_repo_dbs = TargetRepoDbs {
         connections: factory.metadata_db().clone().into(),
-        bookmarks: target_repo.bookmarks().clone(),
-        bookmark_update_log: target_repo.bookmark_update_log().clone(),
+        bookmarks: target_repo.bookmarks_arc(),
+        bookmark_update_log: target_repo.bookmark_update_log_arc(),
         counters: target_repo.mutable_counters_arc(),
     };
     init_target_repo(&ctx, &target_repo_dbs, source_repo_id).await?;
@@ -1562,8 +1568,8 @@ async fn init_merged_repos(
         let small_repo: BlobRepo = factory.with_id(repoid).build()?;
         let small_repo_dbs = TargetRepoDbs {
             connections: factory.metadata_db().clone().into(),
-            bookmarks: small_repo.bookmarks().clone(),
-            bookmark_update_log: small_repo.bookmark_update_log().clone(),
+            bookmarks: small_repo.bookmarks_arc(),
+            bookmark_update_log: small_repo.bookmark_update_log_arc(),
             counters: small_repo.mutable_counters_arc(),
         };
 

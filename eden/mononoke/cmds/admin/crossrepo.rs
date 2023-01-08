@@ -17,7 +17,9 @@ use blobrepo::BlobRepo;
 use blobstore::Loadable;
 use bookmark_renaming::get_small_to_large_renamer;
 use bookmarks::BookmarkName;
+use bookmarks::BookmarkUpdateLogRef;
 use bookmarks::BookmarkUpdateReason;
+use bookmarks::BookmarksRef;
 use bookmarks::Freshness;
 use cached_config::ConfigStore;
 use clap_old::App;
@@ -38,6 +40,7 @@ use cross_repo_sync::CommitSyncRepos;
 use cross_repo_sync::CommitSyncer;
 use cross_repo_sync::CHANGE_XREPO_MAPPING_EXTRA;
 use fbinit::FacebookInit;
+use filestore::FilestoreConfigRef;
 use futures::stream;
 use futures::try_join;
 use futures::TryFutureExt;
@@ -822,7 +825,7 @@ async fn create_file_changes(
         let size = content.len() as u64;
         let content_metadata = filestore::store(
             large_repo.blobstore(),
-            large_repo.filestore_config(),
+            *large_repo.filestore_config(),
             ctx,
             &filestore::StoreRequest::new(size),
             stream::once(async move { Ok(content) }),
@@ -1408,6 +1411,7 @@ mod test {
 
     use ascii::AsciiString;
     use bookmarks::BookmarkName;
+    use changeset_fetcher::ChangesetFetcherArc;
     use cross_repo_sync::validation::find_bookmark_diff;
     use cross_repo_sync::CommitSyncDataProvider;
     use fixtures::set_bookmark;
@@ -1561,7 +1565,7 @@ mod test {
 
         let master_val = maybe_master_val.ok_or_else(|| Error::msg("master not found"))?;
         let changesets: Vec<_> =
-            AncestorsNodeStream::new(ctx.clone(), &small_repo.get_changeset_fetcher(), master_val)
+            AncestorsNodeStream::new(ctx.clone(), &small_repo.changeset_fetcher_arc(), master_val)
                 .compat()
                 .try_collect()
                 .await?;

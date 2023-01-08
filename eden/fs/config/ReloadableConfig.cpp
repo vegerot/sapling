@@ -39,7 +39,6 @@ std::shared_ptr<const EdenConfig> ReloadableConfig::getEdenConfig(
     reload = reloadBehavior_.value();
   }
 
-  // TODO: Update this monitoring code to use FileChangeMonitor.
   bool shouldReload;
   switch (reload) {
     case ConfigReloadBehavior::NoReload:
@@ -49,9 +48,7 @@ std::shared_ptr<const EdenConfig> ReloadableConfig::getEdenConfig(
       shouldReload = true;
       break;
     case ConfigReloadBehavior::AutoReload: {
-      auto lastCheck = std::chrono::steady_clock::time_point{
-          std::chrono::steady_clock::duration{
-              lastCheck_.load(std::memory_order_acquire)}};
+      auto lastCheck = lastCheck_.load(std::memory_order_acquire);
       shouldReload = now - lastCheck >= kEdenConfigMinimumPollDuration;
       break;
     }
@@ -66,30 +63,10 @@ std::shared_ptr<const EdenConfig> ReloadableConfig::getEdenConfig(
   auto state = state_.wlock();
 
   // Throttle the updates when using ConfigReloadBehavior::AutoReload
-  lastCheck_.store(now.time_since_epoch().count(), std::memory_order_release);
+  lastCheck_.store(now, std::memory_order_release);
 
   auto& config = state->config;
-
-  auto userConfigChanged = config->hasUserConfigFileChanged();
-  auto systemConfigChanged = config->hasSystemConfigFileChanged();
-  if (userConfigChanged || systemConfigChanged) {
-    auto newConfig = std::make_shared<EdenConfig>(*config);
-    if (userConfigChanged) {
-      XLOGF(
-          DBG3,
-          "Reloading {} because {}",
-          config->getUserConfigPath(),
-          userConfigChanged);
-      newConfig->loadUserConfig();
-    }
-    if (systemConfigChanged) {
-      XLOGF(
-          DBG3,
-          "Reloading {} because {}",
-          config->getSystemConfigPath(),
-          systemConfigChanged);
-      newConfig->loadSystemConfig();
-    }
+  if (auto newConfig = config->maybeReload()) {
     state->config = std::move(newConfig);
   }
   return state->config;

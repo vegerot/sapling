@@ -15,6 +15,8 @@ use blobrepo::BlobRepo;
 use blobstore::Loadable;
 use bookmarks::BookmarkName;
 use bookmarks::BookmarkUpdateReason;
+use bookmarks::BookmarksRef;
+use changeset_fetcher::ChangesetFetcherArc;
 use commit_transformation::copy_file_contents;
 use commit_transformation::rewrite_stack_no_merges;
 use context::CoreContext;
@@ -131,7 +133,7 @@ async fn find_commits_to_replay(
         .skiplist_index
         .is_ancestor(
             ctx,
-            &source_repo.blob_repo.get_changeset_fetcher(),
+            &source_repo.blob_repo.changeset_fetcher_arc(),
             latest_synced_cs_id,
             source_repo_tip_cs_id,
         )
@@ -148,7 +150,7 @@ async fn find_commits_to_replay(
 
     let cs_ids = RangeNodeStream::new(
         ctx.clone(),
-        source_repo.blob_repo.get_changeset_fetcher(),
+        source_repo.blob_repo.changeset_fetcher_arc(),
         latest_synced_cs_id,
         source_repo_tip_cs_id,
     )

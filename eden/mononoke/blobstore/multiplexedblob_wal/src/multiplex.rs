@@ -28,7 +28,6 @@ use blobstore_sync_queue::BlobstoreWalEntry;
 use cloned::cloned;
 use context::CoreContext;
 use context::PerfCounterType;
-use context::SessionClass;
 use fbinit::FacebookInit;
 use futures::future;
 use futures::stream::FuturesUnordered;
@@ -390,7 +389,6 @@ impl WalMultiplexedBlobstore {
         result
     }
 
-    // TODO(aida): comprehensive lookup (D30839608)
     async fn is_present_impl<'a>(
         &'a self,
         ctx: &'a CoreContext,
@@ -399,9 +397,6 @@ impl WalMultiplexedBlobstore {
     ) -> Result<BlobstoreIsPresent> {
         ctx.perf_counters()
             .increment_counter(PerfCounterType::BlobPresenceChecks);
-
-        // Comprehensive lookup requires blob presence in all of the blobstores.
-        let comprehensive_lookup = is_comprehensive_lookup(ctx);
 
         let mut futs = inner_multi_is_present(ctx, self.blobstores.clone(), key, scuba);
 
@@ -413,16 +408,12 @@ impl WalMultiplexedBlobstore {
             while let Some(result) = futs.next().await {
                 match result {
                     (_, Ok(BlobstoreIsPresent::Present)) => {
-                        // we only return on the first presence for the regular lookup
-                        if !comprehensive_lookup {
-                            return Ok(BlobstoreIsPresent::Present);
-                        }
+                        return Ok(BlobstoreIsPresent::Present);
                     }
                     (_, Ok(BlobstoreIsPresent::Absent)) => {
                         quorum = quorum.saturating_sub(1);
                         // we return if there is either quorum on missing
-                        // or it's a comprehensive lookup and we don't tolerate misses
-                        if comprehensive_lookup || quorum == 0 {
+                        if quorum == 0 {
                             return Ok(BlobstoreIsPresent::Absent);
                         }
                     }
@@ -643,11 +634,4 @@ fn inner_multi_is_present<'a>(
         })
         .collect();
     futs
-}
-
-fn is_comprehensive_lookup(ctx: &CoreContext) -> bool {
-    matches!(
-        ctx.session().session_class(),
-        SessionClass::ComprehensiveLookup
-    )
 }

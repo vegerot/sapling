@@ -236,18 +236,12 @@ pub struct MononokeTunables {
     segmented_changelog_force_reload: TunableI64ByRepo,
     segmented_changelog_force_reload_jitter_secs: AtomicI64,
 
-    // Usage of segmented changelog for speeding up server-side operations
-    segmented_changelog_is_ancestor_percentage: AtomicI64,
-
     // Override default progress logging sampling rate for segmented changelog parts
     segmented_changelog_idmap_log_sampling_rate: AtomicI64,
     segmented_changelog_tailer_log_sampling_rate: AtomicI64,
 
     // How many commits to walk back from the client heads before failing to rebuild SC
     segmented_changelog_client_max_commits_to_traverse: AtomicI64,
-
-    // Use comprehensive mode for is_present method in multiplexed blobstore for edenapi lookup api.
-    edenapi_lookup_use_comprehensive_mode: AtomicBool,
 
     // Timeout for is_present call for multiplexed blobstore
     is_present_timeout_ms: AtomicI64,
@@ -336,6 +330,8 @@ pub struct MononokeTunables {
 
     // Enable usage of basename_suffix_skeleton_manifest in commit_find_files
     disable_basename_suffix_skeleton_manifest: AtomicBool,
+    // Enable using BSSM for suffix queries. Might be inneficient for broad suffixes (like .php)
+    enable_bssm_suffix_query: AtomicBool,
 
     // List of targets in AOSP megarepo to apply squashing config overrides
     megarepo_squashing_config_override_targets: TunableVecOfStringsByRepo,
@@ -353,6 +349,18 @@ pub struct MononokeTunables {
     wal_disable_rendezvous_on_deletes: AtomicBool,
     // Enable derivation on service per repo
     enable_remote_derivation: TunableBoolByRepo,
+
+    // Enable reading from the new commit graph
+    enable_reading_from_new_commit_graph: TunableBoolByRepo,
+    // Enable writing to the new commit graph (double writes to both
+    // the old changesets and csparents tables, and the new
+    // commit_graph_edges and commit_graph_merge_parents tables)
+    enable_writing_to_new_commit_graph: TunableBoolByRepo,
+    // Timeout for writing to the new commit graph
+    commit_graph_writes_timeout_ms: AtomicI64,
+
+    // Usage of new commit graph for speeding up server-side operations
+    new_commit_graph_is_ancestor_percentage: TunableI64ByRepo,
 }
 
 fn log_tunables(tunables: &TunablesStruct) -> String {

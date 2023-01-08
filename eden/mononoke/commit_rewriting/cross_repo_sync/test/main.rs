@@ -20,10 +20,13 @@ use blobrepo::save_bonsai_changesets;
 use blobrepo::BlobRepo;
 use blobstore::Loadable;
 use blobstore::Storable;
+use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarkName;
 use bookmarks::BookmarkUpdateReason;
+use bookmarks::BookmarksRef;
 use bytes::Bytes;
 use cacheblob::InProcessLease;
+use changeset_fetcher::ChangesetFetcherRef;
 use cloned::cloned;
 use context::CoreContext;
 use cross_repo_sync::types::Target;
@@ -438,7 +441,8 @@ async fn test_sync_parentage(fb: FacebookInit) -> Result<(), Error> {
     // And check that the synced commit has correct parentage
     assert_eq!(
         megarepo
-            .get_changeset_parents_by_bonsai(ctx.clone(), megarepo_second_bcs_id.unwrap())
+            .changeset_fetcher()
+            .get_parents(ctx.clone(), megarepo_second_bcs_id.unwrap())
             .await?,
         vec![megarepo_base_bcs_id]
     );

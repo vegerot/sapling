@@ -689,7 +689,7 @@ function ephemeral_db_config() {
 
 function blobstore_db_config() {
   if [[ -n "$DB_SHARD_NAME" ]]; then
-    echo "queue_db = { remote = { db_address = \"$DB_SHARD_NAME\" } }"
+    echo "queue_db = { remote = { shard_map = \"$DB_SHARD_NAME\", shard_num = 1 } }"
   else
     local blobstore_db_path="$TESTTMP/blobstore_sync_queue"
     mkdir -p "$blobstore_db_path"
@@ -718,15 +718,9 @@ function setup_mononoke_storage_config {
     local quorum
     local btype
     local scuba
-    if [[ "$WAL" != "" ]]; then
-      quorum="write_quorum"
-      btype="multiplexed_wal"
-      scuba="multiplex_scuba_table = \"file://$TESTTMP/blobstore_trace_scuba.json\""
-    else
-      quorum="minimum_successful_writes"
-      btype="multiplexed"
-      scuba=""
-    fi
+    quorum="write_quorum"
+    btype="multiplexed_wal"
+    scuba="multiplex_scuba_table = \"file://$TESTTMP/blobstore_trace_scuba.json\""
     cat >> common/storage.toml <<CONFIG
 $(db_config "$blobstorename")
 
@@ -999,12 +993,6 @@ fi
 forbid_p2_root_rebases=false
 CONFIG
 
-if [[ -n "${COMMIT_SCRIBE_CATEGORY:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-commit_scribe_category = "$COMMIT_SCRIBE_CATEGORY"
-CONFIG
-fi
-
 if [[ -n "${ALLOW_CASEFOLDING:-}" ]]; then
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 casefolding_check=false
@@ -1066,12 +1054,6 @@ else
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 [push]
 pure_push_allowed = true
-CONFIG
-fi
-
-if [[ -n "${COMMIT_SCRIBE_CATEGORY:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-commit_scribe_category = "$COMMIT_SCRIBE_CATEGORY"
 CONFIG
 fi
 
@@ -1164,12 +1146,23 @@ sparse_profiles_location="$SPARSE_PROFILES_LOCATION"
 CONFIG
 fi
 
-if [[ -n "${BOOKMARK_SCRIBE_CATEGORY:-}" ]]; then
+if [[ -n "${COMMIT_SCRIBE_CATEGORY:-${BOOKMARK_SCRIBE_CATEGORY:-}}" ]]; then
   cat >> "repos/$reponame/server.toml" <<CONFIG
 [update_logging_config]
+CONFIG
+fi
+
+if [[ -n "${BOOKMARK_SCRIBE_CATEGORY:-}" ]]; then
+  cat >> "repos/$reponame/server.toml" <<CONFIG
 bookmark_logging_destination = { scribe = { scribe_category = "$BOOKMARK_SCRIBE_CATEGORY" } }
 CONFIG
 fi
+if [[ -n "${COMMIT_SCRIBE_CATEGORY:-}" ]]; then
+    cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
+new_commit_logging_destination = { scribe = { scribe_category = "$COMMIT_SCRIBE_CATEGORY" } }
+CONFIG
+fi
+
 }
 
 function write_infinitepush_config {
@@ -1194,12 +1187,6 @@ CONFIG
 allow_writes = ${INFINITEPUSH_ALLOW_WRITES:-true}
 hydrate_getbundle_response = ${INFINITEPUSH_HYDRATE_GETBUNDLE_RESPONSE:-false}
 ${namespace}
-CONFIG
-  fi
-
-  if [[ -n "${DRAFT_COMMIT_SCRIBE_CATEGORY:-}" ]]; then
-    cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-  commit_scribe_category = "$DRAFT_COMMIT_SCRIBE_CATEGORY"
 CONFIG
   fi
 }
@@ -1847,26 +1834,6 @@ function add_synced_commit_mapping_entry() {
     --version-name "$version" 2>/dev/null
 }
 
-function read_blobstore_sync_queue_size() {
-  if [[ -n "$DB_SHARD_NAME" ]]; then
-    echo "SELECT COUNT(*) FROM blobstore_sync_queue;" | db "$DB_SHARD_NAME" 2> /dev/null | grep -v COUNT
-  else
-    local attempts timeout ret
-    timeout="100"
-    attempts="$((timeout * 10))"
-    for _ in $(seq 1 $attempts); do
-      ret="$(sqlite3 "$TESTTMP/blobstore_sync_queue/sqlite_dbs" "select count(*) from blobstore_sync_queue" 2>/dev/null)"
-      if [[ -n "$ret" ]]; then
-        echo "$ret"
-        return 0
-      fi
-      sleep 0.1
-    done
-    return 1
-  fi
-
-}
-
 function read_blobstore_wal_queue_size() {
   if [[ -n "$DB_SHARD_NAME" ]]; then
     echo "SELECT COUNT(*) FROM blobstore_write_ahead_log;" | db "$DB_SHARD_NAME" 2> /dev/null | grep -v COUNT
@@ -1885,17 +1852,6 @@ function read_blobstore_wal_queue_size() {
     return 1
   fi
 
-}
-
-function erase_blobstore_sync_queue() {
-  if [[ -n "$DB_SHARD_NAME" ]]; then
-    # See above for why we have to redirect this output to /dev/null
-    db -wu "$DB_SHARD_NAME" 2> /dev/null <<EOF
-      DELETE FROM blobstore_sync_queue;
-EOF
-  else
-    rm -rf "$TESTTMP/blobstore_sync_queue/sqlite_dbs"
-fi
 }
 
 function log() {
@@ -2144,7 +2100,11 @@ function merge_tunables() {
 function init_tunables() {
   if [[ ! -f "$MONONOKE_TUNABLES_PATH" ]]; then
     cat >> "$MONONOKE_TUNABLES_PATH" <<EOF
-{}
+{
+  "ints": {
+    "commit_graph_writes_timeout_ms": 10000
+  }
+}
 EOF
   fi
 }

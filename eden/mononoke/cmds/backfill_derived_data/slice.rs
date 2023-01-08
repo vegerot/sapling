@@ -10,10 +10,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use anyhow::anyhow;
 use anyhow::Error;
 use anyhow::Result;
 use blobrepo::BlobRepo;
+use changeset_fetcher::ChangesetFetcherArc;
+use changeset_fetcher::ChangesetFetcherRef;
 use context::CoreContext;
 use derived_data_utils::DerivedUtils;
 use futures::stream;
@@ -58,18 +59,16 @@ async fn parents_with_generations(
     csid: ChangesetId,
 ) -> Result<Vec<(ChangesetId, Generation)>> {
     let parents = repo
-        .get_changeset_parents_by_bonsai(ctx.clone(), csid)
+        .changeset_fetcher()
+        .get_parents(ctx.clone(), csid)
         .await?;
     let parents_with_generations =
         stream::iter(parents.into_iter().map(|parent_csid| async move {
-            match repo.get_generation_number(ctx.clone(), parent_csid).await? {
-                Some(gen) => Ok(Some((parent_csid, gen))),
-                None => Err(anyhow!(
-                    "Could not find generation number for commit {} parent {}",
-                    csid,
-                    parent_csid
-                )),
-            }
+            let gen = repo
+                .changeset_fetcher()
+                .get_generation_number(ctx.clone(), parent_csid)
+                .await?;
+            Ok(Some((parent_csid, gen)))
         }))
         .buffered(100)
         .try_filter_map(|maybe_csid_gen| async move { Ok::<_, Error>(maybe_csid_gen) })
@@ -143,7 +142,7 @@ pub(crate) async fn slice_repository(
     }
 
     // Add any unindexed heads to the skiplist index.
-    let changeset_fetcher = repo.get_changeset_fetcher();
+    let changeset_fetcher = repo.changeset_fetcher_arc();
     for head in heads.iter() {
         skiplist_index
             .add_node(ctx, &changeset_fetcher, *head, std::u64::MAX)
@@ -152,13 +151,11 @@ pub(crate) async fn slice_repository(
 
     let mut head_generation_groups: BTreeMap<u64, Vec<ChangesetId>> = BTreeMap::new();
     stream::iter(heads.into_iter().map(|csid| async move {
-        match repo.get_generation_number(ctx.clone(), csid).await? {
-            Some(gen) => Ok(Some((csid, gen))),
-            None => Err(anyhow!(
-                "Could not find generation number for head {}",
-                csid
-            )),
-        }
+        let gen = repo
+            .changeset_fetcher()
+            .get_generation_number(ctx.clone(), csid)
+            .await?;
+        Ok(Some((csid, gen)))
     }))
     .buffered(100)
     .try_for_each(|maybe_csid_gen| {

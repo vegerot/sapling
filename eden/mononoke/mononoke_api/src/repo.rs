@@ -17,7 +17,6 @@ use std::time::UNIX_EPOCH;
 use acl_regions::build_disabled_acl_regions;
 use acl_regions::AclRegions;
 use anyhow::anyhow;
-use anyhow::format_err;
 use anyhow::Error;
 use blobrepo::AsBlobRepo;
 use blobrepo::BlobRepo;
@@ -26,25 +25,34 @@ use blobstore::Loadable;
 use blobstore_factory::make_metadata_sql_factory;
 use blobstore_factory::ReadOnlyStorage;
 use bonsai_git_mapping::BonsaiGitMapping;
+use bonsai_git_mapping::BonsaiGitMappingRef;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
+use bonsai_globalrev_mapping::BonsaiGlobalrevMappingRef;
 use bonsai_hg_mapping::BonsaiHgMapping;
+use bonsai_hg_mapping::BonsaiHgMappingRef;
+use bonsai_svnrev_mapping::BonsaiSvnrevMappingRef;
 use bookmarks::BookmarkKind;
 use bookmarks::BookmarkName;
 use bookmarks::BookmarkPagination;
 use bookmarks::BookmarkPrefix;
 use bookmarks::BookmarkUpdateLog;
 use bookmarks::BookmarkUpdateLogArc;
+use bookmarks::BookmarkUpdateLogRef;
 use bookmarks::Bookmarks;
 use bookmarks::BookmarksArc;
+use bookmarks::BookmarksRef;
 pub use bookmarks::Freshness as BookmarkFreshness;
 use bookmarks::Freshness;
 use cacheblob::InProcessLease;
 use cacheblob::LeaseOps;
 use changeset_fetcher::ChangesetFetcher;
+use changeset_fetcher::ChangesetFetcherArc;
+use changeset_fetcher::ChangesetFetcherRef;
 use changeset_info::ChangesetInfo;
 use changesets::Changesets;
 use changesets::ChangesetsArc;
 use changesets::ChangesetsRef;
+use commit_graph::CommitGraph;
 use context::CoreContext;
 use cross_repo_sync::types::Target;
 use cross_repo_sync::CandidateSelectionHint;
@@ -226,6 +234,9 @@ pub struct Repo {
 
     #[facet]
     pub repo_handler_base: RepoHandlerBase,
+
+    #[facet]
+    pub commit_graph: CommitGraph,
 }
 
 impl AsBlobRepo for Repo {
@@ -373,6 +384,7 @@ impl Repo {
             warm_bookmarks_cache: self.warm_bookmarks_cache.clone(),
             hook_manager: self.hook_manager.clone(),
             repo_handler_base: self.repo_handler_base.clone(),
+            commit_graph: self.commit_graph.clone(),
         }
     }
 
@@ -473,10 +485,11 @@ impl Repo {
             &Arc::new(config.clone()),
             &repo_cross_repo,
             &blob_repo.repo_identity_arc(),
-            blob_repo.bookmarks(),
-            blob_repo.bookmark_update_log(),
+            &blob_repo.bookmarks_arc(),
+            &blob_repo.bookmark_update_log_arc(),
             &mutable_counters,
         )?;
+        let commit_graph = repo_factory.commit_graph(&blob_repo.repo_identity_arc())?;
 
         let inner = InnerRepo {
             blob_repo,
@@ -515,6 +528,7 @@ impl Repo {
             warm_bookmarks_cache: Arc::new(warm_bookmarks_cache),
             hook_manager,
             repo_handler_base,
+            commit_graph,
         })
     }
 
@@ -722,7 +736,7 @@ impl Repo {
 
         let mut ancestors = AncestorsNodeStream::new(
             ctx.clone(),
-            &self.blob_repo().get_changeset_fetcher(),
+            &self.blob_repo().changeset_fetcher_arc(),
             descendant,
         )
         .compat();
@@ -737,7 +751,8 @@ impl Repo {
             let cs_id = cs_id?;
             let parents = self
                 .blob_repo()
-                .get_changeset_parents_by_bonsai(ctx.clone(), cs_id)
+                .changeset_fetcher()
+                .get_parents(ctx.clone(), cs_id)
                 .await?;
 
             if parents.contains(&ancestor) {
@@ -758,11 +773,10 @@ impl Repo {
         ctx: &CoreContext,
         cs_id: &ChangesetId,
     ) -> Result<Generation, Error> {
-        let maybe_gen_num = self
-            .blob_repo()
+        self.blob_repo()
+            .changeset_fetcher()
             .get_generation_number(ctx.clone(), *cs_id)
-            .await?;
-        maybe_gen_num.ok_or_else(|| format_err!("gen num for {} not found", cs_id))
+            .await
     }
 }
 
@@ -837,8 +851,8 @@ impl RepoContext {
         &self.authz
     }
 
-    pub fn mononoke_api_repo(&self) -> Arc<Repo> {
-        self.repo.clone()
+    pub fn repo(&self) -> &Repo {
+        self.repo.as_ref()
     }
 
     /// The underlying `InnerRepo`.
@@ -1094,7 +1108,7 @@ impl RepoContext {
         let repo = self.clone();
         DifferenceOfUnionsOfAncestorsNodeStream::new_with_excludes(
             self.ctx.clone(),
-            self.blob_repo().changeset_fetcher(),
+            &self.blob_repo().changeset_fetcher_arc(),
             self.skiplist_index_arc(),
             includes,
             excludes,
@@ -1766,7 +1780,7 @@ mod tests {
         )?;
 
         let maybe_child = repo.try_find_child(&ctx, ancestor, descendant, 100).await?;
-        let child = maybe_child.ok_or_else(|| format_err!("didn't find child"))?;
+        let child = maybe_child.ok_or_else(|| anyhow!("didn't find child"))?;
         assert_eq!(
             child,
             ChangesetId::from_str(
@@ -1793,7 +1807,7 @@ mod tests {
         )?;
 
         let maybe_child = repo.try_find_child(&ctx, ancestor, descendant, 100).await?;
-        let child = maybe_child.ok_or_else(|| format_err!("didn't find child"))?;
+        let child = maybe_child.ok_or_else(|| anyhow!("didn't find child"))?;
         assert_eq!(child, descendant);
         Ok(())
     }

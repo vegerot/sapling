@@ -224,6 +224,8 @@ pub struct RepoConfig {
     pub deep_sharded: bool,
     /// Configuration for update logging.
     pub update_logging_config: UpdateLoggingConfig,
+    /// Configuration for the commit graph.
+    pub commit_graph_config: CommitGraphConfig,
     /// Default commit identity scheme. Some repos can be hg-mirrored git repos.
     pub default_commit_identity_scheme: CommitIdentityScheme,
 }
@@ -593,15 +595,12 @@ pub struct HookParams {
 pub struct PushParams {
     /// Whether normal non-pushrebase pushes are allowed
     pub pure_push_allowed: bool,
-    /// Scribe category we log new commits to
-    pub commit_scribe_category: Option<String>,
 }
 
 impl Default for PushParams {
     fn default() -> Self {
         PushParams {
             pure_push_allowed: true,
-            commit_scribe_category: None,
         }
     }
 }
@@ -665,8 +664,6 @@ pub struct PushrebaseParams {
     pub block_merges: bool,
     /// Whether to do emit obsmarkers after pushrebase
     pub emit_obsmarkers: bool,
-    /// Scribe category we log new commits to
-    pub commit_scribe_category: Option<String>,
     /// Whether Globalrevs should be assigned
     pub globalrevs_publishing_bookmark: Option<BookmarkName>,
     /// Whether Git Mapping should be populated from extras (affects also blobimport)
@@ -687,7 +684,6 @@ impl Default for PushrebaseParams {
             flags: PushrebaseFlags::default(),
             block_merges: false,
             emit_obsmarkers: false,
-            commit_scribe_category: None,
             globalrevs_publishing_bookmark: None,
             populate_git_mapping: false,
             allow_change_xrepo_mapping_extra: false,
@@ -836,26 +832,6 @@ pub enum BlobConfig {
         /// The remote database config
         remote: ShardableRemoteDatabaseConfig,
     },
-    /// Multiplex across multiple blobstores for redundancy
-    Multiplexed {
-        /// A unique ID that identifies this multiplex configuration
-        multiplex_id: MultiplexId,
-        /// A scuba table to log stats per blobstore
-        scuba_table: Option<String>,
-        /// A scuba table for multiplex stats
-        multiplex_scuba_table: Option<String>,
-        /// Set of blobstores being multiplexed over
-        blobstores: Vec<(BlobstoreId, MultiplexedStoreType, BlobConfig)>,
-        /// The number of writes that must succeed for a `put` to the multiplex to succeed
-        minimum_successful_writes: NonZeroUsize,
-        /// The number of reads needed to decided a blob is not present
-        not_present_read_quorum: NonZeroUsize,
-        /// 1 in scuba_sample_rate samples will be logged for both
-        /// multiplex and per blobstore scuba tables
-        scuba_sample_rate: NonZeroU64,
-        /// DB config to use for the sync queue
-        queue_db: DatabaseConfig,
-    },
     /// Multiplex across multiple blobstores for redundancy based on a WAL approach
     MultiplexedWal {
         /// A unique ID that identifies this multiplex configuration
@@ -924,7 +900,7 @@ impl BlobConfig {
         match self {
             Disabled | Files { .. } | Sqlite { .. } => true,
             Manifold { .. } | Mysql { .. } | ManifoldWithTtl { .. } | S3 { .. } => false,
-            Multiplexed { blobstores, .. } | MultiplexedWal { blobstores, .. } => blobstores
+            MultiplexedWal { blobstores, .. } => blobstores
                 .iter()
                 .map(|(_, _, config)| config)
                 .all(BlobConfig::is_local),
@@ -936,11 +912,7 @@ impl BlobConfig {
     /// If this blobstore performs sampling, update the sampling ratio.
     pub fn apply_sampling_multiplier(&mut self, multiplier: NonZeroU64) {
         match self {
-            Self::Multiplexed {
-                ref mut scuba_sample_rate,
-                ..
-            }
-            | Self::MultiplexedWal {
+            Self::MultiplexedWal {
                 ref mut scuba_sample_rate,
                 ..
             }
@@ -1149,9 +1121,6 @@ pub struct InfinitepushParams {
 
     /// Whether to put trees/files in the getbundle response for infinitepush commits
     pub hydrate_getbundle_response: bool,
-
-    /// Scribe category we log new commits to
-    pub commit_scribe_category: Option<String>,
 }
 
 /// Filestore configuration.
@@ -1726,4 +1695,11 @@ pub struct UpdateLoggingConfig {
     pub bookmark_logging_destination: Option<LoggingDestination>,
     /// Destination where new commits are logged to
     pub new_commit_logging_destination: Option<LoggingDestination>,
+}
+
+/// Configuration for the commit graph
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct CommitGraphConfig {
+    /// Scuba table to log commit graph operations to
+    pub scuba_table: Option<String>,
 }

@@ -21,12 +21,13 @@ use blobrepo_hg::ChangesetHandle;
 use blobstore::Blobstore;
 use blobstore::Loadable;
 use blobstore::LoadableError;
+use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::Freshness;
 use bytes::Bytes;
+use changeset_fetcher::ChangesetFetcherRef;
 use changesets::ChangesetInsert;
 use changesets::ChangesetsRef;
 use context::CoreContext;
-use context::SessionClass;
 use edenapi_types::AnyId;
 use edenapi_types::UploadToken;
 use ephemeral_blobstore::Bubble;
@@ -34,6 +35,7 @@ use ephemeral_blobstore::BubbleId;
 use ephemeral_blobstore::RepoEphemeralStore;
 use ephemeral_blobstore::StorageLocation;
 use filestore::FetchKey;
+use filestore::FilestoreConfigRef;
 use filestore::StoreRequest;
 use futures::compat::Future01CompatExt;
 use futures::compat::Stream01CompatExt;
@@ -47,6 +49,7 @@ use futures_util::try_join;
 use hgproto::GettreepackArgs;
 use mercurial_derived_data::DeriveHgChangeset;
 use mercurial_mutation::HgMutationEntry;
+use mercurial_mutation::HgMutationStoreRef;
 use mercurial_types::blobs::RevlogChangeset;
 use mercurial_types::blobs::UploadHgNodeHash;
 use mercurial_types::blobs::UploadHgTreeEntry;
@@ -75,7 +78,6 @@ use repo_update_logger::log_new_commits;
 use repo_update_logger::CommitInfo;
 use segmented_changelog::CloneData;
 use segmented_changelog::Location;
-use tunables::tunables;
 use unbundle::upload_changeset;
 
 use super::HgFileContext;
@@ -188,15 +190,9 @@ impl HgRepoContext {
         bubble_id: Option<BubbleId>,
     ) -> Result<bool, MononokeError> {
         async move {
-            let mut ctx = self.ctx().clone();
-            let is_comprehensive = tunables().get_edenapi_lookup_use_comprehensive_mode();
-            if is_comprehensive {
-                ctx.session_mut()
-                    .override_session_class(SessionClass::ComprehensiveLookup);
-            }
             self.bubble_blobstore(bubble_id)
                 .await?
-                .is_present(&ctx, key)
+                .is_present(self.ctx(), key)
                 .await
                 .map(|is_present| {
                     // if we can't resolve the presence (some blobstores failed, some returned None)
@@ -247,7 +243,7 @@ impl HgRepoContext {
     ) -> Result<ContentMetadata, MononokeError> {
         filestore::store(
             &self.bubble_blobstore(bubble_id).await?,
-            self.blob_repo().filestore_config(),
+            *self.blob_repo().filestore_config(),
             self.ctx(),
             &StoreRequest::with_fetch_key(size, key.into()),
             data,
@@ -817,7 +813,8 @@ impl HgRepoContext {
             stream::iter(missing_commits.clone().into_iter())
                 .map(move |cs_id| async move {
                     let parents = blob_repo
-                        .get_changeset_parents_by_bonsai(self.ctx().clone(), cs_id)
+                        .changeset_fetcher()
+                        .get_parents(self.ctx().clone(), cs_id)
                         .await?;
                     Ok::<_, Error>((cs_id, parents))
                 })

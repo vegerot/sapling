@@ -223,6 +223,7 @@ fn parse_with_repo_definition(
         backup_hg_sync_config,
         deep_sharded,
         update_logging_config,
+        commit_graph_config,
         ..
     } = named_repo_config;
 
@@ -337,6 +338,8 @@ fn parse_with_repo_definition(
 
     let update_logging_config = update_logging_config.convert()?.unwrap_or_default();
 
+    let commit_graph_config = commit_graph_config.convert()?.unwrap_or_default();
+
     Ok(RepoConfig {
         enabled,
         storage_config,
@@ -377,6 +380,7 @@ fn parse_with_repo_definition(
         backup_hg_sync_config,
         deep_sharded,
         update_logging_config,
+        commit_graph_config,
         default_commit_identity_scheme,
     })
 }
@@ -496,6 +500,7 @@ mod test {
     use metaconfig_types::BookmarkParams;
     use metaconfig_types::BubbleDeletionMode;
     use metaconfig_types::CacheWarmupParams;
+    use metaconfig_types::CommitGraphConfig;
     use metaconfig_types::CommitIdentityScheme;
     use metaconfig_types::CommitSyncConfig;
     use metaconfig_types::CommitSyncConfigVersion;
@@ -530,6 +535,7 @@ mod test {
     use metaconfig_types::SegmentedChangelogConfig;
     use metaconfig_types::SegmentedChangelogHeadConfig;
     use metaconfig_types::ShardableRemoteDatabaseConfig;
+    use metaconfig_types::ShardedDatabaseConfig;
     use metaconfig_types::ShardedRemoteDatabaseConfig;
     use metaconfig_types::SmallRepoCommitSyncConfig;
     use metaconfig_types::SourceControlServiceMonitoring;
@@ -828,7 +834,6 @@ mod test {
 
             [push]
             pure_push_allowed = false
-            commit_scribe_category = "cat"
 
             [pushrebase]
             rewritedates = false
@@ -898,6 +903,9 @@ mod test {
 
             [update_logging_config]
             new_commit_logging_destination = { scribe = { scribe_category = "cat" } }
+
+            [commit_graph_config]
+            scuba_table = "commit_graph"
         "#;
         let fbsource_repo_def = r#"
             repo_id=0
@@ -948,16 +956,16 @@ mod test {
         mutation = { db_address = "mutation_db_address" }
         sparse_profiles = { db_address = "sparse_profiles_db_address" }
 
-        [main.blobstore.multiplexed]
+        [main.blobstore.multiplexed_wal]
         multiplex_id = 1
-        scuba_table = "blobstore_scuba_table"
+        inner_blobstores_scuba_table = "blobstore_scuba_table"
         multiplex_scuba_table = "multiplex_scuba_table"
+        write_quorum = 1
         components = [
             { blobstore_id = 0, blobstore = { manifold = { manifold_bucket = "bucket" } } },
             { blobstore_id = 1, blobstore = { blob_files = { path = "/tmp/foo" } } },
         ]
-        queue_db = { remote = { db_address = "queue_db_address" } }
-        minimum_successful_writes = 2
+        queue_db = { remote = { shard_map = "queue_db_address", shard_num = 13 } }
 
         [files.metadata.local]
         local_db_path = "/tmp/www"
@@ -1004,9 +1012,9 @@ mod test {
         let repoconfig =
             load_repo_configs(tmp_dir.path(), &config_store).expect("Read configs failed");
 
-        let multiplex = BlobConfig::Multiplexed {
+        let multiplex = BlobConfig::MultiplexedWal {
             multiplex_id: MultiplexId::new(1),
-            scuba_table: Some("blobstore_scuba_table".to_string()),
+            inner_blobstores_scuba_table: Some("blobstore_scuba_table".to_string()),
             multiplex_scuba_table: Some("multiplex_scuba_table".to_string()),
             scuba_sample_rate: nonzero!(100u64),
             blobstores: vec![
@@ -1026,10 +1034,10 @@ mod test {
                     },
                 ),
             ],
-            minimum_successful_writes: nonzero!(2usize),
-            not_present_read_quorum: nonzero!(2usize),
-            queue_db: DatabaseConfig::Remote(RemoteDatabaseConfig {
-                db_address: "queue_db_address".into(),
+            write_quorum: 1,
+            queue_db: ShardedDatabaseConfig::Remote(ShardedRemoteDatabaseConfig {
+                shard_map: "queue_db_address".into(),
+                shard_num: nonzero!(13usize),
             }),
         };
         let main_storage_config = StorageConfig {
@@ -1132,7 +1140,6 @@ mod test {
                 ],
                 push: PushParams {
                     pure_push_allowed: false,
-                    commit_scribe_category: Some("cat".to_string()),
                 },
                 pushrebase: PushrebaseParams {
                     flags: PushrebaseFlags {
@@ -1145,7 +1152,6 @@ mod test {
                     },
                     block_merges: false,
                     emit_obsmarkers: false,
-                    commit_scribe_category: None,
                     globalrevs_publishing_bookmark: None,
                     populate_git_mapping: false,
                     allow_change_xrepo_mapping_extra: true,
@@ -1166,7 +1172,6 @@ mod test {
                     allow_writes: true,
                     namespace: Some(InfinitepushNamespace::new(Regex::new("foobar/.+").unwrap())),
                     hydrate_getbundle_response: false,
-                    commit_scribe_category: None,
                 },
                 list_keys_patterns_max: 123,
                 hook_max_file_size: 456,
@@ -1268,6 +1273,9 @@ mod test {
                         scribe_category: "cat".to_string(),
                     }),
                 },
+                commit_graph_config: CommitGraphConfig {
+                    scuba_table: Some("commit_graph".to_string()),
+                },
             },
         );
 
@@ -1342,6 +1350,7 @@ mod test {
                 backup_hg_sync_config: None,
                 deep_sharded: false,
                 update_logging_config: UpdateLoggingConfig::default(),
+                commit_graph_config: CommitGraphConfig::default(),
             },
         );
         assert_eq!(
@@ -1500,12 +1509,13 @@ mod test {
         mutation = { db_address = "some_db" }
         sparse_profiles = { db_address = "some_db" }
 
-        [multiplex_store.blobstore.multiplexed]
+        [multiplex_store.blobstore.multiplexed_wal]
         multiplex_id = 1
         components = [
             { blobstore_id = 1, blobstore = { blob_files = { path = "/tmp/foo" } } },
         ]
-        queue_db = { remote = { db_address = "queue_db_address" } }
+        queue_db = { remote = { shard_map = "queue_db_address", shard_num = 1 } }
+        write_quorum = 1
         "#;
 
         const REPO: &str = r#"
@@ -1552,9 +1562,9 @@ mod test {
             "test".into() => RepoConfig {
                 enabled: true,
                 storage_config: StorageConfig {
-                    blobstore: BlobConfig::Multiplexed {
+                    blobstore: BlobConfig::MultiplexedWal {
                         multiplex_id: MultiplexId::new(1),
-                        scuba_table: None,
+                        inner_blobstores_scuba_table: None,
                         multiplex_scuba_table: None,
                         scuba_sample_rate: nonzero!(100u64),
                         blobstores: vec![
@@ -1562,11 +1572,11 @@ mod test {
                                 path: "/tmp/foo".into()
                             })
                         ],
-                        minimum_successful_writes: nonzero!(1usize),
-                        not_present_read_quorum: nonzero!(1usize),
-                        queue_db: DatabaseConfig::Remote(
-                            RemoteDatabaseConfig {
-                                db_address: "queue_db_address".into(),
+                        write_quorum: 1,
+                        queue_db: ShardedDatabaseConfig::Remote(
+                            ShardedRemoteDatabaseConfig {
+                                shard_map: "queue_db_address".into(),
+                                shard_num: nonzero!(1usize),
                             }
                         ),
                     },
@@ -1608,12 +1618,13 @@ mod test {
         primary = { db_address = "some_db" }
         filenodes = { sharded = { shard_map = "some-shards", shard_num = 123 } }
 
-        [multiplex_store.blobstore.multiplexed]
+        [multiplex_store.blobstore.multiplexed_wal]
         multiplex_id = 1
         components = [
             { blobstore_id = 1, blobstore = { blob_files = { path = "/tmp/foo" } } },
         ]
-        queue_db = { remote = { db_address = "queue_db_address" } }
+        queue_db = { remote = { shard_map = "queue_db_address", shard_num = 1 } }
+        write_quorum = 1
 
         [manifold_store.metadata.remote]
         primary = { db_address = "other_db" }
@@ -1737,14 +1748,15 @@ mod test {
         primary = { db_address = "some_db" }
         filenodes = { sharded = { shard_map = "some-shards", shard_num = 123 } }
 
-        [multiplex_store.blobstore.multiplexed]
+        [multiplex_store.blobstore.multiplexed_wal]
         multiplex_id = 1
         components = [
             { blobstore_id = 1, blobstore = { blob_files = { path = "/tmp/foo1" } } },
             { blobstore_id = 2, store_type = { normal = {}}, blobstore = { blob_files = { path = "/tmp/foo2" } } },
             { blobstore_id = 3, store_type = { write_only = {}}, blobstore = { blob_files = { path = "/tmp/foo3" } } },
         ]
-        queue_db = { remote = { db_address = "queue_db_address" } }
+        queue_db = { remote = { shard_map = "queue_db_address", shard_num = 1 } }
+        write_quorum = 2
         "#;
 
         const REPO: &str = r#"
@@ -1779,7 +1791,7 @@ mod test {
         let tmp_dir = write_files(&paths);
         let res = load_repo_configs(tmp_dir.path(), &config_store).expect("Read configs failed");
 
-        if let BlobConfig::Multiplexed { blobstores, .. } =
+        if let BlobConfig::MultiplexedWal { blobstores, .. } =
             &res.repos["test"].storage_config.blobstore
         {
             let expected_blobstores = vec![

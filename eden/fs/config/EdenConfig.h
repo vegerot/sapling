@@ -19,10 +19,12 @@
 
 #include "common/rust/shed/hostcaps/hostcaps.h"
 #include "eden/fs/config/ConfigSetting.h"
+#include "eden/fs/config/ConfigSource.h"
 #include "eden/fs/config/ConfigVariables.h"
 #include "eden/fs/config/FileChangeMonitor.h"
 #include "eden/fs/config/HgObjectIdFormat.h"
 #include "eden/fs/config/MountProtocol.h"
+#include "eden/fs/config/ReaddirPrefetch.h"
 #include "eden/fs/eden-config.h"
 #include "eden/fs/utils/PathFuncs.h"
 
@@ -42,23 +44,28 @@ extern const AbsolutePath kUnspecifiedDefault;
  */
 class EdenConfig : private ConfigSettingManager {
  public:
+  using SourceVector = std::vector<std::shared_ptr<ConfigSource>>;
+
   /**
-   * Manually construct a EdenConfig object. Users can subsequently use the
-   * load methods to populate the EdenConfig.
+   * Manually construct a EdenConfig object with some default values and
+   * ConfigSources. Duplicate ConfigSources for the same ConfigSourceType are
+   * disallowed. ConfigSources are immediately applied to the ConfigSettings.
    */
   explicit EdenConfig(
       ConfigVariables substitutions,
-      AbsolutePath userHomePath,
-      AbsolutePath userConfigPath,
-      AbsolutePath systemConfigDir,
-      AbsolutePath systemConfigPath);
+      AbsolutePathPiece userHomePath,
+      AbsolutePathPiece systemConfigDir,
+      SourceVector configSources);
 
+  /**
+   * EdenConfig is heap-allocated and not copyable or moveable in general. This
+   * constructor clones an existing EdenConfig and is called when a config file
+   * is reloaded.
+   */
   explicit EdenConfig(const EdenConfig& source);
-
   explicit EdenConfig(EdenConfig&& source) = delete;
 
-  EdenConfig& operator=(const EdenConfig& source);
-
+  EdenConfig& operator=(const EdenConfig& source) = delete;
   EdenConfig& operator=(EdenConfig&& source) = delete;
 
   /**
@@ -67,43 +74,10 @@ class EdenConfig : private ConfigSettingManager {
   static std::shared_ptr<EdenConfig> createTestEdenConfig();
 
   /**
-   * Update EdenConfig by loading the system configuration.
-   */
-  void loadSystemConfig();
-
-  /**
-   * Update EdenConfig by loading the user configuration.
-   */
-  void loadUserConfig();
-
-  /**
-   * Load the configuration based on the passed path. The configuation source
-   * identifies whether the config file is a system or user config file and
-   * apply setting over-rides appropriately. The passed configFile stat is
-   * updated with the config files fstat results.
-   */
-  void loadConfig(
-      AbsolutePathPiece path,
-      ConfigSourceType configSourceType,
-      std::optional<FileStat>& configFileStat);
-
-  /**
    * Return the config data as a EdenConfigData structure that can be
    * thrift-serialized.
    */
   EdenConfigData toThriftConfigData() const;
-
-  /** Determine if user config has changed, fstat userConfigFile.*/
-  FileChangeReason hasUserConfigFileChanged() const;
-
-  /** Determine if user config has changed, fstat systemConfigFile.*/
-  FileChangeReason hasSystemConfigFileChanged() const;
-
-  /** Get the user config path. Default "userHomePath/.edenrc" */
-  const AbsolutePath& getUserConfigPath() const;
-
-  /** Get the system config path. Default "/etc/eden/edenfs.rc" */
-  const AbsolutePath& getSystemConfigPath() const;
 
   /** Get the path to client certificate. */
   const std::optional<AbsolutePath> getClientCertificate() const;
@@ -126,6 +100,19 @@ class EdenConfig : private ConfigSettingManager {
   std::optional<std::string> getValueByFullKey(
       std::string_view configKey) const;
 
+  /**
+   * Unconditionally apply all ConfigSources to the ConfigSettings.
+   */
+  void reload();
+
+  /**
+   * If any ConfigSources are stale, clones this EdenConfig and applies the
+   * updated sources to the ConfigSettings.
+   *
+   * If no sources have changed, returns nullptr.
+   */
+  std::shared_ptr<const EdenConfig> maybeReload() const;
+
  private:
   /**
    * Utility method for converting ConfigSourceType to the filename (or cli).
@@ -139,10 +126,6 @@ class EdenConfig : private ConfigSettingManager {
    */
   std::string toSourcePath(ConfigSourceType cs) const;
 
-  void doCopy(const EdenConfig& source);
-
-  void initConfigMap();
-
   void parseAndApplyConfigFile(
       int configFd,
       AbsolutePathPiece configPath,
@@ -155,11 +138,16 @@ class EdenConfig : private ConfigSettingManager {
   std::map<std::string, std::map<std::string, ConfigSettingBase*>> configMap_;
 
   std::shared_ptr<ConfigVariables> substitutions_;
-  AbsolutePath userConfigPath_;
-  AbsolutePath systemConfigPath_;
 
-  std::optional<FileStat> systemConfigFileStat_;
-  std::optional<FileStat> userConfigFileStat_;
+  static constexpr size_t kConfigSourceLastIndex =
+      static_cast<size_t>(apache::thrift::TEnumTraits<ConfigSourceType>::max());
+
+  /**
+   * Each ConfigSourceType has exactly zero or one ConfigSource. These slots are
+   * iterated in order during reload to populate EdenConfig.
+   */
+  std::array<std::shared_ptr<ConfigSource>, kConfigSourceLastIndex + 1>
+      configSources_;
 
   /*
    * Settings follow. Their initialization registers themselves with the
@@ -311,6 +299,14 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<std::chrono::nanoseconds> gcCutoff{
       "mount:garbage-collection-cutoff",
       std::chrono::hours(24),
+      this};
+
+  /**
+   * Specifies which directory children will be prefetched upon readdir.
+   */
+  ConfigSetting<ReaddirPrefetch> readdirPrefetch{
+      "mount:readdir-prefetch",
+      ReaddirPrefetch::None,
       this};
 
   // [store]
@@ -569,6 +565,8 @@ class EdenConfig : private ConfigSettingManager {
 
   /**
    * Controls whether EdenFS reads blob metadata directly from hg
+   *
+   * TODO: Delete once this config is no longer written.
    */
   ConfigSetting<bool> useAuxMetadata{"hg:use-aux-metadata", true, this};
 

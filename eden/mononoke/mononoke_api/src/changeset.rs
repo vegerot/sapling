@@ -16,15 +16,20 @@ use anyhow::anyhow;
 use basename_suffix_skeleton_manifest::RootBasenameSuffixSkeletonManifest;
 use blobrepo_hg::BlobRepoHg;
 use blobstore::Loadable;
+use bonsai_git_mapping::BonsaiGitMappingRef;
+use bonsai_globalrev_mapping::BonsaiGlobalrevMappingRef;
+use bonsai_svnrev_mapping::BonsaiSvnrevMappingRef;
 use bookmarks::BookmarkName;
 use bytes::Bytes;
+use changeset_fetcher::ChangesetFetcherArc;
+use changeset_fetcher::ChangesetFetcherRef;
 use changeset_info::ChangesetInfo;
 use changesets::ChangesetsRef;
 use chrono::DateTime;
 use chrono::FixedOffset;
 use cloned::cloned;
+use commit_graph::CommitGraphRef;
 use context::CoreContext;
-use context::PerfCounterType;
 use deleted_manifest::DeletedManifestOps;
 use deleted_manifest::RootDeletedManifestIdCommon;
 use deleted_manifest::RootDeletedManifestV2Id;
@@ -39,6 +44,7 @@ use futures::stream::Stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures_lazy_shared::LazyShared;
+use futures_stats::TimedFutureExt;
 use hooks::CrossRepoPushSource;
 use hooks::HookOutcome;
 use hooks::PushAuthoredBy;
@@ -647,28 +653,33 @@ impl ChangesetContext {
     /// Returns `true` if this commit is an ancestor of `other_commit`.  A commit is considered its
     /// own ancestor for the purpose of this call.
     pub async fn is_ancestor_of(&self, other_commit: ChangesetId) -> Result<bool, MononokeError> {
-        let segmented_changelog_rollout_pct =
-            tunables().get_segmented_changelog_is_ancestor_percentage();
-        let use_segmented_changelog =
-            ((rand::random::<usize>() % 100) as i64) < segmented_changelog_rollout_pct;
-        if use_segmented_changelog {
-            let segmented_changelog = self.repo().segmented_changelog();
-            // If we have segmeneted changelog enabled...
-            if !segmented_changelog.disabled(self.ctx()).await? {
-                // ... and it has the answer for us ...
-                if let Some(result) = segmented_changelog
-                    .is_ancestor(self.ctx(), self.id, other_commit)
-                    .await?
-                {
-                    self.ctx()
-                        .perf_counters()
-                        .increment_counter(PerfCounterType::SegmentedChangelogServerSideOpsHits);
-                    // ... it's cheaper to return it.
-                    return Ok(result);
+        let new_commit_graph_rollout_pct = tunables()
+            .get_by_repo_new_commit_graph_is_ancestor_percentage(self.repo().name())
+            .unwrap_or(0);
+        let use_new_commit_graph =
+            ((rand::random::<usize>() % 100) as i64) < new_commit_graph_rollout_pct;
+        if use_new_commit_graph {
+            let (stats, result) = self
+                .repo()
+                .repo()
+                .commit_graph()
+                .is_ancestor(self.ctx(), self.id, other_commit)
+                .timed()
+                .await;
+            let mut scuba = self.ctx().scuba().clone();
+            scuba.add_future_stats(&stats);
+            match result {
+                Ok(is_ancestor) => {
+                    scuba.log_with_msg(
+                        "New commit graph is_ancestor succeeded",
+                        is_ancestor.to_string(),
+                    );
+                    return Ok(is_ancestor);
                 }
-                self.ctx()
-                    .perf_counters()
-                    .increment_counter(PerfCounterType::SegmentedChangelogServerSideOpsFallbacks);
+                Err(err) => {
+                    let mut scuba = self.ctx().scuba().clone();
+                    scuba.log_with_msg("New commit graph is_ancestor failed", err.to_string());
+                }
             }
         }
 
@@ -677,7 +688,7 @@ impl ChangesetContext {
             .skiplist_index_arc()
             .query_reachability(
                 self.ctx(),
-                &self.repo().blob_repo().get_changeset_fetcher(),
+                &self.repo().blob_repo().changeset_fetcher_arc(),
                 other_commit,
                 self.id,
             )
@@ -698,7 +709,7 @@ impl ChangesetContext {
             .skiplist_index_arc()
             .lca(
                 self.ctx().clone(),
-                self.repo().blob_repo().get_changeset_fetcher(),
+                self.repo().blob_repo().changeset_fetcher_arc(),
                 self.id,
                 other_commit,
             )
@@ -1187,7 +1198,9 @@ impl ChangesetContext {
         };
         Ok(match basenames_and_suffixes {
             Some(basenames_and_suffixes)
-                if !tunables().get_disable_basename_suffix_skeleton_manifest() =>
+                if !tunables().get_disable_basename_suffix_skeleton_manifest()
+                    && (!basenames_and_suffixes.has_right()
+                        || tunables().get_enable_bssm_suffix_query()) =>
             {
                 self.find_files_with_bssm(prefixes, basenames_and_suffixes, ordering)
                     .await?
@@ -1404,7 +1417,8 @@ impl ChangesetContext {
                         let mut parents = self
                             .repo()
                             .blob_repo()
-                            .get_changeset_parents_by_bonsai(self.ctx().clone(), changeset_id)
+                            .changeset_fetcher()
+                            .get_parents(self.ctx().clone(), changeset_id)
                             .await?;
                         if parents.len() > 1 {
                             if let Some(ancestor) = descendants_of.as_ref() {

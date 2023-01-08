@@ -18,6 +18,7 @@ use metaconfig_types::BlameVersion;
 use metaconfig_types::BookmarkOrRegex;
 use metaconfig_types::BookmarkParams;
 use metaconfig_types::CacheWarmupParams;
+use metaconfig_types::CommitGraphConfig;
 use metaconfig_types::CommitIdentityScheme;
 use metaconfig_types::ComparableRegex;
 use metaconfig_types::CrossRepoCommitValidation;
@@ -54,6 +55,7 @@ use mononoke_types::PrefixTrie;
 use regex::Regex;
 use repos::RawBookmarkConfig;
 use repos::RawCacheWarmupConfig;
+use repos::RawCommitGraphConfig;
 use repos::RawCommitIdentityScheme;
 use repos::RawCrossRepoCommitValidationConfig;
 use repos::RawDerivedDataConfig;
@@ -220,7 +222,6 @@ impl Convert for RawPushParams {
         let default = PushParams::default();
         Ok(PushParams {
             pure_push_allowed: self.pure_push_allowed.unwrap_or(default.pure_push_allowed),
-            commit_scribe_category: self.commit_scribe_category,
         })
     }
 }
@@ -291,7 +292,6 @@ impl Convert for RawPushrebaseParams {
                 not_generated_filenodes_limit: 500,
                 monitoring_bookmark: self.monitoring_bookmark,
             },
-            commit_scribe_category: self.commit_scribe_category,
             block_merges: self.block_merges.unwrap_or(default.block_merges),
             emit_obsmarkers: self.emit_obsmarkers.unwrap_or(default.emit_obsmarkers),
             globalrevs_publishing_bookmark: self
@@ -335,7 +335,6 @@ impl Convert for RawInfinitepushParams {
                 .namespace_pattern
                 .and_then(|ns| Regex::new(&ns).ok().map(InfinitepushNamespace::new)),
             hydrate_getbundle_response: self.hydrate_getbundle_response.unwrap_or(false),
-            commit_scribe_category: self.commit_scribe_category,
         })
     }
 }
@@ -680,6 +679,16 @@ impl Convert for RawUpdateLoggingConfig {
         Ok(UpdateLoggingConfig {
             bookmark_logging_destination: self.bookmark_logging_destination.convert()?,
             new_commit_logging_destination: self.new_commit_logging_destination.convert()?,
+        })
+    }
+}
+
+impl Convert for RawCommitGraphConfig {
+    type Output = CommitGraphConfig;
+
+    fn convert(self) -> Result<Self::Output> {
+        Ok(CommitGraphConfig {
+            scuba_table: self.scuba_table,
         })
     }
 }

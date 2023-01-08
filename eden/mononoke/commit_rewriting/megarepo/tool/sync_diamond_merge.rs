@@ -5,33 +5,27 @@
  * GNU General Public License version 2.
  */
 
+//! This is a very hacky temporary tool that's used with only one purpose -
+//! to half-manually sync a diamond merge commit from a small repo into a large repo.
+//! NOTE - this is not a production quality tool, but rather a best effort attempt to
+//! half-automate a rare case that might occur. Tool most likely doesn't cover all the cases.
+//! USE WITH CARE!
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// This is a very hacky temporary tool that's used with only one purpose -
-/// to half-manually sync a diamond merge commit from a small repo into a large repo.
-/// NOTE - this is not a production quality tool, but rather a best effort attempt to
-/// half-automate a rare case that might occur. Tool most likely doesn't cover all the cases.
-/// USE WITH CARE!
 use anyhow::format_err;
-/// This is a very hacky temporary tool that's used with only one purpose -
-/// to half-manually sync a diamond merge commit from a small repo into a large repo.
-/// NOTE - this is not a production quality tool, but rather a best effort attempt to
-/// half-automate a rare case that might occur. Tool most likely doesn't cover all the cases.
-/// USE WITH CARE!
 use anyhow::Context;
-/// This is a very hacky temporary tool that's used with only one purpose -
-/// to half-manually sync a diamond merge commit from a small repo into a large repo.
-/// NOTE - this is not a production quality tool, but rather a best effort attempt to
-/// half-automate a rare case that might occur. Tool most likely doesn't cover all the cases.
-/// USE WITH CARE!
 use anyhow::Error;
 use blobrepo::BlobRepo;
 use blobrepo_utils::convert_diff_result_into_file_change_for_diamond_merge;
 use blobstore::Loadable;
 use bookmarks::BookmarkName;
 use bookmarks::BookmarkUpdateReason;
+use bookmarks::BookmarksRef;
 use cacheblob::LeaseOps;
+use changeset_fetcher::ChangesetFetcherArc;
+use changeset_fetcher::ChangesetFetcherRef;
 use cloned::cloned;
 use commit_transformation::upload_commits;
 use context::CoreContext;
@@ -136,7 +130,8 @@ pub async fn do_sync_diamond_merge(
 
     let parents = small_repo
         .blob_repo
-        .get_changeset_parents_by_bonsai(ctx.clone(), small_merge_cs_id)
+        .changeset_fetcher()
+        .get_parents(ctx.clone(), small_merge_cs_id)
         .await?;
 
     let (p1, p2) = validate_parents(parents)?;
@@ -400,7 +395,7 @@ async fn find_new_branch_oldest_first(
     p1: ChangesetId,
     p2: ChangesetId,
 ) -> Result<Vec<BonsaiChangeset>, Error> {
-    let fetcher = small_repo.blob_repo.get_changeset_fetcher();
+    let fetcher = small_repo.blob_repo.changeset_fetcher_arc();
 
     let new_branch = DifferenceOfUnionsOfAncestorsNodeStream::new_with_excludes(
         ctx.clone(),

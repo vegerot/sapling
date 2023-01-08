@@ -5,13 +5,10 @@
  * GNU General Public License version 2.
  */
 
-///! bulkops
-///!
-///! Utiltities for handling data in bulk.
+//! bulkops
+//!
+//! Utiltities for handling data in bulk.
 use std::cmp::max;
-///! bulkops
-///!
-///! Utiltities for handling data in bulk.
 use std::cmp::min;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -125,6 +122,49 @@ impl PublicChangesetBulkFetch {
                         let result = ids
                             .into_iter()
                             .filter_map(move |id| entries_map.remove(&id))
+                            .map(Ok);
+                        Ok::<_, Error>(stream::iter(result))
+                    })
+                })
+                // Allow concurrent entry chunk loads
+                .buffered(2)
+                .try_flatten();
+            Ok(s)
+        }
+        .try_flatten_stream()
+    }
+
+    /// Same as fetch_bounded but also returns the auto-increment id for each changeset
+    pub fn fetch_bounded_with_id<'a>(
+        &'a self,
+        ctx: &'a CoreContext,
+        d: Direction,
+        repo_bounds: Option<(u64, u64)>,
+    ) -> impl Stream<Item = Result<(ChangesetEntry, u64), Error>> + 'a {
+        async move {
+            let s = self
+                .fetch_ids(ctx, d, repo_bounds)
+                .chunks(BLOBSTORE_CHUNK_SIZE)
+                .then(move |results| {
+                    future::ready(async move {
+                        let ids: Vec<(ChangesetId, u64)> = results
+                            .into_iter()
+                            .map(|r| r.map(|(cs_id_and_row_id, _bounds)| cs_id_and_row_id))
+                            .collect::<Result<Vec<_>, Error>>()?;
+                        let entries = self
+                            .changesets
+                            .get_many(
+                                ctx.clone(),
+                                ids.iter().map(|(cs_id, _)| cs_id).copied().collect(),
+                            )
+                            .await?;
+                        let mut entries_map: HashMap<_, _> =
+                            entries.into_iter().map(|e| (e.cs_id, e)).collect();
+                        let result = ids
+                            .into_iter()
+                            .filter_map(move |(cs_id, id)| {
+                                entries_map.remove(&cs_id).map(|entry| (entry, id))
+                            })
                             .map(Ok);
                         Ok::<_, Error>(stream::iter(result))
                     })
@@ -270,6 +310,7 @@ mod tests {
 
     use blobrepo::BlobRepo;
     use bookmarks::BookmarkName;
+    use bookmarks::BookmarksRef;
     use changesets::ChangesetsArc;
     use fbinit::FacebookInit;
     use fixtures::BranchWide;

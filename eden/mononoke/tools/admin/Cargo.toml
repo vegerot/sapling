@@ -19,6 +19,7 @@ bonsai_hg_mapping = { version = "0.1.0", path = "../../bonsai_hg_mapping" }
 bonsai_svnrev_mapping = { version = "0.1.0", path = "../../bonsai_svnrev_mapping" }
 bookmarks = { version = "0.1.0", path = "../../bookmarks" }
 bookmarks_movement = { version = "0.1.0", path = "../../bookmarks/bookmarks_movement" }
+buffered_commit_graph_storage = { version = "0.1.0", path = "../../repo_attributes/commit_graph/buffered_commit_graph_storage" }
 bulkops = { version = "0.1.0", path = "../../bulkops" }
 bytes = { version = "1.1", features = ["serde"] }
 cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -39,6 +40,7 @@ fbthrift = { version = "0.0.1+unstable", git = "https://github.com/facebook/fbth
 filestore = { version = "0.1.0", path = "../../filestore" }
 fsnodes = { version = "0.1.0", path = "../../derived_data/fsnodes" }
 futures = { version = "0.3.22", features = ["async-await", "compat"] }
+futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 git_types = { version = "0.1.0", path = "../../git/git_types" }
 itertools = "0.10.3"
 live_commit_sync_config = { version = "0.1.0", path = "../../commit_rewriting/live_commit_sync_config" }
@@ -70,6 +72,8 @@ skiplist = { version = "0.1.0", path = "../../reachabilityindex/skiplist" }
 slog = { version = "2.7", features = ["max_level_trace", "nested-values"] }
 source_control = { version = "0.1.0", path = "../../scs/if" }
 sql_commit_graph_storage = { version = "0.1.0", path = "../../repo_attributes/commit_graph/sql_commit_graph_storage" }
+sql_construct = { version = "0.1.0", path = "../../common/sql_construct" }
+sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
 strum_macros = "0.21"
 tokio = { version = "1.21.2", features = ["full", "test-util", "tracing"] }
 tokio-util = { version = "0.6", features = ["full"] }

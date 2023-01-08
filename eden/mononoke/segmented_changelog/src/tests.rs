@@ -15,11 +15,12 @@ use blobrepo::AsBlobRepo;
 use blobrepo::BlobRepo;
 use bonsai_hg_mapping::BonsaiHgMappingArc;
 use bookmarks::BookmarkName;
-use bookmarks::Bookmarks;
 use bookmarks::BookmarksArc;
 use bulkops::PublicChangesetBulkFetch;
 use caching_ext::CachelibHandler;
 use caching_ext::MemcacheHandler;
+use changeset_fetcher::ChangesetFetcherArc;
+use changeset_fetcher::ChangesetFetcherRef;
 use changeset_fetcher::PrefetchedChangesetsFetcher;
 use changesets::ChangesetEntry;
 use changesets::ChangesetsArc;
@@ -257,8 +258,8 @@ async fn get_manager(
         sc_version_store,
         iddag_save_store,
         idmap_factory,
-        blobrepo.get_changeset_fetcher(),
-        Arc::clone(blobrepo.bookmarks()) as Arc<dyn Bookmarks>,
+        blobrepo.changeset_fetcher_arc(),
+        blobrepo.bookmarks_arc(),
         seed_heads,
         segmented_changelog_type,
         Some(clone_hints),
@@ -277,11 +278,12 @@ async fn validate_build_idmap(
     let sc = load_owned(&ctx, &blobrepo, &conns).await?;
 
     let mut ancestors =
-        AncestorsNodeStream::new(ctx.clone(), &blobrepo.get_changeset_fetcher(), head).compat();
+        AncestorsNodeStream::new(ctx.clone(), &blobrepo.changeset_fetcher_arc(), head).compat();
     while let Some(cs_id) = ancestors.next().await {
         let cs_id = cs_id?;
         let parents = blobrepo
-            .get_changeset_parents_by_bonsai(ctx.clone(), cs_id)
+            .changeset_fetcher()
+            .get_parents(ctx.clone(), cs_id)
             .await?;
         for parent in parents {
             let parent_dag_id = sc.idmap.get_dag_id(&ctx, parent).await?;
@@ -813,8 +815,8 @@ async fn test_incremental_update_with_desync_iddag(fb: FacebookInit) -> Result<(
             blobrepo.get_repoid(),
             InProcessIdDag::new_in_process(),
             Arc::clone(&idmap),
-            blobrepo.get_changeset_fetcher(),
-            Arc::clone(blobrepo.bookmarks()) as Arc<dyn Bookmarks>,
+            blobrepo.changeset_fetcher_arc(),
+            blobrepo.bookmarks_arc(),
             vec![Some(BOOKMARK_NAME.clone()).into()],
             None,
         )
@@ -964,8 +966,8 @@ async fn test_periodic_update(fb: FacebookInit) -> Result<()> {
         blobrepo.get_repoid(),
         InProcessIdDag::new_in_process(),
         Arc::new(ConcurrentMemIdMap::new()),
-        blobrepo.get_changeset_fetcher(),
-        Arc::clone(blobrepo.bookmarks()) as Arc<dyn Bookmarks>,
+        blobrepo.changeset_fetcher_arc(),
+        blobrepo.bookmarks_arc(),
         vec![Some(bookmark_name.clone()).into()],
         None,
     )?;

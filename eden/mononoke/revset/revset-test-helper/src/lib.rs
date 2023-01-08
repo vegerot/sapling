@@ -10,6 +10,8 @@ use std::str::FromStr;
 
 use anyhow::Error;
 use blobrepo::BlobRepo;
+use bonsai_hg_mapping::BonsaiHgMappingRef;
+use changeset_fetcher::ChangesetFetcherRef;
 use changesets::ChangesetsRef;
 use context::CoreContext;
 use fbinit::FacebookInit;
@@ -74,7 +76,7 @@ pub async fn assert_changesets_sequence<I>(
         }
 
         let expected_generation = repo
-            .clone()
+            .changeset_fetcher()
             .get_generation_number(ctx.clone(), expected)
             .await
             .expect("Unexpected error");
@@ -92,7 +94,7 @@ pub async fn assert_changesets_sequence<I>(
             }
 
             let node_generation = repo
-                .clone()
+                .changeset_fetcher()
                 .get_generation_number(ctx.clone(), expected)
                 .await
                 .expect("Unexpected error");

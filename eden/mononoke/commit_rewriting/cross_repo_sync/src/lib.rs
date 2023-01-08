@@ -26,6 +26,7 @@ use bookmarks::BookmarkName;
 use cacheblob::InProcessLease;
 use cacheblob::LeaseOps;
 use cacheblob::MemcacheOps;
+use changeset_fetcher::ChangesetFetcherRef;
 use commit_transformation::rewrite_commit as multi_mover_rewrite_commit;
 use commit_transformation::upload_commits;
 pub use commit_transformation::CommitRewrittenToEmpty;
@@ -287,7 +288,9 @@ where
             None => {
                 let maybe_mapping_change =
                     get_mapping_change_version(ctx, commit_syncer.get_source_repo(), cs_id);
-                let parents = source_repo.get_changeset_parents_by_bonsai(ctx.clone(), cs_id);
+                let parents = source_repo
+                    .changeset_fetcher()
+                    .get_parents(ctx.clone(), cs_id);
                 let (maybe_mapping_change, parents) =
                     try_join(maybe_mapping_change, parents).await?;
 
@@ -699,7 +702,7 @@ where
             let sync = || async {
                 let parents = self
                     .get_source_repo()
-                    .get_changeset_fetcher()
+                    .changeset_fetcher()
                     .get_parents(ctx.clone(), ancestor)
                     .await?;
                 if parents.is_empty() {

@@ -18,6 +18,9 @@ use blobrepo::BlobRepo;
 use blobstore::Loadable;
 use bookmarks::BookmarkName;
 use bookmarks::BookmarkUpdateLogEntry;
+use bookmarks::BookmarksRef;
+use changeset_fetcher::ChangesetFetcherArc;
+use changeset_fetcher::ChangesetFetcherRef;
 use cloned::cloned;
 use context::CoreContext;
 use cross_repo_sync::get_commit_sync_outcome;
@@ -372,7 +375,8 @@ impl ValidationHelper {
         paths_and_payloads: Vec<(MPath, &FilenodeDiffPayload)>,
     ) -> Result<Vec<MPath>, Error> {
         let maybe_p1 = repo
-            .get_changeset_parents_by_bonsai(ctx.clone(), cs_id.clone())
+            .changeset_fetcher()
+            .get_parents(ctx.clone(), cs_id.clone())
             .await?
             .first()
             .cloned();
@@ -570,7 +574,8 @@ impl ValidationHelpers {
     ) -> Result<FullManifestDiff, Error> {
         let cs_root_mf_id_fut = fetch_root_mf_id(&ctx, repo, cs_id.clone());
         let maybe_p1 = repo
-            .get_changeset_parents_by_bonsai(ctx.clone(), cs_id.clone())
+            .changeset_fetcher()
+            .get_parents(ctx.clone(), cs_id.clone())
             .await?
             .first()
             .cloned();
@@ -716,7 +721,7 @@ pub async fn unfold_bookmarks_update_log_entry(
         .large_repo
         .0
         .blob_repo
-        .get_changeset_fetcher();
+        .changeset_fetcher_arc();
     let lca_hint = validation_helpers.large_repo.0.skiplist_index.clone();
     let is_master_entry = entry.bookmark_name == validation_helpers.large_repo_master_bookmark;
     let master_cs_id = validation_helpers
@@ -971,7 +976,8 @@ async fn validate_topological_order<'a>(
 
     let small_parents = small_repo
         .0
-        .get_changeset_parents_by_bonsai(ctx.clone(), small_cs_id.0.clone())
+        .changeset_fetcher()
+        .get_parents(ctx.clone(), small_cs_id.0.clone())
         .await?;
 
     let remapped_small_parents: Vec<(ChangesetId, ChangesetId)> =
@@ -1015,7 +1021,7 @@ async fn validate_topological_order<'a>(
         }))
         .await?;
 
-    let large_repo_fetcher = large_repo.0.get_changeset_fetcher();
+    let large_repo_fetcher = large_repo.0.changeset_fetcher_arc();
     try_join_all(remapped_small_parents.into_iter().map(
         |(small_parent, remapping_of_small_parent)| {
             cloned!(ctx, large_repo_lca_hint, large_repo_fetcher);

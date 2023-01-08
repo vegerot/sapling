@@ -136,7 +136,7 @@ function translate(
   }
   if (!result) {
     result =
-      langs[currentLanguage][i18nKeyOrEnText] ?? langs.en[i18nKeyOrEnText] ?? i18nKeyOrEnText;
+      langs[currentLanguage]?.[i18nKeyOrEnText] ?? langs.en[i18nKeyOrEnText] ?? i18nKeyOrEnText;
   }
   if (options?.replace) {
     // if we split with a regexp match group, the value will stay in the array,
@@ -171,6 +171,10 @@ export function useCurrentLang(): LanguageId {
 
 function getPlural(i18nKeyOrEnText: string, count: number, lang: LanguageId): string | undefined {
   const pluralizer = pluralizers[lang];
+  if (pluralizer == null) {
+    return undefined;
+  }
+
   const key = i18nKeyOrEnText + '_' + pluralizer(count);
-  return langs[lang][key];
+  return langs[lang]?.[key];
 }
