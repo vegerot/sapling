@@ -14,7 +14,6 @@ use bonsai_hg_mapping::BonsaiHgMapping;
 use bonsai_svnrev_mapping::BonsaiSvnrevMapping;
 use bookmarks::BookmarkUpdateLog;
 use bookmarks::Bookmarks;
-use cacheblob::LeaseOps;
 use changeset_fetcher::ChangesetFetcher;
 use changeset_fetcher::SimpleChangesetFetcher;
 use changesets::Changesets;
@@ -24,8 +23,6 @@ use ephemeral_blobstore::Bubble;
 use filenodes::Filenodes;
 use filestore::FilestoreConfig;
 use mercurial_mutation::HgMutationStore;
-use metaconfig_types::DerivedDataConfig;
-use metaconfig_types::DerivedDataTypesConfig;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::RepositoryId;
 use mutable_counters::MutableCounters;
@@ -36,9 +33,7 @@ use repo_blobstore::RepoBlobstoreRef;
 use repo_bookmark_attrs::RepoBookmarkAttrs;
 use repo_derived_data::RepoDerivedData;
 use repo_identity::RepoIdentity;
-use repo_lock::ArcRepoLock;
 use repo_lock::RepoLock;
-use repo_permission_checker::ArcRepoPermissionChecker;
 use repo_permission_checker::RepoPermissionChecker;
 
 // NOTE: this structure and its fields are public to enable `DangerousOverride` functionality
@@ -157,22 +152,6 @@ impl BlobRepo {
         &self.inner.reponame
     }
 
-    pub fn get_derived_data_config(&self) -> &DerivedDataConfig {
-        self.inner.repo_derived_data.config()
-    }
-
-    pub fn get_active_derived_data_types_config(&self) -> &DerivedDataTypesConfig {
-        self.inner.repo_derived_data.manager().config()
-    }
-
-    pub fn get_derived_data_types_config(&self, name: &str) -> Option<&DerivedDataTypesConfig> {
-        self.inner.repo_derived_data.config().get_config(name)
-    }
-
-    pub fn get_derived_data_lease_ops(&self) -> Arc<dyn LeaseOps> {
-        self.inner.repo_derived_data.lease().clone()
-    }
-
     /// To be used by `DangerousOverride` only
     pub fn inner(&self) -> &Arc<BlobRepoInner> {
         &self.inner
@@ -204,16 +183,6 @@ impl BlobRepo {
         Self {
             inner: Arc::new(inner),
         }
-    }
-
-    #[inline]
-    pub fn permission_checker(&self) -> ArcRepoPermissionChecker {
-        self.inner.permission_checker.clone()
-    }
-
-    #[inline]
-    pub fn repo_lock(&self) -> ArcRepoLock {
-        self.inner.repo_lock.clone()
     }
 }
 
