@@ -40,6 +40,8 @@ OSXVERSIONFLAGS ?= $(shell echo $$OSXVERSIONFLAGS)
 HGNAME ?= hg
 SL_NAME = sl
 
+export SAPLING_VERSION ?= $(shell ../../ci/tag-name.sh)
+
 # Set this to e.g. "mingw32" to use a non-default compiler.
 COMPILER=
 
@@ -119,7 +121,7 @@ deb:
 rpm:
 	rpmbuild \
 		--define "sapling_root `pwd`" \
-		--define "version $(VERSION)" \
+		--define "version $(SAPLING_VERSION)" \
 		-bb packaging/rpm/sapling.spec
 
 wheel:
