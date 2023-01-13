@@ -23,7 +23,9 @@ import type {
   PlatformSpecificClientToServerMessages,
 } from 'isl/src/types';
 
+import {absolutePathForFileInRepo} from './Repository';
 import {browserServerPlatform} from './serverPlatform';
+import fs from 'fs';
 import {serializeToString, deserializeFromString} from 'isl/src/serialize';
 import {revsetArgsForComparison, revsetForComparison} from 'shared/Comparison';
 import {randomId} from 'shared/utils';
@@ -283,6 +285,25 @@ export default class ServerToClientAPI {
           },
           cwd,
         );
+        break;
+      }
+      case 'deleteFile': {
+        const {filePath} = data;
+        const absolutePath = absolutePathForFileInRepo(filePath, repo);
+        // security: don't trust client messages to allow us to delete files outside the repository
+        if (absolutePath == null) {
+          logger.warn("can't delete file outside of the repo", filePath);
+          return;
+        }
+
+        fs.promises
+          .rm(absolutePath)
+          .then(() => {
+            logger.info('deleted file from filesystem', absolutePath);
+          })
+          .catch(err => {
+            logger.error('unable to delete file', absolutePath, err);
+          });
         break;
       }
       case 'requestComparison': {

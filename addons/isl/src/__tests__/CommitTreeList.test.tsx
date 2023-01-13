@@ -91,9 +91,9 @@ describe('CommitTreeList', () => {
 
       it('shows file actions', () => {
         const fileActions = screen.getAllByTestId('file-actions');
-        expect(fileActions).toHaveLength(5);
+        expect(fileActions).toHaveLength(5); // 5 files
         const revertButtons = screen.getAllByTestId('file-revert-button');
-        expect(revertButtons).toHaveLength(4); // modified, added, removed, missing
+        expect(revertButtons).toHaveLength(3); // modified, removed, missing files can be reverted
       });
 
       it('runs revert command when clicking revert button', async () => {
@@ -111,6 +111,98 @@ describe('CommitTreeList', () => {
               id: expect.anything(),
               runner: CommandRunner.Sapling,
             },
+          });
+        });
+      });
+
+      describe('addremove', () => {
+        it('hides addremove if all files tracked', () => {
+          act(() => {
+            simulateUncommittedChangedFiles({
+              value: [
+                {path: 'src/file.js', status: 'M'},
+                {path: 'src/file_add.js', status: 'A'},
+                {path: 'src/file_removed.js', status: 'R'},
+              ],
+            });
+          });
+          expect(screen.queryByTestId('addremove-button')).not.toBeInTheDocument();
+
+          act(() => {
+            simulateUncommittedChangedFiles({
+              value: [
+                {path: 'src/file.js', status: 'M'},
+                {path: 'src/file_add.js', status: 'A'},
+                {path: 'src/file_removed.js', status: 'R'},
+                {path: 'src/file_untracked.js', status: '?'},
+                {path: 'src/file_missing.js', status: '!'},
+              ],
+            });
+          });
+          expect(screen.queryByTestId('addremove-button')).toBeInTheDocument();
+        });
+
+        it('runs addremove', async () => {
+          const addremove = screen.getByTestId('addremove-button');
+          act(() => {
+            fireEvent.click(addremove);
+          });
+          await waitFor(() => {
+            expectMessageSentToServer({
+              type: 'runOperation',
+              operation: {
+                args: ['addremove'],
+                id: expect.anything(),
+                runner: CommandRunner.Sapling,
+              },
+            });
+          });
+        });
+
+        it('optimistically updates file statuses while addremove is running', async () => {
+          const addremove = screen.getByTestId('addremove-button');
+          act(() => {
+            fireEvent.click(addremove);
+          });
+          await waitFor(() => {
+            expectMessageSentToServer({
+              type: 'runOperation',
+              operation: {
+                args: ['addremove'],
+                id: expect.anything(),
+                runner: CommandRunner.Sapling,
+              },
+            });
+          });
+
+          expect(
+            document.querySelectorAll('.changed-files .changed-file.file-ignored'),
+          ).toHaveLength(0);
+        });
+
+        it('runs addremove only on selected files that are untracked', async () => {
+          const ignoredFileCheckboxes = document.querySelectorAll(
+            '.changed-files .changed-file.file-ignored input[type="checkbox"]',
+          );
+          expect(ignoredFileCheckboxes).toHaveLength(2); // file_untracked.js and file_missing.js
+          act(() => {
+            fireEvent.click(ignoredFileCheckboxes[1]);
+          });
+
+          const addremove = screen.getByTestId('addremove-button');
+          act(() => {
+            fireEvent.click(addremove);
+          });
+          await waitFor(() => {
+            expectMessageSentToServer({
+              type: 'runOperation',
+              operation: {
+                // note: although src/file.js & others are selected, they aren't passed to addremove as they aren't untracked
+                args: ['addremove', {path: 'src/file_untracked.js', type: 'repo-relative-file'}],
+                id: expect.anything(),
+                runner: CommandRunner.Sapling,
+              },
+            });
           });
         });
       });

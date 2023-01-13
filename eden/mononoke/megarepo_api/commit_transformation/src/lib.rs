@@ -5,6 +5,8 @@
  * GNU General Public License version 2.
  */
 
+#![feature(trait_alias)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -12,11 +14,14 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Error;
 use blobrepo::save_bonsai_changesets;
-use blobrepo::BlobRepo;
 use blobrepo_utils::convert_diff_result_into_file_change_for_diamond_merge;
 use blobstore::Loadable;
 use blobsync::copy_content;
+use bonsai_hg_mapping::BonsaiHgMappingRef;
+use bookmarks::BookmarksRef;
 use borrowed::borrowed;
+use changeset_fetcher::ChangesetFetcherArc;
+use changesets::ChangesetsRef;
 use cloned::cloned;
 use context::CoreContext;
 use filestore::FilestoreConfigRef;
@@ -37,12 +42,27 @@ use mononoke_types::FileChange;
 use mononoke_types::MPath;
 use mononoke_types::TrackedFileChange;
 use pushrebase::find_bonsai_diff;
+use repo_blobstore::RepoBlobstoreArc;
+use repo_blobstore::RepoBlobstoreRef;
+use repo_derived_data::RepoDerivedDataRef;
+use repo_identity::RepoIdentityRef;
 use sorted_vector_map::SortedVectorMap;
 use thiserror::Error;
 
 pub type MultiMover = Arc<dyn Fn(&MPath) -> Result<Vec<MPath>, Error> + Send + Sync + 'static>;
 pub type DirectoryMultiMover =
     Arc<dyn Fn(&Option<MPath>) -> Result<Vec<Option<MPath>>, Error> + Send + Sync + 'static>;
+
+pub trait Repo = RepoIdentityRef
+    + RepoBlobstoreArc
+    + ChangesetsRef
+    + ChangesetFetcherArc
+    + BookmarksRef
+    + BonsaiHgMappingRef
+    + RepoDerivedDataRef
+    + RepoBlobstoreRef
+    + Send
+    + Sync;
 
 const SQUASH_DELIMITER_MESSAGE: &str = r#"
 
@@ -138,7 +158,7 @@ pub fn create_directory_source_to_target_multi_mover(
 /// This is needed for the purposes of implicit delete detection
 async fn get_manifest_ids<'a, I: IntoIterator<Item = ChangesetId>>(
     ctx: &'a CoreContext,
-    repo: &'a BlobRepo,
+    repo: &'a impl Repo,
     bcs_ids: I,
 ) -> Result<Vec<HgManifestId>, Error> {
     try_join_all(bcs_ids.into_iter().map({
@@ -146,7 +166,7 @@ async fn get_manifest_ids<'a, I: IntoIterator<Item = ChangesetId>>(
             cloned!(ctx, repo);
             async move {
                 let cs_id = repo.derive_hg_changeset(&ctx, bcs_id).await?;
-                let hg_blob_changeset = cs_id.load(&ctx, repo.blobstore()).await?;
+                let hg_blob_changeset = cs_id.load(&ctx, repo.repo_blobstore()).await?;
                 Ok(hg_blob_changeset.manifestid())
             }
         }
@@ -189,7 +209,7 @@ async fn get_implicit_delete_file_changes<'a, I: IntoIterator<Item = ChangesetId
     cs: BonsaiChangesetMut,
     parent_changeset_ids: I,
     mover: MultiMover,
-    source_repo: &'a BlobRepo,
+    source_repo: &'a impl Repo,
 ) -> Result<Vec<(MPath, FileChange)>, Error> {
     let parent_manifest_ids = get_manifest_ids(ctx, source_repo, parent_changeset_ids).await?;
     let file_adds: Vec<_> = cs
@@ -197,7 +217,7 @@ async fn get_implicit_delete_file_changes<'a, I: IntoIterator<Item = ChangesetId
         .iter()
         .filter_map(|(mpath, file_change)| file_change.is_changed().then(|| mpath.clone()))
         .collect();
-    let store = source_repo.get_blobstore();
+    let store = source_repo.repo_blobstore().clone();
     let implicit_deletes: Vec<MPath> =
         get_implicit_deletes(ctx, store, file_adds, parent_manifest_ids)
             .try_collect()
@@ -244,7 +264,7 @@ pub async fn rewrite_commit<'a>(
     cs: BonsaiChangesetMut,
     remapped_parents: &'a HashMap<ChangesetId, ChangesetId>,
     mover: MultiMover,
-    source_repo: BlobRepo,
+    source_repo: &'a impl Repo,
     force_first_parent: Option<ChangesetId>,
     commit_rewritten_to_empty: CommitRewrittenToEmpty,
 ) -> Result<Option<BonsaiChangesetMut>, Error> {
@@ -254,7 +274,7 @@ pub async fn rewrite_commit<'a>(
             cs.clone(),
             remapped_parents.keys().cloned(),
             mover.clone(),
-            &source_repo,
+            source_repo,
         )
         .await?
     } else {
@@ -273,7 +293,7 @@ pub async fn rewrite_commit<'a>(
 
 pub async fn rewrite_as_squashed_commit<'a>(
     ctx: &'a CoreContext,
-    source_repo: &'a BlobRepo,
+    source_repo: &'a impl Repo,
     source_cs_id: ChangesetId,
     (source_parent_cs_id, target_parent_cs_id): (ChangesetId, ChangesetId),
     mut cs: BonsaiChangesetMut,
@@ -325,7 +345,7 @@ pub async fn rewrite_stack_no_merges<'a>(
     css: Vec<BonsaiChangeset>,
     mut rewritten_parent: ChangesetId,
     mover: MultiMover,
-    source_repo: BlobRepo,
+    source_repo: &'a impl Repo,
     force_first_parent: Option<ChangesetId>,
     mut modify_bonsai_cs: impl FnMut((ChangesetId, BonsaiChangesetMut)) -> BonsaiChangesetMut,
 ) -> Result<Vec<Option<BonsaiChangeset>>, Error> {
@@ -527,8 +547,8 @@ pub fn internal_rewrite_commit_with_implicit_deletes<'a>(
 pub async fn upload_commits<'a>(
     ctx: &'a CoreContext,
     rewritten_list: Vec<BonsaiChangeset>,
-    source_repo: &'a BlobRepo,
-    target_repo: &'a BlobRepo,
+    source_repo: &'a (impl RepoBlobstoreRef + ChangesetsRef),
+    target_repo: &'a (impl RepoBlobstoreRef + ChangesetsRef + FilestoreConfigRef),
 ) -> Result<(), Error> {
     let mut files_to_sync = vec![];
     for rewritten in &rewritten_list {
@@ -551,13 +571,13 @@ pub async fn upload_commits<'a>(
 
 pub async fn copy_file_contents<'a>(
     ctx: &'a CoreContext,
-    source_repo: &'a BlobRepo,
-    target_repo: &'a BlobRepo,
+    source_repo: &'a impl RepoBlobstoreRef,
+    target_repo: &'a (impl RepoBlobstoreRef + FilestoreConfigRef),
     content_ids: impl IntoIterator<Item = ContentId>,
     progress_reporter: impl Fn(usize),
 ) -> Result<(), Error> {
-    let source_blobstore = source_repo.get_blobstore();
-    let target_blobstore = target_repo.get_blobstore();
+    let source_blobstore = source_repo.repo_blobstore();
+    let target_blobstore = target_repo.repo_blobstore();
     let target_filestore_config = target_repo.filestore_config();
 
     let mut i = 0;
@@ -565,8 +585,8 @@ pub async fn copy_file_contents<'a>(
         |content_id| {
             copy_content(
                 ctx,
-                &source_blobstore,
-                &target_blobstore,
+                source_blobstore,
+                target_blobstore,
                 target_filestore_config.clone(),
                 content_id,
             )
@@ -734,7 +754,7 @@ mod test {
 
     #[fbinit::test]
     async fn test_rewrite_commit(fb: FacebookInit) -> Result<(), Error> {
-        let repo = TestRepoFactory::new(fb)?.build()?;
+        let repo: blobrepo::BlobRepo = TestRepoFactory::new(fb)?.build()?;
         let ctx = CoreContext::test_mock(fb);
         let first = CreateCommitContext::new_root(&ctx, &repo)
             .add_file("path", "path")
@@ -794,7 +814,7 @@ mod test {
         .await?;
 
         let second_bcs = second_rewritten_bcs_id
-            .load(&ctx, &repo.get_blobstore())
+            .load(&ctx, &repo.repo_blobstore())
             .await?;
         let maybe_copy_from = match second_bcs
             .file_changes_map()
@@ -866,13 +886,13 @@ mod test {
 
     async fn test_rewrite_commit_cs_id<'a>(
         ctx: &'a CoreContext,
-        repo: &'a BlobRepo,
+        repo: &'a impl Repo,
         bcs_id: ChangesetId,
         parents: HashMap<ChangesetId, ChangesetId>,
         multi_mover: MultiMover,
         force_first_parent: Option<ChangesetId>,
     ) -> Result<ChangesetId, Error> {
-        let bcs = bcs_id.load(ctx, &repo.get_blobstore()).await?;
+        let bcs = bcs_id.load(ctx, &repo.repo_blobstore()).await?;
         let bcs = bcs.into_mut();
 
         let maybe_rewritten = rewrite_commit(
@@ -880,7 +900,7 @@ mod test {
             bcs,
             &parents,
             multi_mover,
-            repo.clone(),
+            repo,
             force_first_parent,
             CommitRewrittenToEmpty::Discard,
         )

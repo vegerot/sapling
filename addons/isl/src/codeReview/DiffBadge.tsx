@@ -12,11 +12,13 @@ import type {ReactNode} from 'react';
 import {ExternalLink} from '../ExternalLink';
 import {Icon} from '../Icon';
 import {Tooltip} from '../Tooltip';
-import {t} from '../i18n';
+import {T, t} from '../i18n';
+import platform from '../platform';
 import {diffSummary, codeReviewProvider} from './CodeReviewInfo';
 import {openerUrlForDiffUrl} from './github/GitHubUrlOpener';
 import {useState, Component, Suspense} from 'react';
 import {useRecoilValue} from 'recoil';
+import {useContextMenu} from 'shared/ContextMenu';
 
 import './DiffBadge.css';
 
@@ -50,8 +52,20 @@ export function DiffBadge({
   provider: UICodeReviewProvider;
 }) {
   const openerUrl = useRecoilValue(openerUrlForDiffUrl(url));
+
+  const contextMenu = useContextMenu(() => {
+    return [
+      {
+        label: <T replace={{$number: diff?.number}}>Copy Diff Number "$number"</T>,
+        onClick: () => platform.clipboardCopy(diff?.number ?? ''),
+      },
+    ];
+  });
   return (
-    <ExternalLink url={openerUrl} className={`diff-badge ${provider.name}-diff-badge`}>
+    <ExternalLink
+      url={openerUrl}
+      className={`diff-badge ${provider.name}-diff-badge`}
+      onContextMenu={contextMenu}>
       <provider.DiffBadgeContent diff={diff} children={children} />
     </ExternalLink>
   );
@@ -100,7 +114,7 @@ function DiffNumber({children}: {children: string}) {
       <span
         className="diff-number"
         onClick={() => {
-          navigator.clipboard.writeText(children);
+          platform.clipboardCopy(children);
           setShowing(true);
           setTimeout(() => setShowing(false), 2000);
         }}>
