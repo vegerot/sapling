@@ -114,11 +114,8 @@ def clone(ui, url, destpath=None, update=True, pullnames=None):
     destpath = ui.expandpath(destpath)
 
     if os.path.lexists(destpath):
-        if os.path.isdir(destpath):
-            if os.listdir(destpath):
-                raise error.Abort(_("destination '%s' is not empty") % destpath)
-        else:
-            raise error.Abort(_("destination '%s' already exists") % destpath)
+        if not os.path.isdir(destpath):
+           raise error.Abort(_("destination '%s' is not a directory") % destpath)
 
     try:
         repo = createrepo(ui, url, destpath)
