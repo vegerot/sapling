@@ -473,14 +473,14 @@ mod tests {
     use rand::Rng;
     use rand::SeedableRng;
     use rand_chacha::ChaChaRng;
-    use tempdir::TempDir;
+    use tempfile::tempdir;
 
     use super::*;
     use crate::filestate::StateFlags;
 
     #[test]
     fn test_new() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let state = TreeState::new(dir.path(), true).expect("open").0;
         assert!(state.get_metadata().is_empty());
         assert_eq!(state.len(), 0);
@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_empty_flush() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let mut state = TreeState::new(dir.path(), true).expect("open").0;
         let block_id = state.flush().expect("flush");
         let state = TreeState::open(
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_empty_write_as() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let mut state = TreeState::new(dir.path(), true).expect("open").0;
         let block_id = state.write_new(dir.path()).expect("write_as");
         let state = TreeState::open(
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_set_metadata() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let mut state = TreeState::new(dir.path(), true).expect("open").0;
         state.set_metadata(b"foobar");
         let orig_name = state.file_name().unwrap();
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn test_set_metadata_by_keys() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let mut state = TreeState::new(dir.path(), true).expect("open").0;
         state
             .set_metadata_by_keys(&[
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn test_insert() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let mut state = new_treestate(dir.path());
         let mut rng = ChaChaRng::from_seed([0; 32]);
         for path in &SAMPLE_PATHS {
@@ -626,7 +626,7 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let mut state = new_treestate(dir.path());
         for path in &SAMPLE_PATHS {
             assert!(state.remove(path).unwrap())
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn test_non_empty_flush() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let mut state = new_treestate(dir.path());
         let block_id = state.flush().expect("flush");
         let mut state = TreeState::open(
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn test_non_empty_write_as() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let mut state = new_treestate(dir.path());
         let block_id = state.write_new(dir.path()).expect("write_as");
         let mut state = TreeState::open(
@@ -677,7 +677,7 @@ mod tests {
 
     #[test]
     fn test_has_dir() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let mut state = new_treestate(dir.path());
         assert!(state.has_dir(b"/").unwrap());
         assert!(state.has_dir(b"ext3rd/").unwrap());
@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn test_visit_query_by_flags() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let mut state = TreeState::new(dir.path(), true).expect("open").0;
         let mut rng = ChaChaRng::from_seed([0; 32]);
         let mut file: FileStateV2 = rng.gen();
@@ -730,7 +730,7 @@ mod tests {
         // start states, and 32 end states. 32 ** 2 = 1024 transitions to test.
         let bit = StateFlags::IGNORED;
         for start_bits in 0..(1 << paths.len()) {
-            let dir = TempDir::new("treestate").expect("tempdir");
+            let dir = tempdir().expect("tempdir");
             // First, write the start state.
             let mut state = TreeState::new(dir.path(), true).expect("open").0;
             let file_name = state.file_name().unwrap();
@@ -786,7 +786,7 @@ mod tests {
 
     #[test]
     fn test_get_keys_ignorecase() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let mut state = new_treestate(dir.path());
         let expected = vec![b"ext3rd/__init__.py".to_vec().into_boxed_slice()];
         assert_eq!(
@@ -805,7 +805,7 @@ mod tests {
 
     #[test]
     fn test_normalize_casesensitive() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let mut state = TreeState::new(dir.as_ref(), true).expect("open").0;
 
         let mut rng = ChaChaRng::from_seed([0; 32]);
@@ -831,7 +831,7 @@ mod tests {
 
     #[test]
     fn test_normalize_incasesensitive() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let mut state = TreeState::new(dir.as_ref(), false).expect("open").0;
 
         let mut rng = ChaChaRng::from_seed([0; 32]);
@@ -867,7 +867,7 @@ mod tests {
 
     #[test]
     fn test_parents() {
-        let dir = TempDir::new("treestate").expect("tempdir");
+        let dir = tempdir().expect("tempdir");
         let mut state = TreeState::new(dir.path(), true).expect("open").0;
         let orig_name = state.file_name().unwrap();
         let mut rng = ChaChaRng::from_seed([0; 32]);
@@ -902,5 +902,70 @@ mod tests {
             state.parents().collect::<Result<Vec<_>>>().unwrap(),
             [p1, p3].to_vec()
         );
+    }
+
+    #[test]
+    #[should_panic] // BUG
+    fn test_concurrent_writes() {
+        check_concurrent_writes(&[b"a"], &[b"b"]);
+        check_concurrent_writes(&[b"a/1"], &[b"a/2"]);
+
+        let paths1 = SAMPLE_PATHS.into_iter().take(10).collect::<Vec<_>>();
+        let paths2 = SAMPLE_PATHS.into_iter().rev().take(1).collect::<Vec<_>>();
+        check_concurrent_writes(&paths1, &paths2);
+
+        let paths2 = SAMPLE_PATHS.into_iter().rev().take(10).collect::<Vec<_>>();
+        check_concurrent_writes(&paths1, &paths2);
+    }
+
+    // Test appending paths1, and paths2 "concurrently".
+    // Paths should not overlap.
+    fn check_concurrent_writes(paths1: &[&[u8]], paths2: &[&[u8]]) {
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Prepare initial state.
+        let (path, root_id) = {
+            let mut state = new_treestate(dir_path);
+            let root_id = state.flush().unwrap();
+            (dir_path.join(state.file_name().unwrap()), root_id)
+        };
+
+        // Concurrent writes.
+        let mut state1 = TreeState::open(&path, root_id, true).unwrap();
+        let mut state2 = TreeState::open(&path, root_id, true).unwrap();
+        let file_state1: FileStateV2 = Default::default();
+        let file_state2 = FileStateV2 {
+            size: file_state1.size + 1,
+            ..file_state1.clone()
+        };
+        for p in paths1 {
+            state1.insert(p, &file_state1).unwrap();
+        }
+        for p in paths2 {
+            state2.insert(p, &file_state2).unwrap();
+        }
+
+        let root_id1 = state1.flush().unwrap();
+
+        // Panic (debug build) at
+        // debug_assert!(self.position == file.seek(SeekFrom::End(0))?);
+        // in filestore.rs
+        //
+        // Might error out with (release build): "invalid store id: ..."
+        let root_id2 = state2.flush().unwrap();
+
+        // Check that things can be read properly (aka. no "invalid store id: ..." errors),
+        // and are written properly (file_state1 and file_state2).
+        let mut state1 = TreeState::open(&path, root_id1, true).unwrap();
+        let mut state2 = TreeState::open(&path, root_id2, true).unwrap();
+        for p in paths1 {
+            let got = state1.get(p).unwrap().unwrap();
+            assert_eq!(got, &file_state1);
+        }
+        for p in paths2 {
+            let got = state2.get(p).unwrap().unwrap();
+            assert_eq!(got, &file_state2);
+        }
     }
 }

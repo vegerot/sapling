@@ -12,7 +12,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -36,6 +35,7 @@ use mononoke_app::args::McrouterAppExtension;
 use mononoke_app::args::ReadonlyArgs;
 use mononoke_app::args::RepoFilterAppExtension;
 use mononoke_app::args::ShutdownTimeoutArgs;
+use mononoke_app::args::WarmBookmarksCacheExtension;
 use mononoke_app::fb303::Fb303AppExtension;
 use mononoke_app::fb303::ReadyFlagService;
 use mononoke_app::MononokeApp;
@@ -109,24 +109,17 @@ impl MononokeServerProcess {
         // shallow-sharded repo, in which case it would already be initialized during service startup.
         if self.repos_mgr.repos().get_by_name(repo_name).is_none() {
             // The input repo is a deep-sharded repo, so it needs to be added now.
-            self.repos_mgr.add_repo(repo_name).await?;
-            match self.repos_mgr.repos().get_by_name(repo_name) {
-                None => bail!("Added repo {} does not exist in MononokeRepos", repo_name),
-                Some(repo) => {
-                    let blob_repo = repo.blob_repo().clone();
-                    let cache_warmup_params = repo.config().cache_warmup.clone();
-                    let ctx = CoreContext::new_with_logger(self.fb, logger.clone());
-                    cache_warmup(&ctx, &blob_repo, cache_warmup_params)
-                        .await
-                        .with_context(|| {
-                            format!("Error while warming up cache for repo {}", repo_name)
-                        })?;
-                    info!(
-                        &logger,
-                        "Completed repo {} setup in Mononoke service", repo_name
-                    );
-                }
-            }
+            let repo = self.repos_mgr.add_repo(repo_name).await?;
+            let blob_repo = repo.blob_repo().clone();
+            let cache_warmup_params = repo.config().cache_warmup.clone();
+            let ctx = CoreContext::new_with_logger(self.fb, logger.clone());
+            cache_warmup(&ctx, &blob_repo, cache_warmup_params)
+                .await
+                .with_context(|| format!("Error while warming up cache for repo {}", repo_name))?;
+            info!(
+                &logger,
+                "Completed repo {} setup in Mononoke service", repo_name
+            );
         } else {
             info!(
                 &logger,
@@ -212,6 +205,7 @@ fn main(fb: FacebookInit) -> Result<()> {
     let app = MononokeAppBuilder::new(fb)
         .with_default_scuba_dataset("mononoke_test_perf")
         .with_warm_bookmarks_cache(WarmBookmarksCacheDerivedData::HgOnly)
+        .with_app_extension(WarmBookmarksCacheExtension {})
         .with_app_extension(McrouterAppExtension {})
         .with_app_extension(Fb303AppExtension {})
         .with_app_extension(HooksAppExtension {})
