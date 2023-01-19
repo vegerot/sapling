@@ -20,6 +20,7 @@
 #include <folly/String.h>
 #include <folly/chrono/Conv.h>
 #include <folly/container/Access.h>
+#include <folly/executors/SerialExecutor.h>
 #include <folly/futures/Future.h>
 #include <folly/logging/Logger.h>
 #include <folly/logging/LoggerDB.h>
@@ -27,6 +28,7 @@
 #include <folly/stop_watch.h>
 #include <folly/system/Shell.h>
 #include <thrift/lib/cpp/util/EnumUtils.h>
+#include <thrift/lib/cpp2/server/ThriftServer.h>
 
 #include "eden/common/utils/ProcessNameCache.h"
 #include "eden/fs/config/CheckoutConfig.h"
@@ -67,6 +69,7 @@
 #include "eden/fs/store/ScmStatusDiffCallback.h"
 #include "eden/fs/store/hg/HgQueuedBackingStore.h"
 #include "eden/fs/telemetry/SessionInfo.h"
+#include "eden/fs/telemetry/TaskTrace.h"
 #include "eden/fs/telemetry/Tracing.h"
 #include "eden/fs/utils/Bug.h"
 #include "eden/fs/utils/Clock.h"
@@ -1106,6 +1109,37 @@ EdenServiceHandler::traceThriftRequestEvents() {
         ThriftRequestEvent thriftEvent;
         convertThriftRequestTraceEventToThriftRequestEvent(event, thriftEvent);
         publisher.next(thriftEvent);
+      });
+
+  return std::move(serverStream);
+}
+
+apache::thrift::ServerStream<TaskEvent> EdenServiceHandler::traceTaskEvents(
+    std::unique_ptr<::facebook::eden::TraceTaskEventsRequest> /* request */) {
+  auto helper = INSTRUMENT_THRIFT_CALL(DBG3);
+  struct SubscriptionHandleOwner {
+    TraceBus<TaskTraceEvent>::SubscriptionHandle handle;
+  };
+
+  auto h = std::make_shared<SubscriptionHandleOwner>();
+
+  auto [serverStream, publisher] =
+      apache::thrift::ServerStream<TaskEvent>::createPublisher([h] {
+        // on disconnect, release subscription handle
+      });
+
+  h->handle = TaskTraceEvent::getTraceBus()->subscribeFunction(
+      "Live Thrift request tracing",
+      [publisher = ThriftStreamPublisherOwner{std::move(publisher)}](
+          const TaskTraceEvent& event) mutable {
+        TaskEvent taskEvent;
+        taskEvent.times() = thriftTraceEventTimes(event);
+        taskEvent.name() = event.name;
+        taskEvent.threadName() = event.threadName;
+        taskEvent.threadId() = event.threadId;
+        taskEvent.duration() = event.duration.count();
+        taskEvent.start() = event.start.count();
+        publisher.next(taskEvent);
       });
 
   return std::move(serverStream);
@@ -2619,6 +2653,7 @@ EdenServiceHandler::semifuture_predictiveGlobFiles(
 
 folly::SemiFuture<std::unique_ptr<Glob>>
 EdenServiceHandler::semifuture_globFiles(std::unique_ptr<GlobParams> params) {
+  TaskTraceBlock block{"EdenServiceHandler::globFiles"};
   ThriftGlobImpl globber{*params};
   auto helper = INSTRUMENT_THRIFT_CALL(
       DBG3,
@@ -2640,7 +2675,7 @@ EdenServiceHandler::semifuture_globFiles(std::unique_ptr<GlobParams> params) {
       context,
       server_->getServerState());
 
-  auto globFut =
+  ImmediateFuture<std::unique_ptr<Glob>> globFut =
       std::move(backgroundFuture)
           .thenValue([mount = server_->getMount(
                           absolutePathFromThrift(*params->mountPoint())),
@@ -2650,11 +2685,24 @@ EdenServiceHandler::semifuture_globFiles(std::unique_ptr<GlobParams> params) {
                       &context](auto&&) mutable {
             return globber.glob(mount, serverState, std::move(globs), context);
           });
+
   globFut = std::move(globFut).ensure(
       [helper = std::move(helper), params = std::move(params)] {});
-  return detachIfBackgrounded(
-             std::move(globFut), server_->getServerState(), isBackground)
-      .semi();
+
+  globFut = detachIfBackgrounded(
+      std::move(globFut), server_->getServerState(), isBackground);
+
+  if (globFut.isReady()) {
+    return std::move(globFut).semi();
+  }
+
+  // The glob code has a very large fan-out that can easily overload the Thrift
+  // CPU worker pool. To combat with that, we limit the execution to a single
+  // thread by using `folly::SerialExecutor` so the glob queries will not
+  // overload the executor.
+  auto serial = folly::SerialExecutor::create(
+      server_->getServer()->getThreadManager().get());
+  return std::move(globFut).semi().via(serial);
 }
 
 folly::SemiFuture<folly::Unit> EdenServiceHandler::semifuture_prefetchFiles(
