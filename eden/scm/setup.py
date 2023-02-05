@@ -311,7 +311,7 @@ def filterhgerr(err):
     return b"\n".join(b"  " + e for e in err)
 
 
-def findhg():
+def findhg(vcname: str):
     """Try to figure out how we should invoke hg for examining the local
     repository contents.
 
@@ -324,11 +324,10 @@ def findhg():
     # This repository may require extensions or other settings that would not
     # be enabled by running the hg script directly from this local repository.
     hgenv = os.environ.copy()
-    # Use HGPLAIN to disable hgrc settings that would change output formatting,
-    # and disable localization for the same reasons.
+    # Use HGPLAIN to disable hgrc settings that would change output formatting, and disable localization for the same reasons.
     hgenv["HGPLAIN"] = "1"
     hgenv["LANGUAGE"] = "C"
-    hgcmd = ["hg"]
+    hgcmd = [vcname]
     # Run a simple "hg log" command just to see if using hg from the user's
     # path works and can successfully interact with this repository.
     check_cmd = ["log", "-r.", "-Ttest"]
@@ -341,7 +340,7 @@ def findhg():
 
     # Fall back to trying the local hg installation.
     hgenv = localhgenv()
-    hgcmd = [sys.executable, "hg"]
+    hgcmd = [sys.executable, vcname]
     try:
         retcode, out, err = runcmd(hgcmd + check_cmd, hgenv)
     except EnvironmentError:
@@ -372,9 +371,7 @@ def localhgenv():
         env["SystemRoot"] = os.environ["SystemRoot"]
     return env
 
-
-hg = None if ossbuild else findhg()
-
+hg = findhg("hg") or findhg("sl")
 
 def hgtemplate(template, cast=None):
     if not hg:
@@ -384,6 +381,18 @@ def hgtemplate(template, cast=None):
         result = cast(result)
     return result
 
+def gitversion():
+    hgenv = localhgenv()
+    format = "%cd-h%h"
+    date_format = "format:%Y%m%d-%H%M%S"
+    try:
+        retcode, out, err = runcmd(["git", "-c", "core.abbrev=8", "show", "-s",
+                         f"--format={format}", f"--date={date_format}"], os.environ)
+        if retcode or err:
+            return None
+        return out.decode("utf-8")
+    except EnvironmentError as e:
+        return None
 
 def pickversion():
     # Respect SAPLING_VERSION set by GitHub workflows.
@@ -394,7 +403,7 @@ def pickversion():
     # This is duplicated a bit from build_rpm.py:auto_release_str()
     template = r'{sub("([:+-]|\d\d\d\d$)", "",date|isodatesec)} {node|short}'
     # if hg is not found, fallback to a fixed version
-    out = hgtemplate(template) or ""
+    out = hgtemplate(template) or gitversion() or ""
     # Some tools parse this number to figure out if they support this version of
     # Mercurial, so prepend with 4.4.2.
     # ex. 4.4.2_20180105_214829_58fda95a0202
