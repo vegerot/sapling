@@ -32,6 +32,7 @@ from edenscm import (
     hintutil,
     progress,
     pycompat,
+    redact,
     registrar,
     util,
 )
@@ -527,7 +528,7 @@ def _makerage(ui, repo, **opts) -> str:
 
     encoding.encoding = oldencoding
     encoding.encodingmode = oldencodingmode
-    return msg
+    return redact.redactsensitiveinfo(msg)
 
 
 @command("rage", rageopts, _("@prog@ rage"))
@@ -598,7 +599,9 @@ def rage(ui, repo, *pats, **opts) -> None:
             % (ui.config("ui", "supportcontact"))
         )
         ui.write(
-            "  " + pycompat.decodeutf8(out, errors="replace") + "\n", label="rage.link"
+            # pyre-fixme[61]: `out` is undefined, or not always defined.
+            "  " + pycompat.decodeutf8(out, errors="replace") + "\n",
+            label="rage.link",
         )
     ui.write(ui.config("rage", "advice", "") + "\n")
 

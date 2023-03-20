@@ -26,6 +26,7 @@ struct HgImporterStats;
 struct JournalStats;
 struct ThriftStats;
 struct TelemetryStats;
+struct OverlayStats;
 
 /**
  * StatsGroupBase is a base class for a group of thread-local stats
@@ -119,6 +120,7 @@ class EdenStats {
   ThreadLocal<JournalStats> journalStats_;
   ThreadLocal<ThriftStats> thriftStats_;
   ThreadLocal<TelemetryStats> telemetryStats_;
+  ThreadLocal<OverlayStats> overlayStats_;
 };
 
 template <>
@@ -166,6 +168,11 @@ inline ThriftStats& EdenStats::getStatsForCurrentThread<ThriftStats>() {
 template <>
 inline TelemetryStats& EdenStats::getStatsForCurrentThread<TelemetryStats>() {
   return *telemetryStats_.get();
+}
+
+template <>
+inline OverlayStats& EdenStats::getStatsForCurrentThread<OverlayStats>() {
+  return *overlayStats_.get();
 }
 
 template <typename T>
@@ -283,10 +290,6 @@ struct ObjectStoreStats : StatsGroup<ObjectStoreStats> {
       "object_store.get_blob_metadata.backing_store"};
   Counter getLocalBlobMetadataFromBackingStore{
       "object_store.get_blob_metadata.backing_store_cache"};
-
-  Counter getBlobSizeFromLocalStore{"object_store.get_blob_size.local_store"};
-  Counter getBlobSizeFromBackingStore{
-      "object_store.get_blob_size.backing_store"};
 };
 
 /**
@@ -305,6 +308,7 @@ struct HgBackingStoreStats : StatsGroup<HgBackingStoreStats> {
   Duration fetchBlob{"store.hg.fetch_blob_us"};
   Duration importBlob{"store.hg.import_blob_us"};
   Duration getBlobMetadata{"store.hg.get_blob_metadata_us"};
+  Duration fetchBlobMetadata{"store.hg.get_blob_metadata_us"};
   Counter loadProxyHash{"store.hg.load_proxy_hash"};
   Counter auxMetadataMiss{"store.hg.aux_metadata_miss"};
 };
@@ -333,6 +337,19 @@ struct ThriftStats : StatsGroup<ThriftStats> {
 
 struct TelemetryStats : StatsGroup<TelemetryStats> {
   Counter subprocessLoggerFailure{"telemetry.subprocess_logger_failure"};
+};
+
+struct OverlayStats : StatsGroup<OverlayStats> {
+  Duration saveOverlayDir{"overlay.save_overlay_dir_us"};
+  Duration loadOverlayDir{"overlay.load_overlay_dir_us"};
+  Duration removeOverlayFile{"overlay.remove_overlay_file_us"};
+  Duration removeOverlayDir{"overlay.remove_overlay_dir_us"};
+  Duration hasOverlayDir{"overlay.has_overlay_dir_us"};
+  Duration hasOverlayFile{"overlay.has_overlay_dir_us"};
+  Duration addChild{"overlay.add_child_us"};
+  Duration removeChild{"overlay.remove_child_us"};
+  Duration removeChildren{"overlay.remove_children_us"};
+  Duration renameChild{"overlay.rename_child_us"};
 };
 
 /**

@@ -73,6 +73,14 @@ class HgDatapackStore {
   std::unique_ptr<BlobMetadata> getLocalBlobMetadata(const HgProxyHash& id);
 
   /**
+   * Fetch multiple aux data at once.
+   *
+   * This function returns when all the aux data have been fetched.
+   */
+  void getBlobMetadataBatch(
+      const std::vector<std::shared_ptr<HgImportRequest>>& requests);
+
+  /**
    * Flush any pending writes to disk.
    *
    * As a side effect, this also reloads the current state of Mercurial's
@@ -96,12 +104,22 @@ class HgDatapackStore {
     return liveBatchedTreeWatches_;
   }
 
+  /**
+   * Get the metrics tracking the number of live batched aux data.
+   */
+  RequestMetricsScope::LockedRequestWatchList& getLiveBatchedBlobMetaWatches()
+      const {
+    return liveBatchedBlobMetaWatches_;
+  }
+
  private:
   sapling::SaplingNativeBackingStore store_;
   std::shared_ptr<ReloadableConfig> config_;
 
   mutable RequestMetricsScope::LockedRequestWatchList liveBatchedBlobWatches_;
   mutable RequestMetricsScope::LockedRequestWatchList liveBatchedTreeWatches_;
+  mutable RequestMetricsScope::LockedRequestWatchList
+      liveBatchedBlobMetaWatches_;
 };
 
 } // namespace facebook::eden

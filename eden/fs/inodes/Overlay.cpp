@@ -29,6 +29,7 @@
 #include "eden/fs/inodes/sqlitecatalog/BufferedSqliteInodeCatalog.h"
 #include "eden/fs/inodes/sqlitecatalog/SqliteInodeCatalog.h"
 #include "eden/fs/sqlite/SqliteDatabase.h"
+#include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/utils/Bug.h"
 #include "eden/fs/utils/PathFuncs.h"
 
@@ -42,9 +43,10 @@ std::unique_ptr<InodeCatalog> makeInodeCatalog(
     AbsolutePathPiece localDir,
     Overlay::InodeCatalogType inodeCatalogType,
     const EdenConfig& config,
-    IFileContentStore* fileContentStore) {
+    IFileContentStore* fileContentStore,
+    const std::shared_ptr<StructuredLogger>& logger) {
   if (inodeCatalogType == Overlay::InodeCatalogType::Tree) {
-    return std::make_unique<SqliteInodeCatalog>(localDir);
+    return std::make_unique<SqliteInodeCatalog>(localDir, logger);
   } else if (inodeCatalogType == Overlay::InodeCatalogType::TreeInMemory) {
     XLOG(WARN) << "In-memory overlay requested. This will cause data loss.";
     return std::make_unique<SqliteInodeCatalog>(
@@ -52,10 +54,11 @@ std::unique_ptr<InodeCatalog> makeInodeCatalog(
   } else if (
       inodeCatalogType == Overlay::InodeCatalogType::TreeSynchronousOff) {
     return std::make_unique<SqliteInodeCatalog>(
-        localDir, SqliteTreeStore::SynchronousMode::Off);
+        localDir, logger, SqliteTreeStore::SynchronousMode::Off);
   } else if (inodeCatalogType == Overlay::InodeCatalogType::TreeBuffered) {
     XLOG(DBG4) << "Buffered tree overlay being used";
-    return std::make_unique<BufferedSqliteInodeCatalog>(localDir, config);
+    return std::make_unique<BufferedSqliteInodeCatalog>(
+        localDir, logger, config);
   } else if (
       inodeCatalogType == Overlay::InodeCatalogType::TreeInMemoryBuffered) {
     XLOG(WARN)
@@ -68,7 +71,7 @@ std::unique_ptr<InodeCatalog> makeInodeCatalog(
     XLOG(DBG2)
         << "Buffered tree overlay being used with synchronous-mode = off";
     return std::make_unique<BufferedSqliteInodeCatalog>(
-        localDir, config, SqliteTreeStore::SynchronousMode::Off);
+        localDir, logger, config, SqliteTreeStore::SynchronousMode::Off);
   }
 #ifdef _WIN32
   (void)fileContentStore;
@@ -76,7 +79,7 @@ std::unique_ptr<InodeCatalog> makeInodeCatalog(
     throw std::runtime_error(
         "Legacy overlay type is not supported. Please reclone.");
   }
-  return std::make_unique<SqliteInodeCatalog>(localDir);
+  return std::make_unique<SqliteInodeCatalog>(localDir, logger);
 #else
   return std::make_unique<FsInodeCatalog>(
       static_cast<FileContentStore*>(fileContentStore));
@@ -102,6 +105,7 @@ std::shared_ptr<Overlay> Overlay::create(
     CaseSensitivity caseSensitive,
     InodeCatalogType inodeCatalogType,
     std::shared_ptr<StructuredLogger> logger,
+    std::shared_ptr<EdenStats> stats,
     const EdenConfig& config) {
   // This allows us to access the private constructor.
   struct MakeSharedEnabler : public Overlay {
@@ -110,11 +114,23 @@ std::shared_ptr<Overlay> Overlay::create(
         CaseSensitivity caseSensitive,
         InodeCatalogType inodeCatalogType,
         std::shared_ptr<StructuredLogger> logger,
+        std::shared_ptr<EdenStats> stats,
         const EdenConfig& config)
-        : Overlay(localDir, caseSensitive, inodeCatalogType, logger, config) {}
+        : Overlay(
+              localDir,
+              caseSensitive,
+              inodeCatalogType,
+              logger,
+              std::move(stats),
+              config) {}
   };
   return std::make_shared<MakeSharedEnabler>(
-      localDir, caseSensitive, inodeCatalogType, logger, config);
+      localDir,
+      caseSensitive,
+      inodeCatalogType,
+      logger,
+      std::move(stats),
+      config);
 }
 
 Overlay::Overlay(
@@ -122,18 +138,21 @@ Overlay::Overlay(
     CaseSensitivity caseSensitive,
     InodeCatalogType inodeCatalogType,
     std::shared_ptr<StructuredLogger> logger,
+    std::shared_ptr<EdenStats> stats,
     const EdenConfig& config)
     : fileContentStore_{makeFileContentStore(localDir)},
       inodeCatalog_{makeInodeCatalog(
           localDir,
           inodeCatalogType,
           config,
-          fileContentStore_ ? fileContentStore_.get() : nullptr)},
+          fileContentStore_ ? fileContentStore_.get() : nullptr,
+          logger)},
       inodeCatalogType_{inodeCatalogType},
       supportsSemanticOperations_{inodeCatalog_->supportsSemanticOperations()},
       localDir_{localDir},
       caseSensitive_{caseSensitive},
-      structuredLogger_{logger} {}
+      structuredLogger_{logger},
+      stats_{std::move(stats)} {}
 
 Overlay::~Overlay() {
   close();
@@ -423,6 +442,7 @@ overlay::OverlayDir Overlay::serializeOverlayDir(
 }
 
 void Overlay::saveOverlayDir(InodeNumber inodeNumber, const DirContents& dir) {
+  DurationScope statScope{stats_, &OverlayStats::saveOverlayDir};
   inodeCatalog_->saveOverlayDir(
       inodeNumber, serializeOverlayDir(inodeNumber, dir));
 }
@@ -437,6 +457,7 @@ void Overlay::freeInodeFromMetadataTable(InodeNumber ino) {
 }
 
 void Overlay::removeOverlayFile(InodeNumber inodeNumber) {
+  DurationScope statScope{stats_, &OverlayStats::removeOverlayFile};
 #ifndef _WIN32
   IORequest req{this};
 
@@ -448,6 +469,7 @@ void Overlay::removeOverlayFile(InodeNumber inodeNumber) {
 }
 
 void Overlay::removeOverlayDir(InodeNumber inodeNumber) {
+  DurationScope statScope{stats_, &OverlayStats::removeOverlayDir};
   IORequest req{this};
 
   freeInodeFromMetadataTable(inodeNumber);
@@ -482,6 +504,7 @@ folly::Future<folly::Unit> Overlay::flushPendingAsync() {
 #endif // !_WIN32
 
 bool Overlay::hasOverlayDir(InodeNumber inodeNumber) {
+  DurationScope statScope{stats_, &OverlayStats::hasOverlayDir};
   IORequest req{this};
   return inodeCatalog_->hasOverlayDir(inodeNumber);
 }
@@ -489,6 +512,7 @@ bool Overlay::hasOverlayDir(InodeNumber inodeNumber) {
 #ifndef _WIN32
 
 bool Overlay::hasOverlayFile(InodeNumber inodeNumber) {
+  DurationScope statScope{stats_, &OverlayStats::hasOverlayFile};
   IORequest req{this};
   XCHECK(fileContentStore_);
   return fileContentStore_->hasOverlayFile(inodeNumber);
@@ -699,6 +723,7 @@ void Overlay::addChild(
     InodeNumber parent,
     const std::pair<PathComponent, DirEntry>& childEntry,
     const DirContents& content) {
+  DurationScope statScope{stats_, &OverlayStats::addChild};
   if (supportsSemanticOperations_) {
     inodeCatalog_->addChild(
         parent, childEntry.first, serializeOverlayEntry(childEntry.second));
@@ -711,6 +736,7 @@ void Overlay::removeChild(
     InodeNumber parent,
     PathComponentPiece childName,
     const DirContents& content) {
+  DurationScope statScope{stats_, &OverlayStats::removeChild};
   if (supportsSemanticOperations_) {
     inodeCatalog_->removeChild(parent, childName);
   } else {
@@ -719,6 +745,7 @@ void Overlay::removeChild(
 }
 
 void Overlay::removeChildren(InodeNumber parent, const DirContents& content) {
+  DurationScope statScope{stats_, &OverlayStats::removeChildren};
   saveOverlayDir(parent, content);
 }
 
@@ -729,6 +756,7 @@ void Overlay::renameChild(
     PathComponentPiece dstName,
     const DirContents& srcContent,
     const DirContents& dstContent) {
+  DurationScope statScope{stats_, &OverlayStats::renameChild};
   if (supportsSemanticOperations_) {
     inodeCatalog_->renameChild(src, dst, srcName, dstName);
   } else {
