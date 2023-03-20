@@ -6,7 +6,6 @@
  */
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -15,15 +14,18 @@ use manifest_tree::ReadTreeManifest;
 use manifest_tree::TreeManifest;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
+use pathmatcher::DifferenceMatcher;
 use pathmatcher::ExactMatcher;
 use pathmatcher::Matcher;
 use status::StatusBuilder;
+use tracing::trace;
 use treestate::filestate::StateFlags;
 use treestate::treestate::TreeState;
 use types::HgId;
 use types::RepoPathBuf;
 
 use crate::filesystem::ChangeType;
+use crate::util::walk_treestate;
 
 struct FakeTreeResolver {
     pub manifest: Arc<RwLock<TreeManifest>>,
@@ -48,6 +50,7 @@ pub fn compute_status(
     let mut removed = vec![];
     let mut deleted = vec![];
     let mut unknown = vec![];
+    let mut invalid = vec![];
 
     // Step 1: get the tree state for each pending change in the working copy.
     // We may have a TreeState that only holds files that are being added/removed
@@ -60,34 +63,46 @@ pub fn compute_status(
         let (path, is_deleted) = match change {
             Ok(ChangeType::Changed(path)) => (path, false),
             Ok(ChangeType::Deleted(path)) => (path, true),
-            Err(e) => return Err(e),
+            Err(e) => {
+                match e.downcast::<types::path::ParseError>() {
+                    Ok(parse_err) => invalid.push(parse_err.into_path_bytes()),
+                    Err(e) => return Err(e),
+                }
+
+                continue;
+            }
         };
 
         let mut treestate = treestate.lock();
-
-        let normalized = treestate.normalize(path.as_ref())?;
-        let path = RepoPathBuf::from_utf8(normalized.to_vec())?;
-        match treestate.get(&normalized)? {
+        match treestate.normalized_get(&path)? {
             Some(state) => {
                 let exist_parent = state
                     .state
                     .intersects(StateFlags::EXIST_P1 | StateFlags::EXIST_P2);
                 let exist_next = state.state.contains(StateFlags::EXIST_NEXT);
+                let copied = state.state.contains(StateFlags::COPIED);
 
-                match (is_deleted, exist_parent, exist_next) {
-                    (_, true, false) => removed.push(path),
-                    (true, true, true) => deleted.push(path),
-                    (false, true, true) => modified.push(path),
-                    (false, false, true) => added.push(path),
-                    (false, false, false) => unknown.push(path),
+                trace!(%path, is_deleted, exist_parent, exist_next, copied);
+
+                match (is_deleted, exist_parent, exist_next, copied) {
+                    (_, true, false, _) => removed.push(path),
+                    (true, true, true, _) => deleted.push(path),
+                    (false, true, true, _) => modified.push(path),
+                    (false, false, true, _) => added.push(path),
+                    // This happens on EdenFS when a modified file is
+                    // renamed over another existing file.
+                    (false, false, false, true) => modified.push(path),
+                    (false, false, false, false) => unknown.push(path),
                     _ => {
-                        // The remaining case is (T, F, _).
+                        // The remaining case is (T, F, _, _).
                         // If the file is deleted, but didn't exist in a parent commit,
                         // it didn't change.
                     }
                 }
             }
             None => {
+                trace!(%path, is_deleted, "not in dirstate");
+
                 // Path not found in the TreeState, so we need to query the manifest
                 // to determine if this is a known or unknown file.
                 manifest_files.insert(path, (is_deleted, false));
@@ -113,6 +128,8 @@ pub fn compute_status(
         // Similarly, if a file doesn't exist in the manifest but did EXIST_NEXT,
         // it would be an "added" file.
         // This is a subset of the logic above.
+        trace!(%path, is_deleted, in_manifest, "manifest file");
+
         match (is_deleted, in_manifest) {
             (true, true) => deleted.push(path),
             (false, true) => modified.push(path),
@@ -129,9 +146,13 @@ pub fn compute_status(
         .chain(added.iter())
         .chain(removed.iter())
         .chain(deleted.iter())
-        .chain(unknown.iter())
-        .cloned()
-        .collect::<HashSet<RepoPathBuf>>();
+        .chain(unknown.iter());
+
+    // Augment matcher to skip "seen" files since they have already been handled above.
+    let matcher = Arc::new(DifferenceMatcher::new(
+        matcher,
+        ExactMatcher::new(seen, true),
+    ));
 
     let mut treestate = treestate.lock();
 
@@ -139,12 +160,12 @@ pub fn compute_status(
     // commit) but isn't in "pending changes" must have been deleted on the filesystem.
     walk_treestate(
         &mut treestate,
+        matcher.clone(),
         StateFlags::EXIST_NEXT,
         StateFlags::EXIST_P1 | StateFlags::EXIST_P2,
         |path, state| {
-            if matcher.matches_file(&path)? && !seen.contains(&path) {
-                deleted.push(path);
-            }
+            trace!(%path, "deleted (added file not in pending changes)");
+            deleted.push(path);
             Ok(())
         },
     )?;
@@ -153,27 +174,27 @@ pub fn compute_status(
     // Thus, we need to specially handle files that are in P2.
     walk_treestate(
         &mut treestate,
+        matcher.clone(),
         StateFlags::EXIST_P2,
         StateFlags::empty(),
         |path, state| {
-            // If we saw it in the pending_changes loop earlier, then it's already processed and
-            // done.
-            if matcher.matches_file(&path)? && !seen.contains(&path) {
-                // If it's in P1 but we didn't see it earlier, that means it didn't change with
-                // respect to P1. But since it is marked EXIST_P2, that means P2 changed it and
-                // therefore we should report it as changed.
-                if state.contains(StateFlags::EXIST_P1) {
-                    modified.push(path);
+            // If it's in P1 but we didn't see it earlier, that means it didn't change with
+            // respect to P1. But since it is marked EXIST_P2, that means P2 changed it and
+            // therefore we should report it as changed.
+            if state.state.contains(StateFlags::EXIST_P1) {
+                trace!(%path, "modified (infer p2 modified)");
+                modified.push(path);
+            } else {
+                // Since pending changes is with respect to P1, then if it's not in P1
+                // we either saw it in the pending changes loop earlier (in which case
+                // it is in `seen` and was handled), or we didn't see it and therefore
+                // it doesn't exist and is either deleted or removed.
+                if state.state.contains(StateFlags::EXIST_NEXT) {
+                    trace!(%path, "deleted (in p2, in next, not in pending changes)");
+                    deleted.push(path);
                 } else {
-                    // Since pending changes is with respect to P1, then if it's not in P1
-                    // we either saw it in the pending changes loop earlier (in which case
-                    // it is in `seen` and was handled), or we didn't see it and therefore
-                    // it doesn't exist and is either deleted or removed.
-                    if state.contains(StateFlags::EXIST_NEXT) {
-                        deleted.push(path);
-                    } else {
-                        removed.push(path);
-                    }
+                    trace!(%path, "removed (in p2, not in next, not in pending changes)");
+                    removed.push(path);
                 }
             }
             Ok(())
@@ -186,12 +207,12 @@ pub fn compute_status(
     // not P1 are handled above, so we only need to handle files in P1 here.
     walk_treestate(
         &mut treestate,
+        matcher.clone(),
         StateFlags::EXIST_P1,
         StateFlags::EXIST_NEXT,
         |path, state| {
-            if matcher.matches_file(&path)? && !seen.contains(&path) {
-                removed.push(path);
-            }
+            trace!(%path, "removed (in p1, not in next, not in pending changes)");
+            removed.push(path);
             Ok(())
         },
     )?;
@@ -200,12 +221,12 @@ pub fn compute_status(
     // from another file. These files should be marked as "modified".
     walk_treestate(
         &mut treestate,
+        matcher.clone(),
         StateFlags::COPIED,
         StateFlags::empty(),
         |path, state| {
-            if matcher.matches_file(&path)? && !seen.contains(&path) {
-                modified.push(path);
-            }
+            trace!(%path, "modified (marked copy, not in pending changes)");
+            modified.push(path);
             Ok(())
         },
     )?;
@@ -215,32 +236,8 @@ pub fn compute_status(
         .added(added)
         .removed(removed)
         .deleted(deleted)
-        .unknown(unknown))
-}
-
-/// Walk the TreeState, calling the callback for files that have all flags in [`state_all`]
-/// and none of the flags in [`state_none`].
-fn walk_treestate(
-    treestate: &mut TreeState,
-    state_all: StateFlags,
-    state_none: StateFlags,
-    mut callback: impl FnMut(RepoPathBuf, StateFlags) -> Result<()>,
-) -> Result<()> {
-    let file_mask = state_all | state_none;
-    treestate.visit(
-        &mut |components, state| {
-            let path = RepoPathBuf::from_utf8(components.concat())?;
-            (callback)(path, state.state)?;
-            Ok(treestate::tree::VisitorResult::NotChanged)
-        },
-        &|_path, dir| match dir.get_aggregated_state() {
-            Some(state) => {
-                state.union.contains(state_all) && !state.intersection.intersects(state_none)
-            }
-            None => true,
-        },
-        &|_path, file| file.state & file_mask == state_all,
-    )
+        .unknown(unknown)
+        .invalid(invalid))
 }
 
 #[cfg(test)]

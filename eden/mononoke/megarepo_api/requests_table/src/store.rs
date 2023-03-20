@@ -8,6 +8,7 @@
 use anyhow::bail;
 use anyhow::Result;
 use async_trait::async_trait;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkName;
 use context::CoreContext;
 use mononoke_types::RepositoryId;
@@ -312,14 +313,14 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
         _ctx: &CoreContext,
         request_type: &RequestType,
         repo_id: &RepositoryId,
-        bookmark: &BookmarkName,
+        bookmark: &BookmarkKey,
         args_blobstore_key: &BlobstoreKey,
     ) -> Result<RowId> {
         let res = AddRequest::query(
             &self.connections.write_connection,
             request_type,
             repo_id,
-            bookmark,
+            bookmark.name(),
             args_blobstore_key,
             &Timestamp::now(),
         )
@@ -575,7 +576,7 @@ mod test {
                 &ctx,
                 &RequestType("type".to_string()),
                 &RepositoryId::new(0),
-                &BookmarkName::new("book")?,
+                &BookmarkKey::new("book")?,
                 &BlobstoreKey("key".to_string()),
             )
             .await?;
@@ -619,7 +620,7 @@ mod test {
                 &ctx,
                 &RequestType("type".to_string()),
                 &repo_id,
-                &BookmarkName::new("book")?,
+                &BookmarkKey::new("book")?,
                 &BlobstoreKey("key".to_string()),
             )
             .await?;
@@ -687,7 +688,7 @@ mod test {
                 &ctx,
                 &RequestType("type".to_string()),
                 &repo_id,
-                &BookmarkName::new("book")?,
+                &BookmarkKey::new("book")?,
                 &BlobstoreKey("key".to_string()),
             )
             .await?;

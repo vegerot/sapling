@@ -14,6 +14,7 @@ use edenapi_types::ToWire;
 use futures::stream::TryStreamExt;
 use futures::FutureExt;
 use futures::Stream;
+use futures_stats::futures03::TimedFutureExt;
 use gotham::handler::HandlerError as GothamHandlerError;
 use gotham::handler::HandlerFuture;
 use gotham::middleware::state::StateMiddleware;
@@ -44,6 +45,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::context::ServerContext;
+use crate::middleware::request_dumper::RequestDumper;
 use crate::middleware::RequestContext;
 use crate::utils::cbor_mime;
 use crate::utils::get_repo;
@@ -201,7 +203,8 @@ macro_rules! define_handler {
     ($name:ident, $func:path) => {
         fn $name(mut state: State) -> Pin<Box<HandlerFuture>> {
             async move {
-                let res = $func(&mut state).await;
+                let (future_stats, res) = $func(&mut state).timed().await;
+                ScubaMiddlewareState::try_set_future_stats(&mut state, &future_stats);
                 build_response(res, state, &JsonErrorFomatter)
             }
             .boxed()
@@ -229,8 +232,11 @@ fn health_handler(state: State) -> (State, &'static str) {
 
 async fn handler_wrapper<Handler: EdenApiHandler>(
     mut state: State,
-) -> Result<(State, Response<Body>), (State, GothamHandlerError)> {
-    let res = async {
+) -> Result<(State, Response<Body>), (State, GothamHandlerError)>
+where
+    <Handler as EdenApiHandler>::Request: std::fmt::Debug,
+{
+    let (future_stats, res) = async {
         let path = Handler::PathExtractor::take_from(&mut state);
         let query_string = Handler::QueryStringExtractor::take_from(&mut state);
         let content_encoding = ContentEncoding::from_state(&state);
@@ -248,12 +254,18 @@ async fn handler_wrapper<Handler: EdenApiHandler>(
             ScubaMiddlewareState::try_set_sampling_rate(&mut state, sampling_rate);
         }
 
+        if let Some(rd) = RequestDumper::try_borrow_mut_from(&mut state) {
+            rd.add_request(&request);
+        };
+
         match Handler::handler(repo, path, query_string, request).await {
             Ok(responses) => Ok(encode_response_stream(responses, content_encoding)),
             Err(HandlerError::E500(err)) => Err(HttpError::e500(err)),
         }
     }
+    .timed()
     .await;
+    ScubaMiddlewareState::try_set_future_stats(&mut state, &future_stats);
 
     build_response(res, state, &JsonErrorFomatter)
 }
@@ -284,7 +296,10 @@ where
     C: gotham::pipeline::PipelineHandleChain<P> + Copy + Send + Sync + 'static,
     P: std::panic::RefUnwindSafe + Send + Sync + 'static,
 {
-    fn setup<Handler: EdenApiHandler>(route: &mut RouterBuilder<C, P>) {
+    fn setup<Handler: EdenApiHandler>(route: &mut RouterBuilder<C, P>)
+    where
+        <Handler as EdenApiHandler>::Request: std::fmt::Debug,
+    {
         route
             .request(
                 vec![Handler::HTTP_METHOD],

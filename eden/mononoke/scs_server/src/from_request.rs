@@ -16,6 +16,7 @@ use bookmarks_movement::BookmarkKindRestrictions;
 use bytes::Bytes;
 use chrono::DateTime;
 use chrono::FixedOffset;
+use chrono::Local;
 use chrono::TimeZone;
 use ephemeral_blobstore::BubbleId;
 use faster_hex::hex_string;
@@ -24,7 +25,7 @@ use mononoke_api::specifiers::GitSha1;
 use mononoke_api::specifiers::GitSha1Prefix;
 use mononoke_api::specifiers::Globalrev;
 use mononoke_api::specifiers::Svnrev;
-use mononoke_api::BookmarkName;
+use mononoke_api::BookmarkKey;
 use mononoke_api::CandidateSelectionHintArgs;
 use mononoke_api::ChangesetId;
 use mononoke_api::ChangesetIdPrefix;
@@ -32,6 +33,7 @@ use mononoke_api::ChangesetPrefixSpecifier;
 use mononoke_api::ChangesetSpecifier;
 use mononoke_api::CopyInfo;
 use mononoke_api::CreateCopyInfo;
+use mononoke_api::CreateInfo;
 use mononoke_api::FileId;
 use mononoke_api::FileType;
 use mononoke_api::HgChangesetId;
@@ -45,15 +47,16 @@ use source_control as thrift;
 use crate::commit_id::CommitIdExt;
 use crate::errors;
 
+/// Convert an item from a thrift request to the internal type.
 pub(crate) trait FromRequest<T: ?Sized> {
     fn from_request(t: &T) -> Result<Self, thrift::RequestError>
     where
         Self: Sized;
 }
 
-impl FromRequest<str> for BookmarkName {
-    fn from_request(bookmark: &str) -> Result<BookmarkName, thrift::RequestError> {
-        BookmarkName::new(bookmark).map_err(|e| {
+impl FromRequest<str> for BookmarkKey {
+    fn from_request(bookmark: &str) -> Result<BookmarkKey, thrift::RequestError> {
+        BookmarkKey::new(bookmark).map_err(|e| {
             errors::invalid_request(format!(
                 "failed parsing bookmark out of {}: {:?}",
                 bookmark, e
@@ -97,13 +100,13 @@ impl FromRequest<thrift::CandidateSelectionHint> for CandidateSelectionHintArgs 
     fn from_request(hint: &thrift::CandidateSelectionHint) -> Result<Self, thrift::RequestError> {
         match hint {
             thrift::CandidateSelectionHint::bookmark_ancestor(bookmark) => {
-                let bookmark = BookmarkName::from_request(bookmark)?;
+                let bookmark = BookmarkKey::from_request(bookmark)?;
                 Ok(CandidateSelectionHintArgs::OnlyOrAncestorOfBookmark(
                     bookmark,
                 ))
             }
             thrift::CandidateSelectionHint::bookmark_descendant(bookmark) => {
-                let bookmark = BookmarkName::from_request(bookmark)?;
+                let bookmark = BookmarkKey::from_request(bookmark)?;
                 Ok(CandidateSelectionHintArgs::OnlyOrDescendantOfBookmark(
                     bookmark,
                 ))
@@ -329,9 +332,51 @@ impl FromRequest<thrift::RepoCreateCommitParamsFileCopyInfo> for CreateCopyInfo 
     }
 }
 
+impl FromRequest<thrift::RepoCreateCommitParamsCommitInfo> for CreateInfo {
+    fn from_request(
+        info: &thrift::RepoCreateCommitParamsCommitInfo,
+    ) -> Result<Self, thrift::RequestError> {
+        let author = info.author.clone();
+        let author_date = info.date.as_ref().map_or_else(
+            || {
+                let now = Local::now();
+                Ok(now.with_timezone(now.offset()))
+            },
+            <DateTime<FixedOffset>>::from_request,
+        )?;
+        let committer = info.committer.clone();
+        let committer_date = info
+            .committer_date
+            .as_ref()
+            .map(<DateTime<FixedOffset>>::from_request)
+            .transpose()?;
+        let message = info.message.clone();
+        let extra = info.extra.clone();
+        let git_extra_headers = info.git_extra_headers.as_ref().map(|headers| {
+            headers
+                .iter()
+                .map(|(k, v)| (k.0.clone(), v.clone()))
+                .collect()
+        });
+
+        Ok(CreateInfo {
+            author,
+            author_date,
+            committer,
+            committer_date,
+            message,
+            extra,
+            git_extra_headers,
+        })
+    }
+}
+
 impl FromRequest<thrift::DateTime> for DateTime<FixedOffset> {
     fn from_request(date: &thrift::DateTime) -> Result<Self, thrift::RequestError> {
-        Ok(FixedOffset::east(date.tz).timestamp(date.timestamp, 0))
+        Ok(FixedOffset::east_opt(date.tz)
+            .unwrap()
+            .timestamp_opt(date.timestamp, 0)
+            .unwrap())
     }
 }
 

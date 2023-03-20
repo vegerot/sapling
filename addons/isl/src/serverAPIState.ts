@@ -5,18 +5,33 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {EditedMessage} from './CommitInfo';
+import type {EditedMessage} from './CommitInfoState';
+import type {MessageBusStatus} from './MessageBus';
 import type {CommitTree} from './getCommitTree';
 import type {Operation} from './operations/Operation';
-import type {ChangedFile, CommitInfo, Hash, MergeConflicts, RepoInfo} from './types';
-import type {CallbackInterface} from 'recoil';
+import type {
+  ChangedFile,
+  CommitInfo,
+  Hash,
+  MergeConflicts,
+  RepoInfo,
+  SmartlogCommits,
+  SubscriptionKind,
+  SubscriptionResultsData,
+  UncommittedChanges,
+} from './types';
+import type {AtomEffect, CallbackInterface} from 'recoil';
+import type {EnsureAssignedTogether} from 'shared/EnsureAssignedTogether';
 
 import serverAPI from './ClientToServerAPI';
+import messageBus from './MessageBus';
 import {getCommitTree, walkTreePostorder} from './getCommitTree';
 import {operationBeingPreviewed} from './previews';
 import {initialParams} from './urlParams';
 import {firstLine} from './utils';
+import {DEFAULT_DAYS_OF_COMMITS_TO_LOAD} from 'isl-server/src/constants';
 import {atom, DefaultValue, selector, useRecoilCallback} from 'recoil';
+import {randomId} from 'shared/utils';
 
 const repositoryData = atom<{info: RepoInfo | undefined; cwd: string | undefined}>({
   key: 'repositoryData',
@@ -70,6 +85,17 @@ export const applicationinfo = atom<{platformName: string; version: string} | un
   ],
 });
 
+export const reconnectingStatus = atom<MessageBusStatus>({
+  key: 'reconnectingStatus',
+  default: {type: 'initializing'},
+  effects: [
+    ({setSelf}) => {
+      const disposable = messageBus.onChangeStatus(setSelf);
+      return () => disposable.dispose();
+    },
+  ],
+});
+
 export const serverCwd = selector<string>({
   key: 'serverCwd',
   get: ({get}) => {
@@ -78,78 +104,141 @@ export const serverCwd = selector<string>({
   },
 });
 
+export const latestUncommittedChangesData = atom<{
+  fetchStartTimestamp: number;
+  fetchCompletedTimestamp: number;
+  files: UncommittedChanges;
+  error?: Error;
+}>({
+  key: 'latestUncommittedChangesData',
+  default: {fetchStartTimestamp: 0, fetchCompletedTimestamp: 0, files: []},
+  effects: [
+    subscriptionEffect('uncommittedChanges', (data, {setSelf}) => {
+      setSelf(last => ({
+        ...data,
+        files:
+          data.files.value ??
+          // leave existing files in place if there was no error
+          (last instanceof DefaultValue ? [] : last.files) ??
+          [],
+        error: data.files.error,
+      }));
+    }),
+  ],
+});
+
 /**
  * Latest fetched uncommitted file changes from the server, without any previews.
  * Prefer using `uncommittedChangesWithPreviews`, since it includes optimistic state
  * and previews.
  */
-export const latestUncommittedChanges = atom<Array<ChangedFile>>({
+export const latestUncommittedChanges = selector<Array<ChangedFile>>({
   key: 'latestUncommittedChanges',
-  default: [],
-  effects: [
-    ({setSelf}) => {
-      const disposable = serverAPI.onMessageOfType('uncommittedChanges', event => {
-        if (event.files.error) {
-          // leave existing file changes in place
-          return;
-        }
-        setSelf(event.files.value);
-      });
-      return () => disposable.dispose();
-    },
-    () =>
-      serverAPI.onConnectOrReconnect(() =>
-        serverAPI.postMessage({
-          type: 'subscribeUncommittedChanges',
-          subscriptionID: 'latestUncommittedChanges',
-        }),
-      ),
-  ],
+  get: ({get}) => {
+    return get(latestUncommittedChangesData).files;
+  },
+});
+
+export const uncommittedChangesFetchError = selector<Error | undefined>({
+  key: 'uncommittedChangesFetchError',
+  get: ({get}) => {
+    return get(latestUncommittedChangesData).error;
+  },
 });
 
 export const mergeConflicts = atom<MergeConflicts | undefined>({
   key: 'mergeConflicts',
   default: undefined,
   effects: [
-    ({setSelf}) => {
-      const disposable = serverAPI.onMessageOfType('mergeConflicts', event => {
-        setSelf(event.conflicts);
-      });
-      return () => disposable.dispose();
-    },
-    () =>
-      serverAPI.onConnectOrReconnect(() =>
-        serverAPI.postMessage({
-          type: 'subscribeMergeConflicts',
-          subscriptionID: 'latestMergeConflicts',
-        }),
-      ),
+    subscriptionEffect('mergeConflicts', (data, {setSelf}) => {
+      setSelf(data);
+    }),
   ],
 });
 
-export const latestCommits = atom<Array<CommitInfo>>({
-  key: 'latestCommits',
-  default: [],
+export const latestCommitsData = atom<{
+  fetchStartTimestamp: number;
+  fetchCompletedTimestamp: number;
+  commits: SmartlogCommits;
+  error?: Error;
+}>({
+  key: 'latestCommitsData',
+  default: {fetchStartTimestamp: 0, fetchCompletedTimestamp: 0, commits: []},
   effects: [
-    ({setSelf}) => {
-      const disposable = serverAPI.onMessageOfType('smartlogCommits', event => {
-        if (event.commits.error) {
-          // leave existing commits in place
-          return;
-        }
-        setSelf(event.commits.value);
-      });
-      return () => disposable.dispose();
-    },
-    () =>
-      serverAPI.onConnectOrReconnect(() =>
-        serverAPI.postMessage({
-          type: 'subscribeSmartlogCommits',
-          subscriptionID: 'latestCommits',
-        }),
-      ),
+    subscriptionEffect('smartlogCommits', (data, {setSelf}) => {
+      setSelf(last => ({
+        ...data,
+        commits:
+          data.commits.value ??
+          // leave existing files in place if there was no error
+          (last instanceof DefaultValue ? [] : last.commits) ??
+          [],
+        error: data.commits.error,
+      }));
+    }),
   ],
 });
+
+export const latestCommits = selector<Array<CommitInfo>>({
+  key: 'latestCommits',
+  get: ({get}) => {
+    return get(latestCommitsData).commits;
+  },
+});
+
+export const commitFetchError = selector<Error | undefined>({
+  key: 'commitFetchError',
+  get: ({get}) => {
+    return get(latestCommitsData).error;
+  },
+});
+
+export const mostRecentSubscriptionIds: Record<SubscriptionKind, string> = {
+  smartlogCommits: '',
+  uncommittedChanges: '',
+  mergeConflicts: '',
+};
+
+/**
+ * Send a subscribeFoo message to the server on initialization,
+ * and send an unsubscribe message on dispose.
+ * Extract subscription response messages via a unique subscriptionID per effect call.
+ */
+function subscriptionEffect<K extends SubscriptionKind, T>(
+  kind: K,
+  onData: (data: SubscriptionResultsData[K], params: Parameters<AtomEffect<T>>[0]) => unknown,
+): AtomEffect<T> {
+  return effectParams => {
+    const subscriptionID = randomId();
+    mostRecentSubscriptionIds[kind] = subscriptionID;
+    const disposable = serverAPI.onMessageOfType('subscriptionResult', event => {
+      if (event.subscriptionID !== subscriptionID || event.kind !== kind) {
+        return;
+      }
+      onData(event.data as SubscriptionResultsData[K], effectParams);
+    });
+
+    const disposeSubscription = serverAPI.onConnectOrReconnect(() => {
+      serverAPI.postMessage({
+        type: 'subscribe',
+        kind,
+        subscriptionID,
+      });
+
+      return () =>
+        serverAPI.postMessage({
+          type: 'unsubscribe',
+          kind,
+          subscriptionID,
+        });
+    });
+
+    return () => {
+      disposable.dispose();
+      disposeSubscription();
+    };
+  };
+}
 
 export const isFetchingCommits = atom<boolean>({
   key: 'isFetchingCommits',
@@ -157,10 +246,32 @@ export const isFetchingCommits = atom<boolean>({
   effects: [
     ({setSelf}) => {
       const disposables = [
-        serverAPI.onMessageOfType('smartlogCommits', () => {
+        serverAPI.onMessageOfType('subscriptionResult', () => {
           setSelf(false); // new commits OR error means the fetch is not running anymore
         }),
         serverAPI.onMessageOfType('beganFetchingSmartlogCommitsEvent', () => {
+          setSelf(true);
+        }),
+      ];
+      return () => {
+        disposables.forEach(d => d.dispose());
+      };
+    },
+  ],
+});
+
+export const isFetchingAdditionalCommits = atom<boolean>({
+  key: 'isFetchingAdditionalCommits',
+  default: false,
+  effects: [
+    ({setSelf}) => {
+      const disposables = [
+        serverAPI.onMessageOfType('subscriptionResult', e => {
+          if (e.kind === 'smartlogCommits') {
+            setSelf(false);
+          }
+        }),
+        serverAPI.onMessageOfType('beganLoadingMoreCommits', () => {
           setSelf(true);
         }),
       ];
@@ -177,8 +288,10 @@ export const isFetchingUncommittedChanges = atom<boolean>({
   effects: [
     ({setSelf}) => {
       const disposables = [
-        serverAPI.onMessageOfType('uncommittedChanges', () => {
-          setSelf(false); // new files OR error means the fetch is not running anymore
+        serverAPI.onMessageOfType('subscriptionResult', e => {
+          if (e.kind === 'uncommittedChanges') {
+            setSelf(false); // new files OR error means the fetch is not running anymore
+          }
         }),
         serverAPI.onMessageOfType('beganFetchingUncommittedChangesEvent', () => {
           setSelf(true);
@@ -191,28 +304,19 @@ export const isFetchingUncommittedChanges = atom<boolean>({
   ],
 });
 
-export const commitFetchError = atom<Error | undefined>({
-  key: 'commitFetchError',
-  default: undefined,
+export const commitsShownRange = atom<number | undefined>({
+  key: 'commitsShownRange',
+  default: DEFAULT_DAYS_OF_COMMITS_TO_LOAD,
   effects: [
     ({setSelf}) => {
-      const disposable = serverAPI.onMessageOfType('smartlogCommits', event => {
-        setSelf(event.commits.error); // set even if error is undefined as a way of clearing the error
-      });
-      return () => disposable.dispose();
-    },
-  ],
-});
-
-export const uncommittedChangesFetchError = atom<Error | undefined>({
-  key: 'uncommittedChangesFetchError',
-  default: undefined,
-  effects: [
-    ({setSelf}) => {
-      const disposable = serverAPI.onMessageOfType('uncommittedChanges', event => {
-        setSelf(event.files.error); // set even if error is undefined as a way of clearing the error
-      });
-      return () => disposable.dispose();
+      const disposables = [
+        serverAPI.onMessageOfType('commitsShownRange', event => {
+          setSelf(event.rangeInDays);
+        }),
+      ];
+      return () => {
+        disposables.forEach(d => d.dispose());
+      };
     },
   ],
 });
@@ -296,20 +400,25 @@ export const haveCommitsLoadedYet = selector<boolean>({
 export type OperationInfo = {
   operation: Operation;
   startTime?: Date;
-  endTime?: Date;
   commandOutput?: Array<string>;
-  exitCode?: number | null;
+  /** if true, we have sent "abort" request, the process might have exited or is going to exit soon */
+  aborting?: boolean;
   /** if true, the operation process has exited AND there's no more optimistic commit state to show */
   hasCompletedOptimisticState?: boolean;
   /** if true, the operation process has exited AND there's no more optimistic changes to uncommited changes to show */
   hasCompletedUncommittedChangesOptimisticState?: boolean;
-};
+  /** if true, the operation process has exited AND there's no more optimistic changes to merge conflicts to show */
+  hasCompletedMergeConflictsOptimisticState?: boolean;
+} & EnsureAssignedTogether<{
+  endTime: Date;
+  exitCode: number;
+}>;
 
 /**
  * Bundle history of previous operations together with the current operation,
  * so we can easily manipulate operations together in one piece of state.
  */
-interface OperationList {
+export interface OperationList {
   /** The currently running operation, or the most recently run if not currently running. */
   currentOperation: OperationInfo | undefined;
   /** All previous operations oldest to newest, not including currentOperation */
@@ -327,7 +436,7 @@ function startNewOperation(newOperation: Operation, list: OperationList): Operat
     if (list.currentOperation != null) {
       operationHistory.push(list.currentOperation);
     }
-    const currentOperation = {operation: newOperation};
+    const currentOperation = {operation: newOperation, startTime: new Date()};
     return {...list, operationHistory, currentOperation};
   }
 }
@@ -382,7 +491,11 @@ export const operationList = atom<OperationList>({
 
               return {
                 ...current,
-                currentOperation: {...currentOperation, exitCode: progress.exitCode},
+                currentOperation: {
+                  ...currentOperation,
+                  exitCode: progress.exitCode,
+                  endTime: new Date(progress.timestamp),
+                },
               };
             });
             break;
@@ -443,7 +556,12 @@ function runOperationImpl(
   // and mark those to not be rewritten.
   serverAPI.postMessage({
     type: 'runOperation',
-    operation: {args: operation.getArgs(), id: operation.id, runner: operation.runner},
+    operation: {
+      args: operation.getArgs(),
+      id: operation.id,
+      runner: operation.runner,
+      trackEventName: operation.trackEventName,
+    },
   });
   operationsById.set(operation.id, operation);
   const ongoing = snapshot.getLoadable(operationList).valueMaybe();
@@ -469,6 +587,29 @@ export function useRunOperation() {
       },
     [],
   );
+}
+
+/**
+ * Returns callback to abort the running operation.
+ */
+export function useAbortRunningOperation() {
+  return useRecoilCallback(({snapshot, set}) => (operationId: string) => {
+    serverAPI.postMessage({
+      type: 'abortRunningOperation',
+      operationId,
+    });
+    const ongoing = snapshot.getLoadable(operationList).valueMaybe();
+    if (ongoing?.currentOperation?.operation?.id === operationId) {
+      // Mark 'aborting' as true.
+      set(operationList, list => {
+        const currentOperation = list.currentOperation;
+        if (currentOperation != null) {
+          return {...list, currentOperation: {aborting: true, ...currentOperation}};
+        }
+        return list;
+      });
+    }
+  });
 }
 
 /**
@@ -516,6 +657,12 @@ export function useClearAllOptimisticState() {
                   hasCompletedUncommittedChangesOptimisticState: true,
                 };
               }
+              if (!operationHistory[i].hasCompletedMergeConflictsOptimisticState) {
+                operationHistory[i] = {
+                  ...operationHistory[i],
+                  hasCompletedMergeConflictsOptimisticState: true,
+                };
+              }
             }
           }
           const currentOperation =
@@ -523,6 +670,7 @@ export function useClearAllOptimisticState() {
           if (currentOperation?.exitCode != null) {
             currentOperation.hasCompletedOptimisticState = true;
             currentOperation.hasCompletedUncommittedChangesOptimisticState = true;
+            currentOperation.hasCompletedMergeConflictsOptimisticState = true;
           }
           return {currentOperation, operationHistory};
         });

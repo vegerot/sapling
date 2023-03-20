@@ -5,24 +5,28 @@
  * GNU General Public License version 2.
  */
 
-use anyhow::Error;
+use std::sync::Arc;
+
 use anyhow::Result;
-use blobrepo::BlobRepo;
+use cloned::cloned;
 use context::CoreContext;
-use futures::FutureExt;
-use futures::TryFutureExt;
-use futures_old::stream;
-use futures_old::Stream as StreamOld;
+use futures::future;
+use futures::stream::FuturesUnordered;
+use futures::Stream;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use mercurial_bundles::obsmarkers::MetadataEntry;
 use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::parts;
-use mercurial_derived_data::DeriveHgChangeset;
+use mercurial_derived_data::derive_hg_changeset;
 use mercurial_types::HgChangesetId;
 use mononoke_types::DateTime;
+use repo_derived_data::RepoDerivedData;
+use repo_derived_data::RepoDerivedDataArc;
 
 pub fn pushrebased_changesets_to_obsmarkers_part(
-    ctx: CoreContext,
-    blobrepo: &BlobRepo,
+    ctx: &CoreContext,
+    repo: &impl RepoDerivedDataArc,
     pushrebased_changesets: Vec<pushrebase::PushrebaseChangesetPair>,
 ) -> Option<Result<PartEncodeBuilder>> {
     let filtered_changesets: Vec<_> = pushrebased_changesets
@@ -35,7 +39,7 @@ pub fn pushrebased_changesets_to_obsmarkers_part(
     }
 
     let hg_pushrebased_changesets =
-        pushrebased_changesets_to_hg_stream(ctx.clone(), blobrepo, filtered_changesets);
+        pushrebased_changesets_to_hg_stream(ctx, repo.repo_derived_data_arc(), filtered_changesets);
 
     let time = DateTime::now();
     let mut metadata = vec![MetadataEntry::new("operation", "push")];
@@ -44,32 +48,28 @@ pub fn pushrebased_changesets_to_obsmarkers_part(
         metadata.push(MetadataEntry::new("user", user));
     }
 
-    let part = parts::obsmarkers_part(hg_pushrebased_changesets, time, metadata);
+    let part = parts::obsmarkers_part(hg_pushrebased_changesets.boxed().compat(), time, metadata);
 
     Some(part)
 }
 
 fn pushrebased_changesets_to_hg_stream(
-    ctx: CoreContext,
-    blobrepo: &BlobRepo,
+    ctx: &CoreContext,
+    repo_derived_data: Arc<RepoDerivedData>,
     pushrebased_changesets: Vec<pushrebase::PushrebaseChangesetPair>,
-) -> impl StreamOld<Item = (HgChangesetId, Vec<HgChangesetId>), Error = Error> {
-    let blobrepo = blobrepo.clone();
-    let futures = pushrebased_changesets.into_iter().map({
-        move |p| {
-            let blobrepo = blobrepo.clone();
-            let ctx = ctx.clone();
+) -> impl Stream<Item = Result<(HgChangesetId, Vec<HgChangesetId>)>> {
+    pushrebased_changesets
+        .into_iter()
+        .map(move |p| {
+            cloned!(ctx, repo_derived_data);
             async move {
-                let (old, new) = futures::try_join!(
-                    blobrepo.derive_hg_changeset(&ctx, p.id_old),
-                    blobrepo.derive_hg_changeset(&ctx, p.id_new),
-                )?;
+                let (old, new) = future::try_join(
+                    derive_hg_changeset(&ctx, &repo_derived_data, p.id_old),
+                    derive_hg_changeset(&ctx, &repo_derived_data, p.id_new),
+                )
+                .await?;
                 Ok((old, vec![new]))
             }
-            .boxed()
-            .compat()
-        }
-    });
-
-    stream::futures_unordered(futures)
+        })
+        .collect::<FuturesUnordered<_>>()
 }

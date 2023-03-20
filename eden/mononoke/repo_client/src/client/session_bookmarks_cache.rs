@@ -15,8 +15,9 @@ use blobrepo::BlobRepo;
 use blobrepo_hg::to_hg_bookmark_stream;
 use blobrepo_hg::BlobRepoHg;
 use bookmarks::Bookmark;
+use bookmarks::BookmarkCategory;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkKind;
-use bookmarks::BookmarkName;
 use bookmarks::BookmarkPagination;
 use bookmarks::BookmarkPrefix;
 use bookmarks::BookmarksRef;
@@ -70,7 +71,9 @@ impl BookmarkCacheRepo for Arc<Repo> {
 }
 
 fn bookmarks_timeout() -> Duration {
-    let timeout = tunables().get_repo_client_bookmarks_timeout_secs();
+    let timeout = tunables()
+        .repo_client_bookmarks_timeout_secs()
+        .unwrap_or_default();
     if timeout > 0 {
         Duration::from_secs(timeout as u64)
     } else {
@@ -136,7 +139,7 @@ where
         ctx: &CoreContext,
         prefix: &BookmarkPrefix,
         return_max: u64,
-    ) -> Result<impl Stream<Item = Result<(BookmarkName, HgChangesetId), Error>> + '_, Error> {
+    ) -> Result<impl Stream<Item = Result<(BookmarkKey, HgChangesetId), Error>> + '_, Error> {
         let mut kinds = vec![BookmarkKind::Scratch];
 
         let mut result = HashMap::new();
@@ -167,11 +170,12 @@ where
                     ctx.clone(),
                     Freshness::MaybeStale,
                     prefix,
+                    BookmarkCategory::ALL,
                     &kinds,
                     &BookmarkPagination::FromStart,
                     left_to_fetch,
                 )
-                .map_ok(|(bookmark, cs_id)| (bookmark.name, cs_id))
+                .map_ok(|(bookmark, cs_id)| (bookmark.into_key(), cs_id))
                 .left_stream()
         } else {
             futures::stream::empty().map(Ok).right_stream()
@@ -191,7 +195,7 @@ where
     pub async fn get_bookmark(
         &self,
         ctx: CoreContext,
-        bookmark: BookmarkName,
+        bookmark: BookmarkKey,
     ) -> Result<Option<HgChangesetId>, Error> {
         if let Some(warm_bookmarks_cache) = self.get_warm_bookmark_cache() {
             if let Some(cs_id) = warm_bookmarks_cache.get(&ctx, &bookmark).await? {
@@ -248,7 +252,10 @@ where
 
     fn get_warm_bookmark_cache(&self) -> Option<&Arc<dyn BookmarksCache + Send + Sync>> {
         if self.repo.repo_client_use_warm_bookmarks_cache() {
-            if !tunables().get_disable_repo_client_warm_bookmarks_cache() {
+            if !tunables()
+                .disable_repo_client_warm_bookmarks_cache()
+                .unwrap_or_default()
+            {
                 return Some(self.repo.warm_bookmarks_cache());
             }
         }
@@ -284,7 +291,7 @@ fn update_publishing_bookmarks_maybe_stale_cache_raw(
 
 #[cfg(test)]
 mod test {
-    use bookmarks::BookmarkName;
+    use bookmarks::BookmarkKey;
     use bookmarks::BookmarkUpdateLogArc;
     use bookmarks::BookmarksArc;
     use fbinit::FacebookInit;
@@ -375,7 +382,7 @@ mod test {
         session_bookmark_cache: &SessionBookmarkCache<BasicTestRepo>,
     ) -> Result<(), Error> {
         let maybe_hg_cs_id = session_bookmark_cache
-            .get_bookmark(ctx.clone(), BookmarkName::new("prefix/scratchbook")?)
+            .get_bookmark(ctx.clone(), BookmarkKey::new("prefix/scratchbook")?)
             .await?;
         assert_eq!(maybe_hg_cs_id, Some(hg_cs_id));
 
@@ -386,9 +393,9 @@ mod test {
             .await?;
         assert_eq!(
             hashmap! {
-                BookmarkName::new("prefix/scratchbook")? => hg_cs_id,
-                BookmarkName::new("prefix/publishing")? => hg_cs_id,
-                BookmarkName::new("prefix/pulldefault")? => hg_cs_id,
+                BookmarkKey::new("prefix/scratchbook")? => hg_cs_id,
+                BookmarkKey::new("prefix/publishing")? => hg_cs_id,
+                BookmarkKey::new("prefix/pulldefault")? => hg_cs_id,
             },
             res
         );

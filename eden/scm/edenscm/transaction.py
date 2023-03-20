@@ -21,6 +21,8 @@ from __future__ import absolute_import
 import errno
 import functools
 
+import bindings
+
 from . import encoding, error, json, pycompat, util
 from .i18n import _
 from .node import bin, hex
@@ -310,7 +312,11 @@ class transaction(util.transactional):
             msg = 'cannot use transaction.addbackup inside "group"'
             raise error.ProgrammingError(msg)
 
-        if file in self.map or file in self._backupmap:
+        if (
+            file in self.map
+            or file in self._backupmap
+            or file in bindings.metalog.tracked()
+        ):
             return
         vfs = self._vfsmap[location]
         dirname, filename = vfs.split(file)
@@ -664,7 +670,13 @@ class transaction(util.transactional):
             trdesc = "Transaction: %s" % self.desc
             message = "\n".join([command, parent, trdesc])
 
-            util.failpoint("transaction-metalog-commit")
+            try:
+                util.failpoint("transaction-metalog-commit")
+            except Exception:
+                # Explicit clean up.
+                # Otherwise cleanup might rely on __del__ and run at a wrong time.
+                self._abort()
+                raise
             metalog.commit(
                 message,
                 int(util.timer()),

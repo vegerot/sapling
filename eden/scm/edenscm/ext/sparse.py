@@ -109,30 +109,6 @@ It is also possible to show hints where dirstate size is too large.
     # The number of files in the checkout that constitute a "large checkout".
     largecheckoutcount = 0
 
-The following option allows warning when a user is using a full checkout. It
-allows four values: hint, warn, softblock, hardblock.
-
-- "hint" shows a suppressable warning message.
-- "warn" shows a non-supressable warning message.
-- "softblock" throws an exception that can be bypassed via
-  sparse.bypassfullcheckoutwarn=True
-- "hardblock" throws an exception that cannot be bypassed.
-
-   [sparse]
-   warnfullcheckout = hint
-
-The following option can be used to bypass a softblock on fullcheckouts.
-
-   [sparse]
-   bypassfullcheckoutwarn = True
-
-The following option can be used to check if a sparse profile includes any files that should not normally
-be included.
-
-    [sparse]
-    unsafe_sparse_profile_marker_files = "somefile, anotherfile"
-    unsafe_sparse_profile_message = "do not do this!"
-
 The following options can be used to tune the behaviour of tree prefetching when sparse profile changes
 
     [sparse]
@@ -206,8 +182,6 @@ configitem(
     default=0,
     alias=[("perftweaks", "largecheckoutcount")],
 )
-configitem("sparse", "warnfullcheckout", default=None)
-configitem("sparse", "bypassfullcheckoutwarn", default=False)
 
 profilecachefile = "sparseprofileconfigs"
 
@@ -541,9 +515,6 @@ def _trackdirstatesizes(lui: "uimod.ui", repo: "localrepo.localrepository") -> N
             and _hassparse(repo)
         ):
             hintutil.trigger("sparse-largecheckout", dirstatesize, repo)
-        f = _find_unsafe_marker_files(repo, lui)
-        if f is not None:
-            hintutil.trigger("sparse-unsafe-profile", f, repo, lui)
 
 
 def _clonesparsecmd(orig, ui, repo, *args, **opts):
@@ -582,9 +553,6 @@ def _clonesparsecmd(orig, ui, repo, *args, **opts):
                     include=include,
                     exclude=exclude,
                     enableprofile=enableprofile,
-                    # Allow unsafe sparse profiles because usually people call
-                    # fbclone command which already includes a few safeguards.
-                    allowunsafeprofilechanges=True,
                 )
             ret = orig(self, node, overwrite, *args, **kwargs)
             if enableprofile:
@@ -620,9 +588,7 @@ def _setupadd(ui) -> None:
             for pat in pats:
                 dirname, basename = util.split(pat)
                 dirs.add(dirname)
-            _config(
-                ui, repo, list(dirs), opts, include=True, allowunsafeprofilechanges=True
-            )
+            _config(ui, repo, list(dirs), opts, include=True)
         return orig(ui, repo, *pats, **opts)
 
     extensions.wrapcommand(commands.table, "add", _add)
@@ -722,6 +688,27 @@ def _setupdirstate(ui) -> None:
             return orig(self, *args)
 
         extensions.wrapfunction(dirstate.dirstate, func, _wrapper)
+
+    # dirstate.status should exclude files outside sparse profile
+    def _status(
+        orig,
+        self,
+        match: "Callable[[str], bool]",
+        ignored: bool,
+        clean: bool,
+        unknown: bool,
+    ) -> "scmutil.status":
+        st = orig(self, match, ignored, clean, unknown)
+        if util.safehasattr(self, "repo"):
+            repo = self.repo
+            if util.safehasattr(repo, "sparsematch"):
+                sparsematch = repo.sparsematch()
+                st = scmutil.status(
+                    *([f for f in files if sparsematch(f)] for files in st)
+                )
+        return st
+
+    extensions.wrapfunction(dirstate.dirstate, "status", _status)
 
 
 def _setupdiff(ui) -> None:
@@ -1234,7 +1221,6 @@ def getsparsepatterns(
 
     if rawconfig is None:
         if not repo.localvfs.exists("sparse"):
-            _warnfullcheckout(repo)
             # pyre-fixme[19]: Expected 0 positional arguments.
             return SparseConfig(None, [], [])
 
@@ -1520,41 +1506,6 @@ def _pendingprofileconfigname() -> str:
     return "%s.%s" % (profilecachefile, os.getpid())
 
 
-def _warnfullcheckout(repo) -> None:
-    # Only warn once per command
-    if util.safehasattr(repo, "_warnedfullcheckout") and repo._warnedfullcheckout:
-        return
-    repo._warnedfullcheckout = True
-
-    warnlevel = repo.ui.config("sparse", "warnfullcheckout")
-    if warnlevel is None:
-        return
-
-    if warnlevel == "hardblock":
-        raise error.Abort(
-            _("full checkouts are not supported for this repository"),
-            hint=_("use EdenFS or @prog@ sparse"),
-        )
-    if warnlevel == "softblock":
-        if repo.ui.configbool("sparse", "bypassfullcheckoutwarn", False):
-            warnlevel = "warn"
-        else:
-            raise error.Abort(
-                _("full checkouts are not supported for this repository"),
-                hint=_("use EdenFS or @prog@ sparse"),
-            )
-    if warnlevel == "hint":
-        hintutil.trigger("sparse-fullcheckout")
-    else:
-        repo.ui.warn(
-            _(
-                "warning: full checkouts will soon be disabled in "
-                "this repository. Use EdenFS or @prog@ sparse to get a "
-                "smaller repository.\n"
-            )
-        )
-
-
 # A profile is either active, inactive or included; the latter is a profile
 # included (transitively) by an active profile.
 PROFILE_INACTIVE, PROFILE_ACTIVE, PROFILE_INCLUDED = _profile_flags = range(3)
@@ -1751,18 +1702,6 @@ def hintlargecheckout(dirstatesize, repo) -> str:
     )
 
 
-@hint("sparse-unsafe-profile")
-def hintsparseunsafeprofile(file, repo, ui) -> str:
-    msg = _(
-        "Your sparse profile might be incorrect, and it can lead to "
-        "downloading too much data and slower mercurial operations."
-    )
-    additionalmsg = ui.config("sparse", "unsafe_sparse_profile_message")
-    if additionalmsg:
-        msg = "{}\n{}".format(msg, additionalmsg)
-    return msg
-
-
 @hint("sparse-explain-verbose")
 def hintexplainverbose(*profiles) -> str:
     return _(
@@ -1786,15 +1725,6 @@ def hintlistverbose(profiles, filters, load_matcher) -> Optional[str]:
         )
 
 
-@hint("sparse-fullcheckout")
-def hintwarnfullcheckout() -> str:
-    return _(
-        "warning: full checkouts will eventually be disabled in "
-        "this repository. Use EdenFS or @prog@ sparse to get a "
-        "smaller repository."
-    )
-
-
 _deprecate = (
     lambda o, l=_("(DEPRECATED)"): (o[:3] + (" ".join([o[4], l]),) + o[4:])
     if l not in o[4]
@@ -1810,15 +1740,6 @@ _deprecate = (
             "force",
             False,
             _("allow changing rules even with pending changes" "(DEPRECATED)"),
-        ),
-        (
-            "",
-            "allow-unsafe-profile-changes",
-            False,
-            _(
-                "allow sparse profile change even if this change might be unsafe"
-                "(DEPRECATED)"
-            ),
         ),
         (
             "I",
@@ -1906,7 +1827,6 @@ def sparse(ui, repo, *pats, **opts) -> None:
     refresh = opts.get("refresh")
     reset = opts.get("reset")
     cwdlist = opts.get("cwd_list")
-    allowunsafeprofilechanges = opts.get("allow_unsafe_profile_changes")
     count = sum(
         [
             include,
@@ -1923,11 +1843,6 @@ def sparse(ui, repo, *pats, **opts) -> None:
     )
     if count > 1:
         raise error.Abort(_("too many flags specified"))
-
-    # Disable sparse warnings when running sparse commands, so users can get
-    # sparse checkouts.
-    origwarnfull = repo.ui.config("sparse", "warnfullcheckout")
-    repo.ui.setconfig("sparse", "warnfullcheckout", None)
 
     if count == 0:
         if repo.localvfs.exists("sparse"):
@@ -1954,7 +1869,6 @@ def sparse(ui, repo, *pats, **opts) -> None:
             enableprofile=enableprofile,
             disableprofile=disableprofile,
             force=force,
-            allowunsafeprofilechanges=allowunsafeprofilechanges,
         )
         if enableprofile:
             _checknonexistingprofiles(ui, repo, pats)
@@ -1964,7 +1878,6 @@ def sparse(ui, repo, *pats, **opts) -> None:
 
     if clearrules:
         # Put the check back in to warn people about full checkouts
-        repo.ui.setconfig("sparse", "warnfullcheckout", origwarnfull)
         _clear(ui, repo, pats, force=force)
 
     if refresh:
@@ -2001,9 +1914,6 @@ def show(ui, repo, **opts) -> None:
         if not ui.plain():
             ui.status(_("No sparse profile enabled\n"))
         return
-
-    # Disable fullcheckout warnings to allow users to sparse their fullcheckouts
-    repo.ui.setconfig("sparse", "warnfullcheckout", None)
 
     raw = repo.localvfs.readutf8("sparse")
     rawconfig = readsparseconfig(repo, raw)
@@ -2187,8 +2097,6 @@ def debugsparseexplainmatch(ui, repo, *args, **opts) -> None:
     if "eden" in repo.requirements:
         _wraprepo(ui, repo)
 
-    repo.ui.setconfig("sparse", "warnfullcheckout", None)
-
     ctx = repo["."]
 
     config = None
@@ -2331,9 +2239,6 @@ def _listprofiles(ui, repo, *pats, **opts) -> None:
     """
     _checksparse(repo)
 
-    # Disable fullcheckout warnings to allow users to sparse their fullcheckouts
-    repo.ui.setconfig("sparse", "warnfullcheckout", None)
-
     rev = scmutil.revsingle(repo, opts.get("rev")).hex()
     tocanon = functools.partial(pathutil.canonpath, repo.root, repo.getcwd())
     filters = {
@@ -2438,9 +2343,6 @@ def _explainprofile(ui, repo, *profiles, **opts) -> int:
     # Make it work in an edenfs checkout.
     if "eden" in repo.requirements:
         _wraprepo(ui, repo)
-
-    # Disable fullcheckout warnings to allow users to sparse their fullcheckouts
-    repo.ui.setconfig("sparse", "warnfullcheckout", None)
 
     if ui.plain() and not opts.get("template"):
         hint = _("invoke with -T/--template to control output format")
@@ -2588,9 +2490,6 @@ def _listfilessubcmd(ui, repo, profile: Optional[str], *files, **opts) -> int:
     """
     _checksparse(repo)
 
-    # Disable fullcheckout warnings to allow users to sparse their fullcheckouts
-    repo.ui.setconfig("sparse", "warnfullcheckout", None)
-
     rev = opts.get("rev", ".")
     try:
         raw = getrawprofile(repo, profile, rev)
@@ -2617,19 +2516,12 @@ def _listfilessubcmd(ui, repo, profile: Optional[str], *files, **opts) -> int:
 
 _common_config_opts: List[Tuple[str, str, bool, str]] = [
     ("f", "force", False, _("allow changing rules even with pending changes")),
-    (
-        "",
-        "allow-unsafe-profile-changes",
-        False,
-        _("allow sparse profile change even if this change might be unsafe"),
-    ),
 ]
 
 
 def getcommonopts(opts) -> Dict[str, Any]:
-    allowunsafeprofilechanges = opts.get("allow_unsafe_profile_changes")
     force = opts.get("force")
-    return {"allowunsafeprofilechanges": allowunsafeprofilechanges, "force": force}
+    return {"force": force}
 
 
 @subcmd("reset", _common_config_opts + commands.templateopts)
@@ -2794,13 +2686,8 @@ def _config(
     enableprofile: bool = False,
     disableprofile: bool = False,
     force: bool = False,
-    allowunsafeprofilechanges: bool = False,
 ) -> None:
     _checksparse(repo)
-
-    if not reset:
-        # Disable fullcheckout warnings to allow users to sparse their fullcheckouts
-        repo.ui.setconfig("sparse", "warnfullcheckout", None)
 
     """
     Perform a sparse config update. Only one of the kwargs may be specified.
@@ -2875,12 +2762,7 @@ def _config(
                 newinclude.difference_update(pats)
                 newexclude.difference_update(pats)
 
-            unsafemarkerfile = _find_unsafe_marker_files(repo, ui)
             repo.writesparseconfig(newinclude, newexclude, newprofiles)
-            # Check that new sparse profile is safe, however do it only
-            # if previous sparse profile was safe as well
-            if unsafemarkerfile is None and not allowunsafeprofilechanges:
-                _validate_new_sparse_config(repo, ui)
 
             fcounts = list(
                 map(len, _refresh(ui, repo, oldstatus, oldsparsematch, force))
@@ -2899,41 +2781,6 @@ def _config(
             raise
     finally:
         wlock.release()
-
-
-def _find_unsafe_marker_files(repo, ui):
-    if not _hassparse(repo):
-        return None
-    unsafesparseprofilemarkerfiles = ui.configlist(
-        "sparse", "unsafe_sparse_profile_marker_files"
-    )
-    if not unsafesparseprofilemarkerfiles:
-        return None
-    sparsematch = repo.sparsematch()
-    for f in unsafesparseprofilemarkerfiles:
-        if sparsematch(f):
-            return f
-    return None
-
-
-def _validate_new_sparse_config(repo, ui) -> None:
-    unsafemarkerfile = _find_unsafe_marker_files(repo, ui)
-    if unsafemarkerfile is not None:
-        msg = (
-            "'{}' file is included in sparse profile, "
-            + "it might not be safe because it may introduce a large "
-            + "amount of data into your repository"
-        ).format(unsafemarkerfile)
-        additionalmsg = ui.config("sparse", "unsafe_sparse_profile_message")
-        if additionalmsg:
-            msg = "{}\n{}".format(msg, additionalmsg)
-        raise error.Abort(
-            msg,
-            hint=(
-                "If you are know what you are doing re-run with allow-unsafe-profile-changes, "
-                + "otherwise contact Source control @ fb"
-            ),
-        )
 
 
 def _checknonexistingprofiles(ui, repo, profiles) -> None:
@@ -3025,8 +2872,6 @@ def _import(ui, repo, files, opts, force: bool = False) -> None:
 
 def _clear(ui, repo, files, force: bool = False) -> None:
     _checksparse(repo)
-
-    _warnfullcheckout(repo)
 
     with repo.wlock():
         raw = ""

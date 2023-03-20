@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, List, Optional, Tuple
 
-from edenscm import error, git
+from edenscm import error, git, hintutil
 from edenscm.i18n import _
 from edenscm.node import hex, nullid
 from edenscm.result import Result
@@ -66,7 +66,9 @@ class SubmitWorkflow(Enum):
 
     @staticmethod
     def from_config(ui) -> "SubmitWorkflow":
-        workflow = ui.config("github", "pr_workflow")
+        workflow = ui.config(
+            "github", "pr-workflow", ui.config("github", "pr_workflow")
+        )
         if not workflow or workflow == "overlap":
             # For now, default to OVERLAP.
             return SubmitWorkflow.OVERLAP
@@ -120,27 +122,12 @@ class PullRequestParams:
     number: int
 
 
-async def update_commits_in_stack(
-    ui, repo, github_repo: GitHubRepo, is_draft: bool
-) -> int:
-    parents = repo.dirstate.parents()
-    if parents[0] == nullid:
-        ui.status_err(_("commit has no parent: currently unsupported\n"))
-        return 1
-
-    store = PullRequestStore(repo)
+async def get_partitions(ui, repo, store, filter) -> List[List[CommitData]]:
     commits_to_process = await asyncio.gather(
-        *[
-            derive_commit_data(node, repo, store)
-            for node in repo.nodes("sort(. %% public(), -rev)")
-        ]
+        *[derive_commit_data(node, repo, store) for node in repo.nodes(filter)]
     )
-
     if not commits_to_process:
-        ui.status_err(_("no commits to submit\n"))
-        return 0
-
-    workflow = SubmitWorkflow.from_config(ui)
+        return []
 
     # Partition the chain.
     partitions: List[List[CommitData]] = []
@@ -154,14 +141,26 @@ async def update_commits_in_stack(
                 continue
         else:
             partitions.append([commit])
+    return partitions
 
+
+async def update_commits_in_stack(
+    ui, repo, github_repo: GitHubRepo, is_draft: bool
+) -> int:
+    parents = repo.dirstate.parents()
+    if parents[0] == nullid:
+        ui.status_err(_("commit has no parent: currently unsupported\n"))
+        return 1
+
+    store = PullRequestStore(repo)
+
+    workflow = SubmitWorkflow.from_config(ui)
+
+    partitions = await get_partitions(ui, repo, store, "sort(. %% public(), -rev)")
     if not partitions:
-        # It is possible that all of the commits_to_process were marked as
-        # followers.
         ui.status_err(_("no commits to submit\n"))
         return 0
-
-    origin = get_origin(ui)
+    origin = get_push_origin(ui)
     use_placeholder_strategy = ui.configbool("github", "placeholder-strategy")
     if use_placeholder_strategy:
         params = await create_placeholder_strategy_params(
@@ -209,6 +208,7 @@ async def update_commits_in_stack(
             assert isinstance(params, SerialStrategyParams)
             await create_pull_requests_serially(
                 params.pull_requests_to_create,
+                workflow,
                 repository,
                 store,
                 ui,
@@ -228,7 +228,7 @@ async def update_commits_in_stack(
         repository = await get_repository_for_origin(origin, github_repo.hostname)
     rewrite_and_archive_requests = [
         rewrite_pull_request_body(
-            partitions, index, pr_numbers_and_num_commits, repository, ui
+            partitions, index, workflow, pr_numbers_and_num_commits, repository, ui
         )
         for index in range(len(partitions))
     ] + [
@@ -247,6 +247,7 @@ async def update_commits_in_stack(
 async def rewrite_pull_request_body(
     partitions: List[List[CommitData]],
     index: int,
+    workflow: SubmitWorkflow,
     pr_numbers_and_num_commits: List[Tuple[int, int]],
     repository: Repository,
     ui,
@@ -255,9 +256,8 @@ async def rewrite_pull_request_body(
     # of this branch. Recall that partitions is ordered from the top of the
     # stack to the bottom.
     partition = partitions[index]
-    if index == len(partitions) - 1:
-        base = repository.get_base_branch()
-    else:
+    base = repository.get_base_branch()
+    if workflow == SubmitWorkflow.SINGLE and index < len(partitions) - 1:
         base = none_throws(partitions[index + 1][0].head_branch_name)
 
     head_commit_data = partition[0]
@@ -267,9 +267,18 @@ async def rewrite_pull_request_body(
         pr_numbers_and_num_commits,
         index,
         repository,
+        reviewstack=ui.configbool("github", "pull-request-include-reviewstack"),
     )
     pr = head_commit_data.pr
     assert pr
+
+    if pr.state != PullRequestState.OPEN:
+        ui.status_err(
+            _("warning, not updating #%d because it isn't open\n") % pr.number
+        )
+        hintutil.triggershow(ui, "unlink-closed-pr")
+        return
+
     result = await gh_submit.update_pull_request(
         repository.hostname, pr.node_id, title, body, base
     )
@@ -345,6 +354,7 @@ async def create_serial_strategy_params(
             # Consider including username in branch_name?
             branch_name = f"pr{next_pull_request_number}"
             refs_to_update.append(f"{hex(top.node)}:refs/heads/{branch_name}")
+            top.head_branch_name = branch_name
             pull_requests_to_create.append((top, branch_name))
 
     return SerialStrategyParams(refs_to_update, pull_requests_to_create, repository)
@@ -352,6 +362,7 @@ async def create_serial_strategy_params(
 
 async def create_pull_requests_serially(
     commits: List[Tuple[CommitData, str]],
+    workflow: SubmitWorkflow,
     repository: Repository,
     store: PullRequestStore,
     ui,
@@ -364,15 +375,17 @@ async def create_pull_requests_serially(
     """
     head_ref_prefix = f"{repository.owner}:" if repository.is_fork else ""
     owner, name = repository.get_upstream_owner_and_name()
-    # Because these will be "overlapping" pull requests, all share the same
-    # base.
-    base = repository.get_base_branch()
     hostname = repository.hostname
 
     # Create the pull requests in order serially to give us the best chance of
     # the number in the branch name matching that of the actual pull request.
     commits_to_update = []
+    parent = None
     for commit, branch_name in commits:
+        base = repository.get_base_branch()
+        if workflow == SubmitWorkflow.SINGLE and parent:
+            base = none_throws(parent.head_branch_name)
+
         body = commit.get_msg()
         title = firstline(body)
         result = await gh_submit.create_pull_request(
@@ -403,6 +416,8 @@ async def create_pull_requests_serially(
         pr_id = PullRequestId(hostname=hostname, owner=owner, name=name, number=number)
         store.map_commit_to_pull_request(commit.node, pr_id)
         commits_to_update.append((commit, pr_id))
+
+        parent = commit
 
     # Now that all of the pull requests have been created, update the .pr field
     # on each CommitData. We prioritize the create_pull_request() calls to try
@@ -597,12 +612,12 @@ async def get_repository_for_origin(origin: str, hostname: str) -> Repository:
     return await get_repo(hostname, origin_owner, origin_name)
 
 
-def get_origin(ui) -> str:
+def get_push_origin(ui) -> str:
     test_url = os.environ.get("SL_TEST_GH_URL")
     if test_url:
         origin = test_url
     else:
-        origin = ui.config("paths", "default")
+        origin = ui.expandpath("default-push", "default")
     if origin:
         return origin
     else:

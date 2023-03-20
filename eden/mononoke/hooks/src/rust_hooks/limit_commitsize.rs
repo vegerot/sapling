@@ -9,7 +9,7 @@ use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use context::CoreContext;
 use mononoke_types::BonsaiChangeset;
 use regex::Regex;
@@ -150,7 +150,7 @@ impl ChangesetHook for LimitCommitsize {
     async fn run<'this: 'cs, 'ctx: 'this, 'cs, 'fetcher: 'cs>(
         &'this self,
         _ctx: &'ctx CoreContext,
-        _bookmark: &BookmarkName,
+        _bookmark: &BookmarkKey,
         changeset: &'cs BonsaiChangeset,
         _content_manager: &'fetcher dyn FileContentManager,
         cross_repo_push_source: CrossRepoPushSource,
@@ -261,7 +261,7 @@ mod test {
         let hook_execution = hook
             .run(
                 ctx,
-                &BookmarkName::new("book")?,
+                &BookmarkKey::new("book")?,
                 &bcs,
                 &content_manager,
                 CrossRepoPushSource::NativeToThisRepo,
@@ -277,7 +277,7 @@ mod test {
         let hook_execution = hook
             .run(
                 ctx,
-                &BookmarkName::new("book")?,
+                &BookmarkKey::new("book")?,
                 &bcs,
                 &content_manager,
                 CrossRepoPushSource::NativeToThisRepo,
@@ -300,7 +300,7 @@ mod test {
         let hook_execution = hook
             .run(
                 ctx,
-                &BookmarkName::new("book")?,
+                &BookmarkKey::new("book")?,
                 &bcs,
                 &content_manager,
                 CrossRepoPushSource::NativeToThisRepo,
@@ -346,7 +346,7 @@ mod test {
         let hook_execution = hook
             .run(
                 ctx,
-                &BookmarkName::new("book")?,
+                &BookmarkKey::new("book")?,
                 &bcs,
                 &content_manager,
                 CrossRepoPushSource::NativeToThisRepo,
@@ -362,7 +362,7 @@ mod test {
         let hook_execution = hook
             .run(
                 ctx,
-                &BookmarkName::new("book")?,
+                &BookmarkKey::new("book")?,
                 &bcs,
                 &content_manager,
                 CrossRepoPushSource::NativeToThisRepo,
@@ -409,7 +409,7 @@ mod test {
         let hook_execution = hook
             .run(
                 ctx,
-                &BookmarkName::new("book")?,
+                &BookmarkKey::new("book")?,
                 &bcs,
                 &content_manager,
                 CrossRepoPushSource::NativeToThisRepo,
@@ -454,7 +454,7 @@ mod test {
         let hook_execution = hook
             .run(
                 ctx,
-                &BookmarkName::new("book")?,
+                &BookmarkKey::new("book")?,
                 &bcs,
                 &content_manager,
                 CrossRepoPushSource::NativeToThisRepo,
@@ -467,6 +467,58 @@ mod test {
             HookExecution::Accepted => {
                 return Err(anyhow!("should be rejected"));
             }
+        };
+
+        Ok(())
+    }
+
+    #[fbinit::test]
+    async fn test_limitcommitsize_ignored_files(fb: FacebookInit) -> Result<(), Error> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: BasicTestRepo = test_repo_factory::build_empty(fb)?;
+        borrowed!(ctx, repo);
+
+        let cs_id = CreateCommitContext::new_root(ctx, repo)
+            .add_file("dir/a", "a")
+            .add_file("dir/b", "b")
+            .add_file("ignored_dir/project/c", "c")
+            .add_file("something/ignored_dir/project/d", "d")
+            .add_file("test_ignored_dir/schemas/e", "e")
+            .add_file("ignored_dir/schemas/f", "f")
+            .commit()
+            .await?;
+
+        let bcs = cs_id.load(ctx, &repo.repo_blobstore).await?;
+
+        let content_manager = RepoFileContentManager::new(&repo);
+        let hook = build_hook_with_limits(
+            hashmap! {
+                "commitsizelimit".to_string() => 2,
+                "changed_files_limit".to_string() => 2,
+            },
+            hashmap! {
+                "ignore_path_regexes".to_string() => vec![r"(^|/)(test_)?ignored_dir/(project|schemas)".to_string()],
+            },
+            hashmap! {},
+        )?;
+        let hook_execution = hook
+            .run(
+                ctx,
+                &BookmarkKey::new("book")?,
+                &bcs,
+                &content_manager,
+                CrossRepoPushSource::NativeToThisRepo,
+                PushAuthoredBy::User,
+            )
+            .await?;
+
+        match hook_execution {
+            HookExecution::Rejected(_) => {
+                return Err(anyhow!(
+                    "files in ignored_dir should not count towards limit"
+                ));
+            }
+            HookExecution::Accepted => {}
         };
 
         Ok(())

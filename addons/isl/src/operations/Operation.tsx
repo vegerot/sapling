@@ -6,12 +6,15 @@
  */
 
 import type {
+  ApplyMergeConflictsPreviewsFuncType,
   ApplyPreviewsFuncType,
   ApplyUncommittedChangesPreviewsFuncType,
+  MergeConflictsPreviewContext,
   PreviewContext,
   UncommittedChangesPreviewContext,
 } from '../previews';
 import type {CommandArg} from '../types';
+import type {TrackEventName} from 'isl-server/src/analytics/eventNames';
 
 import {CommandRunner} from '../types';
 import {randomId} from 'shared/utils';
@@ -26,6 +29,8 @@ export abstract class Operation {
   static operationName: string;
   public id: string = randomId();
 
+  constructor(public trackEventName: TrackEventName) {}
+
   abstract getArgs(): Array<CommandArg>;
 
   public runner: CommandRunner = CommandRunner.Sapling;
@@ -39,4 +44,13 @@ export abstract class Operation {
   makeOptimisticUncommittedChangesApplier?(
     context: UncommittedChangesPreviewContext,
   ): ApplyUncommittedChangesPreviewsFuncType | undefined;
+
+  makeOptimisticMergeConflictsApplier?(
+    context: MergeConflictsPreviewContext,
+  ): ApplyMergeConflictsPreviewsFuncType | undefined;
+}
+
+/** Access static opName field of an operation */
+export function getOpName(op: Operation): string {
+  return (op.constructor as unknown as {opName: string}).opName;
 }

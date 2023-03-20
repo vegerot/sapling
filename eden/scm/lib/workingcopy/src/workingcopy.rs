@@ -50,6 +50,7 @@ use crate::filesystem::PendingChangeResult;
 use crate::filesystem::PendingChanges;
 use crate::physicalfs::PhysicalFileSystem;
 use crate::status::compute_status;
+use crate::util::walk_treestate;
 use crate::watchmanfs::WatchmanFileSystem;
 
 type ArcReadFileContents = Arc<dyn ReadFileContents<Error = anyhow::Error> + Send + Sync>;
@@ -302,13 +303,13 @@ impl WorkingCopy {
 
         let manifests =
             WorkingCopy::current_manifests(&self.treestate.lock(), &self.tree_resolver)?;
-        let mut non_ignore_matchers: Vec<Arc<dyn Matcher + Send + Sync + 'static>> =
+        let mut manifest_matchers: Vec<Arc<dyn Matcher + Send + Sync + 'static>> =
             Vec::with_capacity(manifests.len());
 
         let case_sensitive = self.vfs.case_sensitive();
 
         for manifest in manifests.iter() {
-            non_ignore_matchers.push(Arc::new(manifest_tree::ManifestMatcher::new(
+            manifest_matchers.push(Arc::new(manifest_tree::ManifestMatcher::new(
                 manifest.clone(),
                 case_sensitive,
             )));
@@ -319,22 +320,28 @@ impl WorkingCopy {
             self.sparse_matcher(&manifests)?,
         ]));
 
-        let matcher = Arc::new(DifferenceMatcher::new(
-            matcher,
-            DifferenceMatcher::new(
-                self.ignore_matcher.clone(),
-                UnionMatcher::new(non_ignore_matchers),
-            ),
+        // The GitignoreMatcher minus files in the repo. In other
+        // words, it does not match an ignored file that has been
+        // previously committed.
+        let ignore_matcher = Arc::new(DifferenceMatcher::new(
+            self.ignore_matcher.clone(),
+            UnionMatcher::new(manifest_matchers),
         ));
+
+        let matcher = Arc::new(DifferenceMatcher::new(matcher, ignore_matcher.clone()));
+
         let pending_changes = self
             .filesystem
             .lock()
             .inner
-            .pending_changes(matcher.clone(), last_write, config, io)?
+            .pending_changes(matcher.clone(), ignore_matcher, last_write, config, io)?
             .filter_map(|result| match result {
                 Ok(PendingChangeResult::File(change_type)) => {
                     match matcher.matches_file(change_type.get_path()) {
-                        Ok(true) => Some(Ok(change_type)),
+                        Ok(true) => {
+                            tracing::trace!(?change_type, "pending change");
+                            Some(Ok(change_type))
+                        }
                         Err(e) => Some(Err(e)),
                         _ => None,
                     }
@@ -415,22 +422,31 @@ impl WorkingCopy {
         Ok(status_builder)
     }
 
-    pub fn copymap(&self) -> Result<Vec<(RepoPathBuf, RepoPathBuf)>> {
-        self.treestate
-            .lock()
-            .visit_by_state(StateFlags::COPIED)?
-            .into_iter()
-            .map(|(path, state)| {
+    pub fn copymap(
+        &self,
+        matcher: Arc<dyn Matcher + Send + Sync + 'static>,
+    ) -> Result<Vec<(RepoPathBuf, RepoPathBuf)>> {
+        let mut copied: Vec<(RepoPathBuf, RepoPathBuf)> = Vec::new();
+
+        walk_treestate(
+            &mut self.treestate.lock(),
+            matcher,
+            StateFlags::COPIED,
+            StateFlags::empty(),
+            |path, state| {
                 let copied_path = state
                     .copied
-                    .ok_or_else(|| anyhow!("Invalid treestate entry for {}: missing copied from path on file with COPIED flag", String::from_utf8_lossy(&path)))
+                    .clone()
+                    .ok_or_else(|| anyhow!("Invalid treestate entry for {}: missing copied from path on file with COPIED flag", path))
                     .map(|p| p.into_vec())
                     .and_then(|p| RepoPathBuf::from_utf8(p).map_err(|e| anyhow!(e)))?;
-                Ok((
-                    RepoPathBuf::from_utf8(path).map_err(|e| anyhow!(e))?,
-                    copied_path,
-                ))
-            })
-            .collect()
+
+                copied.push((path, copied_path));
+
+                Ok(())
+            },
+        )?;
+
+        Ok(copied)
     }
 }

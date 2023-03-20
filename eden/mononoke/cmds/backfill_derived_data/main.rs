@@ -28,6 +28,7 @@ use blame::BlameRoot;
 use blobrepo::BlobRepo;
 use blobrepo_override::DangerousOverride;
 use blobstore::StoreLoadable;
+use bookmarks::BookmarkCategory;
 use bookmarks::BookmarkKind;
 use bookmarks::BookmarkPagination;
 use bookmarks::BookmarkPrefix;
@@ -1078,9 +1079,9 @@ async fn get_batch_ctx(ctx: &CoreContext, limit_qps: bool) -> CoreContext {
         // create new context so each derivation batch has its own trace
         // and is rate-limited
         let session = SessionContainer::builder(ctx.fb)
-            .blobstore_maybe_read_qps_limiter(tunables().get_backfill_read_qps())
+            .blobstore_maybe_read_qps_limiter(tunables().backfill_read_qps().unwrap_or_default())
             .await
-            .blobstore_maybe_write_qps_limiter(tunables().get_backfill_write_qps())
+            .blobstore_maybe_write_qps_limiter(tunables().backfill_write_qps().unwrap_or_default())
             .await
             .build();
         session.new_context(
@@ -1399,6 +1400,7 @@ async fn get_most_recent_heads(ctx: &CoreContext, repo: &BlobRepo) -> Result<Vec
             ctx.clone(),
             Freshness::MostRecent,
             &BookmarkPrefix::empty(),
+            BookmarkCategory::ALL,
             BookmarkKind::ALL_PUBLISHING,
             &BookmarkPagination::FromStart,
             std::u64::MAX,

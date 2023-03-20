@@ -7,10 +7,15 @@
 
 import type {CommitTree, CommitTreeWithPreviews} from './getCommitTree';
 import type {Operation} from './operations/Operation';
-import type {OperationInfo} from './serverAPIState';
-import type {ChangedFile, CommitInfo, Hash, UncommittedChanges} from './types';
+import type {OperationInfo, OperationList} from './serverAPIState';
+import type {ChangedFile, CommitInfo, Hash, MergeConflicts, UncommittedChanges} from './types';
 
+import {tracker} from './analytics';
+import {getOpName} from './operations/Operation';
 import {
+  latestCommitsData,
+  latestUncommittedChangesData,
+  mergeConflicts,
   latestCommitTree,
   latestCommitTreeMap,
   latestHeadCommit,
@@ -20,7 +25,7 @@ import {
 } from './serverAPIState';
 import {useEffect} from 'react';
 import {atom, selector, useRecoilState, useRecoilValue} from 'recoil';
-import {notEmpty} from 'shared/utils';
+import {notEmpty, unwrap} from 'shared/utils';
 
 export enum CommitPreview {
   REBASE_ROOT = 'rebase-root',
@@ -67,10 +72,159 @@ export type ApplyUncommittedChangesPreviewsFuncType = (
   changes: UncommittedChanges,
 ) => UncommittedChanges;
 
+/**
+ * Like ApplyPreviewsFuncType, this provides a way to alter the set of Merge Conflicts.
+ */
+export type ApplyMergeConflictsPreviewsFuncType = (
+  conflicts: MergeConflicts | undefined,
+) => MergeConflicts | undefined;
+
 export const operationBeingPreviewed = atom<Operation | undefined>({
   key: 'operationBeingPreviewed',
   default: undefined,
 });
+
+function applyPreviewsToChangedFiles(
+  files: Array<ChangedFile>,
+  list: OperationList,
+  queued: Array<Operation>,
+): Array<ChangedFile> {
+  const currentOperation = list.currentOperation;
+
+  // gather operations from past, current, and queued commands which could have optimistic state appliers
+  type Applier = (
+    context: UncommittedChangesPreviewContext,
+  ) => ApplyUncommittedChangesPreviewsFuncType | undefined;
+  const appliersSources: Array<Applier> = [];
+
+  // previous commands
+  for (const op of list.operationHistory) {
+    if (op != null && !op.hasCompletedUncommittedChangesOptimisticState) {
+      if (op.operation.makeOptimisticUncommittedChangesApplier != null) {
+        appliersSources.push(
+          op.operation.makeOptimisticUncommittedChangesApplier.bind(op.operation),
+        );
+      }
+    }
+  }
+
+  // currently running/last command
+  if (
+    currentOperation != null &&
+    !currentOperation.hasCompletedUncommittedChangesOptimisticState &&
+    // don't show optimistic state if we hit an error
+    (currentOperation.exitCode == null || currentOperation.exitCode === 0)
+  ) {
+    if (currentOperation.operation.makeOptimisticUncommittedChangesApplier != null) {
+      appliersSources.push(
+        currentOperation.operation.makeOptimisticUncommittedChangesApplier.bind(
+          currentOperation.operation,
+        ),
+      );
+    }
+  }
+
+  // queued commands
+  for (const op of queued) {
+    if (op != null) {
+      if (op.makeOptimisticUncommittedChangesApplier != null) {
+        appliersSources.push(op.makeOptimisticUncommittedChangesApplier.bind(op));
+      }
+    }
+  }
+
+  // apply in order
+  if (appliersSources.length) {
+    let finalChanges = files;
+
+    for (const applierSource of appliersSources) {
+      const context: UncommittedChangesPreviewContext = {
+        uncommittedChanges: files,
+      };
+
+      const applier = applierSource(context);
+      if (applier == null) {
+        continue;
+      }
+
+      finalChanges = applier(finalChanges);
+    }
+    return finalChanges;
+  }
+
+  return files;
+}
+
+function applyPreviewsToMergeConflicts(
+  conflicts: MergeConflicts,
+  list: OperationList,
+  queued: Array<Operation>,
+): MergeConflicts | undefined {
+  const currentOperation = list.currentOperation;
+  if (conflicts.state !== 'loaded') {
+    return conflicts;
+  }
+
+  // gather operations from past, current, and queued commands which could have optimistic state appliers
+  type Applier = (
+    context: MergeConflictsPreviewContext,
+  ) => ApplyMergeConflictsPreviewsFuncType | undefined;
+  const appliersSources: Array<Applier> = [];
+
+  // previous commands
+  for (const op of list.operationHistory) {
+    if (op != null && !op.hasCompletedMergeConflictsOptimisticState) {
+      if (op.operation.makeOptimisticMergeConflictsApplier != null) {
+        appliersSources.push(op.operation.makeOptimisticMergeConflictsApplier.bind(op.operation));
+      }
+    }
+  }
+
+  // currently running/last command
+  if (
+    currentOperation != null &&
+    !currentOperation.hasCompletedMergeConflictsOptimisticState &&
+    // don't show optimistic state if we hit an error
+    (currentOperation.exitCode == null || currentOperation.exitCode === 0)
+  ) {
+    if (currentOperation.operation.makeOptimisticMergeConflictsApplier != null) {
+      appliersSources.push(
+        currentOperation.operation.makeOptimisticMergeConflictsApplier.bind(
+          currentOperation.operation,
+        ),
+      );
+    }
+  }
+
+  // queued commands
+  for (const op of queued) {
+    if (op != null) {
+      if (op.makeOptimisticMergeConflictsApplier != null) {
+        appliersSources.push(op.makeOptimisticMergeConflictsApplier.bind(op));
+      }
+    }
+  }
+
+  // apply in order
+  if (appliersSources.length) {
+    let finalChanges: MergeConflicts | undefined = conflicts;
+
+    for (const applierSource of appliersSources) {
+      const context: MergeConflictsPreviewContext = {
+        conflicts,
+      };
+
+      const applier = applierSource(context);
+      if (applier == null) {
+        continue;
+      }
+
+      finalChanges = applier(finalChanges);
+    }
+    return finalChanges;
+  }
+  return conflicts;
+}
 
 export const uncommittedChangesWithPreviews = selector({
   key: 'uncommittedChangesWithPreviews',
@@ -78,70 +232,22 @@ export const uncommittedChangesWithPreviews = selector({
     const list = get(operationList);
     const queued = get(queuedOperations);
     const uncommittedChanges = get(latestUncommittedChanges);
-    const currentOperation = list.currentOperation;
 
-    // gather operations from past, current, and queued commands which could have optimistic state appliers
-    type Applier = (
-      context: UncommittedChangesPreviewContext,
-    ) => ApplyUncommittedChangesPreviewsFuncType | undefined;
-    const appliersSources: Array<Applier> = [];
+    return applyPreviewsToChangedFiles(uncommittedChanges, list, queued);
+  },
+});
 
-    // previous commands
-    for (const op of list.operationHistory) {
-      if (op != null && !op.hasCompletedUncommittedChangesOptimisticState) {
-        if (op.operation.makeOptimisticUncommittedChangesApplier != null) {
-          appliersSources.push(
-            op.operation.makeOptimisticUncommittedChangesApplier.bind(op.operation),
-          );
-        }
-      }
+export const optimisticMergeConflicts = selector<MergeConflicts | undefined>({
+  key: 'optimisticMergeConflicts',
+  get: ({get}) => {
+    const list = get(operationList);
+    const queued = get(queuedOperations);
+    const conflicts = get(mergeConflicts);
+    if (conflicts?.files == null) {
+      return conflicts;
     }
 
-    // currently running/last command
-    if (
-      currentOperation != null &&
-      !currentOperation.hasCompletedUncommittedChangesOptimisticState &&
-      // don't show optimistic state if we hit an error
-      (currentOperation.exitCode == null || currentOperation.exitCode === 0)
-    ) {
-      if (currentOperation.operation.makeOptimisticUncommittedChangesApplier != null) {
-        appliersSources.push(
-          currentOperation.operation.makeOptimisticUncommittedChangesApplier.bind(
-            currentOperation.operation,
-          ),
-        );
-      }
-    }
-
-    // queued commands
-    for (const op of queued) {
-      if (op != null) {
-        if (op.makeOptimisticUncommittedChangesApplier != null) {
-          appliersSources.push(op.makeOptimisticUncommittedChangesApplier.bind(op));
-        }
-      }
-    }
-
-    // apply in order
-    if (appliersSources.length) {
-      let finalChanges = uncommittedChanges;
-
-      for (const applierSource of appliersSources) {
-        const context: UncommittedChangesPreviewContext = {
-          uncommittedChanges,
-        };
-
-        const applier = applierSource(context);
-        if (applier == null) {
-          continue;
-        }
-
-        finalChanges = applier(finalChanges);
-      }
-      return finalChanges;
-    }
-
-    return uncommittedChanges;
+    return applyPreviewsToMergeConflicts(conflicts, list, queued);
   },
 });
 
@@ -263,14 +369,12 @@ export const treeWithPreviews = selector({
  * when ongoingOperation is used elsewhere in the tree
  */
 export function useMarkOperationsCompleted(): void {
-  // TODO: re-write this using treeWithPreviews.
-  // `treeWithPreviews` should make the determination of which operations
-  // should be marked as completed, so we don't duplicate the
-  // traversal of the previews here and it already knows everything about previews.
+  const fetchedCommits = useRecoilValue(latestCommitsData);
   const trees = useRecoilValue(latestCommitTree);
   const headCommit = useRecoilValue(latestHeadCommit);
   const treeMap = useRecoilValue(latestCommitTreeMap);
-  const uncommittedChanges = useRecoilValue(latestUncommittedChanges);
+  const uncommittedChanges = useRecoilValue(latestUncommittedChangesData);
+  const conflicts = useRecoilValue(mergeConflicts);
 
   const [list, setOperationList] = useRecoilState(operationList);
 
@@ -285,42 +389,59 @@ export function useMarkOperationsCompleted(): void {
       treeMap,
     };
     const uncommittedContext = {
-      uncommittedChanges,
+      uncommittedChanges: uncommittedChanges.files ?? [],
+    };
+    const mergeConflictsContext = {
+      conflicts,
     };
     const currentOperation = list.currentOperation;
 
     for (const operation of [...list.operationHistory, currentOperation]) {
-      toMarkResolved.push(
-        operation
-          ? shouldMarkOptimisticChangesResolved(operation, context, uncommittedContext)
-          : undefined,
-      );
+      if (operation) {
+        toMarkResolved.push(
+          shouldMarkOptimisticChangesResolved(
+            operation,
+            context,
+            uncommittedContext,
+            mergeConflictsContext,
+          ),
+        );
+      }
     }
-    if (toMarkResolved.some(Boolean)) {
+    if (toMarkResolved.some(notEmpty)) {
       const operationHistory = [...list.operationHistory];
       const currentOperation =
         list.currentOperation == null ? undefined : {...list.currentOperation};
       for (let i = 0; i < toMarkResolved.length - 1; i++) {
-        if (toMarkResolved[i] == 'commits' || toMarkResolved[i] === 'both') {
+        if (toMarkResolved[i]?.commits) {
           operationHistory[i] = {
             ...operationHistory[i],
             hasCompletedOptimisticState: true,
           };
         }
-        if (toMarkResolved[i] == 'files' || toMarkResolved[i] === 'both') {
+        if (toMarkResolved[i]?.files) {
           operationHistory[i] = {
             ...operationHistory[i],
             hasCompletedUncommittedChangesOptimisticState: true,
           };
         }
+        if (toMarkResolved[i]?.conflicts) {
+          operationHistory[i] = {
+            ...operationHistory[i],
+            hasCompletedMergeConflictsOptimisticState: true,
+          };
+        }
       }
       const markCurrentOpResolved = toMarkResolved[toMarkResolved.length - 1];
       if (markCurrentOpResolved && currentOperation != null) {
-        if (markCurrentOpResolved == 'commits' || markCurrentOpResolved === 'both') {
+        if (markCurrentOpResolved.commits) {
           currentOperation.hasCompletedOptimisticState = true;
         }
-        if (markCurrentOpResolved == 'files' || markCurrentOpResolved === 'both') {
+        if (markCurrentOpResolved.files) {
           currentOperation.hasCompletedUncommittedChangesOptimisticState = true;
+        }
+        if (markCurrentOpResolved.conflicts) {
+          currentOperation.hasCompletedMergeConflictsOptimisticState = true;
         }
       }
       setOperationList({operationHistory, currentOperation});
@@ -330,49 +451,84 @@ export function useMarkOperationsCompleted(): void {
       operation: OperationInfo,
       context: PreviewContext,
       uncommittedChangesContext: UncommittedChangesPreviewContext,
-    ): 'commits' | 'files' | 'both' | undefined {
+      mergeConflictsContext: MergeConflictsPreviewContext,
+    ): {commits: boolean; files: boolean; conflicts: boolean} | undefined {
       let files = false;
       let commits = false;
+      let conflicts = false;
 
       if (operation != null && !operation.hasCompletedUncommittedChangesOptimisticState) {
         if (operation.operation.makeOptimisticUncommittedChangesApplier != null) {
           const optimisticApplier =
             operation.operation.makeOptimisticUncommittedChangesApplier(uncommittedChangesContext);
-          if (
-            operation.exitCode != null &&
-            (optimisticApplier == null || operation.exitCode !== 0)
-          ) {
-            files = true;
+          if (operation.exitCode != null) {
+            if (optimisticApplier == null || operation.exitCode !== 0) {
+              files = true;
+            } else if (
+              uncommittedChanges.fetchStartTimestamp > unwrap(operation.endTime).valueOf()
+            ) {
+              tracker.track('OptimisticFilesStateForceResolved', {extras: {}});
+              files = true;
+            }
           }
         } else if (operation.exitCode != null) {
           files = true;
         }
       }
 
+      if (operation != null && !operation.hasCompletedMergeConflictsOptimisticState) {
+        if (operation.operation.makeOptimisticMergeConflictsApplier != null) {
+          const optimisticApplier =
+            operation.operation.makeOptimisticMergeConflictsApplier(mergeConflictsContext);
+          if (operation.exitCode != null) {
+            if (optimisticApplier == null || operation.exitCode !== 0) {
+              conflicts = true;
+            } else if (
+              (mergeConflictsContext.conflicts?.fetchStartTimestamp ?? 0) >
+              unwrap(operation.endTime).valueOf()
+            ) {
+              tracker.track('OptimisticConflictsStateForceResolved', {
+                extras: {operation: getOpName(operation.operation)},
+              });
+              conflicts = true;
+            }
+          }
+        } else if (operation.exitCode != null) {
+          conflicts = true;
+        }
+      }
+
       if (operation != null && !operation.hasCompletedOptimisticState) {
         if (operation.operation.makeOptimisticApplier != null) {
           const optimisticApplier = operation.operation.makeOptimisticApplier(context);
-          if (
-            operation.exitCode != null &&
-            (optimisticApplier == null || operation.exitCode !== 0)
-          ) {
-            commits = true;
+          if (operation.exitCode != null) {
+            if (optimisticApplier == null || operation.exitCode !== 0) {
+              commits = true;
+            } else if (fetchedCommits.fetchStartTimestamp > unwrap(operation.endTime).valueOf()) {
+              tracker.track('OptimisticCommitsStateForceResolved', {extras: {}});
+              commits = true;
+            }
           }
         } else if (operation.exitCode != null) {
           commits = true;
         }
       }
 
-      if (files && commits) {
-        return 'both';
-      } else if (files) {
-        return 'files';
-      } else if (commits) {
-        return 'commits';
+      if (commits || files || conflicts) {
+        return {commits, files, conflicts};
       }
       return undefined;
     }
-  }, [list, setOperationList, headCommit, trees, treeMap, uncommittedChanges]);
+  }, [
+    list,
+    setOperationList,
+    headCommit,
+    trees,
+    treeMap,
+    uncommittedChanges,
+    conflicts,
+    fetchedCommits,
+  ]);
 }
 
 /** Set of info about commit tree to generate appropriate previews */
@@ -385,3 +541,29 @@ export type PreviewContext = {
 export type UncommittedChangesPreviewContext = {
   uncommittedChanges: UncommittedChanges;
 };
+
+export type MergeConflictsPreviewContext = {
+  conflicts: MergeConflicts | undefined;
+};
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type Class<T> = new (...args: any[]) => T;
+/**
+ * React hook which looks in operation queue and history to see if a
+ * particular operation is running or queued to run.
+ * ```
+ * const isRunning = useIsOperationRunningOrQueued(PullOperation);
+ * ```
+ */
+export function useIsOperationRunningOrQueued(
+  cls: Class<Operation>,
+): 'running' | 'queued' | undefined {
+  const list = useRecoilValue(operationList);
+  const queued = useRecoilValue(queuedOperations);
+  if (list.currentOperation?.operation instanceof cls && list.currentOperation?.exitCode == null) {
+    return 'running';
+  } else if (queued.some(op => op instanceof cls)) {
+    return 'queued';
+  }
+  return undefined;
+}

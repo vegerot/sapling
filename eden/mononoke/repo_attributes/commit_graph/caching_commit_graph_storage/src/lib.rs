@@ -15,9 +15,11 @@ use anyhow::anyhow;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
+use caching_ext::fill_cache;
 use caching_ext::get_or_fill;
 use caching_ext::get_or_fill_chunked;
 use caching_ext::CacheDisposition;
+use caching_ext::CacheHandlerFactory;
 use caching_ext::CacheTtl;
 use caching_ext::CachelibHandler;
 use caching_ext::EntityStore;
@@ -33,21 +35,28 @@ use commit_graph_types::edges::ChangesetNodeParents;
 use commit_graph_types::storage::CommitGraphStorage;
 use commit_graph_types::storage::Prefetch;
 use context::CoreContext;
-use fbinit::FacebookInit;
 use fbthrift::compact_protocol;
 use maplit::hashset;
 use memcache::KeyGen;
-use memcache::MemcacheClient;
 use mononoke_types::ChangesetId;
 use mononoke_types::ChangesetIdPrefix;
 use mononoke_types::ChangesetIdsResolvedFromPrefix;
 use mononoke_types::Generation;
 use mononoke_types::RepositoryId;
-use ref_cast::RefCast;
+use stats::prelude::*;
+use tunables::tunables;
 use vec1::Vec1;
 
 #[cfg(test)]
 mod tests;
+
+define_stats! {
+    prefix = "mononoke.cache.commit_graph.prefetch";
+
+    hit: timeseries("hit"; Rate, Sum),
+    fetched: timeseries("fetched"; Rate, Sum),
+    prefetched: timeseries("prefetched"; Rate, Sum),
+}
 
 /// Size of chunk when fetching from the backing store
 const CHUNK_SIZE: usize = 1000;
@@ -71,21 +80,43 @@ struct CacheRequest<'a> {
     required: bool,
 }
 
-#[derive(Clone, Debug, Abomonation, RefCast)]
-#[repr(transparent)]
-pub struct CachedChangesetEdges(ChangesetEdges);
+#[derive(Clone, Debug, Abomonation)]
+pub struct CachedChangesetEdges {
+    /// The cached edges.
+    edges: ChangesetEdges,
+
+    /// Whether these edges were originally fetched via a prefetch operation.
+    prefetched: bool,
+}
 
 impl Deref for CachedChangesetEdges {
     type Target = ChangesetEdges;
 
     fn deref(&self) -> &ChangesetEdges {
-        &self.0
+        &self.edges
     }
 }
 
 impl CachedChangesetEdges {
+    fn fetched(edges: ChangesetEdges) -> Self {
+        CachedChangesetEdges {
+            edges,
+            prefetched: false,
+        }
+    }
+
+    fn prefetched(edges: ChangesetEdges) -> Self {
+        CachedChangesetEdges {
+            edges,
+            prefetched: true,
+        }
+    }
+
     fn take(self) -> ChangesetEdges {
-        self.0
+        if self.prefetched {
+            STATS::hit.add_value(1);
+        }
+        self.edges
     }
 
     fn node_to_thrift(node: &ChangesetNode) -> thrift::ChangesetNode {
@@ -124,30 +155,33 @@ impl CachedChangesetEdges {
     }
 
     fn from_thrift(edges: thrift::ChangesetEdges) -> Result<Self> {
-        Ok(Self(ChangesetEdges {
-            node: Self::node_from_thrift(edges.node)?,
-            parents: edges
-                .parents
-                .into_iter()
-                .map(Self::node_from_thrift)
-                .collect::<Result<ChangesetNodeParents>>()?,
-            merge_ancestor: edges
-                .merge_ancestor
-                .map(Self::node_from_thrift)
-                .transpose()?,
-            skip_tree_parent: edges
-                .skip_tree_parent
-                .map(Self::node_from_thrift)
-                .transpose()?,
-            skip_tree_skew_ancestor: edges
-                .skip_tree_skew_ancestor
-                .map(Self::node_from_thrift)
-                .transpose()?,
-            p1_linear_skew_ancestor: edges
-                .p1_linear_skew_ancestor
-                .map(Self::node_from_thrift)
-                .transpose()?,
-        }))
+        Ok(Self {
+            edges: ChangesetEdges {
+                node: Self::node_from_thrift(edges.node)?,
+                parents: edges
+                    .parents
+                    .into_iter()
+                    .map(Self::node_from_thrift)
+                    .collect::<Result<ChangesetNodeParents>>()?,
+                merge_ancestor: edges
+                    .merge_ancestor
+                    .map(Self::node_from_thrift)
+                    .transpose()?,
+                skip_tree_parent: edges
+                    .skip_tree_parent
+                    .map(Self::node_from_thrift)
+                    .transpose()?,
+                skip_tree_skew_ancestor: edges
+                    .skip_tree_skew_ancestor
+                    .map(Self::node_from_thrift)
+                    .transpose()?,
+                p1_linear_skew_ancestor: edges
+                    .p1_linear_skew_ancestor
+                    .map(Self::node_from_thrift)
+                    .transpose()?,
+            },
+            prefetched: false,
+        })
     }
 }
 
@@ -181,14 +215,6 @@ impl EntityStore<CachedChangesetEdges> for CacheRequest<'_> {
     }
 
     caching_ext::impl_singleton_stats!("commit_graph");
-
-    #[cfg(test)]
-    fn spawn_memcache_writes(&self) -> bool {
-        match self.caching_storage.memcache {
-            MemcacheHandler::Real(_) => true,
-            MemcacheHandler::Mock(..) => false,
-        }
-    }
 }
 
 #[async_trait]
@@ -201,22 +227,48 @@ impl KeyedEntityStore<ChangesetId, CachedChangesetEdges> for CacheRequest<'_> {
         &self,
         keys: HashSet<ChangesetId>,
     ) -> Result<HashMap<ChangesetId, CachedChangesetEdges>> {
-        let cs_ids: Vec<ChangesetId> = keys.into_iter().collect();
+        let prefetch = if tunables().disable_commit_graph_prefetch().unwrap_or(false) {
+            Prefetch::None
+        } else {
+            self.prefetch.include_hint()
+        };
+        let cs_ids: Vec<ChangesetId> = keys.iter().copied().collect();
         let entries = if self.required {
             self.caching_storage
                 .storage
-                .fetch_many_edges_required(self.ctx, &cs_ids, self.prefetch.include_hint())
+                .fetch_many_edges_required(self.ctx, &cs_ids, prefetch)
                 .await?
         } else {
             self.caching_storage
                 .storage
-                .fetch_many_edges(self.ctx, &cs_ids, self.prefetch.include_hint())
+                .fetch_many_edges(self.ctx, &cs_ids, prefetch)
                 .await?
         };
-        Ok(entries
-            .into_iter()
-            .map(|(cs_id, edges)| (cs_id, CachedChangesetEdges(edges)))
-            .collect())
+        if prefetch.is_include() {
+            // We were asked to prefetch. We must separate out the prefetched
+            // values from the fetched values as we may only return the
+            // fetched values.
+            let mut fetched = HashMap::new();
+            let mut prefetched = HashMap::new();
+            for (cs_id, edges) in entries {
+                if keys.contains(&cs_id) {
+                    fetched.insert(cs_id, CachedChangesetEdges::fetched(edges));
+                } else {
+                    prefetched.insert(cs_id, CachedChangesetEdges::prefetched(edges));
+                }
+            }
+            if !prefetched.is_empty() {
+                STATS::prefetched.add_value(prefetched.len() as i64);
+                fill_cache(self, &prefetched).await;
+            }
+            STATS::fetched.add_value(fetched.len() as i64);
+            Ok(fetched)
+        } else {
+            Ok(entries
+                .into_iter()
+                .map(|(cs_id, edges)| (cs_id, CachedChangesetEdges::fetched(edges)))
+                .collect())
+        }
     }
 }
 
@@ -236,33 +288,21 @@ impl CachingCommitGraphStorage {
     }
 
     pub fn new(
-        fb: FacebookInit,
         storage: Arc<dyn CommitGraphStorage>,
-        cache_pool: cachelib::VolatileLruCachePool,
+        cache_handler_factory: CacheHandlerFactory,
     ) -> Self {
         Self {
             repo_id: storage.repo_id(),
             storage,
-            cachelib: cache_pool.into(),
-            memcache: MemcacheClient::new(fb)
-                .expect("Memcache initialization failed")
-                .into(),
+            cachelib: cache_handler_factory.cachelib(),
+            memcache: cache_handler_factory.memcache(),
             keygen: Self::keygen(),
         }
     }
 
     #[cfg(test)]
     pub fn mocked(storage: Arc<dyn CommitGraphStorage>) -> Self {
-        let cachelib = CachelibHandler::create_mock();
-        let memcache = MemcacheHandler::create_mock();
-
-        Self {
-            repo_id: storage.repo_id(),
-            storage,
-            cachelib,
-            memcache,
-            keygen: Self::keygen(),
-        }
+        Self::new(storage, CacheHandlerFactory::Mocked)
     }
 
     fn request<'a>(&'a self, ctx: &'a CoreContext, prefetch: Prefetch) -> CacheRequest<'a> {
@@ -307,7 +347,7 @@ impl CommitGraphStorage for CachingCommitGraphStorage {
         ctx: &CoreContext,
         cs_id: ChangesetId,
     ) -> Result<Option<ChangesetEdges>> {
-        let mut found = get_or_fill(self.request(ctx, Prefetch::None), hashset![cs_id]).await?;
+        let mut found = get_or_fill(&self.request(ctx, Prefetch::None), hashset![cs_id]).await?;
         Ok(found.remove(&cs_id).map(CachedChangesetEdges::take))
     }
 
@@ -317,7 +357,7 @@ impl CommitGraphStorage for CachingCommitGraphStorage {
         cs_id: ChangesetId,
     ) -> Result<ChangesetEdges> {
         let mut found =
-            get_or_fill(self.request_required(ctx, Prefetch::None), hashset![cs_id]).await?;
+            get_or_fill(&self.request_required(ctx, Prefetch::None), hashset![cs_id]).await?;
         Ok(found
             .remove(&cs_id)
             .ok_or_else(|| anyhow!("Missing changeset from commit graph storage: {}", cs_id))?
@@ -331,18 +371,13 @@ impl CommitGraphStorage for CachingCommitGraphStorage {
         prefetch: Prefetch,
     ) -> Result<HashMap<ChangesetId, ChangesetEdges>> {
         let cs_ids: HashSet<ChangesetId> = cs_ids.iter().copied().collect();
-        let mut found = get_or_fill_chunked(
-            self.request(ctx, prefetch),
+        let found = get_or_fill_chunked(
+            &self.request(ctx, prefetch),
             cs_ids.clone(),
             CHUNK_SIZE,
             PARALLEL_CHUNKS,
         )
         .await?;
-        if prefetch.is_hint() {
-            // We may have prefetched additional edges.  Remove them from the
-            // result
-            found.retain(|cs_id, _| cs_ids.contains(cs_id));
-        }
         Ok(found
             .into_iter()
             .map(|(cs_id, edges)| (cs_id, edges.take()))
@@ -356,18 +391,13 @@ impl CommitGraphStorage for CachingCommitGraphStorage {
         prefetch: Prefetch,
     ) -> Result<HashMap<ChangesetId, ChangesetEdges>> {
         let cs_ids: HashSet<ChangesetId> = cs_ids.iter().copied().collect();
-        let mut found = get_or_fill_chunked(
-            self.request_required(ctx, prefetch),
+        let found = get_or_fill_chunked(
+            &self.request_required(ctx, prefetch),
             cs_ids.clone(),
             CHUNK_SIZE,
             PARALLEL_CHUNKS,
         )
         .await?;
-        if prefetch.is_hint() {
-            // We may have prefetched additional edges.  Remove them from the
-            // result
-            found.retain(|cs_id, _| cs_ids.contains(cs_id));
-        }
         Ok(found
             .into_iter()
             .map(|(cs_id, edges)| (cs_id, edges.take()))

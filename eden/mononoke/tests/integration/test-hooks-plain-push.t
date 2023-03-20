@@ -112,8 +112,11 @@ attempt a non-fast-forward move, it should fail
   remote:         source: Error {
   remote:             context: "Failed to fast-forward bookmark (set pushvar NON_FAST_FORWARD=true for a non-fast-forward move)",
   remote:             source: NonFastForwardMove {
-  remote:                 bookmark: BookmarkName {
-  remote:                     bookmark: "main",
+  remote:                 bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "main",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
   remote:                 from: ChangesetId(
   remote:                     Blake2(cbe5624248da659ef8f938baaf65796e68252a0a735e885a814b94f38b901d5b),

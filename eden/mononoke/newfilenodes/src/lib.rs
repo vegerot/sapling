@@ -12,7 +12,6 @@ mod reader;
 mod remote_cache;
 mod shards;
 mod sql_timeout_knobs;
-mod structs;
 mod writer;
 
 #[cfg(test)]
@@ -26,7 +25,7 @@ use async_trait::async_trait;
 pub use builder::NewFilenodesBuilder;
 use context::CoreContext;
 use filenodes::FilenodeInfo;
-use filenodes::FilenodeRangeResult;
+use filenodes::FilenodeRange;
 use filenodes::FilenodeResult;
 use filenodes::Filenodes;
 use filenodes::PreparedFilenode;
@@ -106,7 +105,7 @@ impl Filenodes for NewFilenodes {
         ctx: &CoreContext,
         path: &RepoPath,
         limit: Option<u64>,
-    ) -> Result<FilenodeRangeResult<Vec<FilenodeInfo>>> {
+    ) -> Result<FilenodeResult<FilenodeRange>> {
         let ret = self
             .reader
             .clone()

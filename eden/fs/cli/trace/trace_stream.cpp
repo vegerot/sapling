@@ -39,8 +39,11 @@ constexpr auto kTimeout = std::chrono::seconds{1};
 constexpr size_t kStartingInodeWidth = 5;
 static const auto kTreeEmoji = reinterpret_cast<const char*>(u8"\U0001F332");
 static const auto kBlobEmoji = reinterpret_cast<const char*>(u8"\U0001F954");
-static const auto kDashedArrowEmoji = reinterpret_cast<const char*>(u8"\u21E3");
-static const auto kSolidArrowEmoji = reinterpret_cast<const char*>(u8"\u2193");
+static const auto kRequestStartEmoji =
+    reinterpret_cast<const char*>(u8"\u2193");
+static const auto kRequestCompleteEmoji =
+    reinterpret_cast<const char*>(u8"\u2714");
+
 static const auto kWarningSignEmoji = reinterpret_cast<const char*>(u8"\u26A0");
 static const auto kRedSquareEmoji =
     reinterpret_cast<const char*>(u8"\U0001F7E5");
@@ -57,8 +60,8 @@ static const auto kCalendarEmoji =
 
 static const std::unordered_map<HgEventType, const char*> kHgEventTypes = {
     {HgEventType::QUEUE, " "},
-    {HgEventType::START, kDashedArrowEmoji},
-    {HgEventType::FINISH, kSolidArrowEmoji},
+    {HgEventType::START, kRequestStartEmoji},
+    {HgEventType::FINISH, kRequestCompleteEmoji},
 };
 
 static const std::unordered_map<InodeEventType, const char*> kInodeEventTypes =
@@ -70,8 +73,8 @@ static const std::unordered_map<InodeEventType, const char*> kInodeEventTypes =
 
 static const std::unordered_map<InodeEventProgress, const char*>
     kInodeProgresses = {
-        {InodeEventProgress::START, kDashedArrowEmoji},
-        {InodeEventProgress::END, kSolidArrowEmoji},
+        {InodeEventProgress::START, kRequestStartEmoji},
+        {InodeEventProgress::END, kRequestCompleteEmoji},
         {InodeEventProgress::FAIL, kWarningSignEmoji},
 };
 
@@ -797,12 +800,15 @@ int trace_inode_retroactive(
 
         fmt::print("Last {} inode events\n", events.size());
 
-        int max_inode =
-            *std::max_element(
-                 events.begin(),
-                 events.end(),
-                 [](const auto& a, const auto& b) { return a.ino() < b.ino(); })
-                 ->ino();
+        int max_inode = 0;
+        auto max_inode_event = std::max_element(
+            events.begin(), events.end(), [](const auto& a, const auto& b) {
+              return a.ino() < b.ino();
+            });
+        if (max_inode_event != events.end()) {
+          max_inode = *max_inode_event->ino();
+        }
+
         size_t inode_width = std::max(
             kStartingInodeWidth, folly::to_ascii_size_decimal(max_inode));
 

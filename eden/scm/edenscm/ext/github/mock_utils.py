@@ -8,6 +8,7 @@ from abc import abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import ghstack.query
+from edenscm import error
 
 from edenscm.ext.github.consts import query
 from edenscm.ext.github.gh_submit import PullRequestState
@@ -96,10 +97,9 @@ class MockGitHubServer:
 
         key = create_request_key(params, hostname, endpoint, method)
 
-        try:
-            return self.requests[key].get_response()
-        except KeyError:
+        if key not in self.requests:
             raise MockRequestNotFound(key, self.requests)
+        return self.requests[key].get_response()
 
     def _add_request(self, request_key: str, request: "MockRequest") -> None:
         self.requests[request_key] = request
@@ -285,19 +285,29 @@ class MockGitHubServer:
         base: str = "main",
         owner: str = OWNER,
         name: str = REPO_NAME,
+        stack_pr_ids: Optional[List[int]] = None,
     ) -> "UpdatePrRequest":
+        if not stack_pr_ids:
+            stack_pr_ids = [pr_number]
+        stack_pr_ids = list(reversed(sorted(stack_pr_ids)))
+
+        if len(stack_pr_ids) > 1:
+            pr_list = [
+                f"* __->__ #{n}" if n == pr_number else f"* #{n}" for n in stack_pr_ids
+            ]
+            body += (
+                "\n---\n"
+                "Stack created with [Sapling](https://sapling-scm.com). Best reviewed"
+                f" with [ReviewStack](https://reviewstack.dev/{owner}/{name}/pull/{pr_number}).\n"
+                + "\n".join(pr_list)
+            )
+
         title = firstline(body)
         params: ParamsType = {
             "query": query.GRAPHQL_UPDATE_PULL_REQUEST,
             "pullRequestId": pr_id,
             "title": title,
-            "body": (
-                f"{body}\n"
-                "---\n"
-                "Stack created with [Sapling](https://sapling-scm.com). Best reviewed"
-                f" with [ReviewStack](https://reviewstack.dev/{owner}/{name}/pull/{pr_number}).\n"
-                f"* __->__ #{pr_number}\n"
-            ),
+            "body": body,
             "base": base,
         }
         key = create_request_key(params, self.hostname)
@@ -568,10 +578,34 @@ class MergeIntoBranchRequest(MockRequest):
         return self._response
 
 
-class MockRequestNotFound(Exception):
+class MockRequestNotFound(error.Abort):
     def __init__(self, key: str, requests: Dict[str, MockRequest]) -> None:
-        key_list = "\n\n".join(requests.keys())
-        super().__init__(f"key not found: {key}\nAvailable keys:\n{key_list}")
+        import textwrap
+
+        from edenscm import mdiff
+
+        # Try to find a similar key. The diff should be within 30 lines.
+        best_diff = None
+        best_diff_lines = 30
+        for existing_key in requests.keys():
+            diff_text = b"".join(
+                t
+                for _b, ts in mdiff.unidiff(
+                    existing_key.encode(), "", key.encode(), "", "existing", "got"
+                )[1]
+                for t in ts
+            ).decode()
+            diff_lines = diff_text.count("\n")
+            if diff_lines < best_diff_lines:
+                best_diff = diff_text
+                best_diff_lines = diff_lines
+        if best_diff:
+            msg = f"Mock key has changed:\n{textwrap.indent(best_diff, '| ')}"
+        else:
+            key_list = "\n\n".join(textwrap.indent(k, "| ") for k in requests.keys())
+            indented_key = textwrap.indent(key, "| ")
+            msg = f"key not found:\n{indented_key}\nAvailable keys:\n{key_list}"
+        super().__init__(msg)
 
 
 class MockResponseNotSet(Exception):
@@ -593,7 +627,8 @@ def create_request_key(
     This will be used to verify the input and find corresponding output.
     """
     s = ",".join(f"{k}={v}" for k, v in sorted(params.items()))
-    return f"{hostname}|{endpoint}|{method}|{s}"
+    v = f"{hostname}|{endpoint}|{method}|{s}"
+    return v
 
 
 def gen_hash_hexdigest(s: str) -> str:

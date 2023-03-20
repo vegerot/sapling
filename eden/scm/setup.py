@@ -8,7 +8,7 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2 or any later version.
 
-# This is the mercurial setup script.
+# This is the Sapling setup script.
 #
 # 'python3 setup.py install', or
 # 'python3 setup.py --help' for more options
@@ -50,6 +50,11 @@ if PY_VERSION is None:
         PY_VERSION = "38"
 
 ossbuild = bool(os.environ.get("SAPLING_OSS_BUILD"))
+
+# If this is set, then certain build dependencies like Cython are
+# expected to be present and will not be downloaded. Third-party
+# dependencies like IPython will not be bundled.
+offline = bool(os.environ.get("SAPLING_OFFLINE"))
 
 
 def ensureenv():
@@ -311,7 +316,7 @@ def filterhgerr(err):
     return b"\n".join(b"  " + e for e in err)
 
 
-def findhg():
+def findhg(vcname: str):
     """Try to figure out how we should invoke hg for examining the local
     repository contents.
 
@@ -328,7 +333,7 @@ def findhg():
     # and disable localization for the same reasons.
     hgenv["HGPLAIN"] = "1"
     hgenv["LANGUAGE"] = "C"
-    hgcmd = ["hg"]
+    hgcmd = [vcname]
     # Run a simple "hg log" command just to see if using hg from the user's
     # path works and can successfully interact with this repository.
     check_cmd = ["log", "-r.", "-Ttest"]
@@ -341,7 +346,7 @@ def findhg():
 
     # Fall back to trying the local hg installation.
     hgenv = localhgenv()
-    hgcmd = [sys.executable, "hg"]
+    hgcmd = [sys.executable, vcname]
     try:
         retcode, out, err = runcmd(hgcmd + check_cmd, hgenv)
     except EnvironmentError:
@@ -373,7 +378,7 @@ def localhgenv():
     return env
 
 
-hg = None if ossbuild else findhg()
+hg = findhg("sl") or findhg("hg")
 
 
 def hgtemplate(template, cast=None):
@@ -385,6 +390,30 @@ def hgtemplate(template, cast=None):
     return result
 
 
+def gitversion():
+    hgenv = localhgenv()
+    format = "%cd-h%h"
+    date_format = "format:%Y%m%d-%H%M%S"
+    try:
+        retcode, out, err = runcmd(
+            [
+                "git",
+                "-c",
+                "core.abbrev=8",
+                "show",
+                "-s",
+                f"--format={format}",
+                f"--date={date_format}",
+            ],
+            os.environ,
+        )
+        if retcode or err:
+            return None
+        return out.decode("utf-8")
+    except EnvironmentError as e:
+        return None
+
+
 def pickversion():
     # Respect SAPLING_VERSION set by GitHub workflows.
     env_version = os.environ.get("SAPLING_VERSION")
@@ -394,7 +423,7 @@ def pickversion():
     # This is duplicated a bit from build_rpm.py:auto_release_str()
     template = r'{sub("([:+-]|\d\d\d\d$)", "",date|isodatesec)} {node|short}'
     # if hg is not found, fallback to a fixed version
-    out = hgtemplate(template) or ""
+    out = hgtemplate(template) or gitversion() or ""
     # Some tools parse this number to figure out if they support this version of
     # Mercurial, so prepend with 4.4.2.
     # ex. 4.4.2_20180105_214829_58fda95a0202
@@ -513,7 +542,7 @@ void print_buildinfo() {
 """
 
     path = pjoin(builddir, "buildinfo.c")
-    write_if_changed(path, buildinfosrc)
+    write_if_changed(path, buildinfosrc.encode())
     return path
 
 
@@ -571,6 +600,11 @@ class asset(object):
         return pjoin(builddir, self.destdir)
 
     def _download(self):
+        if offline:
+            raise RuntimeError(
+                "offline requested via SAPLING_OFFLINE, "
+                "but downloading required for %s" % self.url
+            )
         destpath = pjoin(builddir, self.name)
         if havefb:
             # via internal LFS utlity
@@ -750,28 +784,31 @@ class fetchbuilddeps(Command):
     description = "download build depencencies"
     user_options = []
 
-    pyassets = [
-        asset(url=url)
-        for url in [
-            "https://files.pythonhosted.org/packages/22/a6/858897256d0deac81a172289110f31629fc4cee19b6f01283303e18c8db3/ptyprocess-0.7.0-py2.py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/39/7b/88dbb785881c28a102619d46423cb853b46dbccc70d3ac362d99773a78ce/pexpect-4.8.0-py2.py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/23/6a/210816c943c9aeeb29e4e18a298f14bf0e118fe222a23e13bfcc2d41b0a4/ipython-7.16.1-py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/3d/57/4d9c9e3ae9a255cd4e1106bb57e24056d3d0709fc01b2e3e345898e49d5b/simplegeneric-0.8.1.zip",
-            "https://files.pythonhosted.org/packages/44/6f/7120676b6d73228c96e17f1f794d8ab046fc910d781c8d151120c3f1569e/toml-0.10.2-py2.py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/44/98/5b86278fbbf250d239ae0ecb724f8572af1c91f4a11edf4d36a206189440/colorama-0.4.4-py2.py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/4c/1c/ff6546b6c12603d8dd1070aa3c3d273ad4c07f5771689a7b69a550e8c951/backcall-0.2.0-py2.py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/4e/78/56aa1b5f4d8ac548755ae767d84f0be54fdd9d404197a3d9e4659d272348/setuptools-57.0.0-py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/59/7c/e39aca596badaf1b78e8f547c807b04dae603a433d3e7a7e04d67f2ef3e5/wcwidth-0.2.5-py2.py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/87/61/2dfea88583d5454e3a64f9308a686071d58d59a55db638268a6413e1eb6d/prompt_toolkit-2.0.10-py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/6a/36/b1b9bfdf28690ae01d9ca0aa5b0d07cb4448ac65fb91dc7e2d094e3d992f/decorator-5.0.9-py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/9a/41/220f49aaea88bc6fa6cba8d05ecf24676326156c23b991e80b3f2fc24c77/pickleshare-0.7.5-py2.py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/a6/c9/be11fce9810793676017f79ffab3c6cb18575844a6c7b8d4ed92f95de604/Pygments-2.9.0-py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/ca/ab/872a23e29cec3cf2594af7e857f18b687ad21039c1f9b922fac5b9b142d5/traitlets-4.3.3-py2.py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/fa/bc/9bd3b5c2b4774d5f33b2d544f1460be9df7df2fe42f352135381c347c69a/ipython_genutils-0.2.0-py2.py3-none-any.whl",
-            "https://files.pythonhosted.org/packages/fc/56/9f67dcd4a4b9960373173a31be1b8c47fe351a1c9385677a7bdd82810e57/ipdb-0.13.9.tar.gz",
+    if offline:
+        pyassets = []
+    else:
+        pyassets = [
+            asset(url=url)
+            for url in [
+                "https://files.pythonhosted.org/packages/22/a6/858897256d0deac81a172289110f31629fc4cee19b6f01283303e18c8db3/ptyprocess-0.7.0-py2.py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/39/7b/88dbb785881c28a102619d46423cb853b46dbccc70d3ac362d99773a78ce/pexpect-4.8.0-py2.py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/23/6a/210816c943c9aeeb29e4e18a298f14bf0e118fe222a23e13bfcc2d41b0a4/ipython-7.16.1-py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/3d/57/4d9c9e3ae9a255cd4e1106bb57e24056d3d0709fc01b2e3e345898e49d5b/simplegeneric-0.8.1.zip",
+                "https://files.pythonhosted.org/packages/44/6f/7120676b6d73228c96e17f1f794d8ab046fc910d781c8d151120c3f1569e/toml-0.10.2-py2.py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/44/98/5b86278fbbf250d239ae0ecb724f8572af1c91f4a11edf4d36a206189440/colorama-0.4.4-py2.py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/4c/1c/ff6546b6c12603d8dd1070aa3c3d273ad4c07f5771689a7b69a550e8c951/backcall-0.2.0-py2.py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/4e/78/56aa1b5f4d8ac548755ae767d84f0be54fdd9d404197a3d9e4659d272348/setuptools-57.0.0-py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/59/7c/e39aca596badaf1b78e8f547c807b04dae603a433d3e7a7e04d67f2ef3e5/wcwidth-0.2.5-py2.py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/87/61/2dfea88583d5454e3a64f9308a686071d58d59a55db638268a6413e1eb6d/prompt_toolkit-2.0.10-py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/6a/36/b1b9bfdf28690ae01d9ca0aa5b0d07cb4448ac65fb91dc7e2d094e3d992f/decorator-5.0.9-py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/9a/41/220f49aaea88bc6fa6cba8d05ecf24676326156c23b991e80b3f2fc24c77/pickleshare-0.7.5-py2.py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/a6/c9/be11fce9810793676017f79ffab3c6cb18575844a6c7b8d4ed92f95de604/Pygments-2.9.0-py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/ca/ab/872a23e29cec3cf2594af7e857f18b687ad21039c1f9b922fac5b9b142d5/traitlets-4.3.3-py2.py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/fa/bc/9bd3b5c2b4774d5f33b2d544f1460be9df7df2fe42f352135381c347c69a/ipython_genutils-0.2.0-py2.py3-none-any.whl",
+                "https://files.pythonhosted.org/packages/fc/56/9f67dcd4a4b9960373173a31be1b8c47fe351a1c9385677a7bdd82810e57/ipdb-0.13.9.tar.gz",
+            ]
         ]
-    ]
 
     # These pyassets are eden and thrift related. We don't use those in open
     # source for now.
@@ -1071,7 +1108,10 @@ class hgbuildpy(build_py):
 
         build_py.run(self)
 
-        buildpyzip(self.distribution).run()
+        # This builds the 3rd-party pure Python dependencies into
+        # a zip. It is not needed for offline (prefer system-dep) build.
+        if not offline:
+            buildpyzip(self.distribution).run()
 
 
 class buildpyzip(Command):
@@ -1305,7 +1345,8 @@ class hginstalllib(install_lib):
         for src, dst in [("edenscmdeps3.zip", "edenscmdeps3.zip")]:
             srcpath = pjoin(builddir, src)
             dstpath = pjoin(self.install_dir, dst)
-            file_util.copy_file(srcpath, dstpath)
+            if os.path.exists(srcpath):
+                file_util.copy_file(srcpath, dstpath)
 
 
 class hginstallscripts(install_scripts):
@@ -1496,12 +1537,6 @@ havefanotify = (
 
 extmodules = [
     Extension(
-        "edenscmnative.base85",
-        ["edenscm/cext/base85.c"],
-        include_dirs=include_dirs,
-        depends=common_depends,
-    ),
-    Extension(
         "edenscmnative.bdiff",
         ["edenscm/bdiff.c", "edenscm/cext/bdiff.c"],
         include_dirs=include_dirs,
@@ -1561,11 +1596,12 @@ extmodules = [
 
 def cythonize(*args, **kwargs):
     """Proxy to Cython.Build.cythonize. Download Cython on demand."""
-    cythonsrc = asset(
-        url="https://files.pythonhosted.org/packages/4c/76/1e41fbb365ad20b6efab2e61b0f4751518444c953b390f9b2d36cf97eea0/Cython-0.29.32.tar.gz"
-    )
-    path = cythonsrc.ensureready()
-    sys.path.insert(0, path)
+    if not offline:
+        cythonsrc = asset(
+            url="https://files.pythonhosted.org/packages/4c/76/1e41fbb365ad20b6efab2e61b0f4751518444c953b390f9b2d36cf97eea0/Cython-0.29.32.tar.gz"
+        )
+        path = cythonsrc.ensureready()
+        sys.path.insert(0, path)
 
     from Cython.Build import cythonize
 
@@ -1633,6 +1669,12 @@ if not iswindows:
                 "depends": [versionhashpath],
                 "include_dirs": ["contrib/chg"] + include_dirs,
                 "extra_args": filter(None, cflags + chgcflags + [STDC99, WALL, PIC]),
+                # chg uses libc::unistd/getgroups() to check that chg and the
+                # sl cli have the same permissions (see 49ee17f2bfad).
+                # however, on macOS, getgroups() is limited to NGROUPS_MAX (16) groups by default.
+                # we can work around this by defining _DARWIN_UNLIMITED_GETGROUPS
+                # see https://opensource.apple.com/source/xnu/xnu-3247.1.106/bsd/man/man2/getgroups.2.auto.html
+                "macros": [("_DARWIN_UNLIMITED_GETGROUPS", "1")]
             },
         )
     )
@@ -1838,35 +1880,29 @@ if havefb and iswindows:
     rustextbinaries += [RustBinary("fbclone", manifest="fb/fbclone/Cargo.toml")]
 
 
+if sys.platform == "cygwin":
+    print("WARNING: CYGWIN BUILD NO LONGER OFFICIALLY SUPPORTED")
+
+
 setup(
     name="edenscm",
     version=setupversion,
     author="Olivia Mackall and many others",
-    author_email="mercurial@mercurial-scm.org",
-    url="https://mercurial-scm.org/",
-    download_url="https://mercurial-scm.org/release/",
+    url="https://sapling-scm.com/",
     description=(
-        "Fast scalable distributed SCM (revision control, version " "control) system"
+        "Sapling SCM is a cross-platform, highly scalable, Git-compatible source control system."
     ),
     long_description=(
-        "Mercurial is a distributed SCM tool written in Python."
-        " It is used by a number of large projects that require"
-        " fast, reliable distributed revision control, such as "
-        "Mozilla."
+        "It aims to provide both user-friendly and powerful interfaces for users, as "
+        "well as extreme scalability to deal with repositories containing many millions "
+        "of files and many millions of commits."
     ),
     license="GNU GPLv2 or any later version",
     classifiers=[
-        "Development Status :: 6 - Mature",
         "Environment :: Console",
         "Intended Audience :: Developers",
         "Intended Audience :: System Administrators",
         "License :: OSI Approved :: GNU General Public License (GPL)",
-        "Natural Language :: Danish",
-        "Natural Language :: English",
-        "Natural Language :: German",
-        "Natural Language :: Italian",
-        "Natural Language :: Japanese",
-        "Natural Language :: Portuguese (Brazilian)",
         "Operating System :: Microsoft :: Windows",
         "Operating System :: OS Independent",
         "Operating System :: POSIX",

@@ -61,13 +61,9 @@ class status(tuple):
     __slots__ = ()
 
     def __new__(cls, modified, added, removed, deleted, unknown, ignored, clean):
-        assert all(isinstance(f, str) for f in modified)
-        assert all(isinstance(f, str) for f in added)
-        assert all(isinstance(f, str) for f in removed)
-        assert all(isinstance(f, str) for f in deleted)
-        assert all(isinstance(f, str) for f in unknown)
-        assert all(isinstance(f, str) for f in ignored)
-        assert all(isinstance(f, str) for f in clean)
+        for files in (modified, added, removed, deleted, unknown, ignored, clean):
+            assert all(isinstance(f, str) for f in files)
+
         return tuple.__new__(
             cls, (modified, added, removed, deleted, unknown, ignored, clean)
         )
@@ -281,12 +277,13 @@ def callcatch(ui, req, func):
         ui.warn(_("  %s\n\n") % str(inst).replace("\n", "\n  "))
         ui.warn(_("(this usually happens after hard reboot or system crash)\n"))
         ui.warn(_("(try '@prog@ doctor' to attempt to fix it)\n"))
-    except error.RevisionstoreError as inst:
+    except (
+        error.NonUTF8PathError,
+        error.RepoInitError,
+        error.RevisionstoreError,
+        error.WorkingCopyError,
+    ) as inst:
         ui.warn(_("%s\n") % inst, error=_("abort"))
-    except error.NonUTF8PathError as inst:
-        ui.warn(_("%s\n") % str(inst), error=_("abort"))
-    except error.WorkingCopyError as inst:
-        ui.warn(_("%s\n") % str(inst), error=_("abort"))
     except ImportError as inst:
         ui.warn(_("%s!\n") % inst, error=_("abort"))
         m = str(inst).split()[-1]

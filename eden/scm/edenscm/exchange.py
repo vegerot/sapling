@@ -1503,12 +1503,6 @@ def _httpcommitgraphenabled(repo, remote):
     if repo.nullableedenapi is None:
         return None
 
-    if (
-        "lazychangelog" not in repo.storerequirements
-        and "lazytextchangelog" not in repo.storerequirements
-    ):
-        return None
-
     # TODO(liubovd) check if "and" condition is more correct here
     if remote.capable("commitgraph") or repo.ui.configbool("pull", "httpcommitgraph"):
         return "v1"
@@ -1777,7 +1771,6 @@ def _pullcommitgraph(pullop, version):
         items = repo.edenapi.commitgraph2(heads, pullop.common)
     else:
         items = repo.edenapi.commitgraph(heads, pullop.common)
-    traceenabled = tracing.isenabled(tracing.LEVEL_DEBUG, target="pull::httpgraph")
     graphnodes = []
     draftnodes = []
     allphasesreturned = True
@@ -1788,16 +1781,36 @@ def _pullcommitgraph(pullop, version):
             allphasesreturned = False
         elif item["is_draft"]:
             draftnodes.append(node)
-        if traceenabled:
-            tracing.debug(
-                "edenapi fetched graph node: %s %r"
-                % (hex(node), [hex(n) for n in parents]),
-                target="pull::httpgraph",
-            )
         graphnodes.append((node, parents))
 
+    tracing.debug(
+        "edenapi fetched %d graph nodes" % len(graphnodes),
+        target="pull::httpgraph",
+    )
+
     if graphnodes:
-        commits.addgraphnodes(graphnodes)
+        is_lazy = (
+            "lazychangelog" in repo.storerequirements
+            or "lazytextchangelog" in repo.storerequirements
+        )
+        if is_lazy:
+            commits.addgraphnodes(graphnodes)
+        else:
+            # also need fetch commit text (messages)
+            # graphnodes: [(node, [parent])]
+            nodes = [n[0] for n in graphnodes]
+            # commitdata result: [{"hgid": node, "revlog_data": p1_p2_text}]
+            prefix_len = len(nullid) * 2
+            # node_text: {node: text}
+            node_text = {
+                c["hgid"]: c["revlog_data"][prefix_len:]
+                for c in repo.edenapi.commitdata(nodes)[0]
+            }
+            # input of addcommits: [(node, [parent], text)]
+            commits.addcommits(
+                [(node, parents, node_text[node]) for node, parents in graphnodes]
+            )
+
         pullop.cgresult = 2  # changed
         if repo.ui.configbool("pull", "httpmutation"):
             if allphasesreturned:

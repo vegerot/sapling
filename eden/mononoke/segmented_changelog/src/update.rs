@@ -12,8 +12,9 @@ use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
+use bookmarks::BookmarkCategory;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkKind;
-use bookmarks::BookmarkName;
 use bookmarks::BookmarkPagination;
 use bookmarks::BookmarkPrefix;
 use bookmarks::Bookmarks;
@@ -130,7 +131,7 @@ fn head_with_options(head: &ChangesetId) -> (VertexName, VertexOptions) {
 
 async fn all_bookmarks_except_with_options(
     ctx: &CoreContext,
-    exceptions: &[BookmarkName],
+    exceptions: &[BookmarkKey],
     bookmarks: &dyn Bookmarks,
 ) -> Result<VertexListWithOptions> {
     let exceptions: HashSet<_> = exceptions.iter().cloned().collect();
@@ -139,12 +140,13 @@ async fn all_bookmarks_except_with_options(
             ctx.clone(),
             Freshness::MaybeStale,
             &BookmarkPrefix::empty(),
+            BookmarkCategory::ALL,
             BookmarkKind::ALL_PUBLISHING,
             &BookmarkPagination::FromStart,
             u64::MAX,
         )
         .try_filter_map(|(bookmark, cs_id)| {
-            let res = if exceptions.contains(bookmark.name()) {
+            let res = if exceptions.contains(bookmark.key()) {
                 None
             } else {
                 Some(cs_id)
@@ -159,7 +161,7 @@ async fn all_bookmarks_except_with_options(
 
 async fn bookmark_with_options(
     ctx: &CoreContext,
-    bookmark: &BookmarkName,
+    bookmark: &BookmarkKey,
     bookmarks: &dyn Bookmarks,
 ) -> Result<VertexListWithOptions> {
     let cs = bookmarks
@@ -183,7 +185,7 @@ mod tests {
 
     async fn prep_branch_wide_repo(fb: FacebookInit) -> Result<Arc<BlobRepo>> {
         let blobrepo = BranchWide::getrepo(fb).await;
-        let second = BookmarkName::new("second")?;
+        let second = BookmarkKey::new("second")?;
         set_bookmark(
             fb,
             &blobrepo,
@@ -191,7 +193,7 @@ mod tests {
             second,
         )
         .await;
-        let third = BookmarkName::new("third")?;
+        let third = BookmarkKey::new("third")?;
         set_bookmark(
             fb,
             &blobrepo,
@@ -206,7 +208,7 @@ mod tests {
     async fn test_bookmark_with_options(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
         let repo = prep_branch_wide_repo(fb).await?;
-        let second = BookmarkName::new("second")?;
+        let second = BookmarkKey::new("second")?;
 
         let res = bookmark_with_options(&ctx, &second, repo.bookmarks()).await?;
         assert_eq!(
@@ -242,7 +244,7 @@ mod tests {
 
         let res = all_bookmarks_except_with_options(
             &ctx,
-            vec![BookmarkName::new("second")?].as_slice(),
+            vec![BookmarkKey::new("second")?].as_slice(),
             repo.bookmarks(),
         )
         .await?;

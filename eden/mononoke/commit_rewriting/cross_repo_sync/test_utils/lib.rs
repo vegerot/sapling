@@ -12,11 +12,17 @@ use std::sync::Arc;
 use anyhow::format_err;
 use anyhow::Error;
 use ascii::AsciiString;
+use blobrepo::AsBlobRepo;
 use blobrepo::BlobRepo;
 use blobstore::Loadable;
+use bonsai_hg_mapping::BonsaiHgMapping;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
+use bookmarks::BookmarkUpdateLog;
 use bookmarks::BookmarkUpdateReason;
+use bookmarks::Bookmarks;
+use changeset_fetcher::ChangesetFetcher;
+use changesets::Changesets;
 use commit_transformation::upload_commits;
 use context::CoreContext;
 use cross_repo_sync::rewrite_commit;
@@ -28,6 +34,8 @@ use cross_repo_sync::CommitSyncRepos;
 use cross_repo_sync::CommitSyncer;
 use cross_repo_sync::Repo;
 use cross_repo_sync::Syncers;
+use filenodes::Filenodes;
+use filestore::FilestoreConfig;
 use live_commit_sync_config::LiveCommitSyncConfig;
 use live_commit_sync_config::TestLiveCommitSyncConfig;
 use live_commit_sync_config::TestLiveCommitSyncConfigSource;
@@ -38,12 +46,19 @@ use metaconfig_types::CommitSyncConfig;
 use metaconfig_types::CommitSyncConfigVersion;
 use metaconfig_types::CommonCommitSyncConfig;
 use metaconfig_types::DefaultSmallToLargeCommitSyncPathAction;
+use metaconfig_types::RepoConfig;
 use metaconfig_types::SmallRepoCommitSyncConfig;
 use metaconfig_types::SmallRepoPermanentConfig;
 use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
 use mononoke_types::MPath;
 use mononoke_types::RepositoryId;
+use mutable_counters::MutableCounters;
+use phases::Phases;
+use repo_blobstore::RepoBlobstore;
+use repo_derived_data::RepoDerivedData;
+use repo_identity::RepoIdentity;
+use skiplist::SkiplistIndex;
 use sql_construct::SqlConstruct;
 use synced_commit_mapping::SqlSyncedCommitMapping;
 use synced_commit_mapping::SyncedCommitMapping;
@@ -51,6 +66,38 @@ use synced_commit_mapping::SyncedCommitMappingEntry;
 use test_repo_factory::TestRepoFactory;
 use tests_utils::bookmark;
 use tests_utils::CreateCommitContext;
+
+#[facet::container]
+#[derive(Clone)]
+pub struct TestRepo {
+    #[delegate(
+        dyn Bookmarks,
+        dyn BookmarkUpdateLog,
+        dyn BonsaiHgMapping,
+        dyn Changesets,
+        dyn ChangesetFetcher,
+        dyn Filenodes,
+        FilestoreConfig,
+        dyn MutableCounters,
+        dyn Phases,
+        RepoBlobstore,
+        RepoDerivedData,
+        RepoIdentity,
+    )]
+    pub blob_repo: BlobRepo,
+
+    #[facet]
+    pub repo_config: RepoConfig,
+
+    #[facet]
+    pub skiplist: SkiplistIndex,
+}
+
+impl AsBlobRepo for TestRepo {
+    fn as_blob_repo(&self) -> &BlobRepo {
+        &self.blob_repo
+    }
+}
 
 pub fn xrepo_mapping_version_with_small_repo() -> CommitSyncConfigVersion {
     CommitSyncConfigVersion("TEST_VERSION_NAME".to_string())
@@ -67,7 +114,7 @@ where
     M: SyncedCommitMapping + Clone + 'static,
     R: Repo,
 {
-    let bookmark_name = BookmarkName::new("master").unwrap();
+    let bookmark_name = BookmarkKey::new("master").unwrap();
     let source_bcs = source_bcs_id
         .load(&ctx, commit_syncer.get_source_repo().repo_blobstore())
         .await
@@ -141,7 +188,7 @@ pub async fn init_small_large_repo(
     ctx: &CoreContext,
 ) -> Result<
     (
-        Syncers<SqlSyncedCommitMapping, BlobRepo>,
+        Syncers<SqlSyncedCommitMapping, TestRepo>,
         CommitSyncConfig,
         TestLiveCommitSyncConfig,
         TestLiveCommitSyncConfigSource,
@@ -149,10 +196,10 @@ pub async fn init_small_large_repo(
     Error,
 > {
     let mut factory = TestRepoFactory::new(ctx.fb)?;
-    let megarepo: BlobRepo = factory.with_id(RepositoryId::new(1)).build()?;
+    let megarepo: TestRepo = factory.with_id(RepositoryId::new(1)).build()?;
     let mapping =
         SqlSyncedCommitMapping::from_sql_connections(factory.metadata_db().clone().into());
-    let smallrepo: BlobRepo = factory.with_id(RepositoryId::new(0)).build()?;
+    let smallrepo: TestRepo = factory.with_id(RepositoryId::new(0)).build()?;
 
     let repos = CommitSyncRepos::SmallToLarge {
         small_repo: smallrepo.clone(),
@@ -165,7 +212,7 @@ pub async fn init_small_large_repo(
 
     let noop_version_config = CommitSyncConfig {
         large_repo_id: RepositoryId::new(1),
-        common_pushrebase_bookmarks: vec![BookmarkName::new("master")?],
+        common_pushrebase_bookmarks: vec![BookmarkKey::new("master")?],
         small_repos: hashmap! {
             RepositoryId::new(0) => get_small_repo_sync_config_noop(),
         },
@@ -174,7 +221,7 @@ pub async fn init_small_large_repo(
 
     let version_with_small_repo_config = CommitSyncConfig {
         large_repo_id: RepositoryId::new(1),
-        common_pushrebase_bookmarks: vec![BookmarkName::new("master")?],
+        common_pushrebase_bookmarks: vec![BookmarkKey::new("master")?],
         small_repos: hashmap! {
             RepositoryId::new(0) => get_small_repo_sync_config_1(),
         },
@@ -258,7 +305,7 @@ pub async fn init_small_large_repo(
     };
     let move_hg_cs = perform_move(
         ctx,
-        &megarepo,
+        &megarepo.blob_repo,
         second_bcs_id,
         Arc::new(prefix_mover),
         move_cs_args,
@@ -328,7 +375,7 @@ pub async fn init_small_large_repo(
     ))
 }
 
-pub fn base_commit_sync_config(large_repo: &BlobRepo, small_repo: &BlobRepo) -> CommitSyncConfig {
+pub fn base_commit_sync_config(large_repo: &TestRepo, small_repo: &TestRepo) -> CommitSyncConfig {
     let small_repo_sync_config = SmallRepoCommitSyncConfig {
         default_action: DefaultSmallToLargeCommitSyncPathAction::PrependPrefix(
             MPath::new("prefix").unwrap(),

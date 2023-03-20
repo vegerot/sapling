@@ -25,6 +25,8 @@ mod subscription;
 mod transaction;
 
 pub use bookmarks_types::Bookmark;
+pub use bookmarks_types::BookmarkCategory;
+pub use bookmarks_types::BookmarkKey;
 pub use bookmarks_types::BookmarkKind;
 pub use bookmarks_types::BookmarkName;
 pub use bookmarks_types::BookmarkPagination;
@@ -52,7 +54,7 @@ pub trait Bookmarks: Send + Sync + 'static {
     fn get(
         &self,
         ctx: CoreContext,
-        name: &BookmarkName,
+        name: &BookmarkKey,
     ) -> BoxFuture<'static, Result<Option<ChangesetId>>>;
 
     /// List bookmarks that match certain parameters.
@@ -75,7 +77,8 @@ pub trait Bookmarks: Send + Sync + 'static {
         ctx: CoreContext,
         freshness: Freshness,
         prefix: &BookmarkPrefix,
-        kinds: &[BookmarkKind],
+        categories: &[BookmarkCategory],
+        kindsst: &[BookmarkKind],
         pagination: &BookmarkPagination,
         limit: u64,
     ) -> BoxStream<'static, Result<(Bookmark, ChangesetId)>>;
@@ -115,6 +118,7 @@ where
             ctx,
             Freshness::MaybeStale,
             &BookmarkPrefix::empty(),
+            BookmarkCategory::ALL,
             BookmarkKind::ALL_PUBLISHING,
             &BookmarkPagination::FromStart,
             std::u64::MAX,
@@ -131,6 +135,7 @@ where
             ctx,
             Freshness::MaybeStale,
             &BookmarkPrefix::empty(),
+            BookmarkCategory::ALL,
             BookmarkKind::ALL_PUBLISHING,
             &BookmarkPagination::FromStart,
             std::u64::MAX,
@@ -150,6 +155,7 @@ pub fn bookmark_heads_fetcher(
                     ctx.clone(),
                     Freshness::MaybeStale,
                     &BookmarkPrefix::empty(),
+                    BookmarkCategory::ALL,
                     BookmarkKind::ALL_PUBLISHING,
                     &BookmarkPagination::FromStart,
                     std::u64::MAX,

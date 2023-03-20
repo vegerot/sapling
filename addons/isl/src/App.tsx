@@ -17,17 +17,20 @@ import {ErrorBoundary, ErrorNotice} from './ErrorNotice';
 import {ISLCommandContext, useCommand} from './ISLShortcuts';
 import {TopBar} from './TopBar';
 import {TopLevelErrors} from './TopLevelErrors';
+import {tracker} from './analytics';
 import {I18nSupport, t, T} from './i18n';
 import platform from './platform';
 import {repositoryInfo} from './serverAPIState';
 import {ThemeRoot} from './theme';
 import {ModalContainer} from './useModal';
+import {getWindowWidthInPixels} from './utils';
 import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
 import React from 'react';
 import {atom, RecoilRoot, useRecoilValue, useSetRecoilState} from 'recoil';
 import {ContextMenus} from 'shared/ContextMenu';
 import {Drawers} from 'shared/Drawers';
 import {Icon} from 'shared/Icon';
+import {useThrottledEffect} from 'shared/hooks';
 
 import './index.css';
 
@@ -56,7 +59,11 @@ export default function App() {
 export const islDrawerState = atom<AllDrawersState>({
   key: 'islDrawerState',
   default: {
-    right: {size: 500, collapsed: false},
+    right: {
+      size: 500,
+      // Collapse by default on small screens.
+      collapsed: getWindowWidthInPixels() <= 500,
+    },
     left: {size: 200, collapsed: true},
     top: {size: 200, collapsed: true},
     bottom: {size: 200, collapsed: true},
@@ -105,6 +112,28 @@ function MainContent() {
 }
 
 function ISLNullState({repoError}: {repoError: RepositoryError}) {
+  useThrottledEffect(
+    () => {
+      if (repoError != null) {
+        switch (repoError.type) {
+          case 'cwdNotARepository':
+            tracker.track('UIEmptyState', {extras: {cwd: repoError.cwd}, errorName: 'InvalidCwd'});
+            break;
+          case 'invalidCommand':
+            tracker.track('UIEmptyState', {
+              extras: {command: repoError.command},
+              errorName: 'InvalidCommand',
+            });
+            break;
+          case 'unknownError':
+            tracker.error('UIEmptyState', 'RepositoryError', repoError.error);
+            break;
+        }
+      }
+    },
+    1_000,
+    [repoError],
+  );
   let content;
   if (repoError != null) {
     if (repoError.type === 'cwdNotARepository') {

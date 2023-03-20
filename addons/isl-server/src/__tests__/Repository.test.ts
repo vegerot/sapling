@@ -6,7 +6,7 @@
  */
 
 import type {ResolveCommandConflictOutput} from '../Repository';
-import type {ValidatedRepoInfo} from 'isl/src/types';
+import type {MergeConflicts, ValidatedRepoInfo} from 'isl/src/types';
 
 import {absolutePathForFileInRepo, extractRepoInfoFromUrl, Repository} from '../Repository';
 import * as execa from 'execa';
@@ -318,7 +318,9 @@ ${MARK_OUT}
           {path: 'file1.txt', status: 'U'},
           {path: 'file2.txt', status: 'U'},
         ],
-      });
+        fetchStartTimestamp: expect.anything(),
+        fetchCompletedTimestamp: expect.anything(),
+      } as MergeConflicts);
     });
 
     it('disposes conflict change subscriptions', async () => {
@@ -352,6 +354,8 @@ ${MARK_OUT}
           {path: 'file1.txt', status: 'U'},
           {path: 'file2.txt', status: 'U'},
         ],
+        fetchStartTimestamp: expect.anything(),
+        fetchCompletedTimestamp: expect.anything(),
       });
     });
 
@@ -371,6 +375,8 @@ ${MARK_OUT}
           {path: 'file1.txt', status: 'U'},
           {path: 'file2.txt', status: 'U'},
         ],
+        fetchStartTimestamp: expect.anything(),
+        fetchCompletedTimestamp: expect.anything(),
       });
 
       enterMergeConflict(MOCK_CONFLICT_WITH_FILE1_RESOLVED);
@@ -385,6 +391,8 @@ ${MARK_OUT}
           {path: 'file1.txt', status: 'Resolved'},
           {path: 'file2.txt', status: 'U'},
         ],
+        fetchStartTimestamp: expect.anything(),
+        fetchCompletedTimestamp: expect.anything(),
       });
     });
 
@@ -430,10 +438,10 @@ describe('extractRepoInfoFromUrl', () => {
         hostname: 'github.com',
       });
     });
-    it('handles ssh', () => {
-      expect(extractRepoInfoFromUrl('ssh://git@github.com:myUsername/myRepo.git')).toEqual({
+    it('handles ssh with slashes', () => {
+      expect(extractRepoInfoFromUrl('ssh://git@github.com/myUsername/my-repo.git')).toEqual({
         owner: 'myUsername',
-        repo: 'myRepo',
+        repo: 'my-repo',
         hostname: 'github.com',
       });
     });
@@ -475,10 +483,10 @@ describe('extractRepoInfoFromUrl', () => {
         hostname: 'ghe.company.com',
       });
     });
-    it('handles ssh', () => {
-      expect(extractRepoInfoFromUrl('ssh://git@ghe.company.com:myUsername/myRepo.git')).toEqual({
+    it('handles ssh with slashes', () => {
+      expect(extractRepoInfoFromUrl('ssh://git@ghe.company.com/myUsername/my-repo.git')).toEqual({
         owner: 'myUsername',
-        repo: 'myRepo',
+        repo: 'my-repo',
         hostname: 'ghe.company.com',
       });
     });

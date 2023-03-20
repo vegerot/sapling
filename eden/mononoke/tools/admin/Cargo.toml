@@ -25,11 +25,12 @@ bytes = { version = "1.1", features = ["serde"] }
 cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cachelib = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 caching_commit_graph_storage = { version = "0.1.0", path = "../../repo_attributes/commit_graph/caching_commit_graph_storage" }
+caching_ext = { version = "0.1.0", path = "../../common/rust/caching_ext" }
 changeset_fetcher = { version = "0.1.0", path = "../../blobrepo/changeset_fetcher" }
 changesets = { version = "0.1.0", path = "../../changesets" }
 changesets_creation = { version = "0.1.0", path = "../../changesets/changesets_creation" }
 chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
-clap = { version = "3.2.17", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
+clap = { version = "3.2.23", features = ["derive", "env", "regex", "unicode", "wrap_help"] }
 cmdlib_displaying = { version = "0.1.0", path = "../../cmdlib/displaying" }
 cmdlib_scrubbing = { version = "0.1.0", path = "../../cmdlib/scrubbing" }
 commit_graph = { version = "0.1.0", path = "../../repo_attributes/commit_graph/commit_graph" }
@@ -52,6 +53,7 @@ live_commit_sync_config = { version = "0.1.0", path = "../../commit_rewriting/li
 manifest = { version = "0.1.0", path = "../../manifest" }
 megarepo_api = { version = "0.1.0", path = "../../megarepo_api" }
 megarepo_error = { version = "0.1.0", path = "../../megarepo_api/megarepo_error" }
+memcache = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 mercurial_types = { version = "0.1.0", path = "../../mercurial/types" }
 metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
 mononoke_api = { version = "0.1.0", path = "../../mononoke_api" }
@@ -60,7 +62,7 @@ mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
 mutable_counters = { version = "0.1.0", path = "../../mutable_counters" }
 mutable_renames = { version = "0.1.0", path = "../../mutable_renames" }
 phases = { version = "0.1.0", path = "../../phases" }
-prettytable-rs = "0.8"
+prettytable-rs = "0.10"
 pushrebase = { version = "0.1.0", path = "../../pushrebase" }
 pushrebase_mutation_mapping = { version = "0.1.0", path = "../../pushrebase_mutation_mapping" }
 question = "0.2.2"

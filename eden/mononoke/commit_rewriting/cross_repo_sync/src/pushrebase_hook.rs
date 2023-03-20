@@ -49,7 +49,7 @@ impl<R: Repo + 'static> CrossRepoSyncPushrebaseHook<R> {
 
 #[async_trait]
 impl<R: Repo + 'static> PushrebaseHook for CrossRepoSyncPushrebaseHook<R> {
-    async fn prepushrebase(&self) -> Result<Box<dyn PushrebaseCommitHook>, Error> {
+    async fn in_critical_section(&self) -> Result<Box<dyn PushrebaseCommitHook>, Error> {
         let hook = Box::new(self.clone()) as Box<dyn PushrebaseCommitHook>;
         Ok(hook)
     }
@@ -96,7 +96,10 @@ impl PushrebaseTransactionHook for CrossRepoSyncTransactionHook {
         _ctx: &CoreContext,
         txn: Transaction,
     ) -> Result<Transaction, BookmarkTransactionError> {
-        if tunables().get_xrepo_sync_disable_all_syncs() {
+        if tunables()
+            .xrepo_sync_disable_all_syncs()
+            .unwrap_or_default()
+        {
             let e: Error = ErrorKind::XRepoSyncDisabled.into();
             return Err(e.into());
         }

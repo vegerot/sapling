@@ -28,7 +28,9 @@ export interface ClientConnection {
    * Designed to match
    * https://code.visualstudio.com/api/references/vscode-api#Webview.onDidReceiveMessage
    */
-  onDidReceiveMessage(hander: (event: Buffer) => void | Promise<void>): {dispose(): void};
+  onDidReceiveMessage(hander: (event: Buffer, isBinary: boolean) => void | Promise<void>): {
+    dispose(): void;
+  };
 
   /**
    * Which command to use to run `sl`
@@ -59,6 +61,7 @@ export function onClientConnection(connection: ClientConnection): () => void {
   logger.log(`platform '${platform.platformName}', version '${version}'`);
 
   const tracker = makeServerSideTracker(logger, platform, version);
+  tracker.track('ClientConnection', {extras: {cwd: connection.cwd}});
 
   // start listening to messages
   let api: ServerToClientAPI | null = new ServerToClientAPI(platform, connection, tracker);

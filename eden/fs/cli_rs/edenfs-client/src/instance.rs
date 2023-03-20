@@ -98,20 +98,6 @@ impl EdenFsInstance {
         self.home_dir.as_ref()
     }
 
-    pub fn should_prefetch_profiles(&self) -> bool {
-        self.get_config()
-            .ok()
-            .and_then(|config| config.prefetch_profiles)
-            .map_or(false, |config| config.prefetching_enabled)
-    }
-
-    pub fn should_prefetch_predictive_profiles(&self) -> bool {
-        self.get_config()
-            .ok()
-            .and_then(|config| config.prefetch_profiles)
-            .map_or(false, |config| config.predictive_prefetching_enabled)
-    }
-
     async fn _connect(&self, socket_path: &PathBuf) -> Result<EdenFsClient> {
         let stream = UnixStream::connect(&socket_path)
             .await

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use anyhow::Context;
 use anyhow::Error;
 use async_trait::async_trait;
+use bookmarks::BookmarkKey;
 use bookmarks::Freshness;
 use bytes::Bytes;
 use edenapi_types::BookmarkEntry;
@@ -136,8 +137,14 @@ async fn set_bookmark(
                 .ok_or(ErrorKind::HgIdNotFound(from_hgid))?
                 .id();
 
-            repo.move_bookmark(bookmark, to, Some(from), true, pushvars)
-                .await?
+            repo.move_bookmark(
+                &BookmarkKey::new(&bookmark)?,
+                to,
+                Some(from),
+                true,
+                pushvars,
+            )
+            .await?
         }
         (Some(to_hgid), None) => {
             // Create bookmark
@@ -149,7 +156,8 @@ async fn set_bookmark(
                 .ok_or(ErrorKind::HgIdNotFound(to_hgid))?
                 .id();
 
-            repo.create_bookmark(bookmark, to, pushvars).await?
+            repo.create_bookmark(&BookmarkKey::new(&bookmark)?, to, pushvars)
+                .await?
         }
         (None, Some(from_hgid)) => {
             // Delete bookmark
@@ -161,7 +169,8 @@ async fn set_bookmark(
                 .ok_or(ErrorKind::HgIdNotFound(from_hgid))?
                 .id();
 
-            repo.delete_bookmark(bookmark, Some(from), pushvars).await?
+            repo.delete_bookmark(&BookmarkKey::new(&bookmark)?, Some(from), pushvars)
+                .await?
         }
         (None, None) => {
             return Err(Error::msg(

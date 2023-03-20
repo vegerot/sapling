@@ -6,6 +6,7 @@
  */
 
 import type {CodeReviewProvider} from './CodeReviewProvider';
+import type {ServerSideTracker} from './analytics/serverSideTracker';
 import type {Logger} from './logger';
 import type {
   CommitInfo,
@@ -15,7 +16,6 @@ import type {
   SmartlogCommits,
   SuccessorInfo,
   UncommittedChanges,
-  Result,
   ChangedFile,
   RepoInfo,
   OperationCommandProgressReporter,
@@ -30,15 +30,18 @@ import type {
   Revset,
   PreferredSubmitCommand,
   RepoRelativePath,
+  FetchedUncommittedChanges,
+  FetchedCommits,
 } from 'isl/src/types';
 
+import {Internal} from './Internal';
 import {OperationQueue} from './OperationQueue';
 import {PageFocusTracker} from './PageFocusTracker';
 import {WatchForChanges} from './WatchForChanges';
-// @fb-only
+import {DEFAULT_DAYS_OF_COMMITS_TO_LOAD, ErrorShortMessages} from './constants';
 import {GitHubCodeReviewProvider} from './github/githubCodeReviewProvider';
 import {isGithubEnterprise} from './github/queryGraphQL';
-import {serializeAsyncCall} from './utils';
+import {handleAbortSignalOnProcess, serializeAsyncCall} from './utils';
 import execa from 'execa';
 import {CommandRunner} from 'isl/src/types';
 import os from 'os';
@@ -46,6 +49,7 @@ import path from 'path';
 import {RateLimiter} from 'shared/RateLimiter';
 import {TypedEventEmitter} from 'shared/TypedEventEmitter';
 import {exists} from 'shared/fs';
+import {removeLeadingPathSep} from 'shared/pathUtils';
 import {notEmpty, unwrap} from 'shared/utils';
 
 export const COMMIT_END_MARK = '<<COMMIT_END_MARK>>';
@@ -139,12 +143,12 @@ export class Repository {
   public IGNORE_COMMIT_MESSAGE_LINES_REGEX = /^((?:HG|SL):.*)/gm;
 
   private mergeConflicts: MergeConflicts | undefined = undefined;
-  private uncommittedChanges: UncommittedChanges | null = null;
-  private smartlogCommits: SmartlogCommits | null = null;
+  private uncommittedChanges: FetchedUncommittedChanges | null = null;
+  private smartlogCommits: FetchedCommits | null = null;
 
   private mergeConflictsEmitter = new TypedEventEmitter<'change', MergeConflicts | undefined>();
-  private uncommittedChangesEmitter = new TypedEventEmitter<'change', UncommittedChanges>();
-  private smartlogCommitsChangesEmitter = new TypedEventEmitter<'change', SmartlogCommits>();
+  private uncommittedChangesEmitter = new TypedEventEmitter<'change', FetchedUncommittedChanges>();
+  private smartlogCommitsChangesEmitter = new TypedEventEmitter<'change', FetchedCommits>();
 
   private smartlogCommitsBeginFetchingEmitter = new TypedEventEmitter<'start', undefined>();
   private uncommittedChangesBeginFetchingEmitter = new TypedEventEmitter<'start', undefined>();
@@ -165,6 +169,13 @@ export class Repository {
   private pageFocusTracker = new PageFocusTracker();
   public codeReviewProvider?: CodeReviewProvider;
 
+  private currentVisibleCommitRangeIndex = 0;
+  private visibleCommitRanges: Array<number | undefined> = [
+    DEFAULT_DAYS_OF_COMMITS_TO_LOAD,
+    60,
+    undefined,
+  ];
+
   /**  Prefer using `RepositoryCache.getOrCreate()` to access and dispose `Repository`s. */
   constructor(public info: ValidatedRepoInfo, public logger: Logger) {
     const remote = info.codeReviewSystem;
@@ -172,8 +183,9 @@ export class Repository {
       this.codeReviewProvider = new GitHubCodeReviewProvider(remote, logger);
     }
 
-    // prettier-ignore
-    // @fb-only
+    if (remote.type === 'phabricator' && Internal?.PhabricatorCodeReviewProvider != null) {
+      this.codeReviewProvider = new Internal.PhabricatorCodeReviewProvider(remote, logger);
+    }
 
     this.watchForChanges = new WatchForChanges(info, logger, this.pageFocusTracker, kind => {
       if (kind === 'uncommitted changes') {
@@ -197,9 +209,14 @@ export class Repository {
 
     this.operationQueue = new OperationQueue(
       this.logger,
-      (operation: RunnableOperation, cwd: string, handleCommandProgress): Promise<void> => {
+      (
+        operation: RunnableOperation,
+        cwd: string,
+        handleCommandProgress,
+        signal: AbortSignal,
+      ): Promise<void> => {
         if (operation.runner === CommandRunner.Sapling) {
-          return this.runOperation(operation, handleCommandProgress, cwd);
+          return this.runOperation(operation, handleCommandProgress, cwd, signal);
         } else if (operation.runner === CommandRunner.CodeReviewProvider) {
           if (operation.args.some(arg => typeof arg === 'object')) {
             return Promise.reject(
@@ -219,6 +236,7 @@ export class Repository {
               cwd,
               normalizedArgs,
               handleCommandProgress,
+              signal,
             ) ?? Promise.resolve()
           );
         }
@@ -228,10 +246,10 @@ export class Repository {
 
     // refetch summaries whenever we see new diffIds
     const seenDiffs = new Set();
-    const subscription = this.subscribeToSmartlogCommitsChanges(commits => {
-      if (commits.value) {
+    const subscription = this.subscribeToSmartlogCommitsChanges(fetched => {
+      if (fetched.commits.value) {
         const newDiffs = [];
-        const diffIds = commits.value
+        const diffIds = fetched.commits.value
           .filter(commit => commit.diffId != null)
           .map(commit => commit.diffId);
         for (const diffId of diffIds) {
@@ -254,6 +272,13 @@ export class Repository {
     this.checkForMergeConflicts();
 
     this.disposables.push(() => subscription.dispose());
+  }
+
+  public nextVisibleCommitRangeInDays(): number | undefined {
+    if (this.currentVisibleCommitRangeIndex + 1 < this.visibleCommitRanges.length) {
+      this.currentVisibleCommitRangeIndex++;
+    }
+    return this.visibleCommitRanges[this.currentVisibleCommitRangeIndex];
   }
 
   /**
@@ -305,6 +330,7 @@ export class Repository {
     // we're already in a conflict and need to re-check if a conflict was resolved.
 
     let output: ResolveCommandConflictOutput;
+    const fetchStartTimestamp = Date.now();
     try {
       // TODO: is this command fast on large files? it includes full conflicting file contents!
       // `sl resolve --list --all` does not seem to give any way to disambiguate (all conflicts resolved) and (not in merge)
@@ -332,6 +358,8 @@ export class Repository {
         toContinue: data.command_details.to_continue,
         toAbort: data.command_details.to_abort,
         files: [],
+        fetchStartTimestamp,
+        fetchCompletedTimestamp: Date.now(),
       };
       if (previousConflicts?.files != null && previousConflicts.files.length > 0) {
         // we saw conflicts before, some of which might now be resolved. Preserve previous ordering.
@@ -426,13 +454,21 @@ export class Repository {
   async runOrQueueOperation(
     operation: RunnableOperation,
     onProgress: (progress: OperationProgress) => void,
+    tracker: ServerSideTracker,
     cwd: string,
   ): Promise<void> {
-    await this.operationQueue.runOrQueueOperation(operation, onProgress, cwd);
+    await this.operationQueue.runOrQueueOperation(operation, onProgress, tracker, cwd);
 
     // After any operation finishes, make sure we poll right away,
     // so the UI is guarnateed to get the latest data.
     this.watchForChanges.poll('force');
+  }
+
+  /**
+   * Abort the running operation if it matches the given id.
+   */
+  abortRunningOpeation(operationId: string) {
+    this.operationQueue.abortRunningOperation(operationId);
   }
 
   /**
@@ -445,6 +481,7 @@ export class Repository {
     },
     onProgress: OperationCommandProgressReporter,
     cwd: string,
+    signal: AbortSignal,
   ): Promise<void> {
     const repoRoot = unwrap(this.info.repoRoot);
 
@@ -476,8 +513,12 @@ export class Repository {
       onProgress('stderr', data.toString());
     });
     execution.on('exit', exitCode => {
-      onProgress('exit', exitCode);
+      onProgress('exit', exitCode || 0);
     });
+    signal.addEventListener('abort', () => {
+      this.logger.log('kill operation: ', command, cwdRelativeArgs.join(' '));
+    });
+    handleAbortSignalOnProcess(execution, signal);
     await execution;
   }
 
@@ -486,31 +527,37 @@ export class Repository {
   }
 
   /** Return the latest fetched value for UncommittedChanges. */
-  getUncommittedChanges(): UncommittedChanges | null {
+  getUncommittedChanges(): FetchedUncommittedChanges | null {
     return this.uncommittedChanges;
   }
 
   subscribeToUncommittedChanges(
-    callback: (result: Result<UncommittedChanges>) => unknown,
+    callback: (result: FetchedUncommittedChanges) => unknown,
   ): Disposable {
-    const onData = (data: UncommittedChanges) => callback({value: data});
-    const onError = (error: Error) => callback({error});
-    this.uncommittedChangesEmitter.on('change', onData);
-    this.uncommittedChangesEmitter.on('error', onError);
+    this.uncommittedChangesEmitter.on('change', callback);
     return {
       dispose: () => {
-        this.uncommittedChangesEmitter.off('change', onData);
-        this.uncommittedChangesEmitter.off('error', onError);
+        this.uncommittedChangesEmitter.off('change', callback);
       },
     };
   }
 
   fetchUncommittedChanges = serializeAsyncCall(async () => {
+    const fetchStartTimestamp = Date.now();
     try {
       this.uncommittedChangesBeginFetchingEmitter.emit('start');
       // Note `status -tjson` run with PLAIN are repo-relative
       const proc = await this.runCommand(['status', '-Tjson']);
-      this.uncommittedChanges = JSON.parse(proc.stdout) as UncommittedChanges;
+      const files = (JSON.parse(proc.stdout) as UncommittedChanges).map(change => ({
+        ...change,
+        path: removeLeadingPathSep(change.path),
+      }));
+
+      this.uncommittedChanges = {
+        fetchStartTimestamp,
+        fetchCompletedTimestamp: Date.now(),
+        files: {value: files},
+      };
       this.uncommittedChangesEmitter.emit('change', this.uncommittedChanges);
     } catch (err) {
       this.logger.error('Error fetching files: ', err);
@@ -520,26 +567,25 @@ export class Repository {
           return;
         }
       }
-      this.uncommittedChangesEmitter.emit('error', err as Error);
+      // emit an error, but don't save it to this.uncommittedChanges
+      this.uncommittedChangesEmitter.emit('change', {
+        fetchStartTimestamp,
+        fetchCompletedTimestamp: Date.now(),
+        files: {error: err instanceof Error ? err : new Error(err as string)},
+      });
     }
   });
 
   /** Return the latest fetched value for SmartlogCommits. */
-  getSmartlogCommits(): SmartlogCommits | null {
+  getSmartlogCommits(): FetchedCommits | null {
     return this.smartlogCommits;
   }
 
-  subscribeToSmartlogCommitsChanges(callback: (result: Result<SmartlogCommits>) => unknown) {
-    const onData = (data: SmartlogCommits) => {
-      callback({value: data});
-    };
-    const onError = (error: Error) => callback({error});
-    this.smartlogCommitsChangesEmitter.on('change', onData);
-    this.smartlogCommitsChangesEmitter.on('error', onError);
+  subscribeToSmartlogCommitsChanges(callback: (result: FetchedCommits) => unknown) {
+    this.smartlogCommitsChangesEmitter.on('change', callback);
     return {
       dispose: () => {
-        this.smartlogCommitsChangesEmitter.off('change', onData);
-        this.smartlogCommitsChangesEmitter.off('error', onError);
+        this.smartlogCommitsChangesEmitter.off('change', callback);
       },
     };
   }
@@ -565,26 +611,42 @@ export class Repository {
   }
 
   fetchSmartlogCommits = serializeAsyncCall(async () => {
+    const fetchStartTimestamp = Date.now();
     try {
       this.smartlogCommitsBeginFetchingEmitter.emit('start');
-      const revset = 'smartlog()';
+      const visibleCommitDayRange = this.visibleCommitRanges[this.currentVisibleCommitRangeIndex];
+      const revset = !visibleCommitDayRange
+        ? 'smartlog() + .'
+        : `smartlog() and date(-${visibleCommitDayRange}) + .`;
       const proc = await this.runCommand(['log', '--template', FETCH_TEMPLATE, '--rev', revset]);
-      this.smartlogCommits = parseCommitInfoOutput(this.logger, proc.stdout.trim());
+      const commits = parseCommitInfoOutput(this.logger, proc.stdout.trim());
+      if (commits.length === 0) {
+        throw new Error(ErrorShortMessages.NoCommitsFetched);
+      }
+      this.smartlogCommits = {
+        fetchStartTimestamp,
+        fetchCompletedTimestamp: Date.now(),
+        commits: {value: commits},
+      };
       this.smartlogCommitsChangesEmitter.emit('change', this.smartlogCommits);
     } catch (err) {
       this.logger.error('Error fetching commits: ', err);
-      this.smartlogCommitsChangesEmitter.emit('error', err as Error);
+      this.smartlogCommitsChangesEmitter.emit('change', {
+        fetchStartTimestamp,
+        fetchCompletedTimestamp: Date.now(),
+        commits: {error: err instanceof Error ? err : new Error(err as string)},
+      });
     }
   });
 
   /** Watch for changes to the head commit, e.g. from checking out a new commit */
   subscribeToHeadCommit(callback: (head: CommitInfo) => unknown) {
-    let headCommit = this.smartlogCommits?.find(commit => commit.isHead);
+    let headCommit = this.smartlogCommits?.commits.value?.find(commit => commit.isHead);
     if (headCommit != null) {
       callback(headCommit);
     }
-    const onData = (data: SmartlogCommits) => {
-      const newHead = data.find(commit => commit.isHead);
+    const onData = (data: FetchedCommits) => {
+      const newHead = data?.commits.value?.find(commit => commit.isHead);
       if (newHead != null && newHead.hash !== headCommit?.hash) {
         callback(newHead);
         headCommit = newHead;
@@ -614,7 +676,7 @@ export class Repository {
   public getAllDiffIds(): Array<DiffId> {
     return (
       this.getSmartlogCommits()
-        ?.map(commit => commit.diffId)
+        ?.commits.value?.map(commit => commit.diffId)
         .filter(notEmpty) ?? []
     );
   }
@@ -836,6 +898,7 @@ function splitLine(line: string): Array<string> {
  * https://github.com/owner/repo.git
  * git@github.com:owner/repo.git
  * ssh:git@github.com:owner/repo.git
+ * ssh://git@github.com/owner/repo.git
  * git+ssh:git@github.com:owner/repo.git
  *
  * or similar urls with GitHub Enterprise hostnames:
@@ -845,7 +908,9 @@ export function extractRepoInfoFromUrl(
   url: string,
 ): {repo: string; owner: string; hostname: string} | null {
   const match =
-    /(?:https:\/\/(.*)\/|(?:git\+ssh:\/\/|ssh:\/\/)?git@(.*):)([^/]+)\/(.+?)(?:\.git)?$/.exec(url);
+    /(?:https:\/\/(.*)\/|(?:git\+ssh:\/\/|ssh:\/\/)?git@([^:/]*)[:/])([^/]+)\/(.+?)(?:\.git)?$/.exec(
+      url,
+    );
 
   if (match == null) {
     return null;
@@ -879,6 +944,14 @@ export function absolutePathForFileInRepo(
   }
 }
 
-function isProcessError(s: any): s is {stderr: string} {
+export function repoRelativePathForAbsolutePath(
+  absolutePath: AbsolutePath,
+  repo: Repository,
+  pathMod = path,
+): RepoRelativePath {
+  return pathMod.relative(repo.info.repoRoot, absolutePath);
+}
+
+function isProcessError(s: unknown): s is {stderr: string} {
   return s != null && typeof s === 'object' && 'stderr' in s;
 }

@@ -684,6 +684,11 @@ ImmediateFuture<folly::Unit> fileNotification(
             &PrjfsStats::queuedFileNotification, watch.elapsed());
       })
       .thenError([path](const folly::exception_wrapper& ew) {
+        if (ew.get_exception<QuietFault>()) {
+          XLOG(ERR) << "While handling notification on: " << path << ": " << ew;
+          return folly::unit;
+        }
+
         // These should in theory never happen, but they sometimes happen
         // due to filesystem errors, antivirus scanning, etc. During
         // test, these should be treated as fatal errors, so we don't let
@@ -798,6 +803,15 @@ ImmediateFuture<folly::Unit> PrjfsDispatcherImpl::preDirDelete(
   return folly::unit;
 }
 
+ImmediateFuture<folly::Unit> PrjfsDispatcherImpl::preFileConvertedToFull(
+    RelativePath path,
+    const ObjectFetchContextPtr& context) {
+  // this is an asynchonous notification, so we have to treat this just like
+  // all the other write notifications.
+  return fileNotification(
+      *mount_, std::move(path), notificationExecutor_, context);
+}
+
 ImmediateFuture<folly::Unit>
 PrjfsDispatcherImpl::waitForPendingNotifications() {
   // Since the executor is a SequencedExecutor, and the fileNotification
@@ -809,8 +823,13 @@ PrjfsDispatcherImpl::waitForPendingNotifications() {
   // made by a concurrent process or a different thread may still be in
   // ProjectedFS queue and therefore may still be pending when the future
   // complete. This is expected and therefore not a bug.
+  folly::stop_watch<std::chrono::microseconds> timer{};
   return ImmediateFuture{
-      folly::via(notificationExecutor_, []() { return folly::unit; }).semi()};
+      folly::via(notificationExecutor_, [this, timer = std::move(timer)]() {
+        this->mount_->getStats()->addDuration(
+            &PrjfsStats::filesystemSync, timer.elapsed());
+        return folly::unit;
+      }).semi()};
 }
 
 } // namespace facebook::eden

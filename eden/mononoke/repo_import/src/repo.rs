@@ -15,6 +15,7 @@ use bookmarks::Bookmarks;
 use changeset_fetcher::ChangesetFetcher;
 use changesets::Changesets;
 use filestore::FilestoreConfig;
+use metaconfig_types::RepoConfig;
 use mononoke_types::RepositoryId;
 use mutable_counters::MutableCounters;
 use phases::Phases;
@@ -25,6 +26,7 @@ use repo_cross_repo::RepoCrossRepo;
 use repo_derived_data::RepoDerivedData;
 use repo_identity::RepoIdentity;
 use repo_identity::RepoIdentityRef;
+use skiplist::SkiplistIndex;
 
 #[facet::container]
 #[derive(Clone)]
@@ -50,6 +52,12 @@ pub struct Repo {
 
     #[facet]
     repo_cross_repo: RepoCrossRepo,
+
+    #[facet]
+    config: RepoConfig,
+
+    #[facet]
+    skiplist: SkiplistIndex,
 }
 
 impl Repo {

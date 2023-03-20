@@ -19,7 +19,7 @@ use blobstore::Loadable;
 use bonsai_git_mapping::BonsaiGitMappingRef;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMappingRef;
 use bonsai_svnrev_mapping::BonsaiSvnrevMappingRef;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use bytes::Bytes;
 use changeset_fetcher::ChangesetFetcherArc;
 use changeset_fetcher::ChangesetFetcherRef;
@@ -68,6 +68,7 @@ use repo_blobstore::RepoBlobstoreArc;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedDataArc;
 use skeleton_manifest::RootSkeletonManifestId;
+use smallvec::SmallVec;
 use sorted_vector_map::SortedVectorMap;
 use tunables::tunables;
 use unodes::RootUnodeManifestId;
@@ -634,14 +635,28 @@ impl ChangesetContext {
         ))
     }
 
-    /// All commit extras as (name, value) pairs.
-    pub async fn extras(&self) -> Result<Vec<(String, Vec<u8>)>, MononokeError> {
+    /// All mercurial commit extras as (name, value) pairs.
+    pub async fn hg_extras(&self) -> Result<Vec<(String, Vec<u8>)>, MononokeError> {
         Ok(self
             .changeset_info()
             .await?
-            .extra()
+            .hg_extra()
             .map(|(name, value)| (name.to_string(), Vec::from(value)))
             .collect())
+    }
+
+    pub async fn git_extra_headers(
+        &self,
+    ) -> Result<Option<Vec<(SmallVec<[u8; 24]>, Bytes)>>, MononokeError> {
+        Ok(self
+            .changeset_info()
+            .await?
+            .git_extra_headers()
+            .map(|headers| {
+                headers
+                    .map(|(key, value)| (SmallVec::from(key), Bytes::copy_from_slice(value)))
+                    .collect()
+            }))
     }
 
     /// File changes associated with the commit.
@@ -655,7 +670,7 @@ impl ChangesetContext {
     /// own ancestor for the purpose of this call.
     pub async fn is_ancestor_of(&self, other_commit: ChangesetId) -> Result<bool, MononokeError> {
         let new_commit_graph_rollout_pct = tunables()
-            .get_by_repo_new_commit_graph_is_ancestor_percentage(self.repo().name())
+            .by_repo_new_commit_graph_is_ancestor_percentage(self.repo().name())
             .unwrap_or(0);
         let use_new_commit_graph =
             ((rand::random::<usize>() % 100) as i64) < new_commit_graph_rollout_pct;
@@ -1199,9 +1214,11 @@ impl ChangesetContext {
         };
         Ok(match basenames_and_suffixes {
             Some(basenames_and_suffixes)
-                if !tunables().get_disable_basename_suffix_skeleton_manifest()
+                if !tunables()
+                    .disable_basename_suffix_skeleton_manifest()
+                    .unwrap_or_default()
                     && (!basenames_and_suffixes.has_right()
-                        || tunables().get_enable_bssm_suffix_query()) =>
+                        || tunables().enable_bssm_suffix_query().unwrap_or_default()) =>
             {
                 self.find_files_with_bssm(prefixes, basenames_and_suffixes, ordering)
                     .await?
@@ -1515,7 +1532,7 @@ impl ChangesetContext {
             .run_hooks_for_bookmark(
                 self.ctx(),
                 vec![self.bonsai_changeset().await?].iter(),
-                &BookmarkName::new(bookmark.as_ref())?,
+                &BookmarkKey::new(bookmark.as_ref())?,
                 pushvars,
                 CrossRepoPushSource::NativeToThisRepo,
                 PushAuthoredBy::User,

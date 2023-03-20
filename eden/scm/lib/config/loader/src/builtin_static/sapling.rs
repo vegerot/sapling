@@ -141,7 +141,6 @@ fbhistedit=
 fsmonitor=
 ghstack=
 githelp=
-github=
 gitrevset=!
 hgsubversion=!
 histedit=
@@ -153,7 +152,6 @@ morestatus=
 myparent=
 obsshelve=
 patchrmdir=!
-prmarker=
 progressfile=
 pullcreatemarkers=
 pushrebase=!
@@ -428,8 +426,11 @@ style=sl_default
 [revsetalias]
 sb(n)=first(sort(bookmark(), -rev), n)
 sba=sort(bookmark(), -rev)
-top=heads(. ::)
-bottom=first(draft() & ::.)
+top=top()
+bottom=bottom()
+next=next()
+prev=previous
+previous=previous()
 base=last(public() & ::.)
 obsrelated(x)=mutrelated(x)
 focusedsmartlog(x)=focusedbranch(x) + draftbranch(x)^ + present(master)
@@ -574,8 +575,6 @@ generationnumber=5
 [clone]
 default-destination-dir=$HOME
 nativecheckout=True
-# TODO(T131560043): enable Rust for clone
-use-rust=False
 nativepull=True
 
 [commands]
@@ -620,9 +619,6 @@ pager=internal:streampager
 
 [config]
 use-rust=true
-
-[hooks]
-post-pull.prmarker=sl debugprmarker
 
 [init]
 prefer-git=True

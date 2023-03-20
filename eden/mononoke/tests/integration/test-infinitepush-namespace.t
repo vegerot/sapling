@@ -86,8 +86,11 @@ Invalid infinitepush, with pushrebase disabled
   remote:         source: Error {
   remote:             context: "Failed to create scratch bookmark",
   remote:             source: InvalidScratchBookmark {
-  remote:                 bookmark: BookmarkName {
-  remote:                     bookmark: "bad/123",
+  remote:                 bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "bad/123",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
   remote:                 pattern: "^(infinitepush1|infinitepush2)/.+$",
   remote:             },
@@ -118,8 +121,11 @@ Invalid infinitepush, with pushrebase enabled
   remote:         source: Error {
   remote:             context: "Failed to create scratch bookmark",
   remote:             source: InvalidScratchBookmark {
-  remote:                 bookmark: BookmarkName {
-  remote:                     bookmark: "bad/456",
+  remote:                 bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "bad/456",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
   remote:                 pattern: "^(infinitepush1|infinitepush2)/.+$",
   remote:             },
@@ -164,8 +170,11 @@ Invalid push, with pushrebase disabled
   remote:         source: Error {
   remote:             context: "Failed to create bookmark",
   remote:             source: InvalidPublishingBookmark {
-  remote:                 bookmark: BookmarkName {
-  remote:                     bookmark: "infinitepush2/123",
+  remote:                 bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "infinitepush2/123",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
   remote:                 pattern: "^(infinitepush1|infinitepush2)/.+$",
   remote:             },
@@ -197,8 +206,11 @@ Invalid push, with pushrebase enabled
   remote:         source: Error {
   remote:             context: "Failed to create bookmark",
   remote:             source: InvalidPublishingBookmark {
-  remote:                 bookmark: BookmarkName {
-  remote:                     bookmark: "infinitepush2/456",
+  remote:                 bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "infinitepush2/456",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
   remote:                 pattern: "^(infinitepush1|infinitepush2)/.+$",
   remote:             },

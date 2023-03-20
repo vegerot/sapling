@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks_movement::CreateBookmarkOp;
 use bytes::Bytes;
@@ -25,33 +25,33 @@ impl RepoContext {
     /// Create a bookmark.
     pub async fn create_bookmark(
         &self,
-        bookmark: impl AsRef<str>,
+        bookmark: &BookmarkKey,
         target: ChangesetId,
         pushvars: Option<&HashMap<String, Bytes>>,
     ) -> Result<(), MononokeError> {
         self.start_write()?;
 
-        let bookmark = bookmark.as_ref();
-        let bookmark = BookmarkName::new(bookmark)?;
-
         fn make_create_op<'a>(
-            bookmark: &'a BookmarkName,
+            bookmark: &'a BookmarkKey,
             target: ChangesetId,
             pushvars: Option<&'a HashMap<String, Bytes>>,
         ) -> CreateBookmarkOp<'a> {
             let mut op = CreateBookmarkOp::new(bookmark, target, BookmarkUpdateReason::ApiRequest)
                 .with_pushvars(pushvars);
-            if !tunables().get_disable_commit_scribe_logging_scs() {
+            if !tunables()
+                .disable_commit_scribe_logging_scs()
+                .unwrap_or_default()
+            {
                 op = op.log_new_public_commits_to_scribe();
             }
             op
         }
         if let Some(redirector) = self.push_redirector.as_ref() {
-            let large_bookmark = redirector.small_to_large_bookmark(&bookmark).await?;
-            if large_bookmark == bookmark {
+            let large_bookmark = redirector.small_to_large_bookmark(bookmark).await?;
+            if &large_bookmark == bookmark {
                 return Err(MononokeError::InvalidRequest(format!(
                     "Cannot create shared bookmark '{}' from small repo",
-                    bookmark
+                    bookmark.name()
                 )));
             }
             let ctx = self.ctx();
@@ -70,7 +70,7 @@ impl RepoContext {
             // Wait for bookmark to catch up on small repo
             redirector.backsync_latest(ctx).await?;
         } else {
-            make_create_op(&bookmark, target, pushvars)
+            make_create_op(bookmark, target, pushvars)
                 .run(
                     self.ctx(),
                     self.authorization_context(),
@@ -80,7 +80,6 @@ impl RepoContext {
                 )
                 .await?;
         }
-
         Ok(())
     }
 }

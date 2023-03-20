@@ -5,12 +5,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {ServerSideTracker} from './analytics/serverSideTracker';
 import type {Logger} from './logger';
 import type {
   OperationCommandProgressReporter,
   OperationProgress,
   RunnableOperation,
 } from 'isl/src/types';
+
+import {newAbortController} from 'shared/compat';
 
 /**
  * Handle running & queueing all Operations so that only one Operation runs at once.
@@ -23,19 +26,22 @@ export class OperationQueue {
       operation: RunnableOperation,
       cwd: string,
       handleProgress: OperationCommandProgressReporter,
+      signal: AbortSignal,
     ) => Promise<void>,
   ) {}
 
-  private queuedOperations: Array<RunnableOperation> = [];
+  private queuedOperations: Array<RunnableOperation & {tracker: ServerSideTracker}> = [];
   private runningOperation: RunnableOperation | undefined = undefined;
+  private abortController: AbortController | undefined = undefined;
 
   async runOrQueueOperation(
     operation: RunnableOperation,
     onProgress: (progress: OperationProgress) => void,
+    tracker: ServerSideTracker,
     cwd: string,
   ): Promise<void> {
     if (this.runningOperation != null) {
-      this.queuedOperations.push(operation);
+      this.queuedOperations.push({...operation, tracker});
       onProgress({id: operation.id, kind: 'queue', queue: this.queuedOperations.map(o => o.id)});
       return;
     }
@@ -57,13 +63,20 @@ export class OperationQueue {
           onProgress({id: operation.id, kind: 'stderr', message: args[1]});
           break;
         case 'exit':
-          onProgress({id: operation.id, kind: 'exit', exitCode: args[1]});
+          onProgress({id: operation.id, kind: 'exit', exitCode: args[1], timestamp: Date.now()});
           break;
       }
     };
 
     try {
-      await this.runCallback(operation, cwd, handleCommandProgress);
+      const controller = newAbortController();
+      this.abortController = controller;
+      await tracker.operation(
+        operation.trackEventName,
+        'RunOperationError',
+        {extras: {args: operation.args, runner: operation.runner}},
+        _p => this.runCallback(operation, cwd, handleCommandProgress, controller.signal),
+      );
       this.runningOperation = undefined;
 
       // now that we successfully ran this operation, dequeue the next
@@ -75,6 +88,7 @@ export class OperationQueue {
             op,
             // TODO: we're using the onProgress from the LAST `runOperation`... should we be keeping the newer onProgress in the queued operation?
             onProgress,
+            op.tracker,
             cwd,
           );
         }
@@ -86,6 +100,17 @@ export class OperationQueue {
       // clear queue to run when we hit an error
       this.queuedOperations = [];
       this.runningOperation = undefined;
+    }
+  }
+
+  /**
+   * Send kill signal to the running operation if the operationId matches.
+   * If the process exits, the exit event will be noticed by the queue.
+   * This function does not block on waiting for the operation process to exit.
+   */
+  abortRunningOperation(operationId: string) {
+    if (this.runningOperation?.id == operationId) {
+      this.abortController?.abort();
     }
   }
 }

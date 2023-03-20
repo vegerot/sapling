@@ -572,7 +572,7 @@ class ui(object):
             return user
         if user is None and self.configbool("ui", "askusername"):
             user = self.prompt(_("enter a commit username:"), default=None)
-        if user is None and not self.interactive():
+        if user is None and not self.interactive() and self.plain():
             try:
                 user = "%s@%s" % (util.getuser(), socket.getfqdn())
                 self.warn(_("no username found, using '%s' instead\n") % user)
@@ -2039,29 +2039,6 @@ def pushrevpathoption(ui, path, value):
     return value
 
 
-def _normalize_rawloc(rawloc: str) -> str:
-    """Normalize a raw location:
-
-    - If rawloc is a local path backed by an eager repo, return "eager:rawloc".
-      The "eager:" scheme helps various places like `repo.edenapi` correctly
-      realize the remote peer is an eager repo.
-    """
-    if os.path.isabs(rawloc):
-        try:
-            ident = identity.sniffdir(rawloc)
-            if not ident:
-                return rawloc
-
-            with open(os.path.join(rawloc, ident.dotdir(), "store", "requires")) as f:
-                from .eagerepo import EAGEREPO_REQUIREMENT
-
-                if EAGEREPO_REQUIREMENT in f.read().split():
-                    return f"eager:{rawloc}"
-        except IOError:
-            pass
-    return rawloc
-
-
 class path(object):
     """Represents an individual path and its configuration."""
 
@@ -2081,8 +2058,6 @@ class path(object):
         """
         if not rawloc:
             raise ValueError("rawloc must be defined")
-
-        rawloc = _normalize_rawloc(rawloc)
 
         # Locations may define branches via syntax <base>#<branch>.
         u = util.url(rawloc)

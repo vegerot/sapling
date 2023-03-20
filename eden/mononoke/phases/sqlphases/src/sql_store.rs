@@ -17,6 +17,7 @@ use bytes::Bytes;
 use caching_ext::fill_cache;
 use caching_ext::get_or_fill;
 use caching_ext::CacheDisposition;
+use caching_ext::CacheHandlerFactory;
 use caching_ext::CacheTtl;
 use caching_ext::CachelibHandler;
 use caching_ext::EntityStore;
@@ -56,10 +57,10 @@ pub struct Caches {
 }
 
 impl Caches {
-    pub fn new_mock(keygen: KeyGen) -> Self {
+    pub fn new(cache_handler_factory: CacheHandlerFactory, keygen: KeyGen) -> Self {
         Self {
-            memcache: MemcacheHandler::create_mock(),
-            cache_pool: CachelibHandler::create_mock(),
+            memcache: cache_handler_factory.memcache(),
+            cache_pool: cache_handler_factory.cachelib(),
             keygen,
         }
     }
@@ -86,11 +87,11 @@ impl SqlPhasesStore {
 
         let ctx = (ctx, repo_id, self);
 
-        let res = get_or_fill(ctx, hashset! { cs_id })
+        let res = get_or_fill(&ctx, hashset! { cs_id })
             .await
             .with_context(|| "Error fetching phases via cache")?
-            .into_iter()
-            .map(|(_, val)| val.into())
+            .into_values()
+            .map(|val| val.into())
             .next();
 
         Ok(res)
@@ -108,7 +109,7 @@ impl SqlPhasesStore {
         }
         STATS::get_many.add_value(1);
         let ctx = (ctx, repo_id, self);
-        let cs_to_phase = get_or_fill(ctx, ids)
+        let cs_to_phase = get_or_fill(&ctx, ids)
             .await
             .with_context(|| "Error fetching phases via cache")?;
 
@@ -149,7 +150,7 @@ impl SqlPhasesStore {
                 .iter()
                 .map(|csid| (csid, &SqlPhase(Phase::Public)))
                 .collect::<Vec<_>>();
-            fill_cache(ctx, phases).await;
+            fill_cache(&ctx, phases).await;
         }
 
         Ok(())

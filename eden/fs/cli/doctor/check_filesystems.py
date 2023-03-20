@@ -5,6 +5,7 @@
 # GNU General Public License version 2.
 
 import hashlib
+import json
 import os
 import platform
 import random
@@ -29,7 +30,14 @@ from eden.fs.cli.filesystem import FsUtil
 from eden.fs.cli.prjfs import PRJ_FILE_STATE
 from eden.thrift.legacy import EdenClient
 from facebook.eden.constants import DIS_REQUIRE_LOADED, DIS_REQUIRE_MATERIALIZED
-from facebook.eden.ttypes import DebugInvalidateRequest, MountId, SyncBehavior
+from facebook.eden.ttypes import (
+    DebugInvalidateRequest,
+    GetScmStatusParams,
+    MountId,
+    ScmFileStatus,
+    SyncBehavior,
+    TimeSpec,
+)
 
 
 def check_using_nfs_path(tracker: ProblemTracker, mount_path: Path) -> None:
@@ -683,10 +691,10 @@ class HighInodeCountProblem(Problem, FixableProblem):
         )
 
     def dry_run_msg(self) -> str:
-        return f"Would invalidate all non-materialized files and directories in {self._info.path}"
+        return f"Would start a background invalidation of not recently used files and directories in {self._info.path}"
 
     def start_msg(self) -> str:
-        return f"Invalidating all non-materialized files and directories in {self._info.path}"
+        return f"Starting background invalidation of not recently used files and directories in {self._info.path}"
 
     def perform_fix(self) -> None:
         """Invalidate all non-materialized inodes."""
@@ -694,7 +702,10 @@ class HighInodeCountProblem(Problem, FixableProblem):
             try:
                 client.debugInvalidateNonMaterialized(
                     DebugInvalidateRequest(
-                        mount=MountId(mountPoint=bytes(self._info.path)), path=b""
+                        mount=MountId(mountPoint=bytes(self._info.path)),
+                        path=b"",
+                        background=True,
+                        age=TimeSpec(seconds=3600),
                     )
                 )
             except Exception as ex:
@@ -734,3 +745,70 @@ def check_inode_counts(
     )
     if inode_count > threshold:
         tracker.add_problem(HighInodeCountProblem(checkout, inode_count))
+
+
+class HgStatusAndDiffMismatch(PathsProblem):
+    def __init__(self, files: List[Path]) -> None:
+        super().__init__(
+            self.omitPathsDescription(
+                files, " is present as modified in `hg status` but not in `hg diff`"
+            ),
+            severity=ProblemSeverity.ERROR,
+        )
+
+
+def get_modified_files(instance: EdenInstance, checkout: EdenCheckout) -> List[Path]:
+    with instance.get_thrift_client_legacy(timeout=5.0) as client:
+        status = client.getScmStatusV2(
+            GetScmStatusParams(
+                mountPoint=bytes(checkout.path),
+                commit=checkout.get_snapshot().working_copy_parent.encode(),
+            )
+        )
+
+    modified_files = []
+    for path, file_status in status.status.entries.items():
+        if file_status == ScmFileStatus.MODIFIED:
+            modified_files += [Path(os.fsdecode(path))]
+
+    return modified_files
+
+
+def get_hg_diff(checkout: EdenCheckout) -> Set[Path]:
+    hg = os.environ.get("EDEN_HG_BINARY", "hg")
+    json_diff = subprocess.run(
+        [hg, "diff", "--per-file-stat-json"],
+        env=dict(os.environ, HGPLAIN="1"),
+        stdout=subprocess.PIPE,
+        cwd=checkout.path,
+        check=True,
+        text=True,
+    ).stdout
+    diff = json.loads(json_diff)
+
+    return diff.keys()
+
+
+def check_hg_status_match_hg_diff(
+    tracker: ProblemTracker, instance: EdenInstance, checkout: EdenCheckout
+) -> None:
+    modified_files = get_modified_files(instance, checkout)
+    if len(modified_files) == 0:
+        return
+
+    diff = get_hg_diff(checkout)
+
+    # Bail out if status changed while running `hg diff` as it is
+    # guaranteed that the working copy was modified, thus this doctor
+    # checker would raise a Problem
+    if modified_files != get_modified_files(instance, checkout):
+        return
+
+    if len(diff) != len(modified_files):
+        mismatched_files = []
+        for modified_file in modified_files:
+            if modified_file not in diff:
+                mismatched_files += [Path(modified_file)]
+
+        if mismatched_files != []:
+            tracker.add_problem(HgStatusAndDiffMismatch(mismatched_files))

@@ -50,9 +50,8 @@ use anyhow::format_err;
 use anyhow::Error;
 use anyhow::Result;
 use backsyncer::format_counter as format_backsyncer_counter;
-use blobrepo::BlobRepo;
 use bonsai_hg_mapping::BonsaiHgMappingArc;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLogRef;
 use bookmarks::Freshness;
 use cached_config::ConfigStore;
@@ -68,6 +67,7 @@ use context::CoreContext;
 use cross_repo_sync::types::Source;
 use cross_repo_sync::types::Target;
 use cross_repo_sync::CommitSyncer;
+use cross_repo_sync::ConcreteRepo as CrossRepo;
 use derived_data_utils::derive_data_for_csids;
 use fbinit::FacebookInit;
 use filenodes::FilenodesArc;
@@ -144,8 +144,8 @@ async fn run_in_single_commit_mode<M: SyncedCommitMapping + Clone + 'static, R: 
     scuba_sample: MononokeScubaSampleBuilder,
     source_skiplist_index: Source<Arc<SkiplistIndex>>,
     target_skiplist_index: Target<Arc<SkiplistIndex>>,
-    maybe_bookmark: Option<BookmarkName>,
-    common_bookmarks: HashSet<BookmarkName>,
+    maybe_bookmark: Option<BookmarkKey>,
+    common_bookmarks: HashSet<BookmarkKey>,
 ) -> Result<(), Error> {
     info!(
         ctx.logger(),
@@ -191,7 +191,7 @@ async fn run_in_tailing_mode<M: SyncedCommitMapping + Clone + 'static, R: Repo>(
     target_mutable_counters: ArcMutableCounters,
     source_skiplist_index: Source<Arc<SkiplistIndex>>,
     target_skiplist_index: Target<Arc<SkiplistIndex>>,
-    common_pushrebase_bookmarks: HashSet<BookmarkName>,
+    common_pushrebase_bookmarks: HashSet<BookmarkKey>,
     base_scuba_sample: MononokeScubaSampleBuilder,
     backpressure_params: BackpressureParams,
     derived_data_types: Vec<String>,
@@ -267,7 +267,7 @@ async fn tail<M: SyncedCommitMapping + Clone + 'static, R: Repo>(
     commit_syncer: &CommitSyncer<M, R>,
     target_mutable_counters: &ArcMutableCounters,
     mut scuba_sample: MononokeScubaSampleBuilder,
-    common_pushrebase_bookmarks: &HashSet<BookmarkName>,
+    common_pushrebase_bookmarks: &HashSet<BookmarkKey>,
     source_skiplist_index: &Source<Arc<SkiplistIndex>>,
     target_skiplist_index: &Target<Arc<SkiplistIndex>>,
     backpressure_params: &BackpressureParams,
@@ -455,7 +455,7 @@ async fn run<'a>(
     let (source_repo, target_repo): (InnerRepo, InnerRepo) =
         try_join(source_repo, target_repo).await?;
 
-    let commit_syncer = create_commit_syncer_from_matches::<BlobRepo>(&ctx, matches, None).await?;
+    let commit_syncer = create_commit_syncer_from_matches::<InnerRepo>(&ctx, matches, None).await?;
 
     let live_commit_sync_config = Arc::new(CfgrLiveCommitSyncConfig::new(logger, config_store)?);
     let common_commit_sync_config =
@@ -475,7 +475,7 @@ async fn run<'a>(
             add_common_fields(&mut scuba_sample, &commit_syncer);
             let maybe_target_bookmark = sub_m
                 .value_of(ARG_TARGET_BOOKMARK)
-                .map(BookmarkName::new)
+                .map(BookmarkKey::new)
                 .transpose()?;
             let bcs = get_starting_commit(&ctx, sub_m, source_repo.blob_repo.clone()).await?;
 
@@ -551,7 +551,7 @@ fn context_and_matches<'a>(
 }
 
 struct BackpressureParams {
-    backsync_repos: Vec<BlobRepo>,
+    backsync_repos: Vec<CrossRepo>,
     wait_for_target_repo_hg_sync: bool,
 }
 

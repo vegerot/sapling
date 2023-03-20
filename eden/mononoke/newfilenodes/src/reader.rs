@@ -16,7 +16,7 @@ use context::CoreContext;
 use context::PerfCounterType;
 use faster_hex::hex_encode;
 use filenodes::FilenodeInfo;
-use filenodes::FilenodeRangeResult;
+use filenodes::FilenodeRange;
 use filenodes::FilenodeResult;
 use filenodes::PreparedFilenode;
 use futures::future;
@@ -46,8 +46,6 @@ use crate::local_cache::LocalCache;
 use crate::remote_cache::RemoteCache;
 use crate::shards::Shards;
 use crate::sql_timeout_knobs;
-use crate::structs::CachedFilenode;
-use crate::structs::CachedHistory;
 
 define_stats! {
     prefix = "mononoke.filenodes";
@@ -73,6 +71,9 @@ const SQL_TIMEOUT_MILLIS: u64 = 5_000;
 pub enum ErrorKind {
     #[error("Internal error: path is not found: {0:?}")]
     PathNotFound(PathHashBytes),
+
+    #[error("Internal error: invalid path: {0:?}")]
+    InvalidPath(PathBytes, #[source] Error),
 
     #[error("Internal error: fixedcopyinfo is missing for filenode: {0:?}")]
     FixedCopyInfoMissing(HgFileNodeId),
@@ -109,7 +110,7 @@ pub fn filenode_cache_key(
     repo_id: RepositoryId,
     pwh: &PathWithHash<'_>,
     filenode: &HgFileNodeId,
-) -> CacheKey<CachedFilenode> {
+) -> CacheKey<FilenodeInfo> {
     let mut v = vec![0; pwh.hash.0.len() * 2];
     let is_tree = pwh.is_tree as u8;
     hex_encode(pwh.hash.0.as_ref(), &mut v).expect("failed to hex encode");
@@ -131,7 +132,7 @@ pub fn history_cache_key(
     repo_id: RepositoryId,
     pwh: &PathWithHash<'_>,
     limit: Option<u64>,
-) -> CacheKey<Option<CachedHistory>> {
+) -> CacheKey<FilenodeRange> {
     let mut v = vec![0; pwh.hash.0.len() * 2];
     let is_tree = pwh.is_tree as u8;
     hex_encode(pwh.hash.0.as_ref(), &mut v).expect("failed to hex encode");
@@ -173,8 +174,8 @@ impl FilenodesReader {
             shards: Arc::new(Shards::new(1000, 1000)),
             read_connections: Connections::new(read_connections),
             read_master_connections: Connections::new(read_master_connections),
-            local_cache: LocalCache::Noop,
-            remote_cache: RemoteCache::Noop,
+            local_cache: LocalCache::new_noop(),
+            remote_cache: RemoteCache::new_noop(),
         }
     }
 
@@ -190,8 +191,8 @@ impl FilenodesReader {
         let pwh = PathWithHash::from_repo_path_cow(Cow::Owned(path.clone()));
         let key = filenode_cache_key(repo_id, &pwh, &filenode);
 
-        if let Some(cached) = self.local_cache.get(&key) {
-            return Ok(FilenodeResult::Present(Some(cached.try_into()?)));
+        if let Some(cached) = self.local_cache.get_filenode(&key) {
+            return Ok(FilenodeResult::Present(Some(cached)));
         }
 
         let ctx = ctx.clone();
@@ -201,8 +202,8 @@ impl FilenodesReader {
                 async move {
                     // Now that we acquired the permit, check our cache again, in case the previous permit
                     // owner just filed the cache with the filenode we're looking for.
-                    if let Some(cached) = self.local_cache.get(&key) {
-                        return Ok(FilenodeResult::Present(Some(cached.try_into()?)));
+                    if let Some(cached) = self.local_cache.get_filenode(&key) {
+                        return Ok(FilenodeResult::Present(Some(cached)));
                     }
 
                     STATS::get_local_cache_misses.add_value(1);
@@ -210,7 +211,7 @@ impl FilenodesReader {
                     if let Some(info) =
                         enforce_remote_cache_timeout(self.remote_cache.get_filenode(&key)).await
                     {
-                        self.local_cache.fill(&key, &(&info).into());
+                        self.local_cache.fill_filenode(&key, &info);
                         return Ok(FilenodeResult::Present(Some(info)));
                     }
 
@@ -237,7 +238,7 @@ impl FilenodesReader {
                             return Ok(FilenodeResult::Disabled);
                         }
                         Ok(FilenodeResult::Present(Some(res))) => {
-                            return Ok(FilenodeResult::Present(Some(res.try_into()?)));
+                            return Ok(FilenodeResult::Present(Some(res)));
                         }
                         Ok(FilenodeResult::Present(None))
                         | Err(ErrorKind::FixedCopyInfoMissing(_))
@@ -250,7 +251,9 @@ impl FilenodesReader {
                         }
                     }
 
-                    let ratio = tunables().get_filenodes_master_fallback_ratio();
+                    let ratio = tunables()
+                        .filenodes_master_fallback_ratio()
+                        .unwrap_or_default();
                     if ratio > 0 {
                         let mut rng = thread_rng();
                         let n = rng.gen_range(0..ratio);
@@ -275,10 +278,7 @@ impl FilenodesReader {
                     .await?;
 
                     match res {
-                        FilenodeResult::Present(res) => {
-                            let res = res.map(|res| res.try_into()).transpose()?;
-                            Ok(FilenodeResult::Present(res))
-                        }
+                        FilenodeResult::Present(res) => Ok(FilenodeResult::Present(res)),
                         FilenodeResult::Disabled => Ok(FilenodeResult::Disabled),
                     }
                 }
@@ -292,14 +292,14 @@ impl FilenodesReader {
         repo_id: RepositoryId,
         path: &RepoPath,
         limit: Option<u64>,
-    ) -> Result<FilenodeRangeResult<Vec<FilenodeInfo>>, Error> {
+    ) -> Result<FilenodeResult<FilenodeRange>, Error> {
         STATS::range_gets.add_value(1);
 
         let pwh = PathWithHash::from_repo_path_cow(Cow::Owned(path.clone()));
         let key = history_cache_key(repo_id, &pwh, limit);
 
-        if let Some(cached) = self.local_cache.get(&key) {
-            return convert_cached_filenodes(cached);
+        if let Some(cached) = self.local_cache.get_history(&key) {
+            return Ok(FilenodeResult::Present(cached));
         }
         let ctx = ctx.clone();
         self.shards
@@ -307,8 +307,8 @@ impl FilenodesReader {
             .with_history(path, move || {
                 async move {
                     // See above for rationale here.
-                    if let Some(cached) = self.local_cache.get(&key) {
-                        return convert_cached_filenodes(cached);
+                    if let Some(cached) = self.local_cache.get_history(&key) {
+                        return Ok(FilenodeResult::Present(cached));
                     }
 
                     STATS::range_local_cache_misses.add_value(1);
@@ -316,18 +316,9 @@ impl FilenodesReader {
                     if let Some(info) =
                         enforce_remote_cache_timeout(self.remote_cache.get_history(&key)).await
                     {
-                        let info = info.into_option();
                         // TODO: We should compress if this is too big.
-                        self.local_cache
-                            .fill(&key, &info.as_ref().map(|info| info.into()));
-                        match info {
-                            Some(info) => {
-                                return Ok(FilenodeRangeResult::Present(info));
-                            }
-                            None => {
-                                return Ok(FilenodeRangeResult::TooBig);
-                            }
-                        }
+                        self.local_cache.fill_history(&key, &info);
+                        return Ok(FilenodeResult::Present(info));
                     }
 
                     let cache_filler = HistoryCacheFiller {
@@ -336,7 +327,7 @@ impl FilenodesReader {
                         key: &key,
                     };
 
-                    let res = select_history_from_sql(
+                    select_history_from_sql(
                         &cache_filler,
                         &self.read_connections,
                         repo_id,
@@ -347,15 +338,7 @@ impl FilenodesReader {
                         },
                         limit,
                     )
-                    .await?;
-
-                    match res {
-                        FilenodeRangeResult::Present(res) => {
-                            Ok(FilenodeRangeResult::Present(res.try_into()?))
-                        }
-                        FilenodeRangeResult::TooBig => Ok(FilenodeRangeResult::TooBig),
-                        FilenodeRangeResult::Disabled => Ok(FilenodeRangeResult::Disabled),
-                    }
+                    .await
                 }
             })
             .await?
@@ -370,17 +353,8 @@ impl FilenodesReader {
         for c in filenodes {
             let pwh = PathWithHash::from_repo_path(&c.path);
             let key = filenode_cache_key(repo_id, &pwh, &c.info.filenode);
-            self.local_cache.fill(&key, &(&c.info).into())
+            self.local_cache.fill_filenode(&key, &c.info)
         }
-    }
-}
-
-fn convert_cached_filenodes(
-    cached: Option<CachedHistory>,
-) -> Result<FilenodeRangeResult<Vec<FilenodeInfo>>, Error> {
-    match cached {
-        Some(cached) => Ok(FilenodeRangeResult::Present(cached.try_into()?)),
-        None => Ok(FilenodeRangeResult::TooBig),
     }
 }
 
@@ -388,15 +362,13 @@ fn convert_cached_filenodes(
 struct FilenodeCacheFiller<'a> {
     local_cache: &'a LocalCache,
     remote_cache: &'a RemoteCache,
-    key: &'a CacheKey<CachedFilenode>,
+    key: &'a CacheKey<FilenodeInfo>,
 }
 
 impl<'a> FilenodeCacheFiller<'a> {
-    fn fill(&self, filenode: CachedFilenode) {
-        self.local_cache.fill(self.key, &filenode);
-        if let Ok(filenode) = filenode.try_into() {
-            self.remote_cache.fill_filenode(self.key, filenode);
-        }
+    fn fill(&self, filenode: FilenodeInfo) {
+        self.local_cache.fill_filenode(self.key, &filenode);
+        self.remote_cache.fill_filenode(self.key, filenode);
     }
 }
 
@@ -415,8 +387,8 @@ async fn select_filenode_from_sql(
     pwh: &PathWithHash<'_>,
     filenode: HgFileNodeId,
     recorder: &PerfCounterRecorder<'_>,
-) -> Result<FilenodeResult<Option<CachedFilenode>>, ErrorKind> {
-    if tunables().get_filenodes_disabled() {
+) -> Result<FilenodeResult<Option<FilenodeInfo>>, ErrorKind> {
+    if tunables().filenodes_disabled().unwrap_or_default() {
         STATS::gets_disabled.add_value(1);
         return Ok(FilenodeResult::Disabled);
     }
@@ -479,16 +451,13 @@ async fn select_partial_filenode(
 struct HistoryCacheFiller<'a> {
     local_cache: &'a LocalCache,
     remote_cache: &'a RemoteCache,
-    key: &'a CacheKey<Option<CachedHistory>>,
+    key: &'a CacheKey<FilenodeRange>,
 }
 
 impl<'a> HistoryCacheFiller<'a> {
-    fn fill(&self, maybe_history: Option<CachedHistory>) {
-        self.local_cache.fill(self.key, &maybe_history);
-        let maybe_history = maybe_history.map(|history| history.try_into()).transpose();
-        if let Ok(maybe_history) = maybe_history {
-            self.remote_cache.fill_history(self.key, maybe_history);
-        }
+    fn fill(&self, history: FilenodeRange) {
+        self.local_cache.fill_history(self.key, &history);
+        self.remote_cache.fill_history(self.key, history);
     }
 }
 
@@ -499,21 +468,22 @@ async fn select_history_from_sql(
     pwh: &PathWithHash<'_>,
     recorder: &PerfCounterRecorder<'_>,
     limit: Option<u64>,
-) -> Result<FilenodeRangeResult<CachedHistory>, Error> {
-    if tunables().get_filenodes_disabled() {
+) -> Result<FilenodeResult<FilenodeRange>, Error> {
+    if tunables().filenodes_disabled().unwrap_or_default() {
         STATS::range_gets_disabled.add_value(1);
-        return Ok(FilenodeRangeResult::Disabled);
+        return Ok(FilenodeResult::Disabled);
     }
 
     let maybe_partial = select_partial_history(connections, repo_id, pwh, recorder, limit).await?;
     if let Some(partial) = maybe_partial {
-        let history = fill_paths(connections, pwh, repo_id, partial, recorder).await?;
-        let history = CachedHistory { history };
-        filler.fill(Some(history.clone()));
-        Ok(FilenodeRangeResult::Present(history))
+        let history = FilenodeRange::Filenodes(
+            fill_paths(connections, pwh, repo_id, partial, recorder).await?,
+        );
+        filler.fill(history.clone());
+        Ok(FilenodeResult::Present(history))
     } else {
-        filler.fill(None);
-        Ok(FilenodeRangeResult::TooBig)
+        filler.fill(FilenodeRange::TooBig);
+        Ok(FilenodeResult::Present(FilenodeRange::TooBig))
     }
 }
 
@@ -599,7 +569,7 @@ async fn fill_paths(
     repo_id: RepositoryId,
     rows: Vec<PartialFilenode>,
     recorder: &PerfCounterRecorder<'_>,
-) -> Result<Vec<CachedFilenode>, ErrorKind> {
+) -> Result<Vec<FilenodeInfo>, ErrorKind> {
     let path_hashes_to_fetch = rows
         .iter()
         .filter_map(|r| r.copyfrom.as_ref().map(|c| c.0.clone()));
@@ -622,14 +592,20 @@ async fn fill_paths(
                 Some((from_path_hash, from_node)) => {
                     let from_path = path_hashes_to_paths
                         .get(&from_path_hash)
-                        .ok_or_else(|| ErrorKind::PathNotFound(from_path_hash.clone()))?
-                        .clone();
-                    Some((pwh.is_tree, from_path, from_node))
+                        .ok_or_else(|| ErrorKind::PathNotFound(from_path_hash.clone()))?;
+                    let repo_path = if pwh.is_tree {
+                        RepoPath::dir(&from_path.0[..])
+                            .map_err(|e| ErrorKind::InvalidPath(from_path.clone(), e))?
+                    } else {
+                        RepoPath::file(&from_path.0[..])
+                            .map_err(|e| ErrorKind::InvalidPath(from_path.clone(), e))?
+                    };
+                    Some((repo_path, from_node))
                 }
                 None => None,
             };
 
-            let ret = CachedFilenode {
+            let ret = FilenodeInfo {
                 filenode,
                 p1,
                 p2,

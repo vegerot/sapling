@@ -14,10 +14,10 @@ use async_runtime::block_unless_interrupted as block_on;
 use clidispatch::abort;
 use clidispatch::abort_if;
 use clidispatch::errors;
-use clidispatch::output::new_logger;
-use clidispatch::output::TermLogger;
 use clidispatch::ReqCtx;
+use clidispatch::TermLogger;
 use cliparser::define_flags;
+use configloader::hg::resolve_custom_scheme;
 use configmodel::ConfigExt;
 use migration::feature::deprecate;
 use repo::repo::Repo;
@@ -83,7 +83,7 @@ define_flags! {
 }
 
 pub fn run(mut ctx: ReqCtx<CloneOpts>, config: &mut ConfigSet) -> Result<u8> {
-    let mut logger = new_logger(ctx.io(), ctx.global_opts());
+    let mut logger = ctx.logger();
 
     let deprecated_options = [
         ("--rev", "rev-option", ctx.opts.rev.is_empty()),
@@ -139,7 +139,10 @@ pub fn run(mut ctx: ReqCtx<CloneOpts>, config: &mut ConfigSet) -> Result<u8> {
 
     let supported_url = match url::Url::parse(&ctx.opts.source) {
         Err(_) => false,
-        Ok(url) => url.scheme() != "file" && url.scheme() != "ssh",
+        Ok(url) => match resolve_custom_scheme(config, url)?.scheme() {
+            "mononoke" | "eager" | "test" => true,
+            _ => false,
+        },
     };
 
     if !ctx.opts.updaterev.is_empty()
@@ -177,7 +180,7 @@ pub fn run(mut ctx: ReqCtx<CloneOpts>, config: &mut ConfigSet) -> Result<u8> {
             logger.verbose(|| format!("Repo name is {} from config", c));
             c
         }
-        Some(_) | None => match configloader::hg::repo_name_from_url(&ctx.opts.source) {
+        Some(_) | None => match configloader::hg::repo_name_from_url(config, &ctx.opts.source) {
             Some(name) => {
                 logger.verbose(|| format!("Repo name is {} via URL {}", name, ctx.opts.source));
                 config.set(

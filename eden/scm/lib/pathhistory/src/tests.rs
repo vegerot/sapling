@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use dag::ops::DagAddHeads;
 use dag::ops::DagAlgorithm;
 use dag::MemDag;
+use dag::NameSet;
 use dag::Vertex;
 use manifest::FileMetadata;
 use manifest::FileType;
@@ -33,6 +34,7 @@ use types::RepoPath;
 use types::RepoPathBuf;
 
 use crate::PathHistory;
+use crate::RenameTracer;
 
 #[derive(Clone, Default)]
 pub struct TestHistory {
@@ -121,6 +123,37 @@ impl TestHistory {
     /// Obtain the `PathHistory` struct.
     pub async fn paths_history(&self, max_commit_int: u64, paths: &[&str]) -> PathHistory {
         // Build commit graph and the "set".
+        let set = self.build_set(max_commit_int).await;
+
+        // Convert path types.
+        let paths: Vec<RepoPathBuf> = paths
+            .iter()
+            .map(|s| RepoPath::from_str(s).unwrap().to_owned())
+            .collect();
+
+        let path_history =
+            PathHistory::new(set, paths, Arc::new(self.clone()), Arc::new(self.clone()))
+                .await
+                .unwrap();
+        path_history
+    }
+
+    /// Obtain the access log.
+    pub fn take_access_log(&self) -> Vec<String> {
+        self.inner.lock().unwrap().access_log.drain(..).collect()
+    }
+
+    fn commit_to_tree(&self, commit_id: HgId) -> HgId {
+        let commit_int = hgid_to_int(commit_id);
+        let inner = self.inner.lock().unwrap();
+        match inner.commit_to_tree.range(..=commit_int).rev().next() {
+            Some((_, tree_id)) => *tree_id,
+            None => inner.empty_tree_id,
+        }
+    }
+
+    pub async fn build_set(&self, max_commit_int: u64) -> NameSet {
+        // Build commit graph and the "set".
         let mut dag = MemDag::new();
         let parents_override = {
             let inner = self.inner.lock().unwrap();
@@ -151,32 +184,16 @@ impl TestHistory {
             dag.add_heads(&parents, &heads.into()).await.unwrap();
         }
         let set = dag.all().await.unwrap();
-
-        // Convert path types.
-        let paths: Vec<RepoPathBuf> = paths
-            .iter()
-            .map(|s| RepoPath::from_str(s).unwrap().to_owned())
-            .collect();
-
-        let path_history =
-            PathHistory::new(set, paths, Arc::new(self.clone()), Arc::new(self.clone()))
-                .await
-                .unwrap();
-        path_history
+        set
     }
 
-    /// Obtain the access log.
-    pub fn take_access_log(&self) -> Vec<String> {
-        self.inner.lock().unwrap().access_log.drain(..).collect()
-    }
-
-    fn commit_to_tree(&self, commit_id: HgId) -> HgId {
-        let commit_int = hgid_to_int(commit_id);
-        let inner = self.inner.lock().unwrap();
-        match inner.commit_to_tree.range(..=commit_int).rev().next() {
-            Some((_, tree_id)) => *tree_id,
-            None => inner.empty_tree_id,
-        }
+    // Obtain the `RenameTracer` struct.
+    pub async fn rename_tracer(&self, max_commit_int: u64, path: &str) -> RenameTracer {
+        let set = self.build_set(max_commit_int).await;
+        let path = RepoPath::from_str(path).unwrap().to_owned();
+        RenameTracer::new(set, path, Arc::new(self.clone()), Arc::new(self.clone()))
+            .await
+            .unwrap()
     }
 }
 
@@ -263,6 +280,20 @@ fn vertex_to_int(v: Vertex) -> u64 {
 }
 
 impl PathHistory {
+    async fn next_n(&mut self, mut n: usize) -> Vec<u64> {
+        let mut result = Vec::new();
+        while let Some(v) = self.next().await.unwrap() {
+            result.push(vertex_to_int(v));
+            n -= 1;
+            if n == 0 {
+                break;
+            }
+        }
+        result
+    }
+}
+
+impl RenameTracer {
     async fn next_n(&mut self, mut n: usize) -> Vec<u64> {
         let mut result = Vec::new();
         while let Some(v) = self.next().await.unwrap() {
@@ -479,4 +510,71 @@ async fn test_log_with_mode_only_changes() {
     let t = TestHistory::from_history(&[(0, "a", 1, R), (100, "a", 1, E), (200, "a", 1, S)]);
     let mut h = t.paths_history(300, &["a"]).await;
     assert_eq!(h.next_n(5).await, [200, 100, 0]);
+}
+
+#[cfg(test)]
+mod rename_tracer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_trace_rename_files() {
+        let t = TestHistory::from_history(&[
+            (0, "a", 1, R),
+            (100, "a", 2, R),
+            // rename a -> b
+            (150, "a", 0, R),
+            (150, "b", 4, R),
+            (200, "b", 4, R),
+            (250, "b", 5, E),
+        ]);
+
+        let mut r = t.rename_tracer(250, "b").await;
+        assert_eq!(r.next_n(2).await, [150]);
+
+        // commit 150 did the rename (b -> a), so we search commit 149 (150-1)
+        // with name "a"
+        let mut r = t.rename_tracer(149, "a").await;
+        assert_eq!(r.next_n(2).await, [0]);
+    }
+
+    #[tokio::test]
+    async fn test_trace_nested_rename_files() {
+        let t = TestHistory::from_history(&[
+            (0, "a/b/1", 1, R),
+            (100, "a/b/1", 2, R),
+            // rename a/b/1 -> a/2
+            (150, "a/b/1", 0, R),
+            (150, "a/2", 4, R),
+            (200, "a/2", 4, R),
+            (250, "a/2", 5, E),
+        ]);
+
+        let mut r = t.rename_tracer(250, "a/2").await;
+        assert_eq!(r.next_n(2).await, [150]);
+
+        // commit 150 did the rename (b -> a), so we search commit 149 (150-1)
+        // with name "a"
+        let mut r = t.rename_tracer(149, "a/b/1").await;
+        assert_eq!(r.next_n(2).await, [0]);
+    }
+
+    #[tokio::test]
+    async fn test_trace_commit_added_files() {
+        let t = TestHistory::from_history(&[
+            (0, "a", 1, R),
+            (100, "a", 2, R),
+            (150, "b", 3, R),
+            (160, "a", 4, R),
+            (200, "b", 5, R),
+            (210, "b", 6, R),
+            (220, "b", 7, R),
+            (250, "b", 7, E),
+        ]);
+
+        let mut r = t.rename_tracer(250, "a").await;
+        assert_eq!(r.next_n(2).await, [0]);
+
+        let mut r = t.rename_tracer(250, "b").await;
+        assert_eq!(r.next_n(2).await, [150]);
+    }
 }

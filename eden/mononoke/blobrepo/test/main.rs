@@ -911,7 +911,7 @@ async fn test_hg_commit_generation_diamond(fb: FacebookInit) {
 async fn test_hg_commit_generation_many_diamond(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let repo = fixtures::ManyDiamonds::getrepo(fb).await;
-    let book = bookmarks::BookmarkName::new("master").unwrap();
+    let book = bookmarks::BookmarkKey::new("master").unwrap();
     let bcs_id = repo
         .bookmarks()
         .get(ctx.clone(), &book)
@@ -988,7 +988,7 @@ async fn save_reproducibility_under_load(fb: FacebookInit) -> Result<(), Error> 
         db_put_dist: Normal::new(0.002, 0.001).expect("Normal::new failed"),
         db_get_dist: Normal::new(0.002, 0.001).expect("Normal::new failed"),
     };
-    cmdlib_caching::facebook::init_cachelib_from_settings(fb, Default::default()).unwrap();
+    cmdlib_caching::facebook::init_cachelib_from_settings(fb, Default::default(), false).unwrap();
     let repo = new_benchmark_repo(fb, delay_settings)?;
 
     let mut rng = XorShiftRng::seed_from_u64(1);

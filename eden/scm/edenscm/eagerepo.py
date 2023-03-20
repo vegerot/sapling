@@ -5,7 +5,7 @@
 
 import bindings
 
-from . import error, filelog, revlog
+from . import ancestor, error, filelog, revlog
 from .i18n import _
 from .node import bin, nullid
 
@@ -52,6 +52,11 @@ class eagerfilelog(object):
 
     def cmp(self, node, text):
         """returns True if blob hash is different from text"""
+        # Report "changed" when node is nullid. This forces repo._filecommit to
+        # write a new revision to avoid incorrectly using the nullid in
+        # manifest.
+        if node == nullid:
+            return True
         # PERF: This does use a fast path avoid read() - a fast path requires
         # fast path reading p1, p2, which does not exist.
         return self.read(node) != text
@@ -88,6 +93,9 @@ class eagerfilelog(object):
 
     def revision(self, node, raw=True):
         return self._get_content(node)
+
+    def commonancestorsheads(self, a, b):
+        return list(ancestor.commonancestorsheads(self.parents, a, b))
 
     def _get_sha1_blob(self, node):
         """get the SHA1 prefixed (sorted([p1, p2])) content"""

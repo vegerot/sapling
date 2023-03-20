@@ -22,7 +22,8 @@ use blame::BlameRoot;
 use blame::RootBlameV2;
 use bookmarks::ArcBookmarkUpdateLog;
 use bookmarks::ArcBookmarks;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkCategory;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLog;
 use bookmarks::BookmarkUpdateLogRef;
 use bookmarks::Bookmarks;
@@ -84,7 +85,7 @@ define_stats! {
 }
 
 pub struct WarmBookmarksCache {
-    bookmarks: Arc<RwLock<HashMap<BookmarkName, (ChangesetId, BookmarkKind)>>>,
+    bookmarks: Arc<RwLock<HashMap<BookmarkKey, (ChangesetId, BookmarkKind)>>>,
     terminate: Option<oneshot::Sender<()>>,
 }
 
@@ -291,7 +292,7 @@ pub trait BookmarksCache: Send + Sync {
     async fn get(
         &self,
         ctx: &CoreContext,
-        bookmark: &BookmarkName,
+        bookmark: &BookmarkKey,
     ) -> Result<Option<ChangesetId>, Error>;
 
     async fn list(
@@ -300,7 +301,7 @@ pub trait BookmarksCache: Send + Sync {
         prefix: &BookmarkPrefix,
         pagination: &BookmarkPagination,
         limit: Option<u64>,
-    ) -> Result<Vec<(BookmarkName, (ChangesetId, BookmarkKind))>, Error>;
+    ) -> Result<Vec<(BookmarkKey, (ChangesetId, BookmarkKind))>, Error>;
 }
 
 /// A drop-in replacement for warm bookmark cache that doesn't
@@ -320,7 +321,7 @@ impl BookmarksCache for NoopBookmarksCache {
     async fn get(
         &self,
         ctx: &CoreContext,
-        bookmark: &BookmarkName,
+        bookmark: &BookmarkKey,
     ) -> Result<Option<ChangesetId>, Error> {
         self.bookmarks.get(ctx.clone(), bookmark).await
     }
@@ -331,17 +332,21 @@ impl BookmarksCache for NoopBookmarksCache {
         prefix: &BookmarkPrefix,
         pagination: &BookmarkPagination,
         limit: Option<u64>,
-    ) -> Result<Vec<(BookmarkName, (ChangesetId, BookmarkKind))>, Error> {
+    ) -> Result<Vec<(BookmarkKey, (ChangesetId, BookmarkKind))>, Error> {
         self.bookmarks
             .list(
                 ctx.clone(),
                 Freshness::MaybeStale,
                 prefix,
+                BookmarkCategory::ALL,
                 BookmarkKind::ALL_PUBLISHING,
                 pagination,
                 limit.unwrap_or(std::u64::MAX),
             )
-            .map_ok(|(book, cs_id)| (book.name, (cs_id, book.kind)))
+            .map_ok(|(book, cs_id)| {
+                let kind = *book.kind();
+                (book.into_key(), (cs_id, kind))
+            })
             .try_collect()
             .await
     }
@@ -399,7 +404,7 @@ impl BookmarksCache for WarmBookmarksCache {
     async fn get(
         &self,
         _ctx: &CoreContext,
-        bookmark: &BookmarkName,
+        bookmark: &BookmarkKey,
     ) -> Result<Option<ChangesetId>, Error> {
         Ok(self
             .bookmarks
@@ -416,22 +421,22 @@ impl BookmarksCache for WarmBookmarksCache {
         prefix: &BookmarkPrefix,
         pagination: &BookmarkPagination,
         limit: Option<u64>,
-    ) -> Result<Vec<(BookmarkName, (ChangesetId, BookmarkKind))>, Error> {
+    ) -> Result<Vec<(BookmarkKey, (ChangesetId, BookmarkKind))>, Error> {
         let bookmarks = self.bookmarks.read().unwrap();
 
         if prefix.is_empty() && *pagination == BookmarkPagination::FromStart && limit.is_none() {
             // Simple case: return all bookmarks
             Ok(bookmarks
                 .iter()
-                .map(|(name, (cs_id, kind))| (name.clone(), (*cs_id, *kind)))
+                .map(|(key, (cs_id, kind))| (key.clone(), (*cs_id, *kind)))
                 .collect())
         } else {
             // Filter based on prefix and pagination
             let range = prefix.to_range().with_pagination(pagination.clone());
             let mut matches = bookmarks
                 .iter()
-                .filter(|(name, _)| range.contains(name))
-                .map(|(name, (cs_id, kind))| (name.clone(), (*cs_id, *kind)))
+                .filter(|(key, _)| range.contains(key))
+                .map(|(key, (cs_id, kind))| (key.clone(), (*cs_id, *kind)))
                 .collect::<Vec<_>>();
             // Release the read lock.
             drop(bookmarks);
@@ -462,7 +467,7 @@ async fn init_bookmarks(
     bookmark_update_log: &dyn BookmarkUpdateLog,
     warmers: &Arc<Vec<Warmer>>,
     mode: InitMode,
-) -> Result<HashMap<BookmarkName, (ChangesetId, BookmarkKind)>, Error> {
+) -> Result<HashMap<BookmarkKey, (ChangesetId, BookmarkKind)>, Error> {
     let all_bookmarks = sub.bookmarks();
     let total = all_bookmarks.len();
 
@@ -563,7 +568,7 @@ async fn move_bookmark_back_in_history_until_derived(
     ctx: &CoreContext,
     bookmarks: &dyn Bookmarks,
     bookmark_update_log: &dyn BookmarkUpdateLog,
-    book: &BookmarkName,
+    book: &BookmarkKey,
     warmers: &Arc<Vec<Warmer>>,
 ) -> Result<Option<ChangesetId>, Error> {
     info!(ctx.logger(), "moving {} bookmark back in history...", book);
@@ -605,7 +610,7 @@ pub async fn find_all_underived_and_latest_derived(
     ctx: &CoreContext,
     bookmarks: &dyn Bookmarks,
     bookmark_update_log: &dyn BookmarkUpdateLog,
-    book: &BookmarkName,
+    book: &BookmarkKey,
     warmers: &[Warmer],
 ) -> Result<
     (
@@ -695,16 +700,16 @@ struct BookmarksCoordinatorRepo {
 }
 
 struct BookmarksCoordinator {
-    bookmarks: Arc<RwLock<HashMap<BookmarkName, (ChangesetId, BookmarkKind)>>>,
+    bookmarks: Arc<RwLock<HashMap<BookmarkKey, (ChangesetId, BookmarkKind)>>>,
     sub: Box<dyn BookmarksSubscription>,
     repo: BookmarksCoordinatorRepo,
     warmers: Arc<Vec<Warmer>>,
-    live_updaters: Arc<RwLock<HashMap<BookmarkName, BookmarkUpdaterState>>>,
+    live_updaters: Arc<RwLock<HashMap<BookmarkKey, BookmarkUpdaterState>>>,
 }
 
 impl BookmarksCoordinator {
     fn new(
-        bookmarks: Arc<RwLock<HashMap<BookmarkName, (ChangesetId, BookmarkKind)>>>,
+        bookmarks: Arc<RwLock<HashMap<BookmarkKey, (ChangesetId, BookmarkKind)>>>,
         sub: Box<dyn BookmarksSubscription>,
         bookmarks_fetcher: ArcBookmarks,
         bookmark_update_log: ArcBookmarkUpdateLog,
@@ -736,7 +741,10 @@ impl BookmarksCoordinator {
 
         let cur_bookmarks = self.bookmarks.with_read(|bookmarks| bookmarks.clone());
 
-        let new_bookmarks = if tunables().get_warm_bookmark_cache_disable_subscription() {
+        let new_bookmarks = if tunables()
+            .warm_bookmark_cache_disable_subscription()
+            .unwrap_or_default()
+        {
             let books = self
                 .repo
                 .bookmarks()
@@ -744,13 +752,14 @@ impl BookmarksCoordinator {
                     ctx.clone(),
                     Freshness::MaybeStale,
                     &BookmarkPrefix::empty(),
+                    BookmarkCategory::ALL,
                     BookmarkKind::ALL_PUBLISHING,
                     &BookmarkPagination::FromStart,
                     std::u64::MAX,
                 )
                 .map_ok(|(book, cs_id)| {
                     let kind = *book.kind();
-                    (book.into_name(), (cs_id, kind))
+                    (book.into_key(), (cs_id, kind))
                 })
                 .try_collect::<HashMap<_, _>>()
                 .await
@@ -794,8 +803,8 @@ impl BookmarksCoordinator {
 
         for book in changed_bookmarks {
             let need_spawning = self.live_updaters.with_write(|live_updaters| {
-                if !live_updaters.contains_key(book.name()) {
-                    live_updaters.insert(book.name().clone(), BookmarkUpdaterState::Started);
+                if !live_updaters.contains_key(book.key()) {
+                    live_updaters.insert(book.key().clone(), BookmarkUpdaterState::Started);
                     true
                 } else {
                     false
@@ -813,7 +822,9 @@ impl BookmarksCoordinator {
                     self.live_updaters,
                     self.warmers,
                 );
-                let _ = tokio::spawn(async move {
+                // By dropping the future output by tokio::spawn instead of awaiting it, we
+                // delegate the responsibility of managing it to tokio's async queue
+                std::mem::drop(tokio::spawn(async move {
                     let res = single_bookmark_updater(
                         &ctx,
                         &repo,
@@ -823,7 +834,7 @@ impl BookmarksCoordinator {
                         |ts: Timestamp| {
                             live_updaters.with_write(|live_updaters| {
                                 live_updaters.insert(
-                                    book.name().clone(),
+                                    book.key().clone(),
                                     BookmarkUpdaterState::InProgress {
                                         oldest_underived_ts: ts,
                                     },
@@ -834,16 +845,16 @@ impl BookmarksCoordinator {
                     .await;
                     if let Err(ref err) = res {
                         STATS::bookmark_update_failures.add_value(1);
-                        warn!(ctx.logger(), "update of {} failed: {:?}", book.name(), err);
+                        warn!(ctx.logger(), "update of {} failed: {:?}", book.key(), err);
                     };
 
                     live_updaters.with_write(|live_updaters| {
-                        let maybe_state = live_updaters.remove(book.name());
+                        let maybe_state = live_updaters.remove(book.key());
                         if let Some(state) = maybe_state {
-                            live_updaters.insert(book.name().clone(), state.into_finished(&res));
+                            live_updaters.insert(book.key().clone(), state.into_finished(&res));
                         }
                     });
-                });
+                }));
             }
         }
 
@@ -864,7 +875,8 @@ impl BookmarksCoordinator {
                     }
 
                     let delay_ms = match tunables()
-                        .get_warm_bookmark_cache_poll_interval_ms()
+                        .warm_bookmark_cache_poll_interval_ms()
+                        .unwrap_or_default()
                         .try_into()
                     {
                         Ok(duration) if duration > 0 => duration,
@@ -881,14 +893,14 @@ impl BookmarksCoordinator {
             info!(ctx.logger(), "Stopped warm bookmark cache updater");
         };
 
-        // Detach the handle. This will terminate using the `terminate` receiver.
-        let _ = tokio::task::spawn(fut);
+        // Fire and forget. This will terminate using the `terminate` receiver.
+        std::mem::drop(tokio::task::spawn(fut));
     }
 }
 
 fn report_delay_and_remove_finished_updaters(
     ctx: &CoreContext,
-    live_updaters: &Arc<RwLock<HashMap<BookmarkName, BookmarkUpdaterState>>>,
+    live_updaters: &Arc<RwLock<HashMap<BookmarkKey, BookmarkUpdaterState>>>,
     reponame: &str,
 ) {
     let mut max_staleness = 0;
@@ -925,7 +937,7 @@ fn report_delay_and_remove_finished_updaters(
         *live_updaters = new_updaters;
     });
 
-    STATS::max_staleness_secs.set_value(ctx.fb, max_staleness as i64, (reponame.to_owned(),));
+    STATS::max_staleness_secs.set_value(ctx.fb, max_staleness, (reponame.to_owned(),));
 }
 
 #[derive(Clone)]
@@ -985,7 +997,7 @@ async fn single_bookmark_updater(
     ctx: &CoreContext,
     repo: &(impl BookmarksRef + BookmarkUpdateLogRef),
     bookmark: &Bookmark,
-    bookmarks: &Arc<RwLock<HashMap<BookmarkName, (ChangesetId, BookmarkKind)>>>,
+    bookmarks: &Arc<RwLock<HashMap<BookmarkKey, (ChangesetId, BookmarkKind)>>>,
     warmers: &Arc<Vec<Warmer>>,
     mut staleness_reporter: impl FnMut(Timestamp),
 ) -> Result<(), Error> {
@@ -993,15 +1005,15 @@ async fn single_bookmark_updater(
         ctx,
         repo.bookmarks(),
         repo.bookmark_update_log(),
-        bookmark.name(),
+        bookmark.key(),
         warmers.as_ref(),
     )
     .await?;
 
     let update_bookmark = |cs_id: ChangesetId| async move {
         bookmarks.with_write(|bookmarks| {
-            let name = bookmark.name().clone();
-            bookmarks.insert(name, (cs_id, *bookmark.kind()))
+            let key = bookmark.key().clone();
+            bookmarks.insert(key, (cs_id, *bookmark.kind()))
         });
     };
 
@@ -1012,14 +1024,14 @@ async fn single_bookmark_updater(
                 update_bookmark(cs_id).await;
             }
             None => {
-                bookmarks.with_write(|bookmarks| bookmarks.remove(bookmark.name()));
+                bookmarks.with_write(|bookmarks| bookmarks.remove(bookmark.key()));
             }
         },
         LatestDerivedBookmarkEntry::NotFound => {
             warn!(
                 ctx.logger(),
                 "Haven't found previous derived version of {}! Will try to derive anyway",
-                bookmark.name()
+                bookmark.key()
             );
         }
     }
@@ -1035,7 +1047,7 @@ async fn single_bookmark_updater(
         let maybe_ts = maybe_id_ts.map(|(_, ts)| ts);
 
         let ctx = ctx.clone().with_mutated_scuba(|mut scuba| {
-            scuba.add("bookmark", bookmark.name().to_string());
+            scuba.add("bookmark", bookmark.key().to_string());
             scuba.add("bookmark_log_id", bookmark_log_id);
             scuba.add("top_changeset", underived_cs_id.to_hex().to_string());
             scuba
@@ -1060,7 +1072,7 @@ async fn single_bookmark_updater(
                     ctx.logger(),
                     "failed to derive data for {} while updating {}: {}",
                     underived_cs_id,
-                    bookmark.name(),
+                    bookmark.key(),
                     err
                 );
                 break;
@@ -1142,7 +1154,7 @@ mod tests {
         .await?;
         assert_eq!(
             bookmarks,
-            hashmap! {BookmarkName::new("master")? => (master_cs_id, BookmarkKind::PullDefaultPublishing)}
+            hashmap! {BookmarkKey::new("master")? => (master_cs_id, BookmarkKind::PullDefaultPublishing)}
         );
         Ok(())
     }
@@ -1212,7 +1224,7 @@ mod tests {
         .await?;
         assert_eq!(
             bookmarks,
-            hashmap! {BookmarkName::new("master")? => (derived_master, BookmarkKind::PullDefaultPublishing)}
+            hashmap! {BookmarkKey::new("master")? => (derived_master, BookmarkKind::PullDefaultPublishing)}
         );
 
         RootUnodeManifestId::derive(&ctx, &repo.blob_repo, master).await?;
@@ -1227,7 +1239,7 @@ mod tests {
         .await?;
         assert_eq!(
             bookmarks,
-            hashmap! {BookmarkName::new("master")? => (master, BookmarkKind::PullDefaultPublishing)}
+            hashmap! {BookmarkKey::new("master")? => (master, BookmarkKind::PullDefaultPublishing)}
         );
 
         Ok(())
@@ -1276,7 +1288,7 @@ mod tests {
         .await?;
         assert_eq!(
             bookmarks,
-            hashmap! {BookmarkName::new("master")? => (derived_master, BookmarkKind::PullDefaultPublishing)}
+            hashmap! {BookmarkKey::new("master")? => (derived_master, BookmarkKind::PullDefaultPublishing)}
         );
 
         Ok(())
@@ -1332,7 +1344,7 @@ mod tests {
         .await?;
         assert_eq!(
             bookmarks,
-            hashmap! {BookmarkName::new("master")? => (derived_master, BookmarkKind::PullDefaultPublishing)}
+            hashmap! {BookmarkKey::new("master")? => (derived_master, BookmarkKind::PullDefaultPublishing)}
         );
 
         Ok(())
@@ -1349,7 +1361,7 @@ mod tests {
             .get_publishing_bookmarks_maybe_stale(ctx.clone())
             .map_ok(|(book, cs_id)| {
                 let kind = *book.kind();
-                (book.into_name(), (cs_id, kind))
+                (book.into_key(), (cs_id, kind))
             })
             .try_collect::<HashMap<_, _>>()
             .await?;
@@ -1382,7 +1394,7 @@ mod tests {
             warmers,
         );
 
-        let master_book = BookmarkName::new("master")?;
+        let master_book = BookmarkKey::new("master")?;
         update_and_wait_for_bookmark(
             &ctx,
             &mut coordinator,
@@ -1408,7 +1420,7 @@ mod tests {
             .get_publishing_bookmarks_maybe_stale(ctx.clone())
             .map_ok(|(book, cs_id)| {
                 let kind = *book.kind();
-                (book.into_name(), (cs_id, kind))
+                (book.into_key(), (cs_id, kind))
             })
             .try_collect::<HashMap<_, _>>()
             .await?;
@@ -1435,7 +1447,7 @@ mod tests {
         let master_cs_id = resolve_cs_id(&ctx, &repo.blob_repo, "master").await?;
         info!(ctx.logger(), "created the whole stack of commits");
 
-        let master_book_name = BookmarkName::new("master")?;
+        let master_book_name = BookmarkKey::new("master")?;
         let master_book = Bookmark::new(
             master_book_name.clone(),
             BookmarkKind::PullDefaultPublishing,
@@ -1453,7 +1465,7 @@ mod tests {
     async fn update_and_wait_for_bookmark(
         ctx: &CoreContext,
         coordinator: &mut BookmarksCoordinator,
-        book: &BookmarkName,
+        book: &BookmarkKey,
         expected_value: Option<(ChangesetId, BookmarkKind)>,
     ) -> Result<(), Error> {
         coordinator.update(ctx).await?;
@@ -1502,7 +1514,7 @@ mod tests {
             .get_publishing_bookmarks_maybe_stale(ctx.clone())
             .map_ok(|(book, cs_id)| {
                 let kind = *book.kind();
-                (book.into_name(), (cs_id, kind))
+                (book.into_key(), (cs_id, kind))
             })
             .try_collect::<HashMap<_, _>>()
             .await?;
@@ -1570,7 +1582,7 @@ mod tests {
             warmers,
         );
 
-        let master_book = BookmarkName::new("master")?;
+        let master_book = BookmarkKey::new("master")?;
         update_and_wait_for_bookmark(
             &ctx,
             &mut coordinator,
@@ -1583,7 +1595,7 @@ mod tests {
         // to actually show up. :/
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        let failing_book = BookmarkName::new("failingbook")?;
+        let failing_book = BookmarkKey::new("failingbook")?;
         bookmarks.with_read(|bookmarks| assert_eq!(bookmarks.get(&failing_book), None));
 
         // Now change the warmer and make sure it derives successfully
@@ -1629,7 +1641,7 @@ mod tests {
             &repo.blob_repo,
             repo.blob_repo
                 .bookmarks()
-                .get(ctx.clone(), &BookmarkName::new("master")?)
+                .get(ctx.clone(), &BookmarkKey::new("master")?)
                 .await?
                 .unwrap(),
         )
@@ -1677,7 +1689,7 @@ mod tests {
             .get_publishing_bookmarks_maybe_stale(ctx.clone())
             .map_ok(|(book, cs_id)| {
                 let kind = *book.kind();
-                (book.into_name(), (cs_id, kind))
+                (book.into_key(), (cs_id, kind))
             })
             .try_collect::<HashMap<_, _>>()
             .await?;
@@ -1736,7 +1748,7 @@ mod tests {
             .get_publishing_bookmarks_maybe_stale(ctx.clone())
             .map_ok(|(book, cs_id)| {
                 let kind = *book.kind();
-                (book.into_name(), (cs_id, kind))
+                (book.into_key(), (cs_id, kind))
             })
             .try_collect::<HashMap<_, _>>()
             .await?;
@@ -1770,7 +1782,7 @@ mod tests {
             warmers,
         );
 
-        let publishing_book = BookmarkName::new("publishing")?;
+        let publishing_book = BookmarkKey::new("publishing")?;
         update_and_wait_for_bookmark(
             &ctx,
             &mut coordinator,
@@ -1824,7 +1836,7 @@ mod tests {
         let master_cs_id = resolve_cs_id(&ctx, &repo.blob_repo, "master").await?;
         warm_all(&ctx, master_cs_id, &warmers).await?;
 
-        let master_book_name = BookmarkName::new("master")?;
+        let master_book_name = BookmarkKey::new("master")?;
         let master_book = Bookmark::new(
             master_book_name.clone(),
             BookmarkKind::PullDefaultPublishing,

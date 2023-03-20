@@ -9,7 +9,7 @@ use anyhow::format_err;
 use anyhow::Error;
 use anyhow::Result;
 use blobstore_factory::ReadOnlyStorage;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use borrowed::borrowed;
 use clap_old::ArgMatches;
 use cmdlib::args;
@@ -64,8 +64,8 @@ pub async fn get_validation_helpers<'a>(
     let validation_helper_futs =
         common_commit_sync_config
             .small_repos
-            .into_iter()
-            .map(|(small_repo_id, _)| {
+            .into_keys()
+            .map(|small_repo_id| {
                 let large_blob_repo = large_repo.blob_repo.clone();
                 borrowed!(matches, ctx, scuba_sample);
                 async move {
@@ -133,9 +133,9 @@ pub fn get_entry_id<'a>(matches: &'a ArgMatches<'a>) -> Result<u64, Error> {
         .map_err(|_| format_err!("{} must be a valid u64", ARG_ENTRY_ID))
 }
 
-fn get_master_bookmark<'a, 'b>(matches: &'a MononokeMatches<'b>) -> Result<BookmarkName, Error> {
+fn get_master_bookmark<'a, 'b>(matches: &'a MononokeMatches<'b>) -> Result<BookmarkKey, Error> {
     let name = matches
         .value_of(ARG_MASTER_BOOKMARK)
         .ok_or_else(|| format_err!("Argument {} is required", ARG_MASTER_BOOKMARK))?;
-    BookmarkName::new(name)
+    BookmarkKey::new(name)
 }

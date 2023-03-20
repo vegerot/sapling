@@ -35,6 +35,7 @@ use linked_hash_map::LinkedHashMap;
 use mercurial_derived_data::get_manifest_from_bonsai;
 use mercurial_derived_data::DeriveHgChangeset;
 use mononoke_api::BookmarkFreshness;
+use mononoke_api::BookmarkKey;
 use mononoke_app::args::RepoArgs;
 use mononoke_app::fb303::AliveService;
 use mononoke_app::fb303::Fb303AppExtension;
@@ -278,12 +279,13 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                 }
                 let pushvars = None;
                 if repo_context
-                    .create_bookmark(&name, *changeset, pushvars)
+                    .create_bookmark(&BookmarkKey::new(&name)?, *changeset, pushvars)
                     .await
                     .is_err()
                 {
+                    // TODO (pierre): handle category here
                     let old_changeset = repo_context
-                        .resolve_bookmark(&name, BookmarkFreshness::MostRecent)
+                        .resolve_bookmark(&BookmarkKey::new(&name)?, BookmarkFreshness::MostRecent)
                         .await
                         .with_context(|| format!("failed to resolve bookmark {name}"))?
                         .map(|context| context.id());
@@ -291,7 +293,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                         let allow_non_fast_forward = true;
                         repo_context
                         .move_bookmark(
-                            &name,
+                            &BookmarkKey::new(&name)?,
                             *changeset,
                             old_changeset,
                             allow_non_fast_forward,

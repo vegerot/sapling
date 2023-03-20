@@ -29,7 +29,7 @@ regex = { version = "1.6.0", optional = true }
 serde = { version = "1.0.136", features = ["derive", "rc"], optional = true }
 serde_json = { version = "1.0.79", features = ["float_roundtrip", "unbounded_depth"], optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.10.6", optional = true }
 staticconfig = { version = "0.1.0", path = "../static" }
 tempfile = { version = "3.3", optional = true }
 tracing = "0.1.35"
@@ -38,7 +38,7 @@ unionconfig = { version = "0.1.0", path = "../union" }
 url = "2.2.2"
 util = { version = "0.1.0", path = "../../util" }
 version = { version = "0.1.0", path = "../../version" }
-zstd = { version = "0.11.2+zstd.1.5.2", features = ["zstdmt"], optional = true }
+zstd = { version = "0.11.2+zstd.1.5.2", features = ["experimental", "zstdmt"], optional = true }
 
 [dev-dependencies]
 lazy_static = "1.4"

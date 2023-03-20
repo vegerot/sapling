@@ -9,7 +9,16 @@
 import asyncio
 from typing import Optional
 
-from edenscm import autopull, error, namespaces, registrar, util
+from edenscm import (
+    autopull,
+    commands,
+    error,
+    extensions,
+    git,
+    namespaces,
+    registrar,
+    util,
+)
 from edenscm.autopull import pullattempt
 from edenscm.i18n import _
 from edenscm.namespaces import namespace
@@ -20,6 +29,7 @@ from . import (
     github_repo_util,
     import_pull_request,
     link,
+    pr_marker,
     pr_status,
     submit,
     templates,
@@ -40,8 +50,23 @@ templatekeyword = registrar.templatekeyword()
 namespacepredicate = registrar.namespacepredicate()
 autopullpredicate = registrar.autopullpredicate()
 
+hint = registrar.hint()
+
+configtable = {}
+configitem = registrar.configitem(configtable)
+
+configitem("github", "pull-request-include-reviewstack", default=True)
+
+
+@hint("unlink-closed-pr")
+def unlink_closed_pr_hint() -> str:
+    return _(
+        "to create a new PR, disassociate commit(s) using '@prog@ pr unlink' then re-run '@prog@ pr submit'"
+    )
+
 
 def extsetup(ui):
+    extensions.wrapfunction(git, "pull", _pull)
     pr_status.setup_smartset_prefetch()
 
 
@@ -88,7 +113,17 @@ subcmd = pull_request_command.subcommand(
     ],
 )
 def submit_cmd(ui, repo, *args, **opts):
-    """create or update GitHub pull requests from local commits"""
+    """create or update GitHub pull requests from local commits
+
+    Commit(s) will be pushed to ``default-push``, if configured, else
+    ``default`` (see :prog:`help urls` and :prog:`help path`).
+
+    Pull request(s) will be created against ``default``. If
+    ``default`` is a fork, they will be created against default's
+    upstream repository.
+
+    Returns 0 on success.
+    """
     return submit.submit(ui, repo, *args, **opts)
 
 
@@ -231,6 +266,14 @@ def list_cmd(ui, repo, *args, **opts) -> int:
     return rc
 
 
+@command("debugprmarker", commands.dryrunopts)
+def debug_pr_marker(ui, repo, **opts):
+    dry_run = opts.get("dry_run")
+    pr_marker.cleanup_landed_pr(repo, dry_run=dry_run)
+    if dry_run:
+        ui.status(_("(this is a dry-run, nothing was actually done)\n"))
+
+
 @templatekeyword("github_repo")
 def github_repo(repo, ctx, templ, **args) -> bool:
     return github_repo_util.is_github_repo(repo)
@@ -365,3 +408,14 @@ def _autopullghpr(repo, name, rewritepullrev: bool = False) -> Optional[pullatte
             # HASH".
             friendlyname = "PR%s (%s)" % (prno, hex(n))
             return autopull.pullattempt(headnodes=[n], friendlyname=friendlyname)
+
+
+def _pull(orig, repo, source, names=(), nodes=()):
+    ret = orig(repo, source, names, nodes)
+    try:
+        # Don't run in tests by default since it requires more stuff to be mocked out.
+        if repo.ui.configbool("github", "hide-landed-commits", not util.istest()):
+            pr_marker.cleanup_landed_pr(repo)
+    except Exception as ex:
+        repo.ui.warn(_("error marking landed prs: %s\n") % str(ex))
+    return ret

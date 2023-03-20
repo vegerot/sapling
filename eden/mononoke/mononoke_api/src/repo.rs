@@ -31,6 +31,8 @@ use bonsai_globalrev_mapping::BonsaiGlobalrevMappingRef;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bonsai_svnrev_mapping::BonsaiSvnrevMappingRef;
+use bookmarks::BookmarkCategory;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkKind;
 use bookmarks::BookmarkName;
 use bookmarks::BookmarkPagination;
@@ -43,6 +45,7 @@ use bookmarks::BookmarksArc;
 use bookmarks::BookmarksRef;
 pub use bookmarks::Freshness as BookmarkFreshness;
 use bookmarks::Freshness;
+use bytes::Bytes;
 use cacheblob::InProcessLease;
 use cacheblob::LeaseOps;
 use changeset_fetcher::ChangesetFetcher;
@@ -71,6 +74,8 @@ use fbinit::FacebookInit;
 use filestore::Alias;
 use filestore::FetchKey;
 use filestore::FilestoreConfig;
+use filestore::FilestoreConfigRef;
+pub use filestore::StoreRequest;
 use futures::compat::Stream01CompatExt;
 use futures::stream;
 use futures::stream::Stream;
@@ -97,6 +102,7 @@ use mononoke_repos::MononokeRepos;
 use mononoke_types::hash::GitSha1;
 use mononoke_types::hash::Sha1;
 use mononoke_types::hash::Sha256;
+use mononoke_types::ContentId;
 use mononoke_types::Generation;
 use mononoke_types::RepositoryId;
 use mononoke_types::Svnrev;
@@ -280,7 +286,7 @@ async fn maybe_push_redirector(
     repo: &Arc<Repo>,
     repos: &MononokeRepos<Repo>,
 ) -> Result<Option<PushRedirector<Repo>>, MononokeError> {
-    if tunables().get_disable_scs_pushredirect() {
+    if tunables().disable_scs_pushredirect().unwrap_or_default() {
         return Ok(None);
     }
     let base = match repo.repo_handler_base().maybe_push_redirector_base.as_ref() {
@@ -601,7 +607,7 @@ impl Repo {
         Ok(())
     }
 
-    fn report_bookmark_missing_from_cache(&self, ctx: &CoreContext, bookmark: &BookmarkName) {
+    fn report_bookmark_missing_from_cache(&self, ctx: &CoreContext, bookmark: &BookmarkKey) {
         error!(
             ctx.logger(),
             "Monitored bookmark does not exist in the cache: {}, repo: {}",
@@ -616,7 +622,7 @@ impl Repo {
         );
     }
 
-    fn report_bookmark_missing_from_repo(&self, ctx: &CoreContext, bookmark: &BookmarkName) {
+    fn report_bookmark_missing_from_repo(&self, ctx: &CoreContext, bookmark: &BookmarkKey) {
         error!(
             ctx.logger(),
             "Monitored bookmark does not exist in the repo: {}", bookmark
@@ -629,12 +635,7 @@ impl Repo {
         );
     }
 
-    fn report_bookmark_staleness(
-        &self,
-        ctx: &CoreContext,
-        bookmark: &BookmarkName,
-        staleness: i64,
-    ) {
+    fn report_bookmark_staleness(&self, ctx: &CoreContext, bookmark: &BookmarkKey, staleness: i64) {
         // Don't log if staleness is 0 to make output less spammy
         if staleness > 0 {
             debug!(
@@ -656,7 +657,7 @@ impl Repo {
     async fn report_bookmark_age_difference(
         &self,
         ctx: &CoreContext,
-        bookmark: &BookmarkName,
+        bookmark: &BookmarkKey,
     ) -> Result<(), MononokeError> {
         let repo = self.blob_repo();
 
@@ -1045,18 +1046,12 @@ impl RepoContext {
     /// Resolve a bookmark to a changeset.
     pub async fn resolve_bookmark(
         &self,
-        bookmark: impl AsRef<str>,
+        bookmark: &BookmarkKey,
         freshness: BookmarkFreshness,
     ) -> Result<Option<ChangesetContext>, MononokeError> {
-        // a non ascii bookmark name is an invalid request
-        let bookmark = BookmarkName::new(bookmark.as_ref())
-            .map_err(|e| MononokeError::InvalidRequest(e.to_string()))?;
-
         let mut cs_id = match freshness {
             BookmarkFreshness::MaybeStale => {
-                self.warm_bookmarks_cache()
-                    .get(&self.ctx, &bookmark)
-                    .await?
+                self.warm_bookmarks_cache().get(&self.ctx, bookmark).await?
             }
             BookmarkFreshness::MostRecent => None,
         };
@@ -1067,7 +1062,7 @@ impl RepoContext {
             cs_id = self
                 .blob_repo()
                 .bookmarks()
-                .get(self.ctx.clone(), &bookmark)
+                .get(self.ctx.clone(), bookmark)
                 .await?
         }
 
@@ -1283,7 +1278,7 @@ impl RepoContext {
         bookmark: impl AsRef<str>,
     ) -> Result<Option<BookmarkInfo>, MononokeError> {
         // a non ascii bookmark name is an invalid request
-        let bookmark = BookmarkName::new(bookmark.as_ref())
+        let bookmark = BookmarkKey::new(bookmark.as_ref())
             .map_err(|e| MononokeError::InvalidRequest(e.to_string()))?;
 
         let (maybe_warm_cs_id, maybe_log_entry) = try_join!(
@@ -1388,20 +1383,21 @@ impl RepoContext {
                     self.ctx.clone(),
                     BookmarkFreshness::MaybeStale,
                     &prefix,
+                    BookmarkCategory::ALL,
                     BookmarkKind::ALL,
                     &pagination,
                     limit.unwrap_or(std::u64::MAX),
                 )
                 .try_filter_map(move |(bookmark, cs_id)| async move {
                     if bookmark.kind() == &BookmarkKind::Scratch {
-                        Ok(Some((bookmark.into_name().into_string(), cs_id)))
+                        Ok(Some((bookmark.into_key().into_string(), cs_id)))
                     } else {
                         // For non-scratch bookmarks, always return the value
                         // from the cache so that clients only ever see the
                         // warm value.  If the bookmark is newly created and
                         // has no warm value, this might mean we have to
                         // filter this bookmark out.
-                        let bookmark_name = bookmark.into_name();
+                        let bookmark_name = bookmark.into_key();
                         let maybe_cs_id = cache.get(&self.ctx, &bookmark_name).await?;
                         Ok(maybe_cs_id.map(|cs_id| (bookmark_name.into_string(), cs_id)))
                     }
@@ -1531,6 +1527,22 @@ impl RepoContext {
         hash: GitSha1,
     ) -> Result<Option<FileContext>, MononokeError> {
         FileContext::new_check_exists(self.clone(), FetchKey::Aliased(Alias::GitSha1(hash))).await
+    }
+
+    pub async fn upload_file_content(
+        &self,
+        content: Bytes,
+        store_request: &StoreRequest,
+    ) -> Result<ContentId, MononokeError> {
+        let metadata = filestore::store(
+            self.repo.repo_blobstore(),
+            *self.repo.filestore_config(),
+            &self.ctx,
+            store_request,
+            stream::once(async move { Ok(content) }),
+        )
+        .await?;
+        Ok(metadata.content_id)
     }
 
     fn get_target_repo_and_lca_hint(

@@ -12,7 +12,7 @@ use anyhow::Error;
 use context::CoreContext;
 use fbinit::FacebookInit;
 use filenodes::FilenodeInfo;
-use filenodes::FilenodeRangeResult;
+use filenodes::FilenodeRange;
 use filenodes::FilenodeResult;
 use filenodes::PreparedFilenode;
 use maplit::hashmap;
@@ -38,7 +38,6 @@ use vec1::Vec1;
 use super::util::build_reader_writer;
 use super::util::build_shard;
 use crate::builder::SQLITE_INSERT_CHUNK_SIZE;
-use crate::local_cache::test::HashMapCache;
 use crate::local_cache::LocalCache;
 use crate::reader::FilenodesReader;
 use crate::writer::FilenodesWriter;
@@ -463,8 +462,10 @@ async fn assert_all_filenodes(
     let res = reader
         .get_all_filenodes_for_path(ctx, repo_id, path, limit)
         .await?;
-    let res = res.do_not_handle_disabled_filenodes()?;
-    assert_eq!(res.as_ref(), Some(expected));
+    match res.do_not_handle_disabled_filenodes()? {
+        FilenodeRange::Filenodes(ref filenodes) => assert_eq!(filenodes, expected),
+        FilenodeRange::TooBig => panic!("Unexpected FilenodeRange::TooBig"),
+    }
     Ok(())
 }
 
@@ -906,13 +907,13 @@ macro_rules! filenodes_tests {
                     .get_all_filenodes_for_path(&ctx, REPO_ZERO, &RepoPath::RootPath, Some(1))
                     .await?;
                 let res = res.do_not_handle_disabled_filenodes()?;
-                assert_eq!(None, res);
+                assert_eq!(FilenodeRange::TooBig, res);
 
                 let res = reader
                     .get_all_filenodes_for_path(&ctx, REPO_ZERO, &RepoPath::RootPath, Some(2))
                     .await?;
                 let res = res.do_not_handle_disabled_filenodes()?;
-                assert_eq!(None, res);
+                assert_eq!(FilenodeRange::TooBig, res);
 
                 Ok(())
             }
@@ -988,7 +989,7 @@ fn create_sharded() -> Result<Vec1<Connection>, Error> {
 fn no_caching(_reader: &mut FilenodesReader) {}
 
 fn with_caching(reader: &mut FilenodesReader) {
-    reader.local_cache = LocalCache::Test(HashMapCache::new());
+    reader.local_cache = LocalCache::new_mock();
 }
 
 filenodes_tests!(uncached_unsharded_test, create_unsharded, no_caching);
@@ -1038,7 +1039,7 @@ fn get_all_filenodes_maybe_stale_with_disabled(fb: FacebookInit) -> Result<(), E
         ))
     })?;
 
-    if let FilenodeRangeResult::Present(_) = res {
+    if let FilenodeResult::Present(_) = res {
         panic!("expected FilenodeResult::Disabled");
     }
 

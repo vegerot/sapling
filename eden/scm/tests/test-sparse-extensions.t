@@ -5,6 +5,9 @@
 # GNU General Public License version 2.
 
   $ setconfig workingcopy.ruststatus=False
+  $ setconfig fsmonitor.track-ignore-files=true
+
+  $ eagerepo
 
 # test sparse interaction with other extensions
 

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use anyhow::Error;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use context::CoreContext;
 use futures::future::try_join_all;
 use futures::Future;
@@ -32,7 +32,7 @@ use crate::Repo;
 /// The state of a source repo commit in a target repo, assuming
 /// that any multiple `RewrittenAs` options have been resolved
 /// into a single one
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CommitSyncOutcome {
     /// Not suitable for syncing to this repo
     NotSyncCandidate(CommitSyncConfigVersion),
@@ -66,14 +66,14 @@ pub enum CandidateSelectionHint<R: Repo> {
     /// Selected candidate should either be the only candidate
     /// or be an ancestor of a given bookmark
     OnlyOrAncestorOfBookmark(
-        Target<BookmarkName>,
+        Target<BookmarkKey>,
         Target<R>,
         Target<Arc<dyn LeastCommonAncestorsHint>>,
     ),
     /// Selected candidate should either be the only candidate
     /// or be a descendant of a given bookmark
     OnlyOrDescendantOfBookmark(
-        Target<BookmarkName>,
+        Target<BookmarkKey>,
         Target<R>,
         Target<Arc<dyn LeastCommonAncestorsHint>>,
     ),
@@ -667,8 +667,8 @@ impl PluralCommitSyncOutcome {
 
 #[cfg(test)]
 mod tests {
-    use blobrepo::BlobRepo;
     use bookmarks::BookmarkUpdateReason;
+    use cross_repo_sync_test_utils::TestRepo;
     use fbinit::FacebookInit;
     use live_commit_sync_config::TestLiveCommitSyncConfig;
     use mononoke_types_mocks::changesetid::FOURS_CSID;
@@ -690,7 +690,6 @@ mod tests {
 
     const SMALL_REPO_ID: RepositoryId = RepositoryId::new(0);
     const LARGE_REPO_ID: RepositoryId = RepositoryId::new(1);
-    type TestRepo = BlobRepo;
 
     fn test_version() -> CommitSyncConfigVersion {
         CommitSyncConfigVersion("test_version".to_string())
@@ -785,7 +784,7 @@ mod tests {
     #[fbinit::test]
     async fn test_ancestor_hint_selector(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
-        let blob_repo: BlobRepo = TestRepoFactory::new(fb)?.with_id(LARGE_REPO_ID).build()?;
+        let blob_repo: TestRepo = TestRepoFactory::new(fb)?.with_id(LARGE_REPO_ID).build()?;
         let lca_hint: Target<Arc<dyn LeastCommonAncestorsHint>> =
             Target(Arc::new(SkiplistIndex::new()));
         let dag = create_from_dag(
@@ -868,7 +867,7 @@ mod tests {
     #[fbinit::test]
     async fn test_descendant_hint_selector(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
-        let blob_repo: BlobRepo = test_repo_factory::build_empty(fb)?;
+        let blob_repo: TestRepo = test_repo_factory::build_empty(fb)?;
         let lca_hint: Target<Arc<dyn LeastCommonAncestorsHint>> =
             Target(Arc::new(SkiplistIndex::new()));
         let dag = create_from_dag(
@@ -984,9 +983,9 @@ mod tests {
 
     async fn set_bookmark(
         ctx: &CoreContext,
-        blob_repo: &BlobRepo,
+        blob_repo: &TestRepo,
         bcs_id: ChangesetId,
-        book: &BookmarkName,
+        book: &BookmarkKey,
     ) -> Result<(), Error> {
         let mut txn = blob_repo.bookmarks().create_transaction(ctx.clone());
         txn.force_set(book, bcs_id, BookmarkUpdateReason::TestMove)
@@ -998,7 +997,7 @@ mod tests {
     #[fbinit::test]
     async fn test_bookmark_hint_selector(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
-        let blob_repo: BlobRepo = TestRepoFactory::new(fb)?.with_id(LARGE_REPO_ID).build()?;
+        let blob_repo: TestRepo = TestRepoFactory::new(fb)?.with_id(LARGE_REPO_ID).build()?;
         let lca_hint: Target<Arc<dyn LeastCommonAncestorsHint>> =
             Target(Arc::new(SkiplistIndex::new()));
         let dag = create_from_dag(
@@ -1017,9 +1016,9 @@ mod tests {
         let e = *dag.get("E").unwrap();
         let g = *dag.get("G").unwrap();
 
-        let book_e = BookmarkName::new("book_e").unwrap();
+        let book_e = BookmarkKey::new("book_e").unwrap();
         set_bookmark(&ctx, &blob_repo, e, &book_e).await?;
-        let book_g = BookmarkName::new("book_g").unwrap();
+        let book_g = BookmarkKey::new("book_g").unwrap();
         set_bookmark(&ctx, &blob_repo, g, &book_g).await?;
 
         use CandidateSelectionHint::*;
@@ -1064,7 +1063,7 @@ mod tests {
     #[fbinit::test]
     async fn test_only_hint(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
-        let blob_repo: BlobRepo = TestRepoFactory::new(fb)?.with_id(LARGE_REPO_ID).build()?;
+        let blob_repo: TestRepo = TestRepoFactory::new(fb)?.with_id(LARGE_REPO_ID).build()?;
         let dag = create_from_dag(
             &ctx,
             &blob_repo,

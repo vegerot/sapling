@@ -13,6 +13,8 @@ use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
+use bookmarks::BookmarkCategory;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkKind;
 use bookmarks::BookmarkName;
 use bookmarks::BookmarksSubscription;
@@ -43,7 +45,7 @@ pub struct SqlBookmarksSubscription {
     sql_bookmarks: SqlBookmarks,
     freshness: Freshness,
     log_id: u64,
-    bookmarks: HashMap<BookmarkName, (ChangesetId, BookmarkKind)>,
+    bookmarks: HashMap<BookmarkKey, (ChangesetId, BookmarkKind)>,
     last_refresh: Instant,
 }
 
@@ -83,6 +85,7 @@ impl SqlBookmarksSubscription {
             &std::u64::MAX,
             &tok,
             BookmarkKind::ALL_PUBLISHING,
+            BookmarkCategory::ALL,
         )
         .await
         .context("Failed to query bookmarks")?;
@@ -94,7 +97,12 @@ impl SqlBookmarksSubscription {
 
         let bookmarks = bookmarks
             .into_iter()
-            .map(|(name, kind, cs_id, _log_id, _tok)| (name, (cs_id, kind)))
+            .map(|(name, category, kind, cs_id, _log_id, _tok)| {
+                (
+                    BookmarkKey::with_name_and_category(name, category),
+                    (cs_id, kind),
+                )
+            })
             .collect();
 
         Ok(Self {
@@ -107,7 +115,11 @@ impl SqlBookmarksSubscription {
     }
 
     fn has_aged_out(&self) -> bool {
-        let max_age_ms = match tunables().get_bookmark_subscription_max_age_ms().try_into() {
+        let max_age_ms = match tunables()
+            .bookmark_subscription_max_age_ms()
+            .unwrap_or_default()
+            .try_into()
+        {
             Ok(duration) if duration > 0 => duration,
             _ => DEFAULT_SUBSCRIPTION_MAX_AGE_MS,
         };
@@ -146,21 +158,22 @@ impl BookmarksSubscription for SqlBookmarksSubscription {
         let mut max_log_id = None;
         let mut updates = HashMap::new();
 
-        for (log_id, name, kind, cs_id) in changes {
+        for (log_id, name, category, kind, cs_id) in changes {
+            let bookmark = BookmarkKey::with_name_and_category(name, category);
             // kind & cs_id come from the same table (bookmarks) and they're not nullable there, so
             // if one is missing, that means the join didn't find anything, and the one must be
             // missing too.
             let value = match (kind, cs_id) {
                 (Some(kind), Some(cs_id)) => Some((cs_id, kind)),
                 (None, None) => None,
-                _ => bail!("Inconsistent data for bookmark: {}", name),
+                _ => bail!("Inconsistent data for bookmark: {}", bookmark),
             };
 
             max_log_id = std::cmp::max(max_log_id, Some(log_id));
 
             // NOTE: We get the updates in DESC-ending order, so we'll always find the curent
             // bookmark state first.
-            updates.entry(name).or_insert(value);
+            updates.entry(bookmark).or_insert(value);
         }
 
         for (book, maybe_value) in updates.into_iter() {
@@ -169,7 +182,10 @@ impl BookmarksSubscription for SqlBookmarksSubscription {
                     self.bookmarks.insert(book, value);
                 }
                 None => {
-                    if tunables().get_bookmark_subscription_protect_master() {
+                    if tunables()
+                        .bookmark_subscription_protect_master()
+                        .unwrap_or_default()
+                    {
                         if book.as_str() == "master" {
                             warn!(
                                 ctx.logger(),
@@ -194,7 +210,7 @@ impl BookmarksSubscription for SqlBookmarksSubscription {
         Ok(())
     }
 
-    fn bookmarks(&self) -> &HashMap<BookmarkName, (ChangesetId, BookmarkKind)> {
+    fn bookmarks(&self) -> &HashMap<BookmarkKey, (ChangesetId, BookmarkKind)> {
         &self.bookmarks
     }
 }
@@ -203,9 +219,9 @@ mononoke_queries! {
     read SelectUpdatedBookmarks(
         repo_id: RepositoryId,
         log_id: u64
-    ) -> (u64, BookmarkName, Option<BookmarkKind>, Option<ChangesetId>) {
+    ) -> (u64, BookmarkName, BookmarkCategory, Option<BookmarkKind>, Option<ChangesetId>) {
         mysql("
-        SELECT bookmarks_update_log.id, bookmarks_update_log.name, bookmarks.hg_kind, bookmarks.changeset_id
+        SELECT bookmarks_update_log.id, bookmarks_update_log.name, bookmarks_update_log.category, bookmarks.hg_kind, bookmarks.changeset_id
         FROM bookmarks_update_log
         LEFT JOIN bookmarks
             FORCE INDEX (repo_id_log_id)
@@ -215,7 +231,7 @@ mononoke_queries! {
         ORDER BY bookmarks_update_log.id DESC
         ")
         sqlite("
-        SELECT bookmarks_update_log.id, bookmarks_update_log.name, bookmarks.hg_kind, bookmarks.changeset_id
+        SELECT bookmarks_update_log.id, bookmarks_update_log.name, bookmarks_update_log.category, bookmarks.hg_kind, bookmarks.changeset_id
         FROM bookmarks_update_log
         LEFT JOIN bookmarks
             ON  bookmarks.repo_id = bookmarks_update_log.repo_id
@@ -253,7 +269,7 @@ mod test {
         // Insert a bookmark, but without going throguh the log. This won't happen in prod.
         // However, for the purposes of this test, it makes the update invisible to the
         // subscription, and only a full refresh will find it.
-        let book = BookmarkName::new("book")?;
+        let book = BookmarkKey::new("book")?;
         let rows = vec![(
             &bookmarks.repo_id,
             &book,
@@ -265,8 +281,9 @@ mod test {
         sub.refresh(&ctx).await?;
         assert_eq!(*sub.bookmarks(), hashmap! {});
 
-        sub.last_refresh =
-            Instant::now() - Duration::from_millis(DEFAULT_SUBSCRIPTION_MAX_AGE_MS + 1);
+        sub.last_refresh = Instant::now()
+            .checked_sub(Duration::from_millis(DEFAULT_SUBSCRIPTION_MAX_AGE_MS + 1))
+            .ok_or(anyhow::anyhow!("Invalid duration subtraction"))?;
 
         sub.refresh(&ctx).await?;
         assert_eq!(
@@ -287,7 +304,7 @@ mod test {
         let bookmarks = SqlBookmarksBuilder::with_sqlite_in_memory()?.with_repo_id(REPO_ZERO);
         let conn = bookmarks.connections.write_connection.clone();
 
-        let book = BookmarkName::new("master")?;
+        let book = BookmarkKey::new("master")?;
 
         let rows = vec![(
             &bookmarks.repo_id,

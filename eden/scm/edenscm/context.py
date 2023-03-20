@@ -33,6 +33,7 @@ from . import (
     patch,
     pathutil,
     phases,
+    progress,
     pycompat,
     revlog,
     scmutil,
@@ -480,7 +481,7 @@ class changectx(basectx):
                     OverflowError,
                     IndexError,
                     TypeError,
-                    error.RustError,
+                    error.UncategorizedNativeError,
                 ):
                     pass
 
@@ -1345,7 +1346,7 @@ class filectx(basefilectx):
     def size(self) -> int:
         try:
             return self._filelog.size(self._filerev)
-        except error.RustError:
+        except error.UncategorizedNativeError:
             # For submodule, this raises "object not found" error.
             # Let's just return a dummy size.
             if self.flags() == "m":
@@ -1707,7 +1708,7 @@ class workingctx(committablectx):
             uipath = lambda f: ds.pathto(pathutil.join(prefix, f))
             rejected = []
             lstat = self._repo.wvfs.lstat
-            for f in list:
+            for f in progress.each(ui, list, _("adding"), _("files")):
                 # ds.pathto() returns an absolute file when this is invoked from
                 # the keyword extension.  That gets flagged as non-portable on
                 # Windows, since it contains the drive letter and colon.

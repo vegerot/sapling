@@ -13,7 +13,7 @@ use anyhow::Context;
 use anyhow::Error;
 use blobstore::Blobstore;
 use blobstore_factory::make_blobstore;
-use cacheblob::new_memcache_blobstore_no_lease;
+use cacheblob::new_memcache_blobstore;
 use cacheblob::CachelibBlobstoreOptions;
 use clap_old::Arg;
 use cmdlib::args;
@@ -127,21 +127,22 @@ fn main(fb: fbinit::FacebookInit) -> Result<(), Error> {
         .context("Could not make blobstore")?;
         let blobstore = match caching {
             Caching::Disabled => blobstore,
-            Caching::CachelibOnlyBlobstore(cache_shards) => repo_factory::cachelib_blobstore(
+            Caching::LocalOnly(local_cache_config)
+            | Caching::LocalBlobstoreOnly(local_cache_config) => repo_factory::cachelib_blobstore(
                 blobstore,
-                cache_shards,
+                local_cache_config.blobstore_cache_shards,
                 &CachelibBlobstoreOptions::default(),
             )
             .context("repo_factory::cachelib_blobstore failed")?,
-            Caching::Enabled(cache_shards) => {
+            Caching::Enabled(local_cache_config) => {
                 let cachelib_blobstore = repo_factory::cachelib_blobstore(
                     blobstore,
-                    cache_shards,
+                    local_cache_config.blobstore_cache_shards,
                     &CachelibBlobstoreOptions::default(),
                 )
                 .context("repo_factory::cachelib_blobstore failed")?;
                 Arc::new(
-                    new_memcache_blobstore_no_lease(fb, cachelib_blobstore, "benchmark", "")
+                    new_memcache_blobstore(fb, cachelib_blobstore, "benchmark", "")
                         .context("Memcache blobstore issues")?,
                 )
             }

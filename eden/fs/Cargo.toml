@@ -5,25 +5,25 @@ bindgen = { git = "https://github.com/fbsource/bindgen", rev = "65cde6d7eed1b678
 bindgen-cli = { git = "https://github.com/fbsource/bindgen", rev = "65cde6d7eed1b6785d3c4186f326b4470a680e7b" }
 curve25519-dalek = { git = "https://github.com/hariria/curve25519-dalek", rev = "1f39e7b369dc70f432370c9703229a45bfa9664e" }
 daemonize = { git = "https://github.com/krallin/daemonize", rev = "f7be28efa1b4a70e43bb37b5f4ff4d664992edca" }
-deltae = { git = "https://github.com/markbt/deltae", rev = "1c6e9c7c9184751bd17795d78896d522e77a2ce4" }
 graphql-parser = { git = "https://github.com/vmagro/graphql-parser", rev = "c778917f57f6b2c26d9291819b9bb341a2f5948a" }
 hyperx = { git = "https://github.com/chantra/hyperx", rev = "69f17cf858573db42c2baaf0bfead54521de32f9" }
-libc = { git = "https://github.com/fbsource/libc", rev = "52f1a1c7f6282681dfb22d91e7c3acbddbc75ba4" }
 lru-disk-cache = { git = "https://github.com/mozilla/sccache", rev = "fdbf843d174c6796d736b2b61dab0297670390f8" }
 mysql_async = { git = "https://github.com/mzr/mysql_async", rev = "76b6fa05d7bb3408402033e6f94042a756ab55ab" }
+perf-event = { version = "0.4", git = "https://github.com/krallin/perf-event.git", rev = "86224a9bc025d5d19f719542f27c8c629a08b167" }
+perf-event-open-sys = { version = "4.0", git = "https://github.com/krallin/perf-event.git", rev = "86224a9bc025d5d19f719542f27c8c629a08b167" }
 prost = { version = "0.11.6", git = "https://github.com/krallin/prost.git", rev = "90b7e204c66f6baed0b1426ce456fb70d16b1cdb" }
 prost-build = { version = "0.11.6", git = "https://github.com/krallin/prost.git", rev = "90b7e204c66f6baed0b1426ce456fb70d16b1cdb" }
 prost-derive = { version = "0.11.6", git = "https://github.com/krallin/prost.git", rev = "90b7e204c66f6baed0b1426ce456fb70d16b1cdb" }
 prost-types = { version = "0.11.6", git = "https://github.com/krallin/prost.git", rev = "90b7e204c66f6baed0b1426ce456fb70d16b1cdb" }
 quickcheck = { git = "https://github.com/jakoschiko/quickcheck", rev = "6ecdf5bb4b0132ce66670b4d46453aa022ea892c" }
 reqwest = { git = "https://github.com/vmagro/reqwest", rev = "f9490c06756a9d35ab874c44657db790a87af80b" }
-scip = { git = "https://github.com/davidbarsky/scip.git", rev = "58b9509f04aa853006ed1b1256434c421bb54eec" }
+scip = { git = "https://github.com/sourcegraph/scip.git", rev = "f90a867eb194bf6dae2e2b176e4f8ec7928bf70b" }
 solana-program = { git = "https://github.com/omertxyz/solana.git", rev = "03a3b241622b6248bb245c29baef538a88f04c0b" }
 solana-zk-token-sdk = { git = "https://github.com/omertxyz/solana.git", rev = "03a3b241622b6248bb245c29baef538a88f04c0b" }
 tar = { package = "tar", git = "https://github.com/jrwats/tar-rs.git", rev = "21eeccdc08d9b87f6ad610f9b20a5839aabe5974" }
 tempfile = { git = "https://github.com/Stebalien/tempfile.git", rev = "66aa57f7d3a38234fcd393077366b61d36171e42" }
 terminfo = { git = "https://github.com/rust-terminfo/terminfo", rev = "9b4e1c6aae79644c9da7a2e312e3c10ee4759930" }
-toml = { git = "https://github.com/fbsource/toml", branch = "dotted-table-0.5.8" }
+toml = { git = "https://github.com/fbsource/toml", rev = "0ee7001fb64f7c5094a00d3a360e402201f498fe" }
 tonic = { version = "0.8.3", git = "https://github.com/krallin/tonic.git", rev = "c67fc25b636b48b90c83dfc8dd1f89c00b84846d" }
 tonic-build = { version = "0.8.4", git = "https://github.com/krallin/tonic.git", rev = "c67fc25b636b48b90c83dfc8dd1f89c00b84846d" }
 windows-sys = { package = "windows-sys", git = "https://github.com/davidbarsky/windows-rs", rev = "0489fa456a104f49c7807ae309743c36709bf179" }

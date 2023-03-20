@@ -16,6 +16,7 @@ def create_pull_request_title_and_body(
     pr_numbers_and_num_commits: List[Tuple[int, int]],
     pr_numbers_index: int,
     repository: Repository,
+    reviewstack: bool = True,
 ) -> Tuple[str, str]:
     r"""Returns (title, body) for the pull request.
 
@@ -30,36 +31,53 @@ def create_pull_request_title_and_body(
     ...     pr_numbers_index,
     ...     contributor_repo,
     ... )
-    >>> title == 'The original commit message.'
-    True
+    >>> print(title)
+    The original commit message.
     >>> reviewstack_url = "https://reviewstack.dev/facebook/sapling/pull/42"
-    >>> body == (
-    ...     'The original commit message.\n' +
-    ...     'Second line of message.\n' +
-    ...     '---\n' +
-    ...     'Stack created with [Sapling](https://sapling-scm.com). ' +
-    ...     f'Best reviewed with [ReviewStack]({reviewstack_url}).\n' +
-    ...     '* #1\n' +
-    ...     '* #2 (2 commits)\n' +
-    ...     '* __->__ #42\n' +
-    ...     '* #4\n')
-    True
+    >>> print(body.replace(reviewstack_url, "{reviewstack_url}"))
+    The original commit message.
+    Second line of message.
+    ---
+    Stack created with [Sapling](https://sapling-scm.com). Best reviewed with [ReviewStack]({reviewstack_url}).
+    * #1
+    * #2 (2 commits)
+    * __->__ #42
+    * #4
+
+    Disable reviewstack message:
+    >>> title, body = create_pull_request_title_and_body(commit_msg, pr_numbers_and_num_commits,
+    ...     pr_numbers_index, contributor_repo, reviewstack=False)
+    >>> print(body)
+    The original commit message.
+    Second line of message.
+    ---
+    * #1
+    * #2 (2 commits)
+    * __->__ #42
+    * #4
+
+    Single commit stack:
+    >>> title, body = create_pull_request_title_and_body("Foo", [(1, 1)], 0, contributor_repo)
+    >>> print(body.replace(reviewstack_url, "{reviewstack_url}"))
+    Foo
     """
     owner, name = repository.get_upstream_owner_and_name()
     pr = pr_numbers_and_num_commits[pr_numbers_index][0]
-    reviewstack_url = f"https://reviewstack.dev/{owner}/{name}/pull/{pr}"
-    bulleted_list = "\n".join(
-        [
+    title = firstline(commit_msg)
+    body = commit_msg
+    extra = []
+    if len(pr_numbers_and_num_commits) > 1:
+        if reviewstack:
+            reviewstack_url = f"https://reviewstack.dev/{owner}/{name}/pull/{pr}"
+            review_stack_message = f"Stack created with [Sapling](https://sapling-scm.com). Best reviewed with [ReviewStack]({reviewstack_url})."
+            extra.append(review_stack_message)
+        bulleted_list = "\n".join(
             _format_stack_entry(pr_number, index, pr_numbers_index, num_commits)
             for index, (pr_number, num_commits) in enumerate(pr_numbers_and_num_commits)
-        ]
-    )
-    title = firstline(commit_msg)
-    body = f"""{commit_msg}
-{_HORIZONTAL_RULE}
-Stack created with [Sapling](https://sapling-scm.com). Best reviewed with [ReviewStack]({reviewstack_url}).
-{bulleted_list}
-"""
+        )
+        extra.append(bulleted_list)
+    if extra:
+        body = "\n".join([body, _HORIZONTAL_RULE] + extra)
     return title, body
 
 

@@ -88,7 +88,7 @@ pub struct EagerRepo {
 /// zstore delta-compress features, and don't store different types separately.
 #[derive(Clone)]
 pub struct EagerRepoStore {
-    inner: Arc<RwLock<Zstore>>,
+    pub(crate) inner: Arc<RwLock<Zstore>>,
 }
 
 impl EagerRepoStore {
@@ -125,6 +125,10 @@ impl EagerRepoStore {
     pub fn get_content(&self, id: Id20) -> Result<Option<Bytes>> {
         // Prefix in bytes of the hg SHA1s in the eagerepo data.
         const HG_SHA1_PREFIX: usize = Id20::len() * 2;
+        // Special null case.
+        if id.is_null() {
+            return Ok(Some(Bytes::default()));
+        }
         match self.get_sha1_blob(id)? {
             None => Ok(None),
             Some(data) => Ok(Some(data.slice(HG_SHA1_PREFIX..))),
@@ -241,6 +245,7 @@ impl EagerRepo {
     /// Supported URLs:
     /// - `eager:dir_path`, `eager://dir_path`
     /// - `test:name`, `test://name`: same as `eager:$TESTTMP/server-repos/name`
+    /// - `/path/to/dir` where the path is a EagerRepo.
     pub fn url_to_dir(value: &str) -> Option<PathBuf> {
         let prefix = "eager:";
         if let Some(path) = value.strip_prefix(prefix) {
@@ -265,6 +270,19 @@ impl EagerRepo {
                 let tmp: &Path = Path::new(&tmp);
                 let path = tmp.join(path);
                 return Some(path);
+            }
+        }
+        let path = Path::new(value);
+        if path.is_absolute() && path.is_dir() {
+            if let Ok(Some(ident)) = identity::sniff_dir(path) {
+                // Check store requirements
+                let store_requirement_path =
+                    path.join(ident.dot_dir()).join("store").join("requires");
+                if let Ok(s) = std::fs::read_to_string(store_requirement_path) {
+                    if s.lines().any(|s| s == "eagerepo") {
+                        return Some(path.to_path_buf());
+                    }
+                }
             }
         }
         None

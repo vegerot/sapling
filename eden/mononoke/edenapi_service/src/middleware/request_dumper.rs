@@ -17,6 +17,7 @@ use gotham::state::FromState;
 use gotham::state::State;
 use gotham_derive::StateData;
 use gotham_ext::middleware::Middleware;
+use gotham_ext::state_ext::StateExt;
 use http::HeaderMap;
 use hyper::Body;
 use hyper::Response;
@@ -29,6 +30,8 @@ use tunables::tunables;
 use crate::middleware::RequestContext;
 
 static MAX_BODY_LEN: usize = 16 * 1024; // 16 KB
+static MAX_BODY_LEN_DEBUG: usize = 4 * 1024; // 4 KB
+const UPLOAD_PATH: &str = "/upload/";
 
 lazy_static! {
     static ref FILTERED_HEADERS: HashSet<&'static str> = {
@@ -42,12 +45,14 @@ lazy_static! {
 enum LogAction {
     Log,
     BodyTooBig,
+    Upload,
 }
 
 #[derive(Debug, StateData, Clone)]
 pub struct RequestDumper {
     logger: MononokeScubaSampleBuilder,
     log_action: LogAction,
+    log_deserialized: bool,
 }
 
 fn get_content_len(headers: &HeaderMap) -> Option<usize> {
@@ -58,18 +63,27 @@ fn get_content_len(headers: &HeaderMap) -> Option<usize> {
 
 impl RequestDumper {
     pub fn add_http_req_prefix(&mut self, state: &State, headers: &HeaderMap) -> Result<()> {
+        // Log request_id to match between scuba tables.
+        self.logger
+            .add("request_id", state.short_request_id().to_string());
+
         let method = http::method::Method::try_borrow_from(state)
             .context("Method not present in State")?
             .as_str();
         self.logger.add("method", method);
 
         let uri = http::uri::Uri::try_borrow_from(state).context("Uri not present in State")?;
-        self.logger.add(
-            "path",
-            uri.path_and_query()
-                .context("path_and_query is None")?
-                .as_str(),
-        );
+        let uristr = uri
+            .path_and_query()
+            .context("path_and_query is None")?
+            .as_str();
+
+        if uristr.contains(UPLOAD_PATH) {
+            self.log_action = LogAction::Upload;
+            return Ok(());
+        }
+
+        self.logger.add("path", uristr);
 
         let mut headers_hs = HashSet::new();
         for (k, v) in headers
@@ -86,7 +100,16 @@ impl RequestDumper {
         match self.log_action {
             LogAction::Log => true,
             LogAction::BodyTooBig => false,
+            LogAction::Upload => false,
         }
+    }
+
+    fn should_log_deserialized(&self) -> bool {
+        self.should_log() && self.log_deserialized
+    }
+
+    pub fn set_log_deserialized(&mut self, log_deserialized: bool) {
+        self.log_deserialized = log_deserialized;
     }
 
     pub fn log(&mut self) -> Result<()> {
@@ -102,6 +125,7 @@ impl RequestDumper {
         Ok(())
     }
 
+    // If the request is not too big, log encoded, so it can be replayed.
     pub fn add_body(&mut self, body: &Bytes) {
         if body.len() > MAX_BODY_LEN {
             self.log_action = LogAction::BodyTooBig;
@@ -111,12 +135,23 @@ impl RequestDumper {
         self.logger.add("body", b64encode(&body[..]));
     }
 
+    // If the request is very small, log the request in human readable format.
+    pub fn add_request<R>(&mut self, request: &R)
+    where
+        R: std::fmt::Debug,
+    {
+        if self.should_log_deserialized() {
+            self.logger.add("request", format!("{:?}", request));
+        }
+    }
+
     pub fn new(fb: FacebookInit) -> Self {
         let scuba = MononokeScubaSampleBuilder::new(fb, "mononoke_replay_logged_edenapi_requests")
             .expect("Couldn't create scuba sample builder");
         Self {
             logger: scuba,
             log_action: LogAction::Log,
+            log_deserialized: false,
         }
     }
 }
@@ -136,7 +171,11 @@ impl RequestDumperMiddleware {
 impl Middleware for RequestDumperMiddleware {
     async fn inbound(&self, state: &mut State) -> Option<Response<Body>> {
         let logger = &RequestContext::borrow_from(state).logger;
-        let sample_ratio: u64 = match tunables().get_edenapi_req_dumper_sample_ratio().try_into() {
+        let sample_ratio: u64 = match tunables()
+            .edenapi_req_dumper_sample_ratio()
+            .unwrap_or_default()
+            .try_into()
+        {
             Ok(n) => n,
             Err(e) => {
                 warn!(
@@ -160,10 +199,16 @@ impl Middleware for RequestDumperMiddleware {
             }
         };
 
+        let mut log_deserialized = false;
+
         if let Some(len) = get_content_len(headers) {
             if len > MAX_BODY_LEN {
                 trace!(logger, "Body too big ({}), not recording", len);
                 return None;
+            }
+
+            if len <= MAX_BODY_LEN_DEBUG {
+                log_deserialized = true;
             }
         }
 
@@ -176,6 +221,8 @@ impl Middleware for RequestDumperMiddleware {
             );
             return None;
         }
+
+        rd.set_log_deserialized(log_deserialized);
 
         state.put(rd);
 

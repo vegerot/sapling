@@ -13,29 +13,46 @@ import type {
   ServerToClientMessage,
   ClientToServerMessage,
   Disposable,
-  SmartlogCommits,
-  SmartlogCommitsEvent,
-  UncommittedChanges,
-  UncommittedChangesEvent,
   Result,
   MergeConflicts,
-  MergeConflictsEvent,
   RepositoryError,
   PlatformSpecificClientToServerMessages,
+  FileABugProgress,
+  ClientToServerMessageWithPayload,
+  FetchedCommits,
+  FetchedUncommittedChanges,
 } from 'isl/src/types';
 
+import {Internal} from './Internal';
 import {absolutePathForFileInRepo} from './Repository';
 import fs from 'fs';
 import {serializeToString, deserializeFromString} from 'isl/src/serialize';
 import {revsetArgsForComparison, revsetForComparison} from 'shared/Comparison';
-import {randomId} from 'shared/utils';
+import {randomId, unwrap} from 'shared/utils';
 
 export type IncomingMessage = ClientToServerMessage;
+type IncomingMessageWithPayload = ClientToServerMessageWithPayload;
 export type OutgoingMessage = ServerToClientMessage;
 
 type GeneralMessage = IncomingMessage &
-  ({type: 'requestRepoInfo'} | {type: 'requestApplicationInfo'});
+  (
+    | {type: 'requestRepoInfo'}
+    | {type: 'requestApplicationInfo'}
+    | {type: 'fileBugReport'}
+    | {type: 'track'}
+  );
 type WithRepoMessage = Exclude<IncomingMessage, GeneralMessage>;
+
+/**
+ * Return true if a ClientToServerMessage is a ClientToServerMessageWithPayload
+ */
+function expectsBinaryPayload(message: unknown): message is ClientToServerMessageWithPayload {
+  return (
+    message != null &&
+    typeof message === 'object' &&
+    (message as ClientToServerMessageWithPayload).hasBinaryPayload === true
+  );
+}
 
 /**
  * Message passing channel built on top of ClientConnection.
@@ -52,20 +69,13 @@ export default class ServerToClientAPI {
 
   /** Disposables that must be disposed whenever the current repo is changed */
   private repoDisposables: Array<Disposable> = [];
+  private subscriptions = new Map<string, Disposable>();
 
   private queuedMessages: Array<IncomingMessage> = [];
   private currentState:
     | {type: 'loading'}
     | {type: 'repo'; repo: Repository; cwd: string}
     | {type: 'error'; error: RepositoryError} = {type: 'loading'};
-
-  // React Dev mode means we subscribe+unsubscribe+resubscribe in the client,
-  // causing multiple subscriptions on the server. To avoid that,
-  // and for general robustness against duplicated work, we prevent
-  // re-subscribing after the first subscription occurs.
-  private hasSubscribedToSmartlogCommits = false;
-  private hasSubscribedToUncommittedChanges = false;
-  private hasSubscribedToMergeConflicts = false;
 
   private pageId = randomId();
 
@@ -74,9 +84,34 @@ export default class ServerToClientAPI {
     private connection: ClientConnection,
     private tracker: ServerSideTracker,
   ) {
-    this.incomingListener = this.connection.onDidReceiveMessage(buf => {
+    // messages with binary payloads are sent as two post calls. We first get the JSON message, then the binary payload,
+    // which we will reconstruct together.
+    let messageExpectingBinaryFollowup: ClientToServerMessageWithPayload | null = null;
+    this.incomingListener = this.connection.onDidReceiveMessage((buf, isBinary) => {
+      if (isBinary) {
+        if (messageExpectingBinaryFollowup == null) {
+          connection.logger?.error('Error: got a binary message when not expecting one');
+          return;
+        }
+        // TODO: we don't handle queueing up messages with payloads...
+        this.handleIncomingMessageWithPayload(messageExpectingBinaryFollowup, buf);
+        messageExpectingBinaryFollowup = null;
+        return;
+      } else if (messageExpectingBinaryFollowup != null) {
+        connection.logger?.error(
+          'Error: didnt get binary payload after a message that requires one',
+        );
+        messageExpectingBinaryFollowup = null;
+        return;
+      }
+
       const message = buf.toString('utf-8');
       const data = deserializeFromString(message) as IncomingMessage;
+      if (expectsBinaryPayload(data)) {
+        // remember this message, and wait to get the binary payload before handling it
+        messageExpectingBinaryFollowup = data;
+        return;
+      }
 
       // When the client is connected, we want to immediately start listening to messages.
       // However, we can't properly respond to these messages until we have a repository set up.
@@ -146,6 +181,34 @@ export default class ServerToClientAPI {
     this.queuedMessages = [];
   }
 
+  private handleIncomingMessageWithPayload(
+    message: IncomingMessageWithPayload,
+    payload: ArrayBuffer,
+  ) {
+    switch (message.type) {
+      case 'uploadFile': {
+        const {id, filename} = message;
+        const uploadFile = Internal.uploadFile;
+        if (uploadFile == null) {
+          return;
+        }
+        this.tracker
+          .operation('UploadImage', 'UploadImageError', {}, () =>
+            uploadFile(unwrap(this.connection.logger), {filename, data: payload}),
+          )
+          .then((result: string) => {
+            this.connection.logger?.info('sucessfully uploaded file', filename, result);
+            this.postMessage({type: 'uploadFileResult', id, result: {value: result}});
+          })
+          .catch((error: Error) => {
+            this.connection.logger?.info('error uploading file', filename, error);
+            this.postMessage({type: 'uploadFileResult', id, result: {error}});
+          });
+        break;
+      }
+    }
+  }
+
   private handleIncomingMessage(data: IncomingMessage) {
     this.handleIncomingGeneralMessage(data as GeneralMessage);
     const {currentState} = this;
@@ -177,6 +240,10 @@ export default class ServerToClientAPI {
    */
   private handleIncomingGeneralMessage(data: GeneralMessage) {
     switch (data.type) {
+      case 'track': {
+        this.tracker.trackData(data.data);
+        break;
+      }
       case 'requestRepoInfo': {
         switch (this.currentState.type) {
           case 'repo':
@@ -200,6 +267,19 @@ export default class ServerToClientAPI {
         });
         break;
       }
+      case 'fileBugReport': {
+        Internal.fileABug?.(
+          data.data,
+          data.uiState,
+          this.tracker,
+          this.connection.logFileLocation,
+          (progress: FileABugProgress) => {
+            this.connection.logger?.info('file a bug progress: ', JSON.stringify(progress));
+            this.postMessage({type: 'fileBugReportProgress', ...progress});
+          },
+        );
+        break;
+      }
     }
   }
 
@@ -209,95 +289,101 @@ export default class ServerToClientAPI {
   private handleIncomingMessageWithRepo(data: WithRepoMessage, repo: Repository, cwd: string) {
     const {logger} = repo;
     switch (data.type) {
-      case 'track': {
-        this.tracker.trackData(data.data);
+      case 'subscribe': {
+        const {subscriptionID, kind} = data;
+        switch (kind) {
+          case 'uncommittedChanges': {
+            const postUncommittedChanges = (result: FetchedUncommittedChanges) => {
+              this.postMessage({
+                type: 'subscriptionResult',
+                kind: 'uncommittedChanges',
+                subscriptionID,
+                data: result,
+              });
+            };
+
+            const uncommittedChanges = repo.getUncommittedChanges();
+            if (uncommittedChanges != null) {
+              postUncommittedChanges(uncommittedChanges);
+            }
+            const disposables: Array<Disposable> = [];
+
+            // send changes as they come in from watchman
+            disposables.push(repo.subscribeToUncommittedChanges(postUncommittedChanges));
+            // trigger a fetch on startup
+            repo.fetchUncommittedChanges();
+
+            disposables.push(
+              repo.subscribeToUncommittedChangesBeginFetching(() =>
+                this.postMessage({type: 'beganFetchingUncommittedChangesEvent'}),
+              ),
+            );
+            this.subscriptions.set(subscriptionID, {
+              dispose: () => {
+                disposables.forEach(d => d.dispose());
+              },
+            });
+            break;
+          }
+          case 'smartlogCommits': {
+            const postSmartlogCommits = (result: FetchedCommits) => {
+              this.postMessage({
+                type: 'subscriptionResult',
+                kind: 'smartlogCommits',
+                subscriptionID,
+                data: result,
+              });
+            };
+
+            const smartlogCommits = repo.getSmartlogCommits();
+            if (smartlogCommits != null) {
+              postSmartlogCommits(smartlogCommits);
+            }
+            const disposables: Array<Disposable> = [];
+            // send changes as they come from file watcher
+            disposables.push(repo.subscribeToSmartlogCommitsChanges(postSmartlogCommits));
+            // trigger a fetch on startup
+            repo.fetchSmartlogCommits();
+
+            disposables.push(
+              repo.subscribeToSmartlogCommitsBeginFetching(() =>
+                this.postMessage({type: 'beganFetchingSmartlogCommitsEvent'}),
+              ),
+            );
+
+            this.subscriptions.set(subscriptionID, {
+              dispose: () => {
+                disposables.forEach(d => d.dispose());
+              },
+            });
+            break;
+          }
+          case 'mergeConflicts': {
+            const postMergeConflicts = (conflicts: MergeConflicts | undefined) => {
+              this.postMessage({
+                type: 'subscriptionResult',
+                kind: 'mergeConflicts',
+                subscriptionID,
+                data: conflicts,
+              });
+            };
+
+            const mergeConflicts = repo.getMergeConflicts();
+            if (mergeConflicts != null) {
+              postMergeConflicts(mergeConflicts);
+            }
+
+            this.subscriptions.set(subscriptionID, repo.onChangeConflictState(postMergeConflicts));
+            break;
+          }
+        }
         break;
       }
-      case 'subscribeUncommittedChanges': {
-        if (this.hasSubscribedToUncommittedChanges) {
-          break;
-        }
-        this.hasSubscribedToUncommittedChanges = true;
-        const {subscriptionID} = data;
-        const postUncommittedChanges = (result: Result<UncommittedChanges>) => {
-          const message: UncommittedChangesEvent = {
-            type: 'uncommittedChanges',
-            subscriptionID,
-            files: result,
-          };
-          this.postMessage(message);
-        };
-
-        const uncommittedChanges = repo.getUncommittedChanges();
-        if (uncommittedChanges != null) {
-          postUncommittedChanges({value: uncommittedChanges});
-        }
-
-        // send changes as they come in from watchman
-        this.repoDisposables.push(repo.subscribeToUncommittedChanges(postUncommittedChanges));
-        // trigger a fetch on startup
-        repo.fetchUncommittedChanges();
-
-        this.repoDisposables.push(
-          repo.subscribeToUncommittedChangesBeginFetching(() =>
-            this.postMessage({type: 'beganFetchingUncommittedChangesEvent'}),
-          ),
-        );
-        return;
-      }
-      case 'subscribeSmartlogCommits': {
-        if (this.hasSubscribedToSmartlogCommits) {
-          break;
-        }
-        this.hasSubscribedToSmartlogCommits = true;
-        const {subscriptionID} = data;
-        const postSmartlogCommits = (result: Result<SmartlogCommits>) => {
-          const message: SmartlogCommitsEvent = {
-            type: 'smartlogCommits',
-            subscriptionID,
-            commits: result,
-          };
-          this.postMessage(message);
-        };
-
-        const smartlogCommits = repo.getSmartlogCommits();
-        if (smartlogCommits != null) {
-          postSmartlogCommits({value: smartlogCommits});
-        }
-        // send changes as they come from file watcher
-        this.repoDisposables.push(repo.subscribeToSmartlogCommitsChanges(postSmartlogCommits));
-        // trigger a fetch on startup
-        repo.fetchSmartlogCommits();
-
-        this.repoDisposables.push(
-          repo.subscribeToSmartlogCommitsBeginFetching(() =>
-            this.postMessage({type: 'beganFetchingSmartlogCommitsEvent'}),
-          ),
-        );
-        return;
-      }
-      case 'subscribeMergeConflicts': {
-        if (this.hasSubscribedToMergeConflicts) {
-          break;
-        }
-        this.hasSubscribedToMergeConflicts = true;
-        const {subscriptionID} = data;
-        const postMergeConflicts = (conflicts: MergeConflicts | undefined) => {
-          const message: MergeConflictsEvent = {
-            type: 'mergeConflicts',
-            subscriptionID,
-            conflicts,
-          };
-          this.postMessage(message);
-        };
-
-        const mergeConflicts = repo.getMergeConflicts();
-        if (mergeConflicts != null) {
-          postMergeConflicts(mergeConflicts);
-        }
-
-        this.repoDisposables.push(repo.onChangeConflictState(postMergeConflicts));
-        return;
+      case 'unsubscribe': {
+        const subscription = this.subscriptions.get(data.subscriptionID);
+        subscription?.dispose();
+        this.subscriptions.delete(data.subscriptionID);
+        break;
       }
       case 'runOperation': {
         const {operation} = data;
@@ -305,9 +391,18 @@ export default class ServerToClientAPI {
           operation,
           progress => {
             this.postMessage({type: 'operationProgress', ...progress});
+            if (progress.kind === 'queue') {
+              this.tracker.track('QueueOperation', {extras: {operation: operation.trackEventName}});
+            }
           },
+          this.tracker,
           cwd,
         );
+        break;
+      }
+      case 'abortRunningOperation': {
+        const {operationId} = data;
+        repo.abortRunningOpeation(operationId);
         break;
       }
       case 'deleteFile': {
@@ -412,6 +507,14 @@ export default class ServerToClientAPI {
       case 'fetchDiffSummaries': {
         repo.codeReviewProvider?.triggerDiffSummariesFetch(repo.getAllDiffIds());
         break;
+      }
+      case 'loadMoreCommits': {
+        const rangeInDays = repo.nextVisibleCommitRangeInDays();
+        this.postMessage({type: 'commitsShownRange', rangeInDays});
+        this.postMessage({type: 'beganLoadingMoreCommits'});
+        repo.fetchSmartlogCommits();
+        this.tracker.track('LoadMoreCommits', {extras: {daysToFetch: rangeInDays ?? 'Infinity'}});
+        return;
       }
       default: {
         this.platform.handleMessageFromClient(repo, data, message => this.postMessage(message));

@@ -12,7 +12,9 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use anyhow::Error;
 use anyhow::Result;
+use blobrepo::AsBlobRepo;
 use blobstore::Loadable;
+use bookmarks::BookmarkKey;
 use bytes::Bytes;
 use cacheblob::InProcessLease;
 use chrono::FixedOffset;
@@ -88,7 +90,10 @@ async fn commit_info_by_hash(fb: FacebookInit) -> Result<(), Error> {
     assert_eq!(cs.author().await?, "Jeremy Fitzhardinge <jsgf@fb.com>");
     assert_eq!(
         cs.author_date().await?,
-        FixedOffset::west(7 * 3600).timestamp(1504041761, 0)
+        FixedOffset::west_opt(7 * 3600)
+            .unwrap()
+            .timestamp_opt(1504041761, 0)
+            .unwrap()
     );
     assert_eq!(cs.generation().await?.value(), 11);
 
@@ -120,7 +125,10 @@ async fn commit_info_by_hg_hash(fb: FacebookInit) -> Result<(), Error> {
     assert_eq!(cs.author().await?, "Jeremy Fitzhardinge <jsgf@fb.com>");
     assert_eq!(
         cs.author_date().await?,
-        FixedOffset::west(7 * 3600).timestamp(1504041758, 0)
+        FixedOffset::west_opt(7 * 3600)
+            .unwrap()
+            .timestamp_opt(1504041758, 0)
+            .unwrap()
     );
 
     Ok(())
@@ -141,7 +149,7 @@ async fn commit_info_by_bookmark(fb: FacebookInit) -> Result<(), Error> {
         .build()
         .await?;
     let cs = repo
-        .resolve_bookmark("master", BookmarkFreshness::MostRecent)
+        .resolve_bookmark(&BookmarkKey::new("master")?, BookmarkFreshness::MostRecent)
         .await?
         .expect("bookmark exists");
 
@@ -153,7 +161,10 @@ async fn commit_info_by_bookmark(fb: FacebookInit) -> Result<(), Error> {
     assert_eq!(cs.author().await?, "Jeremy Fitzhardinge <jsgf@fb.com>");
     assert_eq!(
         cs.author_date().await?,
-        FixedOffset::west(7 * 3600).timestamp(1504041761, 0)
+        FixedOffset::west_opt(7 * 3600)
+            .unwrap()
+            .timestamp_opt(1504041761, 0)
+            .unwrap()
     );
 
     Ok(())
@@ -654,7 +665,10 @@ async fn commit_find_files_impl(fb: FacebookInit) -> Result<(), Error> {
         .try_collect()
         .await?;
     // BSSM have different but consistent orders
-    let expected_files = if tunables().get_disable_basename_suffix_skeleton_manifest() {
+    let expected_files = if tunables()
+        .disable_basename_suffix_skeleton_manifest()
+        .unwrap_or_default()
+    {
         vec![
             MononokePath::try_from("1")?,
             MononokePath::try_from("dir1/file_1_in_dir1")?,
@@ -690,7 +704,10 @@ async fn commit_find_files_impl(fb: FacebookInit) -> Result<(), Error> {
         .await?
         .try_collect()
         .await?;
-    let expected_files = if tunables().get_disable_basename_suffix_skeleton_manifest() {
+    let expected_files = if tunables()
+        .disable_basename_suffix_skeleton_manifest()
+        .unwrap_or_default()
+    {
         vec![
             MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
             MononokePath::try_from("dir2/file_1_in_dir2")?,
@@ -1300,8 +1317,8 @@ async fn xrepo_commit_lookup_config_changing_live(fb: FacebookInit) -> Result<()
             .await?;
 
     let commit_sync_repos = CommitSyncRepos::new(
-        largerepo.blob_repo().clone(),
-        smallrepo.blob_repo().clone(),
+        largerepo.inner_repo().clone(),
+        smallrepo.inner_repo().clone(),
         &common_config,
     )?;
 
@@ -1357,11 +1374,11 @@ async fn init_x_repo(
         ctx.clone(),
         (
             "smallrepo".to_string(),
-            small_to_large.get_small_repo().clone(),
+            small_to_large.get_small_repo().as_blob_repo().clone(),
         ),
         (
             "largerepo".to_string(),
-            small_to_large.get_large_repo().clone(),
+            small_to_large.get_large_repo().as_blob_repo().clone(),
         ),
         commit_sync_config.clone(),
         mapping.clone(),

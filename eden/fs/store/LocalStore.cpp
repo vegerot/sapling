@@ -21,7 +21,6 @@
 #include "eden/fs/model/git/GitTree.h"
 #include "eden/fs/store/SerializedBlobMetadata.h"
 #include "eden/fs/store/StoreResult.h"
-#include "eden/fs/store/TreeMetadata.h"
 
 using folly::ByteRange;
 using folly::IOBuf;
@@ -171,6 +170,15 @@ void LocalStore::putBlob(const ObjectId& id, const Blob* blob) {
 }
 
 void LocalStore::putBlobMetadata(
+    const ObjectId& id,
+    const BlobMetadata& metadata) {
+  auto hashBytes = id.getBytes();
+  SerializedBlobMetadata metadataBytes(metadata);
+
+  put(KeySpace::BlobMetaDataFamily, hashBytes, metadataBytes.slice());
+}
+
+void LocalStore::WriteBatch::putBlobMetadata(
     const ObjectId& id,
     const BlobMetadata& metadata) {
   auto hashBytes = id.getBytes();

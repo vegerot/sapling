@@ -5,6 +5,12 @@
  * GNU General Public License version 2.
  */
 
+//! Mononoke -> hg sync job
+//!
+//! It's a special job that is used to synchronize Mononoke to Mercurial when Mononoke is a source
+//! of truth. All writes to Mononoke are replayed to Mercurial using this job. That can be used
+//! to verify Mononoke's correctness and/or use hg as a disaster recovery mechanism.
+
 #![feature(auto_traits)]
 #![feature(async_closure)]
 #![feature(drain_filter)]
@@ -12,26 +18,23 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Mononoke -> hg sync job
-///
-/// It's a special job that is used to synchronize Mononoke to Mercurial when Mononoke is a source
-/// of truth. All writes to Mononoke are replayed to Mercurial using this job. That can be used
-/// to verify Mononoke's correctness and/or use hg as a disaster recovery mechanism.
 use anyhow::bail;
 use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
+use assembly_line::TryAssemblyLine;
 use async_trait::async_trait;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLog;
 use bookmarks::BookmarkUpdateLogEntry;
 use bookmarks::Freshness;
@@ -60,7 +63,7 @@ use futures::future::try_join3;
 use futures::future::BoxFuture;
 use futures::future::FutureExt as _;
 use futures::future::TryFutureExt;
-use futures::pin_mut;
+use futures::lock::Mutex;
 use futures::stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
@@ -367,7 +370,17 @@ impl HgSyncProcess {
                     .long("bundle-prefetch")
                     .takes_value(true)
                     .required(false)
-                    .help("How many bundles to prefetch"),
+                    .help("How many bundles to prefetch (NOOP left for backwards compat)"),
+            )
+            .arg(
+                Arg::with_name("bundle-buffer-size")
+                    .long("bundle-buffer-size")
+                    .takes_value(true)
+                    .required(false)
+                    .help(
+                        "How many bundles should be gnererated and buffered in \
+                        advance of replaying (min 1, default 5)",
+                    ),
             )
             .arg(
                 Arg::with_name("exit-file")
@@ -385,6 +398,13 @@ impl HgSyncProcess {
                     .takes_value(true)
                     .required(false)
                     .help("How many bundles to combine into a single bundle before sending to hg"),
+            )
+            .arg(
+                Arg::with_name("max-commits-per-combined-bundle")
+                    .long("max-commits-per-combined-bundle")
+                    .takes_value(true)
+                    .required(false)
+                    .help("How many commits should be maximally put in combined bundle (takes precednce over the number of bundles)"),
             );
         let app = app.subcommand(sync_once).subcommand(sync_loop);
 
@@ -679,7 +699,7 @@ pub struct CombinedBookmarkUpdateLogEntry {
     bundle_file: Arc<NamedTempFile>,
     timestamps_file: Arc<NamedTempFile>,
     cs_id: Option<(ChangesetId, HgChangesetId)>,
-    bookmark: BookmarkName,
+    bookmark: BookmarkKey,
     // List of commits in a bundle in case they are known
     commits: CommitsInBundle,
 }
@@ -886,19 +906,19 @@ where
 
 #[derive(Clone)]
 pub struct BookmarkOverlay {
-    bookmarks: Arc<HashMap<BookmarkName, ChangesetId>>,
-    overlay: HashMap<BookmarkName, Option<ChangesetId>>,
+    bookmarks: Arc<HashMap<BookmarkKey, ChangesetId>>,
+    overlay: HashMap<BookmarkKey, Option<ChangesetId>>,
 }
 
 impl BookmarkOverlay {
-    fn new(bookmarks: Arc<HashMap<BookmarkName, ChangesetId>>) -> Self {
+    fn new(bookmarks: Arc<HashMap<BookmarkKey, ChangesetId>>) -> Self {
         Self {
             bookmarks,
             overlay: HashMap::new(),
         }
     }
 
-    fn update(&mut self, book: BookmarkName, val: Option<ChangesetId>) {
+    fn update(&mut self, book: BookmarkKey, val: Option<ChangesetId>) {
         self.overlay.insert(book, val);
     }
 
@@ -910,7 +930,7 @@ impl BookmarkOverlay {
             .collect()
     }
 
-    fn get(&self, bookmark: &BookmarkName) -> Option<ChangesetId> {
+    fn get(&self, bookmark: &BookmarkKey) -> Option<ChangesetId> {
         if let Some(value) = self.overlay.get(bookmark) {
             return value.clone();
         }
@@ -958,7 +978,7 @@ struct NoopChangesetsFilter;
 impl FilterExistingChangesets for NoopChangesetsFilter {
     async fn filter(
         &self,
-        _ctx: CoreContext,
+        _ctx: &CoreContext,
         cs_ids: Vec<(ChangesetId, HgChangesetId)>,
     ) -> Result<Vec<(ChangesetId, HgChangesetId)>, Error> {
         Ok(cs_ids)
@@ -973,14 +993,14 @@ struct DarkstormBackupChangesetsFilter {
 impl FilterExistingChangesets for DarkstormBackupChangesetsFilter {
     async fn filter(
         &self,
-        ctx: CoreContext,
+        ctx: &CoreContext,
         mut cs_ids: Vec<(ChangesetId, HgChangesetId)>,
     ) -> Result<Vec<(ChangesetId, HgChangesetId)>, Error> {
         let bcs_ids: Vec<_> = cs_ids.iter().map(|(cs_id, _hg_cs_id)| *cs_id).collect();
         let existing_bcs_ids: Vec<_> = self
             .repo
             .changesets
-            .get_many(&ctx, bcs_ids)
+            .get_many(ctx, bcs_ids)
             .await?
             .into_iter()
             .map(|entry| entry.cs_id)
@@ -988,7 +1008,7 @@ impl FilterExistingChangesets for DarkstormBackupChangesetsFilter {
         let existing_hg_cs_id: BTreeSet<_> = self
             .repo
             .bonsai_hg_mapping
-            .get(&ctx, existing_bcs_ids.clone().into())
+            .get(ctx, existing_bcs_ids.clone().into())
             .await?
             .into_iter()
             .map(|entry| entry.hg_cs_id)
@@ -1174,10 +1194,7 @@ async fn run<'a>(
             }
         };
 
-        let globalrevs_publishing_bookmark = repo_config
-            .pushrebase
-            .globalrevs_publishing_bookmark
-            .as_ref();
+        let globalrev_config = repo_config.pushrebase.globalrev_config.as_ref();
 
         let filter_changesets: Arc<dyn FilterExistingChangesets> =
             if let Some(backup_repo) = maybe_darkstorm_backup_repo.clone() {
@@ -1190,14 +1207,16 @@ async fn run<'a>(
         let globalrev_syncer = {
             cloned!(repo);
             async move {
-                match globalrevs_publishing_bookmark {
-                    Some(_) => match maybe_darkstorm_backup_repo {
-                        Some(darkstorm_backup_repo) => {
-                            Ok(GlobalrevSyncer::darkstorm(&repo, darkstorm_backup_repo))
+                match globalrev_config {
+                    Some(config) if config.small_repo_id.is_none() => {
+                        match maybe_darkstorm_backup_repo {
+                            Some(darkstorm_backup_repo) => {
+                                Ok(GlobalrevSyncer::darkstorm(&repo, darkstorm_backup_repo))
+                            }
+                            None => Ok(GlobalrevSyncer::Noop),
                         }
-                        None => Ok(GlobalrevSyncer::Noop),
-                    },
-                    None => Ok(GlobalrevSyncer::Noop),
+                    }
+                    _ => Ok(GlobalrevSyncer::Noop),
                 }
             }
         };
@@ -1264,7 +1283,7 @@ async fn run<'a>(
             let start_id = args::get_usize_opt(&sub_m, "start-id")
                 .ok_or_else(|| Error::msg("--start-id must be specified"))?;
 
-            let (maybe_log_entry, (bundle_preparer, mut overlay, globalrev_syncer)) = try_join(
+            let (maybe_log_entry, (bundle_preparer, overlay, globalrev_syncer)) = try_join(
                 bookmarks
                     .read_next_bookmark_log_entries(
                         ctx.clone(),
@@ -1279,7 +1298,12 @@ async fn run<'a>(
             if let Some(log_entry) = maybe_log_entry {
                 let (stats, res) = async {
                     let batches = bundle_preparer
-                        .prepare_batches(ctx, &mut overlay, vec![log_entry.clone()])
+                        .prepare_batches(
+                            &ctx.clone(),
+                            Arc::new(Mutex::new(overlay)),
+                            vec![log_entry.clone()],
+                            1, // Won't be respected anyway since we're batching a single entry.
+                        )
                         .await?;
                     let mut combined_entries = bundle_preparer
                         .prepare_bundles(ctx.clone(), batches, filter_changesets)
@@ -1314,13 +1338,16 @@ async fn run<'a>(
         }
         (MODE_SYNC_LOOP, Some(sub_m)) => {
             let start_id = args::get_i64_opt(&sub_m, "start-id");
+            let bundle_buffer_size = args::get_usize_opt(&sub_m, "bundle-buffer-size").unwrap_or(5);
             let combine_bundles = args::get_u64_opt(&sub_m, "combine-bundles").unwrap_or(1);
+            let max_commits_per_combined_bundle =
+                args::get_u64_opt(&sub_m, "max-commits-per-combined-bundle").unwrap_or(100);
             let loop_forever = sub_m.is_present("loop-forever");
             let replayed_sync_counter = LatestReplayedSyncCounter::new(
                 &repo,
                 maybe_darkstorm_backup_repo.as_ref().map(|r| r.as_ref()),
             )?;
-            let exit_path = sub_m
+            let exit_path: Option<PathBuf> = sub_m
                 .value_of("exit-file")
                 .map(|name| Path::new(name).to_path_buf());
 
@@ -1352,15 +1379,24 @@ async fn run<'a>(
                     }))
                 });
 
-            let (start_id, (bundle_preparer, mut overlay, globalrev_syncer)) =
+            let (start_id, (bundle_preparer, overlay, globalrev_syncer)) =
                 try_join(counter, repo_parts).watched(ctx.logger()).await?;
 
             let outcome_handler = build_outcome_handler(ctx, lock_via);
+            let overlay = &Arc::new(Mutex::new(overlay));
+            borrowed!(
+                outcome_handler,
+                can_continue,
+                hg_repo,
+                reporting_handler,
+                globalrev_syncer,
+                replayed_sync_counter,
+                bundle_preparer: &Arc<BundlePreparer>,
+                filter_changesets: &Arc<dyn FilterExistingChangesets>,
+            );
 
-            borrowed!(bundle_preparer: &BundlePreparer);
-            let overlay = &mut overlay;
             let mut seen_first = false;
-            let s = loop_over_log_entries(
+            loop_over_log_entries(
                 ctx,
                 &bookmarks,
                 start_id,
@@ -1368,27 +1404,23 @@ async fn run<'a>(
                 &scuba_sample,
                 combine_bundles,
                 unlock_via,
-            );
-            pin_mut!(s);
-            while let Some(entries) = s.try_next().await? {
-                if !can_continue() {
-                    break;
-                }
-
-                if entries.is_empty() {
-                    continue;
-                }
-
-                let mut batches = bundle_preparer
-                    .prepare_batches(ctx, overlay, entries)
-                    .watched(ctx.logger())
+            )
+            .try_filter(|entries| future::ready(!entries.is_empty()))
+            .fuse()
+            .try_next_step(|entries| async move {
+                bundle_preparer
+                    .prepare_batches(
+                        ctx,
+                        overlay.clone(),
+                        entries,
+                        max_commits_per_combined_bundle,
+                    )
                     .await
-                    .map_err(|cause| AnonymousError { cause })?;
-
-                if batches.is_empty() {
-                    continue;
-                }
-
+            })
+            // Compiler bug: Prevents higher-ranked lifetime error
+            .boxed()
+            .try_filter(|batches| future::ready(!batches.is_empty()))
+            .map_ok(|mut batches| {
                 if !seen_first {
                     // In the case that the sync job failed to update the
                     // "latest-replayed-request" counter during its previous
@@ -1402,12 +1434,19 @@ async fn run<'a>(
                         seen_first = true;
                     }
                 }
-
-                let bundles = bundle_preparer
-                    .prepare_bundles(ctx.clone(), batches, filter_changesets.clone())
-                    .watched(ctx.logger())
-                    .await?;
-
+                batches
+            })
+            .map_ok(|batches| async move {
+                anyhow::Ok(
+                    bundle_preparer
+                        .prepare_bundles(ctx.clone(), batches, filter_changesets.clone())
+                        .watched(ctx.logger())
+                        .await?,
+                )
+            })
+            .try_buffered(bundle_buffer_size)
+            .fuse()
+            .try_next_step(async move |bundles: Vec<CombinedBookmarkUpdateLogEntry>| {
                 for bundle in bundles {
                     if !can_continue() {
                         break;
@@ -1415,10 +1454,10 @@ async fn run<'a>(
                     let (stats, res) = sync_single_combined_entry(
                         ctx,
                         &bundle,
-                        &hg_repo,
+                        hg_repo,
                         base_retry_delay_ms,
                         retry_num,
-                        &globalrev_syncer,
+                        globalrev_syncer,
                     )
                     .watched(ctx.logger())
                     .timed()
@@ -1452,8 +1491,10 @@ async fn run<'a>(
                     .watched(ctx.logger())
                     .await?;
                 }
-            }
-            Ok(())
+                Ok(())
+            })
+            .try_collect::<()>()
+            .await
         }
         _ => bail!("incorrect mode of operation is specified"),
     }

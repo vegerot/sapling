@@ -8,8 +8,8 @@
 use acl_regions::AclRegionsRef;
 use anyhow::anyhow;
 use anyhow::Result;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkKind;
-use bookmarks::BookmarkName;
 use context::CoreContext;
 use metaconfig_types::RepoConfigRef;
 use mononoke_types::BonsaiChangeset;
@@ -21,6 +21,8 @@ use repo_permission_checker::RepoPermissionCheckerRef;
 use crate::error::AuthorizationError;
 use crate::error::DeniedAction;
 use crate::error::PermissionDenied;
+
+const GIT_IMPORT_SVC_WRITE_METHOD: &str = "git_import_operations";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AuthorizationContext {
@@ -358,7 +360,7 @@ impl AuthorizationContext {
         &self,
         ctx: &CoreContext,
         repo: &(impl RepoConfigRef + RepoBookmarkAttrsRef),
-        bookmark: &BookmarkName,
+        bookmark: &BookmarkKey,
     ) -> AuthorizationCheckOutcome {
         let permitted = match self {
             AuthorizationContext::FullAccess => true,
@@ -387,7 +389,7 @@ impl AuthorizationContext {
         &self,
         ctx: &CoreContext,
         repo: &(impl RepoConfigRef + RepoBookmarkAttrsRef),
-        bookmark: &BookmarkName,
+        bookmark: &BookmarkKey,
     ) -> Result<(), AuthorizationError> {
         self.check_bookmark_modify(ctx, repo, bookmark)
             .await
@@ -433,6 +435,43 @@ impl AuthorizationContext {
         self.check_override_git_mapping(ctx, repo)
             .await
             .permitted_or_else(|| self.permission_denied(ctx, DeniedAction::OverrideGitMapping))
+    }
+
+    /// Check whether the caller is allowed to invoke git-import related
+    /// operations for the given repo.
+    pub async fn check_git_import_operations(
+        &self,
+        _ctx: &CoreContext,
+        repo: &impl RepoConfigRef,
+    ) -> AuthorizationCheckOutcome {
+        let permitted = match self {
+            AuthorizationContext::FullAccess => true,
+            AuthorizationContext::Identity => {
+                // Users are never allowed to do this.
+                false
+            }
+            AuthorizationContext::Service(service_name) => {
+                // Services are allowed to do this if they are configured to
+                // allow the method.
+                repo.repo_config()
+                    .source_control_service
+                    .service_write_method_permitted(service_name, GIT_IMPORT_SVC_WRITE_METHOD)
+            }
+            AuthorizationContext::ReadOnlyIdentity => false,
+        };
+        AuthorizationCheckOutcome::from_permitted(permitted)
+    }
+
+    /// Require that the caller is allowed to invoke git-import related
+    /// operations for the given repo.
+    pub async fn require_git_import_operations(
+        &self,
+        ctx: &CoreContext,
+        repo: &impl RepoConfigRef,
+    ) -> Result<(), AuthorizationError> {
+        self.check_git_import_operations(ctx, repo)
+            .await
+            .permitted_or_else(|| self.permission_denied(ctx, DeniedAction::GitImportOperation))
     }
 }
 

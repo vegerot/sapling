@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {EditedMessage} from '../CommitInfo';
+import type {EditedMessage} from '../CommitInfoState';
 import type {
   ApplyPreviewsFuncType,
   ApplyUncommittedChangesPreviewsFuncType,
@@ -22,13 +22,13 @@ export class AmendOperation extends Operation {
    * @param message if provided, update commit description to use this title & description
    */
   constructor(private filePathsToAmend?: Array<RepoRelativePath>, private message?: EditedMessage) {
-    super();
+    super('AmendOperation');
   }
 
   static opName = 'Amend';
 
   getArgs() {
-    const args: Array<CommandArg> = ['amend'];
+    const args: Array<CommandArg> = ['amend', '--addremove'];
     if (this.filePathsToAmend) {
       args.push(
         ...this.filePathsToAmend.map(file =>

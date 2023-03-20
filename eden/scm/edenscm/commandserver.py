@@ -23,6 +23,8 @@ import sys
 import traceback
 from typing import Any, BinaryIO, List, Tuple
 
+import bindings
+
 from . import encoding, error, pycompat, util
 from .i18n import _
 
@@ -300,6 +302,8 @@ class server(object):
         hellomsg += "encoding: " + encoding.encoding
         hellomsg += "\n"
         hellomsg += "pid: %d" % util.getpid()
+        hellomsg += "\n"
+        hellomsg += "groups: " + " ".join(str(gid) for gid in sorted(os.getgroups()))
         versionmod = sys.modules.get("edenscm.__version__")
         if versionmod:
             hellomsg += "\n"
@@ -408,8 +412,6 @@ def _serverequest(ui, repo, conn, createcmdserver):
         except IOError as inst:
             if inst.errno != errno.EPIPE:
                 raise
-        except KeyboardInterrupt:
-            pass
         finally:
             sv.cleanup()
     except:  # re-raises
@@ -606,4 +608,7 @@ class unixforkingservice(object):
             # os._exit here. So let's explicitly clear the progress before
             # os._exit.
             util.mainio.disable_progress()
+            # os._exit bypasses Rust `atexit::drop_queued`. Call `drop_queued`
+            # explicitly.
+            bindings.atexit.drop_queued()
             gc.collect()  # trigger __del__ since worker process uses os._exit

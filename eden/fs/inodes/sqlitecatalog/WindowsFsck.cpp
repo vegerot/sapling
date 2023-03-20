@@ -6,15 +6,14 @@
  */
 
 #include "eden/fs/inodes/sqlitecatalog/WindowsFsck.h"
-#include <boost/filesystem/operations.hpp>
 
 #ifdef _WIN32
-#include <boost/filesystem.hpp>
+#include <folly/executors/SerialExecutor.h>
 #include <folly/portability/Windows.h>
 
-#include <ProjectedFSLib.h> // @manual
 #include <winioctl.h> // @manual
 
+#include "eden/common/utils/FileUtils.h"
 #include "eden/common/utils/WinError.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/inodes/InodeNumber.h"
@@ -24,118 +23,31 @@
 #include "eden/fs/utils/CaseSensitivity.h"
 #include "eden/fs/utils/DirType.h"
 #include "eden/fs/utils/FileUtils.h"
+#include "eden/fs/utils/ProjfsUtil.h"
 
 namespace facebook::eden {
 namespace {
 
-namespace boost_fs = boost::filesystem;
-
 // TODO
 // - test/fix behavior when offline
-
-PRJ_FILE_STATE getPrjFileState(AbsolutePathPiece entry) {
-  auto wpath = entry.wide();
-  PRJ_FILE_STATE state;
-
-  auto result = PrjGetOnDiskFileState(wpath.c_str(), &state);
-  if (FAILED(result)) {
-    throwHResultErrorExplicit(result, "Unable to get ProjectedFS file state");
-  }
-
-  return state;
-}
-
-// Generate a set of filenames from a given overlay directory.
-std::set<PathComponent> makeEntriesSet(const overlay::OverlayDir& dir) {
-  std::set<PathComponent> result;
-  const auto& entries = dir.entries_ref();
-  for (auto entry = entries->cbegin(); entry != entries->cend(); entry++) {
-    result.emplace(entry->first);
-  }
-  return result;
-}
 
 // Reparse tag for UNIX domain socket is not defined in Windows header files.
 const ULONG IO_REPARSE_TAG_SOCKET = 0x80000023;
 
-// This is only defined in Windows Device Driver Kit and it is inconvenient to
-// include. This is copied from Watchman's FileDescriptor.cpp.
-struct REPARSE_DATA_BUFFER {
-  ULONG ReparseTag;
-  USHORT ReparseDataLength;
-  USHORT Reserved;
-  union {
-    struct {
-      USHORT SubstituteNameOffset;
-      USHORT SubstituteNameLength;
-      USHORT PrintNameOffset;
-      USHORT PrintNameLength;
-      ULONG Flags;
-      WCHAR PathBuffer[1];
-    } SymbolicLinkReparseBuffer;
-    struct {
-      USHORT SubstituteNameOffset;
-      USHORT SubstituteNameLength;
-      USHORT PrintNameOffset;
-      USHORT PrintNameLength;
-      WCHAR PathBuffer[1];
-    } MountPointReparseBuffer;
-    struct {
-      UCHAR DataBuffer[1];
-    } GenericReparseBuffer;
-  };
-};
-
-dtype_t dtypeFromAttrs(const wchar_t* path, DWORD dwFileAttributes) {
+dtype_t dtypeFromAttrs(DWORD dwFileAttributes, DWORD dwReserved0) {
   if (dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-    FileHandle handle{CreateFileW(
-        path,
-        FILE_GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-        NULL)};
-    if (handle.get() == INVALID_HANDLE_VALUE) {
-      XLOGF(
-          DBG3,
-          "Unable to determine reparse point type for {}: {}",
-          wideToMultibyteString<std::string>(path),
-          GetLastError());
-      return dtype_t::Unknown;
-    }
-
-    char buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
-    DWORD bytes_written;
-
-    if (!DeviceIoControl(
-            handle.get(),
-            FSCTL_GET_REPARSE_POINT,
-            NULL,
-            0,
-            buffer,
-            MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
-            &bytes_written,
-            NULL)) {
-      XLOGF(
-          DBG3,
-          "Unable to read reparse point data for {}: {}",
-          wideToMultibyteString<std::string>(path),
-          GetLastError());
-      return dtype_t::Unknown;
-    }
-
-    auto reparse_data = reinterpret_cast<const REPARSE_DATA_BUFFER*>(buffer);
-
-    if (reparse_data->ReparseTag == IO_REPARSE_TAG_SYMLINK ||
-        reparse_data->ReparseTag == IO_REPARSE_TAG_MOUNT_POINT) {
+    // Microsoft documents the dwReserved0 member as holding the reparse tag:
+    // https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-win32_find_dataw
+    if (dwReserved0 == IO_REPARSE_TAG_SYMLINK ||
+        dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT) {
       return dtype_t::Symlink;
-    } else if (reparse_data->ReparseTag == IO_REPARSE_TAG_SOCKET) {
+    } else if (dwReserved0 == IO_REPARSE_TAG_SOCKET) {
       return dtype_t::Socket;
     }
 
     // We don't care about other reparse point types, so treating them as
     // regular files/directories.
+
     if (dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
       return dtype_t::Dir;
     } else {
@@ -146,21 +58,6 @@ dtype_t dtypeFromAttrs(const wchar_t* path, DWORD dwFileAttributes) {
   } else {
     return dtype_t::Regular;
   }
-}
-
-dtype_t dtypeFromPath(const boost_fs::path& boostPath) {
-  WIN32_FILE_ATTRIBUTE_DATA attrs;
-  auto path = boostPath.wstring();
-
-  if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attrs)) {
-    XLOGF(
-        DBG3,
-        "Unable to get file attributes for {}: {}",
-        boostPath.string(),
-        GetLastError());
-    return dtype_t::Unknown;
-  }
-  return dtypeFromAttrs(path.c_str(), attrs.dwFileAttributes);
 }
 
 PathMap<overlay::OverlayEntry> toPathMap(overlay::OverlayDir& dir) {
@@ -247,15 +144,20 @@ void removeOverlayEntry(
 
 struct FsckFileState {
   bool onDisk = false;
-  // diskMaterialized is true if:
-  //  - a file is full
-  //  - a directory is full or a descendant is materialized or tombstoned.
-  bool diskMaterialized = false;
+  // populatedOrFullOrTomb is true if:
+  //  - a file is full, hydrated or tomstoned
+  //  - a directory is full or a dirty placeholder or a descendant is
+  //  populatedOrFullOrTomb
+  bool populatedOrFullOrTomb = false;
   // diskEmptyPlaceholder is true if:
   //  - a file is virtual or a placeholder
   //  - a directory is a placeholder and has no children (placeholder or
   //  otherwise)
+
+  bool renamedPlaceholder = false;
+
   bool diskEmptyPlaceholder = false;
+  bool directoryIsFull = false;
   bool diskTombstone = false;
   dtype_t diskDtype = dtype_t::Unknown;
 
@@ -307,16 +209,16 @@ void populateDiskState(
     AbsolutePathPiece root,
     RelativePathPiece path,
     FsckFileState& state,
-    const WIN32_FIND_DATAW& findFileData) {
-  auto absPath = root + path;
-  auto wPath = absPath.wide();
-  dtype_t dtype = dtypeFromAttrs(wPath.c_str(), findFileData.dwFileAttributes);
+    const WIN32_FIND_DATAW& findFileData,
+    bool fsckRenamedFiles) {
+  dtype_t dtype =
+      dtypeFromAttrs(findFileData.dwFileAttributes, findFileData.dwReserved0);
   if (dtype != dtype_t::Dir && dtype != dtype_t::Regular) {
     state.onDisk = true;
     // On Windows, EdenFS consider all special files (symlinks, sockets, etc)
     // to be regular.
     state.diskDtype = dtype_t::Regular;
-    state.diskMaterialized = true;
+    state.populatedOrFullOrTomb = true;
     return;
   }
 
@@ -348,6 +250,8 @@ void populateDiskState(
       FILE_ATTRIBUTE_HIDDEN;
   auto system = (findFileData.dwFileAttributes & FILE_ATTRIBUTE_SYSTEM) ==
       FILE_ATTRIBUTE_SYSTEM;
+  auto sparse = (findFileData.dwFileAttributes & FILE_ATTRIBUTE_SPARSE_FILE) ==
+      FILE_ATTRIBUTE_SPARSE_FILE;
 
   bool detectedTombstone = reparse && !recall && hidden && system;
   bool detectedFull = !reparse && !recall;
@@ -356,14 +260,32 @@ void populateDiskState(
   state.diskDtype = dtype;
   state.diskTombstone = detectedTombstone;
 
-  // It can also be diskMaterialized if a descendant directory is
+  // It can also be populated if a descendant directory is
   // materialized. But that is checked later when processing the children.
-  state.diskMaterialized = detectedFull || detectedTombstone;
+  state.populatedOrFullOrTomb = detectedFull || detectedTombstone;
   // It's an empty placeholder unless it's materialized or it has children.
-  state.diskEmptyPlaceholder = !state.diskMaterialized;
+  state.diskEmptyPlaceholder = !state.populatedOrFullOrTomb;
+  state.directoryIsFull = !recall;
 
-  if (dtype == dtype_t::Dir && !directoryIsEmpty(wPath.c_str())) {
-    state.diskEmptyPlaceholder = false;
+  state.renamedPlaceholder = false;
+
+  if (fsckRenamedFiles && sparse) {
+    auto renamedPlaceholderResult =
+        isRenamedPlaceholder((root + path).wide().c_str());
+    if (renamedPlaceholderResult.hasValue()) {
+      state.renamedPlaceholder = renamedPlaceholderResult.value();
+    } else {
+      XLOG(DBG9) << "Error checking rename: "
+                 << renamedPlaceholderResult.exception();
+    }
+  }
+
+  if (dtype == dtype_t::Dir) {
+    auto absPath = root + path;
+    auto wPath = absPath.wide();
+    if (!directoryIsEmpty(wPath.c_str())) {
+      state.diskEmptyPlaceholder = false;
+    }
   }
 }
 
@@ -420,25 +342,43 @@ InodeNumber addOrUpdateOverlay(
   return InodeNumber(*overlayEntry.inodeNumber());
 }
 
+enum class DirectoryOnDiskState { Full, Placeholder };
+
 std::optional<InodeNumber> fixup(
     FsckFileState& state,
     SqliteInodeCatalog& inodeCatalog,
     RelativePathPiece path,
     InodeNumber parentInodeNum,
-    const PathMap<overlay::OverlayEntry>& insensitiveOverlayDir) {
+    const PathMap<overlay::OverlayEntry>& insensitiveOverlayDir,
+    DirectoryOnDiskState parentProjFSState) {
   auto name = path.basename();
 
   if (!state.onDisk) {
-    if (state.inScm) {
+    if (parentProjFSState == DirectoryOnDiskState::Full) {
+      // state.shouldExist defaults to false
+    } else if (state.inScm) {
       state.desiredDtype = state.scmDtype;
       state.desiredHash = state.scmHash;
       state.shouldExist = true;
     }
   } else if (state.diskTombstone) {
     // state.shouldExist defaults to false
+  } else if (state.renamedPlaceholder && !state.populatedOrFullOrTomb) {
+    // renamed files are special snowflakes in EdenFS, they are the only inodes
+    // that can be regular placeholders in projfs and represented by
+    // materialized inodes on disk.
+    state.desiredDtype = state.diskDtype;
+    state.desiredHash =
+        std::nullopt; // renamed files should always be materialized in EdenFS.
+    // This could cause hg status and hg diff to make recersive calls in EdenFS,
+    // but this is ok because the read will be served out of source control
+    // (i.e. no infinite recursion yay!). and eden knows how to make sure these
+    // things don't happen on the same thread (i.e. no deadlock double yay!).
+    state.shouldExist = true;
   } else { // if file exists normally on disk
-    if (!state.inScm && !state.diskMaterialized) {
+    if (!state.inScm && !state.populatedOrFullOrTomb) {
       // Stop fixing this up since we can't materialize if it's not in scm.
+      // (except for when it's a renamed file, see the case above)
       // TODO: This is likely caused by EdenFS not having called PrjDeleteFile
       // in a previous checkout operation. We should probably call it here or
       // as a post-PrjfsChannel initialization.
@@ -447,7 +387,8 @@ std::optional<InodeNumber> fixup(
       return std::nullopt;
     } else {
       state.desiredDtype = state.diskDtype;
-      state.desiredHash = state.diskMaterialized ? std::nullopt : state.scmHash;
+      state.desiredHash =
+          state.populatedOrFullOrTomb ? std::nullopt : state.scmHash;
       state.shouldExist = true;
     }
   }
@@ -460,7 +401,7 @@ std::optional<InodeNumber> fixup(
       state.inOverlay,
       state.inScm,
       state.diskTombstone,
-      state.diskMaterialized);
+      state.populatedOrFullOrTomb);
 
   if (state.shouldExist) {
     bool out_of_sync = !state.inOverlay ||
@@ -512,34 +453,18 @@ std::optional<InodeNumber> fixup(
   }
 }
 
-// Returns true if the given path is considered materialized.
-bool processChildren(
-    SqliteInodeCatalog& inodeCatalog,
-    RelativePathPiece path,
+/**
+ * List all the on-disk entries and return a PathMap from them.
+ */
+PathMap<FsckFileState> populateOnDiskChildrenState(
     AbsolutePathPiece root,
-    InodeNumber inodeNumber,
-    const PathMap<overlay::OverlayEntry>& insensitiveOverlayDir,
-    const std::shared_ptr<const Tree>& scmTree,
-    const SqliteInodeCatalog::LookupCallback& callback,
-    uint64_t logFrequency,
-    uint64_t& traversedDirectories) {
-  XLOGF(DBG9, "processChildren - {}", path);
-
-  traversedDirectories++;
-  if (traversedDirectories % logFrequency == 0) {
-    // TODO: We could also report the progress to the StartupLogger to be
-    // displayed in the user console. That however requires a percent and it's
-    // a bit unclear how we can compute this percent.
-    XLOGF(INFO, "{} directories scanned", traversedDirectories);
-  }
-
-  // Handle children
+    RelativePathPiece path,
+    bool fsckRenamedFiles) {
   PathMap<FsckFileState> children{CaseSensitivity::Insensitive};
-
-  // Populate children disk information
-  auto absPath = (root + path + "*"_relpath).wide();
+  auto absPath = (root + path + "*"_pc).wide();
 
   WIN32_FIND_DATAW findFileData;
+  // TODO: Should FIND_FIRST_EX_ON_DISK_ENTRIES_ONLY be used?
   HANDLE h = FindFirstFileExW(
       absPath.c_str(),
       FindExInfoBasic,
@@ -551,6 +476,9 @@ bool processChildren(
     throw std::runtime_error(
         fmt::format("unable to iterate over directory - {}", path));
   }
+  SCOPE_EXIT {
+    FindClose(h);
+  };
 
   do {
     if (wcscmp(findFileData.cFileName, L".") == 0 ||
@@ -560,7 +488,8 @@ bool processChildren(
     }
     PathComponent name{findFileData.cFileName};
     auto& childState = children[name];
-    populateDiskState(root, path + name, childState, findFileData);
+    populateDiskState(
+        root, path + name, childState, findFileData, fsckRenamedFiles);
   } while (FindNextFileW(h, &findFileData) != 0);
 
   auto error = GetLastError();
@@ -569,7 +498,41 @@ bool processChildren(
         fmt::format("unable to iterate over directory - {}", path));
   }
 
-  FindClose(h);
+  return children;
+}
+
+/**
+ * Recursively crawl the path rooted at root / path.
+ *
+ * Returns true if the given path is either populated or full or a tombstone.
+ *
+ * The caller must ensure that the inodeCatalog, the root path, the callback
+ * and the traversedDirectories live longer than the returned future. As for
+ * the path and scmTree argument, this function will copy them if needed.
+ */
+ImmediateFuture<bool> processChildren(
+    SqliteInodeCatalog& inodeCatalog,
+    RelativePathPiece path,
+    AbsolutePathPiece root,
+    InodeNumber inodeNumber,
+    const PathMap<overlay::OverlayEntry>& insensitiveOverlayDir,
+    const std::shared_ptr<const Tree>& scmTree,
+    const OverlayChecker::LookupCallback& callback,
+    uint64_t logFrequency,
+    std::atomic<uint64_t>& traversedDirectories,
+    bool fsckRenamedFiles,
+    DirectoryOnDiskState parentOnDiskState) {
+  XLOGF(DBG9, "processChildren - {}", path);
+
+  auto traversed = traversedDirectories.fetch_add(1, std::memory_order_relaxed);
+  if (traversed % logFrequency == 0) {
+    // TODO: We could also report the progress to the StartupLogger to be
+    // displayed in the user console. That however requires a percent and it's
+    // a bit unclear how we can compute this percent.
+    XLOGF(INFO, "{} directories scanned", traversed);
+  }
+
+  auto children = populateOnDiskChildrenState(root, path, fsckRenamedFiles);
 
   for (const auto& [name, overlayEntry] : insensitiveOverlayDir) {
     auto& childState = children[name];
@@ -585,14 +548,15 @@ bool processChildren(
   // Populate children scm information
   if (scmTree) {
     for (const auto& [name, treeEntry] : *scmTree) {
-      PathComponentPiece pathName{name};
-      auto& childState = children[pathName];
+      auto& childState = children[name];
       populateScmState(childState, treeEntry);
     }
   }
 
+  std::vector<ImmediateFuture<folly::Unit>> childFutures;
+  childFutures.reserve(children.size());
+
   // Recurse for any children.
-  bool anyChildMaterialized = false;
   for (auto& [childName, childState] : children) {
     auto childPath = path + childName;
     XLOGF(DBG9, "process child - {}", childPath);
@@ -602,245 +566,155 @@ bool processChildren(
         inodeCatalog,
         childPath,
         inodeNumber,
-        insensitiveOverlayDir);
-
-    anyChildMaterialized |= childState.diskMaterialized;
+        insensitiveOverlayDir,
+        parentOnDiskState);
 
     if (childState.desiredDtype == dtype_t::Dir && childState.onDisk &&
         !childState.diskEmptyPlaceholder && childInodeNumberOpt.has_value()) {
       // Fetch child scm tree.
-      std::shared_ptr<const Tree> childScmTree;
+      ImmediateFuture<std::shared_ptr<const Tree>> childScmTreeFut{
+          std::in_place};
       if (childState.scmDtype == dtype_t::Dir) {
-        // TODO: handle scm failure
-        auto scmEntryTry = callback(childPath).getTry();
-        std::variant<
-            std::shared_ptr<const facebook::eden::Tree>,
-            facebook::eden::TreeEntry>& childScmEntry = scmEntryTry.value();
-        // It's guaranteed to be a Tree since scmDtype is Dir.
-        childScmTree = std::get<std::shared_ptr<const Tree>>(childScmEntry);
+        // Move the callback to a non-ready ImmediateFuture to make sure that
+        // the disk crawling is performed in a different thread (ie:
+        // not-immediately) in the case where the Tree is in the hgcache
+        // already.
+        childScmTreeFut =
+            makeNotReadyImmediateFuture()
+                .thenValue(
+                    [&callback, scmTree, childName = RelativePath{childName}](
+                        auto&&) { return callback(scmTree, childName); })
+                .thenValue(
+                    [](std::variant<std::shared_ptr<const Tree>, TreeEntry>
+                           scmEntry) {
+                      // TODO: handle scm failure
+                      // It's guaranteed to be a Tree since scmDtype is Dir.
+                      return std::move(
+                          std::get<std::shared_ptr<const Tree>>(scmEntry));
+                    });
       }
 
-      auto childInodeNumber = *childInodeNumberOpt;
-      auto childOverlayDir = *inodeCatalog.loadOverlayDir(childInodeNumber);
-      auto childInsensitiveOverlayDir = toPathMap(childOverlayDir);
-      bool childMaterialized = childState.diskMaterialized;
-      childMaterialized |= processChildren(
-          inodeCatalog,
-          childPath,
-          root,
-          childInodeNumber,
-          childInsensitiveOverlayDir,
-          childScmTree,
-          callback,
-          logFrequency,
-          traversedDirectories);
-      anyChildMaterialized |= childMaterialized;
+      childFutures.emplace_back(
+          std::move(childScmTreeFut)
+              .thenValue([&inodeCatalog,
+                          isFull = childState.directoryIsFull,
+                          childPath = childPath.copy(),
+                          root,
+                          &callback,
+                          logFrequency,
+                          &traversedDirectories,
+                          childInodeNumber = *childInodeNumberOpt,
+                          fsckRenamedFiles](
+                             const std::shared_ptr<const Tree>& childScmTree) {
+                auto childOverlayDir =
+                    *inodeCatalog.loadOverlayDir(childInodeNumber);
+                auto childInsensitiveOverlayDir = toPathMap(childOverlayDir);
 
-      if (childMaterialized && childState.desiredHash != std::nullopt) {
-        XLOGF(
-            DBG9,
-            "Directory {} has a materialized child, and therefore is materialized too. Marking.",
-            childPath);
-        childState.diskMaterialized = true;
-        childState.desiredHash = std::nullopt;
-        // Refresh the parent state so we see and update the current overlay
-        // entry.
-        auto updatedOverlayDir = *inodeCatalog.loadOverlayDir(inodeNumber);
-        auto updatedInsensitiveOverlayDir = toPathMap(updatedOverlayDir);
-        // Update the overlay entry to remove the scmHash.
-        addOrUpdateOverlay(
-            inodeCatalog,
-            inodeNumber,
-            childName,
-            childState.desiredDtype,
-            childState.desiredHash,
-            updatedInsensitiveOverlayDir);
-      }
+                return processChildren(
+                    inodeCatalog,
+                    childPath,
+                    root,
+                    childInodeNumber,
+                    childInsensitiveOverlayDir,
+                    childScmTree,
+                    callback,
+                    logFrequency,
+                    traversedDirectories,
+                    fsckRenamedFiles,
+                    isFull ? DirectoryOnDiskState::Full
+                           : DirectoryOnDiskState::Placeholder);
+              })
+              .thenValue([&childState = childState,
+                          childPath = childPath.copy(),
+                          &inodeCatalog,
+                          inodeNumber](bool childPopulatedOrFullOrTomb) {
+                childState.populatedOrFullOrTomb |= childPopulatedOrFullOrTomb;
+
+                if (childPopulatedOrFullOrTomb &&
+                    childState.desiredHash != std::nullopt) {
+                  XLOGF(
+                      DBG9,
+                      "Directory {} has a materialized child, and therefore is materialized too. Marking.",
+                      childPath);
+                  childState.desiredHash = std::nullopt;
+
+                  auto updatedOverlayDir =
+                      *inodeCatalog.loadOverlayDir(inodeNumber);
+                  auto updatedInsensitiveOverlayDir =
+                      toPathMap(updatedOverlayDir);
+                  // Update the overlay entry to remove the scmHash.
+                  addOrUpdateOverlay(
+                      inodeCatalog,
+                      inodeNumber,
+                      childPath.basename(),
+                      childState.desiredDtype,
+                      childState.desiredHash,
+                      updatedInsensitiveOverlayDir);
+                }
+                return folly::unit;
+              }));
     }
   }
 
-  return anyChildMaterialized;
+  return collectAllSafe(std::move(childFutures))
+      // The futures have references on this PathMap, make sure it stays alive.
+      .thenValue([children = std::move(children)](auto&&) {
+        for (const auto& [childName, childState] : children) {
+          if (childState.populatedOrFullOrTomb) {
+            return true;
+          }
+        }
+        return false;
+      });
 }
 
-void scanCurrentDir(
-    SqliteInodeCatalog& inodeCatalog,
-    AbsolutePathPiece dir,
-    InodeNumber inode,
-    const overlay::OverlayDir& parentOverlayDir,
-    const PathMap<overlay::OverlayEntry>& parentInsensitiveOverlayDir,
-    bool recordDeletion,
-    SqliteInodeCatalog::LookupCallback& callback) {
-  auto boostPath = boost::filesystem::path(dir.asString());
-  if (!boost::filesystem::is_directory(boostPath)) {
-    XLOGF(WARN, "Attempting to scan '{}' which is not a directory", dir);
-    return;
-  }
-
-  XLOGF(DBG3, "Scanning {}", dir);
-
-  auto overlayEntries = makeEntriesSet(parentOverlayDir);
-  // Loop to synchronize overlay state with disk state
-  for (const auto& entry : boost::filesystem::directory_iterator(boostPath)) {
-    auto path = canonicalPath(entry.path().string());
-    auto name = path.basename();
-    auto dtype = dtypeFromPath(entry.path());
-
-    // TODO: EdenFS for Windows does not support symlinks yet, the only
-    // symlink we have are redirection points.
-    if (dtype == dtype_t::Symlink) {
-      continue;
-    }
-
-    // Check if this entry present in overlay
-    bool presentInOverlay = false;
-    for (auto iter = overlayEntries.begin(); iter != overlayEntries.end();
-         ++iter) {
-      if (folly::StringPiece{name.view()}.equals(
-              folly::StringPiece{iter->view()},
-              folly::AsciiCaseInsensitive())) {
-        // Once we found the entry in inodeCatalog, we remove it from the
-        // inodeCatalog, so we know if there are entries missing from disk at
-        // the end.
-        overlayEntries.erase(iter);
-        presentInOverlay = true;
-        break;
-      }
-    }
-
-    if (presentInOverlay) {
-      auto overlayEntry =
-          getEntryFromOverlayDir(parentInsensitiveOverlayDir, name);
-      // TODO: remove cast once we don't use Thrift to represent overlay entry
-      auto overlayDtype =
-          mode_to_dtype(static_cast<mode_t>(*overlayEntry->mode_ref()));
-
-      // Check if the user has created a different kind of file with the same
-      // name. For example, overlay thinks one file is a file while it's now a
-      // directory on disk.
-      if (overlayDtype != dtype) {
-        XLOGF(
-            DBG3,
-            "Mismatch file type, expected: {} overlay: {}",
-            dtype,
-            overlayDtype);
-        removeOverlayEntry(inodeCatalog, inode, name, *overlayEntry);
-        presentInOverlay = false;
-      }
-    }
-
-    auto state = getPrjFileState(path);
-    auto isTombstone =
-        (state & PRJ_FILE_STATE_TOMBSTONE) == PRJ_FILE_STATE_TOMBSTONE;
-
-    // Tombstone residue may still linger around when EdenFS is not running.
-    // These represent files are deleted and we should not add them back.
-    if (!(presentInOverlay || isTombstone)) {
-      // Add current file to overlay
-      XLOGF(DBG3, "Adding missing entry to overlay {}", name);
-      overlay::OverlayEntry overlayEntry;
-      overlayEntry.set_mode(dtype_to_mode(dtype));
-      overlayEntry.set_inodeNumber(inodeCatalog.nextInodeNumber().get());
-      inodeCatalog.addChild(inode, name, overlayEntry);
-    }
-  }
-
-  // We can only fully trust the disk state when the directory is Full. A
-  // DirtyPlaceholder directory may hide entries that were not previously
-  // accessed when EdenFS is not running, which could lead fsck to remove
-  // entries from overlay incorrectly.
-  if (recordDeletion && !overlayEntries.empty()) {
-    // Files in overlay are not present on disk, remove them.
-    for (auto removed = overlayEntries.begin(); removed != overlayEntries.end();
-         removed++) {
-      XLOGF(DBG3, "Removing missing entry from overlay: {}", *removed);
-      auto overlayEntry =
-          getEntryFromOverlayDir(parentInsensitiveOverlayDir, *removed);
-      removeOverlayEntry(inodeCatalog, inode, *removed, *overlayEntry);
-    }
-  }
-
-  XLOGF(DBG9, "Reloading {} from inodeCatalog.", inode);
-  // Reload the updated overlay as we have fixed the inconsistency.
-  auto updated = *inodeCatalog.loadOverlayDir(inode);
-  auto updatedInsensitiveOverlayDir = toPathMap(updated);
-
-  // Now that this overlay directory is consistent with the on-disk state,
-  // proceed to its children.
-  for (const auto& entry : boost::filesystem::directory_iterator(boostPath)) {
-    auto path = canonicalPath(entry.path().string());
-    auto mode = dtypeFromPath(entry.path());
-
-    // We can't scan non-directories nor follow symlinks
-    if (mode == dtype_t::Symlink) {
-      XLOGF(DBG5, "Skipped {} since it's a symlink", path);
-      continue;
-    } else if (mode != dtype_t::Dir) {
-      continue;
-    }
-
-    auto state = getPrjFileState(path);
-    // User can only modify directory content if it is Full or Dirty
-    // Placeholder.
-    auto isFull = (state & PRJ_FILE_STATE_FULL) == PRJ_FILE_STATE_FULL;
-    auto isDirtyPlaceholder = (state & PRJ_FILE_STATE_DIRTY_PLACEHOLDER) ==
-        PRJ_FILE_STATE_DIRTY_PLACEHOLDER;
-    if (isFull || isDirtyPlaceholder) {
-      auto overlayEntry =
-          getEntryFromOverlayDir(updatedInsensitiveOverlayDir, path.basename());
-      auto entryInode =
-          InodeNumber::fromThrift(*overlayEntry->inodeNumber_ref());
-      auto entryDir = *inodeCatalog.loadOverlayDir(entryInode);
-      auto entryInsensitiveOverlayDir = toPathMap(entryDir);
-      scanCurrentDir(
-          inodeCatalog,
-          path,
-          entryInode,
-          entryDir,
-          entryInsensitiveOverlayDir,
-          isFull,
-          callback);
-    }
-  }
-}
 } // namespace
 
 void windowsFsckScanLocalChanges(
     std::shared_ptr<const EdenConfig> config,
     SqliteInodeCatalog& inodeCatalog,
     AbsolutePathPiece mountPath,
-    SqliteInodeCatalog::LookupCallback& callback) {
+    OverlayChecker::LookupCallback& callback) {
   XLOGF(INFO, "Start scanning {}", mountPath);
   if (auto view = inodeCatalog.loadOverlayDir(kRootNodeId)) {
     auto insensitiveOverlayDir = toPathMap(*view);
-    if (config->useThoroughFsck.getValue()) {
-      // TODO: Handler errors or no trees
-      auto scmEntryTry = callback(""_relpath).getTry();
-      std::variant<
-          std::shared_ptr<const facebook::eden::Tree>,
-          facebook::eden::TreeEntry>& scmEntry = scmEntryTry.value();
-      std::shared_ptr<const Tree> scmTree =
-          std::get<std::shared_ptr<const Tree>>(scmEntry);
-      uint64_t traversedDirectories = 1;
-      processChildren(
-          inodeCatalog,
-          ""_relpath,
-          mountPath,
-          kRootNodeId,
-          insensitiveOverlayDir,
-          scmTree,
-          callback,
-          config->fsckLogFrequency.getValue(),
-          traversedDirectories);
-    } else {
-      scanCurrentDir(
-          inodeCatalog,
-          mountPath,
-          kRootNodeId,
-          *view,
-          insensitiveOverlayDir,
-          false,
-          callback);
+    std::atomic<uint64_t> traversedDirectories = 1;
+    // TODO: Handler errors or no trees
+
+    auto executor = folly::getGlobalCPUExecutor();
+    if (!config->multiThreadedFsck.getValue()) {
+      executor = folly::SerialExecutor::create();
     }
+
+    folly::via(
+        executor,
+        [&callback]() { return callback(nullptr, ""_relpath).semi(); })
+        .thenValue(
+            [&inodeCatalog,
+             mountPath,
+             insensitiveOverlayDir = std::move(insensitiveOverlayDir),
+             &traversedDirectories,
+             &callback,
+             logFrequency = config->fsckLogFrequency.getValue(),
+             fsckRenamedFiles = config->prjfsFsckDetectRenames.getValue()](
+                std::variant<std::shared_ptr<const Tree>, TreeEntry> scmEntry) {
+              auto scmTree =
+                  std::get<std::shared_ptr<const Tree>>(std::move(scmEntry));
+              return processChildren(
+                         inodeCatalog,
+                         ""_relpath,
+                         mountPath,
+                         kRootNodeId,
+                         insensitiveOverlayDir,
+                         scmTree,
+                         callback,
+                         logFrequency,
+                         traversedDirectories,
+                         fsckRenamedFiles,
+                         DirectoryOnDiskState::Placeholder)
+                  .semi();
+            })
+        .get();
     XLOGF(INFO, "Scanning complete for {}", mountPath);
   } else {
     XLOG(INFO)

@@ -101,8 +101,11 @@ Try non fastforward moves (backwards and across branches)
   remote:         source: Error {
   remote:             context: "Failed to move bookmark",
   remote:             source: NonFastForwardMove {
-  remote:                 bookmark: BookmarkName {
-  remote:                     bookmark: "master_bookmark",
+  remote:                 bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "master_bookmark",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
   remote:                 from: ChangesetId(
   remote:                     Blake2(29da74f8872f4ebf8d5221ad99c6684b24374922a8eb50b4b5bc4309602543b5),
@@ -137,8 +140,11 @@ Try non fastforward moves (backwards and across branches)
   remote:         source: Error {
   remote:             context: "Failed to move bookmark",
   remote:             source: NonFastForwardMove {
-  remote:                 bookmark: BookmarkName {
-  remote:                     bookmark: "master_bookmark",
+  remote:                 bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "master_bookmark",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
   remote:                 from: ChangesetId(
   remote:                     Blake2(29da74f8872f4ebf8d5221ad99c6684b24374922a8eb50b4b5bc4309602543b5),
@@ -186,8 +192,11 @@ Try non fastfoward moves on regex bookmark
   remote:         source: Error {
   remote:             context: "Failed to move bookmark",
   remote:             source: NonFastForwardMove {
-  remote:                 bookmark: BookmarkName {
-  remote:                     bookmark: "ffonly_bookmark",
+  remote:                 bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "ffonly_bookmark",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
   remote:                 from: ChangesetId(
   remote:                     Blake2(29da74f8872f4ebf8d5221ad99c6684b24374922a8eb50b4b5bc4309602543b5),
@@ -225,8 +234,11 @@ Try to delete master
   remote:         source: Error {
   remote:             context: "Failed to delete bookmark",
   remote:             source: DeletionProhibited {
-  remote:                 bookmark: BookmarkName {
-  remote:                     bookmark: "master_bookmark",
+  remote:                 bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "master_bookmark",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
   remote:             },
   remote:         },

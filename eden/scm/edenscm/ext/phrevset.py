@@ -13,7 +13,9 @@ Automatically handles commits already in subversion, or whose hash has
 changed since submitting to Differential (due to amends or rebasing).
 
 Requires arcanist to be installed and properly configured.
-Repositories should include a callsign in their hgrc.
+Repositories should include a callsign in their hgrc, or specified
+in ``.arcconfig`` as ``repository.callsign``.
+
 
 Example for www::
 
@@ -27,7 +29,7 @@ Example for www::
 """
 
 import re
-from typing import Optional, Pattern
+from typing import List, Optional, Pattern
 
 from edenscm import autopull, error, hg, json, namespaces, pycompat, registrar, util
 from edenscm.autopull import pullattempt
@@ -184,7 +186,7 @@ def parsedesc(repo, resp, ignoreparsefailure):
             raise error.Abort("Cannot parse Conduit description '%s'" % desc)
 
     callsign = match.group("callsign")
-    repo_callsigns = repo.ui.configlist("phrevset", "callsign")
+    repo_callsigns = _get_callsigns(repo)
 
     if callsign not in repo_callsigns:
         raise error.Abort(
@@ -203,7 +205,7 @@ def diffidtonode(repo, diffid):
     This function does not raise.
     """
 
-    repo_callsigns = repo.ui.configlist("phrevset", "callsign")
+    repo_callsigns = _get_callsigns(repo)
     if not repo_callsigns:
         msg = _("phrevset.callsign is not set - doing a linear search\n")
         hint = _("This will be slow if the diff was not committed recently\n")
@@ -298,15 +300,18 @@ def diffidtonode(repo, diffid):
 
         # commit is still local, get its hash
 
+        hexnodes = []
         try:
             props = resp["phabricator_version_properties"]["edges"]
-            commits = {}
             for prop in props:
-                if prop["node"]["property_name"] == "local:commits":
-                    commits = json.loads(prop["node"]["property_value"])
-            hexnodes = [c["commit"] for c in commits.values()]
+                property_name = prop["node"]["property_name"]
+                get_commits = lambda: json.loads(prop["node"]["property_value"])
+                if property_name == "local:commits":
+                    hexnodes += [c["commit"] for c in get_commits().values()]
+                elif property_name == "facebook:bundle_info:hg":
+                    hexnodes += list(get_commits().values())
         except (AttributeError, IndexError, KeyError):
-            hexnodes = []
+            pass
 
         # find a better alternative of the commit hash specified in
         # graphql response by looking up successors.
@@ -386,3 +391,15 @@ def _autopullphabdiff(
             # HASH".
             friendlyname = "D%s (%s)" % (diffid, hex(node))
             return autopull.pullattempt(headnodes=[node], friendlyname=friendlyname)
+
+
+def _get_callsigns(repo) -> List[str]:
+    callsigns = repo.ui.configlist("phrevset", "callsign")
+    if not callsigns:
+        # Try to read from '.arcconfig'
+        try:
+            parsed = json.loads(repo["."][".arcconfig"].data())
+            callsigns = [parsed["repository.callsign"]]
+        except Exception:
+            pass
+    return callsigns

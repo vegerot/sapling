@@ -6,6 +6,9 @@
 
 # With copied file using the heuristics copytracing:
 
+  $ eagerepo
+  $ setconfig workingcopy.ruststatus=false
+
   $ enable mergedriver
 
   $ newrepo

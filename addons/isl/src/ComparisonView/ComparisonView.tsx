@@ -15,6 +15,7 @@ import {EmptyState} from '../EmptyState';
 import {ErrorNotice} from '../ErrorNotice';
 import {Tooltip} from '../Tooltip';
 import {T, t} from '../i18n';
+import platform from '../platform';
 import {latestHeadCommit} from '../serverAPIState';
 import {themeState} from '../theme';
 import {currentComparisonMode} from './atoms';
@@ -28,7 +29,7 @@ import {
   useRecoilValue,
   useSetRecoilState,
 } from 'recoil';
-import {labelForComparison, ComparisonType} from 'shared/Comparison';
+import {comparisonIsAgainstHead, labelForComparison, ComparisonType} from 'shared/Comparison';
 import {Icon} from 'shared/Icon';
 import {SplitDiffView} from 'shared/SplitDiffView';
 import SplitDiffViewPrimerStyles from 'shared/SplitDiffView/PrimerStyles';
@@ -212,7 +213,16 @@ function ComparisonViewHeader({comparison}: {comparison: Comparison}) {
 
 function ComparisonViewFile({diff, comparison}: {diff: ParsedDiff; comparison: Comparison}) {
   const path = diff.newFileName ?? diff.oldFileName ?? '';
-  const context = {id: {path, comparison}, atoms: {lineRange}, translate: t};
+  const context = {
+    id: {path, comparison},
+    atoms: {lineRange},
+    translate: t,
+    copy: platform.clipboardCopy,
+    // only offer clickable line numbers for comparisons against head, otherwise line numbers will be inaccurate
+    openFileToLine: comparisonIsAgainstHead(comparison)
+      ? (line: number) => platform.openFile(path, {line})
+      : undefined,
+  };
   return (
     <div className="comparison-view-file" key={path}>
       <SplitDiffView ctx={context} patch={diff} path={path} />

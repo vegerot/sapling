@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use blobrepo::save_bonsai_changesets;
 use blobrepo::BlobRepo;
 use blobstore::Loadable;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
 use bytes::Bytes;
@@ -252,7 +252,7 @@ pub trait MegarepoOp {
                     let size = envelope.content_size();
                     let content_id = envelope.content_id();
 
-                    Ok((path, FileChange::tracked(content_id, ty, size as u64, None)))
+                    Ok((path, FileChange::tracked(content_id, ty, size, None)))
                 }
                 BonsaiDiffFileChange::Deleted(path) => Ok((path, FileChange::Deletion)),
             }
@@ -481,8 +481,8 @@ pub trait MegarepoOp {
         let linkfiles: HashSet<MononokePath> = source
             .mapping
             .linkfiles
-            .iter()
-            .map(|(dst, _src)| dst.try_into())
+            .keys()
+            .map(|dst| dst.try_into())
             .try_collect()?;
         all_paths.extend(linkfiles.into_iter());
         Ok(all_paths)
@@ -511,7 +511,10 @@ pub trait MegarepoOp {
         for (src_path, entry) in entries {
             match (src_path, entry) {
                 (Some(src_path), Entry::Leaf(leaf)) => {
-                    if tunables().get_megarepo_api_dont_set_file_mutable_renames() {
+                    if tunables()
+                        .megarepo_api_dont_set_file_mutable_renames()
+                        .unwrap_or_default()
+                    {
                         continue;
                     }
 
@@ -534,7 +537,10 @@ pub trait MegarepoOp {
                     }
                 }
                 (src_path, Entry::Tree(tree)) => {
-                    if tunables().get_megarepo_api_dont_set_directory_mutable_renames() {
+                    if tunables()
+                        .megarepo_api_dont_set_directory_mutable_renames()
+                        .unwrap_or_default()
+                    {
                         continue;
                     }
 
@@ -911,7 +917,7 @@ pub trait MegarepoOp {
         cs_id: ChangesetId,
     ) -> Result<(), MegarepoError> {
         let mut txn = repo.bookmarks().create_transaction(ctx.clone());
-        let bookmark = BookmarkName::new(bookmark).map_err(MegarepoError::request)?;
+        let bookmark = BookmarkKey::new(bookmark).map_err(MegarepoError::request)?;
 
         txn.create(&bookmark, cs_id, BookmarkUpdateReason::XRepoSync)?;
 
@@ -932,7 +938,7 @@ pub trait MegarepoOp {
         (from_cs_id, to_cs_id): (ChangesetId, ChangesetId),
     ) -> Result<(), MegarepoError> {
         let mut txn = repo.bookmarks().create_transaction(ctx.clone());
-        let bookmark = BookmarkName::new(bookmark).map_err(MegarepoError::request)?;
+        let bookmark = BookmarkKey::new(bookmark).map_err(MegarepoError::request)?;
         txn.update(
             &bookmark,
             to_cs_id,
@@ -957,7 +963,7 @@ pub trait MegarepoOp {
         cs_id: ChangesetId,
     ) -> Result<(), MegarepoError> {
         let mut txn = repo.bookmarks().create_transaction(ctx.clone());
-        let bookmark = BookmarkName::new(bookmark).map_err(MegarepoError::request)?;
+        let bookmark = BookmarkKey::new(bookmark).map_err(MegarepoError::request)?;
         let maybe_book_value = repo.bookmarks().get(ctx.clone(), &bookmark).await?;
 
         match maybe_book_value {
@@ -1095,8 +1101,8 @@ pub async fn find_bookmark_and_value(
     ctx: &CoreContext,
     repo: &RepoContext,
     bookmark_name: &str,
-) -> Result<(BookmarkName, ChangesetId), MegarepoError> {
-    let bookmark = BookmarkName::new(bookmark_name).map_err(MegarepoError::request)?;
+) -> Result<(BookmarkKey, ChangesetId), MegarepoError> {
+    let bookmark = BookmarkKey::new(bookmark_name).map_err(MegarepoError::request)?;
 
     let cs_id = repo
         .blob_repo()
@@ -1195,7 +1201,7 @@ pub(crate) async fn find_target_bookmark_and_value(
     ctx: &CoreContext,
     target_repo: &RepoContext,
     target: &Target,
-) -> Result<(BookmarkName, ChangesetId), MegarepoError> {
+) -> Result<(BookmarkKey, ChangesetId), MegarepoError> {
     find_bookmark_and_value(ctx, target_repo, &target.bookmark).await
 }
 

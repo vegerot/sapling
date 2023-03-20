@@ -60,6 +60,7 @@ use gotham_ext::middleware::scuba::ScubaMiddlewareState;
 use gotham_ext::response::TryIntoResponse;
 use mercurial_types::HgChangesetId;
 use mercurial_types::HgNodeHash;
+use mononoke_api::CreateInfo;
 use mononoke_api_hg::HgRepoContext;
 use mononoke_types::hash::GitSha1;
 use mononoke_types::ChangesetId;
@@ -77,6 +78,7 @@ use super::HandlerInfo;
 use super::HandlerResult;
 use crate::context::ServerContext;
 use crate::errors::ErrorKind;
+use crate::middleware::request_dumper::RequestDumper;
 use crate::middleware::RequestContext;
 use crate::utils::cbor_stream_filtered_errors;
 use crate::utils::custom_cbor_stream;
@@ -196,6 +198,11 @@ pub async fn hash_to_location(state: &mut State) -> Result<impl TryIntoResponse,
     let hg_repo_ctx = get_repo(sctx, &rctx, &params.repo, None).await?;
 
     let batch = parse_wire_request::<WireCommitHashToLocationRequestBatch>(state).await?;
+
+    if let Some(rd) = RequestDumper::try_borrow_mut_from(state) {
+        rd.add_request(&batch);
+    };
+
     let master_heads = batch
         .master_heads
         .into_iter()
@@ -374,12 +381,16 @@ impl EdenApiHandler for UploadBonsaiChangesetHandler {
             .repo()
             .create_changeset(
                 parents,
-                cs.author,
-                DateTime::from_timestamp(cs.time, cs.tz)?.into(),
-                None,
-                None,
-                cs.message,
-                cs.extra.into_iter().map(|e| (e.key, e.value)).collect(),
+                CreateInfo {
+                    author: cs.author,
+                    author_date: DateTime::from_timestamp(cs.time, cs.tz)?.into(),
+                    committer: None,
+                    committer_date: None,
+                    message: cs.message,
+                    extra: cs.extra.into_iter().map(|e| (e.key, e.value)).collect(),
+                    // TODO(rajshar): Need to allow passing git_extra_headers through Eden API as well.
+                    git_extra_headers: None,
+                },
                 cs.file_changes
                     .into_iter()
                     .map(|(path, fc)| {
@@ -693,7 +704,7 @@ impl EdenApiHandler for CommitMutationsHandler {
         _query: Self::QueryStringExtractor,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
-        if !tunables().get_mutation_generate_for_draft() {
+        if !tunables().mutation_generate_for_draft().unwrap_or_default() {
             return Ok(stream::empty().boxed());
         }
         let commits = request

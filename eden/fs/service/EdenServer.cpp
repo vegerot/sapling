@@ -184,6 +184,7 @@ std::shared_ptr<Notifier> getPlatformNotifier(
       auto notifier = std::make_shared<WindowsNotifier>(
           config, version, std::chrono::steady_clock::now());
       notifier->initialize();
+      return notifier;
     } catch (const std::exception& ex) {
       auto reason = folly::exceptionStr(ex);
       XLOG(WARN) << "Couldn't start E-Menu: " << reason;
@@ -348,6 +349,7 @@ static constexpr folly::StringPiece kBlobCacheMemory{"blob_cache.memory"};
 EdenServer::EdenServer(
     std::vector<std::string> originalCommandLine,
     UserInfo userInfo,
+    std::shared_ptr<EdenStats> edenStats,
     SessionInfo sessionInfo,
     std::unique_ptr<PrivHelper> privHelper,
     std::shared_ptr<const EdenConfig> edenConfig,
@@ -370,10 +372,13 @@ EdenServer::EdenServer(
       // the main thread.  The runServer() code will end up driving this
       // EventBase.
       mainEventBase_{folly::EventBaseManager::get()->getEventBase()},
-      structuredLogger_{
-          makeDefaultStructuredLogger(*edenConfig, std::move(sessionInfo))},
+      structuredLogger_{makeDefaultStructuredLogger(
+          *edenConfig,
+          std::move(sessionInfo),
+          edenStats)},
       serverState_{make_shared<ServerState>(
           std::move(userInfo),
+          std::move(edenStats),
           std::move(privHelper),
           std::make_shared<EdenCPUThreadPool>(),
           std::make_shared<UnixClock>(),
@@ -780,31 +785,17 @@ void EdenServer::scheduleCallbackOnMainEventBase(
 
 #ifndef _WIN32
 void EdenServer::unloadInodes() {
-  struct Root {
-    AbsolutePath mountName;
-    TreeInodePtr rootInode;
-    shared_ptr<EdenMount> mount;
-  };
-  std::vector<Root> roots;
-  {
-    const auto mountPoints = mountPoints_->wlock();
-    for (auto& entry : *mountPoints) {
-      roots.emplace_back(Root{
-          entry.first,
-          entry.second.edenMount->getRootInode(),
-          entry.second.edenMount});
-    }
-  }
+  auto mounts = getMountPoints();
 
-  if (!roots.empty()) {
+  if (!mounts.empty()) {
     auto cutoff = std::chrono::system_clock::now() -
         std::chrono::minutes(FLAGS_unload_age_minutes);
     auto cutoff_ts = folly::to<timespec>(cutoff);
-    for (auto& [name, rootInode, mount] : roots) {
+    for (auto& [mount, rootInode] : mounts) {
       auto unloaded = rootInode->unloadChildrenLastAccessedBefore(cutoff_ts);
       if (unloaded) {
         XLOG(INFO) << "Unloaded " << unloaded
-                   << " inodes in background from mount " << name;
+                   << " inodes in background from mount " << mount->getPath();
       }
       mount->getInodeMap()->recordPeriodicInodeUnload(unloaded);
     }
@@ -1727,8 +1718,8 @@ void EdenServer::mountFinished(
       });
 }
 
-EdenServer::MountList EdenServer::getMountPoints() const {
-  MountList results;
+std::vector<EdenServer::MountAndRootInode> EdenServer::getMountPoints() const {
+  std::vector<EdenServer::MountAndRootInode> results;
   {
     const auto mountPoints = mountPoints_->rlock();
     for (const auto& entry : *mountPoints) {
@@ -1738,7 +1729,7 @@ EdenServer::MountList EdenServer::getMountPoints() const {
       if (!mount->isSafeForInodeAccess()) {
         continue;
       }
-      results.emplace_back(mount);
+      results.emplace_back(mount, mount->getRootInodeUnchecked());
     }
   }
   return results;
@@ -1755,8 +1746,8 @@ EdenServer::MountList EdenServer::getAllMountPoints() const {
   return results;
 }
 
-std::tuple<std::shared_ptr<EdenMount>, TreeInodePtr>
-EdenServer::getMountAndRootInode(AbsolutePathPiece mountPath) const {
+EdenServer::MountAndRootInode EdenServer::getMountAndRootInode(
+    AbsolutePathPiece mountPath) const {
   const auto mountPoints = mountPoints_->rlock();
   const auto it = mountPoints->find(mountPath);
   if (it == mountPoints->end()) {
@@ -1802,7 +1793,8 @@ Future<CheckoutResult> EdenServer::checkOutRevision(
   // the +1 is so we count the current checkout that hasn't quite started yet
   getServerState()->getNotifier()->signalCheckout(
       enumerateInProgressCheckouts() + 1);
-  return edenMount->checkout(rootId, clientPid, callerName, checkoutMode)
+  return edenMount
+      ->checkout(rootInode, rootId, clientPid, callerName, checkoutMode)
       .via(mainEventBase_)
       .thenValue([this,
                   checkoutMode,
@@ -1863,7 +1855,7 @@ Future<CheckoutResult> EdenServer::checkOutRevision(
         return std::move(result);
       })
       .via(getServerState()->getThreadPool().get())
-      .ensure([rootInode = std::move(rootInode)] {});
+      .ensure([rootInode = rootInode] {});
 }
 
 shared_ptr<BackingStore> EdenServer::getBackingStore(
@@ -2048,16 +2040,22 @@ folly::Future<TakeoverData> EdenServer::startTakeoverShutdown() {
           enumValue(state->state))));
     }
 
-    if (getMountPoints() != getAllMountPoints()) {
-      return makeFuture<TakeoverData>(std::runtime_error(
-          "can only perform graceful restart when all mount points are initialized"));
-      // TODO(xavierd): There is still a potential race after this check if a
-      // mount is initiated at this point. Injecting a block below and starting
-      // a mount would manifest it. In practice, this should be fairly rare.
-      // Moving this further (in stopMountsForTakeover for instance) to avoid
-      // this race requires EdenFS to being able to gracefully handle failures
-      // and recover in these cases by restarting several components after they
-      // have been already shutdown.
+    {
+      const auto mountPoints = mountPoints_->rlock();
+      for (const auto& entry : *mountPoints) {
+        const auto& mount = entry.second.edenMount;
+        if (!mount->isSafeForInodeAccess()) {
+          return makeFuture<TakeoverData>(std::runtime_error(
+              "can only perform graceful restart when all mount points are initialized"));
+          // TODO(xavierd): There is still a potential race after this check if
+          // a mount is initiated at this point. Injecting a block below and
+          // starting a mount would manifest it. In practice, this should be
+          // fairly rare. Moving this further (in stopMountsForTakeover for
+          // instance) to avoid this race requires EdenFS to being able to
+          // gracefully handle failures and recover in these cases by restarting
+          // several components after they have been already shutdown.
+        }
+      }
     }
 
     // Make a copy of the thrift server socket so we can transfer it to the
@@ -2217,33 +2215,67 @@ void EdenServer::manageOverlay() {
   }
 }
 
-void EdenServer::workingCopyGC() {
+ImmediateFuture<uint64_t> EdenServer::garbageCollectWorkingCopy(
+    std::shared_ptr<EdenMount> mount,
+    TreeInodePtr rootInode,
+    std::chrono::system_clock::time_point cutoff,
+    const ObjectFetchContextPtr& context) {
+  folly::stop_watch<> workingCopyRuntime;
+
+  auto lease = mount->tryStartWorkingCopyGC(rootInode);
+  if (!lease) {
+    XLOG(DBG6) << "Not running GC for: " << mount->getPath()
+               << ", another GC is already in progress";
+    return 0;
+  }
+
+  auto mountPath = mount->getPath();
+  XLOG(DBG1) << "Starting GC for: " << mountPath;
+  return rootInode->invalidateChildrenNotMaterialized(cutoff, context)
+      .ensure([rootInode, lease = std::move(lease)] {
+        rootInode->unloadChildrenUnreferencedByFs();
+      })
+      .thenTry([workingCopyRuntime,
+                structuredLogger = structuredLogger_,
+                mountPath = std::move(mountPath)](
+                   folly::Try<uint64_t> numInvalidatedTry) {
+        auto runtime =
+            std::chrono::duration<double>{workingCopyRuntime.elapsed()};
+
+        bool success = numInvalidatedTry.hasValue();
+        int64_t numInvalidated =
+            success ? folly::to_signed(numInvalidatedTry.value()) : 0;
+        structuredLogger->logEvent(
+            WorkingCopyGc{runtime.count(), numInvalidated, success});
+
+        XLOG(DBG1) << "GC for: " << mountPath
+                   << ", completed in: " << runtime.count() << " seconds";
+
+        return numInvalidatedTry;
+      });
+}
+
+void EdenServer::garbageCollectAllMounts() {
   auto config = serverState_->getReloadableConfig()->getEdenConfig();
   auto cutoffConfig =
       std::chrono::duration_cast<std::chrono::system_clock::duration>(
           config->gcCutoff.getValue());
   auto cutoff = std::chrono::system_clock::now() - cutoffConfig;
 
-  const auto mountPoints = getMountPoints();
-  for (const auto& mount : mountPoints) {
-    auto rootInode = mount->getRootInode();
-
-    auto lease = mount->tryStartWorkingCopyGC(rootInode);
-    if (!lease) {
-      XLOG(DBG6) << "Not running GC for: " << mount->getPath()
-                 << ", another GC is already in progress";
-      continue;
-    }
-
-    // Avoid blocking the Thrift EventBase by invalidating on another executor.
-    folly::via(getServerState()->getThreadPool().get(), [rootInode, cutoff] {
-      static auto context = ObjectFetchContext::getNullContextWithCauseDetail(
-          "EdenServer::garbageCollect");
-      return rootInode->invalidateChildrenNotMaterialized(cutoff, context)
-          .semi();
-    }).ensure([rootInode, lease = std::move(lease)] {
-      rootInode->unloadChildrenUnreferencedByFs();
-    });
+  auto mountPoints = getMountPoints();
+  for (auto& [mount, rootInode] : mountPoints) {
+    folly::via(
+        getServerState()->getThreadPool().get(),
+        [this,
+         mount = std::move(mount),
+         rootInode = std::move(rootInode),
+         cutoff]() mutable {
+          static auto context =
+              ObjectFetchContext::getNullContextWithCauseDetail(
+                  "EdenServer::garbageCollectAllMounts");
+          return garbageCollectWorkingCopy(
+              std::move(mount), std::move(rootInode), cutoff, context);
+        });
   }
 }
 

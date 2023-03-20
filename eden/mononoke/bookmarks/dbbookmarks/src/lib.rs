@@ -21,8 +21,9 @@ mod test {
     use anyhow::Result;
     use ascii::AsciiString;
     use bookmarks::Bookmark;
+    use bookmarks::BookmarkCategory;
+    use bookmarks::BookmarkKey;
     use bookmarks::BookmarkKind;
-    use bookmarks::BookmarkName;
     use bookmarks::BookmarkPagination;
     use bookmarks::BookmarkPrefix;
     use bookmarks::BookmarkUpdateReason;
@@ -48,9 +49,9 @@ mod test {
         let store = SqlBookmarksBuilder::with_sqlite_in_memory()
             .unwrap()
             .with_repo_id(REPO_ZERO);
-        let scratch_name = BookmarkName::new("book1").unwrap();
-        let publishing_name = BookmarkName::new("book2").unwrap();
-        let pull_default_name = BookmarkName::new("book3").unwrap();
+        let scratch_name = BookmarkKey::new("book1").unwrap();
+        let publishing_name = BookmarkKey::new("book2").unwrap();
+        let pull_default_name = BookmarkKey::new("book3").unwrap();
 
         let conn = store.connections.write_connection.clone();
 
@@ -136,8 +137,9 @@ mod test {
     }
 
     fn mock_bookmarks_response(
-        bookmarks: &BTreeMap<BookmarkName, (BookmarkKind, ChangesetId)>,
+        bookmarks: &BTreeMap<BookmarkKey, (BookmarkKind, ChangesetId)>,
         prefix: &BookmarkPrefix,
+        categories: &[BookmarkCategory],
         kinds: &[BookmarkKind],
         pagination: &BookmarkPagination,
         limit: u64,
@@ -145,13 +147,14 @@ mod test {
         let range = prefix.to_range().with_pagination(pagination.clone());
         bookmarks
             .range(range)
-            .filter_map(|(bookmark, (kind, changeset_id))| {
-                if kinds.iter().any(|k| kind == k) {
+            .filter_map(|(key, (kind, csid))| {
+                let category = key.category();
+                if kinds.iter().any(|k| kind == k) && categories.iter().any(|c| category == c) {
                     let bookmark = Bookmark {
-                        name: bookmark.clone(),
+                        key: key.clone(),
                         kind: *kind,
                     };
-                    Some((bookmark, *changeset_id))
+                    Some((bookmark, *csid))
                 } else {
                     None
                 }
@@ -162,9 +165,10 @@ mod test {
 
     fn insert_then_query(
         fb: FacebookInit,
-        bookmarks: &BTreeMap<BookmarkName, (BookmarkKind, ChangesetId)>,
+        bookmarks: &BTreeMap<BookmarkKey, (BookmarkKind, ChangesetId)>,
         query_freshness: Freshness,
         query_prefix: &BookmarkPrefix,
+        query_categories: &[BookmarkCategory],
         query_kinds: &[BookmarkKind],
         query_pagination: &BookmarkPagination,
         query_limit: u64,
@@ -191,6 +195,7 @@ mod test {
                 ctx,
                 query_freshness,
                 query_prefix,
+                query_categories,
                 query_kinds,
                 query_pagination,
                 query_limit,
@@ -203,21 +208,23 @@ mod test {
     quickcheck! {
         fn responses_match(
             fb: FacebookInit,
-            bookmarks: BTreeMap<BookmarkName, (BookmarkKind, ChangesetId)>,
+            bookmarks: BTreeMap<BookmarkKey, (BookmarkKind, ChangesetId)>,
             freshness: Freshness,
+            categories: HashSet<BookmarkCategory>,
             kinds: HashSet<BookmarkKind>,
             prefix_char: Option<ascii_ext::AsciiChar>,
-            after: Option<BookmarkName>,
+            after: Option<BookmarkKey>,
             limit: u64
         ) -> bool {
             // Test that requests return what is expected.
+            let categories: Vec<_> = categories.into_iter().collect();
             let kinds: Vec<_> = kinds.into_iter().collect();
             let prefix = match prefix_char {
                 Some(ch) => BookmarkPrefix::new_ascii(AsciiString::from(&[ch.0][..])),
                 None => BookmarkPrefix::empty(),
             };
             let pagination = match after {
-                Some(name) => BookmarkPagination::After(name),
+                Some(key) => BookmarkPagination::After(key.into_name()),
                 None => BookmarkPagination::FromStart,
             };
             let mut have = insert_then_query(
@@ -225,6 +232,7 @@ mod test {
                 &bookmarks,
                 freshness,
                 &prefix,
+                categories.as_slice(),
                 kinds.as_slice(),
                 &pagination,
                 limit,
@@ -232,6 +240,7 @@ mod test {
             let mut want = mock_bookmarks_response(
                 &bookmarks,
                 &prefix,
+                categories.as_slice(),
                 kinds.as_slice(),
                 &pagination,
                 limit,

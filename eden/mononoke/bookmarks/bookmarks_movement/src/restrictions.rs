@@ -5,8 +5,8 @@
  * GNU General Public License version 2.
  */
 
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkKind;
-use bookmarks::BookmarkName;
 use bookmarks::BookmarkUpdateReason;
 use context::CoreContext;
 use futures::stream;
@@ -26,7 +26,9 @@ use crate::Repo;
 pub(crate) fn should_run_hooks(authz: &AuthorizationContext, reason: BookmarkUpdateReason) -> bool {
     if authz.is_service() {
         reason == BookmarkUpdateReason::Pushrebase
-            && tunables().get_enable_hooks_on_service_pushrebase()
+            && tunables()
+                .enable_hooks_on_service_pushrebase()
+                .unwrap_or_default()
     } else {
         true
     }
@@ -43,7 +45,7 @@ impl BookmarkKindRestrictions {
     pub(crate) fn check_kind(
         &self,
         repo: &impl RepoConfigRef,
-        name: &BookmarkName,
+        name: &BookmarkKey,
     ) -> Result<BookmarkKind, BookmarkMovementError> {
         let infinitepush_params = &repo.repo_config().infinitepush;
         match (self, &infinitepush_params.namespace) {
@@ -71,7 +73,7 @@ impl BookmarkKindRestrictions {
 pub(crate) async fn check_restriction_ensure_ancestor_of(
     ctx: &CoreContext,
     repo: &impl Repo,
-    bookmark_to_move: &BookmarkName,
+    bookmark_to_move: &BookmarkKey,
     lca_hint: &dyn LeastCommonAncestorsHint,
     target: ChangesetId,
 ) -> Result<(), BookmarkMovementError> {
@@ -85,9 +87,11 @@ pub(crate) async fn check_restriction_ensure_ancestor_of(
         }
     }
 
-    if let Some(descendant_bookmark) = &repo.repo_config().pushrebase.globalrevs_publishing_bookmark
-    {
-        descendant_bookmarks.push(descendant_bookmark);
+    if let Some(config) = &repo.repo_config().pushrebase.globalrev_config {
+        if config.small_repo_id.is_none() {
+            // On large repo, it's fine not to be descendant of the bookmark.
+            descendant_bookmarks.push(&config.publishing_bookmark);
+        }
     }
 
     stream::iter(descendant_bookmarks)
@@ -119,9 +123,9 @@ pub(crate) async fn check_restriction_ensure_ancestor_of(
 pub(crate) async fn ensure_ancestor_of(
     ctx: &CoreContext,
     repo: &impl Repo,
-    bookmark_to_move: &BookmarkName,
+    bookmark_to_move: &BookmarkKey,
     lca_hint: &dyn LeastCommonAncestorsHint,
-    descendant_bookmark: &BookmarkName,
+    descendant_bookmark: &BookmarkKey,
     target: ChangesetId,
 ) -> Result<bool, BookmarkMovementError> {
     let descendant_cs_id = repo
@@ -144,7 +148,7 @@ pub(crate) async fn ensure_ancestor_of(
 
 pub fn check_bookmark_sync_config(
     repo: &(impl RepoIdentityRef + RepoCrossRepoRef),
-    bookmark: &BookmarkName,
+    bookmark: &BookmarkKey,
     kind: BookmarkKind,
 ) -> Result<(), BookmarkMovementError> {
     match kind {

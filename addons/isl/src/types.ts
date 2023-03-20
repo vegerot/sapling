@@ -5,16 +5,22 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {InternalTypes} from './InternalTypes';
+import type {TrackEventName} from 'isl-server/src/analytics/eventNames';
 import type {TrackDataWithEventName} from 'isl-server/src/analytics/types';
-// @fb-only
 import type {GitHubDiffSummary} from 'isl-server/src/github/githubCodeReviewProvider';
 import type {Comparison} from 'shared/Comparison';
-import type {AllUndefined} from 'shared/typeUtils';
+import type {AllUndefined, Json} from 'shared/typeUtils';
 
 export type Result<T> = {value: T; error?: undefined} | {value?: undefined; error: Error};
 
 /** known supported "Platforms" in which ISL may be embedded */
-export type PlatformName = 'browser' | 'androidStudio' | 'vscode';
+export type PlatformName =
+  | 'browser'
+  | 'androidStudio'
+  | 'androidStudioRemote'
+  | 'vscode'
+  | 'standalone';
 
 export type AbsolutePath = string;
 /**
@@ -52,10 +58,7 @@ export type DiffId = string;
 /**
  * Short info about a Diff fetched in bulk for all diffs to render an overview
  */
-// prettier-ignore
-export type DiffSummary = GitHubDiffSummary
- // @fb-only
- ;
+export type DiffSummary = GitHubDiffSummary | InternalTypes['PhabricatorDiffSummary'];
 
 /**
  * Summary of CI test results for a Diff.
@@ -193,53 +196,53 @@ export function SucceedableRevset(revset: Revset): CommandArg {
   return {type: 'succeedable-revset', revset};
 }
 
-/* uncommited changes */
+/* Subscriptions */
 
-export type SubscribeUncommittedChanges = {
-  type: 'subscribeUncommittedChanges';
-  /** Identifier to include in each event published. */
+/**
+ * A subscription allows the client to ask for a stream of events from the server.
+ * The client may send subscribe and corresponding unsubscribe messages.
+ * Subscriptions are indexed by a subscriptionId field.
+ * Responses to subscriptions are of type Fetched<T>
+ */
+export type Subscribe<K extends string> =
+  | {type: `subscribe${K}`; subscriptionID: string}
+  | {type: `unsubscribe${K}`; subscriptionID: string};
+
+/** Reponses to subscriptions, including data and the time duration the fetch lasted */
+export type Fetched<K extends string, V> = {
+  type: `fetched${K}`;
   subscriptionID: string;
-};
+} & V;
 
 export type UncommittedChanges = Array<ChangedFile>;
-
-export type UncommittedChangesEvent = {
-  type: 'uncommittedChanges';
-  subscriptionID: string;
+export type FetchedUncommittedChanges = {
   files: Result<UncommittedChanges>;
+  fetchStartTimestamp: number;
+  fetchCompletedTimestamp: number;
 };
 
 export type BeganFetchingUncommittedChangesEvent = {
   type: 'beganFetchingUncommittedChangesEvent';
 };
 
-/* smartlog commits */
-
-export type SubscribeSmartlogCommits = {
-  type: 'subscribeSmartlogCommits';
-  /** Identifier to include in each event published. */
-  subscriptionID: string;
-};
-
 export type SmartlogCommits = Array<CommitInfo>;
-
-export type SmartlogCommitsEvent = {
-  type: 'smartlogCommits';
-  subscriptionID: string;
+export type FetchedCommits = {
   commits: Result<SmartlogCommits>;
+  fetchStartTimestamp: number;
+  fetchCompletedTimestamp: number;
 };
 
 export type BeganFetchingSmartlogCommitsEvent = {
   type: 'beganFetchingSmartlogCommitsEvent';
 };
 
-/* merge conflicts */
-
 type ConflictInfo = {
   command: string;
   toContinue: string;
   toAbort: string;
   files: Array<ChangedFile>;
+  fetchStartTimestamp: number;
+  fetchCompletedTimestamp: number;
 };
 export type MergeConflicts =
   | ({state: 'loading'} & AllUndefined<ConflictInfo>)
@@ -247,24 +250,13 @@ export type MergeConflicts =
       state: 'loaded';
     } & ConflictInfo);
 
-export type SubscribeMergeConflicts = {
-  type: 'subscribeMergeConflicts';
-  /** Identifier to include in each event published. */
-  subscriptionID: string;
-};
-
-export type MergeConflictsEvent = {
-  type: 'mergeConflicts';
-  subscriptionID: string;
-  conflicts: MergeConflicts | undefined;
-};
-
 /* Operations */
 
 export type RunnableOperation = {
   args: Array<CommandArg>;
   id: string;
   runner: CommandRunner;
+  trackEventName: TrackEventName;
 };
 
 export type OperationProgress =
@@ -274,14 +266,17 @@ export type OperationProgress =
   | {id: string; kind: 'spawn'; queue: Array<string>}
   | {id: string; kind: 'stderr'; message: string}
   | {id: string; kind: 'stdout'; message: string}
-  | {id: string; kind: 'exit'; exitCode: number | null}
+  | {id: string; kind: 'exit'; exitCode: number; timestamp: number}
   | {id: string; kind: 'error'; error: string};
 
 export type OperationCommandProgressReporter = (
-  ...args: ['spawn'] | ['stdout', string] | ['stderr', string] | ['exit', number | null]
+  ...args: ['spawn'] | ['stdout', string] | ['stderr', string] | ['exit', number]
 ) => void;
 
 export type OperationProgressEvent = {type: 'operationProgress'} & OperationProgress;
+
+/** A line number starting from 1 */
+export type OneIndexedLineNumber = Exclude<number, 0>;
 
 /* protocol */
 
@@ -290,7 +285,8 @@ export type OperationProgressEvent = {type: 'operationProgress'} & OperationProg
  * to be handled uniquely per server type.
  */
 export type PlatformSpecificClientToServerMessages =
-  | {type: 'platform/openFile'; path: RepoRelativePath}
+  | {type: 'platform/openFile'; path: RepoRelativePath; options?: {line?: OneIndexedLineNumber}}
+  | {type: 'platform/openDiff'; path: RepoRelativePath; comparison: Comparison}
   | {type: 'platform/openExternal'; url: string}
   | {type: 'platform/confirm'; message: string; details?: string | undefined};
 
@@ -305,12 +301,34 @@ export type PlatformSpecificServerToClientMessages = {
 
 export type PageVisibility = 'focused' | 'visible' | 'hidden';
 
+export type FileABugFields = {title: string; description: string; repro: string};
+export type FileABugProgress =
+  | {status: 'starting'}
+  | {status: 'inProgress'; message: string}
+  | {status: 'success'; taskNumber: string; taskLink: string}
+  | {status: 'error'; error: Error};
+export type FileABugProgressMessage = {type: 'fileBugReportProgress'} & FileABugProgress;
+
+/**
+ * Like ClientToServerMessage, but these messages will be followed
+ * on the message bus by an additional binary ArrayBuffer payload message.
+ */
+export type ClientToServerMessageWithPayload = {
+  type: 'uploadFile';
+  filename: string;
+  id: string;
+} & {hasBinaryPayload: true};
+
+export type SubscriptionKind = 'uncommittedChanges' | 'smartlogCommits' | 'mergeConflicts';
+
 export type ClientToServerMessage =
   | {
       type: 'refresh';
     }
   | {type: 'track'; data: TrackDataWithEventName}
+  | {type: 'fileBugReport'; data: FileABugFields; uiState?: Json}
   | {type: 'runOperation'; operation: RunnableOperation}
+  | {type: 'abortRunningOperation'; operationId: string}
   | {type: 'deleteFile'; filePath: RepoRelativePath}
   | {type: 'fetchCommitMessageTemplate'}
   | {type: 'requestRepoInfo'}
@@ -330,24 +348,42 @@ export type ClientToServerMessage =
       start: number;
       numLines: number;
     }
-  | SubscribeUncommittedChanges
-  | SubscribeSmartlogCommits
-  | SubscribeMergeConflicts
+  | {type: 'loadMoreCommits'}
+  | {type: 'subscribe'; kind: SubscriptionKind; subscriptionID: string}
+  | {type: 'unsubscribe'; kind: SubscriptionKind; subscriptionID: string}
   | PlatformSpecificClientToServerMessages;
 
+export type SubscriptionResultsData = {
+  uncommittedChanges: FetchedUncommittedChanges;
+  smartlogCommits: FetchedCommits;
+  mergeConflicts: MergeConflicts | undefined;
+};
+
+export type SubscriptionResult<K extends SubscriptionKind> = {
+  type: 'subscriptionResult';
+  subscriptionID: string;
+  kind: K;
+  data: SubscriptionResultsData[K];
+};
+
 export type ServerToClientMessage =
-  | UncommittedChangesEvent
-  | SmartlogCommitsEvent
-  | MergeConflictsEvent
+  | SubscriptionResult<'smartlogCommits'>
+  | SubscriptionResult<'uncommittedChanges'>
+  | SubscriptionResult<'mergeConflicts'>
   | BeganFetchingSmartlogCommitsEvent
   | BeganFetchingUncommittedChangesEvent
+  | FileABugProgressMessage
   | {type: 'fetchedCommitMessageTemplate'; template: string}
   | {type: 'applicationInfo'; platformName: string; version: string}
   | {type: 'repoInfo'; info: RepoInfo; cwd?: string}
   | {type: 'repoError'; error: RepositoryError | undefined}
   | {type: 'fetchedDiffSummaries'; summaries: Result<Map<DiffId, DiffSummary>>}
+  | {type: 'uploadFileResult'; id: string; result: Result<string>}
   | {type: 'comparison'; comparison: Comparison; data: ComparisonData}
   | {type: 'comparisonContextLines'; path: RepoRelativePath; lines: Array<string>}
+  | {type: 'beganLoadingMoreCommits'}
+  | {type: 'commitsShownRange'; rangeInDays: number | undefined}
+  | {type: 'additionalCommitAvailability'; moreAvailable: boolean}
   | OperationProgressEvent
   | PlatformSpecificServerToClientMessages;
 

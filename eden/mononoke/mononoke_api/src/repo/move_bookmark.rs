@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
 use bookmarks_movement::BookmarkUpdatePolicy;
@@ -29,16 +29,13 @@ impl RepoContext {
     /// Move a bookmark.
     pub async fn move_bookmark(
         &self,
-        bookmark: impl AsRef<str>,
+        bookmark: &BookmarkKey,
         target: ChangesetId,
         old_target: Option<ChangesetId>,
         allow_non_fast_forward: bool,
         pushvars: Option<&HashMap<String, Bytes>>,
     ) -> Result<(), MononokeError> {
         self.start_write()?;
-
-        let bookmark = bookmark.as_ref();
-        let bookmark = BookmarkName::new(bookmark)?;
 
         // We need to find out where the bookmark currently points to in order
         // to move it.  Make sure to bypass any out-of-date caches.
@@ -47,7 +44,7 @@ impl RepoContext {
             None => self
                 .blob_repo()
                 .bookmarks()
-                .get(self.ctx().clone(), &bookmark)
+                .get(self.ctx().clone(), bookmark)
                 .await
                 .context("Failed to fetch old bookmark target")?
                 .ok_or_else(|| {
@@ -56,7 +53,7 @@ impl RepoContext {
         };
 
         fn make_move_op<'a>(
-            bookmark: &'a BookmarkName,
+            bookmark: &'a BookmarkKey,
             target: ChangesetId,
             old_target: ChangesetId,
             allow_non_fast_forward: bool,
@@ -76,14 +73,17 @@ impl RepoContext {
                 BookmarkUpdateReason::ApiRequest,
             )
             .with_pushvars(pushvars);
-            if !tunables().get_disable_commit_scribe_logging_scs() {
+            if !tunables()
+                .disable_commit_scribe_logging_scs()
+                .unwrap_or_default()
+            {
                 op = op.log_new_public_commits_to_scribe();
             }
             op
         }
         if let Some(redirector) = self.push_redirector.as_ref() {
-            let large_bookmark = redirector.small_to_large_bookmark(&bookmark).await?;
-            if large_bookmark == bookmark {
+            let large_bookmark = redirector.small_to_large_bookmark(bookmark).await?;
+            if &large_bookmark == bookmark {
                 return Err(MononokeError::InvalidRequest(format!(
                     "Cannot move shared bookmark '{}' from small repo",
                     bookmark
@@ -113,7 +113,7 @@ impl RepoContext {
             redirector.backsync_latest(ctx).await?;
         } else {
             make_move_op(
-                &bookmark,
+                bookmark,
                 target,
                 old_target,
                 allow_non_fast_forward,

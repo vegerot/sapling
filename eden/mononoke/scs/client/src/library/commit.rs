@@ -12,11 +12,13 @@ use std::collections::HashSet;
 use std::io::Write;
 
 use anyhow::Error;
+use bytes::Bytes;
 use chrono::DateTime;
 use chrono::FixedOffset;
 use chrono::Local;
 use chrono::TimeZone;
 use serde::Serialize;
+use smallvec::SmallVec;
 use source_control::types as thrift;
 
 use crate::args::commit_id::map_commit_ids;
@@ -35,6 +37,7 @@ pub(crate) struct CommitInfo {
     pub generation: i64,
     pub extra: BTreeMap<String, String>,
     pub extra_hex: BTreeMap<String, String>,
+    pub git_extra_headers: Option<BTreeMap<SmallVec<[u8; 24]>, Bytes>>,
 }
 
 impl TryFrom<&thrift::CommitInfo> for CommitInfo {
@@ -53,7 +56,10 @@ impl TryFrom<&thrift::CommitInfo> for CommitInfo {
         // the timezone is seconds east of UTC.
         let timestamp = commit.date;
         let timezone = commit.tz;
-        let date = FixedOffset::east(timezone).timestamp(timestamp, 0);
+        let date = FixedOffset::east_opt(timezone)
+            .unwrap()
+            .timestamp_opt(timestamp, 0)
+            .unwrap();
         // Extras are binary data, but usually we want to render them as
         // strings. In the case that they are not UTF-8 strings, they're
         // probably a commit hash, so we should hex-encode them. Record extras
@@ -66,6 +72,12 @@ impl TryFrom<&thrift::CommitInfo> for CommitInfo {
                 Err(_) => extra_hex.insert(name.clone(), faster_hex::hex_string(value)),
             };
         }
+        let git_extra_headers = commit.git_extra_headers.as_ref().map(|headers| {
+            headers
+                .iter()
+                .map(|(k, v)| (k.0.clone(), v.clone()))
+                .collect()
+        });
         Ok(CommitInfo {
             r#type: "commit".to_string(),
             ids,
@@ -78,6 +90,7 @@ impl TryFrom<&thrift::CommitInfo> for CommitInfo {
             generation: commit.generation,
             extra,
             extra_hex,
+            git_extra_headers,
         })
     }
 }
@@ -164,6 +177,18 @@ pub(crate) fn render_commit_info(
         write!(w, "Extra-Binary:\n")?;
         for (name, value) in commit.extra_hex.iter() {
             write!(w, "    {}={}\n", name, value)?;
+        }
+    }
+    if let Some(ref headers) = commit.git_extra_headers {
+        write!(w, "Git Extra Headers:\nNumber of keys: {}", headers.len())?;
+        for (key, value) in headers {
+            match (
+                std::str::from_utf8(key.as_slice()),
+                std::str::from_utf8(value),
+            ) {
+                (Ok(key), Ok(value)) => write!(w, "    {}={}\n", key, value)?,
+                _ => {}
+            }
         }
     }
     write!(w, "\n{}\n", commit.message)?;

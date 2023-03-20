@@ -35,9 +35,9 @@ use edenfs_utils::stop_buckd_for_repo;
 use fbinit::expect_init;
 #[cfg(target_os = "windows")]
 use mkscratch::zzencode;
-#[cfg(target_os = "macos")]
-use nix::sys::stat::stat;
 use pathdiff::diff_paths;
+#[cfg(target_os = "macos")]
+use psutil::disk::disk_usage;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -46,7 +46,6 @@ use util::path::absolute;
 
 use crate::checkout::CheckoutConfig;
 use crate::checkout::EdenFsCheckout;
-#[cfg(target_os = "linux")]
 use crate::instance::EdenFsInstance;
 use crate::mounttable::read_mount_table;
 
@@ -97,6 +96,47 @@ impl FromStr for RedirectionType {
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+#[derive(PartialEq, Debug)]
+pub enum DarwinBindRedirectionType {
+    APFS,
+    DMG,
+}
+
+#[cfg(target_os = "macos")]
+impl fmt::Display for DarwinBindRedirectionType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match *self {
+                DarwinBindRedirectionType::APFS => "apfs",
+                DarwinBindRedirectionType::DMG => "dmg",
+            }
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl FromStr for DarwinBindRedirectionType {
+    type Err = EdenFsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.to_lowercase() == "apfs" || s.is_empty() {
+            Ok(DarwinBindRedirectionType::APFS)
+        } else if s.to_lowercase() == "dmg" {
+            Ok(DarwinBindRedirectionType::DMG)
+        } else {
+            // deliberately did not implement "Unknown"
+            Err(EdenFsError::ConfigurationError(format!(
+                "Unknown darwin bind redirection type: {}. Must be one of: apfs, dmg",
+                s
+            )))
+        }
+    }
+}
+
 #[derive(PartialEq, Debug)]
 pub enum RepoPathDisposition {
     DoesNotExist,
@@ -226,6 +266,34 @@ impl Redirection {
         .from_err()
     }
 
+    /// Determine what bind redirection type should be used on macOS. There are currently only 2
+    /// options: apfs or dmg. We default to the old behavior, apfs.
+    #[cfg(target_os = "macos")]
+    pub fn determine_bind_redirection_type() -> DarwinBindRedirectionType {
+        let config_value = EdenFsInstance::global()
+            .get_config()
+            .map(|config| config.redirections.darwin_redirection_type)
+            .and_then(|ty| DarwinBindRedirectionType::from_str(&ty));
+        let has_apfs_helper = Self::have_apfs_helper().unwrap_or(false);
+        match config_value {
+            Ok(v) if !has_apfs_helper && v == DarwinBindRedirectionType::APFS => {
+                eprintln!(
+                    "cannot use apfs redirections since apfs_helper '{APFS_HELPER}' is not available. Defaulting to dmg redirections."
+                );
+                DarwinBindRedirectionType::DMG
+            }
+            Ok(v) => v,
+            Err(e) if has_apfs_helper => {
+                eprintln!("{}. Defaulting to apfs.", e);
+                DarwinBindRedirectionType::APFS
+            }
+            Err(e) => {
+                eprintln!("{}. Defaulting to dmg.", e);
+                DarwinBindRedirectionType::DMG
+            }
+        }
+    }
+
     pub fn mkscratch_bin() -> PathBuf {
         // mkscratch is provided by the hg deployment at facebook, which has a
         // different installation prefix on macOS vs Linux, so we need to resolve
@@ -258,7 +326,7 @@ impl Redirection {
                 format!(
                     "Failed to execute mkscratch cmd: `{} {}`",
                     &mkscratch.display(),
-                    args.join(" ")
+                    shlex::join(args.iter().copied()),
                 )
             })?;
         if output.status.success() {
@@ -275,7 +343,7 @@ impl Redirection {
             Err(EdenFsError::Other(anyhow!(
                 "Failed to execute `{} {}`, stderr: {}, exit status: {:?}",
                 &mkscratch.display(),
-                args.join(" "),
+                shlex::join(args.iter().copied()),
                 String::from_utf8_lossy(&output.stderr),
                 output.status,
             )))
@@ -284,8 +352,9 @@ impl Redirection {
 
     pub fn expand_target_abspath(&self, checkout: &EdenFsCheckout) -> Result<Option<PathBuf>> {
         match self.redir_type {
+            #[cfg(target_os = "macos")]
             RedirectionType::Bind => {
-                if Redirection::have_apfs_helper()? {
+                if Self::determine_bind_redirection_type() == DarwinBindRedirectionType::APFS {
                     // Ideally we'd return information about the backing, but
                     // it is a bit awkward to determine this in all contexts;
                     // prior to creating the volume we don't know anything
@@ -312,6 +381,11 @@ impl Redirection {
                     )?))
                 }
             }
+            #[cfg(not(target_os = "macos"))]
+            RedirectionType::Bind => Ok(Some(Redirection::make_scratch_dir(
+                checkout,
+                &self.repo_path,
+            )?)),
             RedirectionType::Symlink => Ok(Some(Redirection::make_scratch_dir(
                 checkout,
                 &self.repo_path,
@@ -389,7 +463,7 @@ impl Redirection {
                 format!(
                     "Failed to execute command `{} {}`",
                     APFS_HELPER,
-                    args.join(" ")
+                    shlex::join(args.iter().copied())
                 )
             })?;
         if output.status.success() {
@@ -409,31 +483,44 @@ impl Redirection {
         // Since we don't have bind mounts, we set up a disk image file
         // and mount that instead.
         let image_file_path = self._dmg_file_name(target);
-        let target_stat = stat(target)
+        let target_stat = disk_usage(target)
             .from_err()
             .with_context(|| format!("Failed to stat target {}", target.display()))?;
 
         // Specify the size in kb because the disk utilities have weird
         // defaults if the units are unspecified, and `b` doesn't mean
         // bytes!
-        let total_kb = target_stat.st_size / 1024;
+        let total_kib = target_stat.total() / 1024;
         let mount_path = checkout_path.join(&self.repo_path());
 
-        if !image_file_path.exists() {
-            // We need to convert paths -> strings for the hdiutil commands
-            let image_file_name = image_file_path.to_string_lossy();
-            let mount_name = mount_path.to_string_lossy();
+        // We need to convert paths -> strings for the hdiutil commands
+        let image_file_name = image_file_path.to_string_lossy();
+        let mount_name = mount_path.to_string_lossy();
 
+        if !image_file_path.exists() {
+            let image_file_dir = image_file_path.parent().with_context(|| {
+                format!(
+                    "image file {} must exist in some parent directory",
+                    &image_file_path.display()
+                )
+            })?;
+            if !image_file_dir.exists() {
+                std::fs::create_dir_all(&image_file_dir)
+                    .from_err()
+                    .with_context(|| {
+                        format!("Failed to create directory {}", &image_file_dir.display())
+                    })?;
+            }
             let args = &[
                 "create",
-                "--size",
-                &format!("{}k", total_kb),
-                "--type",
+                "-size",
+                &format!("{}k", total_kib),
+                "-type",
                 "SPARSE",
-                "--fs",
+                "-fs",
                 "HFS+",
-                "--volname",
-                &format!("EdenFS redirection for {}", &mount_name),
+                "-volname",
+                &format!("'EdenFS redirection for {}'", &mount_name),
                 &image_file_name,
             ];
             let create_output = Command::new("hdiutil")
@@ -441,7 +528,10 @@ impl Redirection {
                 .output()
                 .from_err()
                 .with_context(|| {
-                    format!("Failed to execute command `hdiutil {}`", args.join(" "))
+                    format!(
+                        "Failed to execute command `hdiutil {}`",
+                        shlex::join(args.iter().copied())
+                    )
                 })?;
             if !create_output.status.success() {
                 return Err(EdenFsError::Other(anyhow!(
@@ -452,40 +542,54 @@ impl Redirection {
                     String::from_utf8_lossy(&create_output.stdout)
                 )));
             }
-
-            let args = &[
-                "attach",
-                &image_file_name,
-                "--nobrowse",
-                "--mountpoint",
-                &mount_name,
-            ];
-            let attach_output = Command::new("hdiutil")
-                .args(args)
-                .output()
+        }
+        let args = &[
+            "attach",
+            &image_file_name,
+            "-nobrowse",
+            "-mountpoint",
+            &mount_name,
+        ];
+        let mount_path = mount_path.parent().with_context(|| {
+            format!(
+                "mount path {} must exist in some parent directory",
+                &mount_path.display()
+            )
+        })?;
+        if !mount_path.exists() {
+            std::fs::create_dir_all(&mount_path)
                 .from_err()
-                .with_context(|| {
-                    format!("Failed to execute command `hdiutil {}`", args.join(" "))
-                })?;
-            if !attach_output.status.success() {
-                return Err(EdenFsError::Other(anyhow!(
-                    "failed to attach dmg volume {} for mount {}. stderr: {}\n stdout: {}",
-                    &image_file_name,
-                    &mount_name,
-                    String::from_utf8_lossy(&attach_output.stderr),
-                    String::from_utf8_lossy(&attach_output.stdout)
-                )));
-            }
+                .with_context(|| format!("Failed to create directory {}", &mount_path.display()))?;
+        }
+        let attach_output = Command::new("hdiutil")
+            .args(args)
+            .output()
+            .from_err()
+            .with_context(|| {
+                format!(
+                    "Failed to execute command `hdiutil {}`",
+                    shlex::join(args.iter().copied())
+                )
+            })?;
+        if !attach_output.status.success() {
+            return Err(EdenFsError::Other(anyhow!(
+                "failed to attach dmg volume {} for mount {}. stderr: {}\n stdout: {}",
+                &image_file_name,
+                &mount_name,
+                String::from_utf8_lossy(&attach_output.stderr),
+                String::from_utf8_lossy(&attach_output.stdout)
+            )));
         }
         Ok(())
     }
 
     #[cfg(target_os = "macos")]
     fn _bind_mount_darwin(&self, checkout_path: &Path, target: &Path) -> Result<()> {
-        if Redirection::have_apfs_helper()? {
-            self._bind_mount_darwin_apfs(checkout_path)
-        } else {
+        // We default to APFS since DMG redirections are experimental at this point
+        if Self::determine_bind_redirection_type() == DarwinBindRedirectionType::DMG {
             self._bind_mount_darwin_dmg(checkout_path, target)
+        } else {
+            self._bind_mount_darwin_apfs(checkout_path)
         }
     }
 
@@ -537,12 +641,19 @@ impl Redirection {
     #[cfg(target_os = "macos")]
     fn _bind_unmount_darwin(&self, checkout: &EdenFsCheckout) -> Result<()> {
         let mount_path = checkout.path().join(&self.repo_path);
+        // We use unmount instead of eject here since eject has caused issues
+        // by unmounting unrelated apfs volumes in the past. See S325232.
         let args = &["unmount", "force", &mount_path.to_string_lossy()];
         let output = Command::new("diskutil")
             .args(args)
             .output()
             .from_err()
-            .with_context(|| format!("Failed to execute command `diskutil {}`", args.join(" ")))?;
+            .with_context(|| {
+                format!(
+                    "Failed to execute command `diskutil {}`",
+                    shlex::join(args.iter().copied())
+                )
+            })?;
         if output.status.success() {
             Ok(())
         } else {

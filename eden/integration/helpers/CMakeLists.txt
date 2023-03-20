@@ -19,3 +19,23 @@ if(NOT WIN32)
   add_executable(takeover_tool TakeoverTool.cpp)
   target_link_libraries(takeover_tool eden_takeover Folly::folly)
 endif()
+
+if(WIN32)
+  add_executable(read_reparse_buffer ReadReparseBuffer.cpp)
+  target_link_libraries(
+    read_reparse_buffer
+      eden_utils
+      edencommon::edencommon_utils
+      fmt::fmt
+      Folly::folly
+  )
+
+  add_executable(check_windows_rename CheckWindowsRename.cpp)
+  target_link_libraries(
+    read_reparse_buffer
+      eden_utils
+      edencommon::edencommon_utils
+      fmt::fmt
+      Folly::folly
+  )
+endif()

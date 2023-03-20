@@ -6,15 +6,21 @@
  */
 
 use std::collections::HashMap;
+use std::marker::Unpin;
 use std::net::SocketAddr;
-use std::net::TcpListener;
-use std::thread;
+use std::sync::Arc;
 
 use anyhow::Result;
 use log::error;
 use log::info;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+
+use crate::ActionsMap;
 
 /// Set of supported commands
 /// All unknown commands will be ignored
@@ -46,57 +52,60 @@ pub struct Command(pub (CommandName, CommandData));
 
 pub struct TcpReceiverService {
     port: u16,
-    actions: HashMap<CommandName, Box<dyn Fn() + Send>>,
+    actions: Arc<ActionsMap>,
 }
 
 impl TcpReceiverService {
-    pub fn new(port: u16) -> TcpReceiverService {
+    pub fn new(port: u16, actions: ActionsMap) -> TcpReceiverService {
         TcpReceiverService {
             port,
-            actions: HashMap::new(),
+            actions: Arc::new(actions),
         }
     }
 
-    pub fn with_actions(
-        mut self,
-        actions: HashMap<CommandName, Box<dyn Fn() + Send>>,
-    ) -> TcpReceiverService {
-        self.actions = self
-            .actions
-            .into_iter()
-            .chain(actions.into_iter())
-            .collect();
-        self
+    async fn handler(actions: Arc<ActionsMap>, mut socket: impl AsyncRead + Unpin) -> Result<()> {
+        let mut buf = Vec::new();
+        let bytes_read = socket.read_to_end(&mut buf).await?;
+
+        if bytes_read == 0 {
+            // Ping connection, client checks if scm daemon is alive
+            // TODO: implement proper health_check request
+            return Ok(());
+        }
+
+        let command: Command = serde_json::from_slice(&buf[..bytes_read])?;
+        let command_name = serde_json::to_string(&(command.0).0)
+            .ok()
+            .unwrap_or("unknown".into());
+
+        info!("Received {} command", command_name);
+
+        match actions.get(&((command.0).0)) {
+            Some(action) => action(),
+            None => info!("No actions found for {}", command_name),
+        }
+
+        Ok(())
     }
 
-    pub fn serve(self) -> Result<thread::JoinHandle<Result<()>>> {
-        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], self.port)))?;
-        Ok(thread::spawn(move || {
+    pub fn serve(self) -> JoinHandle<Result<()>> {
+        tokio::spawn(async move {
             info!("Starting CommitCloud TcpReceiverService");
+            let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], self.port))).await?;
             info!("Listening on port {}", self.port);
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        match serde_json::from_reader::<_, Command>(stream) {
-                            Ok(command) => {
-                                let command_name = serde_json::to_string(&(command.0).0)
-                                    .ok()
-                                    .unwrap_or("unknown".into());
-
-                                info!("Received {} command", command_name);
-                                if let Some(action) = self.actions.get(&((command.0).0)) {
-                                    action();
-                                } else {
-                                    info!("No actions found for {}", command_name);
-                                }
+            loop {
+                match listener.accept().await {
+                    Ok((socket, _)) => {
+                        let actions = self.actions.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = Self::handler(actions, socket).await {
+                                error!("Failed to handle connection: {err}")
                             }
-                            Err(_) => {}
-                        };
+                        });
                     }
-                    Err(e) => error!("Connection failed {}", e),
+                    Err(err) => error!("{err}"),
                 }
             }
-            Ok(())
-        }))
+        })
     }
 }

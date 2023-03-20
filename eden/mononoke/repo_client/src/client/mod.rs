@@ -33,7 +33,7 @@ use blobstore::Loadable;
 use bonsai_git_mapping::BonsaiGitMappingRef;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::Bookmark;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkPrefix;
 use bookmarks_types::BookmarkKind;
 use bytes::Bytes;
@@ -269,7 +269,9 @@ lazy_static! {
 }
 
 fn clone_timeout() -> Duration {
-    let timeout = tunables().get_repo_client_clone_timeout_secs();
+    let timeout = tunables()
+        .repo_client_clone_timeout_secs()
+        .unwrap_or_default();
     if timeout > 0 {
         Duration::from_secs(timeout as u64)
     } else {
@@ -278,7 +280,9 @@ fn clone_timeout() -> Duration {
 }
 
 fn default_timeout() -> Duration {
-    let timeout = tunables().get_repo_client_default_timeout_secs();
+    let timeout = tunables()
+        .repo_client_default_timeout_secs()
+        .unwrap_or_default();
     if timeout > 0 {
         Duration::from_secs(timeout as u64)
     } else {
@@ -286,7 +290,9 @@ fn default_timeout() -> Duration {
     }
 }
 fn getbundle_timeout() -> Duration {
-    let timeout = tunables().get_repo_client_getbundle_timeout_secs();
+    let timeout = tunables()
+        .repo_client_getbundle_timeout_secs()
+        .unwrap_or_default();
     if timeout > 0 {
         Duration::from_secs(timeout as u64)
     } else {
@@ -295,7 +301,9 @@ fn getbundle_timeout() -> Duration {
 }
 
 fn getpack_timeout() -> Duration {
-    let timeout = tunables().get_repo_client_getpack_timeout_secs();
+    let timeout = tunables()
+        .repo_client_getpack_timeout_secs()
+        .unwrap_or_default();
     if timeout > 0 {
         Duration::from_secs(timeout as u64)
     } else {
@@ -340,7 +348,10 @@ fn bundle2caps() -> String {
             ("listkeys", vec![]),
         ];
 
-        if tunables().get_mutation_advertise_for_infinitepush() {
+        if tunables()
+            .mutation_advertise_for_infinitepush()
+            .unwrap_or_default()
+        {
             caps.push(("b2x:infinitepushmutation", vec![]));
         }
 
@@ -349,7 +360,7 @@ fn bundle2caps() -> String {
 
     let mut encodedcaps = vec![];
 
-    for &(ref key, ref value) in &caps {
+    for (key, value) in &caps {
         let encodedkey = key.to_string();
         if !value.is_empty() {
             let encodedvalue = value.join(",");
@@ -372,20 +383,37 @@ struct UndesiredPathLogger {
 impl UndesiredPathLogger {
     fn new(ctx: CoreContext, repo: &BlobRepo) -> Result<Self, Error> {
         let tunables = tunables();
-        let repo_needs_logging =
-            repo.repo_identity().name() == tunables.get_undesired_path_repo_name_to_log().as_str();
+        let repo_needs_logging = repo.repo_identity().name()
+            == tunables
+                .undesired_path_repo_name_to_log()
+                .unwrap_or_default()
+                .as_str();
 
         let path_prefix_to_log = if repo_needs_logging {
-            MPath::new_opt(tunables.get_undesired_path_prefix_to_log().as_str())?
+            MPath::new_opt(
+                tunables
+                    .undesired_path_prefix_to_log()
+                    .unwrap_or_default()
+                    .as_str(),
+            )?
         } else {
             None
         };
 
         let path_regex_to_log = if repo_needs_logging
-            && !tunables.get_undesired_path_regex_to_log().is_empty()
+            && !tunables
+                .undesired_path_regex_to_log()
+                .unwrap_or_default()
+                .is_empty()
         {
             Some(
-                Regex::new(tunables.get_undesired_path_regex_to_log().as_str()).map_err(|e| {
+                Regex::new(
+                    tunables
+                        .undesired_path_regex_to_log()
+                        .unwrap_or_default()
+                        .as_str(),
+                )
+                .map_err(|e| {
                     error!(
                         ctx.logger(),
                         "Error initializing undesired path regex for {}: {}",
@@ -578,7 +606,7 @@ impl RepoClient {
                     .filter_map(|(book, cs)| {
                         let hash: Vec<u8> = cs.into_nodehash().to_hex().into();
                         if book.kind() == &BookmarkKind::PullDefaultPublishing {
-                            Some((book.into_name().into_byte_vec(), hash))
+                            Some((book.into_key().into_byte_vec(), hash))
                         } else {
                             None
                         }
@@ -663,7 +691,8 @@ impl RepoClient {
         ctx: CoreContext,
         params: GettreepackArgs,
     ) -> BoxStream<BytesOld, Error> {
-        let hash_validation_percentage = tunables().get_hash_validation_percentage();
+        let hash_validation_percentage =
+            tunables().hash_validation_percentage().unwrap_or_default();
         let validate_hash = ((rand::random::<usize>() % 100) as i64) < hash_validation_percentage;
 
         let undesired_path_logger =
@@ -732,7 +761,8 @@ impl RepoClient {
 
             let lfs_params = self.lfs_params();
 
-            let hash_validation_percentage = tunables().get_hash_validation_percentage();
+            let hash_validation_percentage =
+                tunables().hash_validation_percentage().unwrap_or_default();
             let validate_hash =
                 rand::thread_rng().gen_ratio(hash_validation_percentage as u32, 100);
             let getpack_buffer_size = 500;
@@ -787,13 +817,12 @@ impl RepoClient {
                                     // before we have resoved hg filenodes.
                                     let history_fut = tokio::task::spawn(
                                         get_unordered_file_history_for_multiple_nodes(
-                                            ctx.clone(),
-                                            repo.clone(),
+                                            &ctx,
+                                            &repo,
                                             filenodes.into_iter().collect(),
                                             &path,
                                             allow_short_getpack_history,
                                         )
-                                        .compat()
                                         .try_collect::<Vec<_>>(),
                                     )
                                     .flatten_err();
@@ -919,9 +948,9 @@ impl RepoClient {
                             ctx.perf_counters()
                                 .add_to_counter(PerfCounterType::GetpackResponseSize, len);
 
-                            STATS::total_fetched_file_size.add_value(len as i64);
+                            STATS::total_fetched_file_size.add_value(len);
                             if ctx.session().is_quicksand() {
-                                STATS::quicksand_fetched_file_size.add_value(len as i64);
+                                STATS::quicksand_fetched_file_size.add_value(len);
                             }
                         }
                     })
@@ -1074,7 +1103,8 @@ impl RepoClient {
                 cloned!(ctx);
                 async move {
                     let max_nodes = tunables()
-                        .get_repo_client_max_nodes_in_known_method()
+                        .repo_client_max_nodes_in_known_method()
+                        .unwrap_or_default()
                         .try_into()
                         .unwrap();
                     if max_nodes > 0 {
@@ -1288,7 +1318,7 @@ impl HgCommands for RepoClient {
             // Heads are all the commits that has a publishing bookmarks
             // that points to it.
             self.get_publishing_bookmarks_maybe_stale(ctx)
-                .map(|map| map.into_iter().map(|(_, hg_cs_id)| hg_cs_id).collect())
+                .map(|map| map.into_values().collect())
                 .compat()
                 .timeout(default_timeout())
                 .flatten_err()
@@ -1396,7 +1426,7 @@ impl HgCommands for RepoClient {
             // If there are suggestions, show them. This happens in case of ambiguous outcome of prefix lookup.
             // Otherwise, show an error.
 
-            let bookmark = BookmarkName::new(&key).ok();
+            let bookmark = BookmarkKey::new(&key).ok();
             let lookup_fut = node_fut
                 .and_then({
                     cloned!(ctx, repo);
@@ -1644,7 +1674,7 @@ impl HgCommands for RepoClient {
                         }
                     } else {
                         // literal match
-                        let bookmark = BookmarkName::new(&pattern)?;
+                        let bookmark = BookmarkKey::new(&pattern)?;
 
                         let cs_id = session_bookmarks_cache.get_bookmark(ctx, bookmark).await?;
                         match cs_id {
@@ -2063,11 +2093,14 @@ impl HgCommands for RepoClient {
         self.getpack(
             params,
             |ctx, repo, node, _lfs_thresold, validate_hash| {
-                create_getpack_v1_blob(ctx, repo, node, validate_hash).map(|(size, fut)| {
-                    // GetpackV1 has no metadata.
-                    let fut = fut.map(|(id, bytes)| (id, bytes, None));
-                    (size, fut)
-                })
+                async move { create_getpack_v1_blob(&ctx, &repo, node, validate_hash).await }
+                    .boxed()
+                    .compat()
+                    .map(|(size, fut)| {
+                        // GetpackV1 has no metadata.
+                        let fut = fut.boxed().compat().map(|(id, bytes)| (id, bytes, None));
+                        (size, fut)
+                    })
             },
             ops::GETPACKV1,
         )
@@ -2081,13 +2114,19 @@ impl HgCommands for RepoClient {
         self.getpack(
             params,
             |ctx, repo, node, lfs_thresold, validate_hash| {
-                create_getpack_v2_blob(ctx, repo, node, lfs_thresold, validate_hash).map(
-                    |(size, fut)| {
-                        // GetpackV2 always has metadata.
-                        let fut = fut.map(|(id, bytes, metadata)| (id, bytes, Some(metadata)));
-                        (size, fut)
-                    },
-                )
+                async move {
+                    create_getpack_v2_blob(&ctx, &repo, node, lfs_thresold, validate_hash).await
+                }
+                .boxed()
+                .compat()
+                .map(|(size, fut)| {
+                    // GetpackV2 always has metadata.
+                    let fut = fut
+                        .boxed()
+                        .compat()
+                        .map(|(id, bytes, metadata)| (id, bytes, Some(metadata)));
+                    (size, fut)
+                })
             },
             ops::GETPACKV2,
         )
@@ -2499,7 +2538,11 @@ fn with_command_monitor<T>(ctx: CoreContext, t: T) -> Monitor<T, Sender<()>> {
         let start = Instant::now();
 
         loop {
-            let interval = match tunables().get_command_monitor_interval().try_into() {
+            let interval = match tunables()
+                .command_monitor_interval()
+                .unwrap_or_default()
+                .try_into()
+            {
                 Ok(interval) if interval > 0 => interval,
                 _ => {
                     break;
@@ -2508,7 +2551,11 @@ fn with_command_monitor<T>(ctx: CoreContext, t: T) -> Monitor<T, Sender<()>> {
 
             tokio::time::sleep(Duration::from_secs(interval)).await;
 
-            if tunables().get_command_monitor_remote_logging() != 0 {
+            if tunables()
+                .command_monitor_remote_logging()
+                .unwrap_or_default()
+                != 0
+            {
                 info!(
                     ctx.logger(),
                     "Command in progress. Elapsed: {}s, BlobPuts: {}, BlobGets: {}, SqlWrites: {}, SqlReadsMaster: {}, SqlReadsReplica: {}.",

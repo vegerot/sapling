@@ -182,13 +182,19 @@ export function startServer({
         case 'androidStudio':
           platformImpl = (await import('../platform/androidstudioServerPlatform')).platform;
           break;
+        case 'androidStudioRemote':
+          platformImpl = (await import('../platform/androidStudioRemoteServerPlatform')).platform;
+          break;
+        case 'standalone':
+          platformImpl = (await import('../platform/standaloneServerPlatform')).platform;
+          break;
         default:
         case undefined:
           break;
       }
 
       const dispose = onClientConnection({
-        postMessage(message: string) {
+        postMessage(message: string | ArrayBuffer) {
           socket.send(message);
           return Promise.resolve(true);
         },

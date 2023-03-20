@@ -5,13 +5,19 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {ServerToClientMessage, ClientToServerMessage, Disposable} from './types';
+import type {
+  ServerToClientMessage,
+  ClientToServerMessage,
+  Disposable,
+  ClientToServerMessageWithPayload,
+} from './types';
 
 import messageBus from './MessageBus';
 import {deserializeFromString, serializeToString} from './serialize';
+import {defer} from 'shared/utils';
 
 export type IncomingMessage = ServerToClientMessage;
-export type OutgoingMessage = ClientToServerMessage;
+export type OutgoingMessage = ClientToServerMessage | ClientToServerMessageWithPayload;
 
 export interface ClientToServerAPI {
   dispose(): void;
@@ -67,23 +73,62 @@ class ClientToServerAPIImpl implements ClientToServerAPI {
     };
   }
 
-  postMessage(message: OutgoingMessage) {
+  /**
+   * Returns the next message in the stream of `type` that also matches the given predicate.
+   */
+  nextMessageMatching<T extends IncomingMessage['type']>(
+    type: T,
+    test: (message: IncomingMessage & {type: T}) => boolean,
+  ): Promise<IncomingMessage & {type: T}> {
+    const deferred = defer<IncomingMessage & {type: T}>();
+    let dispose: Disposable | null = this.onMessageOfType(type, message => {
+      if (test(message)) {
+        dispose?.dispose();
+        dispose = null;
+        deferred.resolve(message);
+      }
+    });
+
+    return deferred.promise;
+  }
+
+  postMessage(message: ClientToServerMessage) {
     messageBus.postMessage(serializeToString(message));
   }
 
-  onConnectOrReconnect(callback: () => unknown): () => void {
+  /**
+   * Post a message with an ArrayBuffer binary payload.
+   * No need to specify `hasBinaryPayload: true` in your message.
+   * This actually sends two messages: the JSON text message, then the binary payload, and reconnects them on the server.
+   */
+  postMessageWithPayload(
+    // Omit lets callers not include hasBinaryPayload themselves, since it's implicit in calling postMessageWithPayload.
+    message: Omit<ClientToServerMessageWithPayload, 'hasBinaryPayload'>,
+    payload: ArrayBuffer,
+  ) {
+    messageBus.postMessage(
+      serializeToString({...message, hasBinaryPayload: true} as ClientToServerMessageWithPayload),
+    );
+    messageBus.postMessage(payload);
+  }
+
+  onConnectOrReconnect(callback: () => (() => unknown) | unknown): () => void {
     let reconnecting = true;
+    let disposeCallback: (() => unknown) | unknown = undefined;
     const disposable = messageBus.onChangeStatus(newStatus => {
       if (newStatus.type === 'reconnecting') {
         reconnecting = true;
       } else if (newStatus.type === 'open') {
         if (reconnecting) {
-          callback();
+          disposeCallback = callback();
         }
         reconnecting = false;
       }
     });
-    return () => disposable.dispose();
+    return () => {
+      disposable.dispose();
+      typeof disposeCallback === 'function' && disposeCallback?.();
+    };
   }
 }
 

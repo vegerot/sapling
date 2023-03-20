@@ -70,6 +70,7 @@ impl PendingChangesTrait for PhysicalFileSystem {
     fn pending_changes(
         &self,
         matcher: Arc<dyn Matcher + Send + Sync + 'static>,
+        _ignore_matcher: Arc<dyn Matcher + Send + Sync + 'static>,
         last_write: SystemTime,
         _config: &dyn Config,
         _io: &IO,
@@ -86,7 +87,6 @@ impl PendingChangesTrait for PhysicalFileSystem {
         let manifests =
             WorkingCopy::current_manifests(&self.treestate.lock(), &self.tree_resolver)?;
         let file_change_detector = FileChangeDetector::new(
-            self.treestate.clone(),
             self.vfs.clone(),
             last_write.try_into()?,
             manifests[0].clone(),
@@ -101,7 +101,7 @@ impl PendingChangesTrait for PhysicalFileSystem {
             seen: HashSet::new(),
             tree_iter: None,
             lookup_iter: None,
-            file_change_detector,
+            file_change_detector: Some(file_change_detector),
         };
         Ok(Box::new(pending_changes))
     }
@@ -116,7 +116,7 @@ pub struct PendingChanges<M: Matcher + Clone + Send + Sync + 'static> {
     seen: HashSet<RepoPathBuf>,
     tree_iter: Option<Box<dyn Iterator<Item = Result<PendingChangeResult>> + Send>>,
     lookup_iter: Option<Box<dyn Iterator<Item = Result<PendingChangeResult>> + Send>>,
-    file_change_detector: FileChangeDetector,
+    file_change_detector: Option<FileChangeDetector>,
 }
 
 #[derive(PartialEq)]
@@ -143,14 +143,22 @@ impl<M: Matcher + Clone + Send + Sync + 'static> PendingChanges<M> {
         loop {
             match self.walker.next() {
                 Some(Ok(WalkEntry::File(file, metadata))) => {
+                    let mut ts = self.treestate.lock();
+
                     // On case insensitive systems, normalize the path so duplicate paths with
                     // different case can be detected in the seen set.
-                    let file = self.treestate.lock().normalize(file.as_ref())?;
+                    let file = ts.normalize_path(file.as_ref())?;
                     let path = RepoPath::from_utf8(file.as_ref())?;
                     self.seen.insert(path.to_owned());
                     let changed = self
                         .file_change_detector
-                        .has_changed_with_fresh_metadata(path, metadata)?;
+                        .as_mut()
+                        .unwrap()
+                        .has_changed_with_fresh_metadata(
+                            ts.normalized_get(path)?,
+                            path,
+                            Some(metadata),
+                        )?;
 
                     if let FileChangeResult::Yes(change_type) = changed {
                         return Ok(Some(PendingChangeResult::File(change_type)));
@@ -180,60 +188,49 @@ impl<M: Matcher + Clone + Send + Sync + 'static> PendingChanges<M> {
     }
 
     fn get_tree_entries(&mut self) -> Vec<Result<PendingChangeResult>> {
-        let mut results = vec![];
-        let tracked = self.get_tracked_from_p1();
-        if let Err(e) = tracked {
-            results.push(Err(e));
-            return results;
-        }
-        let tracked = tracked.unwrap();
+        let tracked = match self.get_tracked_from_p1() {
+            Err(e) => return vec![Err(e)],
+            Ok(tracked) => tracked,
+        };
+        let mut ts = self.treestate.lock();
 
-        for path in tracked.into_iter() {
-            let cow_path = match self.treestate.lock().normalize(path.as_ref()) {
-                Ok(path) => path,
-                Err(e) => {
-                    results.push(Err(e));
-                    continue;
-                }
-            };
-            let path: &RepoPath = match RepoPath::from_utf8(cow_path.as_ref()) {
-                Ok(path) => path,
-                Err(e) => {
-                    results.push(Err(e.into()));
-                    continue;
-                }
-            };
-            // Skip this path if we've seen it or it doesn't match the matcher.
-            if self.seen.contains(path) {
-                continue;
-            } else {
-                match self.matcher.matches_file(path) {
-                    Err(e) => {
-                        results.push(Err(e));
-                        continue;
+        tracked
+            .into_iter()
+            .filter_map(|path| {
+                let cow_path = match ts.normalize_path(path.as_ref()) {
+                    Ok(path) => path,
+                    Err(e) => return Some(Err(e)),
+                };
+                let path: &RepoPath = match RepoPath::from_utf8(cow_path.as_ref()) {
+                    Ok(path) => path,
+                    Err(e) => return Some(Err(e.into())),
+                };
+                // Skip this path if we've seen it or it doesn't match the matcher.
+                if self.seen.contains(path) {
+                    return None;
+                } else {
+                    match self.matcher.matches_file(path) {
+                        Err(e) => {
+                            return Some(Err(e));
+                        }
+                        Ok(false) => return None,
+                        Ok(true) => {}
                     }
-                    Ok(false) => continue,
-                    Ok(true) => {}
                 }
-            }
 
-            let changed = match self.file_change_detector.has_changed(path) {
-                Ok(result) => result,
-                Err(e) => {
-                    results.push(Err(e));
-                    continue;
-                }
-            };
+                let ts_state = match ts.normalized_get(path) {
+                    Err(err) => return Some(Err(err)),
+                    Ok(state) => state,
+                };
 
-            if let FileChangeResult::Yes(change_type) = changed {
-                // We expect the change type to be deleted here because in an ideal world we
-                // wouldn't see any paths that exist on disk that weren't found by the walk phase,
-                // but there can be ignored files that the walk ignores but that are in the
-                // dirstate. So we compare them here to see if they changed.
-                results.push(Ok(PendingChangeResult::File(change_type)));
-            }
-        }
-        results
+                self.file_change_detector
+                    .as_mut()
+                    .unwrap()
+                    .submit(ts_state, path);
+
+                None
+            })
+            .collect()
     }
 
     /// Returns the files in the treestate that are from p1.
@@ -263,7 +260,9 @@ impl<M: Matcher + Clone + Send + Sync + 'static> PendingChanges<M> {
             .get_or_insert_with(|| {
                 let iter = self
                     .file_change_detector
-                    .resolve_maybes()
+                    .take()
+                    .unwrap()
+                    .into_iter()
                     .filter_map(|result| match result {
                         Ok(ResolvedFileChangeResult::Yes(change_type)) => {
                             Some(Ok(PendingChangeResult::File(change_type)))

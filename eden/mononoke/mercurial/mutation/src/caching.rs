@@ -16,9 +16,9 @@ use anyhow::Error;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
-use cachelib::VolatileLruCachePool;
 use caching_ext::get_or_fill_chunked;
 use caching_ext::CacheDisposition;
+use caching_ext::CacheHandlerFactory;
 use caching_ext::CacheTtl;
 use caching_ext::CachelibHandler;
 use caching_ext::EntityStore;
@@ -28,11 +28,9 @@ use caching_ext::McResult;
 use caching_ext::MemcacheEntity;
 use caching_ext::MemcacheHandler;
 use context::CoreContext;
-use fbinit::FacebookInit;
 use fbthrift::compact_protocol;
 use hg_mutation_entry_thrift as thrift;
 use memcache::KeyGen;
-use memcache::MemcacheClient;
 use mercurial_types::HgChangesetId;
 use mercurial_types::HgNodeHash;
 use mononoke_types::RepositoryId;
@@ -115,40 +113,32 @@ impl HgMutationCacheEntry {
 #[derive(Clone)]
 pub struct CachedHgMutationStore {
     inner_store: Arc<dyn HgMutationStore>,
-    cache_pool: CachelibHandler<HgMutationCacheEntry>,
+    cachelib: CachelibHandler<HgMutationCacheEntry>,
     memcache: MemcacheHandler,
     keygen: KeyGen,
 }
 
 impl CachedHgMutationStore {
     pub fn new(
-        fb: FacebookInit,
         inner_store: Arc<dyn HgMutationStore>,
-        cache_pool: VolatileLruCachePool,
+        cache_handler_factory: CacheHandlerFactory,
     ) -> Self {
         Self {
             inner_store,
-            cache_pool: cache_pool.into(),
-            memcache: MemcacheClient::new(fb)
-                .expect("Memcache initialization failed")
-                .into(),
+            cachelib: cache_handler_factory.cachelib(),
+            memcache: cache_handler_factory.memcache(),
             keygen: CachedHgMutationStore::create_key_gen(),
         }
     }
 
     pub fn new_test(inner_store: Arc<dyn HgMutationStore>) -> Self {
-        Self {
-            inner_store,
-            cache_pool: CachelibHandler::create_mock(),
-            memcache: MemcacheHandler::create_mock(),
-            keygen: CachedHgMutationStore::create_key_gen(),
-        }
+        Self::new(inner_store, CacheHandlerFactory::Mocked)
     }
 
     fn create_key_gen() -> KeyGen {
         let key_prefix = "scm.mononoke.hg_mutation_store";
-        let sitever = if tunables().get_hg_mutation_store_sitever() > 0 {
-            tunables().get_hg_mutation_store_sitever() as u32
+        let sitever = if tunables().hg_mutation_store_sitever().unwrap_or_default() > 0 {
+            tunables().hg_mutation_store_sitever().unwrap_or_default() as u32
         } else {
             thrift::MC_SITEVER as u32
         };
@@ -197,7 +187,7 @@ impl HgMutationStore for CachedHgMutationStore {
         let repo_id = self.repo_id();
 
         let mutation_entries_by_changeset =
-            get_or_fill_chunked(cache_request, changeset_ids, CHUNK_SIZE, PARALLEL_CHUNKS)
+            get_or_fill_chunked(&cache_request, changeset_ids, CHUNK_SIZE, PARALLEL_CHUNKS)
                 .await?
                 .into_iter()
                 .map(|(cs_id, val)| val.into_entries(repo_id, cs_id))
@@ -226,7 +216,7 @@ type CacheRequest<'a> = (&'a CoreContext, &'a CachedHgMutationStore);
 impl EntityStore<HgMutationCacheEntry> for CacheRequest<'_> {
     fn cachelib(&self) -> &CachelibHandler<HgMutationCacheEntry> {
         let (_, inner_store) = self;
-        &inner_store.cache_pool
+        &inner_store.cachelib
     }
 
     fn keygen(&self) -> &KeyGen {
@@ -240,8 +230,14 @@ impl EntityStore<HgMutationCacheEntry> for CacheRequest<'_> {
     }
 
     fn cache_determinator(&self, _: &HgMutationCacheEntry) -> CacheDisposition {
-        let ttl = if tunables().get_hg_mutation_store_caching_ttl_secs() > 0 {
-            tunables().get_hg_mutation_store_caching_ttl_secs() as u64
+        let ttl = if tunables()
+            .hg_mutation_store_caching_ttl_secs()
+            .unwrap_or_default()
+            > 0
+        {
+            tunables()
+                .hg_mutation_store_caching_ttl_secs()
+                .unwrap_or_default() as u64
         } else {
             DEFAULT_TTL_SECS
         };

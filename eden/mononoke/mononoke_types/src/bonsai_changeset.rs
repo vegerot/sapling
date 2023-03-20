@@ -55,6 +55,25 @@ pub struct BonsaiChangesetMut {
     pub git_annotated_tag: Option<BonsaiAnnotatedTag>,
 }
 
+impl Default for BonsaiChangesetMut {
+    fn default() -> Self {
+        Self {
+            parents: Vec::new(),
+            author: String::default(),
+            author_date: DateTime::now(),
+            committer: None,
+            committer_date: None,
+            message: String::default(),
+            hg_extra: SortedVectorMap::default(),
+            git_extra_headers: None,
+            file_changes: SortedVectorMap::default(),
+            is_snapshot: false,
+            git_tree_hash: None,
+            git_annotated_tag: None,
+        }
+    }
+}
+
 impl BonsaiChangesetMut {
     /// Create from a thrift `BonsaiChangeset`.
     fn from_thrift(tc: thrift::BonsaiChangeset) -> Result<Self> {
@@ -154,7 +173,7 @@ impl BonsaiChangesetMut {
     pub fn verify(&self) -> Result<()> {
         // Check that the copy info ID refers to a parent in the parent set.
         for (path, fc) in &self.file_changes {
-            if let Some(&(ref copy_from_path, ref copy_from_id)) = fc.copy_from() {
+            if let Some((copy_from_path, copy_from_id)) = fc.copy_from() {
                 if !self.parents.contains(copy_from_id) {
                     bail!(ErrorKind::InvalidBonsaiChangeset(format!(
                         "copy information for path '{}' (from '{}') has parent {} which isn't \

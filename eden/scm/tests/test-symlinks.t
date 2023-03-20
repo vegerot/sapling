@@ -1,13 +1,16 @@
 #chg-compatible
 #debugruntest-compatible
+  $ eagerepo
+FIXME(status):
+  $ setconfig status.use-rust=false
   $ setconfig workingcopy.ruststatus=False
   $ setconfig experimental.allowfilepeer=True
 
-#require symlink mkfifo
+#require symlink
 
 == tests added in 0.7 ==
 
-  $ hg init test-symlinks-0.7; cd test-symlinks-0.7;
+  $ newclientrepo test-symlinks-0.7
   $ touch foo; ln -s foo bar; ln -s nonexistent baz
 
 import with add and addremove -- symlink walking should _not_ screwup.
@@ -38,10 +41,11 @@ Assert screamed here before, should go by without consequence
   $ hg commit -m 'is there a bug?'
   $ cd ..
 
+#if mkfifo
 
 == fifo & ignore ==
 
-  $ hg init test; cd test;
+  $ newclientrepo
 
   $ mkdir dir
   $ touch a.c dir/a.o dir/b.o
@@ -73,6 +77,7 @@ it should show a.c, dir/a.o and dir/b.o deleted
   ! a.c
   $ cd ..
 
+#endif
 
 == symlinks from outside the tree ==
 
@@ -89,14 +94,25 @@ test absolute path through symlink outside repo
 
 try symlink outside repo to file inside
 
-  $ ln -s x/f ../z
+  $ mkdir foo bar
+  $ echo a > foo/a
+  $ ln -s `pwd`/foo/a bar/in-repo-symlink
+  $ hg add -q
+  $ hg st
+  A bar/in-repo-symlink
+  A f
+  A foo/a
+  $ ln -s `pwd`/bar ../bar
 
-this should fail
+Show that we follow $TESTTMP/bar symlink into repo, but don't follow in-repo-symlink:
 
-  $ hg status ../z && { echo hg mistakenly exited with status 0; exit 1; } || :
-  abort: ../z not under root '$TESTTMP/x'
+  $ hg revert ../bar/in-repo-symlink
+  $ hg st
+  A f
+  A foo/a
+  ? bar/in-repo-symlink
+
   $ cd ..
-
 
 == cloning symlinks ==
   $ hg init clone; cd clone;
@@ -199,8 +215,7 @@ commit and update back
   $ cd ..
 
 
-  $ hg init b
-  $ cd b
+  $ newclientrepo
   $ ln -s nothing dangling
   $ hg commit -m 'commit symlink without adding' dangling
   abort: dangling: file not tracked!

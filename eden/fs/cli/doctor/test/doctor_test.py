@@ -19,6 +19,7 @@ import eden.fs.cli.doctor as doctor
 from eden.fs.cli.config import EdenCheckout, EdenInstance
 from eden.fs.cli.doctor import check_hg, check_watchman
 from eden.fs.cli.doctor.check_filesystems import (
+    check_hg_status_match_hg_diff,
     check_loaded_content,
     check_materialized_are_accessible,
 )
@@ -36,7 +37,10 @@ from eden.fs.cli.doctor.test.lib.testcase import DoctorTestBase
 from eden.fs.cli.prjfs import PRJ_FILE_STATE
 from eden.fs.cli.test.lib.output import TestOutput
 from facebook.eden.ttypes import (
+    GetScmStatusResult,
     MountInodeInfo,
+    ScmFileStatus,
+    ScmStatus,
     SHA1Result,
     TreeInodeDebugInfo,
     TreeInodeEntryDebugInfo,
@@ -274,8 +278,8 @@ To start EdenFS, run:
     eden start
 
 <yellow>1 issue requires manual attention\.<reset>
-Ask in the EdenFS (Windows )?Users group if you need help fixing issues with EdenFS:
-(https://fb\.facebook\.com/groups/eden\.users/|https://fb\.workplace\.com/groups/edenfswindows)
+Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if you need help fixing issues with EdenFS:
+(https://fb\.workplace\.com/groups/eden\.users|https://fb\.workplace\.com/groups/edenfswindows|https://fb\.workplace\.com/groups/edenfsmacos)
 """,
         )
         self.assertEqual(1, exit_code)
@@ -306,13 +310,15 @@ Ask in the EdenFS (Windows )?Users group if you need help fixing issues with Ede
             out.getvalue(),
             r"""<yellow>- Found problem:<reset>
 EdenFS is currently still starting\.
-Please wait for edenfs to finish starting\.
+Please wait for edenfs to finish starting\. You can watch it's progress with
+`eden status --wait`\.
+
 If EdenFS seems to be taking too long to start you can try restarting it
 with "eden restart --force"
 
 <yellow>1 issue requires manual attention\.<reset>
-Ask in the EdenFS (Windows )?Users group if you need help fixing issues with EdenFS:
-(https://fb\.facebook\.com/groups/eden\.users/|https://fb\.workplace\.com/groups/edenfswindows)
+Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if you need help fixing issues with EdenFS:
+(https://fb\.workplace\.com/groups/eden\.users|https://fb\.workplace\.com/groups/edenfswindows|https://fb\.workplace\.com/groups/edenfsmacos)
 """,
         )
         self.assertEqual(1, exit_code)
@@ -348,8 +354,8 @@ Either wait for edenfs to exit, or to forcibly kill EdenFS, run:
     eden stop --kill
 
 <yellow>1 issue requires manual attention\.<reset>
-Ask in the EdenFS (Windows )?Users group if you need help fixing issues with EdenFS:
-(https://fb\.facebook\.com/groups/eden\.users/|https://fb\.workplace\.com/groups/edenfswindows)
+Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if you need help fixing issues with EdenFS:
+(https://fb\.workplace\.com/groups/eden\.users|https://fb\.workplace\.com/groups/edenfswindows|https://fb\.workplace\.com/groups/edenfsmacos)
 """,
         )
         self.assertEqual(1, exit_code)
@@ -876,8 +882,8 @@ Run "cd / && cd -" to update your shell's working directory\.
 
 Checking .*
 <yellow>1 issue requires manual attention\.<reset>
-Ask in the EdenFS (Windows )?Users group if you need help fixing issues with EdenFS:
-(https://fb\.facebook\.com/groups/eden\.users/|https://fb\.workplace\.com/groups/edenfswindows)
+Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if you need help fixing issues with EdenFS:
+(https://fb\.workplace\.com/groups/eden\.users|https://fb\.workplace\.com/groups/edenfswindows|https://fb\.workplace\.com/groups/edenfsmacos)
 """,
         )
         self.assertEqual(1, exit_code)
@@ -1379,7 +1385,7 @@ Fixing files known to EdenFS but not present on disk in {Path(mount)}...<green>f
 Checking {checkout.path}
 <yellow>- Found problem:<reset>
 Mount point {checkout.path} has 9000000 files on disk, which may impact EdenFS performance
-Invalidating all non-materialized files and directories in {checkout.path}...<green>fixed<reset>
+Starting background invalidation of not recently used files and directories in {checkout.path}...<green>fixed<reset>
 
 <yellow>Successfully fixed 1 problem.<reset>
 """,
@@ -1416,16 +1422,64 @@ Invalidating all non-materialized files and directories in {checkout.path}...<gr
             r"""<yellow>- Found problem:<reset>
 Slow file download taking up to 15 minutes observed
 Try:
-- Running `hg debugnetwork`.
-- Checking your network connection's performance.
-- Running `eden top` to check whether downloads are making progress.
+- Running `hg debugnetwork`\.
+- Checking your network connection's performance\.
+- Running `eden top` to check whether downloads are making progress\.
 
 <yellow>1 issue requires manual attention\.<reset>
-Ask in the EdenFS (Windows )?Users group if you need help fixing issues with EdenFS:
-(https://fb\.facebook\.com/groups/eden\.users/|https://fb\.workplace\.com/groups/edenfswindows)
+Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if you need help fixing issues with EdenFS:
+(https://fb\.workplace\.com/groups/eden\.users|https://fb\.workplace\.com/groups/edenfswindows|https://fb\.workplace\.com/groups/edenfsmacos)
 """,
         )
         self.assertEqual(exit_code, 1)
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.getScmStatusV2")
+    @patch("subprocess.run")
+    def test_hg_status_and_diff_agree(
+        self, mock_subprocess_run, mock_getScmStatusV2
+    ) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+
+        mock_getScmStatusV2.return_value = GetScmStatusResult(
+            status=ScmStatus(entries={b"foo/bar": ScmFileStatus.MODIFIED})
+        )
+        mock_subprocess_run.return_value = subprocess.CompletedProcess(
+            stdout='{"foo/bar": {"adds": 2, "isbinary": false, "removes": 0}}',
+            args=["hg", "diff", "--per-file-stat-json"],
+            returncode=0,
+        )
+
+        tracker = ProblemCollector()
+        # pyre-fixme[6]: For 1st param expected `EdenInstance` but got
+        # `FakeEdenInstance`.
+        check_hg_status_match_hg_diff(tracker, instance, checkout)
+        self.assertEqual(tracker.problems, [])
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.getScmStatusV2")
+    @patch("subprocess.run")
+    def test_hg_status_and_diff_mismatch(
+        self, mock_subprocess_run, mock_getScmStatusV2
+    ) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+
+        mock_getScmStatusV2.return_value = GetScmStatusResult(
+            status=ScmStatus(entries={b"foo/bar": ScmFileStatus.MODIFIED})
+        )
+        mock_subprocess_run.return_value = subprocess.CompletedProcess(
+            stdout="{}", args=["hg", "diff", "--stat"], returncode=0
+        )
+
+        tracker = ProblemCollector()
+        # pyre-fixme[6]: For 1st param expected `EdenInstance` but got
+        # `FakeEdenInstance`.
+        check_hg_status_match_hg_diff(tracker, instance, checkout)
+        self.assertEqual(len(tracker.problems), 1)
+        self.assertEqual(
+            tracker.problems[0].description(),
+            f"{Path('foo/bar')} is present as modified in `hg status` but not in `hg diff`",
+        )
 
 
 def _create_watchman_subscription(

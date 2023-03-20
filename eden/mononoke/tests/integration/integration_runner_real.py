@@ -72,6 +72,7 @@ def is_libfb_present() -> bool:
 
 class TestFlags(NamedTuple):
     interactive: bool
+    update_output: bool
     verbose: bool
     debug: bool
     keep_tmpdir: bool
@@ -83,6 +84,9 @@ class TestFlags(NamedTuple):
 
         if self.interactive:
             r.append("--interactive")
+
+        if self.update_output:
+            r.append("--update-output")
 
         if self.verbose:
             r.append("--verbose")
@@ -172,6 +176,7 @@ def _hg_runner(
     disable_all_network_access: bool = False,
     chg: bool = False,
     interactive: bool = False,
+    update_output: bool = False,
     quiet: bool = False,
 ) -> None:
     if "SANDCASTLE" in os.environ and os.path.exists("/dev/shm"):
@@ -331,6 +336,9 @@ def run_tests(
 @click.option(
     "--interactive", default=False, is_flag=True, help="prompt to accept changed output"
 )
+@click.option(
+    "--update-output", default=False, is_flag=True, help="accept changed output"
+)
 @click.option("--output", default=None, help="output directory")
 @click.option("--verbose", default=False, is_flag=True, help="output verbose messages")
 @click.option(
@@ -390,6 +398,7 @@ def run(
     tests,
     dry_run: bool,
     interactive,
+    update_output,
     output: str,
     verbose,
     debug,
@@ -432,6 +441,7 @@ def run(
 
     test_flags: TestFlags = TestFlags(
         interactive,
+        update_output,
         verbose,
         debug,
         keep_tmpdir,

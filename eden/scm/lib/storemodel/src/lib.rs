@@ -46,6 +46,11 @@ pub trait ReadFileContents {
         &self,
         keys: Vec<Key>,
     ) -> BoxStream<Result<(minibytes::Bytes, Key), Self::Error>>;
+
+    /// Read rename metadata of sepcified files.
+    ///
+    /// The result is a vector of (key, Option<rename_from_key>) pairs for success case.
+    fn read_rename_metadata(&self, keys: Vec<Key>) -> Result<Vec<(Key, Option<Key>)>, Self::Error>;
 }
 
 pub trait RefreshableReadFileContents: ReadFileContents {
@@ -64,6 +69,10 @@ pub trait ReadRootTreeIds {
 /// writing storage migration.
 #[auto_impl::auto_impl(Arc)]
 pub trait TreeStore {
+    /// Read the contents of a directory.
+    ///
+    /// The result is opaque bytes data, encoded using the format specified by `format()`.
+    /// To parse the bytes consider `manifest_tree::TreeEntry`.
     fn get(&self, path: &RepoPath, hgid: HgId) -> anyhow::Result<minibytes::Bytes>;
 
     fn insert(&self, path: &RepoPath, hgid: HgId, data: minibytes::Bytes) -> anyhow::Result<()>;

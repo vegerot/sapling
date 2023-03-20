@@ -358,6 +358,14 @@ def gitcommittext(
     #
     # Updating submodules
     committer = (extra.get("committer") if extra else None) or user
+
+    # Bail out early with concise error if usernames are not valid.
+    try:
+        gituser.parse_username(committer)
+        gituser.parse_username(user)
+    except ValueError as ex:
+        raise error.Abort(ex)
+
     committerdate = (extra.get("committer_date") if extra else None) or date
     parent_entries = "".join(f"parent {hex(p)}\n" for p in parents)
     pre_sig_text = f"""\
@@ -371,23 +379,29 @@ committer {gituser.normalize(committer)} {gitdatestr(committerdate)}"""
     if not gpgkeyid:
         return text
 
-    # This should match how Git signs commits:
-    # https://github.com/git/git/blob/2e71cbbddd64695d43383c25c7a054ac4ff86882/gpg-interface.c#L956-L960
-    # Long-form arguments for `gpg` are used for clarity.
-    sig_bytes = subprocess.check_output(
-        [
-            # Should the path to gpg be configurable?
-            "gpg",
-            "--status-fd=2",
-            "--detach-sign",
-            "--sign",
-            "--armor",
-            "--local-user",
-            gpgkeyid,
-        ],
-        stderr=subprocess.DEVNULL,
-        input=text,
-    )
+    try:
+        # This should match how Git signs commits:
+        # https://github.com/git/git/blob/2e71cbbddd64695d43383c25c7a054ac4ff86882/gpg-interface.c#L956-L960
+        # Long-form arguments for `gpg` are used for clarity.
+        sig_bytes = subprocess.check_output(
+            [
+                # Should the path to gpg be configurable?
+                "gpg",
+                "--status-fd=2",
+                "--detach-sign",
+                "--sign",
+                "--armor",
+                "--always-trust",
+                "--yes",
+                "--local-user",
+                gpgkeyid,
+            ],
+            stderr=subprocess.DEVNULL,
+            input=text,
+        )
+    except subprocess.CalledProcessError:
+        raise error.Abort(_("error when running gpg with gpgkeyid %s") % gpgkeyid)
+
     return _signedgitcommittext(sig_bytes, pre_sig_text, normalized_desc, gpgkeyid)
 
 

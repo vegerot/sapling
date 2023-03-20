@@ -11,8 +11,8 @@ use std::fmt;
 use anyhow::Result;
 use async_trait::async_trait;
 use bookmarks::BookmarkUpdateReason;
+use bookmarks_types::BookmarkKey;
 use bookmarks_types::BookmarkKind;
-use bookmarks_types::BookmarkName;
 use context::CoreContext;
 use logger_ext::Loggable;
 use metaconfig_types::RepoConfigRef;
@@ -67,7 +67,7 @@ impl BookmarkOperation {
 }
 
 pub struct BookmarkInfo {
-    pub bookmark_name: BookmarkName,
+    pub bookmark_name: BookmarkKey,
     pub bookmark_kind: BookmarkKind,
     pub operation: BookmarkOperation,
     pub reason: BookmarkUpdateReason,
@@ -125,6 +125,7 @@ impl Loggable for PlainBookmarkInfo {
             .set_operation(self.operation.clone())
             .set_update_reason(self.update_reason.clone());
 
+        logger.attach_raw_scribe_write_cat()?;
         logger.log_async()?;
 
         Ok(())

@@ -9,7 +9,9 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 
+use anyhow::anyhow;
 use blobstore::Loadable;
+use borrowed::borrowed;
 use bytes::Bytes;
 use changesets::ChangesetsRef;
 use chrono::DateTime;
@@ -21,13 +23,12 @@ use filestore::FilestoreConfig;
 use filestore::FilestoreConfigRef;
 use filestore::StoreRequest;
 use futures::stream;
-use futures::stream::FuturesOrdered;
-use futures::stream::FuturesUnordered;
 use futures::stream::Stream;
 use futures::stream::TryStreamExt;
 use futures::try_join;
 use futures::StreamExt;
 use futures_stats::TimedFutureExt;
+use itertools::Itertools;
 use manifest::PathTree;
 use metaconfig_types::RepoConfigRef;
 use mononoke_types::fsnode::FsnodeEntry;
@@ -44,6 +45,7 @@ use repo_blobstore::RepoBlobstoreRef;
 use repo_identity::RepoIdentityRef;
 use repo_update_logger::log_new_commits;
 use repo_update_logger::CommitInfo;
+use smallvec::SmallVec;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::changeset::ChangesetContext;
@@ -65,31 +67,91 @@ impl CreateCopyInfo {
         CreateCopyInfo { path, parent_index }
     }
 
-    async fn resolve(
+    async fn check_valid(
+        &self,
+        stack_changes: Option<&PathTree<CreateChangeType>>,
+        stack_parents: &[ChangesetContext],
+    ) -> Result<(), MononokeError> {
+        if let Some(stack_changes) = stack_changes {
+            // Since this is a stacked commit, there is only one parent.
+            if self.parent_index > 0 {
+                return Err(MononokeError::InvalidRequest(format!(
+                    "Parent index '{}' out of range for stacked commit",
+                    self.parent_index,
+                )));
+            }
+            // Check if the copy-from path was added or removed in the stack.
+            match stack_changes.get(self.path.as_mpath()) {
+                None | Some(CreateChangeType::None) => {}
+                Some(CreateChangeType::Change) => {
+                    return Ok(());
+                }
+                Some(CreateChangeType::Deletion) => {
+                    return Err(MononokeError::InvalidRequest(String::from(
+                        "Copy-from path references a file deleted earler in the stack",
+                    )));
+                }
+            }
+            // Check if the copy-from path was deleted by a prefix change.
+            for prefix in self.path.prefixes() {
+                if stack_changes.get(prefix.as_mpath()) == Some(&CreateChangeType::Change) {
+                    return Err(MononokeError::InvalidRequest(String::from(
+                        "Copy-from path references a file in a directory deleted earler in the stack",
+                    )));
+                }
+            }
+            // The copy-from path wasn't touched in the stack, check it was in
+            // at least one of the stack's parents.
+            for parent_ctx in stack_parents {
+                if parent_ctx
+                    .path_with_content(self.path.clone())
+                    .await?
+                    .is_file()
+                    .await?
+                {
+                    return Ok(());
+                }
+            }
+        } else {
+            // This is the root of the stack.  Check the specific parent.
+            let parent_ctx = stack_parents.get(self.parent_index).ok_or_else(|| {
+                MononokeError::InvalidRequest(format!(
+                    "Parent index '{}' out of range for commit with {} parent(s)",
+                    self.parent_index,
+                    stack_parents.len()
+                ))
+            })?;
+            // Check the file exists in that parent.
+            if parent_ctx
+                .path_with_content(self.path.clone())
+                .await?
+                .is_file()
+                .await?
+            {
+                return Ok(());
+            }
+        };
+
+        Err(MononokeError::InvalidRequest(String::from(
+            "Copy-from path must reference a file",
+        )))
+    }
+
+    fn into_file_change(
         self,
-        parents: &[ChangesetContext],
+        parent_ids: &[ChangesetId],
     ) -> Result<(MPath, ChangesetId), MononokeError> {
-        let parent_ctx = parents.get(self.parent_index).ok_or_else(|| {
-            MononokeError::InvalidRequest(format!(
-                "Parent index '{}' out of range for commit with {} parent(s)",
-                self.parent_index,
-                parents.len()
-            ))
-        })?;
-        if !parent_ctx
-            .path_with_content(self.path.clone())
-            .await?
-            .is_file()
-            .await?
-        {
-            return Err(MononokeError::InvalidRequest(String::from(
-                "Copy-from path must reference a file",
-            )));
-        }
         let mpath = self.path.into_mpath().ok_or_else(|| {
             MononokeError::InvalidRequest(String::from("Copy-from path cannot be the root"))
         })?;
-        Ok((mpath, parent_ctx.id()))
+        let parent_id = parent_ids.get(self.parent_index).ok_or_else(|| {
+            MononokeError::InvalidRequest(format!(
+                "Parent index '{}' out of range for commit with {} parent(s)",
+                self.parent_index,
+                parent_ids.len()
+            ))
+        })?;
+        Ok((mpath, *parent_id))
     }
 }
 
@@ -150,65 +212,92 @@ impl CreateChangeType {
 }
 
 impl CreateChange {
-    pub async fn resolve(
-        self,
+    async fn resolve(
+        &mut self,
         ctx: &CoreContext,
         filestore_config: FilestoreConfig,
         repo_blobstore: RepoBlobstore,
-        parents: &[ChangesetContext],
-    ) -> Result<FileChange, MononokeError> {
-        let (file, copy_info, tracked) = match self {
-            CreateChange::Tracked(file, copy_info) => (
-                file,
-                match copy_info {
-                    Some(copy_info) => Some(copy_info.resolve(parents).await?),
-                    None => None,
-                },
-                true,
-            ),
-            CreateChange::Untracked(file) => (file, None, false),
-            CreateChange::UntrackedDeletion => return Ok(FileChange::UntrackedDeletion),
-            CreateChange::Deletion => return Ok(FileChange::Deletion),
+        stack_changes: Option<&PathTree<CreateChangeType>>,
+        stack_parents: &[ChangesetContext],
+    ) -> Result<(), MononokeError> {
+        let file = match self {
+            CreateChange::Tracked(file, copy_info) => {
+                if let Some(copy_info) = copy_info {
+                    copy_info.check_valid(stack_changes, stack_parents).await?;
+                }
+                file
+            }
+            CreateChange::Untracked(file) => file,
+            CreateChange::UntrackedDeletion | CreateChange::Deletion => return Ok(()),
         };
-        let (file_id, file_type, size) = match file {
+        match file {
             CreateChangeFile::New { bytes, file_type } => {
                 let meta = filestore::store(
                     &repo_blobstore,
                     filestore_config,
                     ctx,
                     &StoreRequest::new(bytes.len() as u64),
-                    stream::once(async move { Ok(bytes) }),
+                    stream::once(async move { Ok(bytes.clone()) }),
                 )
                 .await?;
-                (meta.content_id, file_type, meta.total_size)
+                let file_type = *file_type;
+                *file = CreateChangeFile::Existing {
+                    file_id: meta.content_id,
+                    file_type,
+                    maybe_size: Some(meta.total_size),
+                };
             }
             CreateChangeFile::Existing {
                 file_id,
-                file_type,
                 maybe_size,
-            } => (
+                ..
+            } => {
+                if maybe_size.is_none() {
+                    let size = filestore::get_metadata(
+                        &repo_blobstore,
+                        ctx,
+                        &FetchKey::Canonical(*file_id),
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        MononokeError::InvalidRequest(format!(
+                            "File id '{}' is not available in this repo",
+                            file_id
+                        ))
+                    })?
+                    .total_size;
+                    *maybe_size = Some(size);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn into_file_change(self, parent_ids: &[ChangesetId]) -> Result<FileChange, MononokeError> {
+        match self {
+            CreateChange::Tracked(
+                CreateChangeFile::Existing {
+                    file_id,
+                    file_type,
+                    maybe_size: Some(size),
+                },
+                copy_info,
+            ) => Ok(FileChange::tracked(
                 file_id,
                 file_type,
-                match maybe_size {
-                    Some(size) => size,
-                    None => {
-                        filestore::get_metadata(&repo_blobstore, ctx, &FetchKey::Canonical(file_id))
-                            .await?
-                            .ok_or_else(|| {
-                                MononokeError::InvalidRequest(format!(
-                                    "File id '{}' is not available in this repo",
-                                    file_id
-                                ))
-                            })?
-                            .total_size
-                    }
-                },
-            ),
-        };
-        if tracked {
-            Ok(FileChange::tracked(file_id, file_type, size, copy_info))
-        } else {
-            Ok(FileChange::untracked(file_id, file_type, size))
+                size,
+                copy_info
+                    .map(|copy_info| copy_info.into_file_change(parent_ids))
+                    .transpose()?,
+            )),
+            CreateChange::Untracked(CreateChangeFile::Existing {
+                file_id,
+                file_type,
+                maybe_size: Some(size),
+            }) => Ok(FileChange::untracked(file_id, file_type, size)),
+            CreateChange::UntrackedDeletion => Ok(FileChange::UntrackedDeletion),
+            CreateChange::Deletion => Ok(FileChange::Deletion),
+            _ => Err(anyhow!("Programming error: create change must be resolved first").into()),
         }
     }
 
@@ -220,10 +309,22 @@ impl CreateChange {
     }
 }
 
+/// Commit info for a newly created commit.
+pub struct CreateInfo {
+    pub author: String,
+    pub author_date: DateTime<FixedOffset>,
+    pub committer: Option<String>,
+    pub committer_date: Option<DateTime<FixedOffset>>,
+    pub message: String,
+    pub extra: BTreeMap<String, Vec<u8>>,
+    pub git_extra_headers: Option<BTreeMap<SmallVec<[u8; 24]>, Bytes>>,
+}
+
 /// Verify that all deleted files existed in at least one of the parents.
 async fn verify_deleted_files_existed_in_a_parent(
     parent_ctxs: &[ChangesetContext],
-    deleted_files: BTreeSet<MononokePath>,
+    stack_changes: Option<&PathTree<CreateChangeType>>,
+    mut deleted_files: BTreeSet<MononokePath>,
 ) -> Result<(), MononokeError> {
     async fn get_matching_files<'a>(
         parent_ctx: &'a ChangesetContext,
@@ -242,14 +343,45 @@ async fn verify_deleted_files_existed_in_a_parent(
             .boxed())
     }
 
+    if let Some(stack_changes) = stack_changes {
+        // Ignore files that were created or modified earlier in the stack.
+        deleted_files.retain(|deleted_file| {
+            stack_changes.get(deleted_file.as_mpath()) != Some(&CreateChangeType::Change)
+        });
+
+        for deleted_file in deleted_files.iter() {
+            // It's an error if this file was already deleted, or if any of
+            // its path prefixes were created (this implicitly deletes the
+            // directory).
+            if stack_changes.get(deleted_file.as_mpath()) == Some(&CreateChangeType::Deletion) {
+                return Err(MononokeError::InvalidRequest(format!(
+                    "Deleted file '{}' was deleted earlier in the stack",
+                    deleted_file
+                )));
+            }
+            for prefix in deleted_file.prefixes() {
+                if let Some(CreateChangeType::Change) = stack_changes.get(prefix.as_mpath()) {
+                    return Err(MononokeError::InvalidRequest(format!(
+                        "Deleted file '{}' was deleted earlier in the stack through replacement of '{}'",
+                        deleted_file, prefix
+                    )));
+                }
+            }
+        }
+    }
+
     // Filter the deleted files to those that existed in a parent.
-    let parent_files: BTreeSet<_> = parent_ctxs
-        .iter()
-        .map(|parent_ctx| get_matching_files(parent_ctx, &deleted_files))
-        .collect::<FuturesUnordered<_>>()
-        .try_flatten()
-        .try_collect()
-        .await?;
+    let deleted_files = &deleted_files;
+    let parent_files: BTreeSet<_> = stream::iter(
+        parent_ctxs
+            .iter()
+            .map(|parent_ctx| async move { get_matching_files(parent_ctx, deleted_files).await }),
+    )
+    .boxed()
+    .buffered(10)
+    .try_flatten()
+    .try_collect()
+    .await?;
 
     // Quickly check if all deleted files existed by comparing set lengths.
     if deleted_files.len() == parent_files.len() {
@@ -283,28 +415,56 @@ fn is_prefix_changed(path: &MononokePath, paths: &PathTree<CreateChangeType>) ->
         .any(|prefix| paths.get(prefix.as_mpath()) == Some(&CreateChangeType::Change))
 }
 
-/// Verify that any files in `prefix_paths` that exist in `parent_ctx` have
-/// been marked as deleted in `path_changes`.
+/// Verify that any files in `prefix_paths` that exist in any of
+/// `parent_ctxs`, as modified by the existing stack changes, have been marked
+/// as deleted in `path_changes`.
 async fn verify_prefix_files_deleted(
-    parent_ctx: &ChangesetContext,
-    prefix_paths: &BTreeSet<MononokePath>,
+    parent_ctxs: &[ChangesetContext],
+    stack_changes: Option<&PathTree<CreateChangeType>>,
+    mut prefix_paths: BTreeSet<MononokePath>,
     path_changes: &PathTree<CreateChangeType>,
 ) -> Result<(), MononokeError> {
-    parent_ctx
-        .paths(prefix_paths.iter().cloned())
-        .await?
-        .try_for_each(|prefix_path| async move {
-            if prefix_path.is_file().await?
-                && path_changes.get(prefix_path.path().as_mpath())
-                    != Some(&CreateChangeType::Deletion)
+    if let Some(stack_changes) = stack_changes {
+        // Remove any prefix paths that have already been deleted earlier in the stack.
+        prefix_paths.retain(|prefix_path| {
+            stack_changes.get(prefix_path.as_mpath()) != Some(&CreateChangeType::Deletion)
+        });
+        // Check that any prefix path added earlier in the stack is being deleted.
+        for prefix_path in prefix_paths.iter() {
+            if stack_changes.get(prefix_path.as_mpath()) == Some(&CreateChangeType::Change)
+                && path_changes.get(prefix_path.as_mpath()) != Some(&CreateChangeType::Deletion)
             {
-                Err(MononokeError::InvalidRequest(format!(
-                    "Creating files inside '{}' requires deleting the file at that path",
-                    prefix_path.path()
-                )))
-            } else {
-                Ok(())
+                return Err(MononokeError::InvalidRequest(format!(
+                    concat!(
+                        "Creating files inside '{}' requires deleting the file ",
+                        "added earlier in the stack at that path"
+                    ),
+                    prefix_path
+                )));
             }
+        }
+    }
+    // Check that any prefix path that exists in any parent is being deleted.
+    borrowed!(prefix_paths);
+    stream::iter(parent_ctxs.iter().map(Ok))
+        .try_for_each_concurrent(10, |parent_ctx| async move {
+            parent_ctx
+                .paths(prefix_paths.iter().cloned())
+                .await?
+                .try_for_each(|prefix_path| async move {
+                    if prefix_path.is_file().await?
+                        && path_changes.get(prefix_path.path().as_mpath())
+                            != Some(&CreateChangeType::Deletion)
+                    {
+                        Err(MononokeError::InvalidRequest(format!(
+                            "Creating files inside '{}' requires deleting the file at that path",
+                            prefix_path.path()
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await
         })
         .await
 }
@@ -319,15 +479,13 @@ async fn check_addless_union_conflicts(
         return Ok(());
     }
 
-    let root_fsnodes: Vec<_> = {
-        let futs: FuturesUnordered<_> = changesets
-            .iter()
-            .map(|cs_ctx| cs_ctx.root_fsnode_id())
-            .collect();
-        futs.map_ok(|root| root.into_fsnode_id())
-            .try_collect()
-            .await?
-    };
+    let root_fsnodes: Vec<_> = stream::iter(changesets.iter().map(|cs_ctx| async move {
+        Ok::<_, MononokeError>(cs_ctx.root_fsnode_id().await?.into_fsnode_id())
+    }))
+    .boxed()
+    .buffered(10)
+    .try_collect()
+    .await?;
 
     let store = &repo_blobstore;
 
@@ -408,21 +566,20 @@ async fn check_addless_union_conflicts(
 }
 
 impl RepoContext {
-    async fn save_changeset(
+    pub(crate) async fn save_changesets(
         &self,
-        changeset: BonsaiChangeset,
+        changesets: Vec<BonsaiChangeset>,
         repo: &(impl ChangesetsRef + RepoBlobstoreRef + RepoIdentityRef + RepoConfigRef),
         bubble: Option<&Bubble>,
     ) -> Result<(), MononokeError> {
-        blobrepo::save_bonsai_changesets(vec![changeset.clone()], self.ctx().clone(), repo).await?;
+        let bubble_id = bubble.map(|x| x.bubble_id());
+        let commit_infos = changesets
+            .iter()
+            .map(|changeset| CommitInfo::new(changeset, bubble_id))
+            .collect();
+        changesets_creation::save_changesets(self.ctx(), repo, changesets).await?;
 
-        log_new_commits(
-            self.ctx(),
-            repo,
-            None,
-            vec![CommitInfo::new(&changeset, bubble.map(|x| x.bubble_id()))],
-        )
-        .await;
+        log_new_commits(self.ctx(), repo, None, commit_infos).await;
 
         Ok(())
     }
@@ -448,17 +605,39 @@ impl RepoContext {
     pub async fn create_changeset(
         &self,
         parents: Vec<ChangesetId>,
-        author: String,
-        author_date: DateTime<FixedOffset>,
-        committer: Option<String>,
-        committer_date: Option<DateTime<FixedOffset>>,
-        message: String,
-        extra: BTreeMap<String, Vec<u8>>,
+        info: CreateInfo,
         changes: BTreeMap<MononokePath, CreateChange>,
         // If some, this changeset is a snapshot. Currently unsupported to upload a
         // normal commit to a bubble, though can be easily added.
         bubble: Option<&Bubble>,
     ) -> Result<ChangesetContext, MononokeError> {
+        let changesets = self
+            .create_changeset_stack(parents, vec![info], vec![changes], bubble)
+            .await?;
+        changesets
+            .into_iter()
+            .exactly_one()
+            .map_err(|e| anyhow!("Expected 1 changeset, but created {}", e.len()).into())
+    }
+
+    /// Create a new stack of changesets in the repository.
+    ///
+    /// The first new changeset is created with the given metadata by unioning the
+    /// contents of all parent changesets and then applying the provided
+    /// changes on top.  The subsequent changesets are then stacked on top of
+    /// the first changeset.
+    ///
+    /// The requirements for `create_changeset` must be met for each changeset
+    /// in the stack.
+    pub async fn create_changeset_stack(
+        &self,
+        stack_parents: Vec<ChangesetId>,
+        info_stack: Vec<CreateInfo>,
+        changes_stack: Vec<BTreeMap<MononokePath, CreateChange>>,
+        // If some, this changeset is a snapshot. Currently unsupported to upload a
+        // normal commit to a bubble, though can be easily added.
+        bubble: Option<&Bubble>,
+    ) -> Result<Vec<ChangesetContext>, MononokeError> {
         self.start_write()?;
         self.authorization_context()
             .require_repo_write(
@@ -472,16 +651,15 @@ impl RepoContext {
             .config()
             .source_control_service
             .permit_commits_without_parents;
-        if !allowed_no_parents && parents.is_empty() {
+        if !allowed_no_parents && stack_parents.is_empty() {
             return Err(MononokeError::InvalidRequest(String::from(
                 "Changesets with no parents cannot be created",
             )));
         }
 
         // Obtain contexts for each of the parents (which should exist).
-        let parent_ctxs: Vec<_> = parents
-            .iter()
-            .map(|parent_id| async move {
+        let stack_parent_ctxs: Vec<_> =
+            stream::iter(stack_parents.iter().map(|parent_id| async move {
                 let parent_ctx = self
                     .changeset(ChangesetSpecifier::Bonsai(parent_id.clone()))
                     .await?
@@ -492,10 +670,104 @@ impl RepoContext {
                         ))
                     })?;
                 Ok::<_, MononokeError>(parent_ctx)
-            })
-            .collect::<FuturesOrdered<_>>()
+            }))
+            .boxed()
+            .buffered(10)
             .try_collect()
             .await?;
+        borrowed!(stack_parent_ctxs);
+
+        // Collect together information about each new commit.
+
+        // Extract the set of deleted files.
+        let tracked_deletion_files_stack: Vec<BTreeSet<_>> = changes_stack
+            .iter()
+            .map(|changes| {
+                changes
+                    .iter()
+                    .filter(|(_path, change)| matches!(change, CreateChange::Deletion))
+                    .map(|(path, _change)| path.clone())
+                    .collect()
+            })
+            .collect();
+
+        // Build a path tree recording each path that has been created or deleted.
+        let path_changes_stack: Vec<_> = changes_stack
+            .iter()
+            .map(|changes| {
+                PathTree::from_iter(
+                    changes
+                        .iter()
+                        .map(|(path, change)| (path.as_mpath().cloned(), change.change_type())),
+                )
+            })
+            .collect();
+        let path_changes_stack = path_changes_stack.as_slice();
+
+        // Determine the prefixes of all changed files.
+        let prefix_paths_stack: Vec<BTreeSet<_>> = changes_stack
+            .iter()
+            .map(|changes| {
+                changes
+                    .iter()
+                    .filter(|(_path, change)| change.change_type() == CreateChangeType::Change)
+                    .flat_map(|(path, _change)| path.clone().prefixes())
+                    .collect()
+            })
+            .collect();
+
+        // Convert change paths into the form needed for the bonsai changeset.
+        let changes_stack: Vec<Vec<(MPath, CreateChange)>> = changes_stack
+            .into_iter()
+            .zip(path_changes_stack.iter())
+            .map(|(changes, path_changes)| {
+                changes
+                    .into_iter()
+                    // Filter deletions that have a change at a path prefix. The
+                    // deletion is implicit from the change. (2)
+                    .filter(|(path, change)| {
+                        change.change_type() != CreateChangeType::Deletion
+                            || !is_prefix_changed(path, path_changes)
+                    })
+                    // Then convert the paths to MPaths. Do this before we start
+                    // resolving any changes, so that we don't start storing data
+                    // until we're happy that the changes are valid.
+                    .map(|(path, change)| {
+                        path.into_mpath()
+                            .ok_or_else(|| {
+                                MononokeError::InvalidRequest(String::from(
+                                    "Cannot create a file with an empty path",
+                                ))
+                            })
+                            .map(move |mpath| (mpath, change))
+                    })
+                    .collect::<Result<_, _>>()
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Track the changes already made so far at each step in the stack.
+        let stack_changes_stack = {
+            let mut stack_changes_stack = vec![None];
+            let mut stack_changes = PathTree::default();
+            for (index, path_changes) in path_changes_stack.iter().enumerate() {
+                if index < path_changes_stack.len() - 1 {
+                    for (path, change) in path_changes.clone().into_iter() {
+                        match change {
+                            CreateChangeType::Change => {
+                                stack_changes.insert_and_prune(path, change);
+                            }
+                            CreateChangeType::Deletion => {
+                                stack_changes.insert(path, change);
+                            }
+                            CreateChangeType::None => {}
+                        }
+                    }
+                    stack_changes_stack.push(Some(stack_changes.clone()))
+                }
+            }
+            stack_changes_stack
+        };
+        let stack_changes_stack = stack_changes_stack.as_slice();
 
         // Check that changes are valid according to bonsai rules:
         // (1) deletions and copy-from info must reference a real path in a
@@ -505,64 +777,67 @@ impl RepoContext {
         //     file change for the prefix path.
         // (3) conversely, when a file has been replaced by a directory, there
         //     must be a delete for the file.
-        //
-
-        // Extract the set of deleted files.
-        let tracked_deletion_files: BTreeSet<_> = changes
-            .iter()
-            .filter(|(_path, change)| matches!(change, CreateChange::Deletion))
-            .map(|(path, _change)| path.clone())
-            .collect();
 
         // Check deleted files existed in a parent. (1)
-        let fut_verify_deleted_files_existed = async {
-            // This does NOT consider "missing" (untracked deletion) files as it is NOT
-            // necessary for them to exist in a parent. If they don't exist on a parent,
-            // this means the file was "hg added" and then manually deleted.
-            let (stats, result) =
-                verify_deleted_files_existed_in_a_parent(&parent_ctxs, tracked_deletion_files)
-                    .timed()
-                    .await;
-            let mut scuba = self.ctx().scuba().clone();
-            scuba.add_future_stats(&stats);
-            scuba.log_with_msg("Verify deleted files existed in a parent", None);
-            result
+        let verify_deleted_files_existed_fut = async move {
+            stream::iter(
+                tracked_deletion_files_stack
+                    .into_iter()
+                    .zip(stack_changes_stack.iter())
+                    .map(Ok),
+            )
+            .try_for_each_concurrent(10, |(tracked_deletion_files, stack_changes)| async move {
+                // This does NOT consider "missing" (untracked deletion) files as it is NOT
+                // necessary for them to exist in a parent. If they don't exist on a parent,
+                // this means the file was "hg added" and then manually deleted.
+                let (stats, result) = verify_deleted_files_existed_in_a_parent(
+                    stack_parent_ctxs,
+                    stack_changes.as_ref(),
+                    tracked_deletion_files,
+                )
+                .timed()
+                .await;
+                let mut scuba = self.ctx().scuba().clone();
+                scuba.add_future_stats(&stats);
+                scuba.log_with_msg("Verify deleted files existed in a parent", None);
+                result
+            })
+            .await
         };
-
-        // Build a path tree recording each path that has been created or deleted.
-        let path_changes = PathTree::from_iter(
-            changes
-                .iter()
-                .map(|(path, change)| (path.as_mpath().cloned(), change.change_type())),
-        );
-
-        // Determine the prefixes of all changed files.
-        let prefix_paths: BTreeSet<_> = changes
-            .iter()
-            .filter(|(_path, change)| change.change_type() == CreateChangeType::Change)
-            .flat_map(|(path, _change)| path.clone().prefixes())
-            .collect();
 
         // Check changes that replace a file with a directory also delete
         // this replaced file. (3)
-        let fut_verify_prefix_files_deleted = async {
-            let (stats, result) = parent_ctxs
-                .iter()
-                .map(|parent_ctx| {
-                    verify_prefix_files_deleted(parent_ctx, &prefix_paths, &path_changes)
-                })
-                .collect::<FuturesUnordered<_>>()
-                .try_for_each(|_| async { Ok(()) })
-                .timed()
-                .await;
-            let mut scuba = self.ctx().scuba().clone();
-            scuba.add_future_stats(&stats);
-            scuba.log_with_msg("Verify prefix files in parents have been deleted", None);
-            result
+        let verify_prefix_files_deleted_fut = async move {
+            stream::iter(
+                prefix_paths_stack
+                    .into_iter()
+                    .zip(path_changes_stack.iter())
+                    .zip(stack_changes_stack.iter())
+                    .map(Ok),
+            )
+            .try_for_each_concurrent(
+                10,
+                |((prefix_paths, path_changes), stack_changes)| async move {
+                    let (stats, result) = verify_prefix_files_deleted(
+                        stack_parent_ctxs,
+                        stack_changes.as_ref(),
+                        prefix_paths,
+                        path_changes,
+                    )
+                    .timed()
+                    .await;
+                    let mut scuba = self.ctx().scuba().clone();
+                    scuba.add_future_stats(&stats);
+                    scuba.log_with_msg("Verify prefix files in parents have been deleted", None);
+                    result
+                },
+            )
+            .await
         };
 
-        // Check for merge conflicts
-        let merge_conflicts_fut = async {
+        // Check for merge conflicts.  This only applies to the first commit
+        // in a stack.
+        let verify_no_merge_conflicts_fut = async {
             let (stats, result) = check_addless_union_conflicts(
                 self.ctx(),
                 match &bubble {
@@ -571,8 +846,10 @@ impl RepoContext {
                     }
                     None => self.blob_repo().repo_blobstore().clone(),
                 },
-                parent_ctxs.as_slice(),
-                &path_changes,
+                stack_parent_ctxs,
+                path_changes_stack
+                    .first()
+                    .ok_or_else(|| anyhow!("Should be at least one commit"))?,
             )
             .timed()
             .await;
@@ -583,115 +860,119 @@ impl RepoContext {
             result
         };
 
-        // Convert change paths into the form needed for the bonsai changeset.
-        let changes: Vec<(MPath, CreateChange)> = changes
-            .into_iter()
-            // Filter deletions that have a change at a path prefix. The
-            // deletion is implicit from the change. (2)
-            .filter(|(path, change)| {
-                change.change_type() != CreateChangeType::Deletion
-                    || !is_prefix_changed(path, &path_changes)
-            })
-            // Then convert the paths to MPaths. Do this before we start
-            // resolving any changes, so that we don't start storing data
-            // until we're happy that the changes are valid.
-            .map(|(path, change)| {
-                path.into_mpath()
-                    .ok_or_else(|| {
-                        MononokeError::InvalidRequest(String::from(
-                            "Cannot create a file with an empty path",
+        // Resolve the changes so that they are ready to be converted into
+        // bonsai changes. This also checks (1) for copy-from info.
+        let blobstore = match &bubble {
+            Some(bubble) => bubble.wrap_repo_blobstore(self.blob_repo().repo_blobstore().clone()),
+            None => self.blob_repo().repo_blobstore().clone(),
+        };
+        borrowed!(blobstore);
+        let resolve_file_changes_fut = async move {
+            stream::iter(
+                changes_stack
+                    .into_iter()
+                    .zip(stack_changes_stack.iter())
+                    .map(|(changes, stack_changes)| async move {
+                        let stack_changes = stack_changes.as_ref();
+                        let (stats, result) = stream::iter(changes.into_iter().map(
+                            |(path, mut change)| async move {
+                                change
+                                    .resolve(
+                                        self.ctx(),
+                                        *self.blob_repo().filestore_config(),
+                                        blobstore.clone(),
+                                        stack_changes,
+                                        stack_parent_ctxs,
+                                    )
+                                    .await?;
+                                Ok::<_, MononokeError>((path, change))
+                            },
                         ))
-                    })
-                    .map(move |mpath| (mpath, change))
-            })
-            .collect::<Result<_, _>>()?;
-
-        // Resolve the changes into bonsai changes. This also checks (1) for
-        // copy-from info.
-        let file_changes_fut = async {
-            let (stats, result) = changes
-                .into_iter()
-                .map(|(path, change)| {
-                    let parent_ctxs = &parent_ctxs;
-                    async move {
-                        let change = change
-                            .resolve(
-                                self.ctx(),
-                                *self.blob_repo().filestore_config(),
-                                match &bubble {
-                                    Some(bubble) => bubble.wrap_repo_blobstore(
-                                        self.blob_repo().repo_blobstore().clone(),
-                                    ),
-                                    None => self.blob_repo().repo_blobstore().clone(),
-                                },
-                                parent_ctxs,
-                            )
-                            .await?;
-                        Ok::<_, MononokeError>((path, change))
-                    }
-                })
-                .collect::<FuturesUnordered<_>>()
-                .try_collect::<SortedVectorMap<MPath, FileChange>>()
-                .timed()
-                .await;
-            let mut scuba = self.ctx().scuba().clone();
-            scuba.add_future_stats(&stats);
-            scuba.log_with_msg(
-                "Convert create changeset parameters to bonsai changes",
-                None,
-            );
-            result
+                        .buffered(1000)
+                        .try_collect::<SortedVectorMap<MPath, CreateChange>>()
+                        .timed()
+                        .await;
+                        let mut scuba = self.ctx().scuba().clone();
+                        scuba.add_future_stats(&stats);
+                        scuba.log_with_msg(
+                            "Convert create changeset parameters to bonsai changes",
+                            None,
+                        );
+                        result
+                    }),
+            )
+            .boxed()
+            .buffered(10)
+            .try_collect::<Vec<_>>()
+            .await
         };
 
-        let ((), (), (), file_changes) = try_join!(
-            fut_verify_deleted_files_existed,
-            fut_verify_prefix_files_deleted,
-            merge_conflicts_fut,
-            file_changes_fut,
+        let ((), (), (), file_changes_stack) = try_join!(
+            verify_deleted_files_existed_fut,
+            verify_prefix_files_deleted_fut,
+            verify_no_merge_conflicts_fut,
+            resolve_file_changes_fut,
         )?;
 
-        let author_date = MononokeDateTime::new(author_date);
-        let committer_date = committer_date.map(MononokeDateTime::new);
-        let extra = extra.into();
+        let mut new_changesets = Vec::new();
+        let mut new_changeset_ids = Vec::new();
+        let mut parents = stack_parents;
+        for (info, file_changes) in info_stack.into_iter().zip(file_changes_stack.into_iter()) {
+            let author_date = MononokeDateTime::new(info.author_date);
+            let committer_date = info.committer_date.map(MononokeDateTime::new);
+            let hg_extra = info.extra.into();
+            let git_extra_headers = info.git_extra_headers.map(SortedVectorMap::from);
+            let file_changes = file_changes
+                .into_iter()
+                .map(|(path, change)| Ok((path, change.into_file_change(&parents)?)))
+                .collect::<Result<SortedVectorMap<MPath, FileChange>, MononokeError>>()?;
 
-        // Create the new Bonsai Changeset. The `freeze` method validates
-        // that the bonsai changeset is internally consistent.
+            // Create the new Bonsai Changeset. The `freeze` method validates
+            // that the bonsai changeset is internally consistent.
 
-        // TODO(rajshar): Populate the below git_extra_headers and git_tree_hash values
-        // using appropriate metadata
-        let new_changeset = BonsaiChangesetMut {
-            parents,
-            author,
-            author_date,
-            committer,
-            committer_date,
-            message,
-            hg_extra: extra,
-            git_extra_headers: None,
-            git_tree_hash: None,
-            file_changes,
-            is_snapshot: bubble.is_some(),
-            git_annotated_tag: None,
+            let new_changeset = BonsaiChangesetMut {
+                parents,
+                author: info.author,
+                author_date,
+                committer: info.committer,
+                committer_date,
+                message: info.message,
+                hg_extra,
+                git_extra_headers,
+                git_tree_hash: None,
+                file_changes,
+                is_snapshot: bubble.is_some(),
+                git_annotated_tag: None,
+            }
+            .freeze()
+            .map_err(|e| {
+                MononokeError::InvalidRequest(format!(
+                    "Changes create invalid bonsai changeset: {}",
+                    e
+                ))
+            })?;
+
+            let new_changeset_id = new_changeset.get_changeset_id();
+            parents = vec![new_changeset_id];
+            new_changesets.push(new_changeset);
+            new_changeset_ids.push(new_changeset_id);
         }
-        .freeze()
-        .map_err(|e| {
-            MononokeError::InvalidRequest(format!("Changes create invalid bonsai changeset: {}", e))
-        })?;
-
-        let new_changeset_id = new_changeset.get_changeset_id();
 
         if let Some(bubble) = &bubble {
-            self.save_changeset(
-                new_changeset,
+            self.save_changesets(
+                new_changesets,
                 &bubble.repo_view(self.inner_repo()),
                 Some(bubble),
             )
             .await?;
         } else {
-            self.save_changeset(new_changeset, self.inner_repo(), None)
+            self.save_changesets(new_changesets, self.inner_repo(), None)
                 .await?;
         }
 
-        Ok(ChangesetContext::new(self.clone(), new_changeset_id))
+        Ok(new_changeset_ids
+            .into_iter()
+            .map(|new_changeset_id| ChangesetContext::new(self.clone(), new_changeset_id))
+            .collect())
     }
 }

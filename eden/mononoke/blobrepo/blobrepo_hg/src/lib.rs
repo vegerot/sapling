@@ -34,8 +34,9 @@ use blobrepo_errors::ErrorKind;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bonsai_hg_mapping::BonsaiOrHgChangesetIds;
 use bookmarks::Bookmark;
+use bookmarks::BookmarkCategory;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkKind;
-use bookmarks::BookmarkName;
 use bookmarks::BookmarkPagination;
 use bookmarks::BookmarkPrefix;
 use bookmarks::BookmarksRef;
@@ -44,7 +45,7 @@ use changesets::ChangesetsRef;
 use cloned::cloned;
 use context::CoreContext;
 use filenodes::FilenodeInfo;
-use filenodes::FilenodeRangeResult;
+use filenodes::FilenodeRange;
 use filenodes::FilenodeResult;
 use filenodes::FilenodesRef;
 use futures::future;
@@ -100,7 +101,7 @@ pub trait BlobRepoHg: Send + Sync {
     async fn get_bookmark_hg(
         &self,
         ctx: CoreContext,
-        name: &BookmarkName,
+        name: &BookmarkKey,
     ) -> Result<Option<HgChangesetId>, Error>
     where
         Self: BookmarksRef + RepoDerivedDataRef;
@@ -141,7 +142,7 @@ pub trait BlobRepoHg: Send + Sync {
         ctx: CoreContext,
         path: RepoPath,
         limit: Option<u64>,
-    ) -> Result<FilenodeRangeResult<Vec<FilenodeInfo>>, Error>
+    ) -> Result<FilenodeResult<FilenodeRange>, Error>
     where
         Self: FilenodesRef;
 }
@@ -250,6 +251,7 @@ impl<T: ChangesetsRef + BonsaiHgMappingRef + Send + Sync> BlobRepoHg for T {
                 ctx.clone(),
                 Freshness::MaybeStale,
                 &BookmarkPrefix::empty(),
+                BookmarkCategory::ALL,
                 BookmarkKind::ALL_PUBLISHING,
                 &BookmarkPagination::FromStart,
                 std::u64::MAX,
@@ -315,7 +317,7 @@ impl<T: ChangesetsRef + BonsaiHgMappingRef + Send + Sync> BlobRepoHg for T {
     async fn get_bookmark_hg(
         &self,
         ctx: CoreContext,
-        name: &BookmarkName,
+        name: &BookmarkKey,
     ) -> Result<Option<HgChangesetId>, Error>
     where
         Self: BookmarksRef + RepoDerivedDataRef,
@@ -352,6 +354,7 @@ impl<T: ChangesetsRef + BonsaiHgMappingRef + Send + Sync> BlobRepoHg for T {
             ctx.clone(),
             Freshness::MaybeStale,
             &BookmarkPrefix::empty(),
+            BookmarkCategory::ALL,
             BookmarkKind::ALL_PUBLISHING,
             &BookmarkPagination::FromStart,
             std::u64::MAX,
@@ -395,7 +398,7 @@ impl<T: ChangesetsRef + BonsaiHgMappingRef + Send + Sync> BlobRepoHg for T {
         ctx: CoreContext,
         path: RepoPath,
         limit: Option<u64>,
-    ) -> Result<FilenodeRangeResult<Vec<FilenodeInfo>>, Error>
+    ) -> Result<FilenodeResult<FilenodeRange>, Error>
     where
         Self: FilenodesRef,
     {

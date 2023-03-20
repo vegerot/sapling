@@ -747,7 +747,7 @@ class CloneCmd(Subcmd):
 
         parser.add_argument(
             "--backing-store",
-            help="Clone path as backing store instead of a source control repository. Currently only support 'recas' (Linux and macOS only) and 'http' (Linux only)",
+            help="Clone path as backing store instead of a source control repository. Currently only support 'recas' and 'http' (Linux only)",
         )
 
         parser.add_argument(
@@ -891,9 +891,9 @@ is case-sensitive. This is not recommended and is intended only for testing."""
                     return 1
 
         elif args.backing_store == "recas":
-            if sys.platform == "win32":
+            if sys.platform != "linux":
                 print_stderr(
-                    "error: recas backing store was passed but this feature is not available on Windows"
+                    "error: recas backing store was passed but this feature is only available on Linux"
                 )
                 return 1
             if args.rev is not None:
@@ -1744,7 +1744,7 @@ class StartCmd(Subcmd):
         if sys.platform == "win32":
             return subprocess.call(cmd, env=eden_env)
         else:
-            os.execve(cmd[0], cmd, env=eden_env)
+            os.execvpe(cmd[0], cmd, env=eden_env)
             # Throw an exception just to let mypy know that we should never reach here
             # and will never return normally.
             raise Exception("execve should never return")
@@ -2160,7 +2160,7 @@ class RageCmd(Subcmd):
             # to produce any stdout until they've taken all of their stdin. But if they
             # violate that, then the proc.wait() could fail if its stdout pipe was full,
             # since we don't consume it until afterwards.
-            if rage_processor:
+            if rage_processor and not args.stdout and not args.stderr:
                 proc = subprocess.Popen(
                     shlex.split(rage_processor),
                     stdin=subprocess.PIPE,

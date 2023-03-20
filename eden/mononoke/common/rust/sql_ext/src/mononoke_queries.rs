@@ -341,6 +341,7 @@ struct QueryCacheStore<'a, F, T> {
     key: Key,
     cache_config: &'a CachingConfig,
     cachelib: CachelibHandler<T>,
+    memcache: MemcacheHandler,
     fetcher: F,
 }
 
@@ -354,7 +355,7 @@ impl<F, V> EntityStore<V> for QueryCacheStore<'_, F, V> {
     }
 
     fn memcache(&self) -> &MemcacheHandler {
-        &self.cache_config.memcache
+        &self.memcache
     }
 
     fn cache_determinator(&self, _v: &V) -> CacheDisposition {
@@ -413,7 +414,7 @@ where
     T: Send + 'static,
     Fut: Future<Output = Result<T>>,
 {
-    if tunables().get_disable_sql_auto_retries() {
+    if tunables().disable_sql_auto_retries().unwrap_or_default() {
         return do_query().await;
     }
     Ok(retry(
@@ -440,7 +441,7 @@ where
     T: Send + Abomonation + MemcacheEntity + Clone + 'static,
     Fut: Future<Output = Result<T>> + Send,
 {
-    if tunables().get_disable_sql_auto_cache() {
+    if tunables().disable_sql_auto_cache().unwrap_or_default() {
         return query_with_retry_no_cache(&do_query).await;
     }
     let fetch = || query_with_retry_no_cache(&do_query);
@@ -448,11 +449,12 @@ where
     if let Some(config) = cache_data.config.as_ref() {
         let store = QueryCacheStore {
             key: cache_data.key,
-            cachelib: config.cache_pool.clone().into(),
+            cachelib: config.cache_handler_factory.cachelib(),
+            memcache: config.cache_handler_factory.memcache(),
             cache_config: config,
             fetcher: fetch,
         };
-        Ok(get_or_fill(store, hashset! {key})
+        Ok(get_or_fill(&store, hashset! {key})
             .await?
             .into_iter()
             .exactly_one()

@@ -6,7 +6,7 @@
  */
 
 use anyhow::Error;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLogEntry;
 use thiserror::Error;
 
@@ -27,8 +27,8 @@ pub enum ErrorKind {
     BookmarkMismatchInBundleCombining {
         ids: Vec<i64>,
         entry_id: i64,
-        entry_bookmark_name: BookmarkName,
-        bundle_bookmark_name: BookmarkName,
+        entry_bookmark_name: BookmarkKey,
+        bundle_bookmark_name: BookmarkKey,
     },
 }
 
@@ -41,6 +41,7 @@ pub enum PipelineError {
         cause: Error,
     },
 
+    #[allow(dead_code)]
     #[error("error without tracking entry")]
     AnonymousError {
         #[source]

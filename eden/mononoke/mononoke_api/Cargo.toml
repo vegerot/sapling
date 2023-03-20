@@ -23,12 +23,14 @@ bonsai_hg_mapping = { version = "0.1.0", path = "../bonsai_hg_mapping" }
 bonsai_svnrev_mapping = { version = "0.1.0", path = "../bonsai_svnrev_mapping" }
 bookmarks = { version = "0.1.0", path = "../bookmarks" }
 bookmarks_movement = { version = "0.1.0", path = "../bookmarks/bookmarks_movement" }
+borrowed = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 bounded_traversal = { version = "0.1.0", path = "../common/bounded_traversal" }
 bytes = { version = "1.1", features = ["serde"] }
 cacheblob = { version = "0.1.0", path = "../blobstore/cacheblob" }
 changeset_fetcher = { version = "0.1.0", path = "../blobrepo/changeset_fetcher" }
 changeset_info = { version = "0.1.0", path = "../derived_data/changeset_info" }
 changesets = { version = "0.1.0", path = "../changesets" }
+changesets_creation = { version = "0.1.0", path = "../changesets/changesets_creation" }
 chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 commit_graph = { version = "0.1.0", path = "../repo_attributes/commit_graph/commit_graph" }
@@ -89,6 +91,7 @@ segmented_changelog = { version = "0.1.0", path = "../segmented_changelog" }
 skeleton_manifest = { version = "0.1.0", path = "../derived_data/skeleton_manifest" }
 skiplist = { version = "0.1.0", path = "../reachabilityindex/skiplist" }
 slog = { version = "2.7", features = ["max_level_trace", "nested-values"] }
+smallvec = { version = "1.6.1", features = ["serde", "specialization", "union"] }
 sorted_vector_map = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 sparse = { version = "0.1.0", path = "../../scm/lib/sparse" }
 sql_construct = { version = "0.1.0", path = "../common/sql_construct" }

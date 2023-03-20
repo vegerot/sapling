@@ -70,6 +70,7 @@ async fn pushrebase_assigns_globalrevs_impl(fb: FacebookInit) -> Result<(), Erro
         ctx.clone(),
         repo.bonsai_globalrev_mapping_arc(),
         repo.repo_identity().id(),
+        None,
     )];
 
     let rebased = do_pushrebase_bonsai(
@@ -158,7 +159,7 @@ async fn pushrebase_race_assigns_monotonic_globalrevs(fb: FacebookInit) -> Resul
 
     #[async_trait]
     impl PushrebaseHook for SleepHook {
-        async fn prepushrebase(&self) -> Result<Box<dyn PushrebaseCommitHook>, Error> {
+        async fn in_critical_section(&self) -> Result<Box<dyn PushrebaseCommitHook>, Error> {
             let us = rand::thread_rng().gen_range(0..100);
             tokio::time::sleep(Duration::from_micros(us)).await;
             Ok(Box::new(*self) as Box<dyn PushrebaseCommitHook>)
@@ -209,6 +210,7 @@ async fn pushrebase_race_assigns_monotonic_globalrevs(fb: FacebookInit) -> Resul
             ctx.clone(),
             repo.bonsai_globalrev_mapping_arc(),
             repo.repo_identity().id(),
+            None,
         ),
         Box::new(SleepHook) as Box<dyn PushrebaseHook>,
     ];

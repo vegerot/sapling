@@ -417,15 +417,18 @@ class EdenDoctor(EdenDoctorChecker):
         if fixer.num_fixed_problems == fixer.num_problems:
             return 0
 
-        help_url = (
-            "https://fb.workplace.com/groups/edenfswindows"
-            if sys.platform == "win32"
-            else "https://fb.facebook.com/groups/eden.users/"
-        )
-        help_group = "EdenFS Windows" if sys.platform == "win32" else "EdenFS"
+        if sys.platform == "darwin":
+            help_url = "https://fb.workplace.com/groups/edenfsmacos"
+            help_group = "EdenFS macOS"
+        elif sys.platform == "win32":
+            help_url = "https://fb.workplace.com/groups/edenfswindows"
+            help_group = "EdenFS Windows"
+        else:
+            help_url = "https://fb.workplace.com/groups/eden.users"
+            help_group = "EdenFS"
 
         out.write(
-            f"Ask in the {help_group} Users group if you need help fixing issues with EdenFS:\n"
+            f"Collect an 'eden rage' and ask in the {help_group} Users group if you need help fixing issues with EdenFS:\n"
             f"{help_url}\n"
         )
         return 1
@@ -450,7 +453,9 @@ class EdenfsPrivHelperNotHealthy(Problem):
 class EdenfsStarting(Problem):
     def __init__(self) -> None:
         remediation = '''\
-Please wait for edenfs to finish starting.
+Please wait for edenfs to finish starting. You can watch it's progress with
+`eden status --wait`.
+
 If EdenFS seems to be taking too long to start you can try restarting it
 with "eden restart --force"'''
         super().__init__("EdenFS is currently still starting.", remediation=remediation)
@@ -673,6 +678,12 @@ def check_running_mount(
             check_hg.check_hg(tracker, checkout)
         except Exception as ex:
             raise RuntimeError("Failed to check Mercurial status") from ex
+
+        # The check is flaky, disable for now.
+        # try:
+        #    check_filesystems.check_hg_status_match_hg_diff(tracker, instance, checkout)
+        # except Exception as ex:
+        #    raise RuntimeError("Failed to compare `hg status` with `hg diff`") from ex
 
 
 class CheckoutNotConfigured(Problem):

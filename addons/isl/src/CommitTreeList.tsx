@@ -8,12 +8,24 @@
 import type {CommitTreeWithPreviews} from './getCommitTree';
 import type {Hash} from './types';
 
+import serverAPI from './ClientToServerAPI';
 import {Commit} from './Commit';
+import {Center, LargeSpinner} from './ComponentUtils';
 import {ErrorNotice} from './ErrorNotice';
+import {Tooltip, DOCUMENTATION_DELAY} from './Tooltip';
 import {pageVisibility} from './codeReview/CodeReviewInfo';
-import {t} from './i18n';
+import {T, t} from './i18n';
+import {CreateEmptyInitialCommitOperation} from './operations/CreateEmptyInitialCommitOperation';
 import {treeWithPreviews, useMarkOperationsCompleted} from './previews';
-import {commitFetchError, latestUncommittedChanges} from './serverAPIState';
+import {
+  commitFetchError,
+  commitsShownRange,
+  isFetchingAdditionalCommits,
+  latestUncommittedChangesData,
+  useRunOperation,
+} from './serverAPIState';
+import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {ErrorShortMessages} from 'isl-server/src/constants';
 import {useRecoilState, useRecoilValue} from 'recoil';
 import {Icon} from 'shared/Icon';
 
@@ -24,7 +36,7 @@ export function CommitTreeList() {
   // so we don't miss the first returned uncommitted changes mesage.
   // TODO: This is a little ugly, is there a better way to tell recoil to start the subscription immediately?
   // Or should we queue/cache messages?
-  useRecoilState(latestUncommittedChanges);
+  useRecoilState(latestUncommittedChangesData);
   useRecoilState(pageVisibility);
 
   useMarkOperationsCompleted();
@@ -33,18 +45,46 @@ export function CommitTreeList() {
   const fetchError = useRecoilValue(commitFetchError);
   return fetchError == null && trees.length === 0 ? (
     <Center>
-      <Spinner />
+      <LargeSpinner />
     </Center>
   ) : (
     <>
-      {fetchError ? <ErrorNotice title={t('Failed to fetch commits')} error={fetchError} /> : null}
-      <div className="commit-tree-root commit-group">
-        <MainLineEllipsis />
-        {trees.map(tree => createSubtree(tree))}
-        <MainLineEllipsis />
-      </div>
+      {fetchError ? <CommitFetchError error={fetchError} /> : null}
+      {trees.length === 0 ? null : (
+        <div className="commit-tree-root commit-group">
+          <MainLineEllipsis />
+          {trees.map(tree => createSubtree(tree))}
+          <MainLineEllipsis>
+            <FetchingAdditionalCommitsButton />
+            <FetchingAdditionalCommitsIndicator />
+          </MainLineEllipsis>
+        </div>
+      )}
     </>
   );
+}
+
+function CommitFetchError({error}: {error: Error}) {
+  const runOperation = useRunOperation();
+  if (error.message === ErrorShortMessages.NoCommitsFetched) {
+    return (
+      <ErrorNotice
+        title={t('No commits found')}
+        description={t('If this is a new repository, try adding an initial commit first.')}
+        error={error}
+        buttons={[
+          <VSCodeButton
+            appearance="secondary"
+            onClick={() => {
+              runOperation(new CreateEmptyInitialCommitOperation());
+            }}>
+            <T>Create empty initial commit</T>
+          </VSCodeButton>,
+        ]}
+      />
+    );
+  }
+  return <ErrorNotice title={t('Failed to fetch commits')} error={error} />;
 }
 
 function createSubtree(tree: CommitTreeWithPreviews): Array<React.ReactElement> {
@@ -78,18 +118,6 @@ function createSubtree(tree: CommitTreeWithPreviews): Array<React.ReactElement> 
   ];
 }
 
-function Spinner() {
-  return (
-    <div data-testid="loading-spinner">
-      <Icon icon="loading" size="L" />
-    </div>
-  );
-}
-
-function Center({children}: {children: React.ReactNode}) {
-  return <div className="center-container">{children}</div>;
-}
-
 function Branch({
   children,
   descendsFrom,
@@ -103,10 +131,6 @@ function Branch({
       <BranchIndicator />
     </div>
   );
-}
-
-function MainLineEllipsis() {
-  return <div className="commit-ellipsis" />;
 }
 
 const COMPONENT_PADDING = 10;
@@ -134,3 +158,47 @@ export const BranchIndicator = () => {
     </svg>
   );
 };
+
+/**
+ * Vertical ellipsis to be rendered on top of the branch line.
+ * Expects to rendered as a child of commit-tree-root.
+ * Optionally accepts children to render next to the "..."
+ */
+function MainLineEllipsis({children}: {children?: React.ReactNode}) {
+  return (
+    <div className="commit-ellipsis">
+      <Icon icon="kebab-vertical" />
+      <div className="commit-ellipsis-children">{children}</div>
+    </div>
+  );
+}
+
+function FetchingAdditionalCommitsIndicator() {
+  const isFetching = useRecoilValue(isFetchingAdditionalCommits);
+  return isFetching ? <Icon icon="loading" /> : null;
+}
+
+function FetchingAdditionalCommitsButton() {
+  const shownRange = useRecoilValue(commitsShownRange);
+  const isFetching = useRecoilValue(isFetchingAdditionalCommits);
+  if (shownRange === undefined) {
+    return null;
+  }
+  const commitsShownMessage = t('Showing comits from the last $numDays days', {
+    replace: {$numDays: shownRange.toString()},
+  });
+  return (
+    <Tooltip placement="top" delayMs={DOCUMENTATION_DELAY} title={commitsShownMessage}>
+      <VSCodeButton
+        disabled={isFetching}
+        onClick={() => {
+          serverAPI.postMessage({
+            type: 'loadMoreCommits',
+          });
+        }}
+        appearance="icon">
+        <T>Load more commits</T>
+      </VSCodeButton>
+    </Tooltip>
+  );
+}

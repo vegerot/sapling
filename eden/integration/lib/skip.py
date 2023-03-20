@@ -52,7 +52,6 @@ if sys.platform == "win32":
         "health_test.HealthOfFakeEdenFSTestAdHoc": True,
         "health_test.HealthOfFakeEdenFSTestManaged": True,
         "info_test.InfoTestHg": True,
-        "linux_cgroup_test.LinuxCgroupTest": True,
         "materialized_query_test.MaterializedQueryTestHg": True,
         "mmap_test.MmapTestHg": True,
         "mount_test.MountTestHg": True,
@@ -81,7 +80,10 @@ if sys.platform == "win32":
         "start_test.StartFakeEdenFSTestManaged": True,
         "start_test.StartTest": True,
         "start_test.StartWithRepoTestHg": True,
-        "stats_test.FUSEStatsTest": True,
+        "stats_test.GenericStatsTest": [
+            "test_writing_untracked_file_bumps_write_counter",  # counter not implemented for PrjFS (T147665665)
+            "test_summary_counters_available",  # counter not implemented for PrjFS (T147669123)
+        ],
         "stop_test.AutoStopTest": True,
         "stop_test.StopTestAdHoc": True,
         "stop_test.StopTestManaged": True,
@@ -132,6 +134,11 @@ if sys.platform == "win32":
             "test_mount_state_during_unmount_with_in_progress_checkout",
         ],
         "stale_inode_test.StaleInodeTestHgNFS": True,
+        "windows_fsck_test.WindowsFsckTestHg": [
+            # T146967686
+            "test_detect_removed_file_from_dirty_placeholder_directory",
+            "test_detect_removed_file_from_placeholder_directory",
+        ],
     }
 elif sys.platform.startswith("linux") and not os.path.exists("/etc/redhat-release"):
     # The ChownTest.setUp() code tries to look up the "nobody" group, which doesn't
@@ -151,6 +158,150 @@ elif sys.platform.startswith("linux") and not os.path.exists("/etc/redhat-releas
         # issue.
         "test_post_clone_permissions"
     ]
+elif sys.platform.startswith("darwin"):
+    # OSERROR AF_UNIX path too long
+    TEST_DISABLED["hg.status_test.StatusTestTreeOnly"] = [
+        "test_status",
+        "test_status_thrift_apis",
+    ]
+
+    # update fails because new file created while checkout operation in progress
+    TEST_DISABLED["hg.update_test.UpdateTestTreeOnly"] = [
+        "test_change_casing_with_untracked",
+    ]
+
+    # The remaining tests are failing due to Mercurial issue in asciitransform
+    TEST_DISABLED["hg.add_test.AddTestTreeOnly"] = [
+        "test_debugdirstate",
+        "test_add",
+        "test_add_file_that_would_normally_be_ignored",
+        "test_add_ignored_directory_has_no_effect",
+    ]
+    TEST_DISABLED["hg.files_test.FilesTestTreeOnly"] = [
+        "test_files_with_changes",
+    ]
+    TEST_DISABLED["hg.merge_test.MergeTestTreeOnly"] = [
+        "test_resolve_merge",
+    ]
+    TEST_DISABLED["hg.move_test.MoveTestTreeOnly"] = [
+        "test_replace_after_move_file_then_revert_it"
+    ]
+    TEST_DISABLED["hg.rebase_test.RebaseTestTreeOnly"] = [
+        "test_rebase_stack_with_conflicts",
+    ]
+    TEST_DISABLED["hg.revert_test.RevertTestTreeOnly"] = [
+        "test_revert_during_merge_resolution_succeeds"
+    ]
+    TEST_DISABLED["hg.status_test.StatusTestTreeOnly"] = [
+        "test_status_thrift_apis",
+        "test_status",
+    ]
+    TEST_DISABLED["hg.update_test.UpdateTestTreeOnly"] = [
+        "test_update_clean_removes_added_and_removed_statuses",
+    ]
+    TEST_DISABLED["hg.split_test.SplitTestTreeOnly"] = True
+
+    # hg tests with misc failures
+    TEST_DISABLED["hg.debug_hg_dirstate_test.DebugHgDirstateTestTreeOnly"] = True
+
+    # Assertion error and invalid argument
+    TEST_DISABLED["snapshot.test_snapshots.InfraTestsDefault"] = [
+        "test_snapshot",
+        "test_verify_directory",
+    ]
+    TEST_DISABLED["snapshot.test_snapshots.Testbasic-20210712"] = True
+
+    TEST_DISABLED["basic_test.PosixTest"] = [
+        "test_create_using_mknod",  # PermissionDenied
+        "test_statvfs",  # NFS block size appears to be too small.
+    ]
+
+    # `eden chown` requires the use of `sudo` for chowning redirections. We
+    # don't have access to passwordless `sudo` on macOS Sandcastle hosts, so
+    # we should disable these test.
+    TEST_DISABLED["chown_test.ChownTest"] = True
+
+    # T89441739
+    TEST_DISABLED["corrupt_overlay_test.CorruptOverlayTest"] = [
+        "test_unmount_succeeds",
+        "test_unlink_deletes_corrupted_files",
+    ]
+
+    # CalledProcessError
+    TEST_DISABLED["health_test.HealthOfFakeEdenFSTest"] = True
+
+    # eden clone fails bc Git not supported?
+    TEST_DISABLED["remount_test.RemountTest"] = [
+        "test_git_and_hg",
+    ]
+
+    # EOF error?
+    TEST_DISABLED["restart_test.RestartTestAdHoc"] = [
+        "test_eden_restart_fails_if_edenfs_crashes_on_start",
+        # timeout
+        "test_restart_starts_edenfs_if_not_running",
+        # timeout
+        "test_restart_while_starting",
+    ]
+    TEST_DISABLED["restart_test.RestartTestManaged"] = [
+        "test_eden_restart_fails_if_edenfs_crashes_on_start",
+        # timeout
+        "test_restart_starts_edenfs_if_not_running",
+    ]
+
+    # timeout
+    TEST_DISABLED["restart_test.RestartTest"] = [
+        "test_graceful_restart_unresponsive_thrift",
+        "test_restart",
+    ]
+
+    # Broken on NFS since NFS will just hang with the message "nfs server
+    # edenfs:: not responding". There was an attempt to fix this with commit
+    # 1f5512cf74ca, but it seems like something in test teardown is causing
+    # hangs still.
+    TEST_DISABLED["stale_test.StaleTest"] = True
+
+    # CalledProcessError (same as health_test above?). Seems like
+    # FakeEdenFS is broken on MacOS
+    TEST_DISABLED["service_log_test.ServiceLogFakeEdenFSTest"] = True
+    TEST_DISABLED["service_log_test.ServiceLogRealEdenFSTest"] = True
+
+    # Expect OSError but does not happen (T89439721)
+    TEST_DISABLED["setattr_test.SetAttrTest"] = [
+        "test_chown_gid_as_nonroot_fails_if_not_member",
+        "test_chown_uid_as_nonroot_fails",
+        "test_setuid_setgid_and_sticky_bits_fail_with_eperm",
+    ]
+
+    # On NFS, we don't have the per-mount live_request counters implemented.
+    # We can enable this test once those are added (T147665665)
+    TEST_DISABLED["stats_test.GenericStatsTest"] = [
+        "test_summary_counters_available",
+    ]
+
+    # Various errors (See NFS specific skips for more takeover failures)
+    TEST_DISABLED["takeover_test.TakeoverTestHg"] = True
+    TEST_DISABLED["takeover_test.TakeoverTestNoNFSServer"] = [
+        "test_takeover",
+    ]
+
+    # T89440575: We aren't able to get fetch counts by PID on NFS, which doesn't
+    # provide any information about client processes.
+    TEST_DISABLED["thrift_test.ThriftTest"] = [
+        "test_pid_fetch_counts",
+    ]
+
+    # OSError: AF_UNIX path too long
+    TEST_DISABLED["unixsocket_test.UnixSocketTest"] = True
+
+    # EdenFS on macOS uses NFSv3, which doesn't support extended attributes.
+    TEST_DISABLED["xattr_test.XattrTest"] = True
+
+    # fsck doesn't work on macOS?
+    TEST_DISABLED["fsck.basic_snapshot_tests.Basic20210712TestDefault"] = True
+
+    # flakey (actual timing doesn't match expected timing)
+    TEST_DISABLED["config_test.ConfigTest"] = True
 
 # Windows specific tests
 if sys.platform != "win32":
@@ -160,6 +311,8 @@ if sys.platform != "win32":
             "windows_fsck_test.WindowsFsckTest": True,
             "windows_fsck_test.WindowsRebuildOverlayTest": True,
             "prjfs_stress.PrjFSStress": True,
+            "prjfs_stress.PrjfsStressNoListenToFull": True,
+            "projfs_buffer.PrjFSBuffer": True,
         }
     )
 
@@ -175,7 +328,8 @@ if sys.platform.startswith("linux"):
             # NFS mounts. So we inherently expect this test to fail on
             # NFS.
         ],
-        # These won't be fixed anytime soon, this requires NFSv4
+        # EdenFS's NFS implementation is NFSv3, which doesn't support extended
+        # attributes.
         "xattr_test.XattrTest": [  # T89439481
             "test_get_sha1_xattr",
             "test_get_sha1_xattr_succeeds_after_querying_xattr_on_dir",
@@ -185,8 +339,18 @@ if sys.platform.startswith("linux"):
             "test_chown_uid_as_nonroot_fails",
             "test_setuid_setgid_and_sticky_bits_fail_with_eperm",
         ],
-        "stats_test.CountersTest": True,  # T89440036
-        "thrift_test.ThriftTest": ["test_pid_fetch_counts"],  # T89440575
+        "stats_test.GenericStatsTest": [
+            # On NFS, we don't have the per-mount live_request counters.
+            # We can enable this test once those are added (T147665665).
+            "test_summary_counters_available",
+        ],
+        "stats_test.CountersTest": [
+            # Same as above test: (T147665665).
+            "test_mount_unmount_counters"
+        ],
+        # T89440575: We aren't able to get fetch counts by PID on NFS, which
+        # doesn't provide any information about client processes.
+        "thrift_test.ThriftTest": ["test_pid_fetch_counts"],
         "mount_test.MountTest": [  # T91790656
             "test_unmount_succeeds_while_file_handle_is_open",
             "test_unmount_succeeds_while_dir_handle_is_open",

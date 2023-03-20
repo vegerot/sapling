@@ -10,7 +10,9 @@
 function verify_wc() {
    local large_repo_commit
    large_repo_commit="$1"
-   "$MONONOKE_ADMIN" "${COMMON_ARGS[@]}" --log-level ERROR \
+   "$MONONOKE_ADMIN" \
+     "${CACHE_ARGS[@]}" \
+     "${COMMON_ARGS[@]}" --log-level ERROR \
      --mononoke-config-path  "$TESTTMP"/mononoke-config \
      --source-repo-id="$REPOIDLARGE" --target-repo-id="$REPOIDSMALL" \
      crossrepo verify-wc "$large_repo_commit"
@@ -20,16 +22,15 @@ function validate_commit_sync() {
   local entry_id
   entry_id="$1"
   shift
-  "$COMMIT_VALIDATOR" "${COMMON_ARGS[@]}" --debug --repo-id "$REPOIDLARGE" \
-   --mononoke-config-path "$TESTTMP/mononoke-config" \
-   --master-bookmark=master_bookmark \
-   once --entry-id "$entry_id" "$@"
+  "$COMMIT_VALIDATOR" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" --debug --repo-id "$REPOIDLARGE" \
+    --mononoke-config-path "$TESTTMP/mononoke-config" \
+    --master-bookmark=master_bookmark \
+    once --entry-id "$entry_id" "$@"
 }
 
-function large_small_config() {
-  REPOTYPE="blob_files"
-  INFINITEPUSH_ALLOW_WRITES=true REPOID=0 REPONAME=large-mon setup_common_config "$REPOTYPE"
-  INFINITEPUSH_ALLOW_WRITES=true REPOID=1 REPONAME=small-mon setup_common_config "$REPOTYPE"
+function large_small_megarepo_config() {
 cat >> "$TESTTMP/mononoke-config/common/commitsyncmap.toml" <<EOF
 [megarepo_test]
 large_repo_id = 0
@@ -108,6 +109,14 @@ EOF
 
   fi
 
+
+}
+
+function large_small_config() {
+  REPOTYPE="blob_files"
+  INFINITEPUSH_ALLOW_WRITES=true REPOID=0 REPONAME=large-mon setup_common_config "$REPOTYPE"
+  INFINITEPUSH_ALLOW_WRITES=true REPOID=1 REPONAME=small-mon setup_common_config "$REPOTYPE"
+  large_small_megarepo_config
 }
 
 function large_small_setup() {
@@ -401,14 +410,18 @@ EOF
 }
 
 function backsync_large_to_small() {
-  "$BACKSYNCER" "${COMMON_ARGS[@]}" --debug --source-repo-id "$REPOIDLARGE" \
+  "$BACKSYNCER" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" --debug --source-repo-id "$REPOIDLARGE" \
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --target-repo-id "$REPOIDSMALL" \
     backsync-all
 }
 
 function backsync_large_to_small_forever {
-  "$BACKSYNCER" "${COMMON_ARGS[@]}" --debug \
+  "$BACKSYNCER" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" --debug \
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --source-repo-id "$REPOIDLARGE" \
     --target-repo-id "$REPOIDSMALL" \
@@ -425,6 +438,7 @@ function mononoke_x_repo_sync_forever() {
   shift
   shift
   GLOG_minloglevel=5 "$MONONOKE_X_REPO_SYNC" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --source-repo-id "$source_repo_id" \
@@ -517,4 +531,13 @@ EOF
   REPOID=0 blobimport meg-hg-srv/.hg meg-mon
   REPOID=1 blobimport fbs-hg-srv/.hg fbs-mon
   REPOID=2 blobimport ovr-hg-srv/.hg ovr-mon
+}
+
+function enable_pushredirect {
+  repo_id=$1
+  shift
+
+  cat >"$PUSHREDIRECT_CONF/enable" << EOF
+{"per_repo": {"$repo_id": {"public_push": true, "draft_push": false}}}
+EOF
 }

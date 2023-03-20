@@ -38,6 +38,15 @@ mononoke_queries! {
         "{insert_or_ignore} INTO bonsai_globalrev_mapping (repo_id, bcs_id, globalrev) VALUES {values}"
     }
 
+    write ReplaceGlobalrevs(values: (
+        repo_id: RepositoryId,
+        bcs_id: ChangesetId,
+        globalrev: Globalrev,
+    )) {
+        none,
+        "REPLACE INTO bonsai_globalrev_mapping (repo_id, bcs_id, globalrev) VALUES {values}"
+    }
+
     read SelectMappingByBonsai(
         repo_id: RepositoryId,
         >list bcs_id: ChangesetId
@@ -185,10 +194,18 @@ impl BonsaiGlobalrevMapping for SqlBonsaiGlobalrevMapping {
     }
 
     async fn get_max(&self, ctx: &CoreContext) -> Result<Option<Globalrev>, Error> {
+        self.get_max_custom_repo(ctx, &self.repo_id).await
+    }
+
+    async fn get_max_custom_repo(
+        &self,
+        ctx: &CoreContext,
+        repo_id: &RepositoryId,
+    ) -> Result<Option<Globalrev>, Error> {
         ctx.perf_counters()
             .increment_counter(PerfCounterType::SqlReadsMaster);
 
-        let row = SelectMaxEntry::query(&self.connections.read_master_connection, &self.repo_id)
+        let row = SelectMaxEntry::query(&self.connections.read_master_connection, repo_id)
             .await?
             .into_iter()
             .next();

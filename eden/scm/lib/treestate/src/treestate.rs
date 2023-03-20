@@ -6,6 +6,7 @@
  */
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Cursor;
@@ -119,13 +120,10 @@ impl TreeState {
         case_sensitive: bool,
     ) -> Result<Self> {
         let store = FileStore::in_memory()?;
-        let mut root = TreeStateRoot::default();
+        let root = TreeStateRoot::default();
         let tree = Tree::new();
 
         let (metadata, entries) = read_eden_dirstate(eden_dirstate_path.as_ref())?;
-        let mut buf = Vec::new();
-        metadata.serialize(&mut buf)?;
-        root.set_metadata(buf.into_boxed_slice());
 
         let path = eden_dirstate_path.as_ref().to_path_buf();
         let mut treestate = TreeState {
@@ -136,6 +134,8 @@ impl TreeState {
             eden_dirstate_path: Some(path),
             case_sensitive,
         };
+
+        treestate.set_metadata(metadata)?;
 
         for (key, state) in entries {
             treestate.insert(key, &state)?;
@@ -198,8 +198,7 @@ impl TreeState {
         // TODO: Clean up once we migrate EdenFS to TreeState and no longer
         // need to write to legacy eden dirstate format.
         if let Some(eden_dirstate_path) = self.eden_dirstate_path.clone() {
-            let mut metadata_buf = self.get_metadata();
-            let metadata = Metadata::deserialize(&mut metadata_buf)?;
+            let metadata = self.metadata()?;
             let entries = self.flatten_tree()?;
             write_eden_dirstate(&eden_dirstate_path, metadata, entries)?;
         }
@@ -251,35 +250,39 @@ impl TreeState {
         )
     }
 
-    pub fn get_ignorecase(&mut self, path: &[u8]) -> Result<Vec<(Key, FileStateV2)>> {
-        let paths = self.get_keys_ignorecase(&path)?;
-        let mut results = vec![];
-        for path in paths.into_iter() {
-            if let Some(state) = self.get(&path)? {
-                results.push((path, state.clone()));
+    fn normalize_path_and_get<'a>(
+        &mut self,
+        path: &'a [u8],
+    ) -> Result<(Cow<'a, [u8]>, Option<FileStateV2>)> {
+        if self.case_sensitive {
+            return Ok((Cow::Borrowed(path), self.get(path)?.cloned()));
+        }
+
+        let mut best = None;
+        for key in self.get_keys_ignorecase(path)? {
+            let state = match self.get(&key)? {
+                None => continue,
+                Some(state) => state.clone(),
+            };
+
+            // If there are multiple matches, prefer the format for the version that still exists.
+            if best.is_none() || state.state.intersects(StateFlags::EXIST_NEXT) {
+                best = Some((Cow::Owned(key.into()), state));
             }
         }
-        Ok(results)
+
+        match best {
+            Some((path, state)) => Ok((path, Some(state))),
+            None => Ok((Cow::Borrowed(path), None)),
+        }
     }
 
-    pub fn normalize<'a>(&mut self, path: &'a [u8]) -> Result<Cow<'a, [u8]>> {
-        Ok(if self.case_sensitive {
-            Cow::Borrowed(path)
-        } else {
-            let mut best = None;
-            for (key, state) in self.get_ignorecase(&path)?.into_iter() {
-                // If there are multiple matches, prefer the format for the version that still exists.
-                if state.state.intersects(StateFlags::EXIST_NEXT) {
-                    best = Some(key);
-                } else if best.is_none() {
-                    best = Some(key);
-                }
-            }
-            match best {
-                Some(best) => Cow::Owned(best.into()),
-                None => Cow::Borrowed(path),
-            }
-        })
+    pub fn normalize_path<'a>(&mut self, path: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+        Ok(self.normalize_path_and_get(path)?.0)
+    }
+
+    pub fn normalized_get<K: AsRef<[u8]>>(&mut self, path: K) -> Result<Option<FileStateV2>> {
+        Ok(self.normalize_path_and_get(path.as_ref())?.1)
     }
 
     /// Get the aggregated state of a directory. This is useful, for example, to tell if a
@@ -292,46 +295,49 @@ impl TreeState {
         self.tree.file_count() as usize
     }
 
-    pub fn set_metadata<T: AsRef<[u8]>>(&mut self, metadata: T) {
+    pub fn set_metadata_bytes<T: AsRef<[u8]>>(&mut self, metadata: T) {
         self.root
             .set_metadata(Vec::from(metadata.as_ref()).into_boxed_slice());
     }
 
-    pub fn get_metadata(&self) -> &[u8] {
+    pub fn set_metadata(&mut self, metadata: BTreeMap<String, String>) -> Result<()> {
+        let mut buf = Vec::new();
+        Metadata(metadata).serialize(&mut buf)?;
+        self.set_metadata_bytes(buf);
+        Ok(())
+    }
+
+    pub fn metadata_bytes(&self) -> &[u8] {
         self.root.metadata().deref()
     }
 
-    pub fn get_metadata_by_key(&self, key: &str) -> Result<Option<String>> {
-        let mut metadata_buf = self.get_metadata();
-        let metadata = Metadata::deserialize(&mut metadata_buf)?;
-        Ok(metadata.0.get(key).cloned())
+    pub fn metadata(&self) -> Result<BTreeMap<String, String>> {
+        let metadata = Metadata::deserialize(&mut self.metadata_bytes())?;
+        Ok(metadata.0)
     }
 
-    pub fn set_metadata_by_keys(&mut self, new: &[(String, Option<String>)]) -> Result<()> {
-        let mut metadata_buf = self.get_metadata();
-        let mut metadata = Metadata::deserialize(&mut metadata_buf)?;
+    pub fn update_metadata(&mut self, new: &[(String, Option<String>)]) -> Result<()> {
+        let mut metadata = self.metadata()?;
 
         for (key, value) in new.iter() {
             match value {
-                Some(value) => metadata.0.insert(key.to_string(), value.to_string()),
-                None => metadata.0.remove(key),
+                Some(value) => metadata.insert(key.to_string(), value.to_string()),
+                None => metadata.remove(key),
             };
         }
 
         let mut buf = Vec::new();
-        metadata.serialize(&mut buf)?;
+        Metadata(metadata).serialize(&mut buf)?;
         self.root.set_metadata(buf.into_boxed_slice());
         Ok(())
     }
 
     pub fn parents<'a>(&'a self) -> impl Iterator<Item = Result<HgId>> + 'a {
-        (1..).map_while(|i| {
-            self.get_metadata_by_key(&format!("p{}", i)).map_or_else(
-                |err| Some(Err(err)),
-                |metadata| {
-                    metadata.map(|parent_hash| HgId::from_str(&parent_hash).map_err(|e| e.into()))
-                },
-            )
+        (1..).map_while(|i| match self.metadata() {
+            Err(err) => Some(Err(err)),
+            Ok(metadata) => metadata
+                .get(&format!("p{}", i))
+                .map(|parent_hash| HgId::from_str(parent_hash).map_err(|e| e.into())),
         })
     }
 
@@ -348,7 +354,7 @@ impl TreeState {
         if values.len() == 1 {
             values.push(("p2".to_string(), None));
         }
-        self.set_metadata_by_keys(&values)
+        self.update_metadata(&values)
     }
 
     pub fn has_dir<P: AsRef<[u8]>>(&mut self, path: P) -> Result<bool> {
@@ -368,26 +374,6 @@ impl TreeState {
     {
         self.tree
             .visit_advanced(&self.store, visitor, visit_dir, visit_file)
-    }
-
-    pub fn visit_by_state(
-        &mut self,
-        state_required_any: StateFlags,
-    ) -> Result<Vec<(Vec<u8>, FileStateV2)>> {
-        let mut result = Vec::new();
-        self.visit(
-            &mut |path_components, state| {
-                result.push((path_components.concat(), state.clone()));
-                Ok(VisitorResult::NotChanged)
-            },
-            &|_, dir| match dir.get_aggregated_state() {
-                None => true,
-                Some(aggregated_state) => aggregated_state.union.intersects(state_required_any),
-            },
-            &|_, file| file.state.intersects(state_required_any),
-        )?;
-
-        Ok(result)
     }
 
     pub fn get_filtered_key<F>(
@@ -485,7 +471,7 @@ mod tests {
     fn test_new() {
         let dir = tempdir().expect("tempdir");
         let state = TreeState::new(dir.path(), true).expect("open").0;
-        assert!(state.get_metadata().is_empty());
+        assert!(state.metadata_bytes().is_empty());
         assert_eq!(state.len(), 0);
     }
 
@@ -500,7 +486,7 @@ mod tests {
             true,
         )
         .expect("open");
-        assert!(state.get_metadata().is_empty());
+        assert!(state.metadata_bytes().is_empty());
         assert_eq!(state.len(), 0);
     }
 
@@ -515,7 +501,7 @@ mod tests {
             true,
         )
         .expect("open");
-        assert!(state.get_metadata().is_empty());
+        assert!(state.metadata_bytes().is_empty());
         assert_eq!(state.len(), 0);
     }
 
@@ -523,61 +509,61 @@ mod tests {
     fn test_set_metadata() {
         let dir = tempdir().expect("tempdir");
         let mut state = TreeState::new(dir.path(), true).expect("open").0;
-        state.set_metadata(b"foobar");
+        state.set_metadata_bytes(b"foobar");
         let orig_name = state.file_name().unwrap();
         let block_id1 = state.flush().expect("flush");
         let block_id2 = state.write_new(dir.path()).expect("write_as");
         let new_name = state.file_name().unwrap();
         let state =
             TreeState::open(dir.path().join(orig_name), block_id1.into(), true).expect("open");
-        assert_eq!(state.get_metadata()[..], b"foobar"[..]);
+        assert_eq!(state.metadata_bytes()[..], b"foobar"[..]);
         let state =
             TreeState::open(dir.path().join(new_name), block_id2.into(), true).expect("open");
-        assert_eq!(state.get_metadata()[..], b"foobar"[..]);
+        assert_eq!(state.metadata_bytes()[..], b"foobar"[..]);
     }
 
     #[test]
-    fn test_set_metadata_by_keys() {
+    fn test_update_metadata() {
         let dir = tempdir().expect("tempdir");
         let mut state = TreeState::new(dir.path(), true).expect("open").0;
         state
-            .set_metadata_by_keys(&[
+            .update_metadata(&[
                 ("key1".to_string(), Some("value1".to_string())),
                 ("key2".to_string(), Some("value2".to_string())),
             ])
             .unwrap();
         assert_eq!(
-            state.get_metadata_by_key("key1").unwrap(),
+            state.metadata().unwrap().get("key1").cloned(),
             Some("value1".to_string())
         );
         assert_eq!(
-            state.get_metadata_by_key("key2").unwrap(),
+            state.metadata().unwrap().get("key2").cloned(),
             Some("value2".to_string())
         );
 
         state
-            .set_metadata_by_keys(&[("key1".to_string(), Some("value1.b".to_string()))])
+            .update_metadata(&[("key1".to_string(), Some("value1.b".to_string()))])
             .unwrap();
         assert_eq!(
-            state.get_metadata_by_key("key1").unwrap(),
+            state.metadata().unwrap().get("key1").cloned(),
             Some("value1.b".to_string())
         );
         assert_eq!(
-            state.get_metadata_by_key("key2").unwrap(),
+            state.metadata().unwrap().get("key2").cloned(),
             Some("value2".to_string())
         );
 
         state
-            .set_metadata_by_keys(&[
+            .update_metadata(&[
                 ("key1".to_string(), Some("value1.c".to_string())),
                 ("key2".to_string(), None),
             ])
             .unwrap();
         assert_eq!(
-            state.get_metadata_by_key("key1").unwrap(),
+            state.metadata().unwrap().get("key1").cloned(),
             Some("value1.c".to_string())
         );
-        assert_eq!(state.get_metadata_by_key("key2").unwrap(), None);
+        assert_eq!(state.metadata().unwrap().get("key2"), None);
     }
 
     // Some random paths extracted from fb-ext, plus some manually added entries, shuffled.
@@ -690,104 +676,6 @@ mod tests {
     }
 
     #[test]
-    fn test_visit_query_by_flags() {
-        let dir = tempdir().expect("tempdir");
-        let mut state = TreeState::new(dir.path(), true).expect("open").0;
-        let mut rng = ChaChaRng::from_seed([0; 32]);
-        let mut file: FileStateV2 = rng.gen();
-        file.state = StateFlags::IGNORED | StateFlags::NEED_CHECK;
-        state.insert(b"a/b/1", &file).expect("insert");
-        file.state = StateFlags::IGNORED | StateFlags::EXIST_P2;
-        state.insert(b"a/b/2", &file).expect("insert");
-        file.state = StateFlags::COPIED | StateFlags::EXIST_P2;
-        state.insert(b"a/c/3", &file).expect("insert");
-
-        let files: Vec<Vec<u8>> = state
-            .visit_by_state(StateFlags::IGNORED)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.0)
-            .collect();
-        assert_eq!(files, vec![b"a/b/1", b"a/b/2"]);
-
-        let files: Vec<Vec<u8>> = state
-            .visit_by_state(StateFlags::EXIST_P2)
-            .unwrap()
-            .into_iter()
-            .map(|e| e.0)
-            .collect();
-        assert_eq!(files, vec![b"a/b/2", b"a/c/3"]);
-    }
-
-    #[test]
-    fn test_visit_state_change_propagation() {
-        let paths: [&[u8]; 5] = [b"a/b/1", b"a/b/2", b"a/c/d/3", b"b/5", b"c"];
-
-        // Only care about 1 bit (IGNORED), since other bits will propagate to parent trees in a
-        // same way.
-        //
-        // Enumerate transition from all possible start states to end states. Make sure `visit`
-        // querying that bit would return the expected result.
-        //
-        // 2 states for each file - IGNORED is set, or not set. With 5 files, that's (1 << 5 = 32)
-        // start states, and 32 end states. 32 ** 2 = 1024 transitions to test.
-        let bit = StateFlags::IGNORED;
-        for start_bits in 0..(1 << paths.len()) {
-            let dir = tempdir().expect("tempdir");
-            // First, write the start state.
-            let mut state = TreeState::new(dir.path(), true).expect("open").0;
-            let file_name = state.file_name().unwrap();
-            let mut rng = ChaChaRng::from_seed([0; 32]);
-            for (i, path) in paths.iter().enumerate() {
-                let mut file: FileStateV2 = rng.gen();
-                if ((1 << i) & start_bits) == 0 {
-                    file.state -= bit;
-                } else {
-                    file.state |= bit;
-                }
-                state.insert(path, &file).expect("insert");
-            }
-            let block_id = state.flush().expect("flush");
-
-            // Then test end states.
-            for end_bits in 0..(1 << paths.len()) {
-                let mut state =
-                    TreeState::open(dir.path().join(&file_name), block_id, true).expect("open");
-                let mut i: usize = 0;
-                let mut expected = vec![];
-                state
-                    .visit(
-                        &mut |ref _path, ref mut file| {
-                            let old_state = file.state;
-                            if ((1 << i) & end_bits) == 0 {
-                                file.state -= bit;
-                            } else {
-                                file.state |= bit;
-                                expected.push(paths[i]);
-                            }
-                            i += 1;
-                            if old_state == file.state {
-                                Ok(VisitorResult::NotChanged)
-                            } else {
-                                Ok(VisitorResult::Changed)
-                            }
-                        },
-                        &|_, _| true,
-                        &|_, _| true,
-                    )
-                    .expect("visit");
-                let files: Vec<Vec<u8>> = state
-                    .visit_by_state(bit)
-                    .unwrap()
-                    .into_iter()
-                    .map(|e| e.0)
-                    .collect();
-                assert_eq!(files, expected);
-            }
-        }
-    }
-
-    #[test]
     fn test_get_keys_ignorecase() {
         let dir = tempdir().expect("tempdir");
         let mut state = new_treestate(dir.path());
@@ -814,20 +702,29 @@ mod tests {
         let mut rng = ChaChaRng::from_seed([0; 32]);
         let mut file = rng.gen();
         state.insert(b"dir/file", &file).unwrap();
-        assert_eq!(state.normalize(b"dir/file").unwrap().as_ref(), b"dir/file");
-        assert_eq!(state.normalize(b"dir/FILE").unwrap().as_ref(), b"dir/FILE");
-        assert_eq!(state.normalize(b"DIR/file").unwrap().as_ref(), b"DIR/file");
+        assert_eq!(
+            state.normalize_path(b"dir/file").unwrap().as_ref(),
+            b"dir/file"
+        );
+        assert_eq!(
+            state.normalize_path(b"dir/FILE").unwrap().as_ref(),
+            b"dir/FILE"
+        );
+        assert_eq!(
+            state.normalize_path(b"DIR/file").unwrap().as_ref(),
+            b"DIR/file"
+        );
 
         file.state = StateFlags::EXIST_NEXT;
         state.insert(b"dir/RENAME", &file).unwrap();
         file.state = StateFlags::EXIST_P1;
         state.insert(b"dir/rename", &file).unwrap();
         assert_eq!(
-            state.normalize(b"dir/rename").unwrap().as_ref(),
+            state.normalize_path(b"dir/rename").unwrap().as_ref(),
             b"dir/rename"
         );
         assert_eq!(
-            state.normalize(b"dir/RENAME").unwrap().as_ref(),
+            state.normalize_path(b"dir/RENAME").unwrap().as_ref(),
             b"dir/RENAME"
         );
     }
@@ -841,15 +738,15 @@ mod tests {
         let mut file = rng.gen();
         state.insert(b"dir/file", &file).unwrap();
         assert_eq!(
-            std::str::from_utf8(state.normalize(b"dir/file").unwrap().as_ref()).unwrap(),
+            std::str::from_utf8(state.normalize_path(b"dir/file").unwrap().as_ref()).unwrap(),
             "dir/file"
         );
         assert_eq!(
-            std::str::from_utf8(state.normalize(b"dir/FILE").unwrap().as_ref()).unwrap(),
+            std::str::from_utf8(state.normalize_path(b"dir/FILE").unwrap().as_ref()).unwrap(),
             "dir/file"
         );
         assert_eq!(
-            std::str::from_utf8(state.normalize(b"DIR/file").unwrap().as_ref()).unwrap(),
+            std::str::from_utf8(state.normalize_path(b"DIR/file").unwrap().as_ref()).unwrap(),
             "dir/file"
         );
 
@@ -859,11 +756,11 @@ mod tests {
         file.state = StateFlags::EXIST_P1;
         state.insert(b"dir/rename", &file).unwrap();
         assert_eq!(
-            std::str::from_utf8(state.normalize(b"dir/rename").unwrap().as_ref()).unwrap(),
+            std::str::from_utf8(state.normalize_path(b"dir/rename").unwrap().as_ref()).unwrap(),
             "dir/RENAME"
         );
         assert_eq!(
-            std::str::from_utf8(state.normalize(b"dir/RENAME").unwrap().as_ref()).unwrap(),
+            std::str::from_utf8(state.normalize_path(b"dir/RENAME").unwrap().as_ref()).unwrap(),
             "dir/RENAME"
         );
     }

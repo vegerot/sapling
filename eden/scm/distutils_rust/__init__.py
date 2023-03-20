@@ -80,7 +80,7 @@ class RustExtension(object):
     @property
     def dstnametmp(self):
         platform = distutils.util.get_platform()
-        if platform.startswith("win-"):
+        if platform.startswith("win"):
             name = self.name + ".dll"
         elif platform.startswith("macosx"):
             name = "lib" + self.name + ".dylib"
@@ -91,7 +91,7 @@ class RustExtension(object):
     @property
     def dstname(self):
         platform = distutils.util.get_platform()
-        if platform.startswith("win-"):
+        if platform.startswith("win"):
             name = self.name + ".pyd"
         else:
             name = self.name + ".so"
@@ -129,7 +129,7 @@ class RustBinary(object):
     @property
     def dstnametmp(self):
         platform = distutils.util.get_platform()
-        if platform.startswith("win-"):
+        if platform.startswith("win"):
             return self.name + ".exe"
         else:
             return self.name
@@ -137,7 +137,7 @@ class RustBinary(object):
     @property
     def dstname(self):
         platform = distutils.util.get_platform()
-        if platform.startswith("win-"):
+        if platform.startswith("win"):
             return self.final_name + ".exe"
         else:
             return self.final_name
@@ -325,6 +325,7 @@ replace-with = "vendored-sources"
         # Homebrew. This affects certain Rust targets, somehow, making them produce
         # a target of the wrong arch (e.g. cross compiling to arm64 from x86)
         env.pop("HOMEBREW_CCCFG", None)
+        env = self.update_cargo_env(env)
 
         if target.cfgs:
             env["RUSTFLAGS"] = (
@@ -343,7 +344,7 @@ replace-with = "vendored-sources"
 
         if (
             target.type == "binary"
-            and distutils.util.get_platform().startswith("win-")
+            and distutils.util.get_platform().startswith("win")
             and self.long_paths_support
         ):
             retry = 0
@@ -378,7 +379,7 @@ replace-with = "vendored-sources"
             shutil.copy(pdbsrc, pdbdest)
 
     def set_long_paths_manifest(self, fname):
-        if not distutils.util.get_platform().startswith("win-"):
+        if not distutils.util.get_platform().startswith("win"):
             # This only makes sense on Windows
             distutils.log.info(
                 "skipping set_long_paths_manifest call for %s "
@@ -453,7 +454,11 @@ replace-with = "vendored-sources"
         self.build_target(target)
 
     try:
-        from distutils_rust.fb import rust_binary_paths, rust_vendored_crate_path
+        from distutils_rust.fb import (
+            rust_binary_paths,
+            rust_vendored_crate_path,
+            update_cargo_env,
+        )
     except ImportError:
 
         def rust_vendored_crate_path(self):
@@ -461,6 +466,9 @@ replace-with = "vendored-sources"
 
         def rust_binary_paths(self):
             return {"cargo": os.environ.get("CARGO_BIN", "cargo")}
+
+        def update_cargo_env(self, env):
+            return env
 
 
 class InstallRustExt(distutils.command.install_scripts.install_scripts):

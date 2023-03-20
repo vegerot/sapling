@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {EditedMessage} from '../CommitInfo';
+import type {EditedMessage} from '../CommitInfoState';
 import type {CommitTree} from '../getCommitTree';
 import type {
   ApplyPreviewsFuncType,
@@ -28,7 +28,7 @@ export class CommitOperation extends Operation {
     private originalHeadHash: Hash,
     private filesPathsToCommit?: Array<RepoRelativePath>,
   ) {
-    super();
+    super('CommitOperation');
   }
 
   static opName = 'Commit';
@@ -36,6 +36,7 @@ export class CommitOperation extends Operation {
   getArgs() {
     const args: Array<CommandArg> = [
       'commit',
+      '--addremove',
       '--message',
       `${this.message.title}\n${this.message.description}`,
     ];

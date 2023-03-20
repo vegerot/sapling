@@ -14,11 +14,10 @@ use anyhow::Result;
 use blobrepo::AsBlobRepo;
 use blobrepo::BlobRepo;
 use bonsai_hg_mapping::BonsaiHgMappingArc;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarksArc;
 use bulkops::PublicChangesetBulkFetch;
-use caching_ext::CachelibHandler;
-use caching_ext::MemcacheHandler;
+use caching_ext::CacheHandlerFactory;
 use changeset_fetcher::ChangesetFetcherArc;
 use changeset_fetcher::ChangesetFetcherRef;
 use changeset_fetcher::PrefetchedChangesetsFetcher;
@@ -102,7 +101,7 @@ where
     }
 }
 
-static BOOKMARK_NAME: Lazy<BookmarkName> = Lazy::new(|| BookmarkName::new("master").unwrap());
+static BOOKMARK_NAME: Lazy<BookmarkKey> = Lazy::new(|| BookmarkKey::new("master").unwrap());
 
 async fn new_tailer_for_tailing(
     blobrepo: &BlobRepo,
@@ -891,14 +890,9 @@ async fn test_caching(fb: FacebookInit) -> Result<()> {
     let blobrepo = Linear::getrepo(fb).await;
     let conns = SegmentedChangelogSqlConnections::with_sqlite_in_memory()?;
 
-    let cs_to_dag_handler = CachelibHandler::create_mock();
-    let dag_to_cs_handler = CachelibHandler::create_mock();
-    let memcache_handler = MemcacheHandler::create_mock();
-    let cache_handlers = CacheHandlers::new(
-        cs_to_dag_handler.clone(),
-        dag_to_cs_handler.clone(),
-        memcache_handler.clone(),
-    );
+    let cache_handlers = CacheHandlers::new(CacheHandlerFactory::Mocked);
+    let cs_to_dag_handler = cache_handlers.cs_to_dag.clone();
+    let dag_to_cs_handler = cache_handlers.dag_to_cs.clone();
 
     // It's easier to reason about cache hits and sets when the dag is already built
     let head = resolve_cs_id(&ctx, &blobrepo, "79a13814c5ce7330173ec04d279bf95ab3f652fb").await?;
@@ -958,7 +952,7 @@ async fn test_caching(fb: FacebookInit) -> Result<()> {
 async fn test_periodic_update(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb);
     let blobrepo = Linear::getrepo(fb).await;
-    let bookmark_name = BookmarkName::new("periodic_update")?;
+    let bookmark_name = BookmarkKey::new("periodic_update")?;
 
     let start_hg_id = "607314ef579bd2407752361ba1b0c1729d08b281";
     let start_cs = resolve_cs_id(&ctx, &blobrepo, start_hg_id).await?;

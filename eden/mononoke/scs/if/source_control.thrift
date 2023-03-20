@@ -13,6 +13,12 @@ namespace php SourceControlService
 namespace py scm.service.thrift.source_control
 namespace py3 scm.service.thrift
 
+typedef binary (rust.type = "bytes::Bytes") binary_bytes
+typedef binary small_binary (
+  rust.newtype,
+  rust.type = "smallvec::SmallVec<[u8; 24]>",
+)
+
 struct DateTime {
   /// UNIX timestamp
   1: required i64 timestamp;
@@ -183,20 +189,24 @@ struct CommitInfo {
   /// The date the commit was authored.
   4: i64 date;
 
-  /// The timezone the commit was authored in, in seconds after UTC.
-  8: i32 tz;
-
   /// The author of the commit.
   5: string author;
 
   /// The parents of the commit, in the requested identity schemes.
   6: list<map<CommitIdentityScheme, CommitId>> parents;
 
+  /// Extra metadata about the commit.
+  7: map<string, binary> extra;
+
+  /// The timezone the commit was authored in, in seconds after UTC.
+  8: i32 tz;
+
   /// Length of longest path between this commit and any root.
   9: i64 generation;
 
-  /// Extra metadata about the commit.
-  7: map<string, binary> extra;
+  /// Extra git headers associated with the commit if the commit is a
+  /// mirrored version from a git repo.
+  10: optional map<small_binary, binary_bytes> git_extra_headers;
 }
 
 struct BookmarkInfo {
@@ -430,6 +440,9 @@ struct MetadataDiffLinesCount {
 
   /// Number of significant (not generated) lines.
   4: i64 significant_deleted_lines_count;
+
+  /// Line number of the first added line (1-based).
+  5: optional i64 first_added_line_number;
 }
 
 /// Indicates whether the file was copied or moved
@@ -819,8 +832,12 @@ struct RepoCreateCommitParamsCommitInfo {
   /// The identity that committed this commit, as opposed to wrote it
   5: optional string committer;
 
-  /// The date the commit was committed
+  /// The date the commit was committed.
   6: optional DateTime committer_date;
+
+  /// Extra git headers associated with the commit if the commit is a
+  /// mirrored version from a git repo.
+  7: optional map<small_binary, binary_bytes> git_extra_headers;
 }
 
 struct RepoCreateCommitParams {
@@ -847,6 +864,28 @@ struct RepoCreateCommitParams {
   4: set<CommitIdentityScheme> identity_schemes;
 
   /// Service identity to use for this commit creation.
+  5: optional string service_identity;
+}
+
+struct RepoCreateStackParamsCommit {
+  /// The info for the new commit.
+  1: RepoCreateCommitParamsCommitInfo info;
+
+  /// A mapping from path to the change that is made at that path.
+  3: map<string, RepoCreateCommitParamsChange> changes;
+}
+
+struct RepoCreateStackParams {
+  /// The stack of commits to create, in topological order, starting with the first commit.
+  1: list<RepoCreateStackParamsCommit> commits;
+
+  /// The parents of the first commit in the stack.
+  2: list<CommitId> parents;
+
+  /// Commit identity schemes to return.
+  4: set<CommitIdentityScheme> identity_schemes;
+
+  /// Service identity to use for this stack creation.
   5: optional string service_identity;
 }
 
@@ -966,6 +1005,29 @@ struct RepoPrepareCommitsParams {
   1: list<CommitId> commits;
   /// The type of data that we want to derive
   2: DerivedDataType derived_data_type;
+}
+
+struct RepoUploadFileContentParams {
+  /// Content of the new file.
+  1: binary data;
+
+  /// The expected content sha1 of the file.
+  ///
+  /// If provided, it will be an error if the content does not match this hash.
+  2: optional binary expected_content_sha1;
+
+  /// The expected content sha256 of the file.
+  ///
+  /// If provided, it will be an error if the content does not match this hash.
+  3: optional binary expected_content_sha256;
+
+  /// The expected content seeded-blake3 of the file.
+  ///
+  /// If provided, it will be an error if the content does not match this hash.
+  4: optional binary expected_content_seeded_blake3;
+
+  /// The identity of the service making the upload file content request.
+  5: optional string service_identity;
 }
 
 struct CommitLookupParams {
@@ -1496,6 +1558,26 @@ struct MegarepoRemergeSourceParams {
   5: optional string message;
 }
 
+/// Params for upload_git_object method
+struct UploadGitObjectParams {
+  /// The raw bytes of the hash of the git object that is being uploaded.
+  /// In git terminology, this is the git object_id in bytes
+  1: binary git_hash;
+  /// The raw content of the git object that is being uploaded.
+  2: binary raw_content;
+  /// The identity of the service making the upload git object request.
+  3: optional string service_identity;
+}
+
+/// Params for create_git_tree method
+struct CreateGitTreeParams {
+  /// The raw bytes of the hash of the git tree object that is being stored
+  /// as a bonsai changeset at Mononoke end
+  1: binary git_tree_hash;
+  /// The identity of the service making the create git tree request.
+  2: optional string service_identity;
+}
+
 /// Method response structures
 
 struct RepoResolveBookmarkResponse {
@@ -1554,6 +1636,11 @@ struct RepoCreateCommitResponse {
   1: map<CommitIdentityScheme, CommitId> ids;
 }
 
+struct RepoCreateStackResponse {
+  /// The IDs of the created commits in the stack.
+  1: list<map<CommitIdentityScheme, CommitId>> commit_ids;
+}
+
 struct RepoCreateBookmarkResponse {}
 
 struct RepoMoveBookmarkResponse {}
@@ -1565,6 +1652,12 @@ struct RepoLandStackResponse {
 }
 
 struct RepoPrepareCommitsResponse {}
+
+struct RepoUploadFileContentResponse {
+  /// The id of the uploaded file, which can be used in subsequent
+  /// repo_create_commit requests.
+  1: binary id;
+}
 
 struct CommitCompareResponse {
   /// List of the files that are different between commits with their metadata
@@ -1824,6 +1917,10 @@ struct MegarepoRemergeSourcePollResponse {
   1: optional MegarepoRemergeSourceResult result;
 }
 
+struct UploadGitObjectResponse {}
+
+struct CreateGitTreeResponse {}
+
 /// Exceptions
 
 enum RequestErrorKind {
@@ -1958,6 +2055,13 @@ service SourceControlService extends fb303_core.BaseService {
     2: RepoCreateCommitParams params,
   ) throws (1: RequestError request_error, 2: InternalError internal_error);
 
+  /// Create a stack of new commits.  A stack is a linear chain of commits
+  /// where each commit is the single immediate child of the previous commit.
+  RepoCreateStackResponse repo_create_stack(
+    1: RepoSpecifier repo,
+    2: RepoCreateStackParams params,
+  ) throws (1: RequestError request_error, 2: InternalError internal_error);
+
   /// Create a bookmark.
   RepoCreateBookmarkResponse repo_create_bookmark(
     1: RepoSpecifier repo,
@@ -1991,6 +2095,12 @@ service SourceControlService extends fb303_core.BaseService {
   RepoPrepareCommitsResponse repo_prepare_commits(
     1: RepoSpecifier repo,
     2: RepoPrepareCommitsParams params,
+  ) throws (1: RequestError request_error, 2: InternalError internal_error);
+
+  /// Upload new file content
+  RepoUploadFileContentResponse repo_upload_file_content(
+    1: RepoSpecifier repo,
+    2: RepoUploadFileContentParams params,
   ) throws (1: RequestError request_error, 2: InternalError internal_error);
 
   /// Commit methods
@@ -2266,5 +2376,23 @@ service SourceControlService extends fb303_core.BaseService {
   /// Poll the execution of megarepo_re_merge_source request
   MegarepoRemergeSourcePollResponse megarepo_remerge_source_poll(
     1: MegarepoRemergeSourceToken token,
+  ) throws (1: RequestError request_error, 2: InternalError internal_error);
+
+  /// Git Import Methods
+  /// ==================
+
+  /// Upload raw git object to Mononoke data store for back-and-forth translation.
+  /// Not to be used for uploading raw file content blobs.
+  UploadGitObjectResponse upload_git_object(
+    1: RepoSpecifier repo,
+    2: UploadGitObjectParams params,
+  ) throws (1: RequestError request_error, 2: InternalError internal_error);
+
+  /// Create Mononoke counterpart of git tree object in the form of a bonsai changeset.
+  /// The raw git tree object must already be stored in Mononoke stores before invoking
+  /// this endpoint.
+  CreateGitTreeResponse create_git_tree(
+    1: RepoSpecifier repo,
+    2: CreateGitTreeParams params,
   ) throws (1: RequestError request_error, 2: InternalError internal_error);
 } (rust.request_context, sr.service_name = "mononoke-scs-server")

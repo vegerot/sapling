@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use blobrepo::BlobRepo;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLogRef;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
@@ -45,7 +45,7 @@ async fn init_repo(ctx: &CoreContext) -> Result<(RepoContext, BTreeMap<String, C
     .await?;
     let mut txn = blob_repo.bookmarks().create_transaction(ctx.clone());
     txn.force_set(
-        &BookmarkName::new("trunk")?,
+        &BookmarkKey::new("trunk")?,
         changesets["C"],
         BookmarkUpdateReason::TestMove,
     )?;
@@ -72,8 +72,9 @@ async fn land_stack(fb: FacebookInit) -> Result<()> {
             User,
         )
         .await?;
+    let key = BookmarkKey::new("trunk")?;
     let trunk_g = repo
-        .resolve_bookmark("trunk", BookmarkFreshness::MostRecent)
+        .resolve_bookmark(&key, BookmarkFreshness::MostRecent)
         .await?
         .expect("trunk should be set");
     assert_eq!(trunk_g.id(), outcome.head);
@@ -93,7 +94,7 @@ async fn land_stack(fb: FacebookInit) -> Result<()> {
         )
         .await?;
     let trunk_e = repo
-        .resolve_bookmark("trunk", BookmarkFreshness::MostRecent)
+        .resolve_bookmark(&key, BookmarkFreshness::MostRecent)
         .await?
         .expect("trunk should be set");
     assert_eq!(trunk_e.id(), outcome.head);
@@ -120,7 +121,7 @@ async fn land_stack(fb: FacebookInit) -> Result<()> {
         )
         .await?;
     let trunk_f = repo
-        .resolve_bookmark("trunk", BookmarkFreshness::MostRecent)
+        .resolve_bookmark(&key, BookmarkFreshness::MostRecent)
         .await?
         .expect("trunk should be set");
     assert_eq!(trunk_f.id(), outcome.head);
@@ -149,7 +150,7 @@ async fn land_stack(fb: FacebookInit) -> Result<()> {
         .bookmark_update_log()
         .list_bookmark_log_entries(
             ctx.clone(),
-            BookmarkName::new("trunk")?,
+            BookmarkKey::new("trunk")?,
             4,
             None,
             Freshness::MostRecent,

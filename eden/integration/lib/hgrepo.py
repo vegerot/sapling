@@ -167,6 +167,13 @@ class HgRepository(repobase.Repository):
                 env=env,
             )
         except subprocess.CalledProcessError as ex:
+            print("----------- Mercurial Crash Report")
+            print("cmd: ", " ".join(cmd))
+            if ex.stdout:
+                print("stdout: ", ex.stdout.decode())
+            if ex.stderr:
+                print("stderr: ", ex.stderr.decode())
+            print("----------- Mercurial Crash Report End")
             raise HgError(ex) from ex
 
     def hg(
@@ -195,7 +202,11 @@ class HgRepository(repobase.Repository):
             str, completed_process.stdout.decode(encoding, errors="replace")
         )
 
-    def init(self, hgrc: Optional[configparser.ConfigParser] = None) -> None:
+    def init(
+        self,
+        hgrc: Optional[configparser.ConfigParser] = None,
+        init_configs: Optional[List[str]] = None,
+    ) -> None:
         """
         Initialize a new hg repository by running 'hg init'
 
@@ -203,7 +214,8 @@ class HgRepository(repobase.Repository):
         describing configuration settings that should be added to the
         repository's .hg/hgrc file.
         """
-        self.hg("init")
+        init_config_args = [f"--config={c}" for c in init_configs or ()]
+        self.hg("init", *init_config_args)
         if hgrc is None:
             hgrc = configparser.ConfigParser()
 
@@ -224,9 +236,15 @@ class HgRepository(repobase.Repository):
         hgrc["remotefilelog"]["cachepath"] = cachepath
         self.write_hgrc(hgrc)
 
-        requirespath = os.path.join(self.path, ".hg", "requires")
-        with open(requirespath, "a") as f:
-            f.write("remotefilelog\n")
+        storerequirespath = os.path.join(self.path, ".hg", "store", "requires")
+        with open(storerequirespath, "r") as f:
+            storerequires = set(f.read().split())
+
+        # eagerepo conflicts with remotefilelog repo
+        if "eagerepo" not in storerequires:
+            requirespath = os.path.join(self.path, ".hg", "requires")
+            with open(requirespath, "a") as f:
+                f.write("remotefilelog\n")
 
     def write_hgrc(self, hgrc: configparser.ConfigParser) -> None:
         hgrc_path = os.path.join(self.path, ".hg", "hgrc")

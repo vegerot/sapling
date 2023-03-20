@@ -116,6 +116,10 @@ class EdenFS(object):
     def system_rc_path(self) -> Path:
         return self._etc_eden_dir / "edenfs.rc"
 
+    @property
+    def system_rollout_path(self) -> Path:
+        return self._etc_eden_dir / "edenfsctl_rollout.json"
+
     def __enter__(self) -> "EdenFS":
         return self
 
@@ -609,12 +613,22 @@ class EdenFS(object):
         """
 
         mount_path_bytes = mount_path.encode()
-        with open("/proc/mounts", "rb") as f:
+        if sys.platform == "linux":
+            with open("/proc/mounts", "rb") as f:
+                return any(
+                    mount_path_bytes == line.split(b" ")[1]
+                    for line in f.readlines()
+                    if util.is_edenfs_mount_device(line.split(b" ")[0])
+                )
+        elif sys.platform == "darwin":
+            allmounts = subprocess.check_output("mount")
             return any(
-                mount_path_bytes == line.split(b" ")[1]
-                for line in f.readlines()
+                mount_path_bytes == line.split(b" ")[2]
+                for line in allmounts.split(b"\n")
                 if util.is_edenfs_mount_device(line.split(b" ")[0])
             )
+        else:
+            raise Exception(f"Unsupported platform: {sys.platform}")
 
     def is_healthy(self) -> bool:
         """Executes `eden health` and returns True if it exited with code 0."""

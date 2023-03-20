@@ -37,7 +37,7 @@ else
   # First scsc call takes a while as scs server is doing derivation
   MONONOKE_SCS_DEFAULT_START_TIMEOUT=120
   MONONOKE_LAND_SERVICE_DEFAULT_START_TIMEOUT=120
-  MONONOKE_DDS_DEFAULT_START_TIMEOUT=60
+  MONONOKE_DDS_DEFAULT_START_TIMEOUT=120
 fi
 VI_SERVICE_DEFAULT_START_TIMEOUT=60
 
@@ -50,6 +50,7 @@ REPONAME=${REPONAME:-repo}
 
 # Where we write host:port information after servers bind to :0
 MONONOKE_SERVER_ADDR_FILE="$TESTTMP/mononoke_server_addr.txt"
+DDS_SERVER_ADDR_FILE="$TESTTMP/dds_server_addr.txt"
 
 export LOCAL_CONFIGERATOR_PATH="$TESTTMP/configerator"
 mkdir -p "${LOCAL_CONFIGERATOR_PATH}"
@@ -63,8 +64,17 @@ function get_configerator_relative_path {
   realpath --relative-to "${LOCAL_CONFIGERATOR_PATH}" "$1"
 }
 
+if [[ -n "$ENABLE_LOCAL_CACHE" ]]; then
+  CACHE_ARGS=(
+    --cache-mode=local-only
+    --cache-size-gb=1
+    --cachelib-disable-cacheadmin
+  )
+else
+  CACHE_ARGS=( --cache-mode=disabled )
+fi
+
 COMMON_ARGS=(
-  --skip-caching
   --mysql-master-only
   --tunables-config "$(get_configerator_relative_path "${MONONOKE_TUNABLES_PATH}")"
   --local-configerator-path "${LOCAL_CONFIGERATOR_PATH}"
@@ -191,6 +201,7 @@ function mononoke {
     --bound-address-file "$MONONOKE_SERVER_ADDR_FILE" \
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --no-default-scuba-dataset \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" >> "$TESTTMP/mononoke.out" 2>&1 &
   export MONONOKE_PID=$!
   echo "$MONONOKE_PID" >> "$DAEMON_PIDS"
@@ -203,6 +214,7 @@ function mononoke_hg_sync {
   shift
 
   GLOG_minloglevel=5 "$MONONOKE_HG_SYNC" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --retry-num 1 \
     --repo-id $REPOID \
@@ -220,6 +232,7 @@ function mononoke_backup_sync {
   shift
 
   GLOG_minloglevel=5 "$MONONOKE_HG_SYNC" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --retry-num 1 \
     --repo-id $REPOID \
@@ -236,6 +249,7 @@ function mononoke_backup_sync_loop_forever {
   shift
 
   GLOG_minloglevel=5 "$MONONOKE_HG_SYNC" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --retry-num 1 \
     --repo-id $REPOID \
@@ -253,6 +267,7 @@ function mononoke_backup_sync_loop_forever {
 
 function megarepo_tool {
   GLOG_minloglevel=5 "$MEGAREPO_TOOL" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --repo-id $REPOID \
     --mononoke-config-path "$TESTTMP"/mononoke-config \
@@ -262,6 +277,7 @@ function megarepo_tool {
 
 function megarepo_tool_multirepo {
   GLOG_minloglevel=5 "$MEGAREPO_TOOL" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --mononoke-config-path "$TESTTMP"/mononoke-config \
     "$@"
@@ -269,6 +285,7 @@ function megarepo_tool_multirepo {
 
 function mononoke_walker {
   GLOG_minloglevel=5 "$MONONOKE_WALKER" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --repo-id $REPOID \
     --mononoke-config-path "$TESTTMP"/mononoke-config \
@@ -277,6 +294,7 @@ function mononoke_walker {
 
 function mononoke_blobstore_healer {
   GLOG_minloglevel=5 "$MONONOKE_BLOBSTORE_HEALER" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --mononoke-config-path "$TESTTMP"/mononoke-config \
     "$@" 2>&1 | grep -v "Could not connect to a replica"
@@ -284,6 +302,7 @@ function mononoke_blobstore_healer {
 
 function mononoke_sqlblob_gc {
   GLOG_minloglevel=5 "$MONONOKE_SQLBLOB_GC" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --mononoke-config-path "$TESTTMP"/mononoke-config \
     "$@" 2>&1 | grep -v "Could not connect to a replica"
@@ -295,6 +314,7 @@ function mononoke_x_repo_sync() {
   shift
   shift
   GLOG_minloglevel=5 "$MONONOKE_X_REPO_SYNC" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --source-repo-id "$source_repo_id" \
@@ -304,6 +324,7 @@ function mononoke_x_repo_sync() {
 
 function mononoke_rechunker {
     GLOG_minloglevel=5 "$MONONOKE_RECHUNKER" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --repo-id $REPOID \
     --mononoke-config-path "$TESTTMP"/mononoke-config \
@@ -312,6 +333,7 @@ function mononoke_rechunker {
 
 function mononoke_hg_sync_with_retry {
   GLOG_minloglevel=5 "$MONONOKE_HG_SYNC" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --base-retry-delay-ms 1 \
     --repo-id $REPOID \
@@ -322,6 +344,7 @@ function mononoke_hg_sync_with_retry {
 
 function mononoke_hg_sync_with_failure_handler {
   GLOG_minloglevel=5 "$MONONOKE_HG_SYNC" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --retry-num 1 \
     --repo-id $REPOID \
@@ -340,6 +363,7 @@ function create_books_sqlite3_db {
   from_changeset_id VARBINARY(32),
   to_changeset_id VARBINARY(32),
   reason VARCHAR(32) NOT NULL, -- enum is used in mysql
+  category VARCHAR(32) NOT NULL DEFAULT 'branch',
   timestamp BIGINT NOT NULL
 );
 SQL
@@ -354,6 +378,7 @@ function mononoke_hg_sync_loop {
   shift
 
   GLOG_minloglevel=5 "$MONONOKE_HG_SYNC" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --retry-num 1 \
     --repo-id $REPOID \
@@ -368,6 +393,7 @@ function mononoke_hg_sync_loop_regenerate {
   shift
 
   GLOG_minloglevel=5 "$MONONOKE_HG_SYNC" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --retry-num 1 \
     --repo-id 0 \
@@ -377,6 +403,7 @@ function mononoke_hg_sync_loop_regenerate {
 
 function mononoke_admin {
   GLOG_minloglevel=5 "$MONONOKE_ADMIN" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --repo-id $REPOID \
     --mononoke-config-path "$TESTTMP"/mononoke-config "$@"
@@ -384,18 +411,21 @@ function mononoke_admin {
 
 function mononoke_newadmin {
   GLOG_minloglevel=5 "$MONONOKE_NEWADMIN" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --mononoke-config-path "$TESTTMP"/mononoke-config "$@"
 }
 
 function mononoke_import {
   GLOG_minloglevel=5 "$MONONOKE_IMPORT" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --mononoke-config-path "$TESTTMP"/mononoke-config "$@"
 }
 
 function mononoke_testtool {
   GLOG_minloglevel=5 "$MONONOKE_TESTTOOL" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --mononoke-config-path "$TESTTMP"/mononoke-config "$@"
 }
@@ -406,6 +436,7 @@ function mononoke_admin_source_target {
   local target_repo_id=$1
   shift
   GLOG_minloglevel=5 "$MONONOKE_ADMIN" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --source-repo-id "$source_repo_id" \
     --target-repo-id "$target_repo_id" \
@@ -418,6 +449,7 @@ function mononoke_hyper_repo_builder {
   local target_repo_book=$1
   shift
   GLOG_minloglevel=5 "$MONONOKE_HYPER_REPO_BUILDER" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --repo-id $REPOID \
     --mononoke-config-path "$TESTTMP"/mononoke-config \
@@ -1031,6 +1063,12 @@ globalrevs_publishing_bookmark = "${GLOBALREVS_PUBLISHING_BOOKMARK}"
 CONFIG
 fi
 
+if [[ -n "${GLOBALREVS_SMALL_REPO_ID:-}" ]]; then
+  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
+globalrevs_small_repo_id = ${GLOBALREVS_SMALL_REPO_ID}
+CONFIG
+fi
+
 if [[ -n "${POPULATE_GIT_MAPPING:-}" ]]; then
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 populate_git_mapping=true
@@ -1231,8 +1269,12 @@ CONF
 }
 
 function backfill_mapping {
-  GLOG_minloglevel=5 "$MONONOKE_BACKFILL_MAPPING" --repo-id "$REPOID" \
-  --mononoke-config-path "$TESTTMP/mononoke-config" "${COMMON_ARGS[@]}" "$@"
+  GLOG_minloglevel=5 "$MONONOKE_BACKFILL_MAPPING" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
+    --repo-id "$REPOID" \
+    --mononoke-config-path "$TESTTMP/mononoke-config" \
+    "$@"
 }
 
 function blobimport {
@@ -1251,9 +1293,13 @@ function blobimport {
   rm -rf "$revlog"
   hgedenapi --cwd "$input" debugexportrevlog revlog-export
   mkdir -p "$output"
-  $MONONOKE_BLOBIMPORT --repo-id $REPOID \
+  $MONONOKE_BLOBIMPORT \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
+     --repo-id $REPOID \
      --mononoke-config-path "$TESTTMP/mononoke-config" \
-     "$revlog/.hg" "${COMMON_ARGS[@]}" "$@" > "$TESTTMP/blobimport.out" 2>&1
+     "$revlog/.hg" \
+     "$@" > "$TESTTMP/blobimport.out" 2>&1
   BLOBIMPORT_RC="$?"
   if [[ $BLOBIMPORT_RC -ne 0 ]]; then
     cat "$TESTTMP/blobimport.out"
@@ -1265,13 +1311,20 @@ function blobimport {
 }
 
 function bonsai_verify {
-  GLOG_minloglevel=5 "$MONONOKE_BONSAI_VERIFY" --repo-id "$REPOID" \
-    --mononoke-config-path "$TESTTMP/mononoke-config" "${COMMON_ARGS[@]}" "$@"
+  GLOG_minloglevel=5 "$MONONOKE_BONSAI_VERIFY" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
+    --repo-id "$REPOID" \
+    --mononoke-config-path "$TESTTMP/mononoke-config" \
+    "$@"
 }
 
 function manual_scrub {
   GLOG_minloglevel=5 "$MONONOKE_MANUAL_SCRUB" \
-  --mononoke-config-path "$TESTTMP/mononoke-config" "${COMMON_ARGS[@]}" "$@"
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
+    --mononoke-config-path "$TESTTMP/mononoke-config" \
+    "$@"
 }
 
 function s_client {
@@ -1304,6 +1357,7 @@ function scs {
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --bound-address-file "$TESTTMP/scs_server_addr.txt" \
     --scribe-logging-directory "$TESTTMP/scribe_logs" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" >> "$TESTTMP/scs_server.out" 2>&1 &
   export SCS_SERVER_PID=$!
   echo "$SCS_SERVER_PID" >> "$DAEMON_PIDS"
@@ -1322,6 +1376,7 @@ function land_service {
     --log-level DEBUG \
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --bound-address-file "$TESTTMP/land_service_addr.txt" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" >> "$TESTTMP/land_service.out" 2>&1 &
   export LAND_SERVICE_PID=$!
   echo "$LAND_SERVICE_PID" >> "$DAEMON_PIDS"
@@ -1393,6 +1448,7 @@ function megarepo_async_worker {
     --log-level INFO \
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --scuba-dataset "file://$TESTTMP/async-worker.json" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" >> "$TESTTMP/megarepo_async_worker.out" 2>&1 &
   export MEGAREPO_ASYNC_WORKER_PID=$!
   echo "$MEGAREPO_ASYNC_WORKER_PID" >> "$DAEMON_PIDS"
@@ -1443,6 +1499,7 @@ function lfs_server {
   rm -f "$bound_addr_file"
 
   opts=(
+    "${CACHE_ARGS[@]}"
     "${COMMON_ARGS[@]}"
     --mononoke-config-path "$TESTTMP/mononoke-config"
     --listen-port 0
@@ -1682,15 +1739,16 @@ function hook_test_setup() {
 name="$HOOKBOOKMARK"
 CONFIG
 
-  HOOK_NAME="$1"
-  shift 1
-  EXTRA_CONFIG_DESCRIPTOR=""
-  if [[ $# -gt 0 ]]; then
-    EXTRA_CONFIG_DESCRIPTOR="$1"
-  fi
-
-
-  register_hook "$HOOK_NAME" "$EXTRA_CONFIG_DESCRIPTOR"
+  while [[ "$#" -gt 0 ]]; do
+    HOOK_NAME="$1"
+    shift 1
+    EXTRA_CONFIG_DESCRIPTOR=""
+    if [[ $# -gt 0 ]]; then
+      EXTRA_CONFIG_DESCRIPTOR="$1"
+      shift 1
+    fi
+    register_hook "$HOOK_NAME" "$EXTRA_CONFIG_DESCRIPTOR"
+  done
 
   setup_common_hg_configs
   cd "$TESTTMP" || exit 1
@@ -1724,6 +1782,7 @@ EOF
   cat >> .hg/hgrc <<EOF
 [extensions]
 pushrebase =
+amend=
 remotenames =
 EOF
 }
@@ -1786,6 +1845,7 @@ function aliasverify() {
   mode=$1
   shift 1
   GLOG_minloglevel=5 "$MONONOKE_ALIAS_VERIFY" --repo-id $REPOID \
+     "${CACHE_ARGS[@]}" \
      "${COMMON_ARGS[@]}" \
      --mononoke-config-path "$TESTTMP/mononoke-config" \
      --mode "$mode" "$@"
@@ -1884,9 +1944,9 @@ function add_synced_commit_mapping_entry() {
   large_repo_id="$3"
   large_bcs_id="$4"
   version="$5"
-  mononoke_admin_source_target "$small_repo_id" "$large_repo_id" crossrepo insert rewritten --source-hash "$small_bcs_id" \
+  quiet mononoke_admin_source_target "$small_repo_id" "$large_repo_id" crossrepo insert rewritten --source-hash "$small_bcs_id" \
     --target-hash "$large_bcs_id" \
-    --version-name "$version" 2>/dev/null
+    --version-name "$version"
 }
 
 function read_blobstore_wal_queue_size() {
@@ -1973,6 +2033,7 @@ function gitimport() {
   log="$TESTTMP/gitimport.out"
 
   "$MONONOKE_GITIMPORT" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --repo-id "$REPOID" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
@@ -2029,6 +2090,7 @@ fi
 
 function regenerate_hg_filenodes() {
   "$MONONOKE_REGENERATE_HG_FILENODES" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --repo-id "$REPOID" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
@@ -2038,6 +2100,7 @@ function regenerate_hg_filenodes() {
 
 function segmented_changelog_tailer_reseed() {
   "$MONONOKE_SEGMENTED_CHANGELOG_TAILER" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
     --force-reseed \
@@ -2046,6 +2109,7 @@ function segmented_changelog_tailer_reseed() {
 
 function segmented_changelog_tailer_once() {
   "$MONONOKE_SEGMENTED_CHANGELOG_TAILER" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
     --once \
@@ -2057,6 +2121,7 @@ function background_segmented_changelog_tailer() {
   shift
   # short delay here - we don't want to wait too much during tests
   "$MONONOKE_SEGMENTED_CHANGELOG_TAILER" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
     "$@" >> "$TESTTMP/$out_file" 2>&1 &
@@ -2066,6 +2131,7 @@ function background_segmented_changelog_tailer() {
 
 function microwave_builder() {
   "$MONONOKE_MICROWAVE_BUILDER" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
     "$@"
@@ -2074,6 +2140,7 @@ function microwave_builder() {
 function backfill_derived_data() {
   "$MONONOKE_BACKFILL_DERIVED_DATA" \
     --debug \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --repo-id "$REPOID" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
@@ -2083,6 +2150,7 @@ function backfill_derived_data() {
 function backfill_derived_data_multiple_repos() {
   IFS=':' read -r -a ids <<< "${REPOS[*]}"
   "$MONONOKE_BACKFILL_DERIVED_DATA" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     "${ids[@]}" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
@@ -2091,6 +2159,7 @@ function backfill_derived_data_multiple_repos() {
 
 function hook_tailer() {
   "$MONONOKE_HOOK_TAILER" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --repo-id "$REPOID" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
@@ -2114,7 +2183,9 @@ function copy_blobstore_keys() {
   TARGET_REPO_ID="$1"
   shift
 
-  GLOG_minloglevel=5 "$COPY_BLOBSTORE_KEYS" "${COMMON_ARGS[@]}" \
+  GLOG_minloglevel=5 "$COPY_BLOBSTORE_KEYS" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
     --source-repo-id "$SOURCE_REPO_ID" \
     --target-repo-id "$TARGET_REPO_ID" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
@@ -2122,7 +2193,9 @@ function copy_blobstore_keys() {
 }
 
 function streaming_clone() {
-  GLOG_minloglevel=5 "$MONONOKE_STREAMING_CLONE" "${COMMON_ARGS[@]}" \
+  GLOG_minloglevel=5 "$MONONOKE_STREAMING_CLONE" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
     --repo-id "$REPOID" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
     "$@"
@@ -2132,6 +2205,7 @@ function repo_import() {
   log="$TESTTMP/repo_import.out"
 
   "$MONONOKE_REPO_IMPORT" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --repo-id "$REPOID" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
@@ -2170,6 +2244,7 @@ init_tunables
 
 function packer() {
   "$MONONOKE_PACKER" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --repo-id "$REPOID" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
@@ -2178,6 +2253,7 @@ function packer() {
 
 function check_git_wc() {
   "$MONONOKE_CHECK_GIT_WC" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
     --repo-id "$REPOID" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
@@ -2186,8 +2262,9 @@ function check_git_wc() {
 
 function derived_data_service() {
   export DDS_PORT
-  local DDS_SERVER_ADDR_FILE
-  DDS_SERVER_ADDR_FILE="$TESTTMP/dds_server_addr.txt"
+
+  rm -rf "$DDS_SERVER_ADDR_FILE"
+
   THRIFT_TLS_SRV_CERT="$TEST_CERTDIR/localhost.crt" \
   THRIFT_TLS_SRV_KEY="$TEST_CERTDIR/localhost.key" \
   THRIFT_TLS_CL_CA_PATH="$TEST_CERTDIR/root-ca.crt" \
@@ -2196,11 +2273,20 @@ function derived_data_service() {
     -p 0 \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
     --bound-address-file "$DDS_SERVER_ADDR_FILE" \
+    "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" >> "$TESTTMP/derived_data_service.out" 2>&1 &
 
   pid=$!
   echo "$pid" >> "$DAEMON_PIDS"
+}
 
+function start_and_wait_for_dds() {
+  derived_data_service "$@"
+  wait_for_dds
+}
+
+function wait_for_dds() {
+  export DDS_PORT
   wait_for_server "Derived data service" DDS_PORT "$TESTTMP/derived_data_service.out" \
     "${MONONOKE_DDS_START_TIMEOUT:-"$MONONOKE_DDS_DEFAULT_START_TIMEOUT"}" "$DDS_SERVER_ADDR_FILE" \
     derived_data_client get-status
@@ -2217,7 +2303,10 @@ function derived_data_client() {
 }
 
 function derivation_worker() {
-  GLOG_minloglevel=5 "$DERIVED_DATA_WORKER" "${COMMON_ARGS[@]}" --mononoke-config-path "$TESTTMP"/mononoke-config "$@"
+  GLOG_minloglevel=5 "$DERIVED_DATA_WORKER" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
+    --mononoke-config-path "$TESTTMP"/mononoke-config "$@"
 }
 
 function verify_integrity_service_health() {

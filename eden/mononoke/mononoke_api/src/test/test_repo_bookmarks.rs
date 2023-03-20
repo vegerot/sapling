@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use blobrepo::BlobRepo;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
 use context::CoreContext;
@@ -37,12 +37,12 @@ async fn init_repo(ctx: &CoreContext) -> Result<(RepoContext, BTreeMap<String, C
     .await?;
     let mut txn = blob_repo.bookmarks().create_transaction(ctx.clone());
     txn.force_set(
-        &BookmarkName::new("trunk")?,
+        &BookmarkKey::new("trunk")?,
         changesets["E"],
         BookmarkUpdateReason::TestMove,
     )?;
-    txn.create_scratch(&BookmarkName::new("scratch/branch")?, changesets["G"])?;
-    txn.create_scratch(&BookmarkName::new("scratch/branchpoint")?, changesets["B"])?;
+    txn.create_scratch(&BookmarkKey::new("scratch/branch")?, changesets["G"])?;
+    txn.create_scratch(&BookmarkKey::new("scratch/branchpoint")?, changesets["B"])?;
     txn.commit().await?;
 
     let repo = Repo::new_test(ctx.clone(), blob_repo).await?;
@@ -57,7 +57,7 @@ async fn resolve_bookmark(fb: FacebookInit) -> Result<()> {
 
     // Test that normal bookmarks are visible both in and through the cache.
     assert_eq!(
-        repo.resolve_bookmark("trunk", BookmarkFreshness::MostRecent)
+        repo.resolve_bookmark(&BookmarkKey::new("trunk")?, BookmarkFreshness::MostRecent)
             .await?
             .unwrap()
             .id(),
@@ -65,7 +65,7 @@ async fn resolve_bookmark(fb: FacebookInit) -> Result<()> {
     );
 
     assert_eq!(
-        repo.resolve_bookmark("trunk", BookmarkFreshness::MaybeStale)
+        repo.resolve_bookmark(&BookmarkKey::new("trunk")?, BookmarkFreshness::MaybeStale)
             .await?
             .unwrap()
             .id(),
@@ -74,32 +74,44 @@ async fn resolve_bookmark(fb: FacebookInit) -> Result<()> {
 
     // Test that scratch bookmarks are visible through the cache.
     assert_eq!(
-        repo.resolve_bookmark("scratch/branch", BookmarkFreshness::MaybeStale)
-            .await?
-            .unwrap()
-            .id(),
+        repo.resolve_bookmark(
+            &BookmarkKey::new("scratch/branch")?,
+            BookmarkFreshness::MaybeStale
+        )
+        .await?
+        .unwrap()
+        .id(),
         changesets["G"],
     );
 
     assert_eq!(
-        repo.resolve_bookmark("scratch/branchpoint", BookmarkFreshness::MaybeStale)
-            .await?
-            .unwrap()
-            .id(),
+        repo.resolve_bookmark(
+            &BookmarkKey::new("scratch/branchpoint")?,
+            BookmarkFreshness::MaybeStale
+        )
+        .await?
+        .unwrap()
+        .id(),
         changesets["B"],
     );
 
     // Test that non-existent bookmarks don't exist either way.
     assert!(
-        repo.resolve_bookmark("scratch/nonexistent", BookmarkFreshness::MaybeStale)
-            .await?
-            .is_none()
+        repo.resolve_bookmark(
+            &BookmarkKey::new("scratch/nonexistent")?,
+            BookmarkFreshness::MaybeStale
+        )
+        .await?
+        .is_none()
     );
 
     assert!(
-        repo.resolve_bookmark("nonexistent", BookmarkFreshness::MostRecent)
-            .await?
-            .is_none()
+        repo.resolve_bookmark(
+            &BookmarkKey::new("nonexistent")?,
+            BookmarkFreshness::MostRecent
+        )
+        .await?
+        .is_none()
     );
 
     Ok(())

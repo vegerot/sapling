@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {EditedMessage} from '../CommitInfo';
+import type {EditedMessage} from '../CommitInfoState';
 import type {ApplyPreviewsFuncType, PreviewContext} from '../previews';
 import type {CommandArg, Hash} from '../types';
 
@@ -14,7 +14,7 @@ import {Operation} from './Operation';
 
 export class AmendMessageOperation extends Operation {
   constructor(private hash: Hash, private message: EditedMessage) {
-    super();
+    super('AmendMessageOperation');
   }
 
   static opName = 'Metaedit';

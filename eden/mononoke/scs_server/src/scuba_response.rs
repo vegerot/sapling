@@ -9,6 +9,7 @@ use scuba_ext::MononokeScubaSampleBuilder;
 use source_control as thrift;
 
 use crate::commit_id::CommitIdExt;
+use crate::scuba_common::hex;
 use crate::scuba_common::report_megarepo_target;
 use crate::scuba_common::Reported;
 
@@ -31,6 +32,19 @@ impl AddScubaResponse for thrift::RepoCreateCommitResponse {
     }
 }
 
+impl AddScubaResponse for thrift::RepoCreateStackResponse {
+    fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        if let Some(id) = self
+            .commit_ids
+            .last()
+            .and_then(|id| id.get(&thrift::CommitIdentityScheme::BONSAI))
+        {
+            scuba.add("commit", id.to_string());
+        }
+        scuba.add("response_commit_count", self.commit_ids.len());
+    }
+}
+
 impl AddScubaResponse for thrift::RepoCreateBookmarkResponse {}
 
 impl AddScubaResponse for thrift::RepoMoveBookmarkResponse {}
@@ -50,6 +64,12 @@ impl AddScubaResponse for thrift::RepoBookmarkInfoResponse {}
 impl AddScubaResponse for thrift::RepoStackInfoResponse {}
 
 impl AddScubaResponse for thrift::RepoPrepareCommitsResponse {}
+
+impl AddScubaResponse for thrift::RepoUploadFileContentResponse {
+    fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("response_id", hex(&self.id));
+    }
+}
 
 impl AddScubaResponse for thrift::CommitCompareResponse {}
 
@@ -190,3 +210,6 @@ impl AddScubaResponse for thrift::MegarepoSyncChangesetToken {
         report_megarepo_target(&self.target, scuba, Reported::Response);
     }
 }
+
+impl AddScubaResponse for thrift::UploadGitObjectResponse {}
+impl AddScubaResponse for thrift::CreateGitTreeResponse {}

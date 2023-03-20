@@ -36,8 +36,9 @@ MetaLogError = bindings.error.MetaLogError
 NeedSlowPathError = bindings.error.NeedSlowPathError
 NonUTF8PathError = bindings.error.NonUTF8Path
 WorkingCopyError = bindings.error.WorkingCopyError
+RepoInitError = bindings.error.RepoInitError
 RevisionstoreError = bindings.error.RevisionstoreError
-RustError = bindings.error.RustError
+UncategorizedNativeError = bindings.error.UncategorizedNativeError
 TlsError = bindings.error.TlsError
 
 

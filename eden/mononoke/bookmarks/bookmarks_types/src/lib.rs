@@ -39,21 +39,25 @@ pub enum Freshness {
 
 #[derive(Arbitrary, Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Bookmark {
-    pub name: BookmarkName,
+    pub key: BookmarkKey,
     pub kind: BookmarkKind,
 }
 
 impl Bookmark {
-    pub fn new(name: BookmarkName, kind: BookmarkKind) -> Self {
-        Bookmark { name, kind }
+    pub fn new(key: BookmarkKey, kind: BookmarkKind) -> Self {
+        Bookmark { key, kind }
     }
 
-    pub fn into_name(self) -> BookmarkName {
-        self.name
+    pub fn into_key(self) -> BookmarkKey {
+        self.key
+    }
+
+    pub fn key(&self) -> &BookmarkKey {
+        &self.key
     }
 
     pub fn name(&self) -> &BookmarkName {
-        &self.name
+        &self.key.name
     }
 
     pub fn kind(&self) -> &BookmarkKind {
@@ -78,6 +82,89 @@ impl Bookmark {
             Publishing => false,
             PullDefaultPublishing => true,
         }
+    }
+}
+
+#[derive(Arbitrary, Clone, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
+pub struct BookmarkKey {
+    name: BookmarkName,
+    category: BookmarkCategory,
+}
+
+impl FromStr for BookmarkKey {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        BookmarkKey::new(s)
+    }
+}
+
+impl fmt::Display for BookmarkKey {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
+
+impl BookmarkKey {
+    pub fn with_name_and_category(name: BookmarkName, category: BookmarkCategory) -> Self {
+        Self { name, category }
+    }
+
+    pub fn with_name(name: BookmarkName) -> Self {
+        Self::with_name_and_category(name, Default::default())
+    }
+
+    /// First bookmark key with a given name.  Used for constructing ranges
+    /// which include all categories.
+    pub fn with_first_name(name: BookmarkName) -> Self {
+        Self::with_name_and_category(name, BookmarkCategory::ALL.first().copied().unwrap())
+    }
+
+    /// Last bookmark key with a given name.  Used for constructing ranges
+    /// which include all categories.
+    pub fn with_last_name(name: BookmarkName) -> Self {
+        Self::with_name_and_category(name, BookmarkCategory::ALL.last().copied().unwrap())
+    }
+
+    pub fn new<B: AsRef<str>>(bookmark: B) -> Result<Self, Error> {
+        Ok(Self {
+            name: BookmarkName::new(bookmark)?,
+            category: Default::default(),
+        })
+    }
+
+    pub fn new_ascii(bookmark: AsciiString) -> Self {
+        Self {
+            name: BookmarkName::new_ascii(bookmark),
+            category: Default::default(),
+        }
+    }
+
+    pub fn as_ascii(&self) -> &AsciiString {
+        self.name.as_ascii()
+    }
+
+    pub fn into_string(self) -> String {
+        self.name.into_string()
+    }
+
+    pub fn into_byte_vec(self) -> Vec<u8> {
+        self.name.into_byte_vec()
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.name.as_str()
+    }
+
+    pub fn name(&self) -> &BookmarkName {
+        &self.name
+    }
+
+    pub fn category(&self) -> &BookmarkCategory {
+        &self.category
+    }
+
+    pub fn into_name(self) -> BookmarkName {
+        self.name
     }
 }
 
@@ -277,6 +364,104 @@ impl From<BookmarkKind> for Value {
     }
 }
 
+/// Historically, in Mononoke, bookmark names have been unique.
+/// Since we import repositories from Git, this invariant is not true anymore.
+/// A tag, a branch or a note can have the same name as they are namespaced in Git.
+/// BookmarkCategory allows to differentiate between e.g. a tag called foo and a branch called
+/// foo.
+/// See https://docs.rs/git-ref/0.23.1/git_ref/enum.Category.html for an exhaustive
+/// list of what git supports.
+/// Here, we explicitly don't support worktrees or the distinction between remote and local
+/// branches as these concepts don't fit in the mononoke data model. We also don't support pseudo
+/// refs such as HEAD as the server doesn't need to know about this.
+#[derive(
+    Arbitrary,
+    Clone,
+    Debug,
+    Eq,
+    Hash,
+    PartialEq,
+    Copy,
+    Ord,
+    PartialOrd,
+    clap::ArgEnum
+)]
+#[derive(mysql::OptTryFromRowField)]
+pub enum BookmarkCategory {
+    /// A bookmark created in Mononoke or imported from a Git branch (ref living under
+    /// `refs/heads` or `refs/remotes/<remote_name>`)
+    Branch,
+    /// A bookmark created from importing a Git tag (under `refs/tags`)
+    Tag,
+    /// A bookmark created from importing a Git note (under `refs/notes`)
+    Note,
+}
+
+impl BookmarkCategory {
+    pub const ALL: &'static [BookmarkCategory] = &[Self::Branch, Self::Tag, Self::Note];
+}
+
+const BRANCH_CATEGORY: &[u8] = b"branch";
+const TAG_CATEGORY: &[u8] = b"tag";
+const NOTE_CATEGORY: &[u8] = b"note";
+
+impl Default for BookmarkCategory {
+    fn default() -> Self {
+        Self::Branch
+    }
+}
+
+impl From<BookmarkCategory> for Value {
+    fn from(category: BookmarkCategory) -> Self {
+        use BookmarkCategory::*;
+
+        match category {
+            Branch => Value::Bytes(BRANCH_CATEGORY.to_vec()),
+            Tag => Value::Bytes(TAG_CATEGORY.to_vec()),
+            Note => Value::Bytes(NOTE_CATEGORY.to_vec()),
+        }
+    }
+}
+
+impl ConvIr<BookmarkCategory> for BookmarkCategory {
+    fn new(v: Value) -> Result<Self, FromValueError> {
+        use BookmarkCategory::*;
+
+        match v {
+            Value::Bytes(ref b) if b == BRANCH_CATEGORY => Ok(Branch),
+            Value::Bytes(ref b) if b == TAG_CATEGORY => Ok(Tag),
+            Value::Bytes(ref b) if b == NOTE_CATEGORY => Ok(Note),
+            v => Err(FromValueError(v)),
+        }
+    }
+
+    fn commit(self) -> BookmarkCategory {
+        self
+    }
+
+    fn rollback(self) -> Value {
+        self.into()
+    }
+}
+
+impl FromValue for BookmarkCategory {
+    type Intermediate = BookmarkCategory;
+}
+
+impl std::fmt::Display for BookmarkCategory {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use BookmarkCategory::*;
+
+        let s = match self {
+            Branch => "branch",
+            Tag => "tag",
+            Note => "note",
+        };
+
+        write!(f, "{}", s)
+    }
+}
+
 /// Bookmark name filter for pagination.
 ///
 /// If set to `BookmarkPagination::After(name)`, Filters bookmarks to those
@@ -308,19 +493,19 @@ impl FromStr for BookmarkPrefix {
 
 pub enum BookmarkPrefixRange {
     /// All bookmarks in the given half-open range.
-    Range(Range<BookmarkName>),
+    Range(Range<BookmarkKey>),
 
     /// All bookmarks in the given range from an inclusive start.
-    RangeFrom(RangeFrom<BookmarkName>),
+    RangeFrom(RangeFrom<BookmarkKey>),
 
     /// All bookmarks.
     RangeFull(RangeFull),
 
     /// All bookmarks after the given name (exclusive).
-    After(BookmarkName),
+    After(BookmarkKey),
 
     /// All bookmarks between the given names (exclusive on both sides).
-    Between(BookmarkName, BookmarkName),
+    Between(BookmarkKey, BookmarkKey),
 
     /// No bookmarks.
     ///
@@ -329,7 +514,7 @@ pub enum BookmarkPrefixRange {
     /// provide a valid range.  To do this, we use an arbitrary
     /// name owned by this `BookmarkPrefixRange`, and return
     /// the half-open range `[name, name)`, which is empty.
-    Empty(BookmarkName),
+    Empty(BookmarkKey),
 }
 
 impl BookmarkPrefixRange {
@@ -337,24 +522,26 @@ impl BookmarkPrefixRange {
     /// after a given bookmark page start (exclusively).
     pub fn with_pagination(self, pagination: BookmarkPagination) -> BookmarkPrefixRange {
         use BookmarkPrefixRange::*;
+        let last = BookmarkKey::with_last_name;
+        // For `Empty` we only need an arbitrary value, so the last one will do.
         match pagination {
             BookmarkPagination::FromStart => self,
             BookmarkPagination::After(name) => match self {
-                Range(r) if name >= r.end => Empty(name),
-                Range(r) if name >= r.start => Between(name, r.end),
-                RangeFrom(r) if name >= r.start => After(name),
-                RangeFull(_) => After(name),
-                Between(_, e) if name >= e => Empty(name),
-                Between(s, e) if name >= s => Between(name, e),
-                After(a) if name >= a => After(name),
+                Range(r) if name >= *r.end.name() => Empty(last(name)),
+                Range(r) if name >= *r.start.name() => Between(last(name), r.end),
+                RangeFrom(r) if name >= *r.start.name() => After(last(name)),
+                RangeFull(_) => After(last(name)),
+                Between(_, e) if name >= *e.name() => Empty(last(name)),
+                Between(s, e) if name >= *s.name() => Between(last(name), e),
+                After(a) if name >= *a.name() => After(last(name)),
                 range => range,
             },
         }
     }
 }
 
-impl RangeBounds<BookmarkName> for BookmarkPrefixRange {
-    fn start_bound(&self) -> Bound<&BookmarkName> {
+impl RangeBounds<BookmarkKey> for BookmarkPrefixRange {
+    fn start_bound(&self) -> Bound<&BookmarkKey> {
         use BookmarkPrefixRange::*;
         match self {
             Range(r) => r.start_bound(),
@@ -366,7 +553,7 @@ impl RangeBounds<BookmarkName> for BookmarkPrefixRange {
         }
     }
 
-    fn end_bound(&self) -> Bound<&BookmarkName> {
+    fn end_bound(&self) -> Bound<&BookmarkKey> {
         use BookmarkPrefixRange::*;
         match self {
             Range(r) => r.end_bound(),
@@ -405,8 +592,10 @@ impl BookmarkPrefix {
         match prefix_to_range_end(self.bookmark_prefix.clone()) {
             Some(range_end) => {
                 let range = Range {
-                    start: BookmarkName::new_ascii(self.bookmark_prefix.clone()),
-                    end: BookmarkName::new_ascii(range_end),
+                    start: BookmarkKey::with_first_name(BookmarkName::new_ascii(
+                        self.bookmark_prefix.clone(),
+                    )),
+                    end: BookmarkKey::with_first_name(BookmarkName::new_ascii(range_end)),
                 };
                 BookmarkPrefixRange::Range(range)
             }
@@ -414,7 +603,9 @@ impl BookmarkPrefix {
                 0 => BookmarkPrefixRange::RangeFull(RangeFull),
                 _ => {
                     let range = RangeFrom {
-                        start: BookmarkName::new_ascii(self.bookmark_prefix.clone()),
+                        start: BookmarkKey::with_first_name(BookmarkName::new_ascii(
+                            self.bookmark_prefix.clone(),
+                        )),
                     };
                     BookmarkPrefixRange::RangeFrom(range)
                 }
@@ -501,14 +692,14 @@ mod tests {
     quickcheck! {
         fn test_prefix_range_contains_self(bookmark: Bookmark) -> bool {
             let prefix = BookmarkPrefix::new_ascii(bookmark.name().as_ascii().clone());
-            prefix.to_range().contains(bookmark.name())
+            prefix.to_range().contains(bookmark.key())
         }
 
         fn test_prefix_range_contains_its_suffixes(bookmark: Bookmark, more: ascii_ext::AsciiString) -> bool {
             let prefix = BookmarkPrefix::new_ascii(bookmark.name().as_ascii().clone());
             let mut name = bookmark.name().as_ascii().clone();
             name.push_str(&more.0);
-            prefix.to_range().contains(&BookmarkName::new_ascii(name))
+            prefix.to_range().contains(&BookmarkKey::new_ascii(name))
         }
 
         fn test_prefix_range_does_not_contains_its_prefixes(bookmark: Bookmark, chr: ascii_ext::AsciiChar) -> bool {
@@ -516,12 +707,12 @@ mod tests {
             prefix.push(chr.0);
             let prefix = BookmarkPrefix::new_ascii(prefix);
 
-            !prefix.to_range().contains(bookmark.name())
+            !prefix.to_range().contains(bookmark.key())
         }
 
         fn test_empty_range_contains_any(bookmark: Bookmark) -> bool {
             let prefix = BookmarkPrefix::empty();
-            prefix.to_range().contains(bookmark.name())
+            prefix.to_range().contains(bookmark.key())
         }
 
         fn test_pagination_excludes_start(prefix_char: Option<ascii_ext::AsciiChar>, after: BookmarkName) -> bool {
@@ -530,7 +721,8 @@ mod tests {
                 None => BookmarkPrefix::empty(),
             };
             let pagination = BookmarkPagination::After(after.clone());
-            !prefix.to_range().with_pagination(pagination).contains(&after)
+            let after_key = BookmarkKey::with_last_name(after);
+            !prefix.to_range().with_pagination(pagination).contains(&after_key)
         }
     }
 }

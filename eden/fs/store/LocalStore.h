@@ -28,7 +28,6 @@ class Blob;
 class EdenConfig;
 class StoreResult;
 class Tree;
-class TreeMetadata;
 
 /*
  * LocalStore stores objects (trees and blobs) locally on disk.
@@ -207,6 +206,11 @@ class LocalStore : public std::enable_shared_from_this<LocalStore> {
      * Store a Blob.
      */
     void putBlob(const ObjectId& id, const Blob* blob);
+
+    /**
+     * Store a blob metadata.
+     */
+    void putBlobMetadata(const ObjectId& id, const BlobMetadata& metadata);
 
     /**
      * Put arbitrary data in the store.

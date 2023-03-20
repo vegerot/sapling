@@ -16,6 +16,7 @@ use bytes::Bytes;
 use caching_ext::get_or_fill;
 use caching_ext::get_or_fill_chunked;
 use caching_ext::CacheDisposition;
+use caching_ext::CacheHandlerFactory;
 use caching_ext::CacheTtl;
 use caching_ext::CachelibHandler;
 use caching_ext::EntityStore;
@@ -32,12 +33,10 @@ use changesets::ChangesetInsert;
 use changesets::Changesets;
 use changesets::SortOrder;
 use context::CoreContext;
-use fbinit::FacebookInit;
 use fbthrift::compact_protocol;
 use futures::stream::BoxStream;
 use maplit::hashset;
 use memcache::KeyGen;
-use memcache::MemcacheClient;
 use mononoke_types::ChangesetId;
 use mononoke_types::ChangesetIdPrefix;
 use mononoke_types::ChangesetIdsResolvedFromPrefix;
@@ -83,33 +82,21 @@ fn get_keygen() -> KeyGen {
 
 impl CachingChangesets {
     pub fn new(
-        fb: FacebookInit,
         changesets: Arc<dyn Changesets>,
-        cache_pool: cachelib::VolatileLruCachePool,
+        cache_handler_factory: CacheHandlerFactory,
     ) -> Self {
         Self {
             repo_id: changesets.repo_id(),
             changesets,
-            cachelib: cache_pool.into(),
-            memcache: MemcacheClient::new(fb)
-                .expect("Memcache initialization failed")
-                .into(),
+            cachelib: cache_handler_factory.cachelib(),
+            memcache: cache_handler_factory.memcache(),
             keygen: get_keygen(),
         }
     }
 
     #[cfg(test)]
     pub fn mocked(changesets: Arc<dyn Changesets>) -> Self {
-        let cachelib = CachelibHandler::create_mock();
-        let memcache = MemcacheHandler::create_mock();
-
-        Self {
-            repo_id: changesets.repo_id(),
-            changesets,
-            cachelib,
-            memcache,
-            keygen: get_keygen(),
-        }
+        Self::new(changesets, CacheHandlerFactory::Mocked)
     }
 
     #[cfg(test)]
@@ -126,7 +113,7 @@ impl CachingChangesets {
     #[cfg(test)]
     pub fn cachelib_stats(&self) -> MockStoreStats {
         match self.cachelib {
-            CachelibHandler::Real(_) => unimplemented!(),
+            CachelibHandler::Real(_) | CachelibHandler::Noop => unimplemented!(),
             CachelibHandler::Mock(ref mock) => mock.stats(),
         }
     }
@@ -134,7 +121,7 @@ impl CachingChangesets {
     #[cfg(test)]
     pub fn memcache_stats(&self) -> MockStoreStats {
         match self.memcache {
-            MemcacheHandler::Real(_) => unimplemented!(),
+            MemcacheHandler::Real(_) | MemcacheHandler::Noop => unimplemented!(),
             MemcacheHandler::Mock(ref mock) => mock.stats(),
         }
     }
@@ -165,7 +152,7 @@ impl Changesets for CachingChangesets {
     ) -> Result<Option<ChangesetEntry>, Error> {
         STATS::gets.add_value(1);
         let ctx = (ctx, self);
-        let mut map = get_or_fill(ctx, hashset![cs_id]).await?;
+        let mut map = get_or_fill(&ctx, hashset![cs_id]).await?;
         Ok(map.remove(&cs_id).map(|entry| entry.0))
     }
 
@@ -176,10 +163,10 @@ impl Changesets for CachingChangesets {
     ) -> Result<Vec<ChangesetEntry>, Error> {
         STATS::gets.add_value(1);
         let ctx = (ctx, self);
-        let res = get_or_fill_chunked(ctx, cs_ids.into_iter().collect(), 1000, 2)
+        let res = get_or_fill_chunked(&ctx, cs_ids.into_iter().collect(), 1000, 2)
             .await?
-            .into_iter()
-            .map(|(_, val)| val.0)
+            .into_values()
+            .map(|val| val.0)
             .collect();
         Ok(res)
     }
@@ -279,16 +266,6 @@ impl EntityStore<ChangesetEntryWrapper> for CacheRequest<'_> {
     }
 
     caching_ext::impl_singleton_stats!("changesets");
-
-    #[cfg(test)]
-    fn spawn_memcache_writes(&self) -> bool {
-        let (_, mapping) = self;
-
-        match mapping.memcache {
-            MemcacheHandler::Real(_) => true,
-            MemcacheHandler::Mock(..) => false,
-        }
-    }
 }
 
 #[async_trait]

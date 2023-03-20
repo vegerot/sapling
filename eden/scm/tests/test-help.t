@@ -344,7 +344,6 @@ Test extension help:
        phrevset      provides support for Phabricator revsets
        preventpremegarepoupdateshook
                      (no help text available)
-       prmarker      mark pull requests as "Landed" on pull
        pullcreatemarkers
        pushrebase    rebases commits during push
        rage          upload useful diagnostics and give instructions for asking
@@ -990,6 +989,8 @@ Test list of internal help commands
                  export metalog to a repo for easier investigation
    debugexportrevlog
                  exports to a legacy revlog repo
+   debugexportstack
+                 dump content of commits for automation consumption
    debugextensions
                  show information about active extensions
    debugfilerevision

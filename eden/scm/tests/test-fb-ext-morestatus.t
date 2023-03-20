@@ -2,6 +2,8 @@
 #debugruntest-compatible
 #inprocess-hg-incompatible
 
+  $ eagerepo
+
   $ configure mutation-norecord
   $ enable morestatus fbhistedit histedit rebase reset
   $ setconfig morestatus.show=true
@@ -19,8 +21,7 @@
   > }
 
 Test An empty repo should return no extra output
-  $ hg init repo
-  $ cd repo
+  $ newclientrepo
   $ hg status
 
 Test status on histedit stop
@@ -213,8 +214,8 @@ Test if listed files have a relative path to current location
   $ mkdir -p b/c
   $ cd b/c
   $ hg status
-  M a
-  ? a.orig
+  M ../../a
+  ? ../../a.orig
   
   # The repository is in an unfinished *merge* state.
   # Unresolved merge conflicts:

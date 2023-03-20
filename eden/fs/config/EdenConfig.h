@@ -113,6 +113,14 @@ class EdenConfig : private ConfigSettingManager {
    */
   std::shared_ptr<const EdenConfig> maybeReload() const;
 
+  /**
+   * Returns the system config dir (--etc-eden-dir) path that EdenFS was passed
+   * during startup.
+   */
+  const AbsolutePath& getSystemConfigDir() const {
+    return systemConfigDir_;
+  }
+
  private:
   /**
    * Utility method for converting ConfigSourceType to the filename (or cli).
@@ -148,6 +156,14 @@ class EdenConfig : private ConfigSettingManager {
    */
   std::array<std::shared_ptr<ConfigSource>, kConfigSourceLastIndex + 1>
       configSources_;
+
+  /**
+   * The daemon sometimes needs to invoke the CLI. In doing so, it needs to pass
+   * information about which system config dir (--etc-eden-dir) it's using.
+   * Without this information, the CLI cannot properly load configs and will
+   * default to using the default system config location.
+   */
+  const AbsolutePath systemConfigDir_;
 
   /*
    * Settings follow. Their initialization registers themselves with the
@@ -306,6 +322,24 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<ReaddirPrefetch> readdirPrefetch{
       "mount:readdir-prefetch",
       ReaddirPrefetch::None,
+      this};
+
+  /**
+   * The soong build system used in AOSP loves to crawls the entirety of the
+   * repository, including the .eden directory. In doing so, it infinitely
+   * recurse into the this-dir.
+   *
+   * Per kemurphy@, sending a pull request to soong will be refused, thus we
+   * need to workaround it in EdenFS.
+   *
+   * DO NOT SET UNLESS YOU ARE RUNNING AOSP ON EDENFS.
+   *
+   * TODO(T147468271): Remove this once soong has been taught to recognize
+   * EdenFS/Mercurial correctly.
+   */
+  ConfigSetting<bool> findIgnoreInDotEden{
+      "mount:find-ignore-in-dot-eden",
+      false,
       this};
 
   // [store]
@@ -494,6 +528,13 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> useReaddirplus{"nfs:use-readdirplus", false, this};
 
+  /**
+   * On macOS, ._ (AppleDouble) are sprinkled all over the place. Enabling this
+   * allows these file to be created. When disabled, the AppleDouble files
+   * won't be created.
+   */
+  ConfigSetting<bool> allowAppleDouble{"nfs:allow-apple-double", true, this};
+
   // [prjfs]
 
   /**
@@ -552,6 +593,28 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<std::chrono::nanoseconds> prjfsDirectoryCreationDelay{
       "prjfs:directory-creation-delay",
       std::chrono::milliseconds(100),
+      this};
+
+  /**
+   * Listen to pre convert to full notifications from ProjFS. By the spec these
+   * should not give us any information that the other notifications all ready
+   * cover. However, ProjFS currently (Feb 2023) has a bug: we do not receive
+   * the file closed and modified notification. We can listen to this instead
+   * to ensure our in memory state reflects file truncations.
+   */
+  ConfigSetting<bool> prjfsListenToPreConvertToFull{
+      "prjfs:listen-to-pre-convert-to-full",
+      false,
+      this};
+
+  /**
+   * With out this FSCK will not attempt to "fix" renamed files. This can
+   * leave EdenFS out of sync with the filesystem. However this make FSCK
+   * slower.
+   */
+  ConfigSetting<bool> prjfsFsckDetectRenames{
+      "prjfs:fsck-detect-renames",
+      false,
       this};
 
   // [hg]
@@ -919,6 +982,19 @@ class EdenConfig : private ConfigSettingManager {
       1500,
       this};
 
+  // [redirections]
+
+  /**
+   * Whether to use APFS volumes or disk images for bind
+   * redirections on macOS.
+   */
+  ConfigSetting<std::string> darwinRedirectionType{
+      "redirections:darwin-redirection-type",
+      "apfs",
+      this};
+
+  // [overlay]
+
   /**
    * DANGER: this option will put overlay into memory and skip persisting any
    * actual data to disk. This will guarantee to cause EdenFS corruption after
@@ -935,7 +1011,7 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<std::string> overlaySynchronousMode{
       "overlay:synchronous-mode",
-      "normal",
+      folly::kIsWindows ? "off" : "normal",
       this};
 
   /**
@@ -976,16 +1052,16 @@ class EdenConfig : private ConfigSettingManager {
   // [fsck]
 
   /**
-   * True if Windows FSCK should use the new, more thorough version.
-   */
-  ConfigSetting<bool> useThoroughFsck{"fsck:use-thorough-fsck", true, this};
-
-  /**
    * When FSCK is running, how often should we log about the number of scanned
    * directories. This is the number of directories that are scanned in between
    * logs.
    */
   ConfigSetting<uint64_t> fsckLogFrequency{"fsck:log-frequency", 10000, this};
+
+  /**
+   * Should FSCK be run on multiple threads, or serialized.
+   */
+  ConfigSetting<bool> multiThreadedFsck{"fsck:multi-threaded", false, this};
 
   // [glob]
 

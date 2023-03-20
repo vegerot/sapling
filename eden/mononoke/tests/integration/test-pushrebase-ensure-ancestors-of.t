@@ -76,11 +76,17 @@ Now try to pushrebase "ancestor" bookmark, should fail
   remote: 
   remote:   Debug context:
   remote:     PushrebaseNotAllowedRequiresAncestorsOf {
-  remote:         bookmark: BookmarkName {
-  remote:             bookmark: "ancestor",
+  remote:         bookmark: BookmarkKey {
+  remote:             name: BookmarkName {
+  remote:                 bookmark: "ancestor",
+  remote:             },
+  remote:             category: Branch,
   remote:         },
-  remote:         descendant_bookmark: BookmarkName {
-  remote:             bookmark: "master_bookmark",
+  remote:         descendant_bookmark: BookmarkKey {
+  remote:             name: BookmarkName {
+  remote:                 bookmark: "master_bookmark",
+  remote:             },
+  remote:             category: Branch,
   remote:         },
   remote:     }
   abort: unexpected EOL, expected netstring digit
@@ -118,11 +124,17 @@ And try to move "ancestor" bookmark there, it should fail
   remote:         source: Error {
   remote:             context: "Failed to fast-forward bookmark (set pushvar NON_FAST_FORWARD=true for a non-fast-forward move)",
   remote:             source: RequiresAncestorOf {
-  remote:                 bookmark: BookmarkName {
-  remote:                     bookmark: "ancestor",
+  remote:                 bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "ancestor",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
-  remote:                 descendant_bookmark: BookmarkName {
-  remote:                     bookmark: "master_bookmark",
+  remote:                 descendant_bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "master_bookmark",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
   remote:             },
   remote:         },

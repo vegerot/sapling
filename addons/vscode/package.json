@@ -2,7 +2,7 @@
   "name": "sapling-scm",
   "displayName": "Sapling SCM",
   "description": "Sapling: A Scalable, User-Friendly Source Control System",
-  "version": "0.1.8",
+  "version": "0.1.10",
   "publisher": "meta",
   "license": "MIT",
   "engines": {
@@ -14,7 +14,8 @@
   "activationEvents": [
     "onStartupFinished",
     "onCommand:sapling.open-isl",
-    "onWebviewPanel:sapling.isl"
+    "onWebviewPanel:sapling.isl",
+    "onView:sapling.isl"
   ],
   "extensionKind": [
     "workspace"
@@ -41,10 +42,40 @@
           "type": "string",
           "default": "",
           "description": "%settings.commandPath.description%"
+        },
+        "sapling.isl.showInSidebar": {
+          "type": "boolean",
+          "default": false,
+          "description": "%settings.isl.showInSidebar.description%"
         }
       }
     },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "sapling",
+          "icon": "resources/Sapling_viewContainer.svg",
+          "title": "%sapling.command-category%"
+        }
+      ]
+    },
+    "views": {
+      "sapling": [
+        {
+          "type": "webview",
+          "id": "sapling.isl",
+          "name": "%isl.title%",
+          "when": "config.sapling.isl.showInSidebar"
+        }
+      ]
+    },
     "commands": [
+      {
+        "command": "sapling.revert-file",
+        "title": "%sapling.revert-file-command%",
+        "category": "%sapling.command-category%",
+        "icon": "$(discard)"
+      },
       {
         "command": "sapling.open-isl",
         "title": "%sapling.open-isl-command%",
@@ -54,7 +85,8 @@
       {
         "command": "sapling.open-file-diff-uncommitted",
         "title": "%sapling.open-diff-uncommitted-command%",
-        "category": "%sapling.command-category%"
+        "category": "%sapling.command-category%",
+        "icon": "$(git-pull-request-go-to-changes)"
       },
       {
         "command": "sapling.open-file-diff-head",
@@ -65,9 +97,31 @@
         "command": "sapling.open-file-diff-stack",
         "title": "%sapling.open-diff-stack-command%",
         "category": "%sapling.command-category%"
+      },
+      {
+        "command": "sapling.isl.focus",
+        "title": "Focus Sapling ISL Sidebar"
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "sapling.isl.focus",
+          "when": "config.sapling.isl.showInSidebar"
+        }
+      ],
+      "scm/resourceState/context": [
+        {
+          "command": "sapling.open-file-diff-uncommitted",
+          "group": "inline",
+          "when": "scmProvider == sapling && scmResourceGroup == changes"
+        },
+        {
+          "command": "sapling.revert-file",
+          "group": "inline",
+          "when": "scmProvider == sapling && scmResourceGroup == changes"
+        }
+      ],
       "scm/title": [
         {
           "command": "sapling.open-isl",
@@ -85,6 +139,9 @@
     "build-extension": "cross-env NODE_ENV=production webpack --config extension.webpack.config.ts",
     "build-webview": "cross-env NODE_ENV=production webpack --config webview.webpack.config.ts",
     "vscode:prepublish": "./buildForPublish.sh"
+  },
+  "optionalDependencies": {
+    "vsce": "^2.15.0"
   },
   "devDependencies": {
     "@types/circular-dependency-plugin": "^5.0.5",

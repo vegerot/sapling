@@ -19,18 +19,22 @@ use fixtures::Linear;
 use fixtures::ManyFilesDirs;
 use fixtures::TestRepoFixture;
 use futures::try_join;
+use mononoke_types::hash::Sha256;
 use repo_derived_data::RepoDerivedDataArc;
+use smallvec::SmallVec;
 
 use crate::ChangesetContext;
 use crate::ChangesetId;
 use crate::CoreContext;
 use crate::CreateChange;
 use crate::CreateChangeFile;
+use crate::CreateInfo;
 use crate::FileType;
 use crate::Mononoke;
 use crate::MononokeError;
 use crate::MononokePath;
 use crate::RepoContext;
+use crate::StoreRequest;
 
 #[fbinit::test]
 async fn test_create_commit(fb: FacebookInit) -> Result<(), Error> {
@@ -59,7 +63,10 @@ async fn create_commit(fb: FacebookInit, derived_data_to_derive: &str) -> Result
     let parent_hash = "7785606eb1f26ff5722c831de402350cf97052dc44bc175da6ac0d715a3dbbf6";
     let parents = vec![ChangesetId::from_str(parent_hash)?];
     let author = String::from("Test Author <test@example.com>");
-    let author_date = FixedOffset::east(0).ymd(2000, 2, 1).and_hms(12, 0, 0);
+    let author_date = FixedOffset::east_opt(0)
+        .unwrap()
+        .with_ymd_and_hms(2000, 2, 1, 12, 0, 0)
+        .unwrap();
     let committer = None;
     let committer_date = None;
     let message = String::from("Test Created Commit");
@@ -77,15 +84,32 @@ async fn create_commit(fb: FacebookInit, derived_data_to_derive: &str) -> Result
         ),
     );
 
+    // Pre-upload the file content for the second commit, and check its hash
+    // on the way.
+    let file_id = repo
+        .upload_file_content(
+            Bytes::from("TEST CREATE2\n"),
+            &StoreRequest::with_sha256(
+                13,
+                Sha256::from_str(
+                    "877f6bb6e0aeebc78c9b784ed633ef87019110bd61f867f0a4bf747085fec645",
+                )?,
+            ),
+        )
+        .await?;
+
     let cs = repo
         .create_changeset(
             parents,
-            author.clone(),
-            author_date,
-            committer.clone(),
-            committer_date,
-            message.clone(),
-            extra.clone(),
+            CreateInfo {
+                author: author.clone(),
+                author_date,
+                committer: committer.clone(),
+                committer_date,
+                message: message.clone(),
+                extra: extra.clone(),
+                git_extra_headers: None,
+            },
             changes.clone(),
             bubble,
         )
@@ -94,9 +118,10 @@ async fn create_commit(fb: FacebookInit, derived_data_to_derive: &str) -> Result
     changes.insert(
         MononokePath::try_from("TEST_CREATE")?,
         CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("TEST CREATE2\n"),
+            CreateChangeFile::Existing {
+                file_id,
                 file_type: FileType::Regular,
+                maybe_size: None,
             },
             None,
         ),
@@ -104,12 +129,15 @@ async fn create_commit(fb: FacebookInit, derived_data_to_derive: &str) -> Result
     let second_cs = repo
         .create_changeset(
             vec![cs.id()],
-            author,
-            author_date,
-            committer,
-            committer_date,
-            message,
-            extra,
+            CreateInfo {
+                author,
+                author_date,
+                committer,
+                committer_date,
+                message,
+                extra,
+                git_extra_headers: None,
+            },
             changes,
             bubble,
         )
@@ -211,20 +239,28 @@ async fn create_commit_bad_changes(fb: FacebookInit) -> Result<(), Error> {
         let parent_hash = "b0d1bf77898839595ee0f0cba673dd6e3be9dadaaa78bc6dd2dea97ca6bee77e";
         let parents = vec![ChangesetId::from_str(parent_hash)?];
         let author = String::from("Test Author <test@example.com>");
-        let author_date = FixedOffset::east(0).ymd(2000, 2, 1).and_hms(12, 0, 0);
+        let author_date = FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(2000, 2, 1, 12, 0, 0)
+            .unwrap();
         let committer = None;
         let committer_date = None;
         let message = String::from("Test Created Commit");
         let extra = BTreeMap::new();
         let bubble = None;
+        let git_extra_headers =
+            Some(maplit::btreemap! {SmallVec::new() => Bytes::from_static(b"world")});
         repo.create_changeset(
             parents,
-            author,
-            author_date,
-            committer,
-            committer_date,
-            message,
-            extra,
+            CreateInfo {
+                author,
+                author_date,
+                committer,
+                committer_date,
+                message,
+                extra,
+                git_extra_headers,
+            },
             changes,
             bubble,
         )
@@ -342,20 +378,27 @@ async fn test_create_merge_commit(fb: FacebookInit) -> Result<(), Error> {
         parents: Vec<ChangesetId>,
     ) -> Result<ChangesetContext, MononokeError> {
         let author = String::from("Test Author <test@example.com>");
-        let author_date = FixedOffset::east(0).ymd(2000, 2, 1).and_hms(12, 0, 0);
+        let author_date = FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(2000, 2, 1, 12, 0, 0)
+            .unwrap();
         let committer = None;
         let committer_date = None;
         let message = String::from("Test Created Commit");
         let extra = BTreeMap::new();
         let bubble = None;
+        let git_extra_headers = None;
         repo.create_changeset(
             parents,
-            author.clone(),
-            author_date,
-            committer.clone(),
-            committer_date,
-            message.clone(),
-            extra.clone(),
+            CreateInfo {
+                author: author.clone(),
+                author_date,
+                committer: committer.clone(),
+                committer_date,
+                message: message.clone(),
+                extra: extra.clone(),
+                git_extra_headers,
+            },
             changes.clone(),
             bubble,
         )
@@ -442,20 +485,28 @@ async fn test_merge_commit_parent_file_conflict(fb: FacebookInit) -> Result<(), 
         parents: Vec<ChangesetId>,
     ) -> Result<ChangesetContext, MononokeError> {
         let author = String::from("Test Author <test@example.com>");
-        let author_date = FixedOffset::east(0).ymd(2000, 2, 1).and_hms(12, 0, 0);
+        let author_date = FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(2000, 2, 1, 12, 0, 0)
+            .unwrap();
         let committer = None;
         let committer_date = None;
         let message = String::from("Test Created Commit");
         let extra = BTreeMap::new();
         let bubble = None;
+        let git_extra_headers =
+            Some(maplit::btreemap! {SmallVec::new() => Bytes::from_static(b"world")});
         repo.create_changeset(
             parents,
-            author.clone(),
-            author_date,
-            committer.clone(),
-            committer_date,
-            message.clone(),
-            extra.clone(),
+            CreateInfo {
+                author: author.clone(),
+                author_date,
+                committer: committer.clone(),
+                committer_date,
+                message: message.clone(),
+                extra: extra.clone(),
+                git_extra_headers,
+            },
             changes.clone(),
             bubble,
         )
@@ -551,20 +602,28 @@ async fn test_merge_commit_parent_tree_file_conflict(fb: FacebookInit) -> Result
         parents: Vec<ChangesetId>,
     ) -> Result<ChangesetContext, MononokeError> {
         let author = String::from("Test Author <test@example.com>");
-        let author_date = FixedOffset::east(0).ymd(2000, 2, 1).and_hms(12, 0, 0);
+        let author_date = FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(2000, 2, 1, 12, 0, 0)
+            .unwrap();
         let committer = None;
         let committer_date = None;
         let message = String::from("Test Created Commit");
         let extra = BTreeMap::new();
         let bubble = None;
+        let git_extra_headers =
+            Some(maplit::btreemap! {SmallVec::new() => Bytes::from_static(b"world")});
         repo.create_changeset(
             parents,
-            author.clone(),
-            author_date,
-            committer.clone(),
-            committer_date,
-            message.clone(),
-            extra.clone(),
+            CreateInfo {
+                author: author.clone(),
+                author_date,
+                committer: committer.clone(),
+                committer_date,
+                message: message.clone(),
+                extra: extra.clone(),
+                git_extra_headers,
+            },
             changes.clone(),
             bubble,
         )

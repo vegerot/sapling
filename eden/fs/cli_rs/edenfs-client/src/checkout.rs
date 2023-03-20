@@ -319,24 +319,22 @@ impl CheckoutConfig {
     }
 
     /// Add a profile to the config (read the config file and write it back
-    /// with profile added).
+    /// with profile added). Returns true if we should fetch, false otherwise.
     pub fn activate_profile(
         &mut self,
         profile: &str,
         config_dir: PathBuf,
         force_fetch: &bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if let Some(profiles) = &mut self.profiles {
             if profiles.active.iter().any(|x| x == profile) {
                 // The profile is already activated so we don't need to update the profile list,
                 // but we want to return a success so we continue with the fetch
                 if *force_fetch {
-                    return Ok(());
+                    return Ok(true);
                 }
-                return Err(EdenFsError::Other(anyhow!(
-                    "{} is already an active prefetch profile",
-                    profile
-                )));
+                eprintln!("{} is already an active prefetch profile", profile);
+                return Ok(false);
             }
             profiles.push(profile);
             self.save_config(config_dir.clone()).with_context(|| {
@@ -346,7 +344,7 @@ impl CheckoutConfig {
                 )
             })?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Switch on predictive prefetch profiles (read the config file and write
@@ -716,11 +714,18 @@ impl EdenFsCheckout {
             .as_bytes()
             .to_vec();
         if predictive {
-            let num_dirs = predictive_num_dirs.try_into().with_context(|| {
-                anyhow!("could not convert u32 ({}) to i32", predictive_num_dirs)
-            })?;
+            let num_dirs = if predictive_num_dirs != 0 {
+                predictive_num_dirs
+                    .try_into()
+                    .with_context(|| {
+                        anyhow!("could not convert u32 ({}) to i32", predictive_num_dirs)
+                    })
+                    .ok()
+            } else {
+                None
+            };
             let predictive_params = PredictiveFetch {
-                numTopDirectories: Some(num_dirs),
+                numTopDirectories: num_dirs,
                 ..Default::default()
             };
             let glob_params = GlobParams {
@@ -785,7 +790,10 @@ impl EdenFsCheckout {
     ) -> Result<Vec<Glob>> {
         let mut profiles_to_fetch = profiles.clone();
 
-        if predictive && !instance.should_prefetch_predictive_profiles() {
+        let config = instance
+            .get_config()
+            .context("unable to load configuration")?;
+        if predictive && !config.prefetch_profiles.predictive_prefetching_enabled {
             if !silent {
                 eprintln!(
                     "Skipping Predictive Prefetch Profiles fetch due to global kill switch. \
@@ -796,7 +804,8 @@ impl EdenFsCheckout {
                 return Ok(vec![Glob::default()]);
             }
         }
-        if !instance.should_prefetch_profiles() && !predictive {
+
+        if !config.prefetch_profiles.prefetching_enabled && !predictive {
             if !silent {
                 eprintln!(
                     "Skipping Prefetch Profiles fetch due to global kill switch. \

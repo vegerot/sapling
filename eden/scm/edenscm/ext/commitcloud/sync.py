@@ -273,7 +273,7 @@ def _sync(
                     )
 
                 # Check if any omissions are now included in the repo
-                _checkomissions(repo, remotepath, lastsyncstate, tr, maxage)
+                _checkomissions(repo, lastsyncstate, tr, maxage)
 
             # We committed the transaction so that data downloaded from the cloud is
             # committed.  Start a new transaction for uploading the local changes.
@@ -315,6 +315,7 @@ def _sync(
 def logsyncop(
     repo,
     op,
+    prevversion,
     version,
     oldheads,
     newheads,
@@ -339,6 +340,7 @@ def logsyncop(
         {
             "commit_cloud_sync": {
                 "op": op,
+                "prev_version": prevversion,
                 "version": version,
                 "added_heads": addedheads,
                 "removed_heads": removedheads,
@@ -503,6 +505,7 @@ def _applycloudchanges(repo, remotepath, lastsyncstate, cloudrefs, maxage, state
     logsyncop(
         repo,
         "from_cloud",
+        lastsyncstate.version,
         cloudrefs.version,
         lastsyncstate.heads,
         cloudrefs.heads,
@@ -512,11 +515,19 @@ def _applycloudchanges(repo, remotepath, lastsyncstate, cloudrefs, maxage, state
         newremotebookmarks,
     )
 
-    # For a new join or a workspace switch, record cloudrefs.heads as backed up, not only the pulled commits that are missing locally.
     if lastsyncstate.version == 0:
+        # Update backup state.  For a new cloud join or a workspace switch,
+        # record all cloudrefs.heads that are present in the repo as backed up,
+        # not only the pulled commits that are missing locally (newheads)
+        # Some commits could be in the repo already, so the pull would skip them.
         state.update(
-            [nodemod.bin(head) for head in cloudrefs.heads if head in repo], tr
+            repo.changelog.filternodes([nodemod.bin(n) for n in cloudrefs.heads]),
+            tr,
         )
+    else:
+        # Update backup state.  These new heads are already backed up,
+        # otherwise the server wouldn't have told us about them.
+        state.update([nodemod.bin(head) for head in newheads], tr)
 
     lastsyncstate.update(
         tr,
@@ -529,10 +540,6 @@ def _applycloudchanges(repo, remotepath, lastsyncstate, cloudrefs, maxage, state
         newomittedbookmarks=omittedbookmarks,
         newomittedremotebookmarks=omittedremotebookmarks,
     )
-
-    # Also update backup state.  These new heads are already backed up,
-    # otherwise the server wouldn't have told us about them.
-    state.update([nodemod.bin(head) for head in newheads], tr)
 
 
 def _pullheadgroups(repo, remotepath, headgroups):
@@ -723,6 +730,27 @@ def _mergebookmarks(repo, tr, cloudbookmarks, lastsyncstate, omittedheads, maxag
     newnames = set()
     mindate = (time.time() - maxage * 86400) if maxage is not None else 0
     oldbookmarks = {}
+
+    # select list of nodes for the cloud bookmarks that are present in the local graph
+    # so, locally they are known
+    knownlocally = list(
+        repo.changelog.filternodes([nodemod.bin(n) for n in cloudbookmarks.values()])
+    )
+    # select nodes that are public from the above
+    knownlocallypublic = repo.dageval(lambda: knownlocally & public())
+
+    # convert to set of hashes
+    knownlocallynodes = {nodemod.hex(n) for n in knownlocally}
+    knownlocallypublicnodes = {nodemod.hex(n) for n in knownlocallypublic}
+
+    # prefetch times in a single request for known locally public nodes
+    # tell the revset to batch text fetching, text includes date
+    batched_revset = repo.revs("%ln", knownlocallypublic).prefetch("text")
+    # iterate through the revset
+    node_date_map = {
+        nodemod.hex(c.node()): c.date()[0] for c in batched_revset.iterctx()
+    }
+
     for name in allnames:
         # We are doing a 3-way diff between the local bookmark and the cloud
         # bookmark, using the previous cloud bookmark's value as the common
@@ -758,13 +786,12 @@ def _mergebookmarks(repo, tr, cloudbookmarks, lastsyncstate, omittedheads, maxag
             if cloudnode != lastcloudnode:
                 if cloudnode is not None:
                     # The cloud bookmark has been set to point to a new commit.
-                    if cloudnode in unfi:
-                        ctx = unfi[cloudnode]
+                    if cloudnode in knownlocallynodes:
                         # The cloud bookmark is for a public commit but older than the requested age.
                         if (
                             localnode is None
-                            and not ctx.mutable()
-                            and ctx.date()[0] < mindate
+                            and cloudnode in knownlocallypublicnodes
+                            and node_date_map[cloudnode] < mindate
                         ):
                             oldbookmarks[name] = cloudnode
                             omittedbookmarks.add(name)
@@ -838,7 +865,7 @@ def _forkname(ui, name, othernames):
 
 
 @perftrace.tracefunc("Check Omissions")
-def _checkomissions(repo, remotepath, lastsyncstate, tr, maxage):
+def _checkomissions(repo, lastsyncstate, tr, maxage):
     """check omissions are still not available locally
 
     Check that the commits that have been deliberately omitted are still not
@@ -1035,6 +1062,7 @@ def _submitlocalchanges(repo, reponame, workspacename, lastsyncstate, failed, se
         logsyncop(
             repo,
             "to_cloud",
+            lastsyncstate.version,
             cloudrefs.version,
             lastsyncstate.heads,
             newcloudheads,

@@ -33,7 +33,7 @@ from . import (
 from .config import EdenInstance
 
 try:
-    from .facebook.rage import find_fb_cdb, setup_fb_env
+    from .facebook.rage import find_fb_cdb, get_ods_url, get_scuba_url, setup_fb_env
 
 except ImportError:
 
@@ -42,6 +42,12 @@ except ImportError:
 
     def setup_fb_env(env: Dict[str, str]) -> Dict[str, str]:
         return env
+
+    def get_scuba_url(user: str) -> Optional[str]:
+        return None
+
+    def get_ods_url(host: str) -> Optional[str]:
+        return None
 
 
 try:
@@ -107,9 +113,11 @@ def print_diagnostic_info(
     instance: EdenInstance, out: IO[bytes], dry_run: bool
 ) -> None:
     section_title("System info:", out)
+    user = getpass.getuser()
+    host = socket.gethostname()
     header = (
-        f"User                    : {getpass.getuser()}\n"
-        f"Hostname                : {socket.gethostname()}\n"
+        f"User                    : {user}\n"
+        f"Hostname                : {host}\n"
         f"Version                 : {version_mod.get_current_version()}\n"
     )
     out.write(header.encode())
@@ -134,6 +142,16 @@ def print_diagnostic_info(
     # We will disable this until we figure out a work-around.
     # TODO(T113845692)
     # print_eden_doctor_report(instance, out)
+
+    scuba_url = get_scuba_url(user)
+    if scuba_url:
+        section_title("Scuba samples:", out)
+        out.write(b"%s\n" % scuba_url.encode())
+
+    ods_url = get_ods_url(host)
+    if ods_url:
+        section_title("ODS samples:", out)
+        out.write(b"%s\n" % ods_url.encode())
 
     processor = instance.get_config_value("rage.reporter", default="")
     if not dry_run and processor:

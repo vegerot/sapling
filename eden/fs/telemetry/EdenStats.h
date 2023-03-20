@@ -25,6 +25,7 @@ struct HgBackingStoreStats;
 struct HgImporterStats;
 struct JournalStats;
 struct ThriftStats;
+struct TelemetryStats;
 
 /**
  * StatsGroupBase is a base class for a group of thread-local stats
@@ -117,6 +118,7 @@ class EdenStats {
   ThreadLocal<HgImporterStats> hgImporterStats_;
   ThreadLocal<JournalStats> journalStats_;
   ThreadLocal<ThriftStats> thriftStats_;
+  ThreadLocal<TelemetryStats> telemetryStats_;
 };
 
 template <>
@@ -159,6 +161,11 @@ inline JournalStats& EdenStats::getStatsForCurrentThread<JournalStats>() {
 template <>
 inline ThriftStats& EdenStats::getStatsForCurrentThread<ThriftStats>() {
   return *thriftStats_.get();
+}
+
+template <>
+inline TelemetryStats& EdenStats::getStatsForCurrentThread<TelemetryStats>() {
+  return *telemetryStats_.get();
 }
 
 template <typename T>
@@ -238,6 +245,7 @@ struct NfsStats : StatsGroup<NfsStats> {
 struct PrjfsStats : StatsGroup<PrjfsStats> {
   Counter outOfOrderCreate{"prjfs.out_of_order_create"};
   Duration queuedFileNotification{"prjfs.queued_file_notification_us"};
+  Duration filesystemSync{"prjfs.filesystem_sync_us"};
 
   Duration newFileCreated{"prjfs.newFileCreated_us"};
   Duration fileOverwritten{"prjfs.fileOverwritten_us"};
@@ -248,6 +256,7 @@ struct PrjfsStats : StatsGroup<PrjfsStats> {
   Duration preRenamed{"prjfs.preRenamed_us"};
   Duration fileHandleClosedFileDeleted{"prjfs.fileHandleClosedFileDeleted_us"};
   Duration preSetHardlink{"prjfs.preSetHardlink_us"};
+  Duration preConvertToFull{"prjfs.preConvertToFull_us"};
 
   Duration openDir{"prjfs.opendir_us"};
   Duration readDir{"prjfs.readdir_us"};
@@ -320,6 +329,10 @@ struct JournalStats : StatsGroup<JournalStats> {
 struct ThriftStats : StatsGroup<ThriftStats> {
   Duration streamChangesSince{
       "thrift.StreamingEdenService.streamChangesSince.streaming_time_us"};
+};
+
+struct TelemetryStats : StatsGroup<TelemetryStats> {
+  Counter subprocessLoggerFailure{"telemetry.subprocess_logger_failure"};
 };
 
 /**

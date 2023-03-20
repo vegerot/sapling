@@ -13,11 +13,11 @@ new-pull=true
 
 [extensions]
 commitcloud=!
+github=
 infinitepush=!
 remotenames=
 treemanifest=
 autopullhoisthotfix=!
-prmarker=
 
 [commitcloud]
 automigrate=false

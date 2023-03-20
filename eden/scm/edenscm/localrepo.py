@@ -58,6 +58,7 @@ from . import (
     pathutil,
     peer,
     phases,
+    progress,
     pushkey,
     pycompat,
     repository,
@@ -335,6 +336,8 @@ class localrepository(object):
         "treestate",
         "storerequirements",
         "lfs",
+        # enable symlinks on Windows
+        "windowssymlinks",
     }
     _basestoresupported = {
         "visibleheads",
@@ -427,9 +430,7 @@ class localrepository(object):
         self.requirements = set()
         self.storerequirements = set()
 
-        # wvfs: rooted at the repository root, used to access the working copy
-        self.wvfs = vfsmod.vfs(path, expandpath=True, realpath=True, cacheaudited=False)
-        self.root = self.wvfs.base
+        self.root = os.path.realpath(util.expandpath(path))
 
         self.baseui = baseui
         self.ui = baseui.copy()
@@ -467,9 +468,6 @@ class localrepository(object):
 
         self._loadextensions()
 
-        cacheaudited = self.ui.configbool("unsafe", "wvfsauditorcache")
-        self.wvfs.audit._cached = cacheaudited
-
         self.supported = self._featuresetup(self.featuresetupfuncs, self._basesupported)
         self.storesupported = self._featuresetup(
             self.storefeaturesetupfuncs, self._basestoresupported
@@ -487,6 +485,21 @@ class localrepository(object):
         except IOError as inst:
             if inst.errno != errno.ENOENT:
                 raise
+
+        # wvfs: rooted at the repository root, used to access the working copy
+        disablesymlinks = (
+            pycompat.iswindows and "windowssymlinks" not in self.requirements
+        )
+        self.wvfs = vfsmod.vfs(
+            path,
+            expandpath=True,
+            realpath=True,
+            cacheaudited=False,
+            disablesymlinks=disablesymlinks,
+        )
+
+        cacheaudited = self.ui.configbool("unsafe", "wvfsauditorcache")
+        self.wvfs.audit._cached = cacheaudited
 
         cachepath = self.localvfs.join("cache")
         self.sharedpath = self.path
@@ -603,6 +616,47 @@ class localrepository(object):
             self.ui.debug("skipping automigrate because lock is held\n")
         except errormod.AbandonedTransactionFoundError:
             self.ui.debug("skipping automigrate due to an abandoned transaction\n")
+
+        if not create:
+            self._report_conflicting_requirements()
+            if util.istest() and self.ui.configbool(
+                "devel", "track-legacy-repo-format"
+            ):
+                self._track_legacy_repo_format()
+
+    def _track_legacy_repo_format(self):
+        if "remotefilelog" in self.requirements:
+            return
+        if eagerepo.iseagerepo(self):
+            return
+        if git.isgitstore(self):
+            return
+        testdir = encoding.environ.get("RUNTESTDIR")
+        path = f"{testdir}/.test-legacy-repo"
+        testname = os.path.basename(encoding.environ.get("TESTFILE"))
+        try:
+            with open(path, "r") as f:
+                if testname in f.read():
+                    return
+        except FileNotFoundError:
+            pass
+        with open(path, "a") as f:
+            f.write(f"{testname}\n")
+
+    def _report_conflicting_requirements(self):
+        """Find conflicting requirements"""
+        repo_types = []
+        if "remotefilelog" in self.requirements:
+            repo_types.append("shallow")
+        if eagerepo.iseagerepo(self):
+            repo_types.append("eager")
+        if git.isgitstore(self):
+            repo_types.append("git")
+        if len(repo_types) > 1:
+            hint = "check problematic logic writing to requires directly"
+            raise errormod.ProgrammingError(
+                f"conflicting repo types: {repo_types}\n{hint}"
+            )
 
     def _treestatemigration(self):
         if treestate.currentversion(self) != self.ui.configint("format", "dirstate"):
@@ -1205,46 +1259,10 @@ class localrepository(object):
         return cl
 
     def _getedenapi(self, nullable=True):
-        def absent(reason):
-            if nullable:
-                return None
-            else:
-                raise errormod.Abort(
-                    _("edenapi is required but disabled by %s") % reason
-                )
-
-        # `edenapi.enable` is a manual override option that allows the user to
-        # force EdenAPI to be enabled or disabled, primarily useful for testing.
-        # This is intended as a manual override only; normal usage should rely
-        # on the logic below to determine whether or not to enable EdenAPI.
-        enabled = self.ui.config("edenapi", "enable")
-        if enabled is not None:
-            if not enabled:
-                return absent(_("edenapi.enable being empty"))
+        if nullable:
+            return self._rsrepo.nullableedenapi()
+        else:
             return self._rsrepo.edenapi()
-
-        path = self.ui.paths.get("default")
-        if path is None:
-            return absent(_("empty paths.default"))
-        scheme = path.url.scheme
-
-        # Legacy tests are incomplete with EdenAPI.
-        # They are using either: None or file scheme, or ssh scheme with
-        # dummyssh.
-        if scheme in {None, "file"}:
-            return absent(_("paths.default being 'file:'"))
-
-        if scheme == "ssh" and "dummyssh" in self.ui.config("ui", "ssh"):
-            return absent(_("paths.default being 'ssh:' and dummyssh in use"))
-
-        if self.ui.config("edenapi", "url") and getattr(self, "name", None):
-            return self._rsrepo.edenapi()
-
-        # If remote path is an EagerRepo, use EdenApi provided by it.
-        if scheme in ("eager", "test"):
-            return self._rsrepo.edenapi()
-
-        return absent(_("missing edenapi.url config or repo name"))
 
     @util.propertycache
     def edenapi(self):
@@ -1396,6 +1414,7 @@ class localrepository(object):
                 "lookup": lambda *names: removenull([self[n].node() for n in names]),
                 "obsolete": lambda: mutation.obsoletenodes(self),
                 "public": lambda: getphaseset(self, phases.public),
+                "tonodes": self.changelog.tonodes,
             },
         )
 
@@ -1530,7 +1549,6 @@ class localrepository(object):
 
         path in paths can be either a file or a directory.
         nodes decides the search range (ex. "::." or "_firstancestors(.)")
-        If first is True, only follow the first ancestors.
 
         This can be used for `log` operations.
         """
@@ -1698,15 +1716,7 @@ class localrepository(object):
             # No existing transaction - this is the normal case.
             pass
         else:
-            if stat.st_size > 0:
-                # Non-empty transaction already exists - bail.
-                raise errormod.AbandonedTransactionFoundError(
-                    _("abandoned transaction found"),
-                    hint=_("run '@prog@ recover' to clean up transaction"),
-                )
-            else:
-                self.ui.status(_("cleaning up empty abandoned transaction\n"))
-                self.recover()
+            self.recover()
 
         idbase = b"%.40f#%f" % (random.random(), time.time())
         ha = hex(hashlib.sha1(idbase).digest())
@@ -1959,7 +1969,7 @@ class localrepository(object):
     def recover(self):
         with self.lock():
             if self.svfs.exists("journal"):
-                self.ui.status(_("rolling back interrupted transaction\n"))
+                self.ui.debug("rolling back interrupted transaction\n")
                 vfsmap = {
                     "": self.svfs,
                     "shared": self.sharedvfs,
@@ -2757,7 +2767,7 @@ class localrepository(object):
                             if fctx.filenode() is not None:
                                 keys.append((fctx.path(), fctx.filenode()))
                         self.fileslog.metadatastore.prefetch(keys)
-                for f in added:
+                for f in progress.each(self.ui, added, _("committing"), _("files")):
                     self.ui.note(f + "\n")
                     try:
                         fctx = ctx[f]
@@ -2767,6 +2777,7 @@ class localrepository(object):
                             filenode = self._filecommit(
                                 fctx, m1, m2, linkrev, trp, changed
                             )
+                        assert filenode != nullid, "manifest should not have nullid"
                         m[f] = filenode
                         m.setflag(f, fctx.flags())
                     except OSError:

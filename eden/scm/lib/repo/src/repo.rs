@@ -18,6 +18,8 @@ use anyhow::Result;
 use configloader::config::ConfigSet;
 use configloader::Config;
 use configmodel::ConfigExt;
+use eagerepo::EagerRepo;
+use eagerepo::EagerRepoStore;
 use edenapi::Builder;
 use edenapi::EdenApi;
 use edenapi::EdenApiError;
@@ -288,6 +290,59 @@ impl Repo {
         }
     }
 
+    /// Constructs EdenAPI client if it should be constructed.
+    ///
+    /// Returns `None` if EdenAPI should not be used.
+    pub fn optional_eden_api(&mut self) -> Result<Option<Arc<dyn EdenApi>>, EdenApiError> {
+        if matches!(
+            self.config.get_opt::<bool>("edenapi", "enable"),
+            Ok(Some(false))
+        ) {
+            tracing::trace!(target: "repo::eden_api", "disabled because edenapi.enable is false");
+            return Ok(None);
+        }
+        let path = self.config.get("paths", "default");
+        match path {
+            None => {
+                tracing::trace!(target: "repo::eden_api", "disabled because paths.default is not set");
+                return Ok(None);
+            }
+            Some(path) => {
+                // EagerRepo URLs (test:, eager: file path).
+                if path.starts_with("test:")
+                    || path.starts_with("eager:")
+                    || (!path.contains("://") && EagerRepo::url_to_dir(&path).is_some())
+                {
+                    tracing::trace!(target: "repo::eden_api", "using EagerRepo at {}", &path);
+                    return Ok(Some(self.eden_api()?));
+                }
+                // Legacy tests are incompatible with EdenAPI.
+                // They use None or file or ssh scheme with dummyssh.
+                if path.starts_with("file:") {
+                    tracing::trace!(target: "repo::eden_api", "disabled because paths.default is not set");
+                    return Ok(None);
+                } else if path.starts_with("ssh:") {
+                    if let Some(ssh) = self.config.get("ui", "ssh") {
+                        if ssh.contains("dummyssh") {
+                            tracing::trace!(target: "repo::eden_api", "disabled because paths.default uses ssh scheme and dummyssh is in use");
+                            return Ok(None);
+                        }
+                    }
+                }
+                // Explicitly set EdenAPI URLs.
+                // Ideally we can make paths.default derive the edenapi URLs. But "push" is not on
+                // EdenAPI yet. So we have to wait.
+                if self.config.get("edenapi", "url").is_none()
+                    || self.config.get("remotefilelog", "reponame").is_none()
+                {
+                    tracing::trace!(target: "repo::eden_api", "disabled because edenapi.url or remotefilelog.reponame is not set");
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(self.eden_api()?))
+    }
+
     pub fn dag_commits(&mut self) -> Result<Arc<RwLock<Box<dyn DagCommits + Send + 'static>>>> {
         match &self.dag_commits {
             Some(commits) => Ok(commits.clone()),
@@ -346,23 +401,12 @@ impl Repo {
             return Ok(Arc::new(fs.clone()));
         }
 
-        if self.store_requirements.contains("git") {
-            let git_store = Arc::new(
-                gitstore::GitStore::open(&self.git_dir()?).context("opening git file store")?,
-            );
-            // Set both stores to share underlying git store.
-            self.file_store = Some(git_store.clone());
-            self.tree_store = Some(git_store.clone());
-            return Ok(git_store);
+        if let Some((store, _)) = self.try_construct_file_tree_store()? {
+            return Ok(store);
         }
 
         tracing::trace!(target: "repo::file_store", "creating edenapi");
-        let eden_api = match self.eden_api() {
-            Ok(eden_api) => Some(eden_api),
-            // For tests, don't error if edenapi.url isn't set.
-            Err(_) if std::env::var("TESTTMP").is_ok() => None,
-            Err(e) => return Err(e.into()),
-        };
+        let eden_api = self.optional_eden_api()?;
 
         tracing::trace!(target: "repo::file_store", "building filestore");
         let mut file_builder = FileStoreBuilder::new(self.config())
@@ -370,8 +414,10 @@ impl Repo {
             .correlator(edenapi::DEFAULT_CORRELATOR.as_str());
 
         if let Some(eden_api) = eden_api {
+            tracing::trace!(target: "repo::file_store", "enabling edenapi");
             file_builder = file_builder.edenapi(EdenApiFileStore::new(eden_api));
         } else {
+            tracing::trace!(target: "repo::file_store", "disabling edenapi");
             file_builder = file_builder.override_edenapi(false);
         }
 
@@ -404,30 +450,20 @@ impl Repo {
             return Ok(Arc::new(ts.clone()));
         }
 
-        if self.store_requirements.contains("git") {
-            let git_store = Arc::new(
-                gitstore::GitStore::open(&self.git_dir()?).context("opening git tree store")?,
-            );
-            // Set both stores to share underlying git store.
-            self.file_store = Some(git_store.clone());
-            self.tree_store = Some(git_store.clone());
-            return Ok(git_store);
+        if let Some((_, store)) = self.try_construct_file_tree_store()? {
+            return Ok(store);
         }
 
-        let eden_api = match self.eden_api() {
-            Ok(eden_api) => Some(eden_api),
-            // For tests, don't error if edenapi.url isn't set.
-            Err(_) if std::env::var("TESTTMP").is_ok() => None,
-            Err(e) => return Err(e.into()),
-        };
-
+        let eden_api = self.optional_eden_api()?;
         let mut tree_builder = TreeStoreBuilder::new(self.config())
             .local_path(self.store_path())
             .suffix("manifests");
 
         if let Some(eden_api) = eden_api {
+            tracing::trace!(target: "repo::tree_store", "enabling edenapi");
             tree_builder = tree_builder.edenapi(EdenApiTreeStore::new(eden_api));
         } else {
+            tracing::trace!(target: "repo::tree_store", "disabling edenapi");
             tree_builder = tree_builder.override_edenapi(false);
         }
         let ts = Arc::new(tree_builder.build()?);
@@ -559,6 +595,36 @@ impl Repo {
         let commit_store = self.dag_commits()?.read().to_dyn_read_root_tree_ids();
         let tree_ids = commit_store.read_root_tree_ids(vec![commit_id]).await?;
         Ok(tree_ids[0].1)
+    }
+
+    /// Construct both file and tree store if they are backed by the same storage.
+    /// Return None if they are not backed by the same storage.
+    /// Return Some((file_store, tree_store)) if they are constructed.
+    fn try_construct_file_tree_store(
+        &mut self,
+    ) -> Result<
+        Option<(
+            Arc<dyn ReadFileContents<Error = anyhow::Error> + Send + Sync>,
+            Arc<dyn TreeStore + Send + Sync>,
+        )>,
+    > {
+        if self.store_requirements.contains("git") {
+            let git_store = Arc::new(
+                gitstore::GitStore::open(&self.git_dir()?).context("opening git tree store")?,
+            );
+            // Set both stores to share underlying git store.
+            self.file_store = Some(git_store.clone());
+            self.tree_store = Some(git_store.clone());
+            return Ok(Some((git_store.clone(), git_store)));
+        }
+        if self.store_requirements.contains("eagerepo") {
+            let store = EagerRepoStore::open(&self.store_path.join("hgcommits").join("v1"))?;
+            let store = Arc::new(store);
+            self.file_store = Some(store.clone());
+            self.tree_store = Some(store.clone());
+            return Ok(Some((store.clone(), store)));
+        }
+        return Ok(None);
     }
 }
 

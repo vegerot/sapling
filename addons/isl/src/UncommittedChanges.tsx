@@ -5,13 +5,13 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {ChangedFile, ChangedFileType, RepoRelativePath} from './types';
+import type {ChangedFile, ChangedFileType, MergeConflicts, RepoRelativePath} from './types';
 import type {SetterOrUpdater} from 'recoil';
 import type {EnsureAssignedTogether} from 'shared/EnsureAssignedTogether';
 
 import {islDrawerState} from './App';
 import serverAPI from './ClientToServerAPI';
-import {commitFieldsBeingEdited, commitMode} from './CommitInfo';
+import {commitFieldsBeingEdited, commitMode} from './CommitInfoState';
 import {OpenComparisonViewButton} from './ComparisonView/OpenComparisonViewButton';
 import {ErrorNotice} from './ErrorNotice';
 import {DOCUMENTATION_DELAY, Tooltip} from './Tooltip';
@@ -28,11 +28,15 @@ import {PurgeOperation} from './operations/PurgeOperation';
 import {ResolveOperation, ResolveTool} from './operations/ResolveOperation';
 import {RevertOperation} from './operations/RevertOperation';
 import platform from './platform';
-import {uncommittedChangesWithPreviews} from './previews';
+import {
+  optimisticMergeConflicts,
+  uncommittedChangesWithPreviews,
+  useIsOperationRunningOrQueued,
+} from './previews';
 import {selectedCommits} from './selection';
 import {
   latestHeadCommit,
-  mergeConflicts,
+  operationList,
   uncommittedChangesFetchError,
   useRunOperation,
 } from './serverAPIState';
@@ -41,6 +45,7 @@ import {useEffect, useRef} from 'react';
 import {atom, useRecoilCallback, useRecoilState, useRecoilValue} from 'recoil';
 import {ComparisonType} from 'shared/Comparison';
 import {Icon} from 'shared/Icon';
+import {minimalDisambiguousPaths} from 'shared/minimalDisambiguousPaths';
 
 import './UncommittedChanges.css';
 
@@ -53,10 +58,12 @@ export function ChangedFiles({
   deselectedFiles?: Set<string>;
   setDeselectedFiles?: (newDeselected: Set<string>) => unknown;
 }>) {
+  const disambiguousPaths = minimalDisambiguousPaths(files.map(file => file.path));
   return (
     <div className="changed-files">
-      {files.map(file => {
+      {files.map((file, i) => {
         const [statusName, icon] = nameAndIconForFileStatus[file.status];
+        const minimalName = disambiguousPaths[i];
         return (
           <div
             className={`changed-file file-${statusName}`}
@@ -96,7 +103,7 @@ export function ChangedFiles({
               }}
               title={file.path}>
               <Icon icon={icon} />
-              <span className="changed-file-path-text">{file.path}</span>
+              <span className="changed-file-path-text">{minimalName}</span>
             </span>
             {showFileActions ? <FileActions file={file} /> : null}
           </div>
@@ -112,7 +119,7 @@ export function UncommittedChanges({place}: {place: 'main' | 'amend sidebar' | '
   // TODO: use treeWithPreviews instead, and update CommitOperation
   const headCommit = useRecoilValue(latestHeadCommit);
 
-  const conflicts = useRecoilValue(mergeConflicts);
+  const conflicts = useRecoilValue(optimisticMergeConflicts);
 
   const [deselectedFiles, setDeselectedFiles] = useDeselectedFiles(uncommittedChanges);
   const commitTitleRef = useRef(null);
@@ -201,28 +208,7 @@ export function UncommittedChanges({place}: {place: 'main' | 'amend sidebar' | '
       ) : null}
       <div className="button-row">
         {conflicts != null ? (
-          <>
-            <VSCodeButton
-              appearance={allConflictsResolved ? 'primary' : 'icon'}
-              key="continue"
-              disabled={!allConflictsResolved}
-              data-testid="conflict-continue-button"
-              onClick={() => {
-                runOperation(new ContinueOperation());
-              }}>
-              <Icon slot="start" icon="debug-continue" />
-              <T>Continue</T>
-            </VSCodeButton>
-            <VSCodeButton
-              appearance="icon"
-              key="abort"
-              onClick={() => {
-                runOperation(new AbortMergeOperation(conflicts));
-              }}>
-              <Icon slot="start" icon="circle-slash" />
-              <T>Abort</T>
-            </VSCodeButton>
-          </>
+          <MergeConflictButtons allConflictsResolved={allConflictsResolved} conflicts={conflicts} />
         ) : (
           <>
             <OpenComparisonViewButton
@@ -293,8 +279,8 @@ export function UncommittedChanges({place}: {place: 'main' | 'amend sidebar' | '
           </>
         )}
       </div>
-      {conflicts?.files != null ? (
-        <ChangedFiles files={conflicts.files} showFileActions={true} />
+      {conflicts != null ? (
+        <ChangedFiles files={conflicts.files ?? []} showFileActions={true} />
       ) : (
         <ChangedFiles
           files={uncommittedChanges}
@@ -345,38 +331,90 @@ export function UncommittedChanges({place}: {place: 'main' | 'amend sidebar' | '
               <T>Commit as...</T>
             </VSCodeButton>
           </div>
-          <div className="button-row">
-            <VSCodeButton
-              appearance="icon"
-              disabled={noFilesSelected}
-              data-testid="uncommitted-changes-quick-amend-button"
-              onClick={() => {
-                const filesToCommit =
-                  deselectedFiles.size === 0
-                    ? // all files
-                      undefined
-                    : // only files not unchecked
-                      uncommittedChanges
-                        .filter(file => !deselectedFiles.has(file.path))
-                        .map(file => file.path);
-                runOperation(new AmendOperation(filesToCommit));
-              }}>
-              <Icon slot="start" icon="debug-step-into" />
-              <T>Amend</T>
-            </VSCodeButton>
-            <VSCodeButton
-              appearance="icon"
-              className="show-on-hover"
-              onClick={() => {
-                openCommitForm('amend');
-              }}>
-              <Icon slot="start" icon="edit" />
-              <T>Amend as...</T>
-            </VSCodeButton>
-          </div>
+          {headCommit?.phase === 'public' ? null : (
+            <div className="button-row">
+              <VSCodeButton
+                appearance="icon"
+                disabled={noFilesSelected}
+                data-testid="uncommitted-changes-quick-amend-button"
+                onClick={() => {
+                  const filesToCommit =
+                    deselectedFiles.size === 0
+                      ? // all files
+                        undefined
+                      : // only files not unchecked
+                        uncommittedChanges
+                          .filter(file => !deselectedFiles.has(file.path))
+                          .map(file => file.path);
+                  runOperation(new AmendOperation(filesToCommit));
+                }}>
+                <Icon slot="start" icon="debug-step-into" />
+                <T>Amend</T>
+              </VSCodeButton>
+              <VSCodeButton
+                appearance="icon"
+                className="show-on-hover"
+                onClick={() => {
+                  openCommitForm('amend');
+                }}>
+                <Icon slot="start" icon="edit" />
+                <T>Amend as...</T>
+              </VSCodeButton>
+            </div>
+          )}
         </div>
       )}
     </div>
+  );
+}
+
+function MergeConflictButtons({
+  conflicts,
+  allConflictsResolved,
+}: {
+  conflicts: MergeConflicts;
+  allConflictsResolved: boolean;
+}) {
+  const runOperation = useRunOperation();
+  // usually we only care if the operation is queued or actively running,
+  // but since we don't use optimistic state for continue/abort,
+  // we also need to consider recently run commands to disable the buttons.
+  // But only if the abort/continue command succeeded.
+  // TODO: is this reliable? Is it possible to get stuck with buttons disabled because
+  // we think it's still running?
+  const lastRunOperation = useRecoilValue(operationList).currentOperation;
+  const justFinishedContinue =
+    lastRunOperation?.operation instanceof ContinueOperation && lastRunOperation.exitCode === 0;
+  const justFinishedAbort =
+    lastRunOperation?.operation instanceof AbortMergeOperation && lastRunOperation.exitCode === 0;
+  const isRunningContinue = !!useIsOperationRunningOrQueued(ContinueOperation);
+  const isRunningAbort = !!useIsOperationRunningOrQueued(AbortMergeOperation);
+  const shouldDisableButtons =
+    isRunningContinue || isRunningAbort || justFinishedContinue || justFinishedAbort;
+  return (
+    <>
+      <VSCodeButton
+        appearance={allConflictsResolved ? 'primary' : 'icon'}
+        key="continue"
+        disabled={!allConflictsResolved || shouldDisableButtons}
+        data-testid="conflict-continue-button"
+        onClick={() => {
+          runOperation(new ContinueOperation());
+        }}>
+        <Icon slot="start" icon={isRunningContinue ? 'loading' : 'debug-continue'} />
+        <T>Continue</T>
+      </VSCodeButton>
+      <VSCodeButton
+        appearance="icon"
+        key="abort"
+        disabled={shouldDisableButtons}
+        onClick={() => {
+          runOperation(new AbortMergeOperation(conflicts));
+        }}>
+        <Icon slot="start" icon={isRunningAbort ? 'loading' : 'circle-slash'} />
+        <T>Abort</T>
+      </VSCodeButton>
+    </>
   );
 }
 
@@ -384,6 +422,27 @@ const revertableStatues = new Set(['M', 'R', '!']);
 function FileActions({file}: {file: ChangedFile}) {
   const runOperation = useRunOperation();
   const actions: Array<React.ReactNode> = [];
+
+  if (platform.openDiff != null) {
+    actions.push(
+      <Tooltip title={t('Open diff view')} key="revert" delayMs={1000}>
+        <VSCodeButton
+          className="file-show-on-hover"
+          appearance="icon"
+          data-testid="file-revert-button"
+          onClick={() => {
+            platform.openDiff?.(
+              file.path,
+              // TODO: also show diff button on other commits
+              {type: ComparisonType.UncommittedChanges},
+            );
+          }}>
+          <Icon icon="git-pull-request-go-to-changes" />
+        </VSCodeButton>
+      </Tooltip>,
+    );
+  }
+
   if (revertableStatues.has(file.status)) {
     actions.push(
       <Tooltip title={t('Revert back to original')} key="revert" delayMs={1000}>
@@ -474,6 +533,7 @@ function FileActions({file}: {file: ChangedFile}) {
       <Tooltip title={t('Mark as resolved')} key="resolve-mark">
         <VSCodeButton
           className="file-show-on-hover"
+          data-testid="file-action-resolve"
           key={file.path}
           appearance="icon"
           onClick={() => runOperation(new ResolveOperation(file.path, ResolveTool.mark))}>

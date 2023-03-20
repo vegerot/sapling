@@ -441,9 +441,6 @@ def dispatch(req):
         _formatparse(ferr.write, inst)
         return -1
 
-    if req.ui.configbool("ui", "threaded"):
-        util.preregistersighandlers()
-
     cmdmsg = _formatargs(req.args)
     starttime = util.timer()
     ret = None
@@ -505,20 +502,10 @@ def dispatch(req):
         if inst.hint:
             req.ui.warn(_("** (%s)\n") % inst.hint)
         raise
-    except KeyboardInterrupt as inst:
-        try:
-            if isinstance(inst, error.SignalInterrupt):
-                msg = _("killed!\n")
-            else:
-                msg = _("interrupted!\n")
-            req.ui.warn(msg)
-        except error.SignalInterrupt:
-            # maybe pager would quit without consuming all the output, and
-            # SIGPIPE was raised. we cannot print anything in this case.
-            pass
-        except IOError as inst:
-            if inst.errno != errno.EPIPE:
-                raise
+    except error.SignalInterrupt:
+        # maybe pager would quit without consuming all the output, and
+        # SIGPIPE was raised. we cannot print anything in this case.
+        pass
         ret = -1
     except IOError as inst:
         # Windows does not have SIGPIPE, so pager exit does not
@@ -555,7 +542,8 @@ def _runcatch(req):
 
     ui = req.ui
     try:
-        for name in "SIGBREAK", "SIGHUP", "SIGTERM":
+        # SIGTERM and SIGHUP are handled by Rust (ctrlc crate).
+        for name in ["SIGBREAK"]:
             num = getattr(signal, name, None)
             if num:
                 util.signal(num, catchterm)
@@ -696,19 +684,7 @@ def _runcatch(req):
                 os._exit(255)
             raise
 
-    # IPython (debugshell) has some background (sqlite?) threads that is incompatible
-    # with util.threaded. But "debugshell -c" should use util.threaded.
-    if (
-        ui.configbool("ui", "threaded")
-        and req.args not in [["dbsh"], ["debugsh"], ["debugshell"]]
-        and realcmd != "serve"
-    ):
-        # Run command (and maybe start ipdb) in a background thread for
-        # better Ctrl+C handling of long native logic.
-        return util.threaded(_callcatch)(ui, req, _runcatchfunc)
-    else:
-        # Run in the main thread.
-        return _callcatch(ui, req, _runcatchfunc)
+    return _callcatch(ui, req, _runcatchfunc)
 
 
 def _callcatch(ui, req, func):
@@ -754,8 +730,6 @@ def _callcatch(ui, req, func):
             nosubcmdmsg = _("@prog@ %s: subcommand required\n") % cmd
         ui.warn(nosubcmdmsg)
     except IOError:
-        raise
-    except KeyboardInterrupt:
         raise
     except:  # probably re-raises
         # Potentially enter ipdb debugger when we hit an uncaught exception

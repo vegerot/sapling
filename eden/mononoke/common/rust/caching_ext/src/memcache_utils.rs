@@ -5,7 +5,6 @@
  * GNU General Public License version 2.
  */
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -18,8 +17,8 @@ use crate::mock_store::MockStore;
 #[derive(Clone)]
 pub enum MemcacheHandler {
     Real(MemcacheClient),
-    #[allow(dead_code)]
     Mock(MockStore<Bytes>),
+    Noop,
 }
 
 impl From<MemcacheClient> for MemcacheHandler {
@@ -29,12 +28,29 @@ impl From<MemcacheClient> for MemcacheHandler {
 }
 
 impl MemcacheHandler {
+    /// Returns true if this memcache handler is a no-op, and so operations
+    /// can be entirely skipped.
+    pub fn is_noop(&self) -> bool {
+        match self {
+            MemcacheHandler::Noop => true,
+            MemcacheHandler::Real(_) | MemcacheHandler::Mock(_) => false,
+        }
+    }
+
+    pub fn is_async(&self) -> bool {
+        match self {
+            MemcacheHandler::Real(_) => true,
+            MemcacheHandler::Mock(_) | MemcacheHandler::Noop => false,
+        }
+    }
+
     pub async fn get(&self, key: String) -> Result<Option<Bytes>> {
         match self {
             MemcacheHandler::Real(ref client) => {
                 client.get(key).await.map(|value| value.map(Bytes::from))
             }
             MemcacheHandler::Mock(store) => Ok(store.get(&key)),
+            MemcacheHandler::Noop => Ok(None),
         }
     }
 
@@ -50,6 +66,7 @@ impl MemcacheHandler {
                 store.set(&key, value.into());
                 Ok(())
             }
+            MemcacheHandler::Noop => Ok(()),
         }
     }
 
@@ -65,18 +82,23 @@ impl MemcacheHandler {
                 // For now we ignore TTLs here
                 self.set(key, value).await
             }
+            MemcacheHandler::Noop => Ok(()),
         }
     }
 
-    #[allow(dead_code)]
     pub fn create_mock() -> Self {
         MemcacheHandler::Mock(MockStore::new())
     }
 
-    #[allow(dead_code)]
+    pub fn create_noop() -> Self {
+        MemcacheHandler::Noop
+    }
+
+    #[cfg(test)]
     pub(crate) fn gets_count(&self) -> usize {
+        use std::sync::atomic::Ordering;
         match self {
-            MemcacheHandler::Real(_) => unimplemented!(),
+            MemcacheHandler::Real(_) | MemcacheHandler::Noop => unimplemented!(),
             MemcacheHandler::Mock(MockStore { ref get_count, .. }) => {
                 get_count.load(Ordering::SeqCst)
             }

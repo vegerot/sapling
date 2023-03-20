@@ -147,6 +147,12 @@ class EdenTestCase(EdenTestCaseBase):
                     for setting in values:
                         edenfsrc.write(f"{setting}\n")
 
+        # Default to using the Rust version of commands when running
+        # integration tests. An empty edenfsctl_rollout file means that all
+        # subcommands should use the Rust implementation if available.
+        with open(self.eden.system_rollout_path, "w") as edenfsctl_rollout:
+            edenfsctl_rollout.write("{}")
+
         self.eden.start()
         # Store a lambda in case self.eden is replaced during the test.
         self.addCleanup(lambda: self.eden.cleanup())
@@ -250,11 +256,34 @@ class EdenTestCase(EdenTestCaseBase):
         configs = {"experimental": ["enable-nfs-server = true"]}
         if self.use_nfs():
             configs["clone"] = ['default-mount-protocol = "NFS"']
+        # The number of concurrent APFS volumes we can create on macOS
+        # Sandcastle hosts is extremely limited. Therefore, let's use disk
+        # image redirections instead of APFS volume redirections.
+        if sys.platform == "darwin":
+            configs["redirections"] = ['darwin-redirection-type = "dmg"']
+            configs["nfs"] = ["allow-apple-double = false"]
         return configs
 
     def create_hg_repo(
-        self, name: str, hgrc: Optional[configparser.ConfigParser] = None
+        self,
+        name: str,
+        hgrc: Optional[configparser.ConfigParser] = None,
+        init_configs: Optional[List[str]] = None,
     ) -> hgrepo.HgRepository:
+        """Create an hg repo.
+
+        Configs used:
+        1. Real system config files installed from hg package. See
+           `hgrepo.HgRepository.get_system_hgrc_contents()`.
+        2. `hgrc`. `hgrc` written after `hg init`.
+        3. `init_configs`. Command line flags passed to `hg init`.
+
+        | # | Customizable | Affect `hg init` | Affect commands afterwards |
+        --------------------------------------------------------------------
+        | 1 | No           | Yes              | Yes                        |
+        | 2 | Yes          | No               | Yes                        |
+        | 3 | Yes          | Yes              | No                         |
+        """
         repo_path = os.path.join(self.repos_dir, name)
         os.mkdir(repo_path)
 
@@ -267,7 +296,7 @@ class EdenTestCase(EdenTestCaseBase):
         repo = hgrepo.HgRepository(
             repo_path, system_hgrc=self.system_hgrc, temp_mgr=self.temp_mgr
         )
-        repo.init(hgrc=hgrc)
+        repo.init(hgrc=hgrc, init_configs=init_configs)
 
         return repo
 
@@ -379,6 +408,8 @@ class EdenTestCase(EdenTestCaseBase):
         else:
             return fn
 
+    # TODO(T140123741): add a use_fuse() so we can get rid of the hack to
+    # default to NFS on macOS
     def use_nfs(self) -> bool:
         """
         Should this test case mount the repo using NFS. This is used by the

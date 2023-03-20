@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use anyhow::Context;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
 use bookmarks_movement::DeleteBookmarkOp;
@@ -22,14 +22,11 @@ impl RepoContext {
     /// Delete a bookmark.
     pub async fn delete_bookmark(
         &self,
-        bookmark: impl AsRef<str>,
+        bookmark: &BookmarkKey,
         old_target: Option<ChangesetId>,
         pushvars: Option<&HashMap<String, Bytes>>,
     ) -> Result<(), MononokeError> {
         self.start_write()?;
-
-        let bookmark = bookmark.as_ref();
-        let bookmark = BookmarkName::new(bookmark)?;
 
         // We need to find out where the bookmark currently points to in order
         // to delete it.  Make sure to bypass any out-of-date caches.
@@ -38,7 +35,7 @@ impl RepoContext {
             None => self
                 .blob_repo()
                 .bookmarks()
-                .get(self.ctx().clone(), &bookmark)
+                .get(self.ctx().clone(), bookmark)
                 .await
                 .context("Failed to fetch old bookmark target")?
                 .ok_or_else(|| {
@@ -47,7 +44,7 @@ impl RepoContext {
         };
 
         fn make_delete_op<'a>(
-            bookmark: &'a BookmarkName,
+            bookmark: &'a BookmarkKey,
             old_target: ChangesetId,
             pushvars: Option<&'a HashMap<String, Bytes>>,
         ) -> DeleteBookmarkOp<'a> {
@@ -55,8 +52,8 @@ impl RepoContext {
                 .with_pushvars(pushvars)
         }
         if let Some(redirector) = self.push_redirector.as_ref() {
-            let large_bookmark = redirector.small_to_large_bookmark(&bookmark).await?;
-            if large_bookmark == bookmark {
+            let large_bookmark = redirector.small_to_large_bookmark(bookmark).await?;
+            if &large_bookmark == bookmark {
                 return Err(MononokeError::InvalidRequest(format!(
                     "Cannot delete shared bookmark '{}' from small repo",
                     bookmark
@@ -76,7 +73,7 @@ impl RepoContext {
             // Wait for bookmark to catch up on small repo
             redirector.backsync_latest(ctx).await?;
         } else {
-            make_delete_op(&bookmark, old_target, pushvars)
+            make_delete_op(bookmark, old_target, pushvars)
                 .run(self.ctx(), self.authorization_context(), self.inner_repo())
                 .await?;
         }

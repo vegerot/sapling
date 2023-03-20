@@ -106,6 +106,11 @@ fn main() {
     let _ = io.setup_term();
 
     io.set_main();
+
+    // Note: if you're adding setup logic that creates threads,
+    // you might want to delay it for chg/pfc server's case.
+    // See D44048693 for example.
+
     let mut code = hgcommands::run_command(full_args, &mut io);
     if io.flush().is_err() {
         if code == 0 {
@@ -113,6 +118,10 @@ fn main() {
         }
     }
     drop(io);
+
+    // Run atexit handlers.
+    atexit::drop_queued();
+
     std::process::exit(code as i32);
 }
 

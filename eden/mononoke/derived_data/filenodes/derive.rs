@@ -45,7 +45,10 @@ pub async fn derive_filenodes(
     derivation_ctx: &DerivationContext,
     bcs: BonsaiChangeset,
 ) -> Result<FilenodesOnlyPublic> {
-    if tunables::tunables().get_filenodes_disabled() {
+    if tunables::tunables()
+        .filenodes_disabled()
+        .unwrap_or_default()
+    {
         return Ok(FilenodesOnlyPublic::Disabled);
     }
     let (_, public_filenode, non_roots) =
@@ -60,7 +63,10 @@ pub async fn derive_filenodes(
         }
     }
     // In case it got updated while deriving
-    if tunables::tunables().get_filenodes_disabled() {
+    if tunables::tunables()
+        .filenodes_disabled()
+        .unwrap_or_default()
+    {
         return Ok(FilenodesOnlyPublic::Disabled);
     }
     Ok(public_filenode)
@@ -301,7 +307,7 @@ mod tests {
     use cloned::cloned;
     use derived_data_manager::BatchDeriveOptions;
     use fbinit::FacebookInit;
-    use filenodes::FilenodeRangeResult;
+    use filenodes::FilenodeRange;
     use filenodes::Filenodes;
     use filestore::FilestoreConfig;
     use fixtures::Linear;
@@ -731,7 +737,7 @@ mod tests {
             ctx: &CoreContext,
             path: &RepoPath,
             limit: Option<u64>,
-        ) -> Result<FilenodeRangeResult<Vec<FilenodeInfo>>> {
+        ) -> Result<FilenodeResult<FilenodeRange>> {
             self.inner
                 .get_all_filenodes_maybe_stale(ctx, path, limit)
                 .await

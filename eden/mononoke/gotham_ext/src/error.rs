@@ -20,6 +20,7 @@ pub trait ErrorFormatter {
 
 /// Wrapper around an anyhow::Error to indicate which
 /// HTTP status code should be returned to the client.
+#[derive(Debug)]
 pub struct HttpError {
     pub error: Error,
     pub status_code: StatusCode,
@@ -30,6 +31,13 @@ impl HttpError {
         Self {
             error: err.into(),
             status_code: StatusCode::BAD_REQUEST,
+        }
+    }
+
+    pub fn e401<E: Into<Error>>(err: E) -> Self {
+        Self {
+            error: err.into(),
+            status_code: StatusCode::UNAUTHORIZED,
         }
     }
 

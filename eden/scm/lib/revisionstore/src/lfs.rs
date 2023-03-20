@@ -45,6 +45,7 @@ use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
 use hg_http::http_client;
 use hg_http::http_config;
+use hgstore::strip_metadata;
 use http::status::StatusCode;
 use http_client::Encoding;
 use http_client::HttpClient;
@@ -90,7 +91,6 @@ use util::path::create_dir;
 use util::path::create_shared_dir;
 use util::path::remove_file;
 
-use crate::datastore::strip_metadata;
 use crate::datastore::ContentDataStore;
 use crate::datastore::ContentMetadata;
 use crate::datastore::Delta;
@@ -1040,6 +1040,11 @@ impl LfsPointersEntry {
     /// Returns the size of the file referenced by this LfsPointersEntry
     pub(crate) fn size(&self) -> u64 {
         self.size
+    }
+
+    /// Returns the copy_from of the file referenced by this LfsPointersEntry
+    pub(crate) fn copy_from(&self) -> &Option<Key> {
+        &self.copy_from
     }
 }
 

@@ -6,6 +6,8 @@
 
 #require symlink
 
+  $ eagerepo
+
   $ cd $TESTTMP
 
   $ newrepo

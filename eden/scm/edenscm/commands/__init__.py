@@ -90,6 +90,7 @@ with hgdemandimport.deactivated():
         debugrebuildchangelog,
         debugrunshell,
         debugsendunbundle,
+        debugstack,
         debugstatus,
         debugstrip,
         doctor,
@@ -1943,7 +1944,7 @@ def continuecmd(ui, repo):
             args = shlex.split(cmd)
             if not ui.interactive():
                 args.append("--noninteractive")
-            return bindings.commands.run(args, ui.fin, ui.fout, ui.ferr)
+            return bindings.commands.run(args)
     else:
         ms = mergemod.mergestate.read(repo)
         if ms.files():

@@ -8,6 +8,7 @@
 import type {TestingEventBus} from './__mocks__/MessageBus';
 import type {
   ClientToServerMessage,
+  ClientToServerMessageWithPayload,
   CommitInfo,
   Hash,
   Result,
@@ -19,7 +20,9 @@ import type {Writable} from 'shared/typeUtils';
 
 import messageBus from './MessageBus';
 import {deserializeFromString, serializeToString} from './serialize';
-import {screen, act, within} from '@testing-library/react';
+import {mostRecentSubscriptionIds} from './serverAPIState';
+import {screen, act, within, fireEvent} from '@testing-library/react';
+import {unwrap} from 'shared/utils';
 
 const testMessageBus = messageBus as TestingEventBus;
 
@@ -27,25 +30,64 @@ export function simulateMessageFromServer(message: ServerToClientMessage): void 
   testMessageBus.simulateMessage(serializeToString(message));
 }
 
-export function expectMessageSentToServer(message: Partial<ClientToServerMessage>): void {
-  expect(testMessageBus.sent.map(deserializeFromString)).toContainEqual(message);
+export function expectMessageSentToServer(
+  message: Partial<ClientToServerMessage | ClientToServerMessageWithPayload>,
+): void {
+  expect(
+    testMessageBus.sent
+      .filter((msg: unknown): msg is string => !(msg instanceof ArrayBuffer))
+      .map(deserializeFromString),
+  ).toContainEqual(message);
 }
 export function expectMessageNOTSentToServer(message: Partial<ClientToServerMessage>): void {
-  expect(testMessageBus.sent.map(deserializeFromString)).not.toContainEqual(message);
+  expect(
+    testMessageBus.sent
+      .filter((msg: unknown): msg is string => !(msg instanceof ArrayBuffer))
+      .map(deserializeFromString),
+  ).not.toContainEqual(message);
+}
+
+/**
+ * Return last `num` raw messages sent to the server.
+ * Normal messages will be stingified JSON.
+ * Binary messages with be ArrayBuffers.
+ */
+export function getLastMessagesSentToServer(num: number): Array<string | ArrayBuffer> {
+  return testMessageBus.sent.slice(-num);
+}
+
+export function getLastBinaryMessageSentToServer(): ArrayBuffer | undefined {
+  return testMessageBus.sent.find(
+    (message): message is ArrayBuffer => message instanceof ArrayBuffer,
+  );
+}
+
+export function simulateServerDisconnected(): void {
+  testMessageBus.simulateServerStatusChange({type: 'error', error: 'server disconnected'});
 }
 
 export function simulateCommits(commits: Result<SmartlogCommits>) {
   simulateMessageFromServer({
-    type: 'smartlogCommits',
-    subscriptionID: 'latestCommits',
-    commits,
+    type: 'subscriptionResult',
+    kind: 'smartlogCommits',
+    subscriptionID: mostRecentSubscriptionIds.smartlogCommits,
+    data: {
+      fetchStartTimestamp: 1,
+      fetchCompletedTimestamp: 2,
+      commits,
+    },
   });
 }
 export function simulateUncommittedChangedFiles(files: Result<UncommittedChanges>) {
   simulateMessageFromServer({
-    type: 'uncommittedChanges',
-    subscriptionID: 'latestUncommittedChanges',
-    files,
+    type: 'subscriptionResult',
+    kind: 'uncommittedChanges',
+    subscriptionID: mostRecentSubscriptionIds.uncommittedChanges,
+    data: {
+      fetchStartTimestamp: 1,
+      fetchCompletedTimestamp: 2,
+      files,
+    },
   });
 }
 export function simulateRepoConnected() {
@@ -134,18 +176,19 @@ export const TEST_COMMIT_HISTORY = [
   COMMIT('e', 'Commit E', 'd', {isHead: true}),
   COMMIT('d', 'Commit D', 'c'),
   COMMIT('c', 'Commit C', 'b'),
-  COMMIT('b', 'Commit b', 'a'),
+  COMMIT('b', 'Commit B', 'a'),
   COMMIT('a', 'Commit A', '1'),
   COMMIT('1', 'some public base', '0', {phase: 'public'}),
 ];
 
-const fireMouseEvent = function (
+export const fireMouseEvent = function (
   type: string,
   elem: EventTarget,
   centerX: number,
   centerY: number,
+  additionalProperties?: Partial<MouseEvent | InputEvent>,
 ) {
-  const evt = document.createEvent('MouseEvents');
+  const evt = document.createEvent('MouseEvents') as Writable<MouseEvent & InputEvent>;
   evt.initMouseEvent(
     type,
     true,
@@ -163,7 +206,12 @@ const fireMouseEvent = function (
     0,
     elem,
   );
-  (evt as Writable<DragEvent>).dataTransfer = {} as DataTransfer;
+  evt.dataTransfer = {} as DataTransfer;
+  if (additionalProperties != null) {
+    for (const [key, value] of Object.entries(additionalProperties)) {
+      (evt as Record<string, unknown>)[key] = value;
+    }
+  }
   return elem.dispatchEvent(evt);
 };
 
@@ -213,6 +261,20 @@ export const dragAndDrop = (elemDrag: HTMLElement, elemDrop: HTMLElement) => {
   });
 };
 
+export function dragAndDropCommits(draggedCommit: Hash | HTMLElement, onto: Hash) {
+  const draggableCommit =
+    typeof draggedCommit !== 'string'
+      ? draggedCommit
+      : within(screen.getByTestId(`commit-${draggedCommit}`)).queryByTestId('draggable-commit');
+  expect(draggableCommit).toBeDefined();
+  const dragTargetComit = screen.queryByTestId(`commit-${onto}`)?.querySelector('.commit-details');
+  expect(dragTargetComit).toBeDefined();
+
+  act(() => {
+    dragAndDrop(draggableCommit as HTMLElement, dragTargetComit as HTMLElement);
+  });
+}
+
 /**
  * Despite catching the error in our error boundary, react + jsdom still
  * print big scary messages to console.warn when we throw an error.
@@ -229,3 +291,134 @@ export function suppressReactErrorBoundaryErrorMessages() {
     jest.restoreAllMocks();
   });
 }
+
+export const CommitInfoTestUtils = {
+  withinCommitInfo() {
+    return within(screen.getByTestId('commit-info-view'));
+  },
+
+  withinCommitActionBar() {
+    return within(screen.getByTestId('commit-info-actions-bar'));
+  },
+
+  clickToSelectCommit(hash: string) {
+    const commit = within(screen.getByTestId(`commit-${hash}`)).queryByTestId('draggable-commit');
+    expect(commit).toBeInTheDocument();
+    act(() => {
+      fireEvent.click(unwrap(commit));
+    });
+  },
+
+  clickCommitMode() {
+    const commitRadioChoice = within(screen.getByTestId('commit-info-toolbar-top')).getByText(
+      'Commit',
+    );
+    act(() => {
+      fireEvent.click(commitRadioChoice);
+    });
+  },
+
+  clickAmendMode() {
+    const commitRadioChoice = within(screen.getByTestId('commit-info-toolbar-top')).getByText(
+      'Amend',
+    );
+    act(() => {
+      fireEvent.click(commitRadioChoice);
+    });
+  },
+
+  clickAmendButton() {
+    const amendButton: HTMLButtonElement | null = within(
+      screen.getByTestId('commit-info-actions-bar'),
+    ).queryByText('Amend');
+    expect(amendButton).toBeInTheDocument();
+    act(() => {
+      fireEvent.click(unwrap(amendButton));
+    });
+  },
+
+  clickCommitButton() {
+    const commitButton: HTMLButtonElement | null = within(
+      screen.getByTestId('commit-info-actions-bar'),
+    ).queryByText('Commit');
+    expect(commitButton).toBeInTheDocument();
+    act(() => {
+      fireEvent.click(unwrap(commitButton));
+    });
+  },
+
+  clickCancel() {
+    const cancelButton: HTMLButtonElement | null =
+      CommitInfoTestUtils.withinCommitInfo().queryByText('Cancel');
+    expect(cancelButton).toBeInTheDocument();
+
+    act(() => {
+      fireEvent.click(unwrap(cancelButton));
+    });
+  },
+
+  /** Get the outer custom element for the title editor (actually just a div in tests) */
+  getTitleWrapper(): HTMLDivElement {
+    const title = screen.getByTestId('commit-info-title-field') as HTMLDivElement;
+    expect(title).toBeInTheDocument();
+    return title;
+  },
+  /** Get the inner textarea for the title editor (inside the fake shadow dom) */
+  getTitleEditor(): HTMLTextAreaElement {
+    const textarea = CommitInfoTestUtils.getTitleWrapper();
+    return (textarea as unknown as {control: HTMLTextAreaElement}).control;
+  },
+
+  /** Get the outer custom element for the description editor (actually just a div in tests) */
+  getDescriptionWrapper(): HTMLDivElement {
+    const description = screen.getByTestId('commit-info-description-field') as HTMLDivElement;
+    expect(description).toBeInTheDocument();
+    return description;
+  },
+  /** Get the inner textarea for the description editor (inside the fake shadow dom) */
+  getDescriptionEditor(): HTMLTextAreaElement {
+    const textarea = CommitInfoTestUtils.getDescriptionWrapper();
+    return (textarea as unknown as {control: HTMLTextAreaElement}).control;
+  },
+
+  descriptionTextContent() {
+    return CommitInfoTestUtils.getDescriptionEditor().value;
+  },
+
+  clickToEditTitle() {
+    act(() => {
+      const title = screen.getByTestId('commit-info-rendered-title');
+      expect(title).toBeInTheDocument();
+      fireEvent.click(title);
+    });
+  },
+  clickToEditDescription() {
+    act(() => {
+      const description = screen.getByTestId('commit-info-rendered-description');
+      expect(description).toBeInTheDocument();
+      fireEvent.click(description);
+    });
+  },
+
+  expectIsEditingTitle() {
+    const titleEditor = screen.queryByTestId('commit-info-title-field') as HTMLInputElement;
+    expect(titleEditor).toBeInTheDocument();
+  },
+  expectIsNOTEditingTitle() {
+    const titleEditor = screen.queryByTestId('commit-info-title-field') as HTMLInputElement;
+    expect(titleEditor).not.toBeInTheDocument();
+  },
+
+  expectIsEditingDescription() {
+    const descriptionEditor = screen.queryByTestId(
+      'commit-info-description-field',
+    ) as HTMLTextAreaElement;
+    expect(descriptionEditor).toBeInTheDocument();
+  },
+  expectIsNOTEditingDescription() {
+    const descriptionEditor = screen.queryByTestId(
+      'commit-info-description-field',
+    ) as HTMLTextAreaElement;
+    expect(descriptionEditor).not.toBeInTheDocument();
+  },
+};

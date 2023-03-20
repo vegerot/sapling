@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
-use bookmarks_types::BookmarkName;
+use bookmarks_types::BookmarkKey;
 use bytes::Bytes;
 use context::CoreContext;
 use futures_stats::TimedFutureExt;
@@ -65,14 +65,17 @@ fn take_n_changeset_ids<'a>(
 pub async fn run_hooks(
     ctx: &CoreContext,
     hook_manager: &HookManager,
-    bookmark: &BookmarkName,
+    bookmark: &BookmarkKey,
     changesets: impl Iterator<Item = &BonsaiChangeset> + Clone,
     pushvars: Option<&HashMap<String, Bytes>>,
     cross_repo_push_source: CrossRepoPushSource,
     push_authored_by: PushAuthoredBy,
 ) -> Result<(), BookmarkMovementError> {
     if cross_repo_push_source == CrossRepoPushSource::PushRedirected {
-        if tunables().get_disable_running_hooks_in_pushredirected_repo() {
+        if tunables()
+            .disable_running_hooks_in_pushredirected_repo()
+            .unwrap_or_default()
+        {
             let cs_ids = take_n_changeset_ids(changesets, 10);
             ctx.scuba()
                 .clone()

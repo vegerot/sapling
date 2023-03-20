@@ -126,7 +126,9 @@ impl NewBlobs {
             }
         };
 
-        let buffer_size = tunables::tunables().get_repo_client_concurrent_blob_uploads();
+        let buffer_size = tunables::tunables()
+            .repo_client_concurrent_blob_uploads()
+            .unwrap_or_default();
         let s = if buffer_size <= 0 {
             entries
                 .into_iter()
@@ -195,9 +197,7 @@ impl NewBlobs {
                     hash: nodehash,
                 };
 
-                if let Some(&(ref manifest_content, ref p1, ref p2, ref blobfuture)) =
-                    manifests.get(&key)
-                {
+                if let Some((manifest_content, p1, p2, blobfuture)) = manifests.get(&key) {
                     counters.manifests_count += 1;
                     entries.push(
                         blobfuture
@@ -246,7 +246,7 @@ fn get_manifest_parent_content(
     p: Option<HgNodeHash>,
 ) -> Option<&ManifestContent> {
     p.and_then(|p| manifests.get(&HgNodeKey { path, hash: p }))
-        .map(|&(ref content, ..)| content)
+        .map(|(content, ..)| content)
 }
 
 fn is_entry_present_in_parent(

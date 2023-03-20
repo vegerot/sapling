@@ -10,13 +10,14 @@ use std::ops::BitOr;
 use anyhow::anyhow;
 use anyhow::Result;
 use minibytes::Bytes;
+use types::Key;
 
 use crate::scmstore::file::LazyFile;
 use crate::scmstore::value::StoreValue;
 use crate::scmstore::FileAttributes;
 use crate::scmstore::FileAuxData;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct StoreFile {
     // TODO(meyer): We'll probably eventually need a better "canonical lazy file" abstraction, since EdenApi FileEntry won't always carry content
     pub(crate) content: Option<LazyFile>,
@@ -65,6 +66,13 @@ impl StoreFile {
             .ok_or_else(|| anyhow!("no content available"))?
             .file_content()
     }
+
+    pub fn file_content_with_copy_info(&mut self) -> Result<(Bytes, Option<Key>)> {
+        self.content
+            .as_mut()
+            .ok_or_else(|| anyhow!("no content available"))?
+            .file_content_with_copy_info()
+    }
 }
 
 impl BitOr for StoreFile {
@@ -74,15 +82,6 @@ impl BitOr for StoreFile {
         StoreFile {
             content: self.content.or(rhs.content),
             aux_data: self.aux_data.or(rhs.aux_data),
-        }
-    }
-}
-
-impl Default for StoreFile {
-    fn default() -> Self {
-        StoreFile {
-            content: None,
-            aux_data: None,
         }
     }
 }

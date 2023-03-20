@@ -16,7 +16,7 @@ use anyhow::format_err;
 use anyhow::Error;
 use blobrepo::BlobRepo;
 use blobstore::Loadable;
-use bookmarks::BookmarkName;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLogEntry;
 use bookmarks::BookmarksRef;
 use changeset_fetcher::ChangesetFetcherArc;
@@ -74,7 +74,7 @@ use synced_commit_mapping::SqlSyncedCommitMapping;
 use crate::reporting::log_validation_result_to_scuba;
 use crate::tail::QueueSize;
 
-type LargeBookmarkName = Large<BookmarkName>;
+type LargeBookmarkKey = Large<BookmarkKey>;
 type PathToFileNodeIdMapping = HashMap<MPath, (FileType, HgFileNodeId)>;
 
 define_stats! {
@@ -222,7 +222,7 @@ impl ValidationHelper {
         let commit_sync_data_provider =
             CommitSyncDataProvider::Live(Arc::new(self.live_commit_sync_config.clone()));
         let maybe_commit_sync_outcome: Option<CommitSyncOutcome> = get_commit_sync_outcome(
-            &ctx,
+            ctx,
             Source(large_repo_id),
             Target(small_repo_id),
             Source(hash.0),
@@ -479,7 +479,7 @@ pub struct ValidationHelpers {
     /// we are unfolding an entry, which creates a new bookmark. Such entry
     /// does not have `from_changeset_id`, so instead we using the `to_changeset_id % master`
     /// revset to unfold an entry.
-    large_repo_master_bookmark: BookmarkName,
+    large_repo_master_bookmark: BookmarkKey,
     live_commit_sync_config: CfgrLiveCommitSyncConfig,
     mapping: SqlSyncedCommitMapping,
 }
@@ -491,7 +491,7 @@ impl ValidationHelpers {
             RepositoryId,
             (Large<BlobRepo>, Small<BlobRepo>, MononokeScubaSampleBuilder),
         >,
-        large_repo_master_bookmark: BookmarkName,
+        large_repo_master_bookmark: BookmarkKey,
         mapping: SqlSyncedCommitMapping,
         live_commit_sync_config: CfgrLiveCommitSyncConfig,
     ) -> Self {
@@ -597,7 +597,7 @@ impl ValidationHelpers {
             }
         };
 
-        let p1_root_mf_id_fut = fetch_root_mf_id(&ctx, repo, p1);
+        let p1_root_mf_id_fut = fetch_root_mf_id(ctx, repo, p1);
         let (cs_root_mf_id, p1_root_mf_id): (HgManifestId, HgManifestId) =
             try_join!(cs_root_mf_id_fut, p1_root_mf_id_fut)?;
 
@@ -697,7 +697,7 @@ impl ValidationHelpers {
 #[derive(Debug)]
 pub struct CommitEntry {
     entry_id: EntryCommitId,
-    bookmark_name: BookmarkName,
+    bookmark_name: BookmarkKey,
     cs_id: ChangesetId,
     queue_size: QueueSize,
 }
@@ -860,7 +860,7 @@ pub async fn unfold_bookmarks_update_log_entry(
 #[derive(Debug)]
 pub struct CommitEntryWithSmallReposMapped {
     entry_id: EntryCommitId,
-    bookmark_name: LargeBookmarkName,
+    bookmark_name: LargeBookmarkKey,
     cs_id: Large<ChangesetId>,
     small_repo_cs_ids: HashMap<Small<RepositoryId>, (Small<ChangesetId>, CommitSyncConfigVersion)>,
     queue_size: QueueSize,
@@ -958,11 +958,11 @@ pub async fn prepare_entry(
 
 /// Validate that parents of a changeset in a small repo are
 /// ancestors of it's equivalent in the large repo
-async fn validate_topological_order<'a>(
+async fn validate_topological_order<'a, R: ChangesetFetcherArc + RepoIdentityRef>(
     ctx: &'a CoreContext,
-    large_repo: &'a Large<BlobRepo>,
+    large_repo: &'a Large<R>,
     large_cs_id: Large<ChangesetId>,
-    small_repo: &'a Small<BlobRepo>,
+    small_repo: &'a Small<R>,
     small_cs_id: Small<ChangesetId>,
     large_repo_lca_hint: Arc<dyn LeastCommonAncestorsHint>,
     mapping: &'a SqlSyncedCommitMapping,
@@ -1360,7 +1360,7 @@ async fn validate_in_a_single_repo(
     mapping: SqlSyncedCommitMapping,
 ) -> Result<(), Error> {
     validate_full_manifest_diffs_equivalence(
-        &ctx,
+        ctx,
         &validation_helper,
         &large_cs_id,
         &small_cs_id,
@@ -1372,7 +1372,7 @@ async fn validate_in_a_single_repo(
     .await?;
 
     validate_topological_order(
-        &ctx,
+        ctx,
         &large_repo,
         large_cs_id,
         &validation_helper.small_repo,
@@ -1579,6 +1579,7 @@ mod tests {
     use cross_repo_sync::update_mapping_with_version;
     use cross_repo_sync_test_utils::init_small_large_repo;
     use cross_repo_sync_test_utils::xrepo_mapping_version_with_small_repo;
+    use cross_repo_sync_test_utils::TestRepo;
     use fbinit::FacebookInit;
     use maplit::hashmap;
     use skiplist::SkiplistIndex;
@@ -1591,7 +1592,7 @@ mod tests {
     async fn add_commits_to_repo(
         ctx: &CoreContext,
         spec: Vec<HashMap<&str, &str>>,
-        repo: &BlobRepo,
+        repo: &TestRepo,
     ) -> Result<Vec<ChangesetId>, Error> {
         let mut parent: CommitIdentifier = "master".into();
         let mut commits: Vec<ChangesetId> = vec![];

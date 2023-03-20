@@ -15,8 +15,9 @@ use anyhow::Error;
 use anyhow::Result;
 use async_trait::async_trait;
 use bookmarks_types::Bookmark;
+use bookmarks_types::BookmarkCategory;
+use bookmarks_types::BookmarkKey;
 use bookmarks_types::BookmarkKind;
-use bookmarks_types::BookmarkName;
 use bookmarks_types::BookmarkPagination;
 use bookmarks_types::BookmarkPrefix;
 use bookmarks_types::Freshness;
@@ -48,7 +49,7 @@ define_stats! {
     cached_bookmarks_misses: dynamic_timeseries("{}.miss", (repo: String); Rate, Sum),
 }
 
-type CacheData = BTreeMap<BookmarkName, (BookmarkKind, ChangesetId)>;
+type CacheData = BTreeMap<BookmarkKey, (BookmarkKind, ChangesetId)>;
 
 #[derive(Clone)]
 struct Cache {
@@ -72,6 +73,7 @@ impl Cache {
                         ctx,
                         freshness,
                         &BookmarkPrefix::empty(),
+                        BookmarkCategory::ALL,
                         BookmarkKind::ALL_PUBLISHING,
                         &BookmarkPagination::FromStart,
                         std::u64::MAX,
@@ -79,8 +81,8 @@ impl Cache {
                     .try_fold(
                         BTreeMap::new(),
                         |mut map, (bookmark, changeset_id)| async move {
-                            let Bookmark { name, kind } = bookmark;
-                            map.insert(name, (kind, changeset_id));
+                            let Bookmark { key, kind } = bookmark;
+                            map.insert(key, (kind, changeset_id));
                             Ok(map)
                         },
                     )
@@ -115,7 +117,11 @@ pub struct CachedBookmarks {
 }
 
 fn ttl() -> Option<Duration> {
-    let ttl_ms = match tunables().get_bookmarks_cache_ttl_ms().try_into() {
+    let ttl_ms = match tunables()
+        .bookmarks_cache_ttl_ms()
+        .unwrap_or_default()
+        .try_into()
+    {
         Ok(0) => 2000,            // 0 means default.
         Ok(duration) => duration, // Use provided duration.
         Err(_) => return None,    // Negative values mean no cache.
@@ -206,6 +212,7 @@ impl CachedBookmarks {
         &self,
         ctx: CoreContext,
         prefix: &BookmarkPrefix,
+        categories: &[BookmarkCategory],
         kinds: &[BookmarkKind],
         pagination: &BookmarkPagination,
         limit: u64,
@@ -214,6 +221,15 @@ impl CachedBookmarks {
         let range = prefix.to_range().with_pagination(pagination.clone());
 
         let cache = self.cache(ctx, ttl);
+
+        let filter_categories = if BookmarkCategory::ALL
+            .iter()
+            .all(|category| categories.iter().any(|c| c == category))
+        {
+            None
+        } else {
+            Some(categories.to_vec())
+        };
 
         let filter_kinds = if BookmarkKind::ALL_PUBLISHING
             .iter()
@@ -233,13 +249,17 @@ impl CachedBookmarks {
                 Ok(bookmarks) => {
                     let result: Vec<_> = bookmarks
                         .range(range)
-                        .filter_map(move |(name, (kind, changeset_id))| {
-                            if filter_kinds
+                        .filter_map(move |(key, (kind, changeset_id))| {
+                            let category = key.category();
+                            if filter_categories
                                 .as_ref()
-                                .map_or(true, |kinds| kinds.iter().any(|k| k == kind))
+                                .map_or(true, |categories| categories.iter().any(|c| c == category))
+                                && filter_kinds
+                                    .as_ref()
+                                    .map_or(true, |kinds| kinds.iter().any(|k| k == kind))
                             {
                                 let bookmark = Bookmark {
-                                    name: name.clone(),
+                                    key: key.clone(),
                                     kind: *kind,
                                 };
                                 Some(Ok((bookmark, *changeset_id)))
@@ -287,6 +307,7 @@ impl Bookmarks for CachedBookmarks {
         ctx: CoreContext,
         freshness: Freshness,
         prefix: &BookmarkPrefix,
+        categories: &[BookmarkCategory],
         kinds: &[BookmarkKind],
         pagination: &BookmarkPagination,
         limit: u64,
@@ -298,15 +319,16 @@ impl Bookmarks for CachedBookmarks {
                     .all(|kind| BookmarkKind::ALL_PUBLISHING.iter().any(|k| k == kind))
                 {
                     // All requested kinds are supported by the cache.
-                    return self
-                        .list_from_publishing_cache(ctx, prefix, kinds, pagination, limit, ttl);
+                    return self.list_from_publishing_cache(
+                        ctx, prefix, categories, kinds, pagination, limit, ttl,
+                    );
                 }
             }
         }
 
         // Bypass the cache as it cannot serve this request.
         self.bookmarks
-            .list(ctx, freshness, prefix, kinds, pagination, limit)
+            .list(ctx, freshness, prefix, categories, kinds, pagination, limit)
     }
 
     fn create_transaction(&self, ctx: CoreContext) -> Box<dyn BookmarkTransaction> {
@@ -328,7 +350,7 @@ impl Bookmarks for CachedBookmarks {
     fn get(
         &self,
         ctx: CoreContext,
-        bookmark: &BookmarkName,
+        bookmark: &BookmarkKey,
     ) -> BoxFuture<'static, Result<Option<ChangesetId>>> {
         // NOTE: If you to implement a Freshness notion here and try to fetch from cache, be
         // mindful that not all bookmarks are cached, so a cache miss here does not necessarily
@@ -346,7 +368,7 @@ impl Bookmarks for CachedBookmarks {
 impl BookmarkTransaction for CachedBookmarksTransaction {
     fn update(
         &mut self,
-        bookmark: &BookmarkName,
+        bookmark: &BookmarkKey,
         new_cs: ChangesetId,
         old_cs: ChangesetId,
         reason: BookmarkUpdateReason,
@@ -357,7 +379,7 @@ impl BookmarkTransaction for CachedBookmarksTransaction {
 
     fn create(
         &mut self,
-        bookmark: &BookmarkName,
+        bookmark: &BookmarkKey,
         new_cs: ChangesetId,
         reason: BookmarkUpdateReason,
     ) -> Result<()> {
@@ -367,7 +389,7 @@ impl BookmarkTransaction for CachedBookmarksTransaction {
 
     fn force_set(
         &mut self,
-        bookmark: &BookmarkName,
+        bookmark: &BookmarkKey,
         new_cs: ChangesetId,
         reason: BookmarkUpdateReason,
     ) -> Result<()> {
@@ -377,7 +399,7 @@ impl BookmarkTransaction for CachedBookmarksTransaction {
 
     fn delete(
         &mut self,
-        bookmark: &BookmarkName,
+        bookmark: &BookmarkKey,
         old_cs: ChangesetId,
         reason: BookmarkUpdateReason,
     ) -> Result<()> {
@@ -385,18 +407,14 @@ impl BookmarkTransaction for CachedBookmarksTransaction {
         self.transaction.delete(bookmark, old_cs, reason)
     }
 
-    fn force_delete(
-        &mut self,
-        bookmark: &BookmarkName,
-        reason: BookmarkUpdateReason,
-    ) -> Result<()> {
+    fn force_delete(&mut self, bookmark: &BookmarkKey, reason: BookmarkUpdateReason) -> Result<()> {
         self.dirty = true;
         self.transaction.force_delete(bookmark, reason)
     }
 
     fn update_scratch(
         &mut self,
-        bookmark: &BookmarkName,
+        bookmark: &BookmarkKey,
         new_cs: ChangesetId,
         old_cs: ChangesetId,
     ) -> Result<()> {
@@ -404,19 +422,19 @@ impl BookmarkTransaction for CachedBookmarksTransaction {
         self.transaction.update_scratch(bookmark, new_cs, old_cs)
     }
 
-    fn create_scratch(&mut self, bookmark: &BookmarkName, new_cs: ChangesetId) -> Result<()> {
+    fn create_scratch(&mut self, bookmark: &BookmarkKey, new_cs: ChangesetId) -> Result<()> {
         // Scratch bookmarks aren't stored in the cache.
         self.transaction.create_scratch(bookmark, new_cs)
     }
 
-    fn delete_scratch(&mut self, bookmark: &BookmarkName, old_cs: ChangesetId) -> Result<()> {
+    fn delete_scratch(&mut self, bookmark: &BookmarkKey, old_cs: ChangesetId) -> Result<()> {
         // Scratch bookmarks aren't stored in the cache.
         self.transaction.delete_scratch(bookmark, old_cs)
     }
 
     fn create_publishing(
         &mut self,
-        bookmark: &BookmarkName,
+        bookmark: &BookmarkKey,
         new_cs: ChangesetId,
         reason: BookmarkUpdateReason,
     ) -> Result<()> {
@@ -492,7 +510,7 @@ mod tests {
 
     fn bookmark(name: impl AsRef<str>) -> Bookmark {
         Bookmark::new(
-            BookmarkName::new(name).unwrap(),
+            BookmarkKey::new(name).unwrap(),
             BookmarkKind::PullDefaultPublishing,
         )
     }
@@ -502,6 +520,7 @@ mod tests {
         response: oneshot::Sender<Result<Vec<(Bookmark, ChangesetId)>>>,
         freshness: Freshness,
         prefix: BookmarkPrefix,
+        categories: Vec<BookmarkCategory>,
         kinds: Vec<BookmarkKind>,
         pagination: BookmarkPagination,
         limit: u64,
@@ -527,7 +546,7 @@ mod tests {
         // Dirty the transaction.
         transaction
             .force_delete(
-                &BookmarkName::new("").unwrap(),
+                &BookmarkKey::new("").unwrap(),
                 BookmarkUpdateReason::TestMove,
             )
             .unwrap();
@@ -540,7 +559,7 @@ mod tests {
         fn get(
             &self,
             _ctx: CoreContext,
-            _name: &BookmarkName,
+            _name: &BookmarkKey,
         ) -> BoxFuture<'static, Result<Option<ChangesetId>>> {
             unimplemented!()
         }
@@ -558,6 +577,7 @@ mod tests {
             _ctx: CoreContext,
             freshness: Freshness,
             prefix: &BookmarkPrefix,
+            categories: &[BookmarkCategory],
             kinds: &[BookmarkKind],
             pagination: &BookmarkPagination,
             limit: u64,
@@ -569,6 +589,7 @@ mod tests {
                     response: send,
                     freshness,
                     prefix: prefix.clone(),
+                    categories: categories.to_vec(),
                     kinds: kinds.to_vec(),
                     pagination: pagination.clone(),
                     limit,
@@ -592,7 +613,7 @@ mod tests {
     impl BookmarkTransaction for MockTransaction {
         fn update(
             &mut self,
-            _bookmark: &BookmarkName,
+            _bookmark: &BookmarkKey,
             _new_cs: ChangesetId,
             _old_cs: ChangesetId,
             _reason: BookmarkUpdateReason,
@@ -602,7 +623,7 @@ mod tests {
 
         fn create(
             &mut self,
-            _bookmark: &BookmarkName,
+            _bookmark: &BookmarkKey,
             _new_cs: ChangesetId,
             _reason: BookmarkUpdateReason,
         ) -> Result<()> {
@@ -611,7 +632,7 @@ mod tests {
 
         fn force_set(
             &mut self,
-            _bookmark: &BookmarkName,
+            _bookmark: &BookmarkKey,
             _new_cs: ChangesetId,
             _reason: BookmarkUpdateReason,
         ) -> Result<()> {
@@ -620,7 +641,7 @@ mod tests {
 
         fn delete(
             &mut self,
-            _bookmark: &BookmarkName,
+            _bookmark: &BookmarkKey,
             _old_cs: ChangesetId,
             _reason: BookmarkUpdateReason,
         ) -> Result<()> {
@@ -629,7 +650,7 @@ mod tests {
 
         fn force_delete(
             &mut self,
-            _bookmark: &BookmarkName,
+            _bookmark: &BookmarkKey,
             _reason: BookmarkUpdateReason,
         ) -> Result<()> {
             Ok(())
@@ -637,24 +658,24 @@ mod tests {
 
         fn update_scratch(
             &mut self,
-            _bookmark: &BookmarkName,
+            _bookmark: &BookmarkKey,
             _new_cs: ChangesetId,
             _old_cs: ChangesetId,
         ) -> Result<()> {
             Ok(())
         }
 
-        fn create_scratch(&mut self, _bookmark: &BookmarkName, _new_cs: ChangesetId) -> Result<()> {
+        fn create_scratch(&mut self, _bookmark: &BookmarkKey, _new_cs: ChangesetId) -> Result<()> {
             Ok(())
         }
 
-        fn delete_scratch(&mut self, _bookmark: &BookmarkName, _old_cs: ChangesetId) -> Result<()> {
+        fn delete_scratch(&mut self, _bookmark: &BookmarkKey, _old_cs: ChangesetId) -> Result<()> {
             Ok(())
         }
 
         fn create_publishing(
             &mut self,
-            _bookmark: &BookmarkName,
+            _bookmark: &BookmarkKey,
             _new_cs: ChangesetId,
             _reason: BookmarkUpdateReason,
         ) -> Result<()> {
@@ -752,6 +773,7 @@ mod tests {
                         ctx.clone(),
                         Freshness::MaybeStale,
                         &BookmarkPrefix::new(prefix).unwrap(),
+                        BookmarkCategory::ALL,
                         BookmarkKind::ALL_PUBLISHING,
                         &BookmarkPagination::FromStart,
                         std::u64::MAX,
@@ -814,7 +836,7 @@ mod tests {
         let transaction = bookmarks.create_transaction(ctx.clone());
         rt.block_on(transaction.commit()).unwrap();
 
-        let _ = spawn_query("c", ttl, &rt);
+        std::mem::drop(spawn_query("c", ttl, &rt));
         let requests = assert_no_pending_requests(requests, &rt, 100);
 
         // successfull transaction should redirect further requests to master
@@ -882,20 +904,21 @@ mod tests {
         let requests = assert_no_pending_requests(requests, &rt, 100);
 
         // Spawn two queries, but without the cache being turned on. We expect 2 requests.
-        let _ = spawn_query("a", Some(-1), &rt);
+        std::mem::drop(spawn_query("a", Some(-1), &rt));
         let (request, requests) = next_request(requests, &rt, 100);
         assert_eq!(request.prefix, BookmarkPrefix::new("a").unwrap());
 
-        let _ = spawn_query("b", Some(-1), &rt);
+        std::mem::drop(spawn_query("b", Some(-1), &rt));
         let (request, requests) = next_request(requests, &rt, 100);
         assert_eq!(request.prefix, BookmarkPrefix::new("b").unwrap());
 
-        let _ = requests;
+        std::mem::drop(requests);
     }
 
     fn mock_bookmarks_response(
-        bookmarks: &BTreeMap<BookmarkName, (BookmarkKind, ChangesetId)>,
+        bookmarks: &BTreeMap<BookmarkKey, (BookmarkKind, ChangesetId)>,
         prefix: &BookmarkPrefix,
+        categories: &[BookmarkCategory],
         kinds: &[BookmarkKind],
         pagination: &BookmarkPagination,
         limit: u64,
@@ -903,13 +926,14 @@ mod tests {
         let range = prefix.to_range().with_pagination(pagination.clone());
         bookmarks
             .range(range)
-            .filter_map(|(bookmark, (kind, changeset_id))| {
-                if kinds.iter().any(|k| kind == k) {
+            .filter_map(|(key, (kind, csid))| {
+                let category = key.category();
+                if kinds.iter().any(|k| kind == k) && categories.iter().any(|c| category == c) {
                     let bookmark = Bookmark {
-                        name: bookmark.clone(),
+                        key: key.clone(),
                         kind: *kind,
                     };
-                    Some((bookmark, *changeset_id))
+                    Some((bookmark, *csid))
                 } else {
                     None
                 }
@@ -920,9 +944,10 @@ mod tests {
 
     fn mock_then_query(
         fb: FacebookInit,
-        bookmarks: &BTreeMap<BookmarkName, (BookmarkKind, ChangesetId)>,
+        bookmarks: &BTreeMap<BookmarkKey, (BookmarkKind, ChangesetId)>,
         query_freshness: Freshness,
         query_prefix: &BookmarkPrefix,
+        query_categories: &[BookmarkCategory],
         query_kinds: &[BookmarkKind],
         query_pagination: &BookmarkPagination,
         query_limit: u64,
@@ -950,6 +975,7 @@ mod tests {
                 ctx,
                 query_freshness,
                 query_prefix,
+                query_categories,
                 query_kinds,
                 query_pagination,
                 query_limit,
@@ -969,6 +995,7 @@ mod tests {
         let response = mock_bookmarks_response(
             bookmarks,
             &request.prefix,
+            request.categories.as_slice(),
             request.kinds.as_slice(),
             &request.pagination,
             request.limit,
@@ -981,22 +1008,24 @@ mod tests {
     quickcheck! {
         fn responses_match(
             fb: FacebookInit,
-            bookmarks: BTreeMap<BookmarkName, (BookmarkKind, ChangesetId)>,
+            bookmarks: BTreeMap<BookmarkKey, (BookmarkKind, ChangesetId)>,
             freshness: Freshness,
+            categories: HashSet<BookmarkCategory>,
             kinds: HashSet<BookmarkKind>,
             prefix_char: Option<ascii_ext::AsciiChar>,
-            after: Option<BookmarkName>,
+            after: Option<BookmarkKey>,
             limit: u64
         ) -> bool {
             // Test that requesting via the cache gives the same result
             // as going directly to the back-end.
+            let categories: Vec<_> = categories.into_iter().collect();
             let kinds: Vec<_> = kinds.into_iter().collect();
             let prefix = match prefix_char {
                 Some(ch) => BookmarkPrefix::new_ascii(AsciiString::from(&[ch.0][..])),
                 None => BookmarkPrefix::empty(),
             };
             let pagination = match after {
-                Some(name) => BookmarkPagination::After(name),
+                Some(key) => BookmarkPagination::After(key.into_name()),
                 None => BookmarkPagination::FromStart,
             };
             let have = mock_then_query(
@@ -1004,6 +1033,7 @@ mod tests {
                 &bookmarks,
                 freshness,
                 &prefix,
+                categories.as_slice(),
                 kinds.as_slice(),
                 &pagination,
                 limit,
@@ -1011,6 +1041,7 @@ mod tests {
             let want = mock_bookmarks_response(
                 &bookmarks,
                 &prefix,
+                categories.as_slice(),
                 kinds.as_slice(),
                 &pagination,
                 limit,

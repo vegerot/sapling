@@ -13,10 +13,10 @@ import {
   resetTestMessages,
   expectMessageSentToServer,
   simulateCommits,
-  dragAndDrop,
   expectMessageNOTSentToServer,
   closeCommitInfoSidebar,
   TEST_COMMIT_HISTORY,
+  dragAndDropCommits,
 } from '../../testUtils';
 import {CommandRunner, SucceedableRevset} from '../../types';
 import {fireEvent, render, screen, within} from '@testing-library/react';
@@ -33,7 +33,8 @@ describe('rebase operation', () => {
     act(() => {
       closeCommitInfoSidebar();
       expectMessageSentToServer({
-        type: 'subscribeSmartlogCommits',
+        type: 'subscribe',
+        kind: 'smartlogCommits',
         subscriptionID: expect.anything(),
       });
       simulateCommits({
@@ -41,22 +42,6 @@ describe('rebase operation', () => {
       });
     });
   });
-
-  const dragAndDropCommits = (draggedCommit: Hash | HTMLElement, onto: Hash) => {
-    const draggableCommit =
-      typeof draggedCommit !== 'string'
-        ? draggedCommit
-        : within(screen.getByTestId(`commit-${draggedCommit}`)).queryByTestId('draggable-commit');
-    expect(draggableCommit).toBeDefined();
-    const dragTargetComit = screen
-      .queryByTestId(`commit-${onto}`)
-      ?.querySelector('.commit-details');
-    expect(dragTargetComit).toBeDefined();
-
-    act(() => {
-      dragAndDrop(draggableCommit as HTMLElement, dragTargetComit as HTMLElement);
-    });
-  };
 
   const getCommitWithPreview = (hash: Hash, preview: CommitPreview): HTMLElement => {
     const previewOfCommit = screen
@@ -82,6 +67,15 @@ describe('rebase operation', () => {
         .queryAllByTestId('commit-d')
         .some(commit => commit.querySelector('.commit-preview-rebase-root')),
     ).toEqual(true);
+  });
+
+  it('sets all descendants as the right preview type', () => {
+    expect(screen.getAllByText('Commit D')).toHaveLength(1);
+    dragAndDropCommits('a', '2');
+
+    expect(document.querySelectorAll('.commit-preview-rebase-old')).toHaveLength(5);
+    expect(document.querySelectorAll('.commit-preview-rebase-root')).toHaveLength(1);
+    expect(document.querySelectorAll('.commit-preview-rebase-descendant')).toHaveLength(4);
   });
 
   it('previews onto correct branch', () => {
@@ -113,6 +107,7 @@ describe('rebase operation', () => {
         args: ['rebase', '-s', SucceedableRevset('d'), '-d', SucceedableRevset('remote/master')],
         id: expect.anything(),
         runner: CommandRunner.Sapling,
+        trackEventName: 'RebaseOperation',
       },
     });
   });

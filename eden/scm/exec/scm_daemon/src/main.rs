@@ -83,16 +83,17 @@ async fn main() -> Result<()> {
 
     let commitcloud_workspacesubscriber =
         CommitCloudWorkspaceSubscriberService::new(commitcloudconfref)?;
-    let commitcloud_tcpreceiver =
-        CommitCloudTcpReceiverService::new(commitcloudconfref.tcp_receiver_port)
-            .with_actions(commitcloud_workspacesubscriber.actions());
+    let commitcloud_tcpreceiver = CommitCloudTcpReceiverService::new(
+        commitcloudconfref.tcp_receiver_port,
+        commitcloud_workspacesubscriber.actions(),
+    );
 
     // start services
-    let commitcloud_tcpreceiver_handler = commitcloud_tcpreceiver.serve()?;
+    let commitcloud_tcpreceiver_handler = commitcloud_tcpreceiver.serve();
     let commitcloud_workspacesubscriber_handler = commitcloud_workspacesubscriber.serve()?;
 
     // join running services, this will block
-    match commitcloud_tcpreceiver_handler.join() {
+    match commitcloud_tcpreceiver_handler.await {
         Ok(result) => result?,
         Err(_) => bail!("commitcloud tcpreceiver panicked"),
     };

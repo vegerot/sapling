@@ -21,6 +21,7 @@ futures = { version = "0.3.22", features = ["async-await", "compat"] }
 hex = "0.4.3"
 hg-http = { version = "0.1.0", path = "../hg-http" }
 hg-metrics = { version = "0.1.0", path = "../hg-metrics" }
+hgstore = { version = "0.1.0", path = "../storemodel/hgstore" }
 hgtime = { version = "0.1.0", path = "../hgtime" }
 http = "0.2"
 http-client = { version = "0.1.0", path = "../http-client" }
@@ -28,7 +29,7 @@ indexedlog = { version = "0.1.0", path = "../indexedlog" }
 lfs_protocol = { version = "0.1.0", path = "../../../mononoke/lfs_protocol" }
 lz4-pyframe = { version = "0.1.0", path = "../lz4-pyframe" }
 manifest-tree = { version = "0.1.0", path = "../manifest-tree" }
-memmap = "0.7"
+memmap2 = "0.5.10"
 mincode = { version = "0.1.0", path = "../mincode" }
 minibytes = { version = "0.1.0", path = "../minibytes", features = ["frombytes"] }
 mpatch = { version = "0.1.0", path = "../mpatch" }
@@ -43,8 +44,8 @@ revisionstore_types = { version = "0.1.0", path = "types" }
 serde = { version = "1.0.136", features = ["derive", "rc"] }
 serde_derive = "1.0"
 serde_json = { version = "1.0.79", features = ["float_roundtrip", "unbounded_depth"] }
-sha-1 = "0.10"
-sha2 = "0.10"
+sha1 = "0.10.5"
+sha2 = "0.10.6"
 storemodel = { version = "0.1.0", path = "../storemodel" }
 tempfile = "3.3"
 thiserror = "1.0.36"

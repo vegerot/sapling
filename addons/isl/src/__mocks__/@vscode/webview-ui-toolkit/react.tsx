@@ -14,13 +14,14 @@ import type {
   VSCodeRadio as VSCodeRadioType,
   VSCodeRadioGroup as VSCodeRadioGroupType,
 } from '@vscode/webview-ui-toolkit/react';
-import type {FormEvent, JSXElementConstructor} from 'react';
+import type {FormEvent, JSXElementConstructor, MutableRefObject} from 'react';
 
-import React, {forwardRef} from 'react';
+import React, {useEffect, useRef, forwardRef} from 'react';
 
 // vscode webview-ui-toolkit uses ES Modules, which doesn't play well with jest transpilation yet.
 // We need to provide mock verison of these components for now
 
+export const VSCodeLink = (p: React.PropsWithChildren<typeof VSCodeTagType>) => <a {...p} />;
 export const VSCodeTag = (p: React.PropsWithChildren<typeof VSCodeTagType>) => <div {...p} />;
 export const VSCodeBadge = (p: React.PropsWithChildren<typeof VSCodeBadgeType>) => <div {...p} />;
 export const VSCodeButton = (p: React.PropsWithChildren<typeof VSCodeButtonType>) => (
@@ -33,12 +34,59 @@ export const VSCodeDivider = (p: React.PropsWithChildren<typeof VSCodeDividerTyp
 export const VSCodeCheckbox = (p: React.PropsWithChildren<typeof VSCodeCheckboxType>) => (
   <input type="checkbox" {...p} onChange={() => undefined} />
 );
-export const VSCodeTextField = forwardRef<HTMLInputElement>((p, ref) => (
-  <input type="text" {...p} ref={ref} />
-));
-export const VSCodeTextArea = forwardRef<HTMLTextAreaElement>((p, ref) => (
-  <textarea {...p} ref={ref} />
-));
+export const VSCodeTextField = forwardRef<HTMLInputElement>(
+  (p: {children?: React.ReactNode; onChange?: () => void}, ref) => {
+    const {children, onChange, ...rest} = p;
+    return (
+      <>
+        {children && <label>{children}</label>}
+        <input type="text" {...rest} ref={ref} onChange={onChange ?? (() => undefined)} />
+      </>
+    );
+  },
+);
+
+export const VSCodeTextArea = forwardRef<HTMLDivElement>(
+  (
+    p: {
+      children?: React.ReactNode;
+      onChange?: () => void;
+      className?: string;
+      'data-testid'?: string;
+    },
+    ref,
+  ) => {
+    const {children, className, ['data-testid']: dataid, ...innerProps} = p;
+    const outerProps = {className, ['data-testid']: dataid};
+
+    const backupOuterRef = useRef(null);
+    const outerRef = (ref ?? backupOuterRef) as MutableRefObject<HTMLDivElement>;
+    const innerRef = useRef(null);
+
+    // The actual VSCodeTextArea is a shadow element.
+    // jest and react testing library don't handle those well,
+    // so we mimic it with a div and a nested textarea.
+    // we need to take care to be able to reference the inner textarea part via `.control`,
+    // or else our testing code wouldn't match production.
+    useEffect(() => {
+      if (outerRef?.current && innerRef.current) {
+        (outerRef.current as HTMLDivElement & {control: HTMLElement}).control = innerRef.current;
+      }
+    }, [outerRef, innerRef]);
+    return (
+      <div ref={outerRef} {...outerProps}>
+        <label>{children}</label>
+        <textarea
+          // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+          // @ts-ignore - part is not usually allowed
+          part="control"
+          ref={innerRef}
+          {...innerProps}
+          onChange={innerProps.onChange ?? (() => undefined)}></textarea>
+      </div>
+    );
+  },
+);
 export const VSCodeDropdown = forwardRef<HTMLSelectElement>((p, ref) => (
   <select {...p} ref={ref} />
 ));

@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -22,8 +21,8 @@ use crate::CachelibKey;
 #[derive(Clone)]
 pub enum CachelibHandler<T> {
     Real(VolatileLruCachePool),
-    #[allow(dead_code)]
     Mock(MockStore<T>),
+    Noop,
 }
 
 impl<T> From<VolatileLruCachePool> for CachelibHandler<T> {
@@ -58,6 +57,7 @@ impl<T: Abomonation + Clone + Send + 'static> CachelibHandler<T> {
         match self {
             CachelibHandler::Real(ref cache) => get_cached(cache, key),
             CachelibHandler::Mock(store) => Ok(store.get(key)),
+            CachelibHandler::Noop => Ok(None),
         }
     }
 
@@ -68,18 +68,23 @@ impl<T: Abomonation + Clone + Send + 'static> CachelibHandler<T> {
                 store.set(key, value.clone());
                 Ok(true)
             }
+            CachelibHandler::Noop => Ok(false),
         }
     }
 
-    #[allow(dead_code)]
     pub fn create_mock() -> Self {
         CachelibHandler::Mock(MockStore::new())
     }
 
-    #[allow(dead_code)]
+    pub fn create_noop() -> Self {
+        CachelibHandler::Noop
+    }
+
+    #[cfg(test)]
     pub(crate) fn gets_count(&self) -> usize {
+        use std::sync::atomic::Ordering;
         match self {
-            CachelibHandler::Real(_) => unimplemented!(),
+            CachelibHandler::Real(_) | CachelibHandler::Noop => unimplemented!(),
             CachelibHandler::Mock(MockStore { ref get_count, .. }) => {
                 get_count.load(Ordering::SeqCst)
             }
@@ -88,7 +93,7 @@ impl<T: Abomonation + Clone + Send + 'static> CachelibHandler<T> {
 
     pub fn mock_store(&self) -> Option<&MockStore<T>> {
         match self {
-            CachelibHandler::Real(_) => None,
+            CachelibHandler::Real(_) | CachelibHandler::Noop => None,
             CachelibHandler::Mock(ref mock) => Some(mock),
         }
     }
@@ -143,7 +148,7 @@ mod tests {
             }
 
             let left: HashSet<_> = left.into_iter().map(|(key, _)| key).collect();
-            let mut fetched: HashSet<_> = fetched.into_iter().map(|(key, _)| key).collect();
+            let mut fetched: HashSet<_> = fetched.into_keys().collect();
 
             if fetched.len() + left.len() != keys_to_query.len() {
                 return TestResult::error("Returned wrong number of unique items from get");

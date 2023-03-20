@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use abomonation_derive::Abomonation;
 use anyhow::anyhow;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -32,13 +33,22 @@ pub struct PreparedFilenode {
     pub info: FilenodeInfo,
 }
 
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq)]
+#[derive(Abomonation, Arbitrary, Clone, Debug, Eq, PartialEq)]
 pub struct FilenodeInfo {
     pub filenode: HgFileNodeId,
     pub p1: Option<HgFileNodeId>,
     pub p2: Option<HgFileNodeId>,
     pub copyfrom: Option<(RepoPath, HgFileNodeId)>,
     pub linknode: HgChangesetId,
+}
+
+#[derive(Abomonation, Clone, Debug, Eq, PartialEq)]
+pub enum FilenodeRange {
+    /// A range of filenodes.
+    Filenodes(Vec<FilenodeInfo>),
+
+    /// This range is too large to be fetched.
+    TooBig,
 }
 
 // The main purpose of FilenodeResult is to force callers to deal with situation
@@ -68,32 +78,6 @@ impl<T> FilenodeResult<T> {
         match self {
             FilenodeResult::Present(t) => Ok(t),
             FilenodeResult::Disabled => Err(anyhow!("filenodes are disabled")),
-        }
-    }
-}
-
-#[derive(Debug)]
-#[must_use]
-pub enum FilenodeRangeResult<T> {
-    Present(T),
-    TooBig,
-    Disabled,
-}
-
-impl<T> FilenodeRangeResult<T> {
-    pub fn map<U>(self, func: impl Fn(T) -> U) -> FilenodeRangeResult<U> {
-        match self {
-            FilenodeRangeResult::Present(t) => FilenodeRangeResult::Present(func(t)),
-            FilenodeRangeResult::TooBig => FilenodeRangeResult::TooBig,
-            FilenodeRangeResult::Disabled => FilenodeRangeResult::Disabled,
-        }
-    }
-
-    pub fn do_not_handle_disabled_filenodes(self) -> Result<Option<T>> {
-        match self {
-            FilenodeRangeResult::Present(t) => Ok(Some(t)),
-            FilenodeRangeResult::TooBig => Ok(None),
-            FilenodeRangeResult::Disabled => Err(anyhow!("filenodes are disabled")),
         }
     }
 }
@@ -162,7 +146,7 @@ pub trait Filenodes: Send + Sync {
         ctx: &CoreContext,
         path: &RepoPath,
         limit: Option<u64>,
-    ) -> Result<FilenodeRangeResult<Vec<FilenodeInfo>>>;
+    ) -> Result<FilenodeResult<FilenodeRange>>;
 
     fn prime_cache(&self, ctx: &CoreContext, filenodes: &[PreparedFilenode]);
 }

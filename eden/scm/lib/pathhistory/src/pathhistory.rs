@@ -104,6 +104,21 @@ impl PathHistory {
         root_tree_reader: Arc<dyn ReadRootTreeIds + Send + Sync>,
         tree_store: Arc<dyn TreeStore + Send + Sync>,
     ) -> Result<Self> {
+        Self::new_internal(set, paths, root_tree_reader, tree_store, false).await
+    }
+
+    /// Internal version of `PathHisotry::new` method.
+    ///
+    /// This creation method adds an additional `ignore_file_content` parameter.
+    /// When enabled, file content and file type (e.g. executable) will be ignored,
+    /// this is used for tracing renames.
+    pub(crate) async fn new_internal(
+        set: Set,
+        paths: Vec<RepoPathBuf>,
+        root_tree_reader: Arc<dyn ReadRootTreeIds + Send + Sync>,
+        tree_store: Arc<dyn TreeStore + Send + Sync>,
+        ignore_file_content: bool,
+    ) -> Result<Self> {
         tracing::debug!("PathHistory::new(set={:.12?}, paths={:?})", &set, &paths);
         let (id_set, id_map) = set_to_id_set_and_id_map(&set)?;
         let (roots, id_dag) = if let Some(dag) = set.dag() {
@@ -112,7 +127,7 @@ impl PathHistory {
             let id_dag = dag.id_dag_snapshot()?;
             let parents = id_dag.parents(id_set.clone())?;
             let union = parents.union(&id_set);
-            let roots = id_dag.roots(union.clone())?;
+            let roots = id_dag.roots(union)?;
             let roots = roots.intersection(&id_set);
             (roots, id_dag)
         } else {
@@ -121,7 +136,8 @@ impl PathHistory {
         let roots: Vec<Id> = roots.iter_asc().collect();
         tracing::trace!(" roots: {:?}", &roots);
         let queue = id_dag.id_set_to_id_segments(&id_set)?;
-        let compiled_paths = CompiledPaths::compile(paths);
+        let compiled_paths =
+            CompiledPaths::compile(paths).with_ignore_file_content(ignore_file_content);
         let mut path_history = Self {
             id_dag,
             id_map,
@@ -298,7 +314,7 @@ impl PathHistory {
                         .iter()
                         .all(|&p| !interesting_ancestors.contains(p))
                 {
-                    // Split the segment. It does not contain "interesting" parents.
+                    // Skip the segment. It does not contain "interesting" parents.
                     continue;
                 } else {
                     interesting_ancestors =
@@ -382,7 +398,7 @@ impl PathHistory {
             .cloned()
             .filter(|i| !self.commit_map.contains_key(i))
             .collect::<Vec<_>>();
-        if !ids.is_empty() {
+        if !missing_ids.is_empty() {
             for state in self.prepare_commit_states(&missing_ids).await? {
                 self.stats.commit_count += 1;
                 self.commit_map.insert(state.id, state);

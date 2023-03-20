@@ -54,16 +54,47 @@ impl AddScubaParams for thrift::RepoCreateCommitParams {
         let deletes_count = self
             .changes
             .values()
-            .filter(|change| {
-                if let thrift::RepoCreateCommitParamsChange::deleted(_) = change {
-                    true
-                } else {
-                    false
-                }
-            })
+            .filter(|change| matches!(change, thrift::RepoCreateCommitParamsChange::deleted(_)))
             .count();
         scuba.add("param_changes_count", self.changes.len() - deletes_count);
         scuba.add("param_deletes_count", deletes_count);
+        self.identity_schemes.add_scuba_params(scuba);
+        if let Some(service_identity) = self.service_identity.as_deref() {
+            scuba.add("service_identity", service_identity);
+        }
+    }
+}
+
+impl AddScubaParams for thrift::RepoCreateStackParams {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add(
+            "param_parents",
+            self.parents
+                .iter()
+                .map(CommitIdExt::to_string)
+                .collect::<ScubaValue>(),
+        );
+        let deletes_count = self
+            .commits
+            .iter()
+            .map(|commit| {
+                commit
+                    .changes
+                    .values()
+                    .filter(|change| {
+                        matches!(change, thrift::RepoCreateCommitParamsChange::deleted(_))
+                    })
+                    .count()
+            })
+            .sum::<usize>();
+        let changes_count = self
+            .commits
+            .iter()
+            .map(|commit| commit.changes.len())
+            .sum::<usize>();
+        scuba.add("param_changes_count", changes_count - deletes_count);
+        scuba.add("param_deletes_count", deletes_count);
+        scuba.add("param_commit_count", self.commits.len());
         self.identity_schemes.add_scuba_params(scuba);
         if let Some(service_identity) = self.service_identity.as_deref() {
             scuba.add("service_identity", service_identity);
@@ -168,6 +199,12 @@ impl AddScubaParams for thrift::RepoResolveCommitPrefixParams {
 impl AddScubaParams for thrift::RepoStackInfoParams {}
 
 impl AddScubaParams for thrift::RepoPrepareCommitsParams {}
+
+impl AddScubaParams for thrift::RepoUploadFileContentParams {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("param_data_len", self.data.len());
+    }
+}
 
 impl AddScubaParams for thrift::CommitCompareParams {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
@@ -509,5 +546,17 @@ impl AddScubaParams for thrift::MegarepoAddConfigParams {
 impl AddScubaParams for thrift::MegarepoReadConfigParams {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
         report_megarepo_target(&self.target, scuba, Reported::Param);
+    }
+}
+
+impl AddScubaParams for thrift::UploadGitObjectParams {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("param_git_object_id", hex(&self.git_hash));
+    }
+}
+
+impl AddScubaParams for thrift::CreateGitTreeParams {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("param_git_object_id", hex(&self.git_tree_hash));
     }
 }

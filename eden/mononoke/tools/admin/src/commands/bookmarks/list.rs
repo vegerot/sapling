@@ -10,8 +10,9 @@ use std::fmt;
 use anyhow::Error;
 use anyhow::Result;
 use bookmarks::Bookmark;
+use bookmarks::BookmarkCategory;
+use bookmarks::BookmarkKey;
 use bookmarks::BookmarkKind;
-use bookmarks::BookmarkName;
 use bookmarks::BookmarkPagination;
 use bookmarks::BookmarkPrefix;
 use bookmarks::BookmarksRef;
@@ -32,6 +33,10 @@ pub struct BookmarksListArgs {
     #[clap(long = "kind", short = 'k', value_name = "KIND", arg_enum, default_values = &["publishing", "pull-default-publishing"])]
     kinds: Vec<BookmarkKind>,
 
+    /// Categories of bookmarks to list
+    #[clap(long = "category", short = 'c', value_name = "CATEGORY", arg_enum, default_values = &["branch", "tag", "note"])]
+    categories: Vec<BookmarkCategory>,
+
     /// Prefix of bookmarks to list
     #[clap(long)]
     prefix: Option<BookmarkPrefix>,
@@ -42,7 +47,7 @@ pub struct BookmarksListArgs {
 
     /// Show bookmarks after this name (continue pagination)
     #[clap(long)]
-    after: Option<BookmarkName>,
+    after: Option<BookmarkKey>,
 
     /// Commit identity schemes to display
     #[clap(long, short='S', arg_enum, default_values = &["bonsai"], use_value_delimiter = true)]
@@ -108,12 +113,14 @@ pub async fn list(ctx: &CoreContext, repo: &Repo, list_args: BookmarksListArgs) 
     let prefix = list_args.prefix.unwrap_or_else(BookmarkPrefix::empty);
     let pagination = list_args
         .after
+        .map(|bookmark_key| bookmark_key.into_name())
         .map_or(BookmarkPagination::FromStart, BookmarkPagination::After);
     repo.bookmarks()
         .list(
             ctx.clone(),
             freshness,
             &prefix,
+            &list_args.categories,
             &list_args.kinds,
             &pagination,
             list_args.limit,

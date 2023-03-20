@@ -493,75 +493,6 @@ def _checkexec(path: str) -> bool:
     return False
 
 
-def _checklink(path: str) -> bool:
-    """check whether the given path is on a symlink-capable filesystem"""
-    cap = fscap.getfscap(getfstype(path), fscap.SYMLINK)
-    if cap is not None:
-        return cap
-
-    # mktemp is not racy because symlink creation will fail if the
-    # file already exists
-    while True:
-        ident = identity.sniffdir(path) or identity.default()
-        cachedir = os.path.join(path, ident.dotdir(), "cache")
-        checklink = os.path.join(cachedir, "checklink")
-        # try fast path, read only
-        if os.path.islink(checklink):
-            return True
-        if os.path.isdir(cachedir):
-            checkdir = cachedir
-        else:
-            checkdir = path
-            cachedir = None
-        name = tempfile.mktemp(dir=checkdir, prefix=r"checklink-")
-        try:
-            fd = None
-            if cachedir is None:
-                fd = tempfile.NamedTemporaryFile(dir=checkdir, prefix=r"hg-checklink-")
-                target = os.path.basename(fd.name)
-            else:
-                # create a fixed file to link to; doesn't matter if it
-                # already exists.
-                target = "checklink-target"
-                try:
-                    with open(os.path.join(cachedir, target), "w"):
-                        pass
-                except EnvironmentError as inst:
-                    if inst.errno == errno.EACCES:
-                        # If we can't write to cachedir, just pretend
-                        # that the fs is readonly and by association
-                        # that the fs won't support symlinks. This
-                        # seems like the least dangerous way to avoid
-                        # data loss.
-                        return False
-                    raise
-            try:
-                os.symlink(target, name)
-                if cachedir is None:
-                    unlink(name)
-                else:
-                    try:
-                        os.rename(name, checklink)
-                    except OSError:
-                        unlink(name)
-                return True
-            except OSError as inst:
-                # link creation might race, try again
-                if inst.errno == errno.EEXIST:
-                    continue
-                raise
-            finally:
-                if fd is not None:
-                    fd.close()
-        except AttributeError:
-            return False
-        except OSError as inst:
-            # sshfs might report failure while successfully creating the link
-            if inst.errno == errno.EIO and os.path.exists(name):
-                unlink(name)
-            return False
-
-
 def _checkbrokensymlink(path, msg=None):
     """Check if path or one of its parent directory is a broken symlink.  Raise
     more detailed error about it.
@@ -691,56 +622,7 @@ if pycompat.isdarwin:
         # drop HFS+ ignored characters
         return encoding.hfsignoreclean(enc)
 
-    # pyre-fixme[9]: checkexec has type `(path: str) -> bool`; used as `(path: str)
-    #  -> bool`.
     checkexec = _checkexec
-    # pyre-fixme[9]: checklink has type `(path: str) -> bool`; used as `(path: str)
-    #  -> bool`.
-    checklink = _checklink
-
-elif pycompat.sysplatform == "cygwin":
-    # workaround for cygwin, in which mount point part of path is
-    # treated as case sensitive, even though underlying NTFS is case
-    # insensitive.
-
-    # default mount points
-    cygwinmountpoints = sorted(["/usr/bin", "/usr/lib", "/cygdrive"], reverse=True)
-
-    # use upper-ing as normcase as same as NTFS workaround
-    def normcase(path):
-        pathlen = len(path)
-        if (pathlen == 0) or (path[0] != pycompat.ossep):
-            # treat as relative
-            return encoding.upper(path)
-
-        # to preserve case of mountpoint part
-        for mp in cygwinmountpoints:
-            if not path.startswith(mp):
-                continue
-
-            mplen = len(mp)
-            if mplen == pathlen:  # mount point itself
-                return mp
-            if path[mplen] == pycompat.ossep:
-                return mp + encoding.upper(path[mplen:])
-
-        return encoding.upper(path)
-
-    normcasespec = encoding.normcasespecs.other
-    normcasefallback = normcase
-
-    # Cygwin translates native ACLs to POSIX permissions,
-    # but these translations are not supported by native
-    # tools, so the exec bit tends to be set erroneously.
-    # Therefore, disable executable bit access on Cygwin.
-    def checkexec(path: str) -> bool:
-        return False
-
-    # Similarly, Cygwin's symlink emulation is likely to create
-    # problems when Mercurial is used from both Cygwin and native
-    # Windows, with other native tools, or on shared volumes
-    def checklink(path: str) -> bool:
-        return False
 
 else:
     # os.path.normcase is a no-op, which doesn't help us on non-native
@@ -753,12 +635,7 @@ else:
     # fallback normcase function for non-ASCII strings
     normcasefallback = normcase
 
-    # pyre-fixme[9]: checkexec has type `(path: str) -> bool`; used as `(path: str)
-    #  -> bool`.
     checkexec = _checkexec
-    # pyre-fixme[9]: checklink has type `(path: str) -> bool`; used as `(path: str)
-    #  -> bool`.
-    checklink = _checklink
 
 _needsshellquote = None
 
@@ -962,11 +839,6 @@ class cachestat(object):
 
 def executablepath():
     return None  # available on Windows only
-
-
-def statislink(st):
-    """check whether a stat result is a symlink"""
-    return st and stat.S_ISLNK(st.st_mode)
 
 
 def statisexec(st):

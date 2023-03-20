@@ -2828,11 +2828,12 @@ EdenServiceHandler::semifuture_getScmStatusV2(
              std::move(helper),
              mount
                  ->diff(
+                     rootInode,
                      rootId,
                      context->getConnectionContext()->getCancellationToken(),
                      *params->listIgnored_ref(),
                      enforceParents)
-                 .ensure([rootInode = std::move(rootInode)] {})
+                 .ensure([rootInode = rootInode] {})
                  .thenValue([this, mount = mount](
                                 std::unique_ptr<ScmStatus>&& status) {
                    auto result = std::make_unique<GetScmStatusResult>();
@@ -2865,11 +2866,12 @@ EdenServiceHandler::semifuture_getScmStatus(
   return wrapImmediateFuture(
              std::move(helper),
              mount->diff(
+                 rootInode,
                  hash,
                  context->getConnectionContext()->getCancellationToken(),
                  listIgnored,
                  /*enforceCurrentParent=*/false))
-      .ensure([rootInode = std::move(rootInode)] {})
+      .ensure([rootInode = rootInode] {})
       .semi();
 }
 
@@ -3136,7 +3138,7 @@ EdenServiceHandler::semifuture_debugGetBlobMetadata(
 
     auto metadata = hgBackingStore->getHgBackingStore()
                         .getDatapackStore()
-                        .getLocalBlobMetadata(proxyHash.revHash());
+                        .getLocalBlobMetadata(proxyHash);
     blobFutures.emplace_back(ImmediateFuture<BlobMetadataWithOrigin>{
         transformToBlobMetadataFromOrigin(
             edenMount,
@@ -3270,6 +3272,10 @@ class InodeStatusCallbacks : public TraversalCallbacks {
   }
 
   bool shouldRecurse(const ChildEntry& entry) override {
+    if (flags_ & eden_constants::DIS_NOT_RECURSIVE_) {
+      return false;
+    }
+
     if ((flags_ & eden_constants::DIS_REQUIRE_LOADED_) && !entry.loadedChild) {
       return false;
     }
@@ -3512,7 +3518,7 @@ void EdenServiceHandler::debugGetInodePath(
 void EdenServiceHandler::clearFetchCounts() {
   auto helper = INSTRUMENT_THRIFT_CALL(DBG3);
 
-  for (auto& mount : server_->getMountPoints()) {
+  for (auto& [mount, rootInode] : server_->getMountPoints()) {
     mount->getObjectStore()->clearFetchCounts();
   }
 }
@@ -3569,7 +3575,7 @@ void EdenServiceHandler::getAccessCounts(
 
   auto seconds = std::chrono::seconds{duration};
 
-  for (auto& mount : server_->getMountPoints()) {
+  for (auto& [mount, rootInode] : server_->getMountPoints()) {
     auto& mountStr = mount->getPath().value();
     auto& pal = mount->getProcessAccessLog();
 
@@ -3644,9 +3650,6 @@ EdenServiceHandler::semifuture_debugInvalidateNonMaterialized(
   auto [edenMount, rootInode] = server_->getMountAndRootInode(mountPath);
   auto& fetchContext = helper->getFetchContext();
 
-  TreeInodePtr inode =
-      inodeFromUserPath(*edenMount, *params->path(), fetchContext).asTreePtr();
-
   if (!folly::kIsWindows) {
     if (!(params->age()->seconds() == 0 && params->age()->nanoSeconds() == 0)) {
       throw newEdenError(
@@ -3654,6 +3657,10 @@ EdenServiceHandler::semifuture_debugInvalidateNonMaterialized(
           EdenErrorType::ARGUMENT_ERROR,
           "Non-zero age is not supported on non-Windows platforms");
     }
+  } else {
+    // TODO: We may need to restrict 0s age on Windows as that can lead to
+    // weird behavior where files are invalidated while being read causing the
+    // read to fail.
   }
 
   auto cutoff = std::chrono::system_clock::time_point::max();
@@ -3662,24 +3669,56 @@ EdenServiceHandler::semifuture_debugInvalidateNonMaterialized(
         std::chrono::seconds(*params->age()->seconds());
   }
 
-  return wrapImmediateFuture(
-             std::move(helper),
-             waitForPendingNotifications(*edenMount, *params->sync())
-                 .thenValue([inode = std::move(inode), cutoff, &fetchContext](
-                                auto&&) mutable {
-                   return inode
-                       ->invalidateChildrenNotMaterialized(cutoff, fetchContext)
-                       .ensure([inode]() {
-                         inode->unloadChildrenUnreferencedByFs();
-                       })
-                       .thenValue([inode](uint64_t numInvalidated) {
-                         auto ret = std::make_unique<DebugInvalidateResponse>();
-                         ret->numInvalidated() = numInvalidated;
-                         return ret;
-                       });
-                 }))
-      .ensure([rootInode = std::move(rootInode)] {})
-      .semi();
+  ImmediateFuture<folly::Unit> backgroundFuture{std::in_place};
+  if (*params->background()) {
+    backgroundFuture = makeNotReadyImmediateFuture();
+  }
+
+  auto invalFut =
+      std::move(backgroundFuture)
+          .thenValue([edenMount = edenMount, sync = *params->sync()](auto&&) {
+            return waitForPendingNotifications(*edenMount, sync);
+          })
+          .thenValue([edenMount = edenMount,
+                      path = *params->path(),
+                      &fetchContext](auto&&) {
+            return inodeFromUserPath(*edenMount, path, fetchContext)
+                .asTreePtr();
+          })
+          .thenValue([this,
+                      edenMount = edenMount,
+                      rootInode = rootInode,
+                      cutoff,
+                      &fetchContext](TreeInodePtr inode) mutable {
+            if (inode == rootInode) {
+              return server_->garbageCollectWorkingCopy(
+                  std::move(edenMount),
+                  std::move(rootInode),
+                  cutoff,
+                  fetchContext);
+            } else {
+              return inode
+                  ->invalidateChildrenNotMaterialized(cutoff, fetchContext)
+                  .ensure(
+                      [inode]() { inode->unloadChildrenUnreferencedByFs(); });
+            }
+          })
+          .thenValue([](uint64_t numInvalidated) {
+            auto ret = std::make_unique<DebugInvalidateResponse>();
+            ret->numInvalidated() = numInvalidated;
+            return ret;
+          })
+          .ensure([helper = std::move(helper),
+                   rootInode = std::move(rootInode)] {});
+
+  if (!*params->background()) {
+    return std::move(invalFut).semi();
+  } else {
+    folly::futures::detachOn(
+        server_->getServerState()->getThreadPool().get(),
+        std::move(invalFut).semi());
+    return std::make_unique<DebugInvalidateResponse>();
+  }
 }
 
 void EdenServiceHandler::getStatInfo(
@@ -3698,7 +3737,7 @@ void EdenServiceHandler::getStatInfo(
     auto mountList = server_->getMountPoints();
     std::map<PathString, MountInodeInfo> mountPointInfo = {};
     std::map<PathString, JournalInfo> mountPointJournalInfo = {};
-    for (auto& mount : mountList) {
+    for (auto& [mount, rootInode] : mountList) {
       auto inodeMap = mount->getInodeMap();
       // Set LoadedInde Count and unloaded Inode count for the mountPoint.
       MountInodeInfo mountInodeInfo;
@@ -3734,7 +3773,7 @@ void EdenServiceHandler::getStatInfo(
     auto counters = fb303::ServiceData::get()->getCounters();
     result.counters_ref() = counters;
     size_t periodicUnloadCount{0};
-    for (auto& mount : server_->getMountPoints()) {
+    for (auto& [mount, rootInode] : server_->getMountPoints()) {
       periodicUnloadCount +=
           counters[mount->getCounterName(CounterName::PERIODIC_INODE_UNLOAD)];
     }
@@ -4016,6 +4055,8 @@ std::optional<folly::exception_wrapper> getFaultError(
     } else if (type.startsWith("errno:")) {
       auto errnum = folly::to<int>(type.subpiece(6));
       return std::system_error(errnum, std::generic_category(), msg);
+    } else if (type == "quiet") {
+      return QuietFault(msg);
     }
     // If we want to support other error types in the future they should
     // be added here.

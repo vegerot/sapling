@@ -67,11 +67,17 @@ Check that we cannot pushrebase on that bookmark
   remote: 
   remote:   Debug context:
   remote:     PushrebaseInvalidGlobalrevsBookmark {
-  remote:         bookmark: BookmarkName {
-  remote:             bookmark: "other_bookmark",
+  remote:         bookmark: BookmarkKey {
+  remote:             name: BookmarkName {
+  remote:                 bookmark: "other_bookmark",
+  remote:             },
+  remote:             category: Branch,
   remote:         },
-  remote:         globalrevs_publishing_bookmark: BookmarkName {
-  remote:             bookmark: "master_bookmark",
+  remote:         globalrevs_publishing_bookmark: BookmarkKey {
+  remote:             name: BookmarkName {
+  remote:                 bookmark: "master_bookmark",
+  remote:             },
+  remote:             category: Branch,
   remote:         },
   remote:     }
   abort: unexpected EOL, expected netstring digit
@@ -102,11 +108,17 @@ Check that we cannot push to that bookmark if the commit is not a descendant
   remote:         source: Error {
   remote:             context: "Failed to move bookmark",
   remote:             source: RequiresAncestorOf {
-  remote:                 bookmark: BookmarkName {
-  remote:                     bookmark: "other_bookmark",
+  remote:                 bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "other_bookmark",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
-  remote:                 descendant_bookmark: BookmarkName {
-  remote:                     bookmark: "master_bookmark",
+  remote:                 descendant_bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "master_bookmark",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
   remote:             },
   remote:         },
@@ -136,11 +148,17 @@ Check that we cannot do a regular push to the globalrev bookmark either
   remote:         source: Error {
   remote:             context: "Failed to move bookmark",
   remote:             source: RequiresAncestorOf {
-  remote:                 bookmark: BookmarkName {
-  remote:                     bookmark: "master_bookmark",
+  remote:                 bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "master_bookmark",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
-  remote:                 descendant_bookmark: BookmarkName {
-  remote:                     bookmark: "master_bookmark",
+  remote:                 descendant_bookmark: BookmarkKey {
+  remote:                     name: BookmarkName {
+  remote:                         bookmark: "master_bookmark",
+  remote:                     },
+  remote:                     category: Branch,
   remote:                 },
   remote:             },
   remote:         },

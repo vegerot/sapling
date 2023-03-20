@@ -39,7 +39,8 @@ describe('CommitTreeList', () => {
         simulateRepoConnected();
         closeCommitInfoSidebar();
         expectMessageSentToServer({
-          type: 'subscribeSmartlogCommits',
+          type: 'subscribe',
+          kind: 'smartlogCommits',
           subscriptionID: expect.anything(),
         });
         simulateCommits({
@@ -66,7 +67,8 @@ describe('CommitTreeList', () => {
       beforeEach(() => {
         act(() => {
           expectMessageSentToServer({
-            type: 'subscribeUncommittedChanges',
+            type: 'subscribe',
+            kind: 'uncommittedChanges',
             subscriptionID: expect.anything(),
           });
           simulateUncommittedChangedFiles({
@@ -82,11 +84,30 @@ describe('CommitTreeList', () => {
       });
 
       it('renders uncommitted changes', () => {
-        expect(screen.getByText('src/file.js', {exact: false})).toBeInTheDocument();
-        expect(screen.getByText('src/file_add.js', {exact: false})).toBeInTheDocument();
-        expect(screen.getByText('src/file_removed.js', {exact: false})).toBeInTheDocument();
-        expect(screen.getByText('src/file_untracked.js', {exact: false})).toBeInTheDocument();
-        expect(screen.getByText('src/file_missing.js', {exact: false})).toBeInTheDocument();
+        expect(screen.getByText('file.js', {exact: false})).toBeInTheDocument();
+        expect(screen.getByText('file_add.js', {exact: false})).toBeInTheDocument();
+        expect(screen.getByText('file_removed.js', {exact: false})).toBeInTheDocument();
+        expect(screen.getByText('file_untracked.js', {exact: false})).toBeInTheDocument();
+        expect(screen.getByText('file_missing.js', {exact: false})).toBeInTheDocument();
+      });
+
+      it('shows quick commit button', () => {
+        expect(screen.getByText('Commit')).toBeInTheDocument();
+      });
+      it('shows quick amend button only on non-public commits', () => {
+        expect(screen.getByText('Amend')).toBeInTheDocument();
+        // checkout a public commit
+        act(() => {
+          simulateCommits({
+            value: [
+              COMMIT('1', 'some public base', '0', {phase: 'public', isHead: true}),
+              COMMIT('a', 'My Commit', '1', {successorInfo: {hash: 'a2', type: 'land'}}),
+              COMMIT('b', 'Another Commit', 'a'),
+            ],
+          });
+        });
+        // no longer see quick amend
+        expect(screen.queryByText('Amend')).not.toBeInTheDocument();
       });
 
       it('shows file actions', () => {
@@ -110,6 +131,7 @@ describe('CommitTreeList', () => {
               args: ['revert', {path: 'src/file.js', type: 'repo-relative-file'}],
               id: expect.anything(),
               runner: CommandRunner.Sapling,
+              trackEventName: 'RevertOperation',
             },
           });
         });
@@ -154,6 +176,7 @@ describe('CommitTreeList', () => {
                 args: ['addremove'],
                 id: expect.anything(),
                 runner: CommandRunner.Sapling,
+                trackEventName: 'AddRemoveOperation',
               },
             });
           });
@@ -171,6 +194,7 @@ describe('CommitTreeList', () => {
                 args: ['addremove'],
                 id: expect.anything(),
                 runner: CommandRunner.Sapling,
+                trackEventName: 'AddRemoveOperation',
               },
             });
           });
@@ -201,6 +225,7 @@ describe('CommitTreeList', () => {
                 args: ['addremove', {path: 'src/file_untracked.js', type: 'repo-relative-file'}],
                 id: expect.anything(),
                 runner: CommandRunner.Sapling,
+                trackEventName: 'AddRemoveOperation',
               },
             });
           });

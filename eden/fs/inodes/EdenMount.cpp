@@ -435,13 +435,18 @@ FOLLY_NODISCARD folly::Future<folly::Unit> EdenMount::initialize(
                 getEdenConfig(),
                 getPath(),
                 std::move(progressCallback),
-                [this](RelativePathPiece path) {
+                [this](
+                    const std::shared_ptr<const Tree>& parentTree,
+                    RelativePathPiece path) {
                   auto lookup = std::make_unique<TreeLookupProcessor>(
                       path, objectStore_, context.copy());
+
+                  auto rootTree =
+                      parentTree ? parentTree : getCheckedOutRootTree();
                   // Do the next() and the ensure() on separate lines to make
                   // the order of 'lookup' accesses explicit, so we don't move
                   // it before calling next.
-                  auto future = lookup->next(getCheckedOutRootTree());
+                  auto future = lookup->next(rootTree);
                   // The 'ensure' makes sure the lookup lasts until the future
                   // finishes.
                   return std::move(future).ensure(
@@ -454,17 +459,17 @@ FOLLY_NODISCARD folly::Future<folly::Unit> EdenMount::initialize(
       .thenValue([this, takeover](std::shared_ptr<const Tree> parentTree) {
         auto initTreeNode = createRootInode(std::move(parentTree));
         if (takeover) {
-          inodeMap_->initializeFromTakeover(std::move(initTreeNode), *takeover);
+          inodeMap_->initializeFromTakeover(initTreeNode, *takeover);
         } else if (isWorkingCopyPersistent()) {
-          inodeMap_->initializeFromOverlay(std::move(initTreeNode), *overlay_);
+          inodeMap_->initializeFromOverlay(initTreeNode, *overlay_);
         } else {
-          inodeMap_->initialize(std::move(initTreeNode));
+          inodeMap_->initialize(initTreeNode);
         }
 
         // TODO: It would be nice if the .eden inode was created before
         // allocating inode numbers for the Tree's entries. This would give the
         // .eden directory inode number 2.
-        return setupDotEden(getRootInode())
+        return setupDotEden(std::move(initTreeNode))
             .semi()
             .via(&folly::QueuedImmediateExecutor::instance());
       })
@@ -589,7 +594,7 @@ ImmediateFuture<folly::Unit> EdenMount::setupDotEden(TreeInodePtr root) {
         if (lookupResult.hasValue()) {
           dotEdenInode = *lookupResult;
         } else {
-          dotEdenInode = getRootInode()->mkdir(
+          dotEdenInode = root->mkdir(
               PathComponentPiece{kDotEdenName},
               0755,
               InvalidationRequired::Yes);
@@ -613,6 +618,20 @@ ImmediateFuture<folly::Unit> EdenMount::setupDotEden(TreeInodePtr root) {
             dotEdenInode,
             "client"_pc.copy(),
             checkoutConfig_->getClientDirectory()));
+
+        if (getEdenConfig()->findIgnoreInDotEden.getValue()) {
+          futures.emplace_back(
+              dotEdenInode->getOrLoadChild(".find-ignore"_pc, context)
+                  .unit()
+                  .thenError([dotEdenInode](auto&&) {
+                    dotEdenInode->mknod(
+                        ".find-ignore"_pc,
+                        S_IFREG | 0644,
+                        0,
+                        InvalidationRequired::No);
+                    return folly::unit;
+                  }));
+        }
 #endif
 
         // Wait until we finish setting up all of the symlinks.
@@ -656,13 +675,16 @@ FOLLY_NODISCARD folly::Future<folly::Unit> EdenMount::removeBindMount(
 
 folly::SemiFuture<Unit> EdenMount::performBindMounts() {
   auto mountPath = getPath();
-  return folly::makeSemiFutureWith([argv =
-                                        std::vector<std::string>{
-                                            FLAGS_edenfsctlPath,
-                                            "redirect",
-                                            "fixup",
-                                            "--mount",
-                                            mountPath.c_str()}] {
+  auto systemConfigDir = getEdenConfig()->getSystemConfigDir();
+  return folly::makeSemiFutureWith([&] {
+           std::vector<std::string> argv{
+               FLAGS_edenfsctlPath,
+               "--etc-eden-dir",
+               systemConfigDir.c_str(),
+               "redirect",
+               "fixup",
+               "--mount",
+               mountPath.c_str()};
            return SpawnedProcess(argv).future_wait();
          })
       .deferValue([mountPath](ProcessStatus returnCode) {
@@ -927,9 +949,9 @@ ImmediateFuture<SetPathObjectIdResultAndTimes> EdenMount::setPathsToObjectIds(
                          << " trees (" << fetchStats.tree.cacheHitRate
                          << "% chr), " << fetchStats.blob.accessCount
                          << " blobs (" << fetchStats.blob.cacheHitRate
-                         << "% chr), and " << fetchStats.metadata.accessCount
-                         << " metadata (" << fetchStats.metadata.cacheHitRate
-                         << "% chr).";
+                         << "% chr), and "
+                         << fetchStats.blobMetadata.accessCount << " metadata ("
+                         << fetchStats.blobMetadata.cacheHitRate << "% chr).";
 
               return std::move(resultAndTimes);
             });
@@ -1408,6 +1430,7 @@ ImmediateFuture<folly::Unit> EdenMount::waitForPendingNotifications() const {
 }
 
 folly::Future<CheckoutResult> EdenMount::checkout(
+    TreeInodePtr rootInode,
     const RootId& snapshotHash,
     std::optional<pid_t> clientPid,
     folly::StringPiece thriftMethodCaller,
@@ -1492,6 +1515,7 @@ folly::Future<CheckoutResult> EdenMount::checkout(
                 .semi();
           })
       .thenValue([this,
+                  rootInode,
                   ctx,
                   checkoutTimes,
                   stopWatch,
@@ -1517,7 +1541,7 @@ folly::Future<CheckoutResult> EdenMount::checkout(
           trees.push_back(std::get<1>(treeResults));
         }
         return journalDiffCallback
-            ->performDiff(this, getRootInode(), std::move(trees))
+            ->performDiff(this, rootInode, std::move(trees))
             .thenValue([ctx, journalDiffCallback, treeResults](
                            const StatsFetchContext& diffFetchContext) {
               ctx->getStatsContext().merge(diffFetchContext);
@@ -1526,7 +1550,7 @@ folly::Future<CheckoutResult> EdenMount::checkout(
             .semi()
             .via(&folly::QueuedImmediateExecutor::instance());
       })
-      .thenValue([this, ctx, checkoutTimes, stopWatch, snapshotHash](
+      .thenValue([this, rootInode, ctx, checkoutTimes, stopWatch, snapshotHash](
                      std::tuple<shared_ptr<const Tree>, shared_ptr<const Tree>>
                          treeResults) {
         checkoutTimes->didDiff = stopWatch.elapsed();
@@ -1564,16 +1588,14 @@ folly::Future<CheckoutResult> EdenMount::checkout(
         // the files on disk must also be present in the overlay, and thus the
         // checkout code will take care of doing the right invalidation for
         // these.
-        this->getRootInode()->unloadChildrenUnreferencedByFs();
+        rootInode->unloadChildrenUnreferencedByFs();
 
-        auto rootInode = getRootInode();
         return serverState_->getFaultInjector()
             .checkAsync("inodeCheckout", getPath().view())
             .semi()
             .via(getServerThreadPool().get())
-            .thenValue([ctx,
-                        treeResults = std::move(treeResults),
-                        rootInode = std::move(rootInode)](auto&&) mutable {
+            .thenValue([ctx, treeResults = std::move(treeResults), rootInode](
+                           auto&&) mutable {
               auto& [fromTree, toTree] = treeResults;
               return rootInode->checkout(ctx.get(), fromTree, toTree);
             });
@@ -1645,8 +1667,8 @@ folly::Future<CheckoutResult> EdenMount::checkout(
                    << fetchStats.tree.cacheHitRate << "% chr), "
                    << fetchStats.blob.accessCount << " blobs ("
                    << fetchStats.blob.cacheHitRate << "% chr), and "
-                   << fetchStats.metadata.accessCount << " metadata ("
-                   << fetchStats.metadata.cacheHitRate << "% chr).";
+                   << fetchStats.blobMetadata.accessCount << " metadata ("
+                   << fetchStats.blobMetadata.cacheHitRate << "% chr).";
 
         auto checkoutTimeInSeconds =
             std::chrono::duration<double>{stopWatch.elapsed()};
@@ -1656,6 +1678,10 @@ folly::Future<CheckoutResult> EdenMount::checkout(
         event.success = result.hasValue();
         event.fetchedTrees = fetchStats.tree.fetchCount;
         event.fetchedBlobs = fetchStats.blob.fetchCount;
+        event.fetchedBlobsMetadata = fetchStats.blobMetadata.fetchCount;
+        event.accessedTrees = fetchStats.tree.accessCount;
+        event.accessedBlobs = fetchStats.blob.accessCount;
+        event.accessedBlobsMetadata = fetchStats.blobMetadata.accessCount;
         if (result.hasValue()) {
           auto& conflicts = result.value().conflicts;
           event.numConflicts = conflicts.size();
@@ -1713,10 +1739,18 @@ ImmediateFuture<folly::Unit> EdenMount::flushInvalidations() {
 
 #ifndef _WIN32
 folly::Future<folly::Unit> EdenMount::chown(uid_t uid, gid_t gid) {
-  // 1) Ensure that all future opens will by default provide this owner
+  // 1) Ensure we are running in a fuse mount
+  auto fuseChannel = getFuseChannel();
+  if (!fuseChannel) {
+    return makeFuture<Unit>(newEdenError(
+        EdenErrorType::GENERIC_ERROR,
+        "chown is not currently implemented for NFS mounts"));
+  }
+
+  // 2) Ensure that all future opens will by default provide this owner
   setOwner(uid, gid);
 
-  // 2) Modify all uids/gids of files stored in the overlay
+  // 3) Modify all uids/gids of files stored in the overlay
   auto metadata = getInodeMetadataTable();
   XDCHECK(metadata) << "Unexpected null Metadata Table";
   metadata->forEachModify([&](auto& /* unusued */, auto& record) {
@@ -1728,10 +1762,8 @@ folly::Future<folly::Unit> EdenMount::chown(uid_t uid, gid_t gid) {
   // guaranteed to have the requested uid/gid, but that racyness is
   // consistent with the behavior of chown
 
-  // 3) Invalidate all inodes that the kernel holds a reference to
+  // 4) Invalidate all inodes that the kernel holds a reference to
   auto inodesToInvalidate = getInodeMap()->getReferencedInodes();
-  auto fuseChannel = getFuseChannel();
-  XDCHECK(fuseChannel) << "Unexpected null Fuse Channel";
   fuseChannel->invalidateInodes(folly::range(inodesToInvalidate));
 
   return fuseChannel->flushInvalidations();
@@ -1752,9 +1784,9 @@ std::unique_ptr<DiffContext> EdenMount::createDiffContext(
 }
 
 ImmediateFuture<Unit> EdenMount::diff(
+    TreeInodePtr rootInode,
     DiffContext* ctxPtr,
     const RootId& commitHash) const {
-  auto rootInode = getRootInode();
   return objectStore_->getRootTree(commitHash, ctxPtr->getFetchContext())
       .thenValue([this](std::shared_ptr<const Tree> rootTree) {
         return waitForPendingNotifications().thenValue(
@@ -1772,6 +1804,7 @@ ImmediateFuture<Unit> EdenMount::diff(
 }
 
 ImmediateFuture<Unit> EdenMount::diff(
+    TreeInodePtr rootInode,
     DiffCallback* callback,
     const RootId& commitHash,
     bool listIgnored,
@@ -1825,13 +1858,13 @@ ImmediateFuture<Unit> EdenMount::diff(
 
   // stateHolder() exists to ensure that the DiffContext and the EdenMount
   // exists until the diff completes.
-  auto stateHolder = [ctx = std::move(context), rootInode = getRootInode()]() {
-  };
+  auto stateHolder = [ctx = std::move(context), rootInode]() {};
 
-  return diff(ctxPtr, commitHash).ensure(std::move(stateHolder));
+  return diff(rootInode, ctxPtr, commitHash).ensure(std::move(stateHolder));
 }
 
 ImmediateFuture<std::unique_ptr<ScmStatus>> EdenMount::diff(
+    TreeInodePtr rootInode,
     const RootId& commitHash,
     folly::CancellationToken cancellation,
     bool listIgnored,
@@ -1840,6 +1873,7 @@ ImmediateFuture<std::unique_ptr<ScmStatus>> EdenMount::diff(
   auto callbackPtr = callback.get();
   return this
       ->diff(
+          std::move(rootInode),
           callbackPtr,
           commitHash,
           listIgnored,
@@ -2020,7 +2054,8 @@ folly::Future<folly::Unit> EdenMount::channelMount(bool readOnly) {
                      this->getServerState()->getNotifier());
                  channel->start(
                      readOnly,
-                     edenConfig->prjfsUseNegativePathCaching.getValue());
+                     edenConfig->prjfsUseNegativePathCaching.getValue(),
+                     edenConfig->prjfsListenToPreConvertToFull.getValue());
                  return channel;
                })
             .thenTry([this, mountPromise](

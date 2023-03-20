@@ -120,4 +120,10 @@ pub trait BonsaiGlobalrevMapping: Send + Sync {
     /// Read the most recent Globalrev. This produces the freshest data possible, and is meant to
     /// be used for Globalrev assignment.
     async fn get_max(&self, ctx: &CoreContext) -> Result<Option<Globalrev>, Error>;
+
+    async fn get_max_custom_repo(
+        &self,
+        ctx: &CoreContext,
+        repo_id: &RepositoryId,
+    ) -> Result<Option<Globalrev>, Error>;
 }

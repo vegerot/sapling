@@ -11,7 +11,8 @@
 use std::sync::Arc;
 
 use anyhow::Error;
-pub use bookmarks::BookmarkName;
+pub use bookmarks::BookmarkCategory;
+pub use bookmarks::BookmarkKey;
 use mononoke_repos::MononokeRepos;
 use mononoke_types::RepositoryId;
 use repo_identity::RepoIdentityRef;
@@ -67,11 +68,13 @@ pub use crate::path::MononokePath;
 pub use crate::repo::create_changeset::CreateChange;
 pub use crate::repo::create_changeset::CreateChangeFile;
 pub use crate::repo::create_changeset::CreateCopyInfo;
+pub use crate::repo::create_changeset::CreateInfo;
 pub use crate::repo::land_stack::PushrebaseOutcome;
 pub use crate::repo::BookmarkFreshness;
 pub use crate::repo::BookmarkInfo;
 pub use crate::repo::Repo;
 pub use crate::repo::RepoContext;
+pub use crate::repo::StoreRequest;
 pub use crate::specifiers::ChangesetId;
 pub use crate::specifiers::ChangesetIdPrefix;
 pub use crate::specifiers::ChangesetPrefixSpecifier;
