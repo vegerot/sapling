@@ -260,6 +260,7 @@ Test clone with flags (--noupdate, --updaterev):
      remote/master             3f5848713286
   $ cd ..
 
+  #This test is VERY suspicious.  It's supposed to test `ls-remote` symref HEAD parsing, but it passes `--updaterev` that totally circumvents all the code it's supposed to test
   $ hg clone --git "$TESTTMP/gitrepo" -u foo cloned1
   From $TESTTMP/gitrepo
    * [new ref]         3f5848713286c67b8a71a450e98c7fa66787bde2 -> remote/master
@@ -267,6 +268,15 @@ Test clone with flags (--noupdate, --updaterev):
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ hg --cwd cloned1 log -r . -T '{node|short} {remotenames} {desc}\n'
   57eda5013e06 remote/foo alpha3
+
+  $ (cd $TESTTMP/gitrepo && git switch foo)
+  $ hg clone --git "$TESTTMP/gitrepo" cloned3
+  From $TESTTMP/gitrepo
+   * [new ref]         3f5848713286c67b8a71a450e98c7fa66787bde2 -> remote/master
+   * [new ref]         57eda5013e068ac543a52ad073cec3d7750113b5 -> remote/foo
+  2 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ hg --config publicheads
+  remote/master,remote/foo
 
   $ hg clone --updaterev foo --git "$TESTTMP/gitrepo" cloned2
   From $TESTTMP/gitrepo
