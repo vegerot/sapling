@@ -21,7 +21,7 @@ from typing import Optional
 import bindings
 from edenscm import tracing
 
-from . import bookmarks as bookmod, error, identity, progress, util
+from . import bookmarks as bookmod, error, identity, progress, util, rcutil
 from .i18n import _
 from .node import bin, hex, nullid
 
@@ -153,6 +153,16 @@ def clone(ui, url, destpath=None, update=True, pullnames=None):
                     # If `git ls-remote --symref <url> HEAD` failed to yield a name,
                     # fall back to the using the names in the config.
                     pullnames = bookmod.selectivepullbookmarknames(repo)
+                default_publicheads = repo.ui.config('remotenames',
+                                     'publicheads').split(',') # ['remote/master', 'remote/main']
+                remote_publicheads = ['remote/' + path for path in pullnames]
+                all_publicheads = ','.join(sorted(set(default_publicheads + remote_publicheads)))
+
+                configfilename = repo.ui.identity.configrepofile()
+                rcutil.editconfig(repo.ui,
+                                  repo.localvfs.join(configfilename),
+                                  'remotenames', 'publicheads',
+                                  all_publicheads)
 
                 # Make sure we pull "update". If it looks like a hash, add to
                 # "nodes", otherwise to "names".
