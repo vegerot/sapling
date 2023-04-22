@@ -28,6 +28,7 @@ def defaultpagerenv():
     return {"LESS": "FRX", "LV": "-c"}
 
 
+
 def editconfig(ui, path, section, name, value):
     """Add or remove a config item to the given config path.
 
