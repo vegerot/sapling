@@ -28,6 +28,12 @@ def defaultpagerenv():
     return {"LESS": "FRX", "LV": "-c"}
 
 
+def update_and_persist_repo_config(repo, section, name, value):
+    """edit config and save it to the repo's config file"""
+    configfilename = repo.ui.identity.configrepofile() # config
+    configfilepath = repo.localvfs.join(configfilename) # <reporoot>/.hg/config
+    editconfig(repo.ui, configfilepath, section, name, value)
+
 def editconfig(ui, path, section, name, value):
     """Add or remove a config item to the given config path.
 
