@@ -927,7 +927,7 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<uint32_t> nfsCrawlReadThreshold{
       "experimental:nfs-crawl-read-threshold",
-      500,
+      1000,
       this};
 
   /**
@@ -936,7 +936,7 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<uint32_t> nfsCrawlReadDirThreshold{
       "experimental:nfs-crawl-readdir-threshold",
-      100,
+      250,
       this};
 
   /**
@@ -946,13 +946,6 @@ class EdenConfig : private ConfigSettingManager {
       "experimental:nfs-crawl-excluded-process-names",
       {},
       this};
-
-  /**
-   * Controls whether EdenFS uses EdenApi to import data from remote.
-   *
-   * TODO: Remove once this config value is no longer written.
-   */
-  ConfigSetting<bool> useEdenApi{"experimental:use-edenapi", true, this};
 
   /**
    * Controls whether EdenFS exports itself as an NFS server.
@@ -1133,7 +1126,7 @@ class EdenConfig : private ConfigSettingManager {
   // [redirections]
 
   /**
-   * Whether to use APFS volumes or disk images for bind
+   * Whether to use symlinks, APFS volumes, or disk images for bind
    * redirections on macOS.
    */
   ConfigSetting<std::string> darwinRedirectionType{

@@ -1,13 +1,14 @@
 from __future__ import absolute_import, print_function
 
-from edenscm import pycompat, ui, util, wireproto
 from hghave import require
+
+from sapling import pycompat, ui, util, wireproto
 
 
 stringio = util.stringio
 
 
-class proto(object):
+class proto:
     def __init__(self, args):
         self.args = args
 
@@ -60,7 +61,7 @@ class clientpeer(wireproto.wirepeer):
         yield unmangle(pycompat.decodeutf8(f.value))
 
 
-class serverrepo(object):
+class serverrepo:
     def __init__(self):
         self.ui = ui.ui()
 

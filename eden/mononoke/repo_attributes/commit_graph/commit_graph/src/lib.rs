@@ -67,7 +67,7 @@ impl CommitGraph {
     ) -> Result<bool> {
         let parent_edges = self
             .storage
-            .fetch_many_edges_required(ctx, &parents, Prefetch::None)
+            .fetch_many_edges(ctx, &parents, Prefetch::None)
             .await?;
 
         self.storage
@@ -90,7 +90,7 @@ impl CommitGraph {
 
     /// Returns true if the changeset exists.
     pub async fn exists(&self, ctx: &CoreContext, cs_id: ChangesetId) -> Result<bool> {
-        let edges = self.storage.fetch_edges(ctx, cs_id).await?;
+        let edges = self.storage.maybe_fetch_edges(ctx, cs_id).await?;
         Ok(edges.is_some())
     }
 
@@ -99,24 +99,8 @@ impl CommitGraph {
         &self,
         ctx: &CoreContext,
         cs_id: ChangesetId,
-    ) -> Result<Option<ChangesetParents>> {
-        let edges = self.storage.fetch_edges(ctx, cs_id).await?;
-        Ok(edges.map(|edges| {
-            edges
-                .parents
-                .into_iter()
-                .map(|parent| parent.cs_id)
-                .collect()
-        }))
-    }
-
-    /// Returns the parents of a single changeset that must exist.
-    pub async fn changeset_parents_required(
-        &self,
-        ctx: &CoreContext,
-        cs_id: ChangesetId,
     ) -> Result<ChangesetParents> {
-        let edges = self.storage.fetch_edges_required(ctx, cs_id).await?;
+        let edges = self.storage.fetch_edges(ctx, cs_id).await?;
         Ok(edges
             .parents
             .into_iter()
@@ -129,18 +113,8 @@ impl CommitGraph {
         &self,
         ctx: &CoreContext,
         cs_id: ChangesetId,
-    ) -> Result<Option<Generation>> {
-        let edges = self.storage.fetch_edges(ctx, cs_id).await?;
-        Ok(edges.map(|edges| edges.node.generation))
-    }
-
-    /// Returns the generation number of a single changeset that must exist.
-    pub async fn changeset_generation_required(
-        &self,
-        ctx: &CoreContext,
-        cs_id: ChangesetId,
     ) -> Result<Generation> {
-        let edges = self.storage.fetch_edges_required(ctx, cs_id).await?;
+        let edges = self.storage.fetch_edges(ctx, cs_id).await?;
         Ok(edges.node.generation)
     }
 
@@ -190,7 +164,7 @@ impl CommitGraph {
     ) -> Result<bool> {
         let (mut frontier, target_gen) = futures::try_join!(
             self.single_frontier(ctx, descendant),
-            self.changeset_generation_required(ctx, ancestor)
+            self.changeset_generation(ctx, ancestor)
         )?;
         debug_assert!(!frontier.is_empty(), "frontier should contain descendant");
         self.lower_frontier(ctx, &mut frontier, target_gen).await?;
@@ -209,7 +183,7 @@ impl CommitGraph {
     ) -> Result<bool> {
         let (mut frontier, target_gen) = futures::try_join!(
             self.frontier(ctx, descendants),
-            self.changeset_generation_required(ctx, ancestor)
+            self.changeset_generation(ctx, ancestor)
         )?;
         self.lower_frontier(ctx, &mut frontier, target_gen).await?;
         Ok(frontier.highest_generation_contains(ancestor, target_gen))
@@ -296,7 +270,7 @@ impl CommitGraph {
                 .last_key_value()
                 .and_then(|(_, cs_ids)| cs_ids.iter().next())
             {
-                Some(cs_id) => self.storage.fetch_edges_required(ctx, *cs_id).await?,
+                Some(cs_id) => self.storage.fetch_edges(ctx, *cs_id).await?,
                 None => return Ok(vec![]),
             };
 

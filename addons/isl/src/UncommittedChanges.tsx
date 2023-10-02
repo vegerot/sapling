@@ -11,6 +11,7 @@ import type {ChangedFile, ChangedFileType, MergeConflicts, RepoRelativePath} fro
 import type {MutableRefObject, ReactNode} from 'react';
 import type {Comparison} from 'shared/Comparison';
 
+import {Banner} from './Banner';
 import {
   ChangedFileDisplayTypePicker,
   type ChangedFilesDisplayType,
@@ -28,7 +29,7 @@ import {
 } from './CommitInfoView/CommitMessageFields';
 import {OpenComparisonViewButton} from './ComparisonView/OpenComparisonViewButton';
 import {ErrorNotice} from './ErrorNotice';
-import {PartialFileSelection} from './PartialFileSelection';
+import {PartialFileSelectionWithMode} from './PartialFileSelection';
 import {SuspenseBoundary} from './SuspenseBoundary';
 import {DOCUMENTATION_DELAY, Tooltip} from './Tooltip';
 import {islDrawerState} from './drawerState';
@@ -44,6 +45,7 @@ import {ForgetOperation} from './operations/ForgetOperation';
 import {PurgeOperation} from './operations/PurgeOperation';
 import {ResolveOperation, ResolveTool} from './operations/ResolveOperation';
 import {RevertOperation} from './operations/RevertOperation';
+import {getShelveOperation} from './operations/ShelveOperation';
 import {useUncommittedSelection} from './partialSelection';
 import {buildPathTree} from './pathTree';
 import platform from './platform';
@@ -54,7 +56,6 @@ import {
 } from './previews';
 import {selectedCommits} from './selection';
 import {
-  hasExperimentalFeatures,
   latestHeadCommit,
   operationList,
   uncommittedChangesFetchError,
@@ -62,16 +63,41 @@ import {
 } from './serverAPIState';
 import {usePromise} from './usePromise';
 import {VSCodeButton, VSCodeCheckbox, VSCodeTextField} from '@vscode/webview-ui-toolkit/react';
-import React, {useRef, useState} from 'react';
-import {useRecoilCallback, useRecoilValue} from 'recoil';
+import React, {useEffect, useRef, useState} from 'react';
+import {atom, useRecoilCallback, useRecoilValue} from 'recoil';
 import {labelForComparison, revsetForComparison, ComparisonType} from 'shared/Comparison';
 import {useContextMenu} from 'shared/ContextMenu';
 import {Icon} from 'shared/Icon';
 import {useDeepMemo} from 'shared/hooks';
 import {minimalDisambiguousPaths} from 'shared/minimalDisambiguousPaths';
-import {basename, notEmpty} from 'shared/utils';
+import {basename, notEmpty, partition} from 'shared/utils';
 
 import './UncommittedChanges.css';
+
+const holdingAltAtom = atom<boolean>({
+  key: 'holdingAltAtom',
+  default: false,
+  effects: [
+    ({setSelf}) => {
+      const keydown = (e: KeyboardEvent) => {
+        if (e.altKey) {
+          setSelf(true);
+        }
+      };
+      const keyup = (e: KeyboardEvent) => {
+        if (!e.altKey) {
+          setSelf(false);
+        }
+      };
+      document.addEventListener('keydown', keydown);
+      document.addEventListener('keyup', keyup);
+      return () => {
+        document.removeEventListener('keydown', keydown);
+        document.removeEventListener('keyup', keyup);
+      };
+    },
+  ],
+});
 
 type UIChangedFile = {
   path: RepoRelativePath;
@@ -152,16 +178,90 @@ const sortKeyForStatus: Record<VisualChangedFileType, number> = {
   Resolved: 8,
 };
 
+/**
+ * Display a list of changed files.
+ *
+ * If filesSubset is too long, but filesSubset.length === totalFiles, pagination buttons
+ * are shown. This happens for uncommitted changes, where we have the entire list of files.
+ *
+ * If filesSubset.length < totalFiles, no pagination buttons are shown.
+ * It's expected that filesSubset is already truncated to fit.
+ * This happens for committed lists of changes, where we don't have the entire list of files.
+ *
+ * In either case, a banner is shown to warn that not all files are shown.
+ */
 export function ChangedFiles(props: {
-  files: Array<ChangedFile>;
+  filesSubset: Array<ChangedFile>;
+  totalFiles: number;
   comparison: Comparison;
   selection?: UseUncommittedSelection;
+  place?: Place;
 }) {
   const displayType = useRecoilValue(changedFilesDisplayType);
-  const {files, ...rest} = props;
-  const processedFiles = useDeepMemo(() => processCopiesAndRenames(files), [files]);
+  const {filesSubset, totalFiles, ...rest} = props;
+  const MAX_FILES_TO_SHOW = 25;
+  const [pageNum, setPageNum] = useState(0);
+  const isLastPage = pageNum >= Math.floor((totalFiles - 1) / MAX_FILES_TO_SHOW);
+  const rangeStart = pageNum * MAX_FILES_TO_SHOW;
+  const rangeEnd = Math.min(filesSubset.length, (pageNum + 1) * MAX_FILES_TO_SHOW);
+  const filesToShow = filesSubset.slice(rangeStart, rangeEnd);
+  const hasAdditionalPages = filesSubset.length > MAX_FILES_TO_SHOW;
+  const processedFiles = useDeepMemo(() => processCopiesAndRenames(filesToShow), [filesToShow]);
+
+  useEffect(() => {
+    // If the list of files is updated to have fewer files, we need to reset
+    // the pageNum state to be in the proper range again.
+    const lastPageIndex = Math.floor((totalFiles - 1) / MAX_FILES_TO_SHOW);
+    if (pageNum > lastPageIndex) {
+      setPageNum(Math.max(0, lastPageIndex));
+    }
+  }, [totalFiles, pageNum]);
+
   return (
-    <div className="changed-files">
+    <div className="changed-files" data-testid="changed-files">
+      {totalFiles > filesToShow.length ? (
+        <Banner
+          key={'alert'}
+          icon={<Icon icon="info" />}
+          buttons={
+            hasAdditionalPages ? (
+              <div className="changed-files-pages-buttons">
+                <Tooltip title={t('See previous page of files')}>
+                  <VSCodeButton
+                    data-testid="changed-files-previous-page"
+                    appearance="icon"
+                    disabled={pageNum === 0}
+                    onClick={() => {
+                      setPageNum(old => old - 1);
+                    }}>
+                    <Icon icon="arrow-left" />
+                  </VSCodeButton>
+                </Tooltip>
+                <Tooltip title={t('See next page of files')}>
+                  <VSCodeButton
+                    data-testid="changed-files-next-page"
+                    appearance="icon"
+                    disabled={isLastPage}
+                    onClick={() => {
+                      setPageNum(old => old + 1);
+                    }}>
+                    <Icon icon="arrow-right" />
+                  </VSCodeButton>
+                </Tooltip>
+              </div>
+            ) : null
+          }>
+          {pageNum === 0 ? (
+            <T replace={{$numShown: filesToShow.length, $total: totalFiles}}>
+              Showing first $numShown files out of $total total
+            </T>
+          ) : (
+            <T replace={{$rangeStart: rangeStart + 1, $rangeEnd: rangeEnd, $total: totalFiles}}>
+              Showing files $rangeStart – $rangeEnd out of $total total
+            </T>
+          )}
+        </Banner>
+      ) : null}
       {displayType === 'tree' ? (
         <FileTree {...rest} files={processedFiles} displayType={displayType} />
       ) : (
@@ -176,15 +276,18 @@ function LinearFileList(props: {
   displayType: ChangedFilesDisplayType;
   comparison: Comparison;
   selection?: UseUncommittedSelection;
+  place?: Place;
 }) {
   const {files, ...rest} = props;
 
   return (
-    <>
-      {files.map(file => (
-        <File key={file.path} {...rest} file={file} />
-      ))}
-    </>
+    <div className="changed-files-list-container">
+      <div className="changed-files-list">
+        {files.map(file => (
+          <File key={file.path} {...rest} file={file} />
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -193,6 +296,7 @@ function FileTree(props: {
   displayType: ChangedFilesDisplayType;
   comparison: Comparison;
   selection?: UseUncommittedSelection;
+  place?: Place;
 }) {
   const {files, ...rest} = props;
 
@@ -247,11 +351,13 @@ function File({
   displayType,
   comparison,
   selection,
+  place,
 }: {
   file: UIChangedFile;
   displayType: ChangedFilesDisplayType;
   comparison: Comparison;
   selection?: UseUncommittedSelection;
+  place?: Place;
 }) {
   // Renamed files are files which have a copy field, where that path was also removed.
   // Visually show renamed files as if they were modified, even though sl treats them as added.
@@ -274,53 +380,67 @@ function File({
     return options;
   });
 
+  // Hold "alt" key to show full file paths instead of short form.
+  // This is a quick way to see where a file comes from without
+  // needing to go through the menu to change the rendering type.
+  const isHoldingAlt = useRecoilValue(holdingAltAtom);
+
   return (
-    <div
-      className={`changed-file file-${statusName}`}
-      data-testid={`changed-file-${file.path}`}
-      onContextMenu={contextMenu}
-      key={file.path}
-      tabIndex={0}
-      onKeyPress={e => {
-        if (e.key === 'Enter') {
-          platform.openFile(file.path);
-        }
-      }}>
-      <FileSelectionCheckbox file={file} selection={selection} />
-      <span
-        className="changed-file-path"
-        onClick={() => {
-          platform.openFile(file.path);
+    <>
+      <div
+        className={`changed-file file-${statusName}`}
+        data-testid={`changed-file-${file.path}`}
+        onContextMenu={contextMenu}
+        key={file.path}
+        tabIndex={0}
+        onKeyPress={e => {
+          if (e.key === 'Enter') {
+            platform.openFile(file.path);
+          }
         }}>
-        <Icon icon={icon} />
-        <Tooltip title={file.tooltip} delayMs={2_000} placement="right">
-          <span
-            className="changed-file-path-text"
-            onCopy={e => {
-              const selection = document.getSelection();
-              if (selection) {
-                // we inserted LTR markers, remove them again on copy
-                e.clipboardData.setData('text/plain', selection.toString().replace(/\u200E/g, ''));
-                e.preventDefault();
-              }
-            }}>
-            {escapeForRTL(
-              displayType === 'fish'
-                ? file.path
-                    .split('/')
-                    .map((a, i, arr) => (i === arr.length - 1 ? a : a[0]))
-                    .join('/')
-                : displayType === 'fullPaths'
-                ? file.path
-                : displayType === 'tree'
-                ? file.path.slice(file.path.lastIndexOf('/') + 1)
-                : file.label,
-            )}
-          </span>
-        </Tooltip>
-      </span>
-      <FileActions file={file} comparison={comparison} />
-    </div>
+        <FileSelectionCheckbox file={file} selection={selection} />
+        <span
+          className="changed-file-path"
+          onClick={() => {
+            platform.openFile(file.path);
+          }}>
+          <Icon icon={icon} />
+          <Tooltip title={file.tooltip} delayMs={2_000} placement="right">
+            <span
+              className="changed-file-path-text"
+              onCopy={e => {
+                const selection = document.getSelection();
+                if (selection) {
+                  // we inserted LTR markers, remove them again on copy
+                  e.clipboardData.setData(
+                    'text/plain',
+                    selection.toString().replace(/\u200E/g, ''),
+                  );
+                  e.preventDefault();
+                }
+              }}>
+              {escapeForRTL(
+                displayType === 'tree'
+                  ? file.path.slice(file.path.lastIndexOf('/') + 1)
+                  : // Holding alt takes precedence over fish/short styles, but not tree.
+                  displayType === 'fullPaths' || isHoldingAlt
+                  ? file.path
+                  : displayType === 'fish'
+                  ? file.path
+                      .split('/')
+                      .map((a, i, arr) => (i === arr.length - 1 ? a : a[0]))
+                      .join('/')
+                  : file.label,
+              )}
+            </span>
+          </Tooltip>
+        </span>
+        <FileActions file={file} comparison={comparison} place={place} />
+      </div>
+      {place === 'main' && selection?.isExpanded(file.path) && (
+        <MaybePartialSelection file={file} />
+      )}
+    </>
   );
 }
 
@@ -345,6 +465,7 @@ function FileSelectionCheckbox({
     <VSCodeCheckbox
       checked={selection.isFullyOrPartiallySelected(file.path)}
       indeterminate={selection.isPartiallySelected(file.path)}
+      data-testid={'file-selection-checkbox'}
       // Note: Using `onClick` instead of `onChange` since onChange apparently fires when the controlled `checked` value changes,
       // which means this fires when using "select all" / "deselect all"
       onClick={e => {
@@ -369,7 +490,9 @@ function FileSelectionCheckbox({
   );
 }
 
-export function UncommittedChanges({place}: {place: 'main' | 'amend sidebar' | 'commit sidebar'}) {
+type Place = 'main' | 'amend sidebar' | 'commit sidebar';
+
+export function UncommittedChanges({place}: {place: Place}) {
   const uncommittedChanges = useRecoilValue(uncommittedChangesWithPreviews);
   const error = useRecoilValue(uncommittedChangesFetchError);
   // TODO: use treeWithPreviews instead, and update CommitOperation
@@ -419,6 +542,7 @@ export function UncommittedChanges({place}: {place: 'main' | 'amend sidebar' | '
   }
   const allFilesSelected = selection.isEverythingSelected();
   const noFilesSelected = selection.isNothingSelected();
+  const hasChunkSelection = selection.hasChunkSelection();
 
   const allConflictsResolved =
     conflicts?.files?.every(conflict => conflict.status === 'Resolved') ?? false;
@@ -457,10 +581,14 @@ export function UncommittedChanges({place}: {place: 'main' | 'amend sidebar' | '
     const hash = headCommit?.hash ?? '.';
     const allFiles = uncommittedChanges.map(file => file.path);
     const operation = getCommitOperation(title, hash, selection.selection, allFiles);
-    // TODO(quark): We need better invalidation for chunk selected files.
-    if (selection.hasChunkSelection()) {
-      selection.clear();
-    }
+    selection.discardPartialSelections();
+    runOperation(operation);
+  };
+
+  const onShelve = () => {
+    const title = (commitTitleRef.current as HTMLInputElement | null)?.value || undefined;
+    const allFiles = uncommittedChanges.map(file => file.path);
+    const operation = getShelveOperation(title, selection.selection, allFiles);
     runOperation(operation);
   };
 
@@ -529,11 +657,8 @@ export function UncommittedChanges({place}: {place: 'main' | 'amend sidebar' | '
               <VSCodeButton
                 appearance="icon"
                 disabled={noFilesSelected}
+                data-testid={'discard-all-selected-button'}
                 onClick={() => {
-                  // TODO(quark): [Discard] does not work for partial selection yet.
-                  const selectedFiles = uncommittedChanges
-                    .filter(file => selection.isFullyOrPartiallySelected(file.path))
-                    .map(file => file.path);
                   platform.confirm(t('confirmDiscardChanges')).then(ok => {
                     if (!ok) {
                       return;
@@ -550,10 +675,24 @@ export function UncommittedChanges({place}: {place: 'main' | 'amend sidebar' | '
                       // TODO(quark): Make PartialDiscardOperation replace the above and below cases.
                       const allFiles = uncommittedChanges.map(file => file.path);
                       const operation = new PartialDiscardOperation(selection.selection, allFiles);
+                      selection.discardPartialSelections();
                       runOperation(operation);
                     } else {
-                      // only a subset of files selected -> we need to revert selected files individually
-                      runOperation(new RevertOperation(selectedFiles));
+                      const selectedFiles = uncommittedChanges.filter(file =>
+                        selection.isFullyOrPartiallySelected(file.path),
+                      );
+                      const [selectedTrackedFiles, selectedUntrackedFiles] = partition(
+                        selectedFiles,
+                        file => file.status !== '?', // only untracked, not missing
+                      );
+                      if (selectedTrackedFiles.length > 0) {
+                        // only a subset of files selected -> we need to revert selected tracked files individually
+                        runOperation(new RevertOperation(selectedTrackedFiles.map(f => f.path)));
+                      }
+                      if (selectedUntrackedFiles.length > 0) {
+                        // untracked files must be purged separately to delete from disk
+                        runOperation(new PurgeOperation(selectedUntrackedFiles.map(f => f.path)));
+                      }
                     }
                   });
                 }}>
@@ -566,14 +705,18 @@ export function UncommittedChanges({place}: {place: 'main' | 'amend sidebar' | '
       </div>
       {conflicts != null ? (
         <ChangedFiles
-          files={conflicts.files ?? []}
+          filesSubset={conflicts.files ?? []}
+          totalFiles={conflicts.files?.length ?? 0}
+          place={place}
           comparison={{
             type: ComparisonType.UncommittedChanges,
           }}
         />
       ) : (
         <ChangedFiles
-          files={uncommittedChanges}
+          filesSubset={uncommittedChanges}
+          totalFiles={uncommittedChanges.length}
+          place={place}
           selection={selection}
           comparison={{
             type: ComparisonType.UncommittedChanges,
@@ -612,6 +755,19 @@ export function UncommittedChanges({place}: {place: 'main' | 'amend sidebar' | '
               <Icon slot="start" icon="edit" />
               <T>Commit as...</T>
             </VSCodeButton>
+            <Tooltip
+              title={t(
+                'Save selected uncommitted changes for later unshelving. Removes these changes from the working copy.',
+              )}>
+              <VSCodeButton
+                disabled={noFilesSelected || hasChunkSelection}
+                appearance="icon"
+                className="show-on-hover"
+                onClick={onShelve}>
+                <Icon slot="start" icon="archive" />
+                <T>Shelve</T>
+              </VSCodeButton>
+            </Tooltip>
           </div>
           {headCommit?.phase === 'public' ? null : (
             <div className="button-row">
@@ -628,10 +784,7 @@ export function UncommittedChanges({place}: {place: 'main' | 'amend sidebar' | '
                     selection.selection,
                     allFiles,
                   );
-                  // TODO(quark): We need better invalidation for chunk selected files.
-                  if (selection.hasChunkSelection()) {
-                    selection.clear();
-                  }
+                  selection.discardPartialSelections();
                   runOperation(operation);
                 }}>
                 <Icon slot="start" icon="debug-step-into" />
@@ -707,9 +860,16 @@ function MergeConflictButtons({
 
 const revertableStatues = new Set(['M', 'R', '!']);
 const conflictStatuses = new Set<ChangedFileType>(['U', 'Resolved']);
-function FileActions({comparison, file}: {comparison: Comparison; file: UIChangedFile}) {
+function FileActions({
+  comparison,
+  file,
+  place,
+}: {
+  comparison: Comparison;
+  file: UIChangedFile;
+  place?: Place;
+}) {
   const runOperation = useRunOperation();
-  const hasExperimental = useRecoilValue(hasExperimentalFeatures);
   const conflicts = useRecoilValue(optimisticMergeConflicts);
 
   const actions: Array<React.ReactNode> = [];
@@ -809,6 +969,7 @@ function FileActions({comparison, file}: {comparison: Comparison; file: UIChange
             className="file-show-on-hover"
             key={file.path}
             appearance="icon"
+            data-testid="file-action-delete"
             onClick={async () => {
               const ok = await platform.confirm(
                 t('Are you sure you want to delete $file?', {replace: {$file: file.path}}),
@@ -816,11 +977,7 @@ function FileActions({comparison, file}: {comparison: Comparison; file: UIChange
               if (!ok) {
                 return;
               }
-              // There's no `sl` command that will delete an untracked file, we need to do it manually.
-              serverAPI.postMessage({
-                type: 'deleteFile',
-                filePath: file.path,
-              });
+              runOperation(new PurgeOperation([file.path]));
             }}>
             <Icon icon="trash" />
           </VSCodeButton>
@@ -879,7 +1036,7 @@ function FileActions({comparison, file}: {comparison: Comparison; file: UIChange
       );
     }
 
-    if (hasExperimental && conflicts == null) {
+    if (place === 'main' && conflicts == null) {
       actions.push(<PartialSelectionAction file={file} key="partial-selection" />);
     }
   }
@@ -891,24 +1048,61 @@ function FileActions({comparison, file}: {comparison: Comparison; file: UIChange
 }
 
 function PartialSelectionAction({file}: {file: UIChangedFile}) {
-  const getPanel = () => {
-    return (
-      <SuspenseBoundary>
-        <PartialSelectionPanel file={file} />
-      </SuspenseBoundary>
-    );
+  const selection = useUncommittedSelection();
+
+  const handleClick = () => {
+    selection.toggleExpand(file.path);
   };
 
   return (
     <Tooltip
-      title={t('Select partial changes')}
-      component={getPanel}
-      trigger="click"
-      placement="bottom">
-      <VSCodeButton className="file-show-on-hover" appearance="icon">
+      component={() => (
+        <div style={{maxWidth: '300px'}}>
+          <div>
+            <T
+              replace={{
+                $beta: (
+                  <span
+                    style={{
+                      color: 'var(--scm-removed-foreground)',
+                      marginLeft: 'var(--halfpad)',
+                      fontSize: '80%',
+                    }}>
+                    (Beta)
+                  </span>
+                ),
+              }}>
+              Toggle chunk selection $beta
+            </T>
+          </div>
+          <div>
+            <T>
+              Shows changed files in your commit and lets you select individual chunks or lines to
+              include.
+            </T>
+          </div>
+        </div>
+      )}>
+      <VSCodeButton className="file-show-on-hover" appearance="icon" onClick={handleClick}>
         <Icon icon="diff" />
       </VSCodeButton>
     </Tooltip>
+  );
+}
+
+// Left margin to "indendent" by roughly a checkbox width.
+const leftMarginStyle: React.CSSProperties = {marginLeft: 'calc(2.5 * var(--pad))'};
+
+function MaybePartialSelection({file}: {file: UIChangedFile}) {
+  const fallback = (
+    <div style={leftMarginStyle}>
+      <Icon icon="loading" />
+    </div>
+  );
+  return (
+    <SuspenseBoundary fallback={fallback}>
+      <PartialSelectionPanel file={file} />
+    </SuspenseBoundary>
   );
 }
 
@@ -918,10 +1112,13 @@ function PartialSelectionPanel({file}: {file: UIChangedFile}) {
   const chunkSelect = usePromise(selection.getChunkSelect(path));
 
   return (
-    <PartialFileSelection
-      chunkSelection={chunkSelect}
-      setChunkSelection={state => selection.editChunkSelect(path, state)}
-    />
+    <div style={leftMarginStyle}>
+      <PartialFileSelectionWithMode
+        chunkSelection={chunkSelect}
+        setChunkSelection={state => selection.editChunkSelect(path, state)}
+        mode="unified"
+      />
+    </div>
   );
 }
 

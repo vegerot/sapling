@@ -2,8 +2,9 @@
 
 from __future__ import absolute_import, print_function
 
-from edenscm import bundlerepo, localrepo, sshpeer, ui as uimod
 from hghave import require
+
+from sapling import bundlerepo, localrepo, sshpeer, ui as uimod
 
 
 def checkobject(o):
@@ -36,7 +37,7 @@ def checkobject(o):
 
 
 # Facilitates testing localpeer.
-class dummyrepo(object):
+class dummyrepo:
     def __init__(self):
         self.ui = uimod.ui()
 

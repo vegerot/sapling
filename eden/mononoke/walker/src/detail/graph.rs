@@ -9,6 +9,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 use ahash::RandomState;
 use anyhow::format_err;
@@ -70,14 +71,13 @@ use mononoke_types::DeletedManifestV2Id;
 use mononoke_types::FastlogBatchId;
 use mononoke_types::FileUnodeId;
 use mononoke_types::FsnodeId;
-use mononoke_types::MPath;
 use mononoke_types::MPathHash;
 use mononoke_types::ManifestUnodeId;
 use mononoke_types::MononokeId;
+use mononoke_types::NonRootMPath;
 use mononoke_types::RepoPath;
 use mononoke_types::SkeletonManifestId;
 use newfilenodes::PathHash;
-use once_cell::sync::OnceCell;
 use phases::Phase;
 use repo_blobstore::RepoBlobstoreRef;
 use skeleton_manifest::RootSkeletonManifestId;
@@ -688,15 +688,15 @@ impl fmt::Display for WrappedPathHash {
 // Memoize the hash of the path as it is used frequently
 #[derive(Debug)]
 pub struct MPathWithHashMemo {
-    mpath: MPath,
-    memoized_hash: OnceCell<WrappedPathHash>,
+    mpath: NonRootMPath,
+    memoized_hash: OnceLock<WrappedPathHash>,
 }
 
 impl MPathWithHashMemo {
-    fn new(mpath: MPath) -> Self {
+    fn new(mpath: NonRootMPath) -> Self {
         Self {
             mpath,
-            memoized_hash: OnceCell::new(),
+            memoized_hash: OnceLock::new(),
         }
     }
 
@@ -705,7 +705,7 @@ impl MPathWithHashMemo {
             .get_or_init(|| WrappedPathHash::NonRoot(self.mpath.get_path_hash()))
     }
 
-    pub fn mpath(&self) -> &MPath {
+    pub fn mpath(&self) -> &NonRootMPath {
         &self.mpath
     }
 }
@@ -731,7 +731,7 @@ pub enum WrappedPath {
 }
 
 impl WrappedPath {
-    pub fn as_ref(&self) -> Option<&MPath> {
+    pub fn as_ref(&self) -> Option<&NonRootMPath> {
         match self {
             WrappedPath::Root => None,
             WrappedPath::NonRoot(path) => Some(path.mpath()),
@@ -782,10 +782,10 @@ impl fmt::Display for WrappedPath {
     }
 }
 
-static PATH_HASHER_FACTORY: OnceCell<RandomState> = OnceCell::new();
+static PATH_HASHER_FACTORY: OnceLock<RandomState> = OnceLock::new();
 
-impl From<Option<MPath>> for WrappedPath {
-    fn from(mpath: Option<MPath>) -> Self {
+impl From<Option<NonRootMPath>> for WrappedPath {
+    fn from(mpath: Option<NonRootMPath>) -> Self {
         let hasher_fac = PATH_HASHER_FACTORY.get_or_init(RandomState::default);
         match mpath {
             Some(mpath) => WrappedPath::NonRoot(ArcIntern::new(EagerHashMemoizer::new(
@@ -1227,7 +1227,7 @@ mod tests {
         // list, otherwise it won't get scrubbed and thus you would be unaware of different representation
         // in different stores
         let grandfathered: HashSet<&'static str> =
-            HashSet::from_iter(vec!["git_trees", "git_commits"].into_iter());
+            HashSet::from_iter(vec!["git_trees", "git_commits", "git_delta_manifests"]);
         let mut missing = HashSet::new();
         for t in a {
             if s.contains(t.as_str()) {

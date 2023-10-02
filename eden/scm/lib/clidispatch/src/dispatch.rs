@@ -7,7 +7,6 @@
 
 use std::env;
 use std::path::Path;
-use std::sync::atomic::Ordering::SeqCst;
 
 use anyhow::Error;
 use cliparser::alias::expand_aliases;
@@ -17,7 +16,6 @@ use cliparser::parser::ParseOptions;
 use cliparser::parser::ParseOutput;
 use cliparser::parser::StructFlags;
 use configloader::config::ConfigSet;
-use configmodel::convert::ByteCount;
 use configmodel::Config;
 use configmodel::ConfigExt;
 use repo::repo::Repo;
@@ -184,37 +182,7 @@ fn initialize_blackbox(optional_repo: &OptionalRepo) -> Result<()> {
 }
 
 fn initialize_indexedlog(config: &ConfigSet) -> Result<()> {
-    if cfg!(unix) {
-        let chmod_file = config.get_or("permissions", "chmod-file", || -1)?;
-        if chmod_file >= 0 {
-            indexedlog::config::CHMOD_FILE.store(chmod_file, SeqCst);
-        }
-
-        let chmod_dir = config.get_or("permissions", "chmod-dir", || -1)?;
-        if chmod_dir >= 0 {
-            indexedlog::config::CHMOD_DIR.store(chmod_dir, SeqCst);
-        }
-
-        let use_symlink_atomic_write: bool =
-            config.get_or_default("format", "use-symlink-atomic-write")?;
-        indexedlog::config::SYMLINK_ATOMIC_WRITE.store(use_symlink_atomic_write, SeqCst);
-    }
-
-    if let Some(max_chain_len) =
-        config.get_opt::<u32>("storage", "indexedlog-max-index-checksum-chain-len")?
-    {
-        indexedlog::config::INDEX_CHECKSUM_MAX_CHAIN_LEN.store(max_chain_len, SeqCst);
-    }
-
-    if let Some(threshold) =
-        config.get_opt::<ByteCount>("storage", "indexedlog-page-out-threshold")?
-    {
-        indexedlog::config::set_page_out_threshold(threshold.value() as _);
-    }
-
-    let fsync: bool = config.get_or_default("storage", "indexedlog-fsync")?;
-    indexedlog::config::set_global_fsync(fsync);
-
+    indexedlog::config::configure(config)?;
     Ok(())
 }
 
@@ -256,7 +224,7 @@ impl Dispatcher {
         let cwd = util::path::absolute(cwd)?;
 
         // Load repo and configuration.
-        match OptionalRepo::from_global_opts(&global_opts, &cwd) {
+        match OptionalRepo::from_global_opts(&global_opts, cwd) {
             Ok(optional_repo) => Ok(Self {
                 args,
                 early_result,
@@ -340,12 +308,12 @@ impl Dispatcher {
             env::set_current_dir(&self.global_opts.cwd)?;
         }
 
-        initialize_indexedlog(&config)?;
+        initialize_indexedlog(config)?;
 
         // Prepare alias handling.
         let alias_lookup = |name: &str| {
             // [alias] can have "<name>:doc" entries that are not commands. Skip them.
-            if name.contains(":") {
+            if name.contains(':') {
                 return None;
             }
 
@@ -407,11 +375,11 @@ impl Dispatcher {
         // - expanded => ["status", "-Tjson", "--verbose", "--verbose", "--traceback"]
         // - new_args => ["status", "-Tjson", "--verbose", "--verbose", "--traceback"]
 
-        let command_name = first_arg.to_string();
+        let command_name = first_arg;
         let (expanded, _first_arg_index) = expand_aliases(alias_lookup, &args[first_arg_index..])?;
         let (command_name, command_arg_len) =
             find_command_name(|name| command_table.get(name).is_some(), &expanded)
-                .ok_or_else(|| errors::UnknownCommand(command_name))?;
+                .ok_or(errors::UnknownCommand(command_name))?;
         tracing::info!(
             name = "log:command-row",
             command = AsRef::<str>::as_ref(&command_name)
@@ -447,6 +415,14 @@ impl Dispatcher {
             Ok((name, args)) => (name, args),
             Err(e) => return (None, Err(e)),
         };
+
+        sampling::append_sample("command_info", "positional_args", parsed.args());
+
+        let opt_names = parsed.specified_opts();
+        sampling::append_sample("command_info", "option_names", opt_names);
+
+        let opt_values: Vec<_> = opt_names.iter().map(|n| parsed.opts().get(n)).collect();
+        sampling::append_sample("command_info", "option_values", &opt_values);
 
         let res = || -> Result<u8> {
             add_global_flag_derived_configs(&mut self.optional_repo, parsed.clone().try_into()?);

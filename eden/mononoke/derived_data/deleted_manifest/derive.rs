@@ -41,9 +41,9 @@ use mononoke_types::unode::UnodeEntry;
 use mononoke_types::BlobstoreKey;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
-use mononoke_types::MPath;
 use mononoke_types::MPathElement;
 use mononoke_types::ManifestUnodeId;
+use mononoke_types::NonRootMPath;
 use multimap::MultiMap;
 use slog::debug;
 use tokio::sync::Mutex;
@@ -394,7 +394,7 @@ impl<Manifest: DeletedManifestCommon> DeletedManifestDeriver<Manifest> {
                 }
             }
         }
-        let subentries = changes.subentries;
+        let (_, subentries) = changes.deconstruct();
 
         // Base traversal for all entries included in `changes` arg
         let mut recurse_entries = subentries
@@ -605,7 +605,7 @@ pub(crate) async fn get_changes_list(
     ctx: &CoreContext,
     derivation_ctx: &DerivationContext,
     bonsai: BonsaiChangeset,
-) -> Result<Vec<(MPath, PathChange)>, Error> {
+) -> Result<Vec<(NonRootMPath, PathChange)>, Error> {
     // Get file/directory changes between the current changeset and its parents
     //
     // get unode manifests first
@@ -634,7 +634,7 @@ pub(crate) async fn get_changes_list(
         unode_mf_id
             .list_all_entries(ctx.clone(), derivation_ctx.blobstore().clone())
             .try_filter_map(move |(path, _)| async {
-                match path {
+                match Option::<NonRootMPath>::from(path) {
                     Some(path) => Ok(Some((path, PathChange::Add))),
                     None => Ok(None),
                 }
@@ -653,7 +653,7 @@ async fn diff_against_parents(
     derivation_ctx: &DerivationContext,
     unode: ManifestUnodeId,
     parents: Vec<ManifestUnodeId>,
-) -> Result<Vec<(MPath, PathChange)>, Error> {
+) -> Result<Vec<(NonRootMPath, PathChange)>, Error> {
     let blobstore = derivation_ctx.blobstore();
     let parent_diffs_fut = parents.into_iter().map({
         cloned!(ctx, blobstore, unode);
@@ -668,8 +668,12 @@ async fn diff_against_parents(
         .into_iter()
         .flatten()
         .filter_map(|diff| match diff {
-            Diff::Added(Some(path), _) => Some((path, PathChange::Add)),
-            Diff::Removed(Some(path), _) => Some((path, PathChange::Remove)),
+            Diff::Added(path, _) => {
+                Option::<NonRootMPath>::from(path).map(|path| (path, PathChange::Add))
+            }
+            Diff::Removed(path, _) => {
+                Option::<NonRootMPath>::from(path).map(|path| (path, PathChange::Remove))
+            }
             _ => None,
         });
 

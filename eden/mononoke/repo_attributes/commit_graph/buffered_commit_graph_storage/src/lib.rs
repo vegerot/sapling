@@ -73,29 +73,21 @@ impl CommitGraphStorage for BufferedCommitGraphStorage {
         self.in_memory_storage.add_many(ctx, many_edges).await
     }
 
-    async fn fetch_edges(
-        &self,
-        ctx: &CoreContext,
-        cs_id: ChangesetId,
-    ) -> Result<Option<ChangesetEdges>> {
-        match self.in_memory_storage.fetch_edges(ctx, cs_id).await? {
-            Some(edges) => Ok(Some(edges)),
+    async fn fetch_edges(&self, ctx: &CoreContext, cs_id: ChangesetId) -> Result<ChangesetEdges> {
+        match self.in_memory_storage.maybe_fetch_edges(ctx, cs_id).await? {
+            Some(edges) => Ok(edges),
             None => self.persistent_storage.fetch_edges(ctx, cs_id).await,
         }
     }
 
-    async fn fetch_edges_required(
+    async fn maybe_fetch_edges(
         &self,
         ctx: &CoreContext,
         cs_id: ChangesetId,
-    ) -> Result<ChangesetEdges> {
-        match self.in_memory_storage.fetch_edges(ctx, cs_id).await? {
-            Some(edges) => Ok(edges),
-            None => {
-                self.persistent_storage
-                    .fetch_edges_required(ctx, cs_id)
-                    .await
-            }
+    ) -> Result<Option<ChangesetEdges>> {
+        match self.in_memory_storage.maybe_fetch_edges(ctx, cs_id).await? {
+            Some(edges) => Ok(Some(edges)),
+            None => self.persistent_storage.maybe_fetch_edges(ctx, cs_id).await,
         }
     }
 
@@ -107,7 +99,7 @@ impl CommitGraphStorage for BufferedCommitGraphStorage {
     ) -> Result<HashMap<ChangesetId, ChangesetEdges>> {
         let mut fetched_edges = self
             .in_memory_storage
-            .fetch_many_edges(ctx, cs_ids, prefetch)
+            .maybe_fetch_many_edges(ctx, cs_ids, prefetch)
             .await?;
 
         let unfetched_ids = cs_ids
@@ -120,15 +112,14 @@ impl CommitGraphStorage for BufferedCommitGraphStorage {
             fetched_edges.extend(
                 self.persistent_storage
                     .fetch_many_edges(ctx, unfetched_ids.as_slice(), prefetch)
-                    .await?
-                    .into_iter(),
+                    .await?,
             )
         }
 
         Ok(fetched_edges)
     }
 
-    async fn fetch_many_edges_required(
+    async fn maybe_fetch_many_edges(
         &self,
         ctx: &CoreContext,
         cs_ids: &[ChangesetId],
@@ -136,7 +127,7 @@ impl CommitGraphStorage for BufferedCommitGraphStorage {
     ) -> Result<HashMap<ChangesetId, ChangesetEdges>> {
         let mut fetched_edges = self
             .in_memory_storage
-            .fetch_many_edges(ctx, cs_ids, prefetch)
+            .maybe_fetch_many_edges(ctx, cs_ids, prefetch)
             .await?;
 
         let unfetched_ids = cs_ids
@@ -148,9 +139,8 @@ impl CommitGraphStorage for BufferedCommitGraphStorage {
         if !unfetched_ids.is_empty() {
             fetched_edges.extend(
                 self.persistent_storage
-                    .fetch_many_edges_required(ctx, unfetched_ids.as_slice(), prefetch)
-                    .await?
-                    .into_iter(),
+                    .maybe_fetch_many_edges(ctx, unfetched_ids.as_slice(), prefetch)
+                    .await?,
             )
         }
 
@@ -179,7 +169,7 @@ impl CommitGraphStorage for BufferedCommitGraphStorage {
                     in_memory_matches
                         .to_vec()
                         .into_iter()
-                        .chain(persistent_matches.to_vec().into_iter())
+                        .chain(persistent_matches.to_vec())
                         .collect(),
                     limit,
                 ))
@@ -197,12 +187,7 @@ impl CommitGraphStorage for BufferedCommitGraphStorage {
             .fetch_children(ctx, cs_id)
             .await?
             .into_iter()
-            .chain(
-                self.persistent_storage
-                    .fetch_children(ctx, cs_id)
-                    .await?
-                    .into_iter(),
-            )
+            .chain(self.persistent_storage.fetch_children(ctx, cs_id).await?)
             .collect::<HashSet<_>>()
             .into_iter()
             .collect())

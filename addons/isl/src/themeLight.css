@@ -5,8 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-.light-theme,
-.vscode-light {
+html .light-theme,
+html .vscode-light {
   /* custom values **/
   --scm-modified-foreground: #895503;
   --scm-added-foreground: #007100;
@@ -19,6 +19,7 @@
   --error-bg-color: #e3594120;
 
   --hover-darken: rgba(0, 0, 0, 0.1);
+  --subtle-hover-darken: rgba(0, 0, 0, 0.03);
   --highlight-foreground: #2a2a2a;
 
   --selection-mix-mode: darken;
@@ -39,9 +40,18 @@
   --diffEditor-modifiedLineBackground: #f9ec5633;
   --diffEditor-modifiedLineHighlightBackground: #f9ec5666;
   --editor-selectionBackground: #add6ff;
+  --editor-changedBackground: hsla(211, 100%, 87%, 0.3);
+  --editor-changedHighlightBackground: hsla(211, 100%, 87%, 0.5);
+
+  --banner-fg: rgb(36, 41, 47);
+  --banner-warning-bg: #f9ec5666;
+  --banner-error-bg: #fa7e7c66;
+  --banner-default-bg: var(--tooltip-background);
 
   --signal-good-bg: #2da44e;
   --signal-medium-bg: #d5b14e;
   --signal-bad-bg: #cf222e;
   --signal-fg: white;
+
+  --checkbox-border: var(--vscode-contrastBorder, rgba(0, 0, 0, 0.2));
 }

@@ -363,8 +363,8 @@ void Overlay::initOverlay(
   // Open after infoFile_'s lock is acquired because the InodeTable acquires
   // its own lock, which should be released prior to infoFile_.
   inodeMetadataTable_ = InodeMetadataTable::open(
-      (localDir_ + PathComponentPiece{FileContentStore::kMetadataFile})
-          .c_str());
+      (localDir_ + PathComponentPiece{FileContentStore::kMetadataFile}).c_str(),
+      stats_.copy());
 #endif // !_WIN32
 }
 
@@ -393,9 +393,11 @@ DirContents Overlay::loadOverlayDir(InodeNumber inodeNumber) {
   IORequest req{this};
   auto dirData = inodeCatalog_->loadOverlayDir(inodeNumber);
   if (!dirData.has_value()) {
+    stats_->increment(&OverlayStats::loadOverlayDirMiss);
     return result;
   }
   const auto& dir = dirData.value();
+  stats_->increment(&OverlayStats::loadOverlayDirHit);
 
   bool shouldRewriteOverlay = false;
 

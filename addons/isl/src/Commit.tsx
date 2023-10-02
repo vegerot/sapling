@@ -9,14 +9,17 @@ import type {CommitInfo, SuccessorInfo} from './types';
 import type {Snapshot} from 'recoil';
 import type {ContextMenuItem} from 'shared/ContextMenu';
 
+import {globalRecoil} from './AccessGlobalRecoil';
 import {BranchIndicator} from './BranchIndicator';
 import {hasUnsavedEditedCommitMessage} from './CommitInfoView/CommitInfoState';
 import {currentComparisonMode} from './ComparisonView/atoms';
 import {highlightedCommits} from './HighlightedCommits';
 import {InlineBadge} from './InlineBadge';
+import {Subtle} from './Subtle';
 import {Tooltip} from './Tooltip';
 import {UncommitButton} from './UncommitButton';
 import {UncommittedChanges} from './UncommittedChanges';
+import {tracker} from './analytics';
 import {latestCommitMessage} from './codeReview/CodeReviewInfo';
 import {DiffInfo} from './codeReview/DiffBadge';
 import {islDrawerState} from './drawerState';
@@ -27,10 +30,10 @@ import {GotoOperation} from './operations/GotoOperation';
 import {HideOperation} from './operations/HideOperation';
 import {RebaseOperation} from './operations/RebaseOperation';
 import platform from './platform';
-import {CommitPreview} from './previews';
+import {CommitPreview, uncommittedChangesWithPreviews} from './previews';
 import {RelativeDate} from './relativeDate';
 import {isNarrowCommitTree} from './responsive';
-import {useCommitSelection} from './selection';
+import {selectedCommits, useCommitSelection} from './selection';
 import {
   inlineProgressByHash,
   isFetchingUncommittedChanges,
@@ -40,6 +43,8 @@ import {
   useRunOperation,
   useRunPreviewedOperation,
 } from './serverAPIState';
+import {useConfirmUnsavedEditsBeforeSplit} from './stackEdit/ui/ConfirmUnsavedEditsBeforeSplit';
+import {editingStackIntentionHashes} from './stackEdit/ui/stackEditState';
 import {short} from './utils';
 import {VSCodeButton, VSCodeTag} from '@vscode/webview-ui-toolkit/react';
 import React, {memo, useEffect, useState} from 'react';
@@ -105,6 +110,8 @@ export const Commit = memo(
 
     const handlePreviewedOperation = useRunPreviewedOperation();
     const runOperation = useRunOperation();
+    const setEditStackIntentionHashes = useSetRecoilState(editingStackIntentionHashes);
+
     const isHighlighted = useRecoilValue(highlightedCommits).has(commit.hash);
 
     const inlineProgress = useRecoilValue(inlineProgressByHash(commit.hash));
@@ -141,13 +148,30 @@ export const Commit = memo(
       });
     });
 
+    const confirmUnsavedEditsBeforeSplit = useConfirmUnsavedEditsBeforeSplit();
+    async function handleSplit() {
+      if (!(await confirmUnsavedEditsBeforeSplit([commit], 'split'))) {
+        return;
+      }
+      setEditStackIntentionHashes(['split', new Set([commit.hash])]);
+      tracker.track('SplitOpenFromCommitContextMenu');
+    }
+
     const makeContextMenuOptions = useRecoilCallback(({snapshot}) => () => {
+      const hasUncommittedChanges =
+        (snapshot.getLoadable(uncommittedChangesWithPreviews).valueMaybe()?.length ?? 0) > 0;
       const items: Array<ContextMenuItem> = [
         {
           label: <T replace={{$hash: short(commit?.hash)}}>Copy Commit Hash "$hash"</T>,
           onClick: () => platform.clipboardCopy(commit.hash),
         },
       ];
+      if (!isPublic && commit.diffId != null) {
+        items.push({
+          label: <T replace={{$number: commit.diffId}}>Copy Diff Number "$number"</T>,
+          onClick: () => platform.clipboardCopy(commit.diffId ?? ''),
+        });
+      }
       if (!isPublic) {
         items.push({
           label: <T>View Changes in Commit</T>,
@@ -162,6 +186,19 @@ export const Commit = memo(
             onClick: () => runOperation(getAmendToOperation(commit, snapshot)),
           });
         }
+        items.push({
+          label: hasUncommittedChanges ? (
+            <span className="context-menu-disabled-option">
+              <T>Split... </T>
+              <Subtle>
+                <T>(disabled due to uncommitted changes)</T>
+              </Subtle>
+            </span>
+          ) : (
+            <T>Split...</T>
+          ),
+          onClick: hasUncommittedChanges ? () => null : handleSplit,
+        });
         items.push({
           label: <T>Hide Commit and Descendants</T>,
           onClick: () => setOperationBeingPreviewed(new HideOperation(commit.hash)),
@@ -218,9 +255,12 @@ export const Commit = memo(
                   commit.remoteBookmarks.length > 0 ? commit.remoteBookmarks[0] : commit.hash,
                 ),
               );
-              event.stopPropagation(); // don't select commit
+              event.stopPropagation(); // don't toggle selection by letting click propagate onto selection target.
+              // Instead, ensure we remove the selection, so we view the new head commit by default
+              // (since the head commit is the default thing shown in the sidebar)
+              globalRecoil().reset(selectedCommits);
             }}>
-            <T>Goto</T> <Icon icon="arrow-right" />
+            <T>Goto</T> <Icon icon="newline" />
           </VSCodeButton>
         </span>,
       );
@@ -238,6 +278,7 @@ export const Commit = memo(
           (isHighlighted ? ' highlighted' : '') +
           (isPublic || hasChildren ? '' : ' topmost')
         }
+        onContextMenu={contextMenu}
         data-testid={`commit-${commit.hash}`}>
         {!isNonActionable &&
         (commit.isHead || previewType === CommitPreview.GOTO_PREVIOUS_LOCATION) ? (
@@ -257,7 +298,6 @@ export const Commit = memo(
             commit={commit}
             draggable={!isPublic && isDraggablePreview(previewType)}
             onClick={onClickToSelect}
-            onContextMenu={contextMenu}
             onDoubleClick={onDoubleClickToShowDrawer}>
             <div className="commit-avatar" />
             {isPublic ? null : (

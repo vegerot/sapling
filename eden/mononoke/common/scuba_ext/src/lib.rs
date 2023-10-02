@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
+use clientinfo::ClientRequestInfo;
 use fbinit::FacebookInit;
 use futures_stats::FutureStats;
 use futures_stats::StreamStats;
@@ -129,6 +130,16 @@ impl MononokeScubaSampleBuilder {
         self
     }
 
+    pub fn add_client_request_info(&mut self, client_info: &ClientRequestInfo) -> &mut Self {
+        self.inner
+            .add_opt("client_main_id", client_info.main_id.as_deref());
+        self.inner
+            .add("client_entry_point", client_info.entry_point.to_string());
+        self.inner
+            .add("client_correlator", client_info.correlator.as_str());
+        self
+    }
+
     pub fn add_metadata(&mut self, metadata: &Metadata) -> &mut Self {
         self.inner
             .add("session_uuid", metadata.session_id().to_string());
@@ -154,14 +165,21 @@ impl MononokeScubaSampleBuilder {
             self.inner.add("unix_username", unix_name);
         }
 
+        if let Some(client_info) = metadata.client_request_info() {
+            self.inner
+                .add_opt("client_main_id", client_info.main_id.as_deref());
+            self.inner
+                .add("client_entry_point", client_info.entry_point.to_string());
+            self.inner
+                .add("client_correlator", client_info.correlator.as_str());
+        }
+
         self.inner
             .add_opt("sandcastle_alias", metadata.sandcastle_alias());
         self.inner
             .add_opt("revproxy_region", metadata.revproxy_region().as_deref());
         self.inner
             .add_opt("sandcastle_nonce", metadata.sandcastle_nonce());
-        self.inner
-            .add_opt("clientinfo_tag", metadata.clientinfo_u64tag());
         self.inner
             .add_opt("client_tw_job", metadata.clientinfo_tw_job());
         self.inner

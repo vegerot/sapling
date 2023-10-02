@@ -92,7 +92,7 @@ pub async fn assert_skip_tree_parent(
 ) -> Result<()> {
     assert_eq!(
         storage
-            .fetch_edges(ctx, name_cs_id(u))
+            .maybe_fetch_edges(ctx, name_cs_id(u))
             .await?
             .unwrap()
             .skip_tree_parent
@@ -110,7 +110,7 @@ pub async fn assert_skip_tree_skew_ancestor(
 ) -> Result<()> {
     assert_eq!(
         storage
-            .fetch_edges(ctx, name_cs_id(u))
+            .maybe_fetch_edges(ctx, name_cs_id(u))
             .await?
             .unwrap()
             .skip_tree_skew_ancestor
@@ -218,7 +218,7 @@ pub async fn assert_topological_order(
     let mut previous_cs_ids: HashSet<ChangesetId> = Default::default();
 
     for cs_id in cs_ids {
-        let parents = graph.changeset_parents_required(ctx, *cs_id).await?;
+        let parents = graph.changeset_parents(ctx, *cs_id).await?;
         // Check that each parent of cs_id either isn't contained in cs_ids
         // or is found before cs_id.
         assert!(
@@ -292,7 +292,7 @@ pub async fn assert_p1_linear_skew_ancestor(
 ) -> Result<()> {
     assert_eq!(
         storage
-            .fetch_edges(ctx, name_cs_id(u))
+            .maybe_fetch_edges(ctx, name_cs_id(u))
             .await?
             .unwrap()
             .p1_linear_skew_ancestor

@@ -30,6 +30,7 @@ use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMappingRef;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
+use bonsai_svnrev_mapping::BonsaiSvnrevMapping;
 use bonsai_svnrev_mapping::BonsaiSvnrevMappingRef;
 use bonsai_tag_mapping::BonsaiTagMapping;
 use bookmarks::BookmarkCategory;
@@ -88,8 +89,8 @@ use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures::try_join;
 use futures::Future;
-use hooks::HookManager;
-use hooks::HookManagerArc;
+use hook_manager::manager::HookManager;
+use hook_manager::manager::HookManagerArc;
 use itertools::Itertools;
 use live_commit_sync_config::LiveCommitSyncConfig;
 use mercurial_derivation::MappedHgChangesetId;
@@ -214,6 +215,7 @@ pub struct Repo {
         dyn BonsaiTagMapping,
         dyn BonsaiGitMapping,
         dyn BonsaiGlobalrevMapping,
+        dyn BonsaiSvnrevMapping,
         dyn BonsaiHgMapping,
         dyn BookmarkUpdateLog,
         dyn Bookmarks,

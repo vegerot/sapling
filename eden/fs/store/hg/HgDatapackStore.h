@@ -24,6 +24,7 @@ class HgProxyHash;
 class HgImportRequest;
 class ObjectId;
 class ReloadableConfig;
+class StructuredLogger;
 
 class HgDatapackStore {
  public:
@@ -32,8 +33,13 @@ class HgDatapackStore {
   HgDatapackStore(
       AbsolutePathPiece repository,
       const Options& options,
-      std::shared_ptr<ReloadableConfig> config)
-      : store_{repository.view(), options}, config_{std::move(config)} {}
+      std::shared_ptr<ReloadableConfig> config,
+      std::shared_ptr<StructuredLogger> logger,
+      std::string repoName)
+      : store_{repository.view(), options},
+        config_{std::move(config)},
+        logger_{std::move(logger)},
+        repoName_{std::move(repoName)} {}
 
   void getTreeBatch(
       const std::vector<std::shared_ptr<HgImportRequest>>& requests);
@@ -113,6 +119,8 @@ class HgDatapackStore {
  private:
   sapling::SaplingNativeBackingStore store_;
   std::shared_ptr<ReloadableConfig> config_;
+  std::shared_ptr<StructuredLogger> logger_;
+  std::string repoName_;
 
   mutable RequestMetricsScope::LockedRequestWatchList liveBatchedBlobWatches_;
   mutable RequestMetricsScope::LockedRequestWatchList liveBatchedTreeWatches_;

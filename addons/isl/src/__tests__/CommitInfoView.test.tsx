@@ -180,6 +180,37 @@ describe('CommitInfoView', () => {
         expect(amendButton?.disabled).not.toBe(true);
       });
 
+      it('does not show banner if all files are shown', () => {
+        expect(
+          withinCommitInfo().queryByText(/Showing first .* files out of .* total/),
+        ).not.toBeInTheDocument();
+      });
+
+      it('shows banner if not all files are shown', () => {
+        act(() => {
+          simulateCommits({
+            value: [
+              COMMIT('1', 'some public base', '0', {phase: 'public'}),
+              COMMIT('a', 'Head Commit', '1', {
+                isHead: true,
+                filesSample: new Array(25)
+                  .fill(null)
+                  .map((_, i) => ({path: `src/file${i}.txt`, status: 'M'})),
+                totalFileCount: 100,
+              }),
+            ],
+          });
+          simulateUncommittedChangedFiles({
+            value: [],
+          });
+        });
+
+        expect(withinCommitInfo().queryByText(ignoreRTL('file1.txt'))).toBeInTheDocument();
+        expect(
+          withinCommitInfo().queryByText('Showing first 25 files out of 100 total'),
+        ).toBeInTheDocument();
+      });
+
       it('runs amend with selected files', async () => {
         expect(withinCommitInfo().queryByText(ignoreRTL('file1.js'))).toBeInTheDocument();
         expect(withinCommitInfo().queryByText(ignoreRTL('file2.js'))).toBeInTheDocument();
@@ -1111,14 +1142,12 @@ describe('CommitInfoView', () => {
           expect(withinCommitInfo().queryByText('You are here')).toBeInTheDocument();
         });
 
-        it('takes previews into account when rendering non-head commit', () => {
-          clickToSelectCommit('b'); // explicitly select, so we show even while goto runs
+        it('shows new head when running goto', () => {
+          clickToSelectCommit('b'); // explicitly select
           clickGotoCommit('a');
 
-          // we still show the other commit
-          expect(withinCommitInfo().queryByText('Head Commit')).toBeInTheDocument();
-          // but its not the head commit anymore, according to optimistic state
-          expect(withinCommitInfo().queryByText('You are here')).not.toBeInTheDocument();
+          expect(withinCommitInfo().queryByText('My Commit')).toBeInTheDocument();
+          expect(withinCommitInfo().queryByText('You are here')).toBeInTheDocument();
         });
 
         it('renders metaedit operation smoothly', async () => {

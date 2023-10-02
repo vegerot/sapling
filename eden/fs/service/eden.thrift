@@ -12,6 +12,7 @@ namespace cpp2 facebook.eden
 namespace java com.facebook.eden.thrift
 namespace py facebook.eden
 namespace py3 eden.fs.service
+namespace hack edenfs.service
 
 /**
  * API style guide.
@@ -1021,6 +1022,11 @@ struct RequestInfo {
   2: optional string processName;
 }
 
+struct ClientRequestInfo {
+  1: string correlator;
+  2: string entry_point;
+}
+
 enum HgEventType {
   UNKNOWN = 0,
   QUEUE = 1,
@@ -1463,6 +1469,9 @@ struct GetScmStatusParams {
    * directory) will never be reported even when listIgnored is true.
    */
   3: bool listIgnored = false;
+
+  // Pass unique identifier of this request's caller.
+  4: optional ClientRequestInfo cri;
 }
 
 /**
@@ -1513,6 +1522,9 @@ struct CheckOutRevisionParams {
    * need to look it up.
    */
   1: optional BinaryHash hgRootManifest;
+
+  // Pass unique identifier of this request's caller.
+  2: optional ClientRequestInfo cri;
 }
 
 struct ResetParentCommitsParams {
@@ -1527,6 +1539,9 @@ struct ResetParentCommitsParams {
    * need to look it up.
    */
   1: optional BinaryHash hgRootManifest;
+
+  // Pass unique identifier of this request's caller.
+  2: optional ClientRequestInfo cri;
 }
 
 struct RemoveRecursivelyParams {

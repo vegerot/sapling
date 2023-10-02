@@ -105,7 +105,7 @@ don't allow marking or unmarking driver-resolved files
 
   $ cat > $TESTTMP/markdriver.py << EOF
   > '''mark and unmark files as driver-resolved'''
-  > from edenscm import merge, registrar, scmutil
+  > from sapling import merge, registrar, scmutil
   > cmdtable = {}
   > command = registrar.command(cmdtable)
   > @command('markdriver',
@@ -216,9 +216,6 @@ can not update or merge when there are unresolved conflicts
   abort: outstanding merge conflicts
   [255]
   $ hg merge 'max(desc(append))'
-  abort: outstanding merge conflicts
-  [255]
-  $ hg merge --force 'max(desc(append))'
   abort: outstanding merge conflicts
   [255]
 

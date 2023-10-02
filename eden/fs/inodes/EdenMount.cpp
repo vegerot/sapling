@@ -260,7 +260,10 @@ EdenMount::EdenMount(
           serverState_->getEdenConfig()->prjfsNumInvalidationThreads.getValue(),
           "prjfs-dir-inval")},
 #endif
-      inodeMap_{new InodeMap(this, serverState_->getReloadableConfig())},
+      inodeMap_{new InodeMap(
+          this,
+          serverState_->getReloadableConfig(),
+          stats.copy())},
       objectStore_{std::move(objectStore)},
       blobCache_{std::move(blobCache)},
       blobAccess_{objectStore_, blobCache_},
@@ -643,7 +646,7 @@ folly::SemiFuture<Unit> EdenMount::performBindMounts() {
       });
 }
 
-EdenMount::~EdenMount() {}
+EdenMount::~EdenMount() = default;
 
 bool EdenMount::tryToTransitionState(State expected, State newState) {
   return state_.compare_exchange_strong(
@@ -1422,16 +1425,6 @@ folly::Future<CheckoutResult> EdenMount::checkout(
             })
             .semi();
       })
-      .thenValue([this](std::tuple<
-                        ObjectStore::GetRootTreeResult,
-                        ObjectStore::GetRootTreeResult> treeResults) {
-        XLOG(DBG7) << "Checkout: waitForPendingWrites";
-        return waitForPendingWrites()
-            .thenValue([treeResults = std::move(treeResults)](auto&&) {
-              return treeResults;
-            })
-            .semi();
-      })
       .thenValue(
           [this,
            rootInode,
@@ -1930,7 +1923,7 @@ std::unique_ptr<FuseChannel, FsChannelDeleter> makeFuseChannel(
       FLAGS_fuseNumThreads,
       EdenDispatcherFactory::makeFuseDispatcher(mount),
       &mount->getStraceLogger(),
-      mount->getServerState()->getProcessNameCache(),
+      mount->getServerState()->getProcessInfoCache(),
       mount->getServerState()->getFsEventLogger(),
       std::chrono::duration_cast<folly::Duration>(
           edenConfig->fuseRequestTimeout.getValue()),
@@ -1963,7 +1956,7 @@ folly::Future<NfsServer::NfsMountInfo> makeNfsChannel(
                    mount->getRootInode()->getNodeId(),
                    EdenDispatcherFactory::makeNfsDispatcher(mount),
                    &mount->getStraceLogger(),
-                   mount->getServerState()->getProcessNameCache(),
+                   mount->getServerState()->getProcessInfoCache(),
                    mount->getServerState()->getFsEventLogger(),
                    mount->getServerState()->getStructuredLogger(),
                    std::chrono::duration_cast<folly::Duration>(
@@ -2079,7 +2072,7 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
                          EdenDispatcherFactory::makePrjfsDispatcher(this),
                          serverState_->getReloadableConfig(),
                          &getStraceLogger(),
-                         serverState_->getProcessNameCache(),
+                         serverState_->getProcessInfoCache(),
                          getCheckoutConfig()->getRepoGuid(),
                          getCheckoutConfig()->getEnableWindowsSymlinks(),
                          this->getServerState()->getNotifier()));

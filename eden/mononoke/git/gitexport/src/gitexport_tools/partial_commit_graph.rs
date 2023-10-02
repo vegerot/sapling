@@ -7,8 +7,13 @@
 
 use std::collections::HashMap;
 
+use anyhow::anyhow;
+use anyhow::Error;
+use anyhow::Result;
 use futures::future::try_join_all;
-use futures::TryStreamExt;
+use futures::stream::StreamExt;
+use futures::stream::TryStreamExt;
+use futures::stream::{self};
 use itertools::Itertools;
 use mononoke_api::changeset_path::ChangesetPathHistoryContext;
 use mononoke_api::changeset_path::ChangesetPathHistoryOptions;
@@ -17,6 +22,8 @@ use mononoke_api::MononokeError;
 use mononoke_api::MononokePath;
 use mononoke_types::ChangesetId;
 use slog::debug;
+use slog::info;
+use slog::trace;
 use slog::Logger;
 
 pub type ChangesetParents = HashMap<ChangesetId, Vec<ChangesetId>>;
@@ -31,29 +38,33 @@ pub async fn build_partial_commit_graph_for_export<P>(
     logger: &Logger,
     paths: Vec<P>,
     cs_ctx: ChangesetContext,
+    // Consider history until the provided timestamp, i.e. all commits in the
+    // graph will have its creation time greater than or equal to it.
+    oldest_commit_ts: Option<i64>,
 ) -> Result<PartialGraphInfo, MononokeError>
 where
     P: TryInto<MononokePath>,
     MononokeError: From<P::Error>,
 {
-    let mononoke_paths = paths
-        .into_iter()
-        .map(|path| path.try_into())
-        .collect::<Result<Vec<MononokePath>, _>>()?;
+    info!(logger, "Building partial commit graph for export...");
 
-    let cs_path_hist_ctxs: Vec<ChangesetPathHistoryContext> = cs_ctx
-        .paths_with_history(mononoke_paths.into_iter())
-        .await?
-        .try_collect()
+    let cs_path_hist_ctxs: Vec<ChangesetPathHistoryContext> = stream::iter(paths)
+        .then(|p| async { cs_ctx.path_with_history(p).await })
+        .try_collect::<Vec<_>>()
         .await?;
+
+    let cs_path_history_options = ChangesetPathHistoryOptions {
+        follow_history_across_deletions: true,
+        until_timestamp: oldest_commit_ts,
+        ..Default::default()
+    };
 
     // Get each path's history as a vector of changesets
     let history_changesets: Vec<Vec<ChangesetContext>> = try_join_all(
         try_join_all(
             cs_path_hist_ctxs
                 .iter()
-                // TODO(T160600443): support other ChangesetPathHistoryOptions
-                .map(|csphc| csphc.history(ChangesetPathHistoryOptions::default())),
+                .map(|csphc| csphc.history(cs_path_history_options)),
         )
         .await?
         .into_iter()
@@ -61,47 +72,85 @@ where
     )
     .await?;
 
-    let sorted_changesets = merge_and_sort_changeset_lists(history_changesets)?;
+    let (sorted_changesets, parents_map) =
+        merge_cs_lists_and_build_parents_map(logger, history_changesets).await?;
 
-    debug!(logger, "sorted_changesets: {0:#?}", &sorted_changesets);
+    info!(
+        logger,
+        "Number of changsets to export: {0:?}",
+        sorted_changesets.len()
+    );
 
     // TODO(gustavoavena): remove these prints for debugging after adding tests
     let cs_msgs: Vec<_> = try_join_all(sorted_changesets.iter().map(|csc| csc.message())).await?;
-    debug!(logger, "changeset messages: {0:#?}", cs_msgs);
+    trace!(logger, "changeset messages: {0:#?}", cs_msgs);
 
-    let parents_map = build_parents_map(&sorted_changesets).await?;
-
+    info!(logger, "Partial commit graph built!");
     Ok((sorted_changesets, parents_map))
 }
 
-// TODO(T161204758): build parents map during graph traversal.
-/// Temporary way to create the parents map for a `PartialGraphInfo` that will
-/// be used to export commits in a very simple case (no branches + one path).
-async fn build_parents_map(
-    // Topologically sorted list of changesets that will be exported.
-    changesets: &Vec<ChangesetContext>,
-) -> Result<ChangesetParents, MononokeError> {
-    let parents = changesets
-        .iter()
-        .tuple_windows()
-        .map(|(parent, child)| (child.id().clone(), vec![parent.id().clone()]))
-        .collect::<HashMap<ChangesetId, Vec<ChangesetId>>>();
-
-    // TODO(T161204758): properly sort and dedupe the list of relevant changesets
-    Ok(parents)
-}
-
 /// Given a list of changeset lists, merge, dedupe and sort them topologically
-/// into a single changeset list that can be used to build a commit graph.
-fn merge_and_sort_changeset_lists(
+/// into a single changeset list that can be used to partially copy commits
+/// to a temporary repo.
+/// In the process, also build the hashmap containing the parent information
+/// **considering only the exported directories**.
+///
+/// Example: Given the graph `A -> b -> c -> D -> e`, where commits with uppercase
+/// have modified export paths, the parent map should be `{A: [D]}`, because
+/// the partial graph is `A -> D`.
+async fn merge_cs_lists_and_build_parents_map(
+    logger: &Logger,
     changeset_lists: Vec<Vec<ChangesetContext>>,
-) -> Result<Vec<ChangesetContext>, MononokeError> {
-    let mut changesets: Vec<ChangesetContext> = changeset_lists.into_iter().flatten().collect();
+) -> Result<(Vec<ChangesetContext>, ChangesetParents), Error> {
+    info!(
+        logger,
+        "Merging changeset lists and building parents map..."
+    );
+    let mut changesets_with_gen: Vec<(ChangesetContext, u64)> =
+        stream::iter(changeset_lists.into_iter().flatten())
+            .then(|cs| async move {
+                let generation = cs.generation().await?.value();
+                anyhow::Ok((cs, generation))
+            })
+            .try_collect::<Vec<_>>()
+            .await?;
 
-    // TODO(T161204758): properly sort and dedupe the list of relevant changesets
-    // For now, topologically sort the changesets by reverting their order,
-    // because the `history` method returns them in reverse topological order.
-    changesets.reverse();
+    // Sort by generation number
+    debug!(logger, "Sorting changesets by generation number...");
+    changesets_with_gen
+        .sort_by(|(cs_a, gen_a), (cs_b, gen_b)| (gen_a, cs_a.id()).cmp(&(gen_b, cs_b.id())));
 
-    Ok(changesets)
+    // Collect the sorted changesets
+    let mut sorted_css = changesets_with_gen
+        .into_iter()
+        .map(|(cs, _)| cs)
+        .collect::<Vec<_>>();
+
+    // Remove any duplicates from the list.
+    // NOTE: `dedup_by` can only be used here because the list is sorted!
+    debug!(logger, "Deduping changesets...");
+    sorted_css.dedup_by(|cs_a, cs_b| cs_a.id().eq(&cs_b.id()));
+
+    // Make sure that there are no merge commits by checking that consecutive
+    // changesest are ancestors of each other.
+    // In this process, also build the parents map.
+    debug!(logger, "Building parents map...");
+    let mut parents_map = try_join_all(sorted_css.iter().tuple_windows().map(|(parent, child)| async {
+         let is_ancestor = parent.is_ancestor_of(child.id()).await?;
+         if !is_ancestor {
+             return Err(anyhow!(
+                 "Merge commits are not supported for partial commit graphs. Commit {:?} is not an ancestor of {:?}", parent.id(), child.id(),
+             ));
+         };
+         Ok((child.id(), vec![parent.id()]),)
+     }))
+     .await?
+     .into_iter()
+     .collect::<HashMap<ChangesetId, Vec<ChangesetId>>>();
+
+    if let Some(root_cs) = sorted_css.first() {
+        parents_map.insert(root_cs.id(), vec![]);
+    };
+
+    Ok((sorted_css, parents_map))
 }

@@ -32,7 +32,7 @@ use manifest::ManifestOps;
 use mercurial_derivation::DeriveHgChangeset;
 use mercurial_types::HgFileEnvelope;
 use mercurial_types::HgFileNodeId;
-use mercurial_types::MPath;
+use mercurial_types::NonRootMPath;
 use mononoke_types::RepoPath;
 use repo_blobstore::RepoBlobstoreRef;
 use slog::debug;
@@ -128,8 +128,8 @@ pub fn build_subcommand<'a, 'b>() -> App<'a, 'b> {
         )
 }
 
-fn extract_path(path: &str) -> Result<MPath, Error> {
-    MPath::new(path).map_err(|err| format_err!("Could not parse path {}: {:?}", path, err))
+fn extract_path(path: &str) -> Result<NonRootMPath, Error> {
+    NonRootMPath::new(path).map_err(|err| format_err!("Could not parse path {}: {:?}", path, err))
 }
 
 fn log_filenode(
@@ -162,7 +162,7 @@ async fn handle_filenodes_at_revision(
     ctx: CoreContext,
     blobrepo: BlobRepo,
     revision: &str,
-    paths: Vec<MPath>,
+    paths: Vec<NonRootMPath>,
     log_envelope: bool,
 ) -> Result<(), Error> {
     let cs_id = helpers::csid_resolve(&ctx, &blobrepo, revision.to_string()).await?;
@@ -276,12 +276,14 @@ pub async fn subcommand_filenodes<'a>(
                     async move {
                         let (repo_path, filenode_id) = match entry {
                             Entry::Leaf((_, filenode_id)) => (
-                                RepoPath::FilePath(path.expect("unexpected empty file path")),
+                                RepoPath::FilePath(
+                                    path.try_into().expect("unexpected empty file path"),
+                                ),
                                 filenode_id,
                             ),
                             Entry::Tree(mf_id) => {
                                 let filenode_id = HgFileNodeId::new(mf_id.into_nodehash());
-                                match path {
+                                match Option::<NonRootMPath>::from(path) {
                                     Some(path) => (RepoPath::DirectoryPath(path), filenode_id),
                                     None => (RepoPath::RootPath, filenode_id),
                                 }
@@ -304,7 +306,7 @@ pub async fn subcommand_filenodes<'a>(
             Ok(())
         }
         (COMMAND_ALL_FILENODES, Some(matches)) => {
-            let maybe_mpath = MPath::new_opt(matches.value_of(ARG_PATH).unwrap())?;
+            let maybe_mpath = NonRootMPath::new_opt(matches.value_of(ARG_PATH).unwrap())?;
             let is_tree = matches.is_present(ARG_IS_TREE);
             let path = match (maybe_mpath, is_tree) {
                 (Some(path), true) => RepoPath::DirectoryPath(path),

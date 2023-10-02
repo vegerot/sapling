@@ -11,8 +11,8 @@ import tempfile
 import unittest
 
 import silenttestrunner
-from edenscm import encoding, error, extensions, lock, pycompat, ui, util, vfs as vfsmod
 from hghave import require
+from sapling import encoding, error, extensions, lock, pycompat, ui, util, vfs as vfsmod
 
 
 testlockname = "testlock"
@@ -30,7 +30,7 @@ class lockwrapper(lock.lock):
         return "%s/%s" % (pid, self._pidoffset)
 
 
-class teststate(object):
+class teststate:
     def __init__(self, testcase, dir, pidoffset=0):
         self._testcase = testcase
         self._acquirecalled = False

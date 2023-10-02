@@ -288,6 +288,27 @@ new mode 120000
         self.assertTrue(os.path.isfile(self.get_path("symlink")))
         self.assertEqual("hola", self.read_file("symlink"))
 
+    def test_abspath_posixstyle_symlink(self) -> None:
+        self.repo.symlink("slink", os.sep.join(["", "foo", "bar"]))
+        slinkcommit = self.repo.commit("Symlink with unixpaths")
+        self.assertEqual(
+            self.repo.hg("log", "-r", ".", "--template", "{node}", "--patch"),
+            r"""31ca60316fb55b7165c8c9257374ef4d4a09c13bdiff --git a/slink b/slink
+new file mode 120000
+--- /dev/null
++++ b/slink
+@@ -0,0 +1,1 @@
++/foo/bar
+\ No newline at end of file
+
+""",
+        )
+        self.repo.update(self.simple_commit)
+        self.repo.update(slinkcommit)
+        self.assertEqual(
+            os.readlink(self.get_path("slink")), os.sep.join(["", "foo", "bar"])
+        )
+
 
 @hg_test
 # pyre-ignore[13]: T62487924
@@ -360,3 +381,15 @@ class SymlinkWindowsDisabledTest(EdenHgTestCase):
 \\ No newline at end of file
 """,
         )
+
+    def test_status_empty_after_restart(self) -> None:
+        # Run scandir for triggering the bug
+        self.assertEqual(
+            {"contents1", "contents2", "symlink", ".hg", ".eden"},
+            {entry.name for entry in os.scandir(self.mount)},
+        )
+        self.assert_status_empty()
+        self.eden.shutdown()
+        self.eden.start()
+        # Makes sure the symlink does not appear after restarting
+        self.assert_status_empty()

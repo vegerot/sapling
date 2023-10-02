@@ -53,7 +53,6 @@ Show all commands except debug commands
   recover
   remove
   rename
-  repack
   resolve
   revert
   rollback
@@ -160,6 +159,7 @@ Show debug commands if there are no other candidates
   debugmergestate
   debugmetalog
   debugmetalogroots
+  debugmigratesymlinks
   debugmutation
   debugmutationfromobsmarkers
   debugnamecomplete
@@ -212,7 +212,6 @@ Show debug commands if there are no other candidates
   debugvisibility
   debugvisibleheads
   debugwaitonprefetch
-  debugwaitonrepack
   debugwalk
   debugwireargs
 
@@ -223,7 +222,6 @@ Do not show the alias of a debug command if there are other candidates
   recover
   remove
   rename
-  repack
   resolve
   revert
   rollback
@@ -370,7 +368,6 @@ Show aliases with -v
   recover
   remove rm
   rename move mv
-  repack
   resolve
   revert
   rollback
@@ -488,6 +485,7 @@ Show all commands + options
   debugmergestate: 
   debugmetalog: time-range
   debugmetalogroots: style, template
+  debugmigratesymlinks: 
   debugmutation: rev, successors, time-range
   debugmutationfromobsmarkers: 
   debugnamecomplete: description
@@ -540,7 +538,6 @@ Show all commands + options
   debugvisibility: 
   debugvisibleheads: style, template
   debugwaitonprefetch: 
-  debugwaitonrepack: 
   debugwalk: include, exclude
   debugwireargs: three, four, five
   diff: rev, change, text, git, binary, nodates, noprefix, show-function, reverse, ignore-all-space, ignore-space-change, ignore-blank-lines, ignore-space-at-eol, unified, stat, root, only-files-in-revs, include, exclude
@@ -567,14 +564,13 @@ Show all commands + options
   parents: rev, style, template
   paths: template
   phase: public, draft, secret, force, rev
-  prefetch: rev, repack, base, include, exclude
+  prefetch: rev, base, include, exclude
   pull: update, force, rev, bookmark
   push: force, rev, bookmark, new-branch, pushvars
   record: addremove, amend, secret, edit, message, logfile, date, user, ignore-all-space, ignore-space-change, ignore-blank-lines, ignore-space-at-eol, include, exclude
   recover: 
   remove: after, force, include, exclude
   rename: after, force, include, exclude, dry-run
-  repack: background, incremental
   resolve: all, list, mark, unmark, no-status, root-relative, tool, include, exclude, template, skip
   revert: all, date, rev, no-backup, interactive, include, exclude, dry-run
   rollback: dry-run, force

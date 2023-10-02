@@ -11,136 +11,77 @@ Setting up a simple scenario for the gitexport tool
 Setup configuration
   $ REPOTYPE="blob_files"
   $ setup_common_config "$REPOTYPE"
+  $ ENABLE_API_WRITES=1 REPOID=1 setup_mononoke_repo_config "temp_repo"
   $ cd $TESTTMP
 
 
 Set some env vars that will be used frequently
 
   $ EXPORT_DIR="export_dir"
+  $ EXPORT_SUBDIR="$EXPORT_DIR/subdir_to_export"
 -- Folder that should NOT be exported to the git repo
   $ INTERNAL_DIR="internal_dir"
--- Subdirectory in EXPORT_DIR that should not be exported
-  $ FB_SUBDIR="$EXPORT_DIR/facebook"
   $ SECOND_EXPORT_DIR="second_export_dir"
 
 
 # -------------------------- Create commits --------------------------
-  $ testtool_drawdag -R repo --derive-all <<EOF
-  > A-B-C-D-E-F-G-H-I
+  $ testtool_drawdag -R repo --derive-all --no-default-files <<EOF
+  > A-B-C-D-E-F-G-H-I-J-K
   > # modify: A "$EXPORT_DIR/B.txt" "File to export"
   > # message: A "Add files to export dir"
   > # modify: B "$INTERNAL_DIR/internal.txt" "Internal file"
   > # message: B "Add file to internal_dir"
-  > # modify: C "$FB_DIR/exception_from_export.txt" "Internal file in exception folder"
-  > # message: C "Add exception directory to export dir"
-  > # modify: D "$FB_DIR/2nd_exception_from_export_dir.txt" "Internal file in exception folder"
-  > # modify: D "$EXPORT_DIR/export_dir/C.txt" "File to export"
+  > # modify: C "$EXPORT_SUBDIR/export_file_in_subdir.txt" "File in export subdirectory"
+  > # message: C "Add subdirectory to export dir"
+  > # modify: D "$EXPORT_SUBDIR/second_subdir_export.txt" "File in export subdirectory"
+  > # modify: D "$EXPORT_DIR/C.txt" "File to export"
   > # modify: D "$INTERNAL_DIR/another_internal.txt" "Internal file"
   > # message: D "Add files to all directories"
   > # modify: E "$SECOND_EXPORT_DIR/another_file.txt" "Another file to export"
   > # message: E "Create another export directory"
   > # modify: F "$INTERNAL_DIR/internal.txt" "Changing file"
   > # modify: F "$EXPORT_DIR/A.txt" "Changing file"
-  > # modify: F "$FB_DIR/exception_from_export_dir.txt" "Changing file"
+  > # modify: F "$EXPORT_SUBDIR/exception_from_export_dir.txt" "Changing file"
   > # message: F "Modify internal and exported files"
   > # modify: G "$EXPORT_DIR/B.txt" "Changing file"
   > # message: G "Modify only exported file"
-  > # modify: H "$FB_DIR/2nd_exception_from_export_dir.txt" "Changing file"
-  > # message: H "Modify only file in exception folder"
+  > # modify: H "$EXPORT_SUBDIR/second_subdir_export.txt" "Changing file"
+  > # message: H "Modify only file in export subdirectory"
   > # modify: I "$INTERNAL_DIR/another_internal.txt" "Changing file"
   > # message: I "Modify only file in internal root"
-  > # bookmark: I main
+  > # delete: J "$EXPORT_SUBDIR/second_subdir_export.txt"
+  > # delete: J "$INTERNAL_DIR/another_internal.txt"
+  > # message: J "Delete internal and exported files"
+  > # modify: K "root_file.txt" "Root file"
+  > # message: K "Add file to repo root"
+  > # bookmark: K master
   > EOF
-  A=8b4acc9caa1cacc715912d4ea9c314db2d7028dd10f64553eb99620be92bb830
-  B=8e8f391769a0bddcd8af193d0721531eb4766b5cd4fc22ffda0f5233fa7dbe19
-  C=051d574d6d5e12428ef853f7880d0652677f8cf59bebf80c9227f009f36105d6
-  D=0f23d869bfbfa7d096524f0df979bc338a68c0ff2394c792209ed0015c68210a
-  E=49d0241f406a42212d94b4ca40dea808f757132ced9512fed044936fc503fff9
-  F=eaaccaee56ade23100dea1550ab076eadc447b772f62adb6bd871e9c6505148d
-  G=7bd6f9b27f56175b08eb32a2ab6663b4dff203665cf782df6d83a99d132e1edb
-  H=82d17e92c6fb604c17efbc3daa6afab60728f3a576b185eaa41a1bf2aa512d0f
-  I=a8f6bcc345058aca2f28dac45d6b54b89e923bda7c75423bebf7678eaf3dd8eb
+  A=2b45b0cac2615a6b5f1808161f96eb56376f313b45744ce83fd60931dee1e02b
+  B=db859048f5ffc6d47dddd3bbe01e223654e9992537421e4ba13b87a7e0dbcc3c
+  C=18ecf80ae5c1d7f1ca4d86f0679553c96be5aff1fb7b6dfa7b6343c0cde461a5
+  D=b1075aab50713f6440222a3e8729d874fab9e3276fd97057ebda2bea4fc27e68
+  E=bf427657abaa0a5b88cf50295ba5c5639f45b89cc67e15f7bc5c2b496c84bff9
+  F=22bf902c5e155b92caddfe384693a69f379cdada5277ab524a8dbfddc5ab2077
+  G=ae2469ceeba5ee03e6501c85b7335c1fa5fa8e75a5de678743037d6e8c220c47
+  H=aad9a55aa109275b392b829d09c571caa4add25753c6a6d547d753534e8ddc89
+  I=83f4af124d0b2052d090ca254150f6fa4d5dc9303ffd23c601d1f7a6dc23892e
+  J=56abf334447e5deb10163335caf2477aa105a8bee096627de06222f01d45c65d
+  K=ca1b7e33632b3b9a89abe7f820b590f1185cf7e187386e9bddf4c1cbe62dc324
 
   $ start_and_wait_for_mononoke_server
-  $ hgmn_clone mononoke://$(mononoke_address)/repo repo
-  $ cd repo
-  $ hg -q co main
-
 
 # Finish creating commits
-# ------------------------------------------------------------------------------
-
-
-Check all the commits
-  $ hg sl
-  @  commit:      7e52b1ef6f84
-  │  bookmark:    main
-  │  user:        author
-  │  date:        Thu Jan 01 00:00:00 1970 +0000
-  │  summary:     Modify only file in internal root
-  │
-  o  commit:      1f6147d06261
-  │  user:        author
-  │  date:        Thu Jan 01 00:00:00 1970 +0000
-  │  summary:     Modify only file in exception folder
-  │
-  o  commit:      a435687d6bae
-  │  user:        author
-  │  date:        Thu Jan 01 00:00:00 1970 +0000
-  │  summary:     Modify only exported file
-  │
-  o  commit:      fa672b512392
-  │  user:        author
-  │  date:        Thu Jan 01 00:00:00 1970 +0000
-  │  summary:     Modify internal and exported files
-  │
-  o  commit:      cf9999253960
-  │  user:        author
-  │  date:        Thu Jan 01 00:00:00 1970 +0000
-  │  summary:     Create another export directory
-  │
-  o  commit:      40ce49af8415
-  │  user:        author
-  │  date:        Thu Jan 01 00:00:00 1970 +0000
-  │  summary:     Add files to all directories
-  │
-  o  commit:      88517b405cd8
-  │  user:        author
-  │  date:        Thu Jan 01 00:00:00 1970 +0000
-  │  summary:     Add exception directory to export dir
-  │
-  o  commit:      e839bab2b2da
-  │  user:        author
-  │  date:        Thu Jan 01 00:00:00 1970 +0000
-  │  summary:     Add file to internal_dir
-  │
-  o  commit:      55f1431a4e73
-     user:        author
-     date:        Thu Jan 01 00:00:00 1970 +0000
-     summary:     Add files to export dir
-  
-
-
-
 
 # -------------------- Use the gitexport tool --------------------
 
 Set location of binary, resources and options (e.g. output path, directories)
-# TODO(T160600991): Pass the CLI pass once the initial binary is setup in buck
-  $ GITEXPORT_CLI=""
-
 # Path that should be exported to the git repo
-  $ EXPORT_PATHS="$EXPORT_DIR $SECOND_EXPORT_DIR"
+  $ EXPORT_PATHS=($EXPORT_DIR $SECOND_EXPORT_DIR)
 
-  $ HG_REPO="$TESTTMP/repo"
+  $ SOURCE_GRAPH_OUTPUT=$TESTTMP/source_graph_output
+  $ PARTIAL_GRAPH_OUTPUT=$TESTTMP/partial_graph_output
 
   $ GIT_REPO_OUTPUT="$TESTTMP/git_repo"
-
-# TODO(T160600443): support optional first/last commits
-# NOTE: these would take precedence over the start/end date arguments.
-  $ FIRST_COMMIT=""
-
-  $ LAST_COMMIT=""
 
 # TODO(T160600443): support optional start/end date arguments
   $ START_DATE="2023-01-01"
@@ -149,10 +90,65 @@ Set location of binary, resources and options (e.g. output path, directories)
 
 Run the tool
 
-# TODO(T160600991): uncomment once the CLI binary is created
-# $ $GITEXPORT_CLI --hg-repo "$REPO" --output "$GIT_REPO_OUTPUT" --export-paths "$EXPORT_PATHS"
+  $ gitexport --log-level ERROR --repo-name "repo" -B "master" $(printf -- '-p %s ' "${EXPORT_PATHS[@]}") --source-graph-output "$SOURCE_GRAPH_OUTPUT" --partial-graph-output "$PARTIAL_GRAPH_OUTPUT" --distance-limit 30
 
-
+  $ diff --old-line-format="- %L" --new-line-format="+ %L" "$SOURCE_GRAPH_OUTPUT" "$PARTIAL_GRAPH_OUTPUT"
+  - o  message: Add file to repo root, id: ca1b7e33632b3b9a89abe7f820b590f1185cf7e187386e9bddf4c1cbe62dc324
+  - │   File changes:
+  - │  	 ADDED/MODIFIED: root_file.txt 1fc392f47d2822cab18c09dd980ea6bff4c0af4f55249fd01696b5ae04b8f30f
+  - │
+  - o  message: Delete internal and exported files, id: 56abf334447e5deb10163335caf2477aa105a8bee096627de06222f01d45c65d
+  + o  message: Delete internal and exported files, id: 125c12a5605e721287dda77a62975461902083347436356664fa6e38be01e714
+  │   File changes:
+  │  	 REMOVED: export_dir/subdir_to_export/second_subdir_export.txt
+  - │  	 REMOVED: internal_dir/another_internal.txt
+  - │
+  - o  message: Modify only file in internal root, id: 83f4af124d0b2052d090ca254150f6fa4d5dc9303ffd23c601d1f7a6dc23892e
+  - │   File changes:
+  - │  	 ADDED/MODIFIED: internal_dir/another_internal.txt a6ef1a0dddad73cbfd4ce3bd9642f5aab0c4ae1fcb58af3cacda2f0ed914efd8
+  │
+  - o  message: Modify only file in export subdirectory, id: aad9a55aa109275b392b829d09c571caa4add25753c6a6d547d753534e8ddc89
+  + o  message: Modify only file in export subdirectory, id: 56afc1f97612fee7e67df5ca86cdd0705cc74a079ebdc15e08c139d77a588597
+  │   File changes:
+  │  	 ADDED/MODIFIED: export_dir/subdir_to_export/second_subdir_export.txt a6ef1a0dddad73cbfd4ce3bd9642f5aab0c4ae1fcb58af3cacda2f0ed914efd8
+  │
+  - o  message: Modify only exported file, id: ae2469ceeba5ee03e6501c85b7335c1fa5fa8e75a5de678743037d6e8c220c47
+  + o  message: Modify only exported file, id: 2a1902253c3076731ae693822c4399974975c13f1be892925026a7df0e143d01
+  │   File changes:
+  │  	 ADDED/MODIFIED: export_dir/B.txt a6ef1a0dddad73cbfd4ce3bd9642f5aab0c4ae1fcb58af3cacda2f0ed914efd8
+  │
+  - o  message: Modify internal and exported files, id: 22bf902c5e155b92caddfe384693a69f379cdada5277ab524a8dbfddc5ab2077
+  + o  message: Modify internal and exported files, id: 1f7a5e225e6207d0d8604173a13f3592173e07efa8804ffc20381d5595179009
+  │   File changes:
+  │  	 ADDED/MODIFIED: export_dir/A.txt a6ef1a0dddad73cbfd4ce3bd9642f5aab0c4ae1fcb58af3cacda2f0ed914efd8
+  │  	 ADDED/MODIFIED: export_dir/subdir_to_export/exception_from_export_dir.txt a6ef1a0dddad73cbfd4ce3bd9642f5aab0c4ae1fcb58af3cacda2f0ed914efd8
+  - │  	 ADDED/MODIFIED: internal_dir/internal.txt a6ef1a0dddad73cbfd4ce3bd9642f5aab0c4ae1fcb58af3cacda2f0ed914efd8
+  │
+  - o  message: Create another export directory, id: bf427657abaa0a5b88cf50295ba5c5639f45b89cc67e15f7bc5c2b496c84bff9
+  + o  message: Create another export directory, id: e018441040174d40efefea1717dd81112159ab716ca1fdfb19e7ddf4d5ae4f0f
+  │   File changes:
+  │  	 ADDED/MODIFIED: second_export_dir/another_file.txt 5edfe2d7d203cc580278e40f794da385c8895e8cad8803e176d305a5bf48e406
+  │
+  - o  message: Add files to all directories, id: b1075aab50713f6440222a3e8729d874fab9e3276fd97057ebda2bea4fc27e68
+  + o  message: Add files to all directories, id: 994707996002ba7d453fce0668b883d056f5a168318d94f905d55891ccf0a331
+  │   File changes:
+  │  	 ADDED/MODIFIED: export_dir/C.txt 3e8ba6ef6107965afc1446b5b24533d9865204f1ea617672930d202f932bb892
+  │  	 ADDED/MODIFIED: export_dir/subdir_to_export/second_subdir_export.txt e6d9f9d3bdd71e9c2dddec53da3bf447734da86b3897a7f7afd69cc7ac0cf3f1
+  - │  	 ADDED/MODIFIED: internal_dir/another_internal.txt dbc317c4f0146e8a455e9bc8eea646248145c962b3f4689c22285d3c8b25fd5e
+  │
+  - o  message: Add subdirectory to export dir, id: 18ecf80ae5c1d7f1ca4d86f0679553c96be5aff1fb7b6dfa7b6343c0cde461a5
+  + o  message: Add subdirectory to export dir, id: 736ffbf2afbe183ef8caaa7e148ca208cad27de8b0436443a836393654b3a658
+  │   File changes:
+  │  	 ADDED/MODIFIED: export_dir/subdir_to_export/export_file_in_subdir.txt e6d9f9d3bdd71e9c2dddec53da3bf447734da86b3897a7f7afd69cc7ac0cf3f1
+  - │
+  - o  message: Add file to internal_dir, id: db859048f5ffc6d47dddd3bbe01e223654e9992537421e4ba13b87a7e0dbcc3c
+  - │   File changes:
+  - │  	 ADDED/MODIFIED: internal_dir/internal.txt dbc317c4f0146e8a455e9bc8eea646248145c962b3f4689c22285d3c8b25fd5e
+  │
+  o  message: Add files to export dir, id: 2b45b0cac2615a6b5f1808161f96eb56376f313b45744ce83fd60931dee1e02b
+      File changes:
+     	 ADDED/MODIFIED: export_dir/B.txt 3e8ba6ef6107965afc1446b5b24533d9865204f1ea617672930d202f932bb892
+  [1]
 
 # -------------------- Run checks on the git repo --------------------
 

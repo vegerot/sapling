@@ -13,8 +13,10 @@ use anyhow::Result;
 use cloned::cloned;
 use commit_graph::CommitGraph;
 use commit_graph_types::storage::CommitGraphStorage;
+use commit_graph_types::storage::Prefetch;
 use context::CoreContext;
 use in_memory_commit_graph_storage::InMemoryCommitGraphStorage;
+use maplit::hashset;
 use mononoke_types::ChangesetIdPrefix;
 use mononoke_types::ChangesetIdsResolvedFromPrefix;
 use mononoke_types::RepositoryId;
@@ -66,11 +68,11 @@ pub async fn test_storage_store_and_fetch(
 ) -> Result<()> {
     let graph = from_dag(
         &ctx,
-        r##"
+        r"
              A-B-C-D-G-H-I
               \     /
                E---F
-         "##,
+         ",
         storage.clone(),
     )
     .await?;
@@ -83,7 +85,6 @@ pub async fn test_storage_store_and_fetch(
         graph
             .changeset_generation(&ctx, name_cs_id("G"))
             .await?
-            .unwrap()
             .value(),
         5
     );
@@ -91,7 +92,6 @@ pub async fn test_storage_store_and_fetch(
         graph
             .changeset_parents(&ctx, name_cs_id("A"))
             .await?
-            .unwrap()
             .as_slice(),
         &[]
     );
@@ -99,7 +99,6 @@ pub async fn test_storage_store_and_fetch(
         graph
             .changeset_parents(&ctx, name_cs_id("E"))
             .await?
-            .unwrap()
             .as_slice(),
         &[name_cs_id("A")]
     );
@@ -107,7 +106,6 @@ pub async fn test_storage_store_and_fetch(
         graph
             .changeset_parents(&ctx, name_cs_id("G"))
             .await?
-            .unwrap()
             .as_slice(),
         &[name_cs_id("D"), name_cs_id("F")]
     );
@@ -216,7 +214,7 @@ pub async fn test_storage_store_and_fetch(
     // Check some underlying storage details.
     assert_eq!(
         storage
-            .fetch_edges(&ctx, name_cs_id("A"))
+            .maybe_fetch_edges(&ctx, name_cs_id("A"))
             .await?
             .unwrap()
             .merge_ancestor,
@@ -224,7 +222,7 @@ pub async fn test_storage_store_and_fetch(
     );
     assert_eq!(
         storage
-            .fetch_edges(&ctx, name_cs_id("C"))
+            .maybe_fetch_edges(&ctx, name_cs_id("C"))
             .await?
             .unwrap()
             .merge_ancestor,
@@ -232,11 +230,61 @@ pub async fn test_storage_store_and_fetch(
     );
     assert_eq!(
         storage
-            .fetch_edges(&ctx, name_cs_id("I"))
+            .maybe_fetch_edges(&ctx, name_cs_id("I"))
             .await?
             .unwrap()
             .merge_ancestor,
         Some(name_cs_node("G", 5, 1, 4))
+    );
+
+    // fetch_many_edges and maybe_fetch_many_edges return the same result if none of the changesets
+    // are missing.
+    assert_eq!(
+        storage
+            .fetch_many_edges(
+                &ctx,
+                &[name_cs_id("A"), name_cs_id("C"), name_cs_id("I")],
+                Prefetch::None
+            )
+            .await?,
+        storage
+            .maybe_fetch_many_edges(
+                &ctx,
+                &[name_cs_id("A"), name_cs_id("C"), name_cs_id("I")],
+                Prefetch::None
+            )
+            .await?,
+    );
+
+    // fetch_many_edges returns an error if any of the changesets are missing.
+    assert!(
+        storage
+            .fetch_many_edges(
+                &ctx,
+                &[name_cs_id("Z"), name_cs_id("A"), name_cs_id("B")],
+                Prefetch::None
+            )
+            .await
+            .is_err()
+    );
+
+    // maybe_fetch_many_edges ignores missing changesets ("Z" in this case).
+    assert_eq!(
+        storage
+            .maybe_fetch_many_edges(
+                &ctx,
+                &[
+                    name_cs_id("Z"),
+                    name_cs_id("A"),
+                    name_cs_id("C"),
+                    name_cs_id("I")
+                ],
+                Prefetch::None
+            )
+            .await?
+            .into_keys()
+            .collect::<HashSet<_>>(),
+        hashset! {name_cs_id("A"), name_cs_id("C"), name_cs_id("I")},
     );
 
     Ok(())
@@ -245,20 +293,20 @@ pub async fn test_storage_store_and_fetch(
 pub async fn test_skip_tree(ctx: CoreContext, storage: Arc<dyn CommitGraphStorage>) -> Result<()> {
     let graph = from_dag(
         &ctx,
-        r##"
+        r"
          A-B-C-D-G-H---J-K
             \   /   \ /
              E-F     I
 
          L-M-N-O-P-Q-R-S-T-U
-         "##,
+         ",
         storage.clone(),
     )
     .await?;
 
     assert_eq!(
         storage
-            .fetch_edges(&ctx, name_cs_id("K"))
+            .maybe_fetch_edges(&ctx, name_cs_id("K"))
             .await?
             .unwrap()
             .node
@@ -299,13 +347,13 @@ pub async fn test_p1_linear_tree(
 ) -> Result<()> {
     let graph = from_dag(
         &ctx,
-        r##"
+        r"
          A-B-C-D-G-H---J-K
             \   /   \ /
              E-F     I
 
          L-M-N-O-P-Q-R-S-T-U
-         "##,
+         ",
         storage.clone(),
     )
     .await?;
@@ -344,13 +392,13 @@ pub async fn test_ancestors_difference(
 ) -> Result<()> {
     let graph = from_dag(
         &ctx,
-        r##"
+        r"
          A-B-C-D-G-H---J-K
             \   /   \ /
              E-F     I
 
          L-M-N-O-P-Q-R-S-T-U
-         "##,
+         ",
         storage.clone(),
     )
     .await?;
@@ -536,11 +584,11 @@ pub async fn test_add_recursive(
     let reference_graph = Arc::new(
         from_dag(
             &ctx,
-            r##"
+            r"
              A-B-C-D-G-H-I
               \     /
                E---F---J
-         "##,
+         ",
             reference_storage,
         )
         .await?,
@@ -574,7 +622,6 @@ pub async fn test_add_recursive(
         graph
             .changeset_parents(&ctx, name_cs_id("E"))
             .await?
-            .unwrap()
             .as_slice(),
         &[name_cs_id("A")]
     );
@@ -582,7 +629,6 @@ pub async fn test_add_recursive(
         graph
             .changeset_parents(&ctx, name_cs_id("G"))
             .await?
-            .unwrap()
             .as_slice(),
         &[name_cs_id("D"), name_cs_id("F")]
     );
@@ -590,7 +636,6 @@ pub async fn test_add_recursive(
         graph
             .changeset_parents(&ctx, name_cs_id("I"))
             .await?
-            .unwrap()
             .as_slice(),
         &[name_cs_id("H")]
     );
@@ -598,7 +643,6 @@ pub async fn test_add_recursive(
         graph
             .changeset_parents(&ctx, name_cs_id("J"))
             .await?
-            .unwrap()
             .as_slice(),
         &[name_cs_id("F")]
     );
@@ -615,11 +659,11 @@ pub async fn test_add_recursive_many_changesets(
     let reference_graph = Arc::new(
         from_dag(
             &ctx,
-            r##"
+            r"
              A-B-C-D-G-H-I
               \     /
                E---F---J
-         "##,
+         ",
             reference_storage,
         )
         .await?,
@@ -646,7 +690,6 @@ pub async fn test_add_recursive_many_changesets(
         graph
             .changeset_parents(&ctx, name_cs_id("I"))
             .await?
-            .unwrap()
             .as_slice(),
         &[name_cs_id("H")]
     );
@@ -654,7 +697,6 @@ pub async fn test_add_recursive_many_changesets(
         graph
             .changeset_parents(&ctx, name_cs_id("K"))
             .await?
-            .unwrap()
             .as_slice(),
         &[name_cs_id("I")]
     );
@@ -662,7 +704,6 @@ pub async fn test_add_recursive_many_changesets(
         graph
             .changeset_parents(&ctx, name_cs_id("L"))
             .await?
-            .unwrap()
             .as_slice(),
         &[name_cs_id("K")]
     );
@@ -689,13 +730,13 @@ pub async fn test_ancestors_frontier_with(
 ) -> Result<()> {
     let graph = from_dag(
         &ctx,
-        r##"
+        r"
          A-B-C-D-G-H---J-K
             \   /   \ /
              E-F     I
 
          L-M-N-O-P-Q-R-S-T-U
-         "##,
+         ",
         storage.clone(),
     )
     .await?;
@@ -791,13 +832,13 @@ pub async fn test_range_stream(
 ) -> Result<()> {
     let graph = from_dag(
         &ctx,
-        r##"
+        r"
          A-B-C-D-G-H---J-K
             \   /   \ /
              E-F     I
 
          L-M-N-O-P-Q-R-S-T-U
-         "##,
+         ",
         storage.clone(),
     )
     .await?;
@@ -823,7 +864,7 @@ pub async fn test_common_base(
 ) -> Result<()> {
     let graph = from_dag(
         &ctx,
-        r##"
+        r"
         A-B-C-D-E-L------N
            \       \    /
             F-G-H   M  /
@@ -831,7 +872,7 @@ pub async fn test_common_base(
               I-J-K--/
 
         O-P-Q-R-S-T-U-V-W
-        "##,
+        ",
         storage.clone(),
     )
     .await?;
@@ -856,13 +897,13 @@ pub async fn test_slice_ancestors(
 ) -> Result<()> {
     let graph = from_dag(
         &ctx,
-        r##"
+        r"
          A-B-C-D-G-H---J-K
             \   /   \ /
              E-F     I
 
          L-M-N-O-P-Q-R-S-T-U
-         "##,
+         ",
         storage.clone(),
     )
     .await?;
@@ -925,13 +966,13 @@ pub async fn test_slice_ancestors(
 pub async fn test_children(ctx: CoreContext, storage: Arc<dyn CommitGraphStorage>) -> Result<()> {
     let graph = from_dag(
         &ctx,
-        r##"
+        r"
         A-B-C-D-E-L------N
            \       \    /
             F-G-H   M  /
              \     /  /
               I-J-K--/
-        "##,
+        ",
         storage,
     )
     .await?;
@@ -960,7 +1001,7 @@ pub async fn test_ancestors_difference_segments_1(
 ) -> Result<()> {
     let graph = from_dag(
         &ctx,
-        r##"
+        r"
         A-B-C-D-E---L------N----O
            \         \    /
             F-G-H     M  /
@@ -968,7 +1009,7 @@ pub async fn test_ancestors_difference_segments_1(
               I-J---K--/
                  \
                   \---------P
-        "##,
+        ",
         storage,
     )
     .await?;
@@ -993,7 +1034,7 @@ pub async fn test_ancestors_difference_segments_2(
 ) -> Result<()> {
     let graph = from_dag(
         &ctx,
-        r##"
+        r"
         A--B------C----E---J---K
          \  \      \
           \  \--D   \-----F----L
@@ -1001,7 +1042,7 @@ pub async fn test_ancestors_difference_segments_2(
             \  \--G---H     \--M
              \     \
               \-P   \--I--N----O
-        "##,
+        ",
         storage,
     )
     .await?;

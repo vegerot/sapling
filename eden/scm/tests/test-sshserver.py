@@ -4,8 +4,8 @@ import io
 import unittest
 
 import silenttestrunner
-from edenscm import sshserver, wireproto
 from hghave import require
+from sapling import sshserver, wireproto
 
 
 class SSHServerGetArgsTests(unittest.TestCase):
@@ -32,12 +32,12 @@ def mockserver(inbytes):
     return sshserver.sshserver(ui, repo)
 
 
-class mockrepo(object):
+class mockrepo:
     def __init__(self, ui):
         self.ui = ui
 
 
-class mockui(object):
+class mockui:
     def __init__(self, inbytes):
         self.fin = io.BytesIO(inbytes)
         self.fout = io.BytesIO()

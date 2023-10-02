@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use anyhow::anyhow;
 use anyhow::Error;
 use blobrepo::BlobRepo;
 use blobstore::Loadable;
@@ -16,21 +17,21 @@ use cmdlib::args;
 use cmdlib::args::MononokeMatches;
 use cmdlib::helpers;
 use context::CoreContext;
+use derived_data::BonsaiDerived;
 use fbinit::FacebookInit;
 use futures::stream::StreamExt;
 use manifest::Entry;
 use manifest::ManifestOps;
 use manifest::ManifestOrderedOps;
 use manifest::PathOrPrefix;
+use mononoke_types::path::MPath;
 use mononoke_types::skeleton_manifest::SkeletonManifestEntry;
 use mononoke_types::ChangesetId;
-use mononoke_types::MPath;
 use repo_blobstore::RepoBlobstoreRef;
 use skeleton_manifest::RootSkeletonManifestId;
 use slog::info;
 use slog::Logger;
 
-use crate::derived_data::derive_or_fetch;
 use crate::error::SubcommandError;
 
 pub const SKELETON_MANIFESTS: &str = "skeleton-manifests";
@@ -93,7 +94,7 @@ pub async fn subcommand_skeleton_manifests<'a>(
     match sub_matches.subcommand() {
         (COMMAND_TREE, Some(matches)) => {
             let hash_or_bookmark = String::from(matches.value_of(ARG_CSID).unwrap());
-            let path = matches.value_of(ARG_PATH).map(MPath::new).transpose()?;
+            let path = MPath::new(matches.value_of(ARG_PATH).unwrap())?;
 
             let csid = helpers::csid_resolve(&ctx, repo.clone(), hash_or_bookmark).await?;
             let fetch_derived = matches.is_present(ARG_IF_DERIVED);
@@ -103,7 +104,7 @@ pub async fn subcommand_skeleton_manifests<'a>(
         }
         (COMMAND_LIST, Some(matches)) => {
             let hash_or_bookmark = String::from(matches.value_of(ARG_CSID).unwrap());
-            let path = matches.value_of(ARG_PATH).map(MPath::new).transpose()?;
+            let path = MPath::new(matches.value_of(ARG_PATH).unwrap())?;
 
             let csid = helpers::csid_resolve(&ctx, repo.clone(), hash_or_bookmark).await?;
             let fetch_derived = matches.is_present(ARG_IF_DERIVED);
@@ -114,11 +115,25 @@ pub async fn subcommand_skeleton_manifests<'a>(
     }
 }
 
+async fn derive_or_fetch<T: BonsaiDerived>(
+    ctx: &CoreContext,
+    repo: &BlobRepo,
+    csid: ChangesetId,
+    fetch_derived: bool,
+) -> Result<T, Error> {
+    if fetch_derived {
+        let value = T::fetch_derived(ctx, repo, &csid).await?;
+        value.ok_or_else(|| anyhow!("{} are not derived for {}", T::DERIVABLE_NAME, csid))
+    } else {
+        Ok(T::derive(ctx, repo, csid).await?)
+    }
+}
+
 async fn subcommand_list(
     ctx: &CoreContext,
     repo: &BlobRepo,
     csid: ChangesetId,
-    path: Option<MPath>,
+    path: MPath,
     fetch_derived: bool,
 ) -> Result<(), Error> {
     let root = derive_or_fetch::<RootSkeletonManifestId>(ctx, repo, csid, fetch_derived).await?;
@@ -135,15 +150,15 @@ async fn subcommand_list(
             for (elem, entry) in skeleton_id.load(ctx, repo.repo_blobstore()).await?.list() {
                 match entry {
                     SkeletonManifestEntry::Directory(..) => {
-                        println!("{}/", MPath::join_opt_element(path.as_ref(), elem));
+                        println!("{}/", path.join_element(Some(elem)));
                     }
                     SkeletonManifestEntry::File => {
-                        println!("{}", MPath::join_opt_element(path.as_ref(), elem));
+                        println!("{}", path.join_element(Some(elem)));
                     }
                 }
             }
         }
-        Some(Entry::Leaf(())) => println!("{}", MPath::display_opt(path.as_ref())),
+        Some(Entry::Leaf(())) => println!("{}", MPath::display_opt(&path)),
         None => {}
     }
 
@@ -154,7 +169,7 @@ async fn subcommand_tree(
     ctx: &CoreContext,
     repo: &BlobRepo,
     csid: ChangesetId,
-    path: Option<MPath>,
+    path: MPath,
     fetch_derived: bool,
     ordered: bool,
 ) -> Result<(), Error> {
@@ -186,7 +201,7 @@ async fn subcommand_tree(
         match entry {
             Entry::Tree(..) => {}
             Entry::Leaf(()) => {
-                println!("{}", MPath::display_opt(path.as_ref()),);
+                println!("{}", MPath::display_opt(&path),);
             }
         };
     }

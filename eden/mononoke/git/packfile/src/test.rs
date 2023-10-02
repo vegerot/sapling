@@ -19,14 +19,16 @@ use gix_hash::ObjectId;
 use gix_object::Object;
 use gix_object::ObjectRef;
 use gix_object::Tag;
+use tempfile::NamedTempFile;
 
 use crate::bundle::BundleWriter;
 use crate::pack::PackfileWriter;
 use crate::types::to_vec_bytes;
+use crate::types::BaseObject;
 use crate::types::PackfileItem;
 
 fn get_objects_stream()
--> anyhow::Result<impl stream::Stream<Item = impl Future<Output = anyhow::Result<Bytes>>>> {
+-> anyhow::Result<impl stream::Stream<Item = impl Future<Output = anyhow::Result<PackfileItem>>>> {
     // Create a few Git objects
     let tag_bytes = Bytes::from(to_vec_bytes(&gix_object::Object::Tag(Tag {
         target: ObjectId::empty_tree(gix_hash::Kind::Sha1),
@@ -47,9 +49,9 @@ fn get_objects_stream()
         }],
     }))?);
     let objects_stream = stream::iter(vec![
-        futures::future::ready(Ok(tag_bytes)),
-        futures::future::ready(Ok(blob_bytes)),
-        futures::future::ready(Ok(tree_bytes)),
+        futures::future::ready(PackfileItem::new_base(tag_bytes)),
+        futures::future::ready(PackfileItem::new_base(blob_bytes)),
+        futures::future::ready(PackfileItem::new_base(tree_bytes)),
     ]);
     Ok(objects_stream)
 }
@@ -69,7 +71,7 @@ fn validate_packitem_creation() -> anyhow::Result<()> {
     let bytes =
         to_vec_bytes(&Object::Tag(tag)).expect("Expected successful Git object serialization");
     // Convert it into a packfile item
-    PackfileItem::new(Bytes::from(bytes)).expect("Expected successful PackfileItem creation");
+    BaseObject::new(Bytes::from(bytes)).expect("Expected successful PackfileItem creation");
     Ok(())
 }
 
@@ -89,7 +91,7 @@ fn validate_packfile_item_encoding() -> anyhow::Result<()> {
         to_vec_bytes(&Object::Tag(tag)).expect("Expected successful Git object serialization");
     // Convert it into a packfile item
     let item =
-        PackfileItem::new(Bytes::from(bytes)).expect("Expected successful PackfileItem creation");
+        BaseObject::new(Bytes::from(bytes)).expect("Expected successful PackfileItem creation");
     let mut encoded_bytes = BytesMut::new();
     item.write_encoded(&mut encoded_bytes, true)
         .expect("Expected successful encoding of packfile item");
@@ -140,11 +142,10 @@ async fn validate_packfile_generation_format() -> anyhow::Result<()> {
     // Retrieve the raw_writer (in this case Vec) back from the PackfileWriter
     let written_content = packfile_writer.into_write();
     // Write the packfile to disk
-    let mut created_file = std::fs::File::create("packfile2")?;
+    let mut created_file = NamedTempFile::new()?;
     created_file.write_all(written_content.as_ref())?;
     // Open the written packfile
-    let opened_packfile =
-        gix_pack::data::File::at(std::path::Path::new("packfile2"), gix_hash::Kind::Sha1);
+    let opened_packfile = gix_pack::data::File::at(created_file.path(), gix_hash::Kind::Sha1);
     // Validate that the packfile gets opened without error
     assert!(opened_packfile.is_ok());
     let opened_packfile = opened_packfile.expect("Expected successful opening of packfile");
@@ -158,8 +159,6 @@ async fn validate_packfile_generation_format() -> anyhow::Result<()> {
         .expect("Expected successful checksum computation");
     // Verify the checksum matches the hash generated when computing the packfile
     assert_eq!(checksum, checksum_from_file);
-    // Delete the created temporary packfile
-    std::fs::remove_file("packfile2").expect("Expected successful deleltion of packfile");
     Ok(())
 }
 
@@ -177,7 +176,9 @@ async fn validate_staggered_packfile_generation() -> anyhow::Result<()> {
     }))?);
     // Validate we are able to write the object to the packfile without errors
     packfile_writer
-        .write(stream::iter(vec![futures::future::ready(Ok(tag_bytes))]))
+        .write(stream::iter(vec![futures::future::ready(
+            PackfileItem::new_base(tag_bytes),
+        )]))
         .await
         .expect("Expected successful write of object to packfile");
     let blob_bytes = Bytes::from(to_vec_bytes(&gix_object::Object::Blob(gix_object::Blob {
@@ -185,7 +186,9 @@ async fn validate_staggered_packfile_generation() -> anyhow::Result<()> {
     }))?);
     // Validate we are able to write the object to the packfile without errors
     packfile_writer
-        .write(stream::iter(vec![futures::future::ready(Ok(blob_bytes))]))
+        .write(stream::iter(vec![futures::future::ready(
+            PackfileItem::new_base(blob_bytes),
+        )]))
         .await
         .expect("Expected successful write of object to packfile");
     let tree_bytes = Bytes::from(to_vec_bytes(&gix_object::Object::Tree(gix_object::Tree {
@@ -197,7 +200,9 @@ async fn validate_staggered_packfile_generation() -> anyhow::Result<()> {
     }))?);
     // Validate we are able to write the object to the packfile without errors
     packfile_writer
-        .write(stream::iter(vec![futures::future::ready(Ok(tree_bytes))]))
+        .write(stream::iter(vec![futures::future::ready(
+            PackfileItem::new_base(tree_bytes),
+        )]))
         .await
         .expect("Expected successful write of object to packfile");
 
@@ -211,11 +216,10 @@ async fn validate_staggered_packfile_generation() -> anyhow::Result<()> {
     // Retrieve the raw_writer (in this case Vec) back from the PackfileWriter
     let written_content = packfile_writer.into_write();
     // Write the packfile to disk
-    let mut created_file = std::fs::File::create("packfile")?;
+    let mut created_file = NamedTempFile::new()?;
     created_file.write_all(written_content.as_ref())?;
     // Open the written packfile
-    let opened_packfile =
-        gix_pack::data::File::at(std::path::Path::new("packfile"), gix_hash::Kind::Sha1);
+    let opened_packfile = gix_pack::data::File::at(created_file.path(), gix_hash::Kind::Sha1);
     // Validate that the packfile gets opened without error
     assert!(opened_packfile.is_ok());
     let opened_packfile = opened_packfile.expect("Expected successful opening of packfile");
@@ -229,8 +233,6 @@ async fn validate_staggered_packfile_generation() -> anyhow::Result<()> {
         .expect("Expected successful checksum computation");
     // Verify the checksum matches the hash generated when computing the packfile
     assert_eq!(checksum, checksum_from_file);
-    // Delete the created temporary packfile
-    std::fs::remove_file("packfile").expect("Expected successful deleltion of packfile");
     Ok(())
 }
 
@@ -252,11 +254,10 @@ async fn validate_roundtrip_packfile_generation() -> anyhow::Result<()> {
     // Retrieve the raw_writer (in this case Vec) back from the PackfileWriter
     let written_content = packfile_writer.into_write();
     // Write the packfile to disk
-    let mut created_file = std::fs::File::create("packfile3")?;
+    let mut created_file = NamedTempFile::new()?;
     created_file.write_all(written_content.as_ref())?;
     // Open the written packfile
-    let opened_packfile =
-        gix_pack::data::File::at(std::path::Path::new("packfile3"), gix_hash::Kind::Sha1);
+    let opened_packfile = gix_pack::data::File::at(created_file.path(), gix_hash::Kind::Sha1);
     // Validate that the packfile gets opened without error
     assert!(opened_packfile.is_ok());
     let opened_packfile = opened_packfile.expect("Expected successful opening of packfile");
@@ -270,8 +271,6 @@ async fn validate_roundtrip_packfile_generation() -> anyhow::Result<()> {
         // Since we used only base objects, the packfile entries should all have is_base() set to true
         assert!(entry.header.is_base());
     }
-    // Delete the created temporary packfile
-    std::fs::remove_file("packfile3").expect("Expected successful deleltion of packfile");
     Ok(())
 }
 
@@ -321,7 +320,9 @@ async fn validate_staggered_bundle_generation() -> anyhow::Result<()> {
     }))?);
     // Validate we are able to write the object to the bundle without errors
     bundle_writer
-        .write(stream::iter(vec![futures::future::ready(Ok(tag_bytes))]))
+        .write(stream::iter(vec![futures::future::ready(
+            PackfileItem::new_base(tag_bytes),
+        )]))
         .await
         .expect("Expected successful write of object to bundle");
     let blob_bytes = Bytes::from(to_vec_bytes(&gix_object::Object::Blob(gix_object::Blob {
@@ -329,7 +330,9 @@ async fn validate_staggered_bundle_generation() -> anyhow::Result<()> {
     }))?);
     // Validate we are able to write the object to the bundle without errors
     bundle_writer
-        .write(stream::iter(vec![futures::future::ready(Ok(blob_bytes))]))
+        .write(stream::iter(vec![futures::future::ready(
+            PackfileItem::new_base(blob_bytes),
+        )]))
         .await
         .expect("Expected successful write of object to bundle");
     let tree_bytes = Bytes::from(to_vec_bytes(&gix_object::Object::Tree(gix_object::Tree {
@@ -337,7 +340,9 @@ async fn validate_staggered_bundle_generation() -> anyhow::Result<()> {
     }))?);
     // Validate we are able to write the object to the bundle without errors
     bundle_writer
-        .write(stream::iter(vec![futures::future::ready(Ok(tree_bytes))]))
+        .write(stream::iter(vec![futures::future::ready(
+            PackfileItem::new_base(tree_bytes),
+        )]))
         .await
         .expect("Expected successful write of object to bundle");
     // Validate we are able to finish writing to the bundle

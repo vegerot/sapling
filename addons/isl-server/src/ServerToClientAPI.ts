@@ -27,10 +27,9 @@ import type {
 import type {ExportStack, ImportedStack} from 'shared/types/stack';
 
 import {Internal} from './Internal';
-import {Repository, absolutePathForFileInRepo} from './Repository';
+import {Repository} from './Repository';
 import {repositoryCache} from './RepositoryCache';
 import {findPublicAncestor, parseExecJson} from './utils';
-import fs from 'fs';
 import {serializeToString, deserializeFromString} from 'isl/src/serialize';
 import {revsetForComparison} from 'shared/Comparison';
 import {randomId, unwrap} from 'shared/utils';
@@ -194,7 +193,7 @@ export default class ServerToClientAPI {
     // This ensures new messages coming in will be queued and handled only with the new repository
     this.currentState = {type: 'loading'};
     const command = this.connection.command ?? 'sl';
-    this.activeRepoRef = repositoryCache.getOrCreate(command, this.logger, newCwd);
+    this.activeRepoRef = repositoryCache.getOrCreate(command, this.logger, this.tracker, newCwd);
     this.activeRepoRef.promise.then(repoOrError => {
       if (repoOrError instanceof Repository) {
         this.setCurrentRepo(repoOrError, newCwd);
@@ -487,25 +486,6 @@ export default class ServerToClientAPI {
         });
         break;
       }
-      case 'deleteFile': {
-        const {filePath} = data;
-        const absolutePath = absolutePathForFileInRepo(filePath, repo);
-        // security: don't trust client messages to allow us to delete files outside the repository
-        if (absolutePath == null) {
-          logger.warn("can't delete file outside of the repo", filePath);
-          return;
-        }
-
-        fs.promises
-          .rm(absolutePath)
-          .then(() => {
-            logger.info('deleted file from filesystem', absolutePath);
-          })
-          .catch(err => {
-            logger.error('unable to delete file', absolutePath, err);
-          });
-        break;
-      }
       case 'requestComparison': {
         const {comparison} = data;
         const diff: Promise<Result<string>> = repo
@@ -563,16 +543,21 @@ export default class ServerToClientAPI {
         break;
       }
       case 'fetchCommitMessageTemplate': {
+        this.handleFetchCommitMessageTemplate(repo);
+        break;
+      }
+      case 'fetchShelvedChanges': {
         repo
-          .runCommand(['debugcommitmessage', 'isl'])
-          .then(result => {
-            const template = result.stdout
-              .replace(repo.IGNORE_COMMIT_MESSAGE_LINES_REGEX, '')
-              .replace(/^<Replace this line with a title. Use 1 line only, 67 chars or less>/, '');
-            this.postMessage({type: 'fetchedCommitMessageTemplate', template});
+          .getShelvedChanges()
+          .then(shelvedChanges => {
+            this.postMessage({
+              type: 'fetchedShelvedChanges',
+              shelvedChanges: {value: shelvedChanges},
+            });
           })
           .catch(err => {
-            logger?.error('Could not fetch commit message template', err);
+            logger?.error('Could not fetch shelved changes', err);
+            this.postMessage({type: 'fetchedShelvedChanges', shelvedChanges: {error: err}});
           });
         break;
       }
@@ -624,9 +609,11 @@ export default class ServerToClientAPI {
         const assumeTrackedArgs = (assumeTracked ?? []).map(path => `--assume-tracked=${path}`);
         const exec = repo.runCommand(
           ['debugexportstack', '-r', revs, ...assumeTrackedArgs],
+          'ExportStackCommand',
           undefined,
           undefined,
           /* don't timeout */ 0,
+          this.tracker,
         );
         const reply = (stack?: ExportStack, error?: string) => {
           this.postMessage({
@@ -644,9 +631,11 @@ export default class ServerToClientAPI {
         const stdinStream = Readable.from(JSON.stringify(data.stack));
         const exec = repo.runCommand(
           ['debugimportstack'],
+          'ImportStackCommand',
           undefined,
           {stdin: stdinStream},
           /* don't timeout */ 0,
+          this.tracker,
         );
         const reply = (imported?: ImportedStack, error?: string) => {
           this.postMessage({type: 'importedStack', imported: imported ?? [], error});
@@ -708,6 +697,40 @@ export default class ServerToClientAPI {
     const listeners = this.listenersByType.get(data.type);
     if (listeners) {
       listeners.forEach(handle => handle(data));
+    }
+  }
+
+  private async handleFetchCommitMessageTemplate(repo: Repository) {
+    const {logger} = repo;
+    try {
+      const [result, customTemplate] = await Promise.all([
+        repo.runCommand(
+          ['debugcommitmessage', 'isl'],
+          'FetchCommitTemplateCommand',
+          undefined,
+          undefined,
+          undefined,
+          this.tracker,
+        ),
+        Internal.getCustomDefaultCommitTemplate?.(),
+      ]);
+
+      let template = result.stdout
+        .replace(repo.IGNORE_COMMIT_MESSAGE_LINES_REGEX, '')
+        .replace(/^<Replace this line with a title. Use 1 line only, 67 chars or less>/, '');
+
+      if (customTemplate?.trim() !== '') {
+        template = customTemplate as string;
+
+        this.tracker.track('UseCustomCommitMessageTemplate');
+      }
+
+      this.postMessage({
+        type: 'fetchedCommitMessageTemplate',
+        template,
+      });
+    } catch (err) {
+      logger?.error('Could not fetch commit message template', err);
     }
   }
 }

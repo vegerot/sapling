@@ -9,8 +9,12 @@ import type {ThemeColor} from './theme';
 import type {PreferredSubmitCommand} from './types';
 import type {ReactNode} from 'react';
 
+import {confirmShouldSubmitEnabledAtom} from './ConfirmSubmitStack';
 import {DropdownField, DropdownFields} from './DropdownFields';
 import {Tooltip} from './Tooltip';
+import {codeReviewProvider} from './codeReview/CodeReviewInfo';
+import {showDiffNumberConfig} from './codeReview/DiffBadge';
+import {SubmitAsDraftCheckbox} from './codeReview/DraftCheckbox';
 import {debugToolsEnabledState} from './debug/DebugToolsState';
 import {t, T} from './i18n';
 import {SetConfigOperation} from './operations/SetConfigOperation';
@@ -24,7 +28,7 @@ import {
   VSCodeLink,
   VSCodeOption,
 } from '@vscode/webview-ui-toolkit/react';
-import {useRecoilState} from 'recoil';
+import {useRecoilState, useRecoilValue} from 'recoil';
 import {Icon} from 'shared/Icon';
 import {unwrap} from 'shared/utils';
 
@@ -44,6 +48,7 @@ function SettingsDropdown() {
   const [theme, setTheme] = useRecoilState(themeState);
   const [repoInfo, setRepoInfo] = useRecoilState(repositoryInfo);
   const runOperation = useRunOperation();
+  const [showDiffNumber, setShowDiffNumber] = useRecoilState(showDiffNumberConfig);
   return (
     <DropdownFields title={<T>Settings</T>} icon="gear" data-testid="settings-dropdown">
       {platform.theme != null ? null : (
@@ -109,8 +114,45 @@ function SettingsDropdown() {
           </VSCodeDropdown>
         </Setting>
       ) : null}
+      <Setting title={<T>Code Review</T>}>
+        <div className="multiple-settings">
+          <VSCodeCheckbox
+            checked={showDiffNumber}
+            onChange={e => {
+              setShowDiffNumber((e.target as HTMLInputElement).checked);
+            }}>
+            <T>Show copyable Diff / Pull Request numbers inline for each commit</T>
+          </VSCodeCheckbox>
+          <ConfirmSubmitStackSetting />
+          <SubmitAsDraftCheckbox forceShow />
+        </div>
+      </Setting>
       <DebugToolsField />
     </DropdownFields>
+  );
+}
+
+function ConfirmSubmitStackSetting() {
+  const [value, setValue] = useRecoilState(confirmShouldSubmitEnabledAtom);
+  const provider = useRecoilValue(codeReviewProvider);
+  if (provider == null || !provider.supportSubmittingAsDraft) {
+    return null;
+  }
+  return (
+    <Tooltip
+      title={t(
+        'This lets you choose to submit as draft and provide an update message. ' +
+          'If false, no confirmation is shown and it will submit as draft if you previously ' +
+          'checked the submit as draft checkbox.',
+      )}>
+      <VSCodeCheckbox
+        checked={value}
+        onChange={e => {
+          setValue((e.target as HTMLInputElement).checked);
+        }}>
+        <T>Show confirmation when submitting a stack</T>
+      </VSCodeCheckbox>
+    </Tooltip>
   );
 }
 

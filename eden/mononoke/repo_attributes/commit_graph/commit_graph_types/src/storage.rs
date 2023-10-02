@@ -141,22 +141,20 @@ pub trait CommitGraphStorage: Send + Sync {
     /// Add many changesets at once. Used for low level stuff like backfilling.
     async fn add_many(&self, ctx: &CoreContext, many_edges: Vec1<ChangesetEdges>) -> Result<usize>;
 
-    /// Returns the changeset graph edges for this changeset.
-    async fn fetch_edges(
+    /// Returns the changeset graph edges for this changeset, or an error if
+    /// this changeset is missing from the commit graph.
+    async fn fetch_edges(&self, ctx: &CoreContext, cs_id: ChangesetId) -> Result<ChangesetEdges>;
+
+    /// Returns the changeset graph edges for this changeset, or None if
+    /// it doesn't exist in the commit graph.
+    async fn maybe_fetch_edges(
         &self,
         ctx: &CoreContext,
         cs_id: ChangesetId,
     ) -> Result<Option<ChangesetEdges>>;
 
-    /// Returns the changeset graph edges for this changeset, or an error of
-    /// this changeset is missing in the commit graph.
-    async fn fetch_edges_required(
-        &self,
-        ctx: &CoreContext,
-        cs_id: ChangesetId,
-    ) -> Result<ChangesetEdges>;
-
-    /// Returns the changeset graph edges for multiple changesets.
+    /// Returns the changeset graph edges for multiple changesets, or an error
+    /// if any of the changesets are missing from the commit graph.
     ///
     /// Prefetch indicates that this request is part of a larger request
     /// involving commits down to a particular generation number, and so
@@ -168,9 +166,10 @@ pub trait CommitGraphStorage: Send + Sync {
         prefetch: Prefetch,
     ) -> Result<HashMap<ChangesetId, ChangesetEdges>>;
 
-    /// Same as fetch_many_edges but returns an error if any of
-    /// the changesets are missing in the commit graph.
-    async fn fetch_many_edges_required(
+    /// Same as fetch_many_edges but doesn't return an error if any of
+    /// the changesets are missing from the commit graph and instead
+    /// only returns edges for found changesets.
+    async fn maybe_fetch_many_edges(
         &self,
         ctx: &CoreContext,
         cs_ids: &[ChangesetId],

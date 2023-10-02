@@ -21,6 +21,7 @@ import {
   parseCommitMessageFields,
   findFieldsBeingEdited,
   emptyCommitMessageFields,
+  allFieldsBeingEdited,
 } from './CommitMessageFields';
 import {atomFamily, selectorFamily, atom, selector} from 'recoil';
 
@@ -68,6 +69,15 @@ export const commitMessageTemplate = atom<EditedMessage | undefined>({
   ],
 });
 
+/** Typed update messages when submitting a commit or set of commits.
+ * Unlike editedCommitMessages, you can't provide an update message when committing the first time,
+ * so we don't need to track this state for 'head'.
+ */
+export const diffUpdateMessagesState = atomFamily<string, Hash>({
+  key: 'diffUpdateMessagesState',
+  default: '',
+});
+
 /**
  * Map of hash -> latest edited commit message, representing any changes made to the commit's message fields.
  * This also stores the state of new commit messages being written, keyed by "head" instead of a commit hash.
@@ -109,13 +119,57 @@ export const editedCommitMessages = atomFamily<EditedMessageUnlessOptimistic, Ha
       },
   }),
 });
-successionTracker.onSuccessions(successions => {
-  for (const [oldHash, newHash] of successions) {
-    const existing = globalRecoil().getLoadable(editedCommitMessages(oldHash));
-    if (existing.state === 'hasValue') {
-      globalRecoil().set(editedCommitMessages(newHash), existing.valueOrThrow());
+function updateEditedCommitMessagesFromSuccessions() {
+  return successionTracker.onSuccessions(successions => {
+    for (const [oldHash, newHash] of successions) {
+      const existing = globalRecoil().getLoadable(editedCommitMessages(oldHash));
+      if (
+        existing.state === 'hasValue' &&
+        // Never copy an "optimistic" message during succession, we have no way to clear it out.
+        // "optimistic" may also correspond to a message which was not edited,
+        // for which the hash no longer exists in the tree.
+        // We should just use the atom's default, which lets it populate correctly.
+        existing.valueOrThrow().type !== 'optimistic'
+      ) {
+        globalRecoil().set(editedCommitMessages(newHash), existing.valueOrThrow());
+      }
+
+      const existingUpdateMessage = globalRecoil().getLoadable(diffUpdateMessagesState(oldHash));
+      if (existingUpdateMessage.state === 'hasValue') {
+        // TODO: this doesn't work if you have multiple commits selected...
+        globalRecoil().set(diffUpdateMessagesState(oldHash), existingUpdateMessage.valueOrThrow());
+      }
     }
-  }
+  });
+}
+let editedCommitMessageSuccessionDisposable = updateEditedCommitMessagesFromSuccessions();
+export const __TEST__ = {
+  renewEditedCommitMessageSuccessionSubscription() {
+    editedCommitMessageSuccessionDisposable();
+    editedCommitMessageSuccessionDisposable = updateEditedCommitMessagesFromSuccessions();
+  },
+};
+
+export const unsavedFieldsBeingEdited = selectorFamily<
+  FieldsBeingEdited | undefined,
+  Hash | 'head'
+>({
+  key: 'unsavedFieldsBeingEdited',
+  get:
+    hash =>
+    ({get}) => {
+      const edited = get(editedCommitMessages(hash));
+      if (edited.type === 'optimistic') {
+        return undefined;
+      }
+      const schema = get(commitMessageFieldsSchema);
+      if (hash === 'head') {
+        return allFieldsBeingEdited(schema);
+      }
+      const [originalTitle, originalDescription] = get(latestCommitMessage(hash));
+      const parsed = parseCommitMessageFields(schema, originalTitle, originalDescription);
+      return findFieldsBeingEdited(schema, edited.fields, parsed);
+    },
 });
 
 export const hasUnsavedEditedCommitMessage = selectorFamily<boolean, Hash | 'head'>({
@@ -123,17 +177,11 @@ export const hasUnsavedEditedCommitMessage = selectorFamily<boolean, Hash | 'hea
   get:
     hash =>
     ({get}) => {
-      const edited = get(editedCommitMessages(hash));
-      if (edited.type === 'optimistic') {
+      const beingEdited = get(unsavedFieldsBeingEdited(hash));
+      if (beingEdited == null) {
         return false;
       }
-      if (hash === 'head') {
-        return Object.values(edited).some(Boolean);
-      }
-      const [originalTitle, originalDescription] = get(latestCommitMessage(hash));
-      const schema = get(commitMessageFieldsSchema);
-      const parsed = parseCommitMessageFields(schema, originalTitle, originalDescription);
-      return Object.values(findFieldsBeingEdited(schema, edited.fields, parsed)).some(Boolean);
+      return Object.values(beingEdited).some(Boolean);
     },
 });
 

@@ -49,7 +49,7 @@ impl SkewAncestorsSet {
         cs_id: ChangesetId,
         base_generation: Generation,
     ) -> Result<()> {
-        let mut edges = storage.fetch_edges_required(ctx, cs_id).await?;
+        let mut edges = storage.fetch_edges(ctx, cs_id).await?;
 
         if self
             .changesets
@@ -74,7 +74,7 @@ impl SkewAncestorsSet {
                         if skip_tree_skew_ancestor.generation >= base_generation =>
                     {
                         edges = storage
-                            .fetch_edges_required(ctx, skip_tree_skew_ancestor.cs_id)
+                            .fetch_edges(ctx, skip_tree_skew_ancestor.cs_id)
                             .await?;
                     }
                     _ => break,
@@ -136,7 +136,7 @@ impl CommitGraph {
 
         let all_edges = self
             .storage
-            .fetch_many_edges_required(ctx, &cs_ids, Prefetch::None)
+            .fetch_many_edges(ctx, &cs_ids, Prefetch::None)
             .await?;
 
         for (cs_id, edges) in all_edges {
@@ -171,7 +171,7 @@ impl CommitGraph {
                 let segment_bases: Vec<_> = segments.into_keys().collect();
                 let all_edges = self
                     .storage
-                    .fetch_many_edges_required(ctx, &segment_bases, Prefetch::None)
+                    .fetch_many_edges(ctx, &segment_bases, Prefetch::None)
                     .await?;
 
                 let parents: Vec<_> = all_edges
@@ -182,7 +182,7 @@ impl CommitGraph {
 
                 let parent_edges = self
                     .storage
-                    .fetch_many_edges_required(ctx, &parents, Prefetch::None)
+                    .fetch_many_edges(ctx, &parents, Prefetch::None)
                     .await?;
 
                 for (cs_id, edges) in parent_edges {
@@ -209,7 +209,7 @@ impl CommitGraph {
         heads: Vec<ChangesetId>,
         common: Vec<ChangesetId>,
     ) -> Result<Vec<ChangesetSegment>> {
-        let base_edges = self.storage.fetch_edges_required(ctx, base).await?;
+        let base_edges = self.storage.fetch_edges(ctx, base).await?;
 
         let mut heads_skew_ancestors_set: SkewAncestorsSet = Default::default();
         let mut common_skew_ancestors_set: SkewAncestorsSet = Default::default();
@@ -289,7 +289,7 @@ impl CommitGraph {
                     let cs_ids: Vec<_> = last_changesets.keys().copied().collect();
                     let all_edges = self
                         .storage
-                        .fetch_many_edges_required(ctx, &cs_ids, Prefetch::None)
+                        .fetch_many_edges(ctx, &cs_ids, Prefetch::None)
                         .await?;
 
                     // Try to lower the highest generation changesets in the frontier to their
@@ -508,7 +508,7 @@ impl CommitGraph {
 
             let all_edges = self
                 .storage
-                .fetch_many_edges_required(ctx, &bases_not_reachable_from_common, Prefetch::None)
+                .fetch_many_edges(ctx, &bases_not_reachable_from_common, Prefetch::None)
                 .await?;
 
             let parents: Vec<_> = all_edges
@@ -519,7 +519,7 @@ impl CommitGraph {
 
             let parent_edges = self
                 .storage
-                .fetch_many_edges_required(ctx, &parents, Prefetch::None)
+                .fetch_many_edges(ctx, &parents, Prefetch::None)
                 .await?;
 
             for (cs_id, edges) in parent_edges {
@@ -562,7 +562,7 @@ impl CommitGraph {
             }
 
             let mut parents = self
-                .changeset_parents_required(ctx, current_cs_id)
+                .changeset_parents(ctx, current_cs_id)
                 .await?
                 .into_iter();
 
@@ -622,7 +622,7 @@ impl CommitGraph {
         let mut union_segments_cs_ids: HashMap<_, _> = Default::default();
 
         for (segment_num, segment) in difference_segments.iter().rev().enumerate() {
-            let parents = self.changeset_parents_required(ctx, segment.base).await?;
+            let parents = self.changeset_parents(ctx, segment.base).await?;
             let segment_parents: SmallVec<[ChangesetId; 1]> =
                 segment.parents.iter().map(|parent| parent.cs_id).collect();
 
@@ -653,7 +653,7 @@ impl CommitGraph {
                     (Some(location), _) => {
                         let location_head_depth = self
                             .storage
-                            .fetch_edges_required(ctx, location.head)
+                            .fetch_edges(ctx, location.head)
                             .await?
                             .node
                             .skip_tree_depth;

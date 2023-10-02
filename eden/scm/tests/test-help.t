@@ -333,7 +333,6 @@ Test extension help:
                      this extension logs different pieces of information that
                      will be used
        megarepo      provides support for cross repo commit resolution
-       memcommit     make commits without a working copy
        morestatus    make status give a bit more context
        myparent
        ownercheck    prevent operations on repos not owned by the current user
@@ -747,7 +746,7 @@ this is a section and erroring out weirdly.
 
   $ cat > helpext.py <<EOF
   > import os
-  > from edenscm import commands, registrar
+  > from sapling import commands, registrar
   > 
   > cmdtable = {}
   > command = registrar.command(cmdtable)
@@ -1031,6 +1030,8 @@ Test list of internal help commands
    debugmetalog  show changes in commit graph over time
    debugmetalogroots
                  list roots stored in metalog
+   debugmigratesymlinks
+                 enables or disables symlink support on a repo on Windows
    debugmutation
                  display the mutation history (or future) of a commit
    debugmutationfromobsmarkers
@@ -1128,8 +1129,6 @@ Test list of internal help commands
    debugvisibleheads
                  print visible heads
    debugwaitonprefetch
-                 (no help text available)
-   debugwaitonrepack
                  (no help text available)
    debugwalk     show how files match on given patterns
    debugwireargs
@@ -1325,7 +1324,7 @@ Test deprecated items
 Test help hooks
 
   $ cat > helphook1.py <<EOF
-  > from edenscm import help
+  > from sapling import help
   > 
   > def rewrite(ui, topic, doc):
   >     return doc + '\nhelphook1\n'
@@ -1334,7 +1333,7 @@ Test help hooks
   >     help.addtopichook('revisions', rewrite)
   > EOF
   $ cat > helphook2.py <<EOF
-  > from edenscm import help
+  > from sapling import help
   > 
   > def rewrite(ui, topic, doc):
   >     return doc + '\nhelphook2\n'
@@ -1453,7 +1452,7 @@ Test omit indicating for help
   > This paragraph is never omitted, too (for extension)
   > '''
   > from __future__ import absolute_import
-  > from edenscm import commands, help
+  > from sapling import commands, help
   > testtopic = """This paragraph is never omitted (for topic).
   > 
   > .. container:: verbose

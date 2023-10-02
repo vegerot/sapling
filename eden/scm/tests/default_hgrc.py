@@ -29,7 +29,7 @@ use-rust=True
 
 [workingcopy]
 use-rust=True
-ruststatus=True
+rust-status=True
 
 [status]
 use-rust=True
@@ -45,7 +45,6 @@ useruststore=True
 
 [remotefilelog]
 reponame=reponame-default
-localdatarepack=True
 cachepath=$TESTTMP/default-hgcache
 
 [mutation]
@@ -58,6 +57,7 @@ ack-match-full-traversal=True
 contentstorefallback=True
 
 [experimental]
+rustmatcher=True
 use-rust-changelog=True
 windows-symlinks=True
 """

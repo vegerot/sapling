@@ -25,6 +25,7 @@ use futures::future::FutureExt;
 use futures::future::TryFutureExt;
 use manifest::derive_manifest_with_io_sender;
 use manifest::derive_manifests_for_simple_stack_of_commits;
+use manifest::flatten_subentries;
 use manifest::Entry;
 use manifest::LeafInfo;
 use manifest::ManifestChanges;
@@ -40,9 +41,10 @@ use mercurial_types::HgFileNodeId;
 use mercurial_types::HgManifestId;
 use mononoke_types::ChangesetId;
 use mononoke_types::FileType;
-use mononoke_types::MPath;
+use mononoke_types::NonRootMPath;
 use mononoke_types::RepoPath;
 use mononoke_types::TrackedFileChange;
+use mononoke_types::TrieMap;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::derive_hg_changeset::store_file_change;
@@ -136,7 +138,7 @@ pub async fn derive_hg_manifest(
     ctx: CoreContext,
     blobstore: Arc<dyn Blobstore>,
     parents: impl IntoIterator<Item = HgManifestId>,
-    changes: impl IntoIterator<Item = (MPath, Option<(FileType, HgFileNodeId)>)> + 'static,
+    changes: impl IntoIterator<Item = (NonRootMPath, Option<(FileType, HgFileNodeId)>)> + 'static,
 ) -> Result<HgManifestId, Error> {
     let parents: Vec<_> = parents
         .into_iter()
@@ -187,6 +189,9 @@ async fn create_hg_manifest(
         Traced<ParentIndex, HgManifestId>,
         Traced<ParentIndex, (FileType, HgFileNodeId)>,
         (),
+        TrieMap<
+            Entry<Traced<ParentIndex, HgManifestId>, Traced<ParentIndex, (FileType, HgFileNodeId)>>,
+        >,
     >,
 ) -> Result<((), Traced<ParentIndex, HgManifestId>), Error> {
     let TreeInfo {
@@ -206,6 +211,8 @@ async fn create_hg_manifest(
     // 2) It adds an additional read of parent manifests, and it can potentially be expensive if manifests
     //    are large.
     //    We'd rather not do it if we don't need to, and it seems that we don't really need to (see point 1)
+
+    let subentries: BTreeMap<_, _> = flatten_subentries(&ctx, &(), subentries).await?.collect();
     if parents.len() > 1 {
         let mut subentries_vec_map = BTreeMap::new();
         for (name, (_context, subentry)) in &subentries {
@@ -322,7 +329,7 @@ async fn create_hg_file(
 async fn resolve_conflict(
     ctx: CoreContext,
     blobstore: Arc<dyn Blobstore>,
-    path: MPath,
+    path: NonRootMPath,
     parents: &[Traced<ParentIndex, (FileType, HgFileNodeId)>],
 ) -> Result<(FileType, HgFileNodeId), Error> {
     let make_err = || {

@@ -170,7 +170,7 @@ tweakdefaults=
 undo=
 
 [extorder]
-fsmonitor=sqldirstate, sparse
+fsmonitor=sparse
 journal=eden
 
 [format]
@@ -223,14 +223,9 @@ publish=False
 
 [remotefilelog]
 cachelimit=20GB
-cleanoldpacks=True
-fastdatapack=True
-historypackv1=True
-localdatarepack=True
 useruststore=True
 manifestlimit=4GB
 http=True
-userustrepack=True
 cachepath=~/.sl_cache
 retryprefetch=True
 fetchpacks=True
@@ -517,10 +512,8 @@ filechangesplain={
 filechangesdetailed={ifeq(verbosity,"verbose",diff()|hgprefix,stat("status")|hgprefix)}\n
 
 [copytrace]
-maxmovescandidatestocheck=0
-
-[perftweaks]
-disablecasecheck=True
+dagcopytrace=True
+hint-with-commit=True
 
 [profiling:background]
 enabled=1

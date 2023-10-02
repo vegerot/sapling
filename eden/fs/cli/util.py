@@ -62,7 +62,7 @@ class NotAnEdenMountError(Exception):
         return f"{self.path} does not appear to be inside an EdenFS checkout"
 
 
-class HealthStatus(object):
+class HealthStatus:
     def __init__(
         self,
         status: fb303_status,
@@ -783,3 +783,12 @@ def hook_recursive_with_spinner(function: Callable, spinner: Spinner):
         return function(*args, **kwargs)
 
     return run
+
+
+if sys.platform == "win32":
+
+    def remove_unc_prefix(path: Path) -> Path:
+        parts = list(path.parts)
+        if re.match(r"\\\\\?\\[A-Za-z]:\\", parts[0]):
+            parts[0] = parts[0][-3:].upper()
+        return Path(*parts)

@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::thread_local;
 
 use anyhow::Result;
@@ -18,7 +19,6 @@ use cached_config::ConfigHandle;
 use futures::future::poll_fn;
 use futures::Future;
 use futures::FutureExt;
-use once_cell::sync::OnceCell;
 use slog::debug;
 use slog::error;
 use slog::warn;
@@ -33,8 +33,8 @@ define_stats! {
     refresh_failure_count: timeseries(Average, Sum, Count),
 }
 
-static TUNABLES: OnceCell<MononokeTunables> = OnceCell::new();
-static TUNABLES_WORKER_STATE: OnceCell<TunablesWorkerState> = OnceCell::new();
+static TUNABLES: OnceLock<MononokeTunables> = OnceLock::new();
+static TUNABLES_WORKER_STATE: OnceLock<TunablesWorkerState> = OnceLock::new();
 
 thread_local! {
     static TUNABLES_OVERRIDE: RefCell<Option<Arc<MononokeTunables>>> = RefCell::new(None);
@@ -128,7 +128,6 @@ pub struct MononokeTunables {
     disable_running_hooks_in_pushredirected_repo: TunableBool,
     scs_request_read_qps: TunableI64,
     scs_request_write_qps: TunableI64,
-    enable_logging_commit_rewrite_data: TunableBool,
     // All blobstore read request with size bigger than
     // this threshold will be logged to scuba
     blobstore_read_size_logging_threshold: TunableI64,
@@ -150,12 +149,6 @@ pub struct MononokeTunables {
     multiplex_blobstore_background_session_timeout_ms: TunableI64,
 
     allow_change_xrepo_mapping_extra: TunableBool,
-
-    // Disable EdenAPI in http_service.
-    disable_http_service_edenapi: TunableBool,
-
-    // Disable putting hydrating manifests in .hg
-    disable_hydrating_manifests_in_dot_hg: TunableBool,
 
     // Rendez vous configuration.
     rendezvous_dispatch_delay_ms: TunableI64,
@@ -221,16 +214,10 @@ pub struct MononokeTunables {
     // Disable the parallel derivation for DM and default to serial
     deleted_manifest_disable_new_parallel_derivation: TunableBool,
 
-    // Not in use.
-    // TODO(mitrandir): clean it up
-    fastlog_use_mutable_renames: TunableBoolByRepo,
     // Disable mutable renames for fastlog in case they cause problems.
     fastlog_disable_mutable_renames: TunableBoolByRepo,
     megarepo_api_dont_set_file_mutable_renames: TunableBool,
     megarepo_api_dont_set_directory_mutable_renames: TunableBool,
-
-    force_unode_v2: TunableBool,
-    fastlog_use_gen_num_traversal: TunableBool,
 
     // Changing the value of this tunable forces all mononoke instances
     // to reload segmented changelog. One can also specify jitter (or use default)
@@ -339,6 +326,8 @@ pub struct MononokeTunables {
     disable_basename_suffix_skeleton_manifest: TunableBool,
     // Enable using BSSM for suffix queries. Might be inneficient for broad suffixes (like .php)
     enable_bssm_suffix_query: TunableBool,
+    // Enable using optimized BSSM derivation.
+    enable_bssm_optimized_derivation: TunableBool,
 
     // List of targets in AOSP megarepo to apply squashing config overrides
     megarepo_squashing_config_override_targets: TunableVecOfStringsByRepo,

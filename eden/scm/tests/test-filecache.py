@@ -4,8 +4,9 @@ import os
 import subprocess
 import sys
 
-from edenscm import extensions, hg, localrepo, ui as uimod, util, vfs as vfsmod
 from hghave import require
+
+from sapling import extensions, hg, localrepo, ui as uimod, util, vfs as vfsmod
 
 
 require(["py2"])
@@ -17,11 +18,11 @@ except NameError:
     xrange = range
 
 
-class fakerepo(object):
+class fakerepo:
     def __init__(self):
         self._filecache = {}
 
-    class fakevfs(object):
+    class fakevfs:
         def join(self, p):
             return p
 

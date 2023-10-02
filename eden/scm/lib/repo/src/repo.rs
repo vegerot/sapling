@@ -11,7 +11,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[cfg(feature = "wdir")]
 use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
@@ -37,7 +36,6 @@ use revisionstore::scmstore::TreeStoreBuilder;
 use revisionstore::trait_impls::ArcFileStore;
 use revisionstore::EdenApiFileStore;
 use revisionstore::EdenApiTreeStore;
-use revisionstore::MemcacheStore;
 use revsets::errors::RevsetLookupError;
 use revsets::utils as revset_utils;
 use storemodel::ReadFileContents;
@@ -321,11 +319,8 @@ impl Repo {
             Some(eden_api) => Ok(eden_api.clone()),
             None => {
                 tracing::trace!(target: "repo::eden_api", "creating edenapi");
-                let correlator = edenapi::DEFAULT_CORRELATOR.as_str();
                 tracing::trace!(target: "repo::eden_api", "getting edenapi builder");
-                let eden_api = Builder::from_config(&self.config)?
-                    .correlator(Some(correlator))
-                    .build()?;
+                let eden_api = Builder::from_config(&self.config)?.build()?;
                 tracing::info!(url=eden_api.url(), path=?self.path, "EdenApi built");
                 self.eden_api = Some(eden_api.clone());
                 Ok(eden_api)
@@ -489,9 +484,7 @@ impl Repo {
         let eden_api = self.optional_eden_api()?;
 
         tracing::trace!(target: "repo::file_store", "building filestore");
-        let mut file_builder = FileStoreBuilder::new(self.config())
-            .local_path(self.store_path())
-            .correlator(edenapi::DEFAULT_CORRELATOR.as_str());
+        let mut file_builder = FileStoreBuilder::new(self.config()).local_path(self.store_path());
 
         if let Some(eden_api) = eden_api {
             tracing::trace!(target: "repo::file_store", "enabling edenapi");
@@ -504,15 +497,6 @@ impl Repo {
         tracing::trace!(target: "repo::file_store", "configuring aux data");
         if self.config.get_or_default("scmstore", "auxindexedlog")? {
             file_builder = file_builder.store_aux_data();
-        }
-
-        tracing::trace!(target: "repo::file_store", "configuring memcache");
-        if self
-            .config
-            .get_nonempty("remotefilelog", "cachekey")
-            .is_some()
-        {
-            file_builder = file_builder.memcache(Arc::new(MemcacheStore::new(&self.config)?));
         }
 
         tracing::trace!(target: "repo::file_store", "building file store");
@@ -752,18 +736,14 @@ impl Repo {
             tracing::trace!(target: "repo::file_store", "creating EagerRepo file and tree store");
             return Ok(Some((store.clone(), store)));
         }
-        return Ok(None);
-    }
-
-    pub fn correlator(&self) -> &'static str {
-        edenapi::DEFAULT_CORRELATOR.as_str()
+        Ok(None)
     }
 }
 
 fn read_sharedpath(dot_path: &Path) -> Result<Option<(PathBuf, identity::Identity)>> {
     let sharedpath = fs::read_to_string(dot_path.join("sharedpath"))
         .ok()
-        .map(|s| PathBuf::from(s))
+        .map(PathBuf::from)
         .and_then(|p| Some(PathBuf::from(p.parent()?)));
 
     if let Some(mut possible_path) = sharedpath {

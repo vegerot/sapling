@@ -2,15 +2,16 @@ from __future__ import absolute_import, print_function
 
 import os
 
-from edenscm import context, encoding, hg, pycompat, scmutil, ui as uimod
-from edenscm.node import hex
 from hghave import require
+
+from sapling import context, encoding, hg, pycompat, scmutil, ui as uimod
+from sapling.node import hex
 
 
 u = uimod.ui.load()
 u.setconfig("extensions", "treemanifest", "!")
 u.setconfig("devel", "segmented-changelog-rev-compat", "true")
-u.setconfig("workingcopy", "ruststatus", False)
+u.setconfig("workingcopy", "rust-status", False)
 
 repo = hg.repository(u, "test1", create=1)
 os.chdir("test1")

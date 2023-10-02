@@ -23,8 +23,8 @@ use manifest::ManifestOps;
 use mercurial_derivation::DeriveHgChangeset;
 use mercurial_types::HgFileNodeId;
 use mercurial_types::HgManifestId;
-use mercurial_types::MPath;
 use mononoke_types::hash::GitSha1;
+use mononoke_types::path::MPath;
 use mononoke_types::FileType;
 use repo_blobstore::RepoBlobstoreRef;
 use slog::Logger;
@@ -159,7 +159,7 @@ async fn fetch_entry(
 
     let ret = hg_cs
         .manifestid()
-        .find_entry(ctx.clone(), repo.repo_blobstore().clone(), Some(mpath))
+        .find_entry(ctx.clone(), repo.repo_blobstore().clone(), mpath)
         .await?
         .ok_or_else(|| format_err!("Path does not exist: {}", path))?;
 

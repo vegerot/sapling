@@ -71,6 +71,12 @@
   max-width: unset;
 }
 
+.changed-files-pages-buttons {
+  display: flex;
+  align-items: center;
+  gap: var(--halfpad);
+}
+
 .file-tree-level .file-tree-level:before {
   content: '';
   position: absolute;
@@ -94,6 +100,50 @@
   margin-right: var(--halfpad);
   transition: color 0.1s;
   line-height: 30px;
+  /* when files are expanded with chunk selection, use position sticky to keep showing path at the top */
+  position: sticky;
+  top: 0;
+  background-color: var(--background);
+  z-index: 10;
+}
+
+.changed-files-list .changed-file:nth-child(n + 15):last-child {
+  margin-bottom: 10px;
+}
+
+.changed-files .banner {
+  padding: var(--pad);
+  margin: var(--pad) 0;
+  max-width: 500px;
+}
+
+.changed-files-list-container {
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow-y: hidden;
+}
+
+.changed-files-list {
+  --changed-files-list-height: 500px;
+  --changed-files-overflow-color: var(--background);
+  overflow-y: scroll;
+  max-height: var(--changed-files-list-height);
+}
+
+.changed-files-list:after {
+  --overflow-gradient-height: 20px;
+  display: block;
+  content: ' ';
+  width: 100%;
+  height: var(--overflow-gradient-height);
+  background: linear-gradient(transparent, var(--changed-files-overflow-color));
+  z-index: 10;
+  position: absolute;
+  bottom: 0px;
+  left: 0;
+  top: calc(var(--changed-files-list-height) - var(--overflow-gradient-height));
+  pointer-events: none;
 }
 
 .changed-file-path {
@@ -162,6 +212,9 @@
 }
 .changed-file:hover .file-show-on-hover {
   opacity: 1;
+}
+.uncommitted-changes:hover vscode-button:disabled.show-on-hover {
+  opacity: 0.4;
 }
 
 .changed-file-list .button-rows,

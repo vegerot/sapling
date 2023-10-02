@@ -6,8 +6,7 @@
  */
 
 import App from '../App';
-import {__TEST__} from '../Tooltip';
-import {ignoreRTL} from '../testQueries';
+import {ignoreRTL, CommitInfoTestUtils} from '../testQueries';
 import {
   expectMessageSentToServer,
   simulateCommits,
@@ -19,6 +18,7 @@ import {
   simulateMessageFromServer,
 } from '../testUtils';
 import {fireEvent, render, screen} from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import {act} from 'react-dom/test-utils';
 
 jest.mock('../MessageBus');
@@ -26,7 +26,6 @@ jest.mock('../MessageBus');
 describe('Changed Files', () => {
   beforeEach(() => {
     resetTestMessages();
-    __TEST__.resetMemoizedTooltipContainer();
     render(<App />);
     act(() => {
       simulateRepoConnected();
@@ -142,6 +141,20 @@ describe('Changed Files', () => {
         screen.getByText(ignoreRTL('src/subfolder/another/yet/another/file5.js')),
       ).toBeInTheDocument();
     });
+
+    it('shows full paths when holding alt', () => {
+      expect(screen.queryByText(ignoreRTL('src/b/foo.js'))).not.toBeInTheDocument();
+      act(() => {
+        userEvent.keyboard('{Alt>}'); // '>' means keep pressed
+      });
+      expect(screen.getByText(ignoreRTL('file1.js'))).toBeInTheDocument();
+      expect(screen.getByText(ignoreRTL('src/file2.js'))).toBeInTheDocument();
+      expect(screen.getByText(ignoreRTL('src/a/foo.js'))).toBeInTheDocument();
+      expect(screen.getByText(ignoreRTL('src/b/foo.js'))).toBeInTheDocument();
+      expect(
+        screen.getByText(ignoreRTL('src/subfolder/another/yet/another/file5.js')),
+      ).toBeInTheDocument();
+    });
   });
 
   describe('one-letter-per-directory file paths', () => {
@@ -213,6 +226,118 @@ describe('Changed Files', () => {
       });
       expect(screen.queryByText(ignoreRTL('file1.js'))).not.toBeInTheDocument();
       expect(screen.queryByText(ignoreRTL('file3.js'))).toBeInTheDocument();
+    });
+  });
+
+  describe('truncated list of changed files', () => {
+    it('only first 25 files are shown', () => {
+      act(() => {
+        simulateUncommittedChangedFiles({
+          value: new Array(100).fill(null).map((_, i) => ({path: `file${i}.txt`, status: 'M'})),
+        });
+      });
+      const files = screen.getAllByText(/file\d+\.txt/);
+      expect(files).toHaveLength(25);
+    });
+
+    it('banner is shown if some files are hidden', () => {
+      act(() => {
+        simulateUncommittedChangedFiles({
+          value: new Array(100).fill(null).map((_, i) => ({path: `file${i}.txt`, status: 'M'})),
+        });
+      });
+      expect(screen.getByText('Showing first 25 files out of 100 total')).toBeInTheDocument();
+    });
+
+    it('if more than 25 files are provided, there are page navigation buttons', () => {
+      act(() => {
+        simulateUncommittedChangedFiles({
+          value: new Array(52).fill(null).map((_, i) => ({path: `src/file${i}.js`, status: 'M'})),
+        });
+      });
+      expect(screen.getByTestId('changed-files-next-page')).toBeInTheDocument();
+      expect(screen.getByTestId('changed-files-previous-page')).toBeInTheDocument();
+      expect(screen.getByTestId('changed-files-previous-page')).toBeDisabled();
+      expect(screen.getByText('Showing first 25 files out of 52 total')).toBeInTheDocument();
+    });
+
+    it('can click buttons to navigate pages', () => {
+      act(() => {
+        simulateUncommittedChangedFiles({
+          value: new Array(52).fill(null).map((_, i) => ({path: `src/file${i}.js`, status: 'M'})),
+        });
+      });
+      fireEvent.click(screen.getByTestId('changed-files-next-page'));
+      expect(screen.getByText('Showing files 26 – 50 out of 52 total')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('changed-files-next-page'));
+      expect(screen.getByText('Showing files 51 – 52 out of 52 total')).toBeInTheDocument();
+
+      expect(screen.getByTestId('changed-files-next-page')).toBeDisabled();
+
+      fireEvent.click(screen.getByTestId('changed-files-previous-page'));
+      expect(screen.getByText('Showing files 26 – 50 out of 52 total')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('changed-files-previous-page'));
+      expect(screen.getByText('Showing first 25 files out of 52 total')).toBeInTheDocument();
+    });
+
+    it("if more than 25 files exist, but only 25 are provided, don't show pagination buttons", () => {
+      act(() => {
+        simulateUncommittedChangedFiles({
+          value: [],
+        });
+        simulateCommits({
+          value: [
+            COMMIT('1', 'some public base', '0', {phase: 'public'}),
+            COMMIT('a', 'Commit', '1', {
+              isHead: true,
+              filesSample: new Array(25)
+                .fill(null)
+                .map((_, i) => ({path: `src/file${i}.js`, status: 'M'})),
+              totalFileCount: 52,
+            }),
+          ],
+        });
+        CommitInfoTestUtils.openCommitInfoSidebar();
+      });
+
+      const changedFiles = CommitInfoTestUtils.withinCommitInfo().getByTestId('changed-files');
+      expect(changedFiles).toBeInTheDocument();
+
+      // banner shows truncation
+      expect(
+        CommitInfoTestUtils.withinCommitInfo().getByText('Showing first 25 files out of 52 total'),
+      ).toBeInTheDocument();
+
+      // but no pagination buttons, since we only provide first 25 anyway
+      expect(
+        CommitInfoTestUtils.withinCommitInfo().queryByTestId('changed-files-next-page'),
+      ).not.toBeInTheDocument();
+      expect(
+        CommitInfoTestUtils.withinCommitInfo().queryByTestId('changed-files-previous-page'),
+      ).not.toBeInTheDocument();
+    });
+
+    it('if the number of files changes, restrict the page number to fit', () => {
+      act(() => {
+        simulateUncommittedChangedFiles({
+          value: new Array(102).fill(null).map((_, i) => ({path: `src/file${i}.js`, status: 'M'})),
+        });
+      });
+      fireEvent.click(screen.getByTestId('changed-files-next-page'));
+      fireEvent.click(screen.getByTestId('changed-files-next-page'));
+      fireEvent.click(screen.getByTestId('changed-files-next-page'));
+      fireEvent.click(screen.getByTestId('changed-files-next-page'));
+      expect(screen.getByText('Showing files 101 – 102 out of 102 total')).toBeInTheDocument();
+
+      // now some file changes are removed (e.g. discarded)
+      act(() => {
+        simulateUncommittedChangedFiles({
+          value: new Array(40).fill(null).map((_, i) => ({path: `src/file${i}.js`, status: 'M'})),
+        });
+      });
+
+      // ranges are remapped
+      expect(screen.getByText('Showing files 26 – 40 out of 40 total')).toBeInTheDocument();
     });
   });
 });

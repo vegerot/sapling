@@ -85,6 +85,9 @@ if sys.platform == "win32":
             "test_writing_untracked_file_bumps_write_counter",  # counter not implemented for PrjFS (T147665665)
             "test_summary_counters_available",  # counter not implemented for PrjFS (T147669123)
         ],
+        "stats_test.ObjectCacheStatsTest": [
+            "test_get_tree_memory",  # unloadInodeForPath not implemented
+        ],
         "stop_test.AutoStopTest": True,
         "stop_test.StopTestAdHoc": True,
         "stop_test.StopTestManaged": True,
@@ -114,9 +117,7 @@ if sys.platform == "win32":
             "test_grep_directory_from_root",
             "test_grep_directory_from_subdirectory",
         ],
-        "hg.rebase_test.RebaseTest": [
-            "test_rebase_commit_with_independent_folder"
-        ],
+        "hg.rebase_test.RebaseTest": ["test_rebase_commit_with_independent_folder"],
         "hg.rm_test.RmTest": [
             "test_rm_directory_with_modification",
             "test_rm_modified_file_permissions",
@@ -136,10 +137,16 @@ if sys.platform == "win32":
         "hg.update_test.UpdateTest": [
             # TODO: A \r\n is used
             "test_mount_state_during_unmount_with_in_progress_checkout",
+            # Windows doesn't support executable files; mode changes are no-op
+            "test_mode_change_with_no_content_change",
         ],
-        "hg.update_test.UpdateTestTreeOnlyInMemory": [
-            # kill and restart Eden
-            "test_resume_interrupted_update"
+        "hg.storage_engine_test.FailsToOpenLocalStoreTest": [
+            # takeover unsupported on Windows
+            "test_restart_eden_with_local_store_that_fails_to_open"
+        ],
+        "hg.storage_engine_test.FailsToOpenLocalStoreTestWithMounts": [
+            # takeover unsupported on Windows
+            "test_restart_eden_with_local_store_that_fails_to_open"
         ],
         "stale_inode_test.StaleInodeTestHgNFS": True,
         "windows_fsck_test.WindowsFsckTestHg": [
@@ -173,9 +180,16 @@ elif sys.platform.startswith("darwin"):
         "test_status_thrift_apis",
     ]
 
-    # update fails because new file created while checkout operation in progress
+    # Times out on macOS
+    TEST_DISABLED["stats_test.ObjectCacheStatsTest"] = [
+        "test_get_tree_memory",
+    ]
+
     TEST_DISABLED["hg.update_test.UpdateTestTreeOnly"] = [
+        # update fails because new file created while checkout operation in progress
         "test_change_casing_with_untracked",
+        # TODO(T163970408)
+        "test_mount_state_during_unmount_with_in_progress_checkout",
     ]
 
     # Assertion error and invalid argument
@@ -276,6 +290,11 @@ elif sys.platform.startswith("darwin"):
     # flakey (actual timing doesn't match expected timing)
     TEST_DISABLED["config_test.ConfigTest"] = True
 
+    if "SANDCASTLE" in os.environ:
+        # S362020: Redirect tests leave behind garbage on macOS Sandcastle hosts
+        TEST_DISABLED["redirect_test.RedirectTest"] = True
+
+
 # Windows specific tests
 if sys.platform != "win32":
     TEST_DISABLED.update(
@@ -294,15 +313,20 @@ if sys.platform != "win32":
         }
     )
 
+
 def _have_ntapi_extension_module() -> bool:
     if sys.platform != "win32":
         return False
 
     try:
-        from eden.integration.lib.ntapi import get_directory_entry_size  # @manual # @nolint
+        from eden.integration.lib.ntapi import (  # @manual  # @nolint
+            get_directory_entry_size,
+        )
+
         return True
     except ImportError:
         return False
+
 
 # ProjFS enumeration tests depend on a Python extension module, which may not be
 # available with all build systems.

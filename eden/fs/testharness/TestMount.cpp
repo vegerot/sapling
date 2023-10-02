@@ -17,7 +17,7 @@
 #include <folly/portability/GTest.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include "eden/common/utils/ProcessNameCache.h"
+#include "eden/common/utils/ProcessInfoCache.h"
 #include "eden/fs/config/CheckoutConfig.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/inodes/EdenDispatcherFactory.h"
@@ -38,6 +38,7 @@
 #include "eden/fs/store/MemoryLocalStore.h"
 #include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/store/TreeCache.h"
+#include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/IHiveLogger.h"
 #include "eden/fs/telemetry/NullStructuredLogger.h"
 #include "eden/fs/testharness/FakeBackingStore.h"
@@ -138,7 +139,8 @@ bool TestMountFile::operator==(const TestMountFile& other) const {
 TestMount::TestMount(bool enableActivityBuffer, CaseSensitivity caseSensitivity)
     : blobCache_{BlobCache::create(
           kBlobCacheMaximumSize,
-          kBlobCacheMinimumEntries)},
+          kBlobCacheMinimumEntries,
+          makeRefPtr<EdenStats>())},
       privHelper_{make_shared<FakePrivHelper>()},
       serverExecutor_{make_shared<folly::ManualExecutor>()} {
   // Initialize the temporary directory.
@@ -171,7 +173,7 @@ TestMount::TestMount(bool enableActivityBuffer, CaseSensitivity caseSensitivity)
       privHelper_,
       make_shared<UnboundedQueueExecutor>(serverExecutor_),
       clock_,
-      make_shared<ProcessNameCache>(),
+      make_shared<ProcessInfoCache>(),
       make_shared<NullStructuredLogger>(),
       make_shared<NullHiveLogger>(),
       reloadableConfig,
@@ -311,7 +313,7 @@ void TestMount::createMount(
       backingStore_,
       treeCache_,
       stats_.copy(),
-      std::make_shared<ProcessNameCache>(),
+      std::make_shared<ProcessInfoCache>(),
       std::make_shared<NullStructuredLogger>(),
       edenConfig_,
       config_->getEnableWindowsSymlinks(),
@@ -445,7 +447,7 @@ void TestMount::remount() {
       backingStore_,
       treeCache_,
       stats_.copy(),
-      std::make_shared<ProcessNameCache>(),
+      std::make_shared<ProcessInfoCache>(),
       std::make_shared<NullStructuredLogger>(),
       edenConfig_,
       config->getEnableWindowsSymlinks(),
@@ -487,7 +489,7 @@ void TestMount::remountGracefully() {
       backingStore_,
       treeCache_,
       stats_.copy(),
-      std::make_shared<ProcessNameCache>(),
+      std::make_shared<ProcessInfoCache>(),
       std::make_shared<NullStructuredLogger>(),
       edenConfig_,
       config->getEnableWindowsSymlinks(),

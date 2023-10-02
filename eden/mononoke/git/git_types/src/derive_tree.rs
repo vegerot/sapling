@@ -26,9 +26,10 @@ use futures::future::ready;
 use futures::stream::FuturesUnordered;
 use futures::stream::TryStreamExt;
 use manifest::derive_manifest;
+use manifest::flatten_subentries;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
-use mononoke_types::MPath;
+use mononoke_types::NonRootMPath;
 
 use crate::errors::MononokeGitError;
 use crate::upload_git_object;
@@ -113,7 +114,7 @@ async fn derive_git_manifest<B: Blobstore + Clone + 'static>(
     ctx: &CoreContext,
     blobstore: B,
     parents: Vec<TreeHandle>,
-    changes: Vec<(MPath, Option<BlobHandle>)>,
+    changes: Vec<(NonRootMPath, Option<BlobHandle>)>,
 ) -> Result<TreeHandle, Error> {
     let handle = derive_manifest(
         ctx.clone(),
@@ -123,16 +124,15 @@ async fn derive_git_manifest<B: Blobstore + Clone + 'static>(
         {
             cloned!(ctx, blobstore);
             move |tree_info| {
-                let members = tree_info
-                    .subentries
-                    .into_iter()
-                    .map(|(p, (_, entry))| (p, entry.into()))
-                    .collect();
-
-                let builder = TreeBuilder::new(members);
-                let (mut tree_bytes_without_header, tree) = builder.into_tree_with_bytes();
                 cloned!(ctx, blobstore);
                 async move {
+                    let members = flatten_subentries(&ctx, &(), tree_info.subentries)
+                        .await?
+                        .map(|(p, (_, entry))| (p, entry.into()))
+                        .collect();
+
+                    let builder = TreeBuilder::new(members);
+                    let (mut tree_bytes_without_header, tree) = builder.into_tree_with_bytes();
                     // Store the raw git tree before storing the thrift version
                     let oid = tree.handle().oid();
                     let git_hash =
@@ -181,7 +181,7 @@ pub async fn get_file_changes<B: Blobstore + Clone>(
     blobstore: &B,
     ctx: &CoreContext,
     bcs: BonsaiChangeset,
-) -> Result<Vec<(MPath, Option<BlobHandle>)>, Error> {
+) -> Result<Vec<(NonRootMPath, Option<BlobHandle>)>, Error> {
     bcs.into_mut()
         .file_changes
         .into_iter()

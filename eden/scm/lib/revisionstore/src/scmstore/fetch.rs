@@ -21,7 +21,7 @@ use crate::scmstore::value::StoreValue;
 
 #[derive(Debug)]
 pub enum FetchMode {
-    /// The fetch may hit memcache or other servers.
+    /// The fetch may hit remote servers.
     AllowRemote,
     /// The fetch is limited to RAM and disk.
     LocalOnly,
@@ -105,7 +105,7 @@ impl<T: StoreValue> CommonFetchState<T> {
             }
         };
 
-        return false;
+        false
     }
 
     pub(crate) fn results(mut self, errors: FetchErrors) {
@@ -128,7 +128,7 @@ impl<T: StoreValue> CommonFetchState<T> {
         for (key, errors) in incomplete {
             let _ = self
                 .found_tx
-                .send(Err(KeyFetchError::KeyedError { key, errors }.into()));
+                .send(Err(KeyFetchError::KeyedError { key, errors }));
         }
 
         for err in errors.other_errors {
@@ -153,8 +153,8 @@ impl<T: StoreValue> CommonFetchState<T> {
             (available, fetchable)
         };
         let missing = self.request_attrs - available;
-        let actionable = missing & fetchable;
-        actionable
+
+        missing & fetchable
     }
 }
 

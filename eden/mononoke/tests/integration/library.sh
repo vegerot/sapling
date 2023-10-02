@@ -576,7 +576,7 @@ edenapi.prefix=localhost
 edenapi.cacerts=$TEST_CERTDIR/root-ca.crt
 [workingcopy]
 use-rust=False
-ruststatus=False
+rust-status=False
 [status]
 use-rust=False
 EOF
@@ -1617,7 +1617,7 @@ cachepath=$TESTTMP/cachepath
 server=True
 shallowtrees=True
 [workingcopy]
-ruststatus=False
+rust-status=False
 use-rust=False
 [status]
 use-rust=False
@@ -2024,6 +2024,16 @@ function default_setup() {
 pushrebase =
 remotenames =
 EOF
+}
+
+function gitexport() {
+  log="$TESTTMP/gitexport.out"
+
+  "$MONONOKE_GITEXPORT" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
+    --mononoke-config-path "${TESTTMP}/mononoke-config" \
+    "$@"
 }
 
 function gitimport() {

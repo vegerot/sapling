@@ -6,6 +6,7 @@
  */
 
 import type {CodeReviewProvider} from './CodeReviewProvider';
+import type {TrackEventName} from './analytics/eventNames';
 import type {ServerSideTracker} from './analytics/serverSideTracker';
 import type {Logger} from './logger';
 import type {ExecaError} from 'execa';
@@ -33,6 +34,7 @@ import type {
   RepoRelativePath,
   FetchedUncommittedChanges,
   FetchedCommits,
+  ShelvedChange,
 } from 'isl/src/types';
 import type {Comparison} from 'shared/Comparison';
 
@@ -54,7 +56,7 @@ import {RateLimiter} from 'shared/RateLimiter';
 import {TypedEventEmitter} from 'shared/TypedEventEmitter';
 import {exists} from 'shared/fs';
 import {removeLeadingPathSep} from 'shared/pathUtils';
-import {notEmpty, unwrap} from 'shared/utils';
+import {notEmpty, randomId, unwrap} from 'shared/utils';
 
 export const COMMIT_END_MARK = '<<COMMIT_END_MARK>>';
 export const NULL_CHAR = '\0';
@@ -130,8 +132,22 @@ function fromEntries<V>(entries: Array<[string, V]>): {
 const FIELD_INDEX = fromEntries(Object.keys(FIELDS).map((key, i) => [key, i])) as {
   [key in Required<keyof typeof FIELDS>]: number;
 };
-
 const FETCH_TEMPLATE = [...Object.values(FIELDS), COMMIT_END_MARK].join('\n');
+
+const SHELVE_FIELDS = {
+  hash: '{node}',
+  name: '{shelvename}',
+  author: '{author}',
+  date: '{date|isodatesec}',
+  filesAdded: '{file_adds|json}',
+  filesModified: '{file_mods|json}',
+  filesRemoved: '{file_dels|json}',
+  description: '{desc}',
+};
+const SHELVE_FIELD_INDEX = fromEntries(Object.keys(SHELVE_FIELDS).map((key, i) => [key, i])) as {
+  [key in Required<keyof typeof SHELVE_FIELDS>]: number;
+};
+const SHELVE_FETCH_TEMPLATE = [...Object.values(SHELVE_FIELDS), COMMIT_END_MARK].join('\n');
 
 /**
  * This class is responsible for providing information about the working copy
@@ -181,7 +197,16 @@ export class Repository {
   ];
 
   /**  Prefer using `RepositoryCache.getOrCreate()` to access and dispose `Repository`s. */
-  constructor(public info: ValidatedRepoInfo, public logger: Logger) {
+  constructor(
+    public info: ValidatedRepoInfo,
+    public logger: Logger,
+    /** Analytics Tracker that was valid when this repo was created. Since Repository's can be reused,
+     * there may be other trackers associated with this repo, which are not accounted for.
+     * This tracker should only be used for things that are shared among multiple consumers of this repo,
+     * like uncommitted changes.
+     */
+    public trackerBestEffort: ServerSideTracker,
+  ) {
     const remote = info.codeReviewSystem;
     if (remote.type === 'github') {
       this.codeReviewProvider = new GitHubCodeReviewProvider(remote, logger);
@@ -239,7 +264,10 @@ export class Repository {
           );
         } else if (operation.runner === CommandRunner.InternalArcanist) {
           const normalizedArgs = this.normalizeOperationArgs(cwd, operation.args);
-          Internal.runArcanistCommand?.(cwd, normalizedArgs, handleCommandProgress, signal);
+          return (
+            Internal.runArcanistCommand?.(cwd, normalizedArgs, handleCommandProgress, signal) ??
+            Promise.resolve()
+          );
         }
         return Promise.resolve();
       },
@@ -335,7 +363,10 @@ export class Repository {
     try {
       // TODO: is this command fast on large files? it includes full conflicting file contents!
       // `sl resolve --list --all` does not seem to give any way to disambiguate (all conflicts resolved) and (not in merge)
-      const proc = await this.runCommand(['resolve', '--tool', 'internal:dumpjson', '--all']);
+      const proc = await this.runCommand(
+        ['resolve', '--tool', 'internal:dumpjson', '--all'],
+        'GetConflictsCommand',
+      );
       output = JSON.parse(proc.stdout) as ResolveCommandConflictOutput;
     } catch (err) {
       this.logger.error(`failed to check for merge conflicts: ${err}`);
@@ -469,11 +500,7 @@ export class Repository {
    * Called by this.operationQueue in response to runOrQueueOperation when an operation is ready to actually run.
    */
   private async runOperation(
-    operation: {
-      id: string;
-      args: Array<CommandArg>;
-      stdin?: string;
-    },
+    operation: RunnableOperation,
     onProgress: OperationCommandProgressReporter,
     cwd: string,
     signal: AbortSignal,
@@ -485,6 +512,7 @@ export class Repository {
       cwdRelativeArgs,
       cwd,
       stdin ? {input: stdin} : undefined,
+      Internal.additionalEnvForCommand?.(operation),
     );
 
     this.logger.log('run operation: ', command, cwdRelativeArgs.join(' '));
@@ -535,7 +563,7 @@ export class Repository {
     try {
       this.uncommittedChangesBeginFetchingEmitter.emit('start');
       // Note `status -tjson` run with PLAIN are repo-relative
-      const proc = await this.runCommand(['status', '-Tjson', '--copies']);
+      const proc = await this.runCommand(['status', '-Tjson', '--copies'], 'StatusCommand');
       const files = (JSON.parse(proc.stdout) as UncommittedChanges).map(change => ({
         ...change,
         path: removeLeadingPathSep(change.path),
@@ -607,7 +635,10 @@ export class Repository {
         ? 'smartlog()'
         : // filter default smartlog query by date range
           `smartlog(((interestingbookmarks() + heads(draft())) & date(-${visibleCommitDayRange})) + .)`;
-      const proc = await this.runCommand(['log', '--template', FETCH_TEMPLATE, '--rev', revset]);
+      const proc = await this.runCommand(
+        ['log', '--template', FETCH_TEMPLATE, '--rev', revset],
+        'LogCommand',
+      );
       const commits = parseCommitInfoOutput(this.logger, proc.stdout.trim());
       if (commits.length === 0) {
         throw new Error(ErrorShortMessages.NoCommitsFetched);
@@ -665,8 +696,14 @@ export class Repository {
     return this.catLimiter.enqueueRun(async () => {
       // For `sl cat`, we want the output of the command verbatim.
       const options = {stripFinalNewline: false};
-      return (await this.runCommand(['cat', file, '--rev', rev], /*cwd=*/ undefined, options))
-        .stdout;
+      return (
+        await this.runCommand(
+          ['cat', file, '--rev', rev],
+          'CatCommand',
+          /*cwd=*/ undefined,
+          options,
+        )
+      ).stdout;
     });
   }
 
@@ -682,6 +719,7 @@ export class Repository {
     const t1 = Date.now();
     const output = await this.runCommand(
       ['blame', filePath, '-Tjson', '--change', '--rev', hash],
+      'BlameCommand',
       undefined,
       undefined,
       /* don't timeout */ 0,
@@ -718,13 +756,10 @@ export class Repository {
     const commits =
       hashesToFetch.length === 0
         ? [] // don't bother running log
-        : await this.runCommand([
-            'log',
-            '--template',
-            FETCH_TEMPLATE,
-            '--rev',
-            hashesToFetch.join('+'),
-          ]).then(output => {
+        : await this.runCommand(
+            ['log', '--template', FETCH_TEMPLATE, '--rev', hashesToFetch.join('+')],
+            'LookupCommitsCommand',
+          ).then(output => {
             return parseCommitInfoOutput(this.logger, output.stdout.trim());
           });
 
@@ -746,6 +781,20 @@ export class Repository {
     return result;
   }
 
+  public async getShelvedChanges(): Promise<Array<ShelvedChange>> {
+    const output = (
+      await this.runCommand(
+        ['log', '--rev', 'shelved()', '--template', SHELVE_FETCH_TEMPLATE],
+        'GetShelvesCommand',
+      )
+    ).stdout;
+
+    const shelves = parseShelvedCommitsOutput(this.logger, output.trim());
+    // sort by date ascending
+    shelves.sort((a, b) => b.date.getTime() - a.date.getTime());
+    return shelves;
+  }
+
   public getAllDiffIds(): Array<DiffId> {
     return (
       this.getSmartlogCommits()
@@ -755,32 +804,56 @@ export class Repository {
   }
 
   public async runDiff(comparison: Comparison, contextLines = 4): Promise<string> {
-    const output = await this.runCommand([
-      'diff',
-      ...revsetArgsForComparison(comparison),
-      // don't include a/ and b/ prefixes on files
-      '--noprefix',
-      '--no-binary',
-      '--nodate',
-      '--unified',
-      String(contextLines),
-    ]);
+    const output = await this.runCommand(
+      [
+        'diff',
+        ...revsetArgsForComparison(comparison),
+        // don't include a/ and b/ prefixes on files
+        '--noprefix',
+        '--no-binary',
+        '--nodate',
+        '--unified',
+        String(contextLines),
+      ],
+      'DiffCommand',
+    );
     return output.stdout;
   }
 
   public runCommand(
     args: Array<string>,
+    /** Which event name to track for this command. If undefined, generic 'RunCommand' is used. */
+    eventName: TrackEventName | undefined,
     cwd?: string,
     options?: execa.Options,
-    timeout: number = READ_COMMAND_TIMEOUT_MS,
+    timeout?: number,
+    /**
+     * Optionally provide a more specific tracker. If not provided, the best-effort tracker for the repo is used.
+     * Prefer passing an exact tracker when available, or else cwd/session id/platform/version could be inaccurate.
+     */
+    tracker: ServerSideTracker = this.trackerBestEffort,
   ) {
-    return runCommand(
-      this.info.command,
-      args,
-      this.logger,
-      unwrap(cwd ?? this.info.repoRoot),
-      options,
-      timeout,
+    const id = randomId();
+    return tracker.operation(
+      eventName ?? 'RunCommand',
+      'RunCommandError',
+      {
+        // if we don't specify a specific eventName, provide the command arguments in logging
+        extras: eventName == null ? {args} : undefined,
+        operationId: `isl:${id}`,
+      },
+      () =>
+        runCommand(
+          this.info.command,
+          args,
+          this.logger,
+          unwrap(cwd ?? this.info.repoRoot),
+          {
+            ...options,
+            env: {...options?.env, ...Internal.additionalEnvForCommand?.(id)} as NodeJS.ProcessEnv,
+          },
+          timeout ?? READ_COMMAND_TIMEOUT_MS,
+        ),
     );
   }
 
@@ -799,6 +872,7 @@ export class Repository {
   }
 }
 
+/** Run an sl command (without analytics). */
 async function runCommand(
   command_: string,
   args_: Array<string>,
@@ -916,6 +990,7 @@ function getExecParams(
   args_: Array<string>,
   cwd: string,
   options_?: execa.Options,
+  env?: NodeJS.ProcessEnv | Record<string, string>,
 ): {
   command: string;
   args: Array<string>;
@@ -935,6 +1010,8 @@ function getExecParams(
   const options: execa.Options = {
     ...options_,
     env: {
+      ...options_?.env,
+      ...env,
       LANG: 'en_US.utf-8', // make sure to use unicode if user hasn't set LANG themselves
       // TODO: remove when SL_ENCODING is used everywhere
       HGENCODING: 'UTF-8',
@@ -1017,6 +1094,45 @@ export function parseCommitInfoOutput(logger: Logger, output: string): SmartlogC
   }
   return commitInfos;
 }
+
+export function parseShelvedCommitsOutput(logger: Logger, output: string): Array<ShelvedChange> {
+  const shelves = output.split(COMMIT_END_MARK);
+  const commitInfos: Array<ShelvedChange> = [];
+  for (const chunk of shelves) {
+    try {
+      const lines = chunk.trim().split('\n');
+      if (lines.length < Object.keys(SHELVE_FIELDS).length) {
+        continue;
+      }
+      const files: Array<ChangedFile> = [
+        ...(JSON.parse(lines[SHELVE_FIELD_INDEX.filesModified]) as Array<string>).map(path => ({
+          path,
+          status: 'M' as const,
+        })),
+        ...(JSON.parse(lines[SHELVE_FIELD_INDEX.filesAdded]) as Array<string>).map(path => ({
+          path,
+          status: 'A' as const,
+        })),
+        ...(JSON.parse(lines[SHELVE_FIELD_INDEX.filesRemoved]) as Array<string>).map(path => ({
+          path,
+          status: 'R' as const,
+        })),
+      ];
+      commitInfos.push({
+        hash: lines[SHELVE_FIELD_INDEX.hash],
+        name: lines[SHELVE_FIELD_INDEX.name],
+        date: new Date(lines[SHELVE_FIELD_INDEX.date]),
+        filesSample: files.slice(0, MAX_FETCHED_FILES_PER_COMMIT),
+        totalFileCount: files.length,
+        description: lines.slice(SHELVE_FIELD_INDEX.description).join('\n'),
+      });
+    } catch (err) {
+      logger.error('failed to parse shelved change');
+    }
+  }
+  return commitInfos;
+}
+
 export function parseSuccessorData(successorData: string): SuccessorInfo | undefined {
   const [successorString] = successorData.split(',', 1); // we're only interested in the first available mutation
   if (!successorString) {

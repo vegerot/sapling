@@ -9,7 +9,7 @@ edition = "2021"
 anyhow = { version = "1.0.71", features = ["backtrace"] }
 async-runtime = { version = "0.1.0", path = "../async-runtime" }
 atexit = { version = "0.1.0", path = "../util/atexit" }
-bindings = { path = "../../edenscmnative/bindings", default-features = false }
+bindings = { version = "0.1.0", path = "../../saplingnative/bindings", default-features = false }
 blackbox = { version = "0.1.0", path = "../blackbox" }
 checkout = { version = "0.1.0", path = "../checkout" }
 chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
@@ -21,7 +21,7 @@ commandserver = { version = "0.1.0", path = "../commandserver" }
 configloader = { version = "0.1.0", path = "../config/loader" }
 configmodel = { version = "0.1.0", path = "../config/model" }
 cpython = { version = "0.7.1", default-features = false }
-cpython_ext = { version = "0.1.0", path = "../cpython-ext", default-features = false }
+cpython_ext = { version = "0.1.0", path = "../cpython-ext" }
 ctrlc = { version = "3.1", features = ["termination"] }
 dag = { version = "0.1.0", path = "../dag" }
 debugtop = { version = "0.1.0", path = "../debugtop" }
@@ -52,9 +52,11 @@ pathmatcher = { version = "0.1.0", path = "../pathmatcher" }
 procinfo = { version = "0.1.0", path = "../procinfo" }
 progress-model = { version = "0.1.0", path = "../progress/model" }
 progress-render = { version = "0.1.0", path = "../progress/render" }
-pyconfigloader = { path = "../../edenscmnative/bindings/modules/pyconfigloader" }
+pyconfigloader = { version = "0.1.0", path = "../../saplingnative/bindings/modules/pyconfigloader" }
+pyedenclient = { version = "0.1.0", path = "../../saplingnative/bindings/modules/pyedenclient" }
+pymodules = { version = "0.1.0", path = "../../saplingnative/bindings/modules/pymodules" }
 python3-sys = "0.7.1"
-pytracing = { path = "../../edenscmnative/bindings/modules/pytracing", default-features = false }
+pytracing = { version = "0.1.0", path = "../../saplingnative/bindings/modules/pytracing", default-features = false }
 rand = { version = "0.8", features = ["small_rng"] }
 repo = { version = "0.1.0", path = "../repo", features = ["wdir"] }
 repo_name = { version = "0.1.0", path = "../repo_name" }
@@ -80,5 +82,5 @@ zstd = { version = "0.11.2+zstd.1.5.2", features = ["experimental", "zstdmt"] }
 
 [features]
 default = []
-eden = ["clidispatch/eden"]
+eden = ["clidispatch/eden", "pyedenclient/eden"]
 fb = ["configloader/fb", "identity/fb"]

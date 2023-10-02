@@ -182,6 +182,7 @@ struct FinishedMount {
   double duration = 0.0;
   bool success = false;
   bool clean = false;
+  int64_t inode_catalog_type = -1;
 
   void populate(DynamicEvent& event) const {
     event.addString("repo_type", repo_type);
@@ -191,6 +192,7 @@ struct FinishedMount {
     event.addDouble("duration", duration);
     event.addBool("success", success);
     event.addBool("clean", clean);
+    event.addInt("overlay_type", inode_catalog_type);
   }
 };
 
@@ -276,6 +278,7 @@ struct EdenApiMiss {
 
   std::string repo_name;
   MissType miss_type;
+  std::string reason;
 
   void populate(DynamicEvent& event) const {
     event.addString("repo_source", repo_name);
@@ -284,6 +287,7 @@ struct EdenApiMiss {
     } else {
       event.addString("edenapi_miss_type", "tree");
     }
+    event.addString("edenapi_miss_reason", reason);
   }
 };
 

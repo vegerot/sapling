@@ -10,7 +10,6 @@ use std::cell::RefCell;
 use cpython::*;
 use cpython_ext::AnyhowResultExt;
 use cpython_ext::ResultPyErrExt;
-use cpython_ext::Str;
 use futures::stream::BoxStream;
 use futures::stream::TryStreamExt;
 use futures::Stream;
@@ -87,14 +86,14 @@ mod pytypes {
                     } else {
                         Ok(None)
                     }
-                })(&pyiter);
+                })(pyiter);
                 item.into_anyhow_result().transpose()
             });
             // async_runtime::iter_to_stream supports blocking `next` calls.
             // futures::stream::iter doesn't. If futures::stream::iter is used,
             // then test_nested_stream_to_and_from_python() will hang.
             let stream = async_runtime::iter_to_stream(iter);
-            return Ok(stream.into());
+            Ok(stream.into())
         }
     }
 
@@ -148,8 +147,8 @@ mod pytypes {
             }
         }
 
-        def typename(&self) -> PyResult<Str> {
-            Ok(self.type_name(py).clone().into())
+        def typename(&self) -> PyResult<String> {
+            Ok(self.type_name(py).clone())
         }
     });
 

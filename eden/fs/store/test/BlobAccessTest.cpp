@@ -9,7 +9,7 @@
 #include <folly/executors/QueuedImmediateExecutor.h>
 #include <folly/portability/GTest.h>
 #include <chrono>
-#include "eden/common/utils/ProcessNameCache.h"
+#include "eden/common/utils/ProcessInfoCache.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/ReloadableConfig.h"
 #include "eden/fs/store/LocalStore.h"
@@ -83,7 +83,7 @@ struct BlobAccessTest : ::testing::Test {
   BlobAccessTest()
       : localStore{std::make_shared<NullLocalStore>()},
         backingStore{std::make_shared<FakeBackingStore>()},
-        blobCache{BlobCache::create(10, 0)} {
+        blobCache{BlobCache::create(10, 0, makeRefPtr<EdenStats>())} {
     std::shared_ptr<EdenConfig> rawEdenConfig{
         EdenConfig::createTestEdenConfig()};
     rawEdenConfig->inMemoryTreeCacheSize.setValue(
@@ -99,7 +99,7 @@ struct BlobAccessTest : ::testing::Test {
         backingStore,
         treeCache,
         makeRefPtr<EdenStats>(),
-        std::make_shared<ProcessNameCache>(),
+        std::make_shared<ProcessInfoCache>(),
         std::make_shared<NullStructuredLogger>(),
         rawEdenConfig,
         true,

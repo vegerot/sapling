@@ -38,7 +38,7 @@ Commands can succeed without a stdin
   [255]
 
   $ hg status ENOENT 2>/dev/full
-  [1]
+  [255]
 #endif
 
 #if devfull chg
@@ -63,7 +63,7 @@ This command is ancient:
 Verify that updating to revision acb14030fe0a via commands.update() works properly
 
   $ cat <<EOF > update_to_rev0.py
-  > from edenscm import ui, hg, commands
+  > from sapling import ui, hg, commands
   > myui = ui.ui.load()
   > repo = hg.repository(myui, path='.')
   > commands.update(myui, repo, rev='acb14030fe0a')

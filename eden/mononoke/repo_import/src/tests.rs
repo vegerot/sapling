@@ -33,6 +33,7 @@ mod tests {
     use fbinit::FacebookInit;
     use futures::stream::TryStreamExt;
     use git_types::MappedGitCommitId;
+    use git_types::RootGitDeltaManifestId;
     use git_types::TreeHandle;
     use live_commit_sync_config::CfgrLiveCommitSyncConfig;
     use live_commit_sync_config::LiveCommitSyncConfig;
@@ -40,7 +41,7 @@ mod tests {
     use live_commit_sync_config::CONFIGERATOR_ALL_COMMIT_SYNC_CONFIGS;
     use live_commit_sync_config::CONFIGERATOR_PUSHREDIRECT_ENABLE;
     use maplit::hashmap;
-    use mercurial_types::MPath;
+    use mercurial_types::NonRootMPath;
     use mercurial_types_mocks::nodehash::ONES_CSID as HG_CSID;
     use metaconfig_types::CommitSyncConfig;
     use metaconfig_types::CommitSyncConfigVersion;
@@ -96,8 +97,8 @@ mod tests {
         BookmarkKey::new(book).unwrap()
     }
 
-    fn mp(s: &'static str) -> MPath {
-        MPath::new(s).unwrap()
+    fn mp(s: &'static str) -> NonRootMPath {
+        NonRootMPath::new(s).unwrap()
     }
 
     async fn create_repo(fb: FacebookInit, id: i32) -> Result<Repo> {
@@ -107,9 +108,10 @@ mod tests {
                     .derived_data_config
                     .get_active_config()
                     .expect("No enabled derived data types config");
-
+                // Repo import has no need of these derived data types
                 config.types.remove(TreeHandle::NAME);
                 config.types.remove(MappedGitCommitId::NAME);
+                config.types.remove(RootGitDeltaManifestId::NAME);
             })
             .with_id(RepositoryId::new(id))
             .build()
@@ -117,7 +119,7 @@ mod tests {
         Ok(repo)
     }
 
-    fn get_file_changes_mpaths(bcs: &BonsaiChangeset) -> Vec<MPath> {
+    fn get_file_changes_mpaths(bcs: &BonsaiChangeset) -> Vec<NonRootMPath> {
         bcs.file_changes()
             .map(|(mpath, _)| mpath)
             .cloned()
@@ -724,7 +726,7 @@ mod tests {
                 .await?,
         );
 
-        let combined_mover: Mover = Arc::new(move |source_path: &MPath| {
+        let combined_mover: Mover = Arc::new(move |source_path: &NonRootMPath| {
             let mut mutable_path = source_path.clone();
             for mover in movers.clone() {
                 let maybe_path = mover(&mutable_path)?;
@@ -889,7 +891,7 @@ mod tests {
                 .await?,
         );
 
-        let combined_mover: Mover = Arc::new(move |source_path: &MPath| {
+        let combined_mover: Mover = Arc::new(move |source_path: &NonRootMPath| {
             let mut mutable_path = source_path.clone();
             for mover in movers.clone() {
                 let maybe_path = mover(&mutable_path)?;
@@ -973,7 +975,7 @@ mod tests {
         assert_eq!(
             wc,
             hashmap! {
-                MPath::new("dest_path_prefix/B/file")? => "text".to_string()
+                NonRootMPath::new("dest_path_prefix/B/file")? => "text".to_string()
             }
         );
 
@@ -982,8 +984,8 @@ mod tests {
         assert_eq!(
             wc,
             hashmap! {
-                MPath::new("dest_path_prefix/B/file")? => "text".to_string(),
-                MPath::new("justfile")? => "justtext".to_string(),
+                NonRootMPath::new("dest_path_prefix/B/file")? => "text".to_string(),
+                NonRootMPath::new("justfile")? => "justtext".to_string(),
             }
         );
 

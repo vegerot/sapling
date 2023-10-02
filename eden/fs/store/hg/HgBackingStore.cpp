@@ -172,14 +172,16 @@ HgBackingStore::HgBackingStore(
           make_unique<folly::UnboundedBlockingQueue<
               folly::CPUThreadPoolExecutor::CPUTask>>(),
           std::make_shared<HgImporterThreadFactory>(repository, stats.copy()))),
-      config_(config),
+      config_(std::move(config)),
       serverThreadPool_(serverThreadPool),
-      datapackStore_(repository, computeOptions(), config),
-      logger_(logger) {
-  HgImporter importer(repository, stats.copy());
-  const auto& options = importer.getOptions();
-  repoName_ = options.repoName;
-}
+      logger_(std::move(logger)),
+      repoName_(HgImporter(repository, stats.copy()).getOptions().repoName),
+      datapackStore_(
+          repository,
+          computeOptions(),
+          config_,
+          logger_,
+          repoName_) {}
 
 /**
  * Create an HgBackingStore suitable for use in unit tests. It uses an inline
@@ -197,11 +199,9 @@ HgBackingStore::HgBackingStore(
       importThreadPool_{std::make_unique<HgImporterTestExecutor>(importer)},
       config_(std::move(config)),
       serverThreadPool_{importThreadPool_.get()},
-      datapackStore_(repository, testOptions(), config_),
-      logger_(nullptr) {
-  const auto& options = importer->getOptions();
-  repoName_ = options.repoName;
-}
+      logger_(nullptr),
+      repoName_(importer->getOptions().repoName),
+      datapackStore_(repository, testOptions(), config_, logger_, repoName_) {}
 
 HgBackingStore::~HgBackingStore() = default;
 
@@ -300,12 +300,9 @@ folly::Future<TreePtr> HgBackingStore::fetchTreeFromImporter(
             Importer& importer = getThreadLocalImporter();
             folly::stop_watch<std::chrono::milliseconds> watch;
             RequestMetricsScope queueTracker{&liveImportTreeWatches};
-            if (logger_) {
-              logger_->logEvent(EdenApiMiss{repoName_, EdenApiMiss::Tree});
-            }
             auto serializedTree = importer.fetchTree(path, manifestNode);
             stats_->addDuration(
-                &HgBackingStoreStats::importTree, watch.elapsed());
+                &HgBackingStoreStats::importTreeDuration, watch.elapsed());
             return serializedTree;
           })
           .via(serverThreadPool_);
@@ -317,7 +314,15 @@ folly::Future<TreePtr> HgBackingStore::fetchTreeFromImporter(
                                  batch = std::move(writeBatch)](
                                     folly::Try<std::unique_ptr<IOBuf>> val) {
     // Note: the `value` call will throw if fetchTree threw an exception
+    if (val.hasException()) {
+      stats_->increment(&HgBackingStoreStats::importTreeError);
+    }
     auto iobuf = std::move(val).value();
+    if (iobuf) {
+      stats_->increment(&HgBackingStoreStats::importTreeSuccess);
+    } else {
+      stats_->increment(&HgBackingStoreStats::importTreeFailure);
+    }
     return processTree(std::move(iobuf), node, treeID, ownedPath, batch.get());
   });
 }
@@ -548,12 +553,16 @@ SemiFuture<BlobPtr> HgBackingStore::fetchBlobFromHgImporter(
         Importer& importer = getThreadLocalImporter();
         folly::stop_watch<std::chrono::milliseconds> watch;
         RequestMetricsScope queueTracker{&liveImportBlobWatches};
-        if (logger_) {
-          logger_->logEvent(EdenApiMiss{repoName_, EdenApiMiss::Blob});
-        }
         auto blob =
             importer.importFileContents(hgInfo.path(), hgInfo.revHash());
-        stats_->addDuration(&HgBackingStoreStats::importBlob, watch.elapsed());
+        stats_->addDuration(
+            &HgBackingStoreStats::importBlobDuration, watch.elapsed());
+
+        if (blob) {
+          stats_->increment(&HgBackingStoreStats::importBlobSuccess);
+        } else {
+          stats_->increment(&HgBackingStoreStats::importBlobFailure);
+        }
         return blob;
       });
 }

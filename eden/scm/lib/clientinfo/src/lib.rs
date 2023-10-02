@@ -5,10 +5,10 @@
  * GNU General Public License version 2.
  */
 
+mod request_info;
+
 use anyhow::anyhow;
 use anyhow::Result;
-use configmodel::Config;
-use configmodel::ConfigExt;
 use hostname::get_hostname;
 use serde::Deserialize;
 use serde::Serialize;
@@ -24,31 +24,62 @@ use facebook::FbClientInfo;
 #[cfg(not(fbcode_build))]
 use oss as facebook;
 
-#[derive(Clone, Deserialize, Serialize, Debug)]
+pub use crate::request_info::get_client_request_info;
+pub use crate::request_info::get_client_request_info_thread_local;
+pub use crate::request_info::set_client_request_info_thread_local;
+pub use crate::request_info::ClientEntryPoint;
+pub use crate::request_info::ClientRequestInfo;
+
+#[derive(Default, Clone, Deserialize, Serialize, Debug)]
 pub struct ClientInfo {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub u64token: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
     #[serde(flatten)]
     pub fb: FbClientInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_info: Option<ClientRequestInfo>,
 }
 
 impl ClientInfo {
-    pub fn new(config: &dyn Config) -> Result<Self> {
+    /// Creates a new ClientInfo object with a singleton (Sapling) ClientRequestInfo
+    pub fn new() -> Result<Self> {
         let fb = get_fb_client_info();
 
-        let u64token = config.get_opt::<u64>("clientinfo", "u64token")?;
         let hostname = get_hostname().ok();
+        let cri = get_client_request_info();
 
         Ok(ClientInfo {
-            u64token,
             hostname,
             fb,
+            request_info: Some(cri),
         })
+    }
+
+    /// Creates a new ClientInfo object with fresh generated ClientRequestInfo for the specified ClientEntryPoint
+    pub fn new_with_entry_point(entry_point: ClientEntryPoint) -> Result<Self> {
+        let fb = get_fb_client_info();
+        let hostname = get_hostname().ok();
+        Ok(ClientInfo {
+            hostname,
+            fb,
+            request_info: Some(ClientRequestInfo::new(entry_point)),
+        })
+    }
+
+    /// Creates a new ClientInfo object with fresh generated ClientRequestInfo for the specified
+    /// ClientEntryPoint but the remaining fields will be empty.
+    pub fn default_with_entry_point(entry_point: ClientEntryPoint) -> Self {
+        let mut client_info = Self::default();
+        client_info.add_request_info(ClientRequestInfo::new(entry_point));
+        client_info
     }
 
     pub fn into_json(&self) -> Result<String> {
         serde_json::to_string(self).map_err(|e| anyhow!(e))
+    }
+
+    pub fn add_request_info(&mut self, info: ClientRequestInfo) -> &mut Self {
+        self.request_info = Some(info);
+        self
     }
 }

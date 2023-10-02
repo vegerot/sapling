@@ -165,6 +165,9 @@ impl AuxStore {
     }
 
     fn open_options(config: &dyn Config) -> Result<StoreOpenOptions> {
+        // If you update defaults/logic here, please update the "cache" help topic
+        // calculations in help.py.
+
         let mut open_options = StoreOpenOptions::new()
             .max_log_count(4)
             .max_bytes_per_log(250 * 1000 * 1000 / 4)
@@ -193,7 +196,7 @@ impl AuxStore {
 
     pub fn get(&self, hgid: HgId) -> Result<Option<Entry>> {
         let log = self.0.read();
-        let mut entries = log.lookup(0, &hgid)?;
+        let mut entries = log.lookup(0, hgid)?;
 
         let slice = match entries.next() {
             None => return Ok(None),
@@ -350,12 +353,12 @@ mod tests {
 
         // Set up local-only FileStore
         let mut store = FileStore::empty();
-        store.aux_local = Some(aux.clone());
+        store.aux_local = Some(aux);
 
         // Attempt fetch.
         let fetched = store
             .fetch(
-                std::iter::once(k.clone()),
+                std::iter::once(k),
                 FileAttributes::AUX,
                 FetchMode::AllowRemote,
             )
@@ -393,7 +396,7 @@ mod tests {
 
         // Set up local-only FileStore
         let mut store = FileStore::empty();
-        store.indexedlog_local = Some(content.clone());
+        store.indexedlog_local = Some(content);
         store.aux_local = Some(aux.clone());
 
         let mut expected = Entry::default();

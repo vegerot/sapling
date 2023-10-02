@@ -8,7 +8,6 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 
 use anyhow::Result;
 use configmodel::convert::ByteCount;
@@ -38,13 +37,11 @@ use crate::ContentStore;
 use crate::EdenApiFileStore;
 use crate::EdenApiTreeStore;
 use crate::ExtStoredPolicy;
-use crate::MemcacheStore;
 
 pub struct FileStoreBuilder<'a> {
     config: &'a dyn Config,
     local_path: Option<PathBuf>,
     suffix: Option<PathBuf>,
-    correlator: Option<String>,
     store_aux_data: bool,
     override_edenapi: Option<bool>,
 
@@ -54,8 +51,6 @@ pub struct FileStoreBuilder<'a> {
     lfs_cache: Option<Arc<LfsStore>>,
 
     edenapi: Option<Arc<EdenApiFileStore>>,
-    memcache: Option<Arc<MemcacheStore>>,
-
     contentstore: Option<Arc<ContentStore>>,
 }
 
@@ -65,7 +60,6 @@ impl<'a> FileStoreBuilder<'a> {
             config,
             local_path: None,
             suffix: None,
-            correlator: None,
             store_aux_data: false,
             override_edenapi: None,
             indexedlog_local: None,
@@ -73,7 +67,6 @@ impl<'a> FileStoreBuilder<'a> {
             lfs_local: None,
             lfs_cache: None,
             edenapi: None,
-            memcache: None,
             contentstore: None,
         }
     }
@@ -85,11 +78,6 @@ impl<'a> FileStoreBuilder<'a> {
 
     pub fn suffix(mut self, suffix: impl AsRef<Path>) -> Self {
         self.suffix = Some(suffix.as_ref().to_path_buf());
-        self
-    }
-
-    pub fn correlator(mut self, correlator: impl ToString) -> Self {
-        self.correlator = Some(correlator.to_string());
         self
     }
 
@@ -105,11 +93,6 @@ impl<'a> FileStoreBuilder<'a> {
 
     pub fn edenapi(mut self, edenapi: Arc<EdenApiFileStore>) -> Self {
         self.edenapi = Some(edenapi);
-        self
-    }
-
-    pub fn memcache(mut self, memcache: Arc<MemcacheStore>) -> Self {
-        self.memcache = Some(memcache);
         self
     }
 
@@ -191,7 +174,7 @@ impl<'a> FileStoreBuilder<'a> {
                 max_bytes: None,
             };
             Some(Arc::new(IndexedLogHgIdDataStore::new(
-                get_indexedlogdatastore_path(&local_path)?,
+                get_indexedlogdatastore_path(local_path)?,
                 self.get_extstored_policy()?,
                 &config,
                 StoreType::Local,
@@ -222,7 +205,7 @@ impl<'a> FileStoreBuilder<'a> {
             max_bytes,
         };
         Ok(Some(Arc::new(IndexedLogHgIdDataStore::new(
-            get_indexedlogdatastore_path(&cache_path)?,
+            get_indexedlogdatastore_path(cache_path)?,
             self.get_extstored_policy()?,
             &config,
             StoreType::Shared,
@@ -232,7 +215,7 @@ impl<'a> FileStoreBuilder<'a> {
     pub fn build_aux_local(&self) -> Result<Option<Arc<AuxStore>>> {
         Ok(if let Some(local_path) = self.local_path.clone() {
             let local_path = get_local_path(local_path, &self.suffix)?;
-            let local_path = get_indexedlogdatastore_aux_path(&local_path)?;
+            let local_path = get_indexedlogdatastore_aux_path(local_path)?;
             Some(Arc::new(AuxStore::new(
                 local_path,
                 self.config,
@@ -249,7 +232,7 @@ impl<'a> FileStoreBuilder<'a> {
             None => return Ok(None),
         };
 
-        let cache_path = get_indexedlogdatastore_aux_path(&cache_path)?;
+        let cache_path = get_indexedlogdatastore_aux_path(cache_path)?;
         Ok(Some(Arc::new(AuxStore::new(
             cache_path,
             self.config,
@@ -264,7 +247,7 @@ impl<'a> FileStoreBuilder<'a> {
 
         Ok(if let Some(local_path) = self.local_path.clone() {
             let local_path = get_local_path(local_path, &self.suffix)?;
-            Some(Arc::new(LfsStore::local(&local_path, self.config)?))
+            Some(Arc::new(LfsStore::local(local_path, self.config)?))
         } else {
             None
         })
@@ -280,7 +263,7 @@ impl<'a> FileStoreBuilder<'a> {
             None => return Ok(None),
         };
 
-        Ok(Some(Arc::new(LfsStore::shared(&cache_path, self.config)?)))
+        Ok(Some(Arc::new(LfsStore::shared(cache_path, self.config)?)))
     }
 
     pub fn build(mut self) -> Result<FileStore> {
@@ -345,7 +328,6 @@ impl<'a> FileStoreBuilder<'a> {
                     lfs_cache.clone(),
                     lfs_local.clone(),
                     self.config,
-                    self.correlator.take(),
                 )?))
             } else {
                 None
@@ -353,8 +335,6 @@ impl<'a> FileStoreBuilder<'a> {
         } else {
             None
         };
-
-        let memcache = self.memcache.take();
 
         tracing::trace!(target: "revisionstore::filestore", "processing edenapi");
         let edenapi = if self.use_edenapi()? {
@@ -418,9 +398,6 @@ impl<'a> FileStoreBuilder<'a> {
             indexedlog_cache,
             lfs_cache,
 
-            memcache,
-            cache_to_memcache: true,
-
             edenapi,
             lfs_remote,
 
@@ -432,7 +409,6 @@ impl<'a> FileStoreBuilder<'a> {
             aux_local,
             aux_cache,
 
-            creation_time: Instant::now(),
             lfs_progress: AggregatingProgressBar::new("fetching", "LFS"),
             flush_on_drop: true,
         })
@@ -466,7 +442,6 @@ pub struct TreeStoreBuilder<'a> {
     indexedlog_local: Option<Arc<IndexedLogHgIdDataStore>>,
     indexedlog_cache: Option<Arc<IndexedLogHgIdDataStore>>,
     edenapi: Option<Arc<EdenApiTreeStore>>,
-    memcache: Option<Arc<MemcacheStore>>,
     contentstore: Option<Arc<ContentStore>>,
     filestore: Option<Arc<FileStore>>,
 }
@@ -481,7 +456,6 @@ impl<'a> TreeStoreBuilder<'a> {
             indexedlog_local: None,
             indexedlog_cache: None,
             edenapi: None,
-            memcache: None,
             contentstore: None,
             filestore: None,
         }
@@ -504,11 +478,6 @@ impl<'a> TreeStoreBuilder<'a> {
 
     pub fn edenapi(mut self, edenapi: Arc<EdenApiTreeStore>) -> Self {
         self.edenapi = Some(edenapi);
-        self
-    }
-
-    pub fn memcache(mut self, memcache: Arc<MemcacheStore>) -> Self {
-        self.memcache = Some(memcache);
         self
     }
 
@@ -560,7 +529,7 @@ impl<'a> TreeStoreBuilder<'a> {
                 max_bytes: None,
             };
             Some(Arc::new(IndexedLogHgIdDataStore::new(
-                get_indexedlogdatastore_path(&local_path)?,
+                get_indexedlogdatastore_path(local_path)?,
                 ExtStoredPolicy::Use,
                 &config,
                 StoreType::Local,
@@ -592,7 +561,7 @@ impl<'a> TreeStoreBuilder<'a> {
         };
 
         Ok(Some(Arc::new(IndexedLogHgIdDataStore::new(
-            get_indexedlogdatastore_path(&cache_path)?,
+            get_indexedlogdatastore_path(cache_path)?,
             ExtStoredPolicy::Use,
             &config,
             StoreType::Shared,
@@ -623,8 +592,6 @@ impl<'a> TreeStoreBuilder<'a> {
             self.build_indexedlog_cache()?
         };
 
-        let memcache = self.memcache.take();
-
         tracing::trace!(target: "revisionstore::treestore", "processing edenapi");
         let edenapi = if self.use_edenapi()? {
             if let Some(edenapi) = self.edenapi.take() {
@@ -649,19 +616,11 @@ impl<'a> TreeStoreBuilder<'a> {
         tracing::trace!(target: "revisionstore::treestore", "constructing TreeStore");
         Ok(TreeStore {
             indexedlog_local,
-
             indexedlog_cache,
             cache_to_local_cache: true,
-
-            memcache,
-            cache_to_memcache: true,
-
             edenapi,
-
             contentstore,
             filestore: self.filestore,
-
-            creation_time: Instant::now(),
             flush_on_drop: true,
         })
     }

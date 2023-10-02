@@ -4,8 +4,9 @@ from __future__ import absolute_import, print_function
 
 import sys
 
-from edenscm import encoding, node, revlog, transaction, vfs
 from hghave import require
+
+from sapling import encoding, node, revlog, transaction, vfs
 
 
 require(["py2"])
@@ -112,7 +113,7 @@ def addgroupcopy(rlog, tr, destname=b"_destrevlog.i", optimaldelta=True):
     code path, which is not covered by "appendrev" alone.
     """
 
-    class dummychangegroup(object):
+    class dummychangegroup:
         @staticmethod
         def deltachunk(pnode):
             pnode = pnode or node.nullid

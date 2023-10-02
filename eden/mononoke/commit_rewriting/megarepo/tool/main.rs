@@ -49,9 +49,10 @@ use manifest::PathOrPrefix;
 use metaconfig_types::CommitSyncConfigVersion;
 use metaconfig_types::MetadataDatabaseConfig;
 use mononoke_api_types::InnerRepo;
+use mononoke_types::path::MPath;
 use mononoke_types::ChangesetId;
 use mononoke_types::FileChange;
-use mononoke_types::MPath;
+use mononoke_types::NonRootMPath;
 use mononoke_types::RepositoryId;
 use movers::get_small_to_large_mover;
 use movers::Mover;
@@ -413,7 +414,10 @@ async fn run_history_fixup_delete<'a>(
     };
     let paths_file = sub_m.value_of(PATHS_FILE).unwrap().to_owned();
     let s = read_to_string(&paths_file).await?;
-    let paths: Vec<MPath> = s.lines().map(MPath::new).collect::<Result<Vec<MPath>>>()?;
+    let paths: Vec<NonRootMPath> = s
+        .lines()
+        .map(NonRootMPath::new)
+        .collect::<Result<Vec<NonRootMPath>>>()?;
     let hfd = create_history_fixup_deletes(
         ctx,
         &repo,
@@ -462,7 +466,7 @@ async fn run_gradual_delete<'a>(
 
     let delete_cs_args_factory = get_delete_commits_cs_args_factory(sub_m)?;
 
-    let chunker: Chunker<MPath> = {
+    let chunker: Chunker<NonRootMPath> = {
         let even_chunk_size: usize = sub_m
             .value_of(EVEN_CHUNK_SIZE)
             .ok_or_else(|| format_err!("{} is required", EVEN_CHUNK_SIZE))?
@@ -478,7 +482,7 @@ async fn run_gradual_delete<'a>(
     let path_prefixes: Vec<_> = sub_m
         .values_of(PATH)
         .unwrap()
-        .map(MPath::new)
+        .map(NonRootMPath::new)
         .collect::<Result<Vec<_>, Error>>()?;
     info!(
         ctx.logger(),
@@ -797,7 +801,7 @@ async fn run_mover<'a>(
     let path = sub_m
         .value_of(PATH)
         .ok_or_else(|| format_err!("{} not set", PATH))?;
-    let path = MPath::new(path)?;
+    let path = NonRootMPath::new(path)?;
     println!("{:?}", mover(&path));
     Ok(())
 }
@@ -1243,7 +1247,7 @@ async fn run_delete_no_longer_bound_files_from_large_repo<'a>(
         .find_entries(
             ctx.clone(),
             large_repo.repo_blobstore().clone(),
-            vec![PathOrPrefix::Prefix(Some(MPath::new(prefix)?))],
+            vec![PathOrPrefix::Prefix(MPath::new(prefix)?)],
         )
         .try_collect::<Vec<_>>()
         .await?;
@@ -1254,7 +1258,7 @@ async fn run_delete_no_longer_bound_files_from_large_repo<'a>(
     let mut to_delete = vec![];
     for (path, entry) in entries {
         if let Entry::Leaf(_) = entry {
-            let path = path.unwrap();
+            let path = path.try_into().unwrap();
             if mover(&path)?.is_none() {
                 to_delete.push(path);
             }

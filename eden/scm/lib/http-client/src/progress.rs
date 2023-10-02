@@ -17,9 +17,8 @@ use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::Ordering::Release;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
-
-use once_cell::sync::OnceCell;
 
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
 pub struct Progress {
@@ -210,7 +209,7 @@ impl<P: FnMut(Progress)> ProgressReporter<P> {
         let inner = &self.inner;
         let progress = inner.aggregate();
         if progress != self.last_progress.to_progress() {
-            (&mut *self.callback.borrow_mut())(inner.aggregate());
+            (*self.callback.borrow_mut())(inner.aggregate());
             self.last_progress.set(progress);
         }
     }
@@ -239,7 +238,7 @@ impl ProgressUpdater {
 #[derive(Default)]
 struct ProgressInner {
     total_progress: MutableProgress,
-    first_byte_received: OnceCell<Instant>,
+    first_byte_received: OnceLock<Instant>,
 }
 
 impl ProgressInner {

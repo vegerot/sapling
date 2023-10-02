@@ -1346,26 +1346,22 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
         }
     }
 
-    async fn fetch_edges(
+    async fn fetch_edges(&self, ctx: &CoreContext, cs_id: ChangesetId) -> Result<ChangesetEdges> {
+        self.fetch_many_edges(ctx, &[cs_id], Prefetch::None)
+            .await?
+            .remove(&cs_id)
+            .ok_or_else(|| anyhow!("Missing changeset from sql commit graph storage: {}", cs_id))
+    }
+
+    async fn maybe_fetch_edges(
         &self,
         ctx: &CoreContext,
         cs_id: ChangesetId,
     ) -> Result<Option<ChangesetEdges>> {
         Ok(self
-            .fetch_many_edges(ctx, &[cs_id], Prefetch::None)
+            .maybe_fetch_many_edges(ctx, &[cs_id], Prefetch::None)
             .await?
             .remove(&cs_id))
-    }
-
-    async fn fetch_edges_required(
-        &self,
-        ctx: &CoreContext,
-        cs_id: ChangesetId,
-    ) -> Result<ChangesetEdges> {
-        self.fetch_many_edges_required(ctx, &[cs_id], Prefetch::None)
-            .await?
-            .remove(&cs_id)
-            .ok_or_else(|| anyhow!("Missing changeset from sql commit graph storage: {}", cs_id))
     }
 
     async fn fetch_many_edges(
@@ -1374,13 +1370,25 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
         cs_ids: &[ChangesetId],
         prefetch: Prefetch,
     ) -> Result<HashMap<ChangesetId, ChangesetEdges>> {
-        ctx.perf_counters()
-            .increment_counter(PerfCounterType::SqlReadsReplica);
-        self.fetch_many_edges_impl(ctx, cs_ids, prefetch, &self.read_connection)
-            .await
+        let mut edges = self.maybe_fetch_many_edges(ctx, cs_ids, prefetch).await?;
+        let unfetched_ids: Vec<ChangesetId> = cs_ids
+            .iter()
+            .filter(|id| !edges.contains_key(id))
+            .copied()
+            .collect();
+        if !unfetched_ids.is_empty() {
+            anyhow::bail!(
+                "Missing changesets from sql commit graph storage: {}",
+                unfetched_ids
+                    .into_iter()
+                    .map(|id| format!("{}, ", id))
+                    .collect::<String>()
+            );
+        }
+        Ok(edges)
     }
 
-    async fn fetch_many_edges_required(
+    async fn maybe_fetch_many_edges(
         &self,
         ctx: &CoreContext,
         cs_ids: &[ChangesetId],
@@ -1396,7 +1404,7 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
             .filter(|id| !edges.contains_key(id))
             .copied()
             .collect();
-        let unfetched_ids = if !unfetched_ids.is_empty() {
+        if !unfetched_ids.is_empty() {
             // Let's go to master with the remaining edges
             ctx.perf_counters()
                 .increment_counter(PerfCounterType::SqlReadsMaster);
@@ -1404,22 +1412,6 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
                 .fetch_many_edges_impl(ctx, &unfetched_ids, prefetch, &self.read_master_connection)
                 .await?;
             edges.extend(extra_edges);
-            cs_ids
-                .iter()
-                .filter(|id| !edges.contains_key(id))
-                .copied()
-                .collect()
-        } else {
-            unfetched_ids
-        };
-        if !unfetched_ids.is_empty() {
-            anyhow::bail!(
-                "Missing changesets from sql commit graph storage: {}",
-                unfetched_ids
-                    .into_iter()
-                    .map(|id| format!("{}, ", id))
-                    .collect::<String>()
-            );
         }
         Ok(edges)
     }

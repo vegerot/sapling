@@ -18,6 +18,7 @@ import {Center} from '../ComponentUtils';
 import {HighlightCommitsWhileHovering} from '../HighlightedCommits';
 import {numPendingImageUploads} from '../ImageUpload';
 import {OperationDisabledButton} from '../OperationDisabledButton';
+import {SubmitUpdateMessageInput} from '../SubmitUpdateMessageInput';
 import {Subtle} from '../Subtle';
 import {Tooltip} from '../Tooltip';
 import {ChangedFiles, UncommittedChanges} from '../UncommittedChanges';
@@ -45,6 +46,7 @@ import {useModal} from '../useModal';
 import {assert, firstLine, firstOfIterable} from '../utils';
 import {CommitInfoField} from './CommitInfoField';
 import {
+  diffUpdateMessagesState,
   commitInfoViewCurrentCommits,
   assertNonOptimistic,
   commitFieldsBeingEdited,
@@ -105,6 +107,12 @@ export function MultiCommitInfo({selectedCommits}: {selectedCommits: Array<Commi
   const provider = useRecoilValue(codeReviewProvider);
   const diffSummaries = useRecoilValue(allDiffSummaries);
   const shouldSubmitAsDraft = useRecoilValue(submitAsDraft);
+  const commitsWithDiffs = selectedCommits.filter(commit => commit.diffId != null);
+  const [updateMessage, setUpdateMessage] = useRecoilState(
+    // Combine hashes to key the typed update message.
+    // This is kind of volatile, since if you change your selection at all, the message will be cleared.
+    diffUpdateMessagesState(selectedCommits.map(commit => commit.hash).join(',')),
+  );
   const submittable =
     (diffSummaries.value != null
       ? provider?.getSubmittableDiffs(selectedCommits, diffSummaries.value)
@@ -127,6 +135,9 @@ export function MultiCommitInfo({selectedCommits}: {selectedCommits: Array<Commi
         ))}
       </div>
       <div className="commit-info-actions-bar">
+        {commitsWithDiffs.length === 0 ? null : (
+          <SubmitUpdateMessageInput commits={selectedCommits} />
+        )}
         <div className="commit-info-actions-bar-left">
           <SubmitAsDraftCheckbox commitsToBeSubmit={selectedCommits} />
         </div>
@@ -137,8 +148,11 @@ export function MultiCommitInfo({selectedCommits}: {selectedCommits: Array<Commi
                 contextKey={'submit-selected'}
                 appearance="secondary"
                 runOperation={() => {
+                  // clear update message on submit
+                  setUpdateMessage('');
                   return unwrap(provider).submitOperation(selectedCommits, {
                     draft: shouldSubmitAsDraft,
+                    updateMessage: updateMessage || undefined,
                   });
                 }}>
                 <T>Submit Selected Commits</T>
@@ -331,7 +345,8 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
                 </VSCodeButton>
               </div>
               <ChangedFiles
-                files={commit.filesSample}
+                filesSubset={commit.filesSample}
+                totalFiles={commit.totalFileCount}
                 comparison={
                   commit.isHead
                     ? {type: ComparisonType.HeadChanges}
@@ -488,6 +503,8 @@ function ActionsBar({
   const schema = useRecoilValue(commitMessageFieldsSchema);
   const headCommit = useRecoilValue(latestHeadCommit);
 
+  const [updateMessage, setUpdateMessage] = useRecoilState(diffUpdateMessagesState(commit.hash));
+
   const messageSyncEnabled = useRecoilValue(messageSyncingEnabledState);
 
   // after committing/amending, if you've previously selected the head commit,
@@ -534,10 +551,7 @@ function ActionsBar({
       ? getCommitOperation(message, headHash, selection.selection, allFiles)
       : getAmendOperation(message, headHash, selection.selection, allFiles);
 
-    // TODO(quark): We need better invalidation for chunk selected files.
-    if (selection.hasChunkSelection()) {
-      selection.clear();
-    }
+    selection.discardPartialSelections();
 
     clearEditedCommitMessage(/* skip confirmation */ true);
     // reset to amend mode now that the commit has been made
@@ -567,6 +581,9 @@ function ActionsBar({
 
   return (
     <div className="commit-info-actions-bar" data-testid="commit-info-actions-bar">
+      {isCommitMode || commit.diffId == null ? null : (
+        <SubmitUpdateMessageInput commits={[commit]} />
+      )}
       <div className="commit-info-actions-bar-left">
         <SubmitAsDraftCheckbox commitsToBeSubmit={isCommitMode ? [] : [commit]} />
       </div>
@@ -772,8 +789,14 @@ function ActionsBar({
                   {
                     draft: shouldSubmitAsDraft,
                     updateFields: shouldUpdateMessage,
+                    updateMessage: updateMessage || undefined,
                   },
                 );
+                // clear out the update message now that we've used it to submit
+                if (updateMessage) {
+                  setUpdateMessage('');
+                }
+
                 return [amendOrCommitOp, submitOp].filter(notEmpty);
               }}>
               {commit.isHead && anythingToCommit ? (

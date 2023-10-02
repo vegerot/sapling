@@ -94,11 +94,10 @@ use filestore::FilestoreConfig;
 use futures_watchdog::WatchdogExt;
 use git_symbolic_refs::ArcGitSymbolicRefs;
 use git_symbolic_refs::SqlGitSymbolicRefsBuilder;
+use hook_manager::manager::ArcHookManager;
+use hook_manager::manager::HookManager;
+use hook_manager::TextOnlyHookFileContentProvider;
 use hooks::hook_loader::load_hooks;
-use hooks::ArcHookManager;
-use hooks::HookManager;
-use hooks_content_stores::RepoFileContentManager;
-use hooks_content_stores::TextOnlyFileContentManager;
 use live_commit_sync_config::CfgrLiveCommitSyncConfig;
 use memcache::KeyGen;
 use memcache::MemcacheClient;
@@ -142,6 +141,7 @@ use repo_derived_data::ArcRepoDerivedData;
 use repo_derived_data::RepoDerivedData;
 use repo_derived_data_service::ArcDerivedDataManagerSet;
 use repo_derived_data_service::DerivedDataManagerSet;
+use repo_hook_file_content_provider::RepoHookFileContentProvider;
 use repo_identity::ArcRepoIdentity;
 use repo_identity::RepoIdentity;
 use repo_lock::AlwaysLockedRepoLock;
@@ -236,6 +236,7 @@ pub struct RepoFactory {
     blobstores: RepoFactoryCache<BlobConfig, Arc<dyn Blobstore>>,
     redacted_blobs: RepoFactoryCache<MetadataDatabaseConfig, Arc<RedactedBlobs>>,
     blobstore_override: Option<Arc<dyn RepoFactoryOverride<Arc<dyn Blobstore>>>>,
+    lease_override: Option<Arc<dyn RepoFactoryOverride<Arc<dyn LeaseOps>>>>,
     scrub_handler: Arc<dyn ScrubHandler>,
     blobstore_component_sampler: Option<Arc<dyn ComponentSamplingHandler>>,
     bonsai_hg_mapping_overwrite: bool,
@@ -248,6 +249,7 @@ impl RepoFactory {
             blobstores: RepoFactoryCache::new(),
             redacted_blobs: RepoFactoryCache::new(),
             blobstore_override: None,
+            lease_override: None,
             scrub_handler: default_scrub_handler(),
             blobstore_component_sampler: None,
             bonsai_hg_mapping_overwrite: false,
@@ -260,6 +262,14 @@ impl RepoFactory {
         blobstore_override: impl RepoFactoryOverride<Arc<dyn Blobstore>>,
     ) -> &mut Self {
         self.blobstore_override = Some(Arc::new(blobstore_override));
+        self
+    }
+
+    pub fn with_lease_override(
+        &mut self,
+        lease_override: impl RepoFactoryOverride<Arc<dyn LeaseOps>>,
+    ) -> &mut Self {
+        self.lease_override = Some(Arc::new(lease_override));
         self
     }
 
@@ -449,6 +459,32 @@ impl RepoFactory {
                 Ok(blobstore)
             })
             .await
+    }
+
+    fn lease_init(
+        fb: FacebookInit,
+        caching: Caching,
+        lease_type: &'static str,
+    ) -> Result<Arc<dyn LeaseOps>> {
+        // Derived data leasing is performed through the cache, so is only
+        // available if caching is enabled.
+        if let Caching::Enabled(_) = caching {
+            Ok(Arc::new(MemcacheOps::new(fb, lease_type, "")?))
+        } else {
+            Ok(Arc::new(InProcessLease::new()))
+        }
+    }
+
+    fn lease(&self, lease_type: &'static str) -> Result<Arc<dyn LeaseOps>> {
+        let fb = self.env.fb;
+        let caching = self.env.caching;
+        Self::lease_init(fb, caching, lease_type).map(|lease| {
+            if let Some(lease_override) = &self.lease_override {
+                lease_override(lease)
+            } else {
+                lease
+            }
+        })
     }
 
     pub async fn blobstore_unlink_ops_with_overriden_blob_config(
@@ -1067,7 +1103,7 @@ impl RepoFactory {
         repo_blobstore: &ArcRepoBlobstore,
     ) -> Result<ArcRepoDerivedData> {
         let config = repo_config.derived_data_config.clone();
-        let lease = lease_init(self.env.fb, self.env.caching, DERIVED_DATA_LEASE)?;
+        let lease = self.lease(DERIVED_DATA_LEASE)?;
         let scuba = build_scuba(
             self.env.fb,
             config.scuba_table.clone(),
@@ -1205,7 +1241,7 @@ impl RepoFactory {
         repo_blobstore: &ArcRepoBlobstore,
     ) -> Result<ArcDerivedDataManagerSet> {
         let config = repo_config.derived_data_config.clone();
-        let lease = lease_init(self.env.fb, self.env.caching, DERIVED_DATA_LEASE)?;
+        let lease = self.lease(DERIVED_DATA_LEASE)?;
         let ctx = self.ctx(Some(repo_identity));
         let logger = ctx.logger().clone();
         let derived_data_scuba = build_scuba(
@@ -1296,12 +1332,6 @@ impl RepoFactory {
     ) -> Result<ArcHookManager> {
         let name = repo_identity.name();
 
-        let content_store = RepoFileContentManager::from_parts(
-            bookmarks.clone(),
-            repo_blobstore.clone(),
-            repo_derived_data.clone(),
-        );
-
         let disabled_hooks = self
             .env
             .disabled_hooks
@@ -1323,15 +1353,19 @@ impl RepoFactory {
         }
 
         let hook_manager = async {
-            let fetcher = Box::new(TextOnlyFileContentManager::new(
-                content_store,
+            let content_provider = Box::new(TextOnlyHookFileContentProvider::new(
+                RepoHookFileContentProvider::from_parts(
+                    bookmarks.clone(),
+                    repo_blobstore.clone(),
+                    repo_derived_data.clone(),
+                ),
                 repo_config.hook_max_file_size,
             ));
 
             let mut hook_manager = HookManager::new(
                 self.env.fb,
                 self.env.acl_provider.as_ref(),
-                fetcher,
+                content_provider,
                 repo_config.hook_manager_params.clone().unwrap_or_default(),
                 hooks_scuba,
                 name.to_string(),
@@ -1620,20 +1654,6 @@ impl RepoFactory {
             .await
             .context(RepoFactoryError::SqlDeletionLog)?;
         Ok(Arc::new(DeletionLog { sql_deletion_log }))
-    }
-}
-
-fn lease_init(
-    fb: FacebookInit,
-    caching: Caching,
-    lease_type: &'static str,
-) -> Result<Arc<dyn LeaseOps>> {
-    // Derived data leasing is performed through the cache, so is only
-    // available if caching is enabled.
-    if let Caching::Enabled(_) = caching {
-        Ok(Arc::new(MemcacheOps::new(fb, lease_type, "")?))
-    } else {
-        Ok(Arc::new(InProcessLease::new()))
     }
 }
 

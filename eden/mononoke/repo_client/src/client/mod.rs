@@ -86,7 +86,7 @@ use hgproto::GetbundleArgs;
 use hgproto::GettreepackArgs;
 use hgproto::HgCommandRes;
 use hgproto::HgCommands;
-use hooks::HookManagerArc;
+use hook_manager::manager::HookManagerArc;
 use hostname::get_hostname;
 use itertools::Itertools;
 use lazy_static::lazy_static;
@@ -113,7 +113,7 @@ use mercurial_types::HgFileNodeId;
 use mercurial_types::HgManifestId;
 use mercurial_types::HgNodeHash;
 use mercurial_types::HgParents;
-use mercurial_types::MPath;
+use mercurial_types::NonRootMPath;
 use mercurial_types::RepoPath;
 use mercurial_types::NULL_CSID;
 use mercurial_types::NULL_HASH;
@@ -374,7 +374,7 @@ fn bundle2caps() -> String {
 struct UndesiredPathLogger {
     ctx: CoreContext,
     repo_needs_logging: bool,
-    path_prefix_to_log: Option<MPath>,
+    path_prefix_to_log: Option<NonRootMPath>,
     path_regex_to_log: Option<Regex>,
 }
 
@@ -388,7 +388,7 @@ impl UndesiredPathLogger {
                 .as_str();
 
         let path_prefix_to_log = if repo_needs_logging {
-            MPath::new_opt(
+            NonRootMPath::new_opt(
                 tunables
                     .undesired_path_prefix_to_log()
                     .unwrap_or_default()
@@ -433,7 +433,7 @@ impl UndesiredPathLogger {
         })
     }
 
-    fn maybe_log_tree(&self, path: Option<&MPath>) {
+    fn maybe_log_tree(&self, path: Option<&NonRootMPath>) {
         if self.should_log(path) {
             STATS::undesired_tree_fetches.add_value(1);
             self.ctx
@@ -442,7 +442,7 @@ impl UndesiredPathLogger {
         }
     }
 
-    fn maybe_log_file(&self, path: Option<&MPath>, sizes: impl Iterator<Item = u64>) {
+    fn maybe_log_file(&self, path: Option<&NonRootMPath>, sizes: impl Iterator<Item = u64>) {
         if self.should_log(path) {
             for size in sizes {
                 STATS::undesired_file_fetches.add_value(1);
@@ -457,11 +457,11 @@ impl UndesiredPathLogger {
         }
     }
 
-    fn should_log(&self, path: Option<&MPath>) -> bool {
+    fn should_log(&self, path: Option<&NonRootMPath>) -> bool {
         if self.repo_needs_logging {
             let op1 = match self.path_prefix_to_log.as_ref() {
                 None => false,
-                Some(prefix) => prefix.is_prefix_of(MPath::iter_opt(path)),
+                Some(prefix) => prefix.is_prefix_of(NonRootMPath::iter_opt(path)),
             };
 
             let op2 = match (path, self.path_regex_to_log.as_ref()) {
@@ -732,7 +732,7 @@ impl RepoClient {
 
     fn getpack<WeightedContent, Content, GetpackHandler>(
         &self,
-        params: BoxStream<(MPath, Vec<HgFileNodeId>), Error>,
+        params: BoxStream<(NonRootMPath, Vec<HgFileNodeId>), Error>,
         handler: GetpackHandler,
         name: &'static str,
     ) -> BoxStream<BytesOld, Error>
@@ -782,7 +782,7 @@ impl RepoClient {
                             .add("getpack_paths", params.len())
                             .log_with_msg("Getpack Params", None);
 
-                        let res = stream::iter(params.into_iter())
+                        let res = stream::iter(params)
                             .map({
                                 cloned!(ctx, getpack_params, repo, lfs_params);
                                 move |(path, filenodes)| {
@@ -928,7 +928,7 @@ impl RepoClient {
                                     metadata,
                                 }));
                             }
-                            stream_old::iter_ok(res.into_iter())
+                            stream_old::iter_ok(res)
                         }
                     })
                     .flatten()
@@ -1232,7 +1232,7 @@ impl HgCommands for RepoClient {
             // TODO(jsgf): do pairs in parallel?
             // TODO: directly return stream of streams
             cloned!(self.repo);
-            stream_old::iter_ok(pairs.into_iter())
+            stream_old::iter_ok(pairs)
                 .and_then({
                     cloned!(ctx);
                     move |(top, bottom)| {
@@ -2052,7 +2052,7 @@ impl HgCommands for RepoClient {
                         let header = format!("{}\0{}\n", name, size);
 
                         stream::once(future::ready(Ok(header.into_bytes().into())))
-                            .chain(stream::iter(data.into_iter()).buffered(100))
+                            .chain(stream::iter(data).buffered(100))
                     }
 
                     let res = response
@@ -2090,7 +2090,7 @@ impl HgCommands for RepoClient {
     // @wireprotocommand('getpackv1')
     fn getpackv1(
         &self,
-        params: BoxStream<(MPath, Vec<HgFileNodeId>), Error>,
+        params: BoxStream<(NonRootMPath, Vec<HgFileNodeId>), Error>,
     ) -> BoxStream<BytesOld, Error> {
         self.getpack(
             params,
@@ -2111,7 +2111,7 @@ impl HgCommands for RepoClient {
     // @wireprotocommand('getpackv2')
     fn getpackv2(
         &self,
-        params: BoxStream<(MPath, Vec<HgFileNodeId>), Error>,
+        params: BoxStream<(NonRootMPath, Vec<HgFileNodeId>), Error>,
     ) -> BoxStream<BytesOld, Error> {
         self.getpack(
             params,
@@ -2144,7 +2144,7 @@ impl HgCommands for RepoClient {
                 .add("getcommitdata_nodes", nodes.len())
                 .log_with_msg("GetCommitData Params", None);
 
-            let s = stream::iter(nodes.into_iter())
+            let s = stream::iter(nodes)
                 .map({
                     cloned!(ctx, blobrepo);
                     move |hg_cs_id| {
@@ -2203,7 +2203,7 @@ pub fn gettreepack_entries(
     ctx: CoreContext,
     repo: &BlobRepo,
     params: GettreepackArgs,
-) -> BoxStream<(HgManifestId, Option<MPath>), Error> {
+) -> BoxStream<(HgManifestId, Option<NonRootMPath>), Error> {
     let GettreepackArgs {
         rootdir,
         mfnodes,
@@ -2234,10 +2234,10 @@ pub fn gettreepack_entries(
 
         let entries = mfnodes
             .into_iter()
-            .zip(directories.into_iter())
+            .zip(directories)
             .map(|(node, path)| {
                 let path = if !path.is_empty() {
-                    Some(MPath::new(path.as_ref())?)
+                    Some(NonRootMPath::new(path.as_ref())?)
                 } else {
                     None
                 };
@@ -2302,9 +2302,9 @@ fn get_changed_manifests_stream(
     repo: &BlobRepo,
     mfid: HgManifestId,
     basemfid: HgManifestId,
-    rootpath: Option<MPath>,
+    rootpath: Option<NonRootMPath>,
     max_depth: usize,
-) -> BoxStream<(HgManifestId, Option<MPath>), Error> {
+) -> BoxStream<(HgManifestId, Option<NonRootMPath>), Error> {
     if max_depth == 1 {
         return stream_old::iter_ok(vec![(mfid, rootpath)]).boxify();
     }
@@ -2328,17 +2328,16 @@ fn get_changed_manifests_stream(
                 }
             },
             move |tree_diff| match tree_diff {
-                Diff::Added(path, ..) | Diff::Changed(path, ..) => match path {
-                    Some(path) => path.num_components() <= max_depth,
-                    None => true,
-                },
+                Diff::Added(path, ..) | Diff::Changed(path, ..) => {
+                    path.num_components() <= max_depth
+                }
                 Diff::Removed(..) => false,
             },
         )
         .compat()
         .map(move |(path_no_root_path, hg_mf_id)| {
             let mut path = rootpath.clone();
-            path.extend(MPath::into_iter_opt(path_no_root_path));
+            path.extend(NonRootMPath::into_iter_opt(path_no_root_path.into()));
             (hg_mf_id, path)
         })
         .boxify()
@@ -2348,7 +2347,7 @@ pub fn fetch_treepack_part_input(
     ctx: CoreContext,
     repo: &BlobRepo,
     hg_mf_id: HgManifestId,
-    path: Option<MPath>,
+    path: Option<NonRootMPath>,
     validate_content: bool,
 ) -> BoxFuture<parts::TreepackPartInput, Error> {
     let repo_path = match path {

@@ -5,24 +5,27 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {Context} from './types';
 import type {EnsureAssignedTogether} from 'shared/EnsureAssignedTogether';
 import type {DiffType} from 'shared/patch/parse';
 
 import {Tooltip} from '../../Tooltip';
+import {t} from '../../i18n';
+import platform from '../../platform';
 import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
 import {Icon} from 'shared/Icon';
 
-export function FileHeader<Id>({
-  ctx,
+import './SplitDiffHunk.css';
+
+export function FileHeader({
   path,
   diffType,
   open,
   onChangeOpen,
+  fileActions,
 }: {
-  ctx?: Context<Id>;
   path: string;
   diffType?: DiffType;
+  fileActions?: JSX.Element;
 } & EnsureAssignedTogether<{
   open: boolean;
   onChangeOpen: (open: boolean) => void;
@@ -35,9 +38,6 @@ export function FileHeader<Id>({
   const pathSeparator = '/';
   const pathParts = path.split(pathSeparator);
 
-  const t = ctx?.translate ?? (s => s);
-  const copy = ctx?.copy;
-
   const filePathParts = (
     <>
       {pathParts.reduce((acc, part, idx) => {
@@ -49,15 +49,14 @@ export function FileHeader<Id>({
             {acc}
             {
               <Tooltip
-                // TODO: better translate API that supports templates.
                 component={() => (
                   <span className="file-header-copyable-path-hover">
-                    {t('Copy $path').replace('$path', pathSoFar)}
+                    {t('Copy $path', {replace: {$path: pathSoFar}})}
                   </span>
                 )}
                 delayMs={100}
                 placement="bottom">
-                <span onClick={copy && (() => copy(pathSoFar))}>
+                <span onClick={() => platform.clipboardCopy(pathSoFar)}>
                   {part}
                   {idx < pathParts.length - 1 ? pathSeparator : ''}
                 </span>
@@ -84,13 +83,16 @@ export function FileHeader<Id>({
       )}
       {diffType !== undefined && <Icon icon={diffTypeToIcon[diffType]} />}
       <div className="split-diff-view-file-path-parts">{filePathParts}</div>
-      {ctx?.openFile && (
+      {fileActions != null ? (
+        fileActions
+      ) : (
+        // open file button shows only if other actions not specified
         <Tooltip title={t('Open file')} placement={'bottom'}>
           <VSCodeButton
             appearance="icon"
             className="split-diff-view-file-header-open-button"
             onClick={() => {
-              ctx.openFile?.();
+              platform.openFile(path);
             }}>
             <Icon icon="go-to-file" />
           </VSCodeButton>

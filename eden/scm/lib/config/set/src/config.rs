@@ -260,7 +260,7 @@ impl ConfigSet {
         let section = Text::copy_from_slice(section.as_ref());
         let name = Text::copy_from_slice(name.as_ref());
         let value = value.map(|v| Text::copy_from_slice(v.as_ref()));
-        self.set_internal(section, name, value, None, &opts)
+        self.set_internal(section, name, value, None, opts)
     }
 
     fn set_internal(
@@ -439,7 +439,7 @@ impl ConfigSet {
                         // entry is trimmed. In order for the serialized config to be parsable, we
                         // need some indentation after each newline. Since this whitespace will be
                         // stripped on load, it shouldn't hurt anything.
-                        let value = value.replace("\n", "\n ");
+                        let value = value.replace('\n', "\n ");
                         result.push_str(&value);
                         result.push('\n');
                     } else {
@@ -451,7 +451,7 @@ impl ConfigSet {
                 }
             }
 
-            result.push_str("\n");
+            result.push('\n');
         }
 
         result
@@ -469,57 +469,89 @@ impl ConfigSet {
     ) {
         for (sname, section) in self.sections.iter_mut() {
             for (kname, values) in section.items.iter_mut() {
-                let values_copy = values.clone();
-                let mut removals = 0;
-                // value with a larger index takes precedence.
-                for (index, value) in values_copy.iter().enumerate() {
-                    // Convert the index into the original index.
-                    let index = index - removals;
+                let orig_active_value = values.last().cloned();
 
+                let mut remove_idxs: Vec<usize> = Vec::new();
+
+                // The value index, if any, that will be in effect after removals.
+                let mut new_active_idx: Option<usize> = None;
+
+                // value with a larger index takes precedence.
+                for (index, value) in values.iter().enumerate() {
                     // Get the filename of the value's rc location
-                    let path: PathBuf = match value.location() {
-                        None => continue,
-                        Some((path, _)) => path,
-                    };
-                    let location: Option<String> = path
-                        .file_name()
-                        .and_then(|f| f.to_str())
-                        .map(|s| s.to_string());
-                    // If only certain locations are allowed, and this isn't one of them, remove
-                    // it. If location is None, it came from inmemory, so don't filter it.
-                    if let Some(location) = location {
-                        if crate::builtin::get(location.as_str()).is_none()
-                            && allowed_locations
-                                .as_ref()
-                                .map(|a| a.contains(location.as_str()))
-                                == Some(false)
-                            && allowed_configs
-                                .as_ref()
-                                .map(|a| a.contains(&(sname, kname)))
-                                != Some(true)
-                        {
-                            tracing::trace!(
-                                target: "configset::validate",
-                                "dropping {}.{} set by {} ({})",
-                                sname.as_ref(),
-                                kname.as_ref(),
-                                path.display().to_string(),
-                                value
-                                    .value()
+                    if let Some((path, _)) = value.location() {
+                        let location: Option<String> = path
+                            .file_name()
+                            .and_then(|f| f.to_str())
+                            .map(|s| s.to_string());
+                        // If only certain locations are allowed, and this isn't one of them, remove
+                        // it. If location is None, it came from inmemory, so don't filter it.
+                        if let Some(location) = location {
+                            if crate::builtin::get(location.as_str()).is_none()
+                                && allowed_locations
                                     .as_ref()
-                                    .map(|v| v.as_ref())
-                                    .unwrap_or_default(),
-                            );
-                            values.remove(index);
-                            removals += 1;
-                            continue;
+                                    .map(|a| a.contains(location.as_str()))
+                                    == Some(false)
+                                && allowed_configs
+                                    .as_ref()
+                                    .map(|a| a.contains(&(sname, kname)))
+                                    != Some(true)
+                            {
+                                tracing::trace!(
+                                    target: "configset::validate",
+                                    "dropping {}.{} set by {} ({})",
+                                    sname.as_ref(),
+                                    kname.as_ref(),
+                                    path.display().to_string(),
+                                    value
+                                        .value()
+                                        .as_ref()
+                                        .map(|v| v.as_ref())
+                                        .unwrap_or_default(),
+                                );
+                                remove_idxs.push(index);
+                                continue;
+                            }
                         }
                     }
+
+                    new_active_idx = Some(index);
+                }
+
+                // The goal is to leave invalid values as non-active sources so
+                // they can be seen via the "config" command.
+
+                let mut to_splice = Vec::new();
+                for remove_idx in remove_idxs.iter().rev() {
+                    // Add something to the source to indicate it was marked invalid.
+                    values[*remove_idx].source =
+                        [values[*remove_idx].source.as_ref(), "(invalid - dropped)"]
+                            .join(" ")
+                            .into();
+
+                    // Keep track of invalid values that are after the desired
+                    // "active" value - we have to do something with them.
+                    if new_active_idx.is_some_and(|new_active_idx| *remove_idx > new_active_idx) {
+                        to_splice.push(values.remove(*remove_idx));
+                    }
+                }
+
+                if let Some(new_active_idx) = new_active_idx {
+                    // If there is an active value, insert invalid values before
+                    // it so they don't take effect.
+                    values.splice(new_active_idx..new_active_idx, to_splice);
+                } else {
+                    // If there is no active value, insert a dummy "unset" value.
+                    values.push(ValueSource {
+                        value: None,
+                        source: "(invalid - dummy)".into(),
+                        location: None,
+                    });
                 }
 
                 // If the removal changes the config, log it as mismatched.
                 if let (Some(before_remove), Some(after_remove)) =
-                    (values_copy.last(), values.last())
+                    (orig_active_value, values.last())
                 {
                     if before_remove.value != after_remove.value {
                         let source = match before_remove.location() {
@@ -688,7 +720,7 @@ pub(crate) mod tests {
         assert_eq!(cfg.get("x", "n"), Some(Text::new()));
         assert_eq!(
             cfg.get("x", "m"),
-            Some(Text::from(&"this\nvalue has\nmulti lines"[..]))
+            Some(Text::from("this\nvalue has\nmulti lines"))
         );
 
         let sources = cfg.get_sources("y", "a");
@@ -1230,7 +1262,7 @@ x = 2
         );
 
         assert_eq!(cfg.get_or("foo", "bar", || 3).unwrap(), 3);
-        assert_eq!(cfg.get_or("foo", "bool1", || false).unwrap(), true);
+        assert!(cfg.get_or("foo", "bool1", || false).unwrap());
         assert_eq!(
             format!("{}", cfg.get_or("foo", "bool2", || true).unwrap_err()),
             "invalid bool: unknown"
@@ -1246,7 +1278,7 @@ x = 2
             vec![2, 3, 1]
         );
 
-        assert_eq!(cfg.get_or_default::<bool>("foo", "bool1").unwrap(), true);
+        assert!(cfg.get_or_default::<bool>("foo", "bool1").unwrap());
         assert_eq!(
             cfg.get_or_default::<Vec<bool>>("foo", "bools").unwrap(),
             vec![true, true, true, true, false, false, false, false]

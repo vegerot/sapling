@@ -11,8 +11,6 @@ use std::fmt::Debug;
 use std::fs::create_dir_all;
 use std::future::ready;
 use std::num::NonZeroU64;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -230,16 +228,6 @@ impl Client {
             req.set_header(k, v);
         }
 
-        if let Some(ref correlator) = config.correlator {
-            // Also send correlator to telemetry. Usually it's just the edenapi
-            // DEFAULT_CORRELATOR so we just send it once.
-            static LOGGED: AtomicBool = AtomicBool::new(false);
-            if !LOGGED.fetch_or(true, Ordering::AcqRel) {
-                tracing::debug!(target: "clienttelemetry", client_correlator=config.correlator);
-            }
-            req.set_header("X-Client-Correlator", correlator);
-        }
-
         if let Some(timeout) = config.timeout {
             req.set_timeout(timeout);
         }
@@ -432,7 +420,7 @@ impl Client {
         };
         let timestamp = chrono::Local::now().format("%y%m%d_%H%M%S_%f");
         let name = format!("{}_{}.log", &timestamp, label);
-        let path = log_dir.join(&name);
+        let path = log_dir.join(name);
 
         let _ = async_runtime::spawn_blocking(move || {
             if let Err(e) = || -> std::io::Result<()> {
@@ -473,7 +461,7 @@ impl Client {
             req
         })?;
 
-        Ok(self.fetch_guard::<FileResponse>(requests, guards)?)
+        self.fetch_guard::<FileResponse>(requests, guards)
     }
 
     pub(crate) async fn fetch_trees(
@@ -506,7 +494,7 @@ impl Client {
             req
         })?;
 
-        Ok(self.fetch::<Result<TreeEntry, EdenApiServerError>>(requests)?)
+        self.fetch::<Result<TreeEntry, EdenApiServerError>>(requests)
     }
 
     pub(crate) async fn fetch_files_attrs(
@@ -536,7 +524,7 @@ impl Client {
             req
         })?;
 
-        Ok(self.fetch_guard::<FileResponse>(requests, guards)?)
+        self.fetch_guard::<FileResponse>(requests, guards)
     }
 
     /// Upload a single file
@@ -574,10 +562,10 @@ impl Client {
         let msg = format!("Requesting upload for {}", url);
         tracing::info!("{}", &msg);
 
-        Ok(self.fetch::<UploadToken>(vec![{
+        self.fetch::<UploadToken>(vec![{
             self.configure_request(self.inner.client.put(url.clone()))?
                 .body(raw_content.to_vec())
-        }])?)
+        }])
     }
 
     async fn clone_data_attempt(&self) -> Result<CloneData<HgId>, EdenApiError> {
@@ -776,7 +764,7 @@ impl EdenApi for Client {
         let url = self.build_url(paths::COMMIT_HASH_LOOKUP)?;
         let prefixes: Vec<CommitHashLookupRequest> = prefixes
             .into_iter()
-            .map(|prefix| make_hash_lookup_request(prefix))
+            .map(make_hash_lookup_request)
             .collect::<Result<Vec<CommitHashLookupRequest>, _>>()?;
         let requests = self.prepare_requests(
             &url,
@@ -976,11 +964,7 @@ impl EdenApi for Client {
         &self,
         hgids: Vec<HgId>,
     ) -> Result<Vec<CommitKnownResponse>, EdenApiError> {
-        let anyids: Vec<_> = hgids
-            .iter()
-            .cloned()
-            .map(|hgid| AnyId::HgChangesetId(hgid))
-            .collect();
+        let anyids: Vec<_> = hgids.iter().cloned().map(AnyId::HgChangesetId).collect();
         let entries = self.lookup_batch(anyids.clone(), None, None).await?;
 
         let into_hgid = |id: IndexableId| match id.id {
@@ -1173,7 +1157,7 @@ impl EdenApi for Client {
         // Merge all the tokens together
         let all_tokens = new_tokens
             .into_iter()
-            .chain(uploaded_tokens.into_iter().map(|token| Ok(token)))
+            .chain(uploaded_tokens.into_iter().map(Ok))
             .collect::<Vec<Result<_, _>>>();
 
         Ok(Response {

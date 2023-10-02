@@ -7,8 +7,10 @@
 
 from __future__ import absolute_import
 
-from edenscm import context, dirstate, extensions, pycompat, registrar, treestate, util
-from edenscmnative import parsers
+import bindings
+from sapling import context, dirstate, extensions, pycompat, registrar, treestate, util
+
+parsers = bindings.cext.parsers
 
 
 configtable = {}
