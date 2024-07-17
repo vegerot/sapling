@@ -9,9 +9,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::fs::OpenOptions;
 use std::io::BufWriter;
-use std::io::Cursor;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
@@ -27,10 +25,12 @@ use byteorder::BigEndian;
 use byteorder::ByteOrder;
 use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
+use fs_err::OpenOptions;
 
 use crate::errors::ErrorKind;
 use crate::filereadwrite::FileReadWrite;
 use crate::filereadwrite::FileReaderWriter;
+use crate::filereadwrite::MemReaderWriter;
 use crate::store::BlockId;
 use crate::store::ScopedLock;
 use crate::store::Store;
@@ -74,16 +74,17 @@ pub struct FileStore {
 }
 
 impl FileStore {
-    /// Create a new FileStore, overwriting any existing file.
-    pub fn create<P: AsRef<Path>>(path: P) -> Result<FileStore> {
-        let path = path.as_ref();
+    /// Create a new FileStore, avoid overwriting any existing file.
+    pub fn create(path: &Path) -> Result<FileStore> {
+        tracing::trace!(target: "treestate::filestore::create", ?path);
         let writer = BufWriter::new(
             OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
-                .truncate(true)
-                .open(path)?,
+                .create_new(true)
+                .open(path)?
+                .into(),
         );
         let mut file = FileReaderWriter::new(writer, path)?;
         file.write(&MAGIC)?;
@@ -101,9 +102,8 @@ impl FileStore {
 
     /// Create a new FileStore in memory. This is used solely for providing
     /// EdenFS a TreeState that is backed by a legacy dirstate.
-    /// TODO: Remove once EdenFS has migrated to TreeState.
-    pub fn in_memory() -> Result<FileStore> {
-        let mut file = Cursor::new(Vec::new());
+    pub fn in_memory_with_lock_path(lock_path: &Path) -> Result<FileStore> {
+        let mut file = MemReaderWriter::new(lock_path)?;
         file.write_all(&MAGIC)?;
         file.write_u32::<BigEndian>(VERSION)?;
         let file = Arc::new(Mutex::new(Box::new(file) as Box<dyn FileReadWrite>));
@@ -120,8 +120,9 @@ impl FileStore {
     /// Open an existing FileStore.  Attempts to open the file in read/write mode.  If write
     /// access is not permitted, falls back to opening the file in read-only mode.  When open
     /// in read-only mode, new blocks of data cannot be appended.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<FileStore> {
+    pub fn open(path: &Path) -> Result<FileStore> {
         let path = path.as_ref();
+        tracing::trace!(target: "treestate::filestore::open", ?path);
         let mut read_only = false;
         let file = OpenOptions::new()
             .read(true)
@@ -131,7 +132,7 @@ impl FileStore {
                 read_only = true;
                 OpenOptions::new().read(true).open(path)
             })?;
-        let mut file = FileReaderWriter::new(BufWriter::new(file), path)?;
+        let mut file = FileReaderWriter::new(BufWriter::new(file.into()), path)?;
 
         // Check the file header is as expected.
         let mut buffer = [0; MAGIC_LEN];
@@ -148,6 +149,7 @@ impl FileStore {
         // Find the size of the file (and hence the position to write new blocks of data)
         // by seeking to the end.
         let position = file.seek(SeekFrom::End(0))?;
+        tracing::trace!(target: "treestate::filestore::open", ?position);
         let file = Arc::new(Mutex::new(Box::new(file) as Box<dyn FileReadWrite>));
         Ok(FileStore {
             file,
@@ -284,9 +286,9 @@ impl StoreView for FileStore {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::io::Write;
 
+    use fs_err as fs;
     use tempfile::tempdir;
 
     use crate::filestore::FileStore;
@@ -317,7 +319,7 @@ mod tests {
             .expect("write block 3");
         s.flush().expect("flush");
         drop((s, lock));
-        let s = FileStore::open(p).expect("open store");
+        let s = FileStore::open(&p).expect("open store");
         assert_eq!(s.read(id3).expect("read 3"), "third data block".as_bytes());
         assert_eq!(s.read(id2).expect("read 2"), "data block two".as_bytes());
         assert_eq!(s.read(id1).expect("read 1"), "data block 1".as_bytes());

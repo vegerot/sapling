@@ -17,6 +17,7 @@ from typing import Dict, Optional, Sized, Tuple, Union
 from . import (
     encoding,
     error,
+    git,
     hbisect,
     i18n,
     mutation,
@@ -346,8 +347,9 @@ def showauthor(repo, ctx, templ, **args):
 @templatekeyword("committer")
 def showcommitter(repo, ctx, templ, **args):
     """String. The committer. Fallback to "author"."""
-    committer = ctx.extra().get("committer")
-    return committer or ctx.user()
+    if committer_info := git.committer_and_date_from_extras(ctx.extra()):
+        return committer_info[0]
+    return ctx.user()
 
 
 @templatekeyword("bisect")
@@ -420,27 +422,20 @@ def showactivebookmark(**args):
     return ""
 
 
-def _date_from_extra(ctx, extra_name: str) -> Tuple[int, int]:
-    d = ctx.extra().get(extra_name)
-    if d:
-        try:
-            sec_str, tz_str = d.split(" ", 1)
-            return int(sec_str), int(tz_str)
-        except ValueError:
-            pass
-    return ctx.date()
-
-
 @templatekeyword("authordate")
 def showauthordate(repo, ctx, templ, **args):
     """Date information. The "author" date. Fallback to "date"."""
-    return _date_from_extra(ctx, "author_date")
+    if author_date := git.author_date_from_extras(ctx.extra()):
+        return author_date
+    return ctx.date()
 
 
 @templatekeyword("committerdate")
 def showcommitterdate(repo, ctx, templ, **args):
     """Date information. The "committer" date. Fallback to "date"."""
-    return _date_from_extra(ctx, "committer_date")
+    if committer_info := git.committer_and_date_from_extras(ctx.extra()):
+        return committer_info[1:]
+    return ctx.date()
 
 
 @templatekeyword("date")
@@ -729,6 +724,15 @@ def shownode(repo, ctx, templ, **args):
     digit string.
     """
     return ctx.hex()
+
+
+@templatekeyword("nodescheme")
+def nodescheme(repo, ctx, templ, **args):
+    """String. The changeset id scheme, e.g. "hg" or "git"."""
+    if git.isgitformat(repo):
+        return "git"
+    else:
+        return "hg"
 
 
 @templatekeyword("obsolete")

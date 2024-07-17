@@ -411,7 +411,7 @@ def setuptreestores(repo, mfl):
     elif eagerepo.iseagerepo(repo) or repo.storage_format() == "revlog":
         mfl._isgit = False
         mfl._iseager = True
-        store = repo.fileslog.contentstore
+        store = repo.fileslog.filestore
         mfl.datastore = EagerDataStore(store)
         mfl.historystore = mfl.datastore.historystore
         if not isinstance(store, bindings.eagerepo.EagerRepoStore):
@@ -557,6 +557,13 @@ class basetreemanifestlog:
             store.get(dir, node)
         except KeyError:
             raise shallowutil.MissingNodesError([(dir, node)])
+        except error.HttpError as ex:
+            # Hack to handle eagerstore errors. This should be converted to a KeyError
+            # somewhere in Rust.
+            if "404" in str(ex):
+                raise shallowutil.MissingNodesError([(dir, node)])
+            else:
+                raise ex
 
         m = treemanifestctx(self, dir, node)
         self._treemanifestcache[node] = m
@@ -1136,8 +1143,7 @@ def pull(orig, ui, repo, *pats, **opts):
         except Exception as ex:
             # Errors are not fatal.
             ui.warn(_("failed to prefetch trees after pull: %s\n") % ex)
-            ui.log(
-                "exceptions",
+            ui.log_exception(
                 exception_type=type(ex).__name__,
                 exception_msg=str(ex),
                 fatal="false",
@@ -1386,7 +1392,8 @@ def _existonserver(repo, mfnode):
     Return True if the server has the mfnode, False otherwise.
     """
     stream, _stats = repo.edenapi.trees(
-        [("", mfnode)], {"parents": False, "manifest_blob": False}
+        [("", mfnode)],
+        {"parents": False, "manifest_blob": False, "child_metadata": False},
     )
     try:
         list(stream)

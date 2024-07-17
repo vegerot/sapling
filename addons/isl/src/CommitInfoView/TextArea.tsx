@@ -6,7 +6,7 @@
  */
 
 import type {FieldConfig} from './types';
-import type {ForwardedRef, MutableRefObject, ReactNode} from 'react';
+import type {ReactNode, RefObject} from 'react';
 
 import {
   useUploadFilesCallback,
@@ -16,61 +16,14 @@ import {
 } from '../ImageUpload';
 import {Internal} from '../Internal';
 import {insertAtCursor} from '../textareaUtils';
-import {assert} from '../utils';
-import {GenerateAICommitMesageButton} from './GenerateWithAI';
-import {getInnerTextareaForVSCodeTextArea} from './utils';
-import {VSCodeTextArea} from '@vscode/webview-ui-toolkit/react';
-import {forwardRef, useRef, useEffect} from 'react';
+import {GenerateAICommitMessageButton} from './GenerateWithAI';
+import {MinHeightTextField} from './MinHeightTextField';
+import {TextArea} from 'isl-components/TextArea';
+import {useRef, useEffect} from 'react';
 
-/**
- * Wrap `VSCodeTextArea` to auto-resize to minimum height and disallow newlines.
- * Like a `VSCodeTextField` that has text wrap inside.
- */
-const MinHeightTextField = forwardRef(
-  (
-    props: React.ComponentProps<typeof VSCodeTextArea> & {
-      onInput: (event: {target: {value: string}}) => unknown;
-    },
-    ref: ForwardedRef<typeof VSCodeTextArea>,
-  ) => {
-    const {onInput, ...rest} = props;
-
-    // ref could also be a callback ref; don't bother supporting that right now.
-    assert(typeof ref === 'object', 'MinHeightTextArea requires ref object');
-
-    // whenever the value is changed, recompute & apply the minimum height
-    useEffect(() => {
-      const r = ref as MutableRefObject<typeof VSCodeTextArea>;
-      const current = r?.current as unknown as HTMLInputElement;
-      // height must be applied to textarea INSIDE shadowRoot of the VSCodeTextArea
-      const innerTextArea = current?.shadowRoot?.querySelector('textarea');
-      if (innerTextArea) {
-        const resize = () => {
-          innerTextArea.style.height = '';
-          innerTextArea.style.height = `${innerTextArea.scrollHeight}px`;
-        };
-        resize();
-        const obs = new ResizeObserver(resize);
-        obs.observe(innerTextArea);
-        return () => obs.unobserve(innerTextArea);
-      }
-    }, [props.value, ref]);
-
-    return (
-      <VSCodeTextArea
-        ref={ref}
-        {...rest}
-        className={`min-height-text-area${rest.className ? ' ' + rest.className : ''}`}
-        onInput={e => {
-          const newValue = (e.target as HTMLInputElement)?.value
-            // remove newlines so this acts like a textField rather than a textArea
-            .replace(/(\r|\n)/g, '');
-          onInput({target: {value: newValue}});
-        }}
-      />
-    );
-  },
-);
+function moveCursorToEnd(element: HTMLTextAreaElement) {
+  element.setSelectionRange(element.value.length, element.value.length);
+}
 
 export function CommitInfoTextArea({
   kind,
@@ -87,21 +40,21 @@ export function CommitInfoTextArea({
   editedMessage: string;
   setEditedCommitMessage: (fieldValue: string) => unknown;
 }) {
-  const ref = useRef(null);
+  const ref = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
     if (ref.current && autoFocus) {
-      const inner = getInnerTextareaForVSCodeTextArea(ref.current as HTMLElement);
-      inner?.focus();
+      ref.current.focus();
+      moveCursorToEnd(ref.current);
     }
   }, [autoFocus, ref]);
-  const Component = kind === 'field' || kind === 'title' ? MinHeightTextField : VSCodeTextArea;
+  const Component = kind === 'field' || kind === 'title' ? MinHeightTextField : TextArea;
   const props =
     kind === 'field' || kind === 'title'
       ? {}
-      : {
+      : ({
           rows: 15,
           resize: 'vertical',
-        };
+        } as const);
 
   // The gh cli does not support uploading images for commit messages,
   // see https://github.com/cli/cli/issues/1895#issuecomment-718899617
@@ -112,11 +65,11 @@ export function CommitInfoTextArea({
       // image upload is always enabled in tests
       process.env.NODE_ENV === 'test');
 
-  const onInput = (event: {target: HTMLInputElement}) => {
-    setEditedCommitMessage((event.target as HTMLInputElement)?.value);
+  const onInput = (event: {currentTarget: HTMLTextAreaElement}) => {
+    setEditedCommitMessage(event.currentTarget?.value);
   };
 
-  const uploadFiles = useUploadFilesCallback(ref, onInput);
+  const uploadFiles = useUploadFilesCallback(name, ref, onInput);
 
   const fieldKey = name.toLowerCase().replace(/\s/g, '-');
 
@@ -127,8 +80,8 @@ export function CommitInfoTextArea({
         {...props}
         onPaste={
           !supportsImageUpload
-            ? null
-            : (event: ClipboardEvent) => {
+            ? undefined
+            : (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
                 if (event.clipboardData != null && event.clipboardData.files.length > 0) {
                   uploadFiles([...event.clipboardData.files]);
                   event.preventDefault();
@@ -140,17 +93,16 @@ export function CommitInfoTextArea({
         onInput={onInput}
       />
       <EditorToolbar
+        fieldName={name}
         uploadFiles={supportsImageUpload ? uploadFiles : undefined}
         supportsGeneratingAIMessage={
           fieldConfig.supportsBeingAutoGenerated && Internal.generateAICommitMessage
         }
         appendToTextArea={(toAdd: string) => {
-          const textarea = getInnerTextareaForVSCodeTextArea(
-            ref.current as HTMLTextAreaElement | null,
-          );
+          const textarea = ref.current;
           if (textarea) {
             insertAtCursor(textarea, toAdd);
-            onInput({target: textarea as unknown as HTMLInputElement});
+            onInput({currentTarget: textarea});
           }
         }}
         textAreaRef={ref}
@@ -168,24 +120,28 @@ export function CommitInfoTextArea({
  * Floating button list at the bottom corner of the text area
  */
 export function EditorToolbar({
+  fieldName,
   textAreaRef,
   uploadFiles,
   appendToTextArea,
   supportsGeneratingAIMessage,
 }: {
+  fieldName: string;
   uploadFiles?: (files: Array<File>) => unknown;
-  textAreaRef: MutableRefObject<unknown>;
+  textAreaRef: RefObject<HTMLTextAreaElement>;
   appendToTextArea: (toAdd: string) => unknown;
   supportsGeneratingAIMessage?: unknown;
 }) {
   const parts: Array<ReactNode> = [];
   if (uploadFiles != null) {
-    parts.push(<PendingImageUploads key="pending-uploads" textAreaRef={textAreaRef} />);
+    parts.push(
+      <PendingImageUploads fieldName={fieldName} key="pending-uploads" textAreaRef={textAreaRef} />,
+    );
     parts.push(<FilePicker key="picker" uploadFiles={uploadFiles} />);
   }
   if (supportsGeneratingAIMessage != null) {
     parts.push(
-      <GenerateAICommitMesageButton
+      <GenerateAICommitMessageButton
         textAreaRef={textAreaRef}
         appendToTextArea={appendToTextArea}
         key="gen-ai-message"

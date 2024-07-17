@@ -4,7 +4,6 @@ import os
 import unittest
 
 import silenttestrunner
-from hghave import require
 from sapling import match as matchmod
 
 
@@ -41,7 +40,7 @@ class ExplainTreeMatcherTests(unittest.TestCase):
         self.assertEqual(m.explain("foo/bar"), "foo/bar")
 
         m = matchmod.treematcher(
-            "/", "", rules=["foo/bar", "!baz"], ruledetails=["a", "b"]
+            "/", "", rules=["foo/bar", "!baz"], ruledetails=["foo/bar (a)", "!baz (b)"]
         )
         self.assertEqual(m.explain("blah"), None)
         self.assertEqual(m.explain("baz"), "!baz (b)")

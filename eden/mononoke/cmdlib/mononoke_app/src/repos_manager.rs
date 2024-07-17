@@ -126,6 +126,10 @@ impl<Repo> MononokeReposManager<Repo> {
         &self.repos
     }
 
+    pub fn configs(&self) -> Arc<MononokeConfigs> {
+        self.configs.clone()
+    }
+
     /// The logger for the app.
     pub fn logger(&self) -> &Logger {
         &self.logger
@@ -278,11 +282,12 @@ where
             }
             // If the service name is known, then by default we need to reload or add all repos
             // that are in RepoConfig AND are shallow-sharded (i.e. NOT deep-sharded).
-            else if repo_config.enabled && let Some(ref service_name) = self.service_name {
+            else if repo_config.enabled
+                && let Some(ref service_name) = self.service_name
+            {
                 if let Some(ref config) = repo_config.deep_sharding_config {
                     // Repo is shallow sharded for this service AND enabled, so should be loaded.
-                    if !config.status.get(service_name).cloned().unwrap_or(false)
-                    {
+                    if !config.status.get(service_name).cloned().unwrap_or(false) {
                         repos_to_load.push((repo_name, repo_config));
                     }
                 } else {

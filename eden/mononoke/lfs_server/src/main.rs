@@ -17,7 +17,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
@@ -34,6 +33,7 @@ use futures::future::try_select;
 use futures::pin_mut;
 use futures::TryFutureExt;
 use gotham_ext::handler::MononokeHttpHandler;
+use gotham_ext::middleware::ConfigInfoMiddleware;
 use gotham_ext::middleware::LoadMiddleware;
 use gotham_ext::middleware::LogMiddleware;
 use gotham_ext::middleware::MetadataMiddleware;
@@ -55,15 +55,14 @@ use mononoke_app::fb303::AliveService;
 use mononoke_app::fb303::Fb303AppExtension;
 use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
+use mononoke_configs::MononokeConfigs;
 use mononoke_repos::MononokeRepos;
-use qps::Qps;
 use repo_blobstore::RepoBlobstore;
 use repo_identity::RepoIdentity;
 use repo_permission_checker::RepoPermissionChecker;
 use slog::info;
 use tokio::net::TcpListener;
 
-use crate::lfs_server_context::get_bandwidth;
 use crate::lfs_server_context::LfsServerContext;
 use crate::lfs_server_context::ServerUris;
 use crate::middleware::OdsMiddleware;
@@ -82,7 +81,6 @@ mod popularity;
 mod scuba;
 mod service;
 mod upload;
-mod util;
 
 const SERVICE_NAME: &str = "mononoke_lfs_server";
 
@@ -121,7 +119,7 @@ struct LfsServerArgs {
     shutdown_timeout_args: ShutdownTimeoutArgs,
     /// TLS parameters for this service
     #[clap(flatten)]
-    tls_params: TLSArgs,
+    tls_params: Option<TLSArgs>,
     /// The host to listen on locally
     #[clap(long, default_value = "127.0.0.1")]
     listen_host: String,
@@ -159,14 +157,12 @@ struct LfsServerArgs {
     max_upload_size: Option<u64>,
     #[clap(flatten)]
     readonly: ReadonlyArgs,
-    /// Path to config
-    #[clap(long)]
-    cslb_config: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct LfsRepos {
     pub(crate) repos: Arc<MononokeRepos<Repo>>,
+    pub(crate) config: Arc<MononokeConfigs>,
 }
 
 impl LfsRepos {
@@ -175,7 +171,8 @@ impl LfsRepos {
             .open_managed_repos(Some(ShardedService::LargeFilesService))
             .await?;
         let repos = repos_mgr.repos().clone();
-        Ok(Self { repos })
+        let config = repos_mgr.configs().clone();
+        Ok(Self { repos, config })
     }
 
     pub(crate) fn get(&self, repo_name: &str) -> Option<Arc<Repo>> {
@@ -210,25 +207,18 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
     let addr = format!("{}:{}", listen_host, listen_port);
 
-    let tls_certificate = args.tls_params.tls_certificate.clone();
-    let tls_private_key = args.tls_params.tls_private_key.clone();
-    let tls_ca = args.tls_params.tls_ca.clone();
-    let tls_ticket_seeds = args.tls_params.tls_ticket_seeds.clone();
-
-    let tls_acceptor = match (tls_certificate, tls_private_key, tls_ca, tls_ticket_seeds) {
-        (Some(tls_certificate), Some(tls_private_key), Some(tls_ca), tls_ticket_seeds) => {
-            let acceptor = secure_utils::SslConfig::new(
-                tls_ca,
-                tls_certificate,
-                tls_private_key,
-                tls_ticket_seeds,
+    let tls_acceptor = args
+        .tls_params
+        .map(|tls_params| {
+            secure_utils::SslConfig::new(
+                tls_params.tls_ca,
+                tls_params.tls_certificate,
+                tls_params.tls_private_key,
+                tls_params.tls_ticket_seeds,
             )
-            .build_tls_acceptor(logger.clone())?;
-            Some(acceptor)
-        }
-        (None, None, None, None) => None,
-        _ => bail!("TLS flags must be passed together"),
-    };
+            .build_tls_acceptor(logger.clone())
+        })
+        .transpose()?;
 
     let tls_session_data_log = args.tls_session_data_log_file.clone();
 
@@ -243,14 +233,6 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
     let config_handle = config_handle.context(Error::msg("Failed to load configuration"))?;
 
-    let cslb_config = args.cslb_config;
-
-    let qps = match cslb_config {
-        Some(config) => {
-            Some(Qps::new(fb, config, config_store).with_context(|| "Failed to initialize QPS")?)
-        }
-        None => None,
-    };
     let max_upload_size: Option<u64> = args.max_upload_size;
 
     let self_urls = args.self_urls;
@@ -310,8 +292,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
             let server_uris = ServerUris::new(self_urls, upstream_url)?;
 
-            let bandwidth = get_bandwidth(&logger);
-
+            let repos_config = repos.config.clone();
             let ctx = LfsServerContext::new(
                 repos,
                 server_uris,
@@ -319,9 +300,6 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                 max_upload_size,
                 will_exit,
                 config_handle.clone(),
-                logger.clone(),
-                qps,
-                bandwidth,
             )?;
             let enforce_authentication = ctx.get_config().enforce_authentication();
 
@@ -331,13 +309,16 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
             let handler = MononokeHttpHandler::builder()
                 .add(TlsSessionDataMiddleware::new(tls_session_data_log)?)
+                .add(ConfigInfoMiddleware::new(repos_config))
                 .add(MetadataMiddleware::new(
                     fb,
                     logger.clone(),
                     internal_identity,
-                    ClientEntryPoint::LFS,
+                    ClientEntryPoint::LfsServer,
+                    false,
                 ))
                 .add(PostResponseMiddleware::with_config(config_handle))
+                .add(<ScubaMiddleware<LfsScubaHandler>>::new(scuba_logger))
                 .add(RequestContextMiddleware::new(
                     fb,
                     logger.clone(),
@@ -349,7 +330,6 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                 .add(ServerIdentityMiddleware::new(HeaderValue::from_static(
                     "mononoke-lfs",
                 )))
-                .add(<ScubaMiddleware<LfsScubaHandler>>::new(scuba_logger))
                 .add(OdsMiddleware::new())
                 .add(TimerMiddleware::new())
                 .build(router);

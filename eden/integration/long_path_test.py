@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 from typing import Dict
 
 from facebook.eden.ttypes import GetScmStatusParams, ScmFileStatus
@@ -33,6 +35,7 @@ class LongPathsTest(testcase.EdenRepoTest):
                     mountPoint=self.mount.encode(),
                     commit=self.initial_commit.encode(),
                     listIgnored=listIgnored,
+                    rootIdOptions=None,
                 )
             )
             return status.status.entries

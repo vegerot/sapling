@@ -16,8 +16,14 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use checkout::BookmarkAction;
+use checkout::CheckoutMode;
+use checkout::ReportMode;
 use configmodel::config::ConfigExt;
+use context::CoreContext;
 use cpython::*;
+use cpython_ext::convert::ImplInto;
+use cpython_ext::convert::Serde;
 use cpython_ext::error::ResultPyErrExt;
 use cpython_ext::ExtractInner;
 use cpython_ext::PyNone;
@@ -26,7 +32,7 @@ use parking_lot::RwLock;
 use pyconfigloader::config;
 use pydag::commits::commits as PyCommits;
 use pyeagerepo::EagerRepoStore as PyEagerRepoStore;
-use pyedenapi::PyClient as PyEdenApi;
+use pyedenapi::PyClient as PySaplingRemoteApi;
 use pymetalog::metalog as PyMetaLog;
 use pyrevisionstore::filescmstore as PyFileScmStore;
 use pyrevisionstore::pyremotestore as PyRemoteStore;
@@ -35,6 +41,7 @@ use pyworkingcopy::workingcopy as PyWorkingCopy;
 use revisionstore::ContentStoreBuilder;
 use rsrepo::repo::Repo;
 use rsworkingcopy::workingcopy::WorkingCopy;
+use types::HgId;
 
 pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
     let name = [package, "repo"].join(".");
@@ -64,9 +71,8 @@ py_class!(pub class repo |py| {
     def workingcopy(&self) -> PyResult<PyWorkingCopy> {
         let mut wc_option = self.inner_wc(py).borrow_mut();
         if wc_option.is_none() {
-            let mut repo = self.inner(py).write();
-            let path = repo.path().to_path_buf();
-            wc_option.replace(Arc::new(RwLock::new(repo.working_copy(&path).map_pyerr(py)?)));
+            let repo = self.inner(py).write();
+            wc_option.replace(Arc::new(RwLock::new(repo.working_copy().map_pyerr(py)?)));
         }
         PyWorkingCopy::create_instance(py, wc_option.as_ref().unwrap().clone())
     }
@@ -74,16 +80,15 @@ py_class!(pub class repo |py| {
     def invalidateworkingcopy(&self) -> PyResult<PyNone> {
         let wc_option = self.inner_wc(py).borrow_mut();
         if wc_option.is_some() {
-            let mut repo = self.inner(py).write();
-            let path = repo.path().to_path_buf();
+            let repo = self.inner(py).write();
             let mut wc = wc_option.as_ref().unwrap().write();
-            *wc = repo.working_copy(&path).map_pyerr(py)?;
+            *wc = repo.working_copy().map_pyerr(py)?;
         }
         Ok(PyNone)
     }
 
     def metalog(&self) -> PyResult<PyMetaLog> {
-        let mut repo_ref = self.inner(py).write();
+        let repo_ref = self.inner(py).write();
         let path = String::from(repo_ref.metalog_path().to_string_lossy());
         let log_ref = repo_ref.metalog().map_pyerr(py)?;
         PyMetaLog::create_instance(py, log_ref, path)
@@ -110,27 +115,27 @@ py_class!(pub class repo |py| {
     }
 
     def invalidatemetalog(&self) -> PyResult<PyNone> {
-        let mut repo_ref = self.inner(py).write();
-        repo_ref.invalidate_metalog();
+        let repo_ref = self.inner(py).write();
+        repo_ref.invalidate_metalog().map_pyerr(py)?;
         Ok(PyNone)
     }
 
-    def edenapi(&self) -> PyResult<PyEdenApi> {
-        let mut repo_ref = self.inner(py).write();
+    def edenapi(&self) -> PyResult<PySaplingRemoteApi> {
+        let repo_ref = self.inner(py).read();
         let edenapi_ref = repo_ref.eden_api().map_pyerr(py)?;
-        PyEdenApi::create_instance(py, edenapi_ref)
+        PySaplingRemoteApi::create_instance(py, edenapi_ref)
     }
 
-    def nullableedenapi(&self) -> PyResult<Option<PyEdenApi>> {
-        let mut repo_ref = self.inner(py).write();
+    def nullableedenapi(&self) -> PyResult<Option<PySaplingRemoteApi>> {
+        let repo_ref = self.inner(py).read();
         match repo_ref.optional_eden_api().map_pyerr(py)? {
-            Some(api) => Ok(Some(PyEdenApi::create_instance(py, api)?)),
+            Some(api) => Ok(Some(PySaplingRemoteApi::create_instance(py, api)?)),
             None => Ok(None),
         }
     }
 
     def filescmstore(&self, remote: PyRemoteStore) -> PyResult<PyFileScmStore> {
-        let mut repo = self.inner(py).write();
+        let repo = self.inner(py).write();
         let _ = repo.file_store().map_pyerr(py)?;
         let mut file_scm_store = repo.file_scm_store().unwrap();
 
@@ -156,7 +161,7 @@ py_class!(pub class repo |py| {
     }
 
     def treescmstore(&self, remote: PyRemoteStore) -> PyResult<PyTreeScmStore> {
-        let mut repo = self.inner(py).write();
+        let repo = self.inner(py).write();
         let _ = repo.tree_store().map_pyerr(py)?;
         let mut tree_scm_store = repo.tree_scm_store().unwrap();
 
@@ -184,7 +189,7 @@ py_class!(pub class repo |py| {
     }
 
     def changelog(&self) -> PyResult<PyCommits> {
-        let mut repo_ref = self.inner(py).write();
+        let repo_ref = self.inner(py).write();
         let changelog_ref = py
             .allow_threads(|| repo_ref.dag_commits())
             .map_pyerr(py)?;
@@ -192,13 +197,13 @@ py_class!(pub class repo |py| {
     }
 
     def invalidatechangelog(&self) -> PyResult<PyNone> {
-        let mut repo_ref = self.inner(py).write();
+        let repo_ref = self.inner(py).write();
         repo_ref.invalidate_dag_commits().map_pyerr(py)?;
         Ok(PyNone)
     }
 
     def invalidatestores(&self) -> PyResult<PyNone> {
-        let mut repo_ref = self.inner(py).write();
+        let repo_ref = self.inner(py).write();
         repo_ref.invalidate_stores().map_pyerr(py)?;
         Ok(PyNone)
     }
@@ -232,14 +237,41 @@ py_class!(pub class repo |py| {
     }
 
     def eagerstore(&self) -> PyResult<PyEagerRepoStore> {
-        let mut repo = self.inner(py).write();
+        let repo = self.inner(py).write();
         let _ = repo.file_store().map_pyerr(py)?;
         PyEagerRepoStore::create_instance(py, repo.eager_store().unwrap())
+    }
+
+    def goto(
+        &self,
+        ctx: ImplInto<CoreContext>,
+        target: Serde<HgId>,
+        bookmark: Serde<BookmarkAction>,
+        mode: Serde<CheckoutMode>,
+        report_mode: Serde<ReportMode>,
+    ) -> PyResult<(usize, usize, usize, usize)> {
+        let repo = self.inner(py).read();
+        let wc = self.workingcopy(py)?.get_wc(py);
+        let wc = wc.write();
+        let flush_dirstate = !wc.is_locked();
+        checkout::checkout(
+            &ctx.0,
+            &repo,
+            &wc.lock().map_pyerr(py)?,
+            target.0,
+            bookmark.0,
+            mode.0,
+            report_mode.0,
+            flush_dirstate,
+        ).map(|opt_stats| {
+            let (updated, removed) = opt_stats.unwrap_or_default();
+            (updated, 0, removed, 0)
+        }).map_pyerr(py)
     }
 });
 
 py_class!(pub class repolock |py| {
-    data lock: Cell<Option<rsrepolock::RepoLockHandle>>;
+    data lock: Cell<Option<rsrepolock::LockedPath>>;
 
     def unlock(&self) -> PyResult<PyNone> {
         if let Some(f) = self.lock(py).replace(None) {

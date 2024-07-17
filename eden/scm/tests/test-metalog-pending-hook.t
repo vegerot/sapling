@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 Check pending changes to metalog is visible to hooks running in subprocesses.
 

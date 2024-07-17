@@ -63,7 +63,7 @@ pub trait HgIdDataStore: LocalStore + Send + Sync {
 pub trait RemoteDataStore: HgIdDataStore + Send + Sync {
     /// Attempt to bring the data corresponding to the passed in keys to a local store.
     ///
-    /// When implemented on a pure remote store, like the `EdenApi`, the method will always fetch
+    /// When implemented on a pure remote store, like the `SaplingRemoteApi`, the method will always fetch
     /// everything that was asked. On a higher level store, such as the `ContentStore`, this will
     /// avoid fetching data that is already present locally.
     fn prefetch(&self, keys: &[StoreKey]) -> Result<Vec<StoreKey>>;
@@ -103,7 +103,6 @@ pub trait HgIdMutableDeltaStore: HgIdDataStore + Send + Sync {
 
 pub trait LegacyStore: HgIdMutableDeltaStore + RemoteDataStore + Send + Sync {
     fn get_file_content(&self, key: &Key) -> Result<Option<Bytes>>;
-    fn get_logged_fetches(&self) -> HashSet<RepoPathBuf>;
     fn get_shared_mutable(&self) -> Arc<dyn HgIdMutableDeltaStore>;
     fn add_pending(
         &self,

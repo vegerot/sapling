@@ -14,17 +14,16 @@ use context::CoreContext;
 use context::PerfCounters;
 use derived_data_constants::*;
 use futures_stats::FutureStats;
+use metadata::Metadata;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use scuba_ext::MononokeScubaSampleBuilder;
 use slog::warn;
-use time_ext::DurationExt;
 
 use super::derive::DerivationOutcome;
-use super::util::DiscoveryStats;
 use super::DerivedDataManager;
 use crate::derivable::BonsaiDerivable;
-use crate::error::DerivationError;
+use crate::error::SharedDerivationError;
 
 pub(super) struct DerivedDataScuba<Derivable> {
     /// Scuba sample builder to log to the derived data table.
@@ -60,10 +59,18 @@ impl<Derivable: BonsaiDerivable> DerivedDataScuba<Derivable> {
             .unwrap_or_else(|| Derivable::NAME.to_string())
     }
 
-    /// Add a single changeset to the logger.
-    pub(super) fn add_changeset(&mut self, csid: ChangesetId) {
+    /// Add a single changeset id to the logger.
+    pub(super) fn add_changeset_id(&mut self, csid: ChangesetId) {
         self.scuba.add("changeset", csid.to_string());
         self.description = Some(format!("{} {csid}", Derivable::NAME));
+    }
+
+    /// Add a single changeset to the logger.  Logs additional data available
+    /// from the bonsai changeset.
+    pub(super) fn add_changeset(&mut self, bcs: &BonsaiChangeset) {
+        self.add_changeset_id(bcs.get_changeset_id());
+        self.scuba
+            .add("changed_files_count", bcs.file_changes_map().len());
     }
 
     /// Add a batch of changesets to the logger.
@@ -80,20 +87,16 @@ impl<Derivable: BonsaiDerivable> DerivedDataScuba<Derivable> {
             }
         };
         self.scuba.add("changesets", csids);
+        let changed_files_count = changesets
+            .iter()
+            .map(|bcs| bcs.file_changes_map().len())
+            .sum::<usize>();
+        self.scuba.add("changed_files_count", changed_files_count);
     }
 
-    /// Add values for the parameters controlling batched derivation to the
-    /// scuba logger.
-    pub(super) fn add_batch_parameters(&mut self, parallel: bool, gap_size: Option<usize>) {
-        self.scuba.add("parallel", parallel);
-        if let Some(gap_size) = gap_size {
-            self.scuba.add("gap_size", gap_size);
-        }
-    }
-
-    /// Add statistics from derivation discovery to the scuba logger.
-    pub(super) fn add_discovery_stats(&mut self, discovery_stats: &DiscoveryStats) {
-        discovery_stats.add_scuba_fields(&mut self.scuba);
+    /// Add metadata to the logger
+    pub fn add_metadata(&mut self, metadata: &Metadata) {
+        self.scuba.add_metadata(metadata);
     }
 
     /// Log the start of derivation to both the request and derived data scuba
@@ -220,13 +223,14 @@ impl<Derivable: BonsaiDerivable> DerivedDataScuba<Derivable> {
 
 impl DerivedDataManager {
     fn should_log_slow_derivation(&self, duration: Duration) -> bool {
-        let threshold = tunables::tunables()
-            .derived_data_slow_derivation_threshold_secs()
-            .unwrap_or_default();
-        let threshold = match threshold.try_into() {
-            Ok(t) if t > 0 => t,
-            _ => return false,
-        };
+        const FALLBACK_THRESHOLD_SECS: u64 = 15;
+
+        let threshold: u64 = justknobs::get_as::<u64>(
+            "scm/mononoke_timeouts:derived_data_slow_derivation_threshold_secs",
+            None,
+        )
+        .unwrap_or(FALLBACK_THRESHOLD_SECS);
+
         duration > Duration::from_secs(threshold)
     }
 
@@ -237,7 +241,7 @@ impl DerivedDataManager {
         csid: ChangesetId,
         stats: &FutureStats,
         pc: &PerfCounters,
-        result: &Result<DerivationOutcome<Derivable>, DerivationError>,
+        result: &Result<DerivationOutcome<Derivable>, SharedDerivationError>,
     ) where
         Derivable: BonsaiDerivable,
     {
@@ -256,17 +260,12 @@ impl DerivedDataManager {
         match result {
             Ok(derivation_outcome) => {
                 scuba.add("derived", derivation_outcome.count);
-                scuba.add(
-                    "find_underived_completion_time_ms",
-                    derivation_outcome.find_underived_time.as_millis_unchecked(),
-                );
                 warn!(
                     ctx.logger(),
-                    "slow derivation of {} for {}, took {:.2?} (find_underived: {:.2?}), derived {} changesets",
+                    "slow derivation of {} for {}, took {:.2?}, derived {} changesets",
                     Derivable::NAME,
                     csid,
                     stats.completion_time,
-                    derivation_outcome.find_underived_time,
                     derivation_outcome.count,
                 );
             }

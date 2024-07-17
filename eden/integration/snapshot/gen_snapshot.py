@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 import argparse
 import logging
 import sys
@@ -71,6 +73,10 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+def main_2() -> None:
     rc: int = main()
     sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main_2()

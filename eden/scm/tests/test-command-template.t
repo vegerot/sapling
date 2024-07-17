@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ setconfig format.use-segmented-changelog=true
   $ setconfig devel.segmented-changelog-rev-compat=true
@@ -208,7 +210,7 @@
 # experimental:
 
   $ hg log -r 'wdir()' -T '{rev}:{node}\n'
-  2147483647:ffffffffffffffffffffffffffffffffffffffff
+  9151595917793558527:ffffffffffffffffffffffffffffffffffffffff
 
 # Some keywords are invalid for working-directory revision, but they should
 # never cause crash:
@@ -266,7 +268,7 @@
   $ hg log -l1 -Tblah/blah
   blah/blah (no-eol)
 
-  $ echo 'changeset = "{rev}\n"' > map-simple
+  $ printf "%s" 'changeset = "{rev}\n"' > map-simple
   $ hg log -l1 -T./map-simple
   8
 
@@ -298,7 +300,7 @@
 # Test template map inheritance
 
   $ echo '__base__ = map-cmdline.default' > map-simple
-  $ echo 'cset = "changeset: ***{rev}***\n"' >> map-simple
+  $ printf "%s" 'cset = "changeset: ***{rev}***\n"' >> map-simple
   $ hg log -l1 -T./map-simple
   changeset: ***8***
   user:        test
@@ -3264,34 +3266,34 @@
 # Test localdate(date, tz) function:
 
 # TZ= does not override the global timezone state on Windows.
-#if no-nt
+#if no-windows
     import time, os
 
     oldtz = getenv("TZ")
     setenv("TZ", "JST-09")
-    os.setenv("TZ", "JST-09")
+    os.environ["TZ"] = "JST-09"
 
     # tzset() is required for Python 3.6+ to recognize the timezone change.
     # https://bugs.python.org/issue30062
     time.tzset()
 
-    $ hg log -r0 -T '{date|localdate|isodate}\\n'
+    $ hg log -r0 -T '{date|localdate|isodate}\n'
     1970-01-01 09:00 +0900
 
-    $ hg log -r0 -T '{localdate(date, \"UTC\")|isodate}\\n'
+    $ hg log -r0 -T '{localdate(date, \"UTC\")|isodate}\n'
     1970-01-01 00:00 +0000
 
-    $ hg log -r0 -T '{localdate(date, \"blahUTC\")|isodate}\\n'
+    $ hg log -r0 -T '{localdate(date, \"blahUTC\")|isodate}\n'
     hg: parse error: localdate expects a timezone
     [255]
 
-    $ hg log -r0 -T '{localdate(date, \"+0200\")|isodate}\\n'
+    $ hg log -r0 -T '{localdate(date, \"+0200\")|isodate}\n'
     1970-01-01 02:00 +0200
 
-    $ hg log -r0 -T '{localdate(date, \"0\")|isodate}\\n'
+    $ hg log -r0 -T '{localdate(date, \"0\")|isodate}\n'
     1970-01-01 00:00 +0000
 
-    $ hg log -r0 -T '{localdate(date, 0)|isodate}\\n'
+    $ hg log -r0 -T '{localdate(date, 0)|isodate}\n'
     1970-01-01 00:00 +0000
 
     setenv("TZ", oldtz)
@@ -3681,6 +3683,8 @@
     r2
    titles color=titles builtin=True
     
+   commitscheme color=commitscheme builtin=True
+    
   
   1
    bookmarks color=bookmark builtin=True
@@ -3694,6 +3698,8 @@
    revnames color=revname builtin=False
     r1
    titles color=titles builtin=True
+    
+   commitscheme color=commitscheme builtin=True
     
   
   0
@@ -3709,6 +3715,8 @@
     r0
    titles color=titles builtin=True
     
+   commitscheme color=commitscheme builtin=True
+    
 
 # revert side effect of loading the revnames extension
 
@@ -3721,6 +3729,7 @@
   remotebookmarks: 
   hoistednames: 
   titles: 
+  commitscheme: 
   $ hg log -r2 -T '{namespaces % "{namespace}:\n{names % " {name}\n"}"}'
   bookmarks:
    bar
@@ -3731,6 +3740,7 @@
   remotebookmarks:
   hoistednames:
   titles:
+  commitscheme:
   $ hg log -r2 -T '{get(namespaces, "bookmarks") % "{name}\n"}'
   bar
   foo
@@ -4024,15 +4034,15 @@
 
 # Aliases should honor HGPLAIN:
 
-#if no-nt
+#if no-windows
 # Environment override does not work well across Python/Rust boundry on
 # Windows. A solution will be changing the config parser take an environ
 # instead of using hardcoded system env.
 
-  $ HGPLAIN= hg log -r0 -T 'nothing expanded:{rn}\\n'
+  $ HGPLAIN= hg log -r0 -T 'nothing expanded:{rn}\n'
   nothing expanded:
 
-  $ HGPLAINEXCEPT=templatealias hg log -r0 -T '{rn}\\n'
+  $ HGPLAINEXCEPT=templatealias hg log -r0 -T '{rn}\n'
   0:1e4e1b8f71e0
 #endif
 

@@ -7,31 +7,38 @@
 
 #include "eden/fs/nfs/NfsServer.h"
 
-#include <folly/executors/thread_factory/NamedThreadFactory.h>
 #include "eden/fs/nfs/Nfsd3.h"
 #include "eden/fs/nfs/portmap/Rpcbindd.h"
-#include "eden/fs/utils/EdenTaskQueue.h"
 
 namespace facebook::eden {
 
 NfsServer::NfsServer(
     PrivHelper* privHelper,
     folly::EventBase* evb,
-    uint64_t numServicingThreads,
-    uint64_t maxInflightRequests,
+    std::shared_ptr<folly::Executor> threadPool,
     bool shouldRunOurOwnRpcbindServer,
-    const std::shared_ptr<StructuredLogger>& structuredLogger)
+    const std::shared_ptr<StructuredLogger>& structuredLogger,
+    size_t maximumInFlightRequests,
+    std::chrono::nanoseconds highNfsRequestsLogInterval)
     : privHelper_{privHelper},
       evb_(evb),
-      threadPool_(std::make_shared<folly::CPUThreadPoolExecutor>(
-          numServicingThreads,
-          std::make_unique<EdenTaskQueue>(maxInflightRequests),
-          std::make_unique<folly::NamedThreadFactory>("NfsThreadPool"))),
+      threadPool_{std::move(threadPool)},
       rpcbindd_(
-          shouldRunOurOwnRpcbindServer
-              ? std::make_shared<Rpcbindd>(evb_, threadPool_, structuredLogger)
-              : nullptr),
-      mountd_(evb_, threadPool_, structuredLogger) {}
+          shouldRunOurOwnRpcbindServer ? std::make_shared<Rpcbindd>(
+                                             evb_,
+                                             threadPool_,
+                                             structuredLogger,
+                                             maximumInFlightRequests,
+                                             highNfsRequestsLogInterval)
+                                       : nullptr),
+      mountd_(
+          evb_,
+          threadPool_,
+          structuredLogger,
+          maximumInFlightRequests,
+          highNfsRequestsLogInterval),
+      maximumInFlightRequests_(maximumInFlightRequests),
+      highNfsRequestsLogInterval_(highNfsRequestsLogInterval) {}
 
 void NfsServer::initialize(
     folly::SocketAddress addr,
@@ -89,6 +96,8 @@ NfsServer::NfsMountInfo NfsServer::registerMount(
       std::move(notifier),
       caseSensitive,
       iosize,
+      maximumInFlightRequests_,
+      highNfsRequestsLogInterval_,
       traceBusCapacity}};
   mountd_.registerMount(path, rootIno);
 

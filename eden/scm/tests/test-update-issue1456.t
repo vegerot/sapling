@@ -1,7 +1,8 @@
-#debugruntest-compatible
+#modern-config-incompatible
 
-#require execbit
+#require execbit no-eden
   $ setconfig experimental.nativecheckout=true
+  $ setconfig commands.update.check=none
 
   $ newserver server
 
@@ -21,10 +22,10 @@ Test that local removed/deleted, remote removed works with flags
   $ hg co -q 'desc(0)'
 
   $ echo dirty > foo
-  $ hg up -c
+  $ hg up -c 'desc(1)'
   abort: uncommitted changes
   [255]
-  $ hg up -q
+  $ hg up -q 'desc(1)'
   $ cat foo
   dirty
   $ hg st -A
@@ -42,7 +43,7 @@ Validate update of standalone execute bit change:
   [1]
   $ hg up -C 'desc(0)'
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  $ hg up
+  $ hg up 'desc(1)'
   3 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ hg st
 

@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
 Tests JSON Input support for histedit

@@ -3,18 +3,20 @@
 run-test.t only checks positive matches and can not see warnings
 (both by design)
 """
+
 from __future__ import absolute_import, print_function
 
 import doctest
 import os
 import re
 
-from hghave import require
-
 
 # this is hack to make sure no escape characters are inserted into the output
 if "TERM" in os.environ:
     del os.environ["TERM"]
+
+os.environ.pop("HGTEST_USE_EDEN", None)
+
 run_tests = __import__("run-tests")
 
 

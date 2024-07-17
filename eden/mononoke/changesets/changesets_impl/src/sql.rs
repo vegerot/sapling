@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
@@ -30,14 +31,15 @@ use mononoke_types::ChangesetIdsResolvedFromPrefix;
 use mononoke_types::Generation;
 use mononoke_types::RepositoryId;
 use rand::Rng;
+use rendezvous::ConfigurableRendezVousController;
 use rendezvous::RendezVous;
 use rendezvous::RendezVousOptions;
 use rendezvous::RendezVousStats;
-use rendezvous::TunablesRendezVousController;
 use sql::Connection;
 use sql::Transaction;
 use sql_construct::SqlConstruct;
 use sql_construct::SqlConstructFromMetadataDatabaseConfig;
+use sql_ext::_macro_internal::ClientRequestInfo;
 use sql_ext::mononoke_queries;
 use sql_ext::SqlConnections;
 use stats::prelude::*;
@@ -71,7 +73,7 @@ impl RendezVousConnection {
         Self {
             conn,
             rdv: RendezVous::new(
-                TunablesRendezVousController::new(opts),
+                ConfigurableRendezVousController::new(opts),
                 Arc::new(RendezVousStats::new(format!("changesets.{}", name,))),
             ),
         }
@@ -295,14 +297,62 @@ impl Changesets for SqlChangesets {
         }
     }
 
-    async fn add_many(
-        &self,
-        ctx: &CoreContext,
-        css: Vec1<(ChangesetInsert, Generation)>,
-    ) -> Result<()> {
+    async fn add_many(&self, ctx: &CoreContext, css: Vec1<ChangesetInsert>) -> Result<()> {
+        // If we're inserting a single changeset, use the faster single insertion method.
+        if css.len() == 1 {
+            self.add(ctx, css.split_off_first().0).await?;
+            return Ok(());
+        }
+
         STATS::adds.add_value(css.len() as i64);
         ctx.perf_counters()
             .increment_counter(PerfCounterType::SqlWrites);
+
+        // Find all parents that are already inserted in the database.
+        let mut existing_parents = css
+            .iter()
+            .flat_map(|entry| entry.parents.iter().copied())
+            .collect::<HashSet<_>>();
+        for entry in &css {
+            existing_parents.remove(&entry.cs_id);
+        }
+
+        // Find the generation numbers of the existing parents.
+        let mut generations = self
+            .get_many(ctx, existing_parents.into_iter().collect())
+            .await?
+            .into_iter()
+            .map(|entry| (entry.cs_id, entry.gen))
+            .collect::<HashMap<_, _>>();
+
+        // Calculate the generation numbers of the changesets using the generation numbers of their parents.
+        let css = css
+            .into_iter()
+            .map(|entry| {
+                let parents_generations = entry
+                    .parents
+                    .iter()
+                    .map(|parent| {
+                        generations.get(parent).ok_or_else(|| {
+                            anyhow!(
+                                "Missing changeset parent {} while calculating generation numbers (in SqlChangesets::add_many)",
+                                parent
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let entry_generation = parents_generations
+                    .into_iter()
+                    .max()
+                    .unwrap_or(&0) + 1;
+
+                generations.insert(entry.cs_id, entry_generation);
+
+                Ok((entry, Generation::new(entry_generation)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         let transaction = self.write_connection.start_transaction().await?;
         // Part 1 - Add all changesets to the SQL table.
         let (transaction, result) = InsertChangeset::query_with_transaction(
@@ -406,8 +456,14 @@ impl Changesets for SqlChangesets {
         ctx.perf_counters()
             .increment_counter(PerfCounterType::SqlReadsReplica);
 
-        let fetched_cs =
-            select_many_changesets(ctx.fb, &self.read_connection, self.repo_id, &cs_ids).await?;
+        let fetched_cs = select_many_changesets(
+            ctx.fb,
+            ctx.client_request_info(),
+            &self.read_connection,
+            self.repo_id,
+            &cs_ids,
+        )
+        .await?;
         let fetched_set: HashSet<_> = fetched_cs
             .clone()
             .into_iter()
@@ -426,6 +482,7 @@ impl Changesets for SqlChangesets {
                 .increment_counter(PerfCounterType::SqlReadsMaster);
             let mut master_fetched_cs = select_many_changesets(
                 ctx.fb,
+                ctx.client_request_info(),
                 &self.read_master_connection,
                 self.repo_id,
                 &notfetched_cs_ids,
@@ -677,6 +734,7 @@ async fn select_changeset(
 
 async fn select_many_changesets(
     fb: FacebookInit,
+    cri: Option<&ClientRequestInfo>,
     connection: &RendezVousConnection,
     repo_id: RepositoryId,
     cs_ids: &[ChangesetId],
@@ -689,13 +747,20 @@ async fn select_many_changesets(
         .rdv
         .dispatch(fb, cs_ids.iter().copied().collect(), || {
             let conn = connection.conn.clone();
+            let cri = cri.cloned();
             move |cs_ids| async move {
                 let cs_ids = cs_ids.into_iter().collect::<Vec<_>>();
 
                 let tok: i32 = rand::thread_rng().gen();
 
-                let fetched_changesets =
-                    SelectManyChangesets::query(&conn, &repo_id, &tok, &cs_ids[..]).await?;
+                let fetched_changesets = SelectManyChangesets::maybe_traced_query(
+                    &conn,
+                    cri.as_ref(),
+                    &repo_id,
+                    &tok,
+                    &cs_ids[..],
+                )
+                .await?;
 
                 let mut cs_id_to_cs_entry = HashMap::new();
                 for (cs_id, gen, maybe_parent, _, _) in fetched_changesets {

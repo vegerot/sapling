@@ -5,9 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import AbstractLanguageExtension from './AbstractLanguageExtension';
-import {promises as fs} from 'fs';
-import pathMod from 'path';
+import AbstractLanguageExtension from './AbstractLanguageExtension.js';
+import {promises as fs} from 'node:fs';
+import pathMod from 'node:path';
 
 export default class LanguageExtensionOnDisk extends AbstractLanguageExtension {
   constructor(private extensionRoot: string) {

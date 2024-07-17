@@ -1,4 +1,7 @@
-#debugruntest-compatible
+#modern-config-incompatible
+
+#require no-eden
+
   $ configure modern
 
   $ newserver master

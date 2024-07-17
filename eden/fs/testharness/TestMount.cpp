@@ -9,15 +9,21 @@
 
 #include <folly/FileUtil.h>
 #include <folly/executors/ManualExecutor.h>
-#include <folly/executors/QueuedImmediateExecutor.h>
-#include <folly/experimental/TestUtil.h>
 #include <folly/io/IOBuf.h>
 #include <folly/logging/xlog.h>
 #include <folly/portability/GFlags.h>
 #include <folly/portability/GTest.h>
+#include <folly/testing/TestUtil.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#include "eden/common/telemetry/NullStructuredLogger.h"
+#include "eden/common/testharness/TempFile.h"
+#include "eden/common/utils/FileUtils.h"
+#include "eden/common/utils/Guid.h"
 #include "eden/common/utils/ProcessInfoCache.h"
+#include "eden/common/utils/UnboundedQueueExecutor.h"
+#include "eden/common/utils/UserInfo.h"
 #include "eden/fs/config/CheckoutConfig.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/inodes/EdenDispatcherFactory.h"
@@ -40,22 +46,15 @@
 #include "eden/fs/store/TreeCache.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/IHiveLogger.h"
-#include "eden/fs/telemetry/NullStructuredLogger.h"
 #include "eden/fs/testharness/FakeBackingStore.h"
 #include "eden/fs/testharness/FakeClock.h"
 #include "eden/fs/testharness/FakeFuse.h"
 #include "eden/fs/testharness/FakePrivHelper.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
-#include "eden/fs/testharness/TempFile.h"
+#include "eden/fs/testharness/TestConfigSource.h"
 #include "eden/fs/testharness/TestUtil.h"
-#include "eden/fs/utils/FileUtils.h"
-#include "eden/fs/utils/Guid.h"
 #include "eden/fs/utils/NotImplemented.h"
-#include "eden/fs/utils/UnboundedQueueExecutor.h"
-#include "eden/fs/utils/UserInfo.h"
 
-using folly::Future;
-using folly::makeFuture;
 using folly::Unit;
 using namespace std::chrono_literals;
 using namespace std::string_literals;
@@ -76,75 +75,16 @@ constexpr size_t kBlobCacheMaximumSize = 1000; // bytes
 constexpr size_t kBlobCacheMinimumEntries = 0;
 } // namespace
 
-class TestConfigSource final : public ConfigSource {
- public:
-  using Values = std::map<std::string, std::map<std::string, std::string>>;
-
-  explicit TestConfigSource(ConfigSourceType sourceType)
-      : sourceType_{sourceType} {}
-
-  void setValues(Values values) {
-    auto state = state_.wlock();
-    state->values = std::move(values);
-    state->shouldReload = true;
-  }
-
-  // ConfigSource methods:
-
-  ConfigSourceType getSourceType() override {
-    return sourceType_;
-  }
-  std::string getSourcePath() override {
-    return "test";
-  }
-  FileChangeReason shouldReload() override {
-    return state_.rlock()->shouldReload ? FileChangeReason::MTIME
-                                        : FileChangeReason::NONE;
-  }
-  void reload(const ConfigVariables& substitutions, ConfigSettingMap& map)
-      override {
-    auto state = state_.rlock();
-    for (const auto& [sectionName, section] : state->values) {
-      auto* configMapEntry = folly::get_ptr(map, sectionName);
-      XCHECK(configMapEntry)
-          << "EdenConfig does not have section named " << sectionName;
-
-      for (const auto& [entryKey, entryValue] : section) {
-        auto* configMapKeyEntry = folly::get_ptr(*configMapEntry, entryKey);
-        XCHECK(configMapKeyEntry) << "EdenConfig does not have setting named "
-                                  << sectionName << ":" << entryKey;
-        auto rslt =
-            (*configMapKeyEntry)
-                ->setStringValue(entryValue, substitutions, sourceType_);
-        XCHECK(rslt) << "invalid config value for " << sectionName << ":"
-                     << entryKey << " = " << entryValue << ", " << rslt.error();
-      }
-    }
-  }
-
- private:
-  ConfigSourceType sourceType_;
-  struct State {
-    bool shouldReload = false;
-    Values values;
-  };
-  folly::Synchronized<State> state_;
-};
-
 bool TestMountFile::operator==(const TestMountFile& other) const {
   return path == other.path && contents == other.contents && rwx == other.rwx &&
       type == other.type;
 }
 
 TestMount::TestMount(bool enableActivityBuffer, CaseSensitivity caseSensitivity)
-    : blobCache_{BlobCache::create(
-          kBlobCacheMaximumSize,
-          kBlobCacheMinimumEntries,
-          makeRefPtr<EdenStats>())},
-      privHelper_{make_shared<FakePrivHelper>()},
+    : privHelper_{make_shared<FakePrivHelper>()},
       serverExecutor_{make_shared<folly::ManualExecutor>()} {
   // Initialize the temporary directory.
-  // This sets both testDir_, config_, localStore_, and backingStore_
+  // This sets both testDir_, config_, and localStore_
   initTestDirectory(caseSensitivity);
 
   testConfigSource_ =
@@ -164,14 +104,22 @@ TestMount::TestMount(bool enableActivityBuffer, CaseSensitivity caseSensitivity)
 
   auto reloadableConfig = std::make_shared<ReloadableConfig>(edenConfig_);
 
+  // create blobCache
+  blobCache_ = BlobCache::create(
+      kBlobCacheMaximumSize,
+      kBlobCacheMinimumEntries,
+      reloadableConfig,
+      makeRefPtr<EdenStats>());
+
   // Create treeCache
-  treeCache_ = TreeCache::create(reloadableConfig);
+  treeCache_ = TreeCache::create(reloadableConfig, makeRefPtr<EdenStats>());
 
   serverState_ = make_shared<ServerState>(
       UserInfo::lookup(),
       makeRefPtr<EdenStats>(),
       privHelper_,
       make_shared<UnboundedQueueExecutor>(serverExecutor_),
+      serverExecutor_,
       clock_,
       make_shared<ProcessInfoCache>(),
       make_shared<NullStructuredLogger>(),
@@ -181,6 +129,9 @@ TestMount::TestMount(bool enableActivityBuffer, CaseSensitivity caseSensitivity)
       nullptr,
       make_shared<CommandNotifier>(reloadableConfig),
       /*enableFaultInjection=*/true);
+
+  backingStore_ = make_shared<FakeBackingStore>(
+      BackingStore::LocalStoreCachingPolicy::NoCaching, serverState_);
 }
 
 TestMount::TestMount(
@@ -194,7 +145,7 @@ TestMount::TestMount(
 
   auto edenConfig = std::make_shared<ReloadableConfig>(
       edenConfig_, ConfigReloadBehavior::NoReload);
-  treeCache_ = TreeCache::create(edenConfig);
+  treeCache_ = TreeCache::create(edenConfig, makeRefPtr<EdenStats>());
   initialize(rootBuilder, startReady);
 }
 
@@ -223,7 +174,7 @@ TestMount::TestMount(
   // Create treeCache
   auto edenConfig = std::make_shared<ReloadableConfig>(
       edenConfig_, ConfigReloadBehavior::NoReload);
-  treeCache_ = TreeCache::create(edenConfig);
+  treeCache_ = TreeCache::create(edenConfig, makeRefPtr<EdenStats>());
   initialize(initialCommitHash, rootBuilder, startReady);
 }
 
@@ -282,7 +233,10 @@ void TestMount::initialize(
 }
 
 void TestMount::initializeEdenMount() {
-  edenMount_->initialize().getVia(serverExecutor_.get());
+  edenMount_->initialize()
+      .semi()
+      .via(serverExecutor_.get())
+      .getVia(serverExecutor_.get());
   rootInode_ = edenMount_->getRootInodeUnchecked();
 }
 
@@ -311,6 +265,7 @@ void TestMount::createMount(
     InodeCatalogOptions inodeCatalogOptions) {
   shared_ptr<ObjectStore> objectStore = ObjectStore::create(
       backingStore_,
+      localStore_,
       treeCache_,
       stats_.copy(),
       std::make_shared<ProcessInfoCache>(),
@@ -390,9 +345,8 @@ void TestMount::initTestDirectory(CaseSensitivity caseSensitivity) {
   // Create the CheckoutConfig using our newly-populated client directory
   config_ = CheckoutConfig::loadFromClientDirectory(mountPath, clientDirectory);
 
-  // Create localStore_ and backingStore_
+  // Create localStore_
   localStore_ = make_shared<MemoryLocalStore>(makeRefPtr<EdenStats>());
-  backingStore_ = make_shared<FakeBackingStore>();
 
   stats_ = makeRefPtr<EdenStats>();
 }
@@ -414,29 +368,10 @@ void TestMount::startFuseAndWait(std::shared_ptr<FakeFuse> fuse) {
 }
 #endif
 
-namespace {
-std::pair<std::string_view, std::string_view> splitKey(
-    std::string_view keypair) {
-  auto idx = keypair.find(':');
-  if (idx == std::string_view::npos) {
-    throwf<std::domain_error>("config name {} must have a colon", keypair);
-  }
-  return {keypair.substr(0, idx), keypair.substr(idx + 1)};
-}
-} // namespace
-
 void TestMount::updateEdenConfig(
     const std::map<std::string, std::string>& values) {
-  std::map<std::string, std::map<std::string, std::string>> nested;
-
-  for (auto& [key, value] : values) {
-    auto [sectionName, configName] = splitKey(key);
-    nested[std::string(sectionName)][std::string(configName)] = value;
-  }
-
-  testConfigSource_->setValues(nested);
-  (void)serverState_->getReloadableConfig()->getEdenConfig(
-      ConfigReloadBehavior::ForceReload);
+  updateTestEdenConfig(
+      testConfigSource_, serverState_->getReloadableConfig(), values);
 }
 
 void TestMount::remount() {
@@ -445,6 +380,7 @@ void TestMount::remount() {
   // Create a new ObjectStore pointing to our local store and backing store
   auto objectStore = ObjectStore::create(
       backingStore_,
+      localStore_,
       treeCache_,
       stats_.copy(),
       std::make_shared<ProcessInfoCache>(),
@@ -487,6 +423,7 @@ void TestMount::remountGracefully() {
   // Create a new ObjectStore pointing to our local store and backing store
   auto objectStore = ObjectStore::create(
       backingStore_,
+      localStore_,
       treeCache_,
       stats_.copy(),
       std::make_shared<ProcessInfoCache>(),
@@ -532,6 +469,8 @@ void TestMount::remountGracefully() {
           [](auto) {},
           takeoverData,
           std::optional<MountProtocol>(MountProtocol::FUSE))
+      .semi()
+      .via(serverExecutor_.get())
       .getVia(serverExecutor_.get());
   rootInode_ = edenMount_->getRootInodeUnchecked();
 }
@@ -563,7 +502,7 @@ bool TestMount::hasOverlayDir(InodeNumber ino) const {
   return edenMount_->getOverlay()->hasOverlayDir(ino);
 }
 
-bool TestMount::hasMetadata(FOLLY_MAYBE_UNUSED InodeNumber ino) const {
+bool TestMount::hasMetadata([[maybe_unused]] InodeNumber ino) const {
 #ifndef _WIN32
   return edenMount_->getInodeMetadataTable()->getOptional(ino).has_value();
 #else
@@ -835,12 +774,12 @@ VirtualInode TestMount::getVirtualInode(folly::StringPiece path) const {
 }
 
 void TestMount::loadAllInodes() {
-  auto fut = loadAllInodesFuture().via(getServerExecutor().get());
+  auto fut = loadAllInodesFuture().semi().via(getServerExecutor().get());
   drainServerExecutor();
   std::move(fut).get(std::chrono::milliseconds(1));
 }
 
-Future<Unit> TestMount::loadAllInodesFuture() {
+ImmediateFuture<Unit> TestMount::loadAllInodesFuture() {
   return loadAllInodesFuture(edenMount_->getRootInode());
 }
 
@@ -848,7 +787,8 @@ void TestMount::loadAllInodes(const TreeInodePtr& treeInode) {
   loadAllInodesFuture(treeInode).get();
 }
 
-Future<Unit> TestMount::loadAllInodesFuture(const TreeInodePtr& treeInode) {
+ImmediateFuture<Unit> TestMount::loadAllInodesFuture(
+    const TreeInodePtr& treeInode) {
   // Build a list of child names to load.
   // (If necessary we could make a more efficient version of this that starts
   // all the child loads while holding the lock.  However, we don't really care
@@ -862,22 +802,20 @@ Future<Unit> TestMount::loadAllInodesFuture(const TreeInodePtr& treeInode) {
   }
 
   // Now start all the loads.
-  std::vector<Future<Unit>> childFutures;
+  std::vector<ImmediateFuture<Unit>> childFutures;
   for (const auto& name : childNames) {
     auto childFuture =
         treeInode->getOrLoadChild(name, ObjectFetchContext::getNullContext())
-            .semi()
-            .via(&folly::QueuedImmediateExecutor::instance())
-            .thenValue([](InodePtr child) {
+            .thenValue([](InodePtr child) -> ImmediateFuture<folly::Unit> {
               TreeInodePtr childTree = child.asTreePtrOrNull();
               if (childTree) {
                 return loadAllInodesFuture(childTree);
               }
-              return makeFuture();
+              return folly::unit;
             });
     childFutures.emplace_back(std::move(childFuture));
   }
-  return folly::collectUnsafe(childFutures).unit();
+  return collectAllSafe(std::move(childFutures)).unit();
 }
 
 std::shared_ptr<const Tree> TestMount::getRootTree() const {

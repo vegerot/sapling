@@ -8,10 +8,10 @@
 #include "eden/fs/inodes/sqlitecatalog/SqliteInodeCatalog.h"
 
 #include <folly/File.h>
+#include "eden/common/utils/Bug.h"
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/inodes/overlay/gen-cpp2/overlay_types.h"
 #include "eden/fs/inodes/sqlitecatalog/WindowsFsck.h"
-#include "eden/fs/utils/Bug.h"
 
 namespace facebook::eden {
 
@@ -119,8 +119,8 @@ std::vector<InodeNumber> SqliteInodeCatalog::getAllParentInodeNumbers() {
 InodeNumber SqliteInodeCatalog::scanLocalChanges(
     std::shared_ptr<const EdenConfig> config,
     AbsolutePathPiece mountPath,
-    FOLLY_MAYBE_UNUSED bool windowsSymlinksEnabled,
-    FOLLY_MAYBE_UNUSED InodeCatalog::LookupCallback& callback) {
+    [[maybe_unused]] bool windowsSymlinksEnabled,
+    [[maybe_unused]] InodeCatalog::LookupCallback& callback) {
 #ifdef _WIN32
   windowsFsckScanLocalChanges(
       config,

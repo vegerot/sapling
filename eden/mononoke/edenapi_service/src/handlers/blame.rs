@@ -26,10 +26,10 @@ use mononoke_api::ChangesetId;
 use mononoke_api_hg::HgRepoContext;
 use mononoke_types::blame_v2::BlameV2;
 
-use super::handler::EdenApiContext;
-use super::EdenApiHandler;
-use super::EdenApiMethod;
+use super::handler::SaplingRemoteApiContext;
 use super::HandlerResult;
+use super::SaplingRemoteApiHandler;
+use super::SaplingRemoteApiMethod;
 use crate::errors::ErrorKind;
 use crate::utils::to_hg_path;
 use crate::utils::to_mpath;
@@ -40,12 +40,12 @@ const MAX_CONCURRENT_BLAMES_PER_REQUEST: usize = 10;
 pub struct BlameHandler;
 
 #[async_trait]
-impl EdenApiHandler for BlameHandler {
+impl SaplingRemoteApiHandler for BlameHandler {
     type Request = BlameRequest;
     type Response = BlameResult;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::Blame;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::Blame;
     const ENDPOINT: &'static str = "/blame";
 
     fn sampling_rate(_request: &Self::Request) -> NonZeroU64 {
@@ -53,7 +53,7 @@ impl EdenApiHandler for BlameHandler {
     }
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
@@ -86,10 +86,21 @@ async fn blame_file_data(repo: HgRepoContext, key: Key) -> Result<BlameData> {
         .context("failed to resolve blame hgid")?
         .ok_or(ErrorKind::HgIdNotFound(key.hgid))?;
 
+    let disable_mutable_blame: bool = justknobs::eval(
+        "scm/mononoke:edenapi_disable_mutable_blame",
+        None,
+        Some(repo.name()),
+    )
+    .unwrap_or(false);
+
     let blame = cs
-        .path_with_history(to_mpath(&key.path)?.context(ErrorKind::UnexpectedEmptyPath)?)
+        .path_with_history(
+            to_mpath(&key.path)?
+                .into_optional_non_root_path()
+                .context(ErrorKind::UnexpectedEmptyPath)?,
+        )
         .await?
-        .blame(true)
+        .blame(!disable_mutable_blame)
         .await?;
 
     let blame = match blame {

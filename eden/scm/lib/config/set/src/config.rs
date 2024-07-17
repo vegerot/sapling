@@ -7,13 +7,18 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::fmt;
+use std::fmt::Display;
+use std::fmt::Formatter;
 use std::fs;
 use std::hash::Hash;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::str;
 use std::sync::Arc;
 
+use configmodel::config::ContentHash;
 use configmodel::Config;
 pub use configmodel::ValueLocation;
 pub use configmodel::ValueSource;
@@ -30,12 +35,22 @@ use crate::error::Error;
 #[derive(Clone, Default)]
 pub struct ConfigSet {
     name: Text,
+
+    // Max priority values that should always be remembered/maintained.
+    // These include --config CLI values and runtime config overrides.
+    // These take priority over `sections` and `secondary`.
+    pinned: IndexMap<Text, Section>,
+
+    // Regular priority values. This is where `load_file()` and `set()` go by default.
     sections: IndexMap<Text, Section>,
-    // Canonicalized files that were loaded, including files with errors
-    files: Vec<PathBuf>,
-    // Secondary, immutable config to try out if `sections` does not
-    // contain the requested config.
+
+    // Secondary, immutable config to try out if `sections` and `pinned` do not contain
+    // the requested config.
     secondary: Option<Arc<dyn Config>>,
+
+    // Canonicalized files that were loaded, including files with errors.
+    // Value is a hash of file contents, if file was readable.
+    files: Vec<(PathBuf, Option<ContentHash>)>,
 }
 
 /// Internal representation of a config section.
@@ -49,7 +64,13 @@ struct Section {
 #[derive(Clone, Default)]
 pub struct Options {
     source: Text,
-    filters: Vec<Arc<Box<dyn Fn(Text, Text, Option<Text>) -> Option<(Text, Text, Option<Text>)>>>>,
+    filters: Vec<Rc<Box<dyn Fn(Text, Text, Option<Text>) -> Option<(Text, Text, Option<Text>)>>>>,
+    pin: Option<bool>,
+
+    /// Minimize cases where we regenerate the dynamic config synchronously.
+    /// This is useful for programs that embed us (like EdenFS) to avoid dynamic config
+    /// flapping due to version string mismatch.
+    pub minimize_dynamic_gen: bool,
 }
 
 impl Config for ConfigSet {
@@ -57,17 +78,28 @@ impl Config for ConfigSet {
     ///
     /// keys("foo") returns keys in section "foo".
     fn keys(&self, section: &str) -> Vec<Text> {
-        let self_keys = self
-            .sections
-            .get(section)
-            .map(|section| section.items.keys().cloned().collect())
-            .unwrap_or_default();
+        let pinned_keys: Cow<[Text]> = Cow::Owned(
+            self.pinned
+                .get(section)
+                .map(|section| section.items.keys().cloned().collect())
+                .unwrap_or_default(),
+        );
+
+        let main_keys: Cow<[Text]> = Cow::Owned(
+            self.sections
+                .get(section)
+                .map(|section| section.items.keys().cloned().collect())
+                .unwrap_or_default(),
+        );
+
+        let self_keys = merge_cow_list(pinned_keys, main_keys);
+
         if let Some(secondary) = &self.secondary {
             let secondary_keys = secondary.keys(section);
-            let result = merge_cow_list(Cow::Owned(secondary_keys), Cow::Owned(self_keys));
+            let result = merge_cow_list(Cow::Owned(secondary_keys), self_keys);
             result.into_owned()
         } else {
-            self_keys
+            self_keys.into_owned()
         }
     }
 
@@ -75,12 +107,15 @@ impl Config for ConfigSet {
     /// Return `None` if the config item does not exist.
     /// Return `Some(None)` if the config is is unset.
     fn get_considering_unset(&self, section: &str, name: &str) -> Option<Option<Text>> {
-        let self_value = (|| -> Option<Option<Text>> {
-            let section = self.sections.get(section)?;
+        let get_self_value = |sections: &IndexMap<Text, Section>| -> Option<Option<Text>> {
+            let section = sections.get(section)?;
             let value_sources: &Vec<ValueSource> = section.items.get(name)?;
             let value = value_sources.last()?.value.clone();
             Some(value)
-        })();
+        };
+
+        let self_value = get_self_value(&self.pinned).or_else(|| get_self_value(&self.sections));
+
         if let (None, Some(secondary)) = (&self_value, &self.secondary) {
             return secondary.get_considering_unset(section, name);
         }
@@ -89,8 +124,9 @@ impl Config for ConfigSet {
 
     /// Get config sections.
     fn sections(&self) -> Cow<[Text]> {
-        let sections = self.sections.keys().cloned().collect();
-        let self_sections: Cow<[Text]> = Cow::Owned(sections);
+        let pinned: Cow<[Text]> = Cow::Owned(self.pinned.keys().cloned().collect());
+        let main: Cow<[Text]> = Cow::Owned(self.sections.keys().cloned().collect());
+        let self_sections = merge_cow_list(pinned, main);
         if let Some(secondary) = &self.secondary {
             let secondary_sections = secondary.sections();
             merge_cow_list(secondary_sections, self_sections)
@@ -104,14 +140,23 @@ impl Config for ConfigSet {
     ///
     /// Return an emtpy vector if the config does not exist.
     fn get_sources(&self, section: &str, name: &str) -> Cow<[ValueSource]> {
-        let self_sources: Cow<[ValueSource]> = match self
+        let pinned_sources = self
+            .pinned
+            .get(section)
+            .and_then(|section| section.items.get(name));
+
+        let main_sources = self
             .sections
             .get(section)
-            .and_then(|section| section.items.get(name))
-        {
-            None => Cow::Owned(Vec::new()),
-            Some(sources) => Cow::Borrowed(sources),
+            .and_then(|section| section.items.get(name));
+
+        let self_sources: Cow<[ValueSource]> = match (pinned_sources, main_sources) {
+            (None, None) => Cow::Owned(Vec::new()),
+            (Some(pinned), None) => Cow::Borrowed(pinned),
+            (None, Some(main)) => Cow::Borrowed(main),
+            (Some(pinned), Some(main)) => Cow::Owned(main.iter().chain(pinned).cloned().collect()),
         };
+
         if let Some(secondary) = &self.secondary {
             let secondary_sources = secondary.get_sources(section, name);
             if secondary_sources.is_empty() {
@@ -120,8 +165,8 @@ impl Config for ConfigSet {
                 secondary_sources
             } else {
                 let sources: Vec<ValueSource> = secondary_sources
-                    .into_owned()
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .chain(self_sources.into_owned())
                     .collect();
                 Cow::Owned(sources)
@@ -132,8 +177,8 @@ impl Config for ConfigSet {
     }
 
     /// Get on-disk files loaded for this `Config`.
-    fn files(&self) -> Cow<[PathBuf]> {
-        let self_files: Cow<[PathBuf]> = Cow::Borrowed(&self.files);
+    fn files(&self) -> Cow<[(PathBuf, Option<ContentHash>)]> {
+        let self_files: Cow<[(PathBuf, Option<ContentHash>)]> = Cow::Borrowed(&self.files);
         if let Some(secondary) = &self.secondary {
             let secondary_files = secondary.files();
             // file load order: secondary first
@@ -153,10 +198,29 @@ impl Config for ConfigSet {
 
     fn layers(&self) -> Vec<Arc<dyn Config>> {
         if let Some(secondary) = &self.secondary {
-            secondary.layers()
+            let mut layers = secondary.layers();
+            if !self.sections.is_empty() {
+                // PERF: This clone can be slow.
+                let mut primary = self.clone().named("primary");
+                primary.secondary = None;
+                layers.push(Arc::new(primary))
+            }
+            layers
         } else {
             Vec::new()
         }
+    }
+
+    fn pinned(&self) -> Vec<(Text, Text, Vec<ValueSource>)> {
+        self.pinned
+            .iter()
+            .flat_map(|(sname, svalues)| {
+                svalues
+                    .items
+                    .iter()
+                    .map(|(kname, values)| (sname.clone(), kname.clone(), values.to_vec()))
+            })
+            .collect()
     }
 }
 
@@ -168,9 +232,41 @@ fn merge_cow_list<'a, T: Clone + Hash + Eq>(a: Cow<'a, [T]>, b: Cow<'a, [T]>) ->
     } else if b.is_empty() {
         a
     } else {
-        let result: IndexSet<T> = a.into_owned().into_iter().chain(b.into_owned()).collect();
+        let result: IndexSet<T> = a.iter().cloned().chain(b.iter().cloned()).collect();
         let result: Vec<T> = result.into_iter().collect();
         Cow::Owned(result)
+    }
+}
+
+impl Display for ConfigSet {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        for section in self.sections().iter() {
+            writeln!(f, "[{}]", section.as_ref())?;
+
+            for key in self.keys(section).iter() {
+                let value = self.get_considering_unset(section, key);
+                #[cfg(test)]
+                {
+                    let values = self.get_sources(section, key);
+                    assert_eq!(values.last().map(|v| v.value().clone()), value);
+                }
+                if let Some(value) = value {
+                    if let Some(value) = value {
+                        // When a newline delimited list is loaded, the whitespace around each
+                        // entry is trimmed. In order for the serialized config to be parsable, we
+                        // need some indentation after each newline. Since this whitespace will be
+                        // stripped on load, it shouldn't hurt anything.
+                        writeln!(f, "{}={}", key, value.replace('\n', "\n "))?;
+                    } else {
+                        // None indicates the value was unset.
+                        writeln!(f, "%unset {}", key)?;
+                    }
+                }
+            }
+
+            writeln!(f)?;
+        }
+        Ok(())
     }
 }
 
@@ -180,21 +276,41 @@ impl ConfigSet {
         Default::default()
     }
 
+    /// Create a (mutable) ConfigSet wrapping `config`.
+    /// This allows you to overlay new configs on top of `config`.
+    pub fn wrap(config: Arc<dyn Config>) -> Self {
+        let mut wrapped = Self {
+            secondary: Some(config.clone()),
+            ..Default::default()
+        };
+
+        for (sname, kname, values) in config.pinned() {
+            wrapped
+                .pinned
+                .entry(sname)
+                .or_default()
+                .items
+                .insert(kname, values);
+        }
+
+        wrapped
+    }
+
     /// Attach a secondary config as fallback for items missing from the
     /// main config.
     ///
     /// The secondary config is immutable, is cheaper to clone, and provides
     /// the layers information.
     ///
-    /// If a secondary config was already attached, it will be completed
-    /// replaced by this call.
+    /// If a secondary config was already attached, it will be replaced by this
+    /// call.
     pub fn secondary(&mut self, secondary: Arc<dyn Config>) -> &mut Self {
         self.secondary = Some(secondary);
         self
     }
 
     /// Update the name of the `ConfigSet`.
-    pub fn named(&mut self, name: &str) -> &mut Self {
+    pub fn named(mut self, name: &str) -> Self {
         self.name = Text::copy_from_slice(name);
         self
     }
@@ -250,6 +366,7 @@ impl ConfigSet {
 
     /// Set a config item directly. `section`, `name` locates the config. `value` is the new value.
     /// `source` is some annotation about who set it, ex. "reporc", "userrc", "--config", etc.
+    /// Value is set as a "pinned" config which will "stick" if the config is re-loaded.
     pub fn set(
         &mut self,
         section: impl AsRef<str>,
@@ -272,8 +389,12 @@ impl ConfigSet {
         opts: &Options,
     ) {
         if let Some((section, name, value)) = opts.filter(section, name, value) {
-            self.sections
-                .entry(section)
+            let dest = if opts.pin.unwrap_or(true) {
+                &mut self.pinned
+            } else {
+                &mut self.sections
+            };
+            dest.entry(section)
                 .or_insert_with(Default::default)
                 .items
                 .entry(name)
@@ -293,39 +414,55 @@ impl ConfigSet {
         visited: &mut HashSet<PathBuf>,
         errors: &mut Vec<Error>,
     ) {
-        if let Ok(path) = path.canonicalize() {
-            let path = &path;
-            debug_assert!(path.is_absolute());
+        match path.canonicalize() {
+            Ok(path) => {
+                let path = &path;
+                debug_assert!(path.is_absolute());
 
-            if !visited.insert(path.to_path_buf()) {
-                // skip - visited before
-                return;
-            }
-
-            self.files.push(path.to_path_buf());
-
-            match fs::read_to_string(path) {
-                Ok(mut text) => {
-                    text.push('\n');
-                    let text = Text::from(text);
-                    self.load_file_content(path, text, opts, visited, errors);
+                if !visited.insert(path.to_path_buf()) {
+                    // skip - visited before
+                    return;
                 }
-                Err(error) => errors.push(Error::Io(path.to_path_buf(), error)),
-            }
-        } else {
-            // On Windows, a UNC path `\\?\C:\foo\.\x` will fail to canonicalize
-            // because it contains `.`. That path can be constructed by using
-            // `PathBuf::join` to concatenate a UNC path `\\?\C:\foo` with
-            // a "normal" path `.\x`.
-            // Try to fix it automatically by stripping the UNC prefix and retry
-            // `canonicalize`. `C:\foo\.\x` would be canonicalized without errors.
-            #[cfg(windows)]
-            {
-                if let Some(path_str) = path.to_str() {
-                    if path_str.starts_with(r"\\?\") {
-                        let path = Path::new(&path_str[4..]);
-                        self.load_file(&path, opts, visited, errors);
+
+                match fs::read_to_string(path) {
+                    Ok(mut text) => {
+                        self.files.push((
+                            path.to_path_buf(),
+                            Some(ContentHash::from_contents(text.as_bytes())),
+                        ));
+
+                        text.push('\n');
+                        let text = Text::from(text);
+                        self.load_file_content(path, text, opts, visited, errors);
                     }
+                    Err(error) => {
+                        self.files.push((path.to_path_buf(), None));
+
+                        errors.push(Error::Io(path.to_path_buf(), error))
+                    }
+                }
+            }
+            Err(err) => {
+                // On Windows, a UNC path `\\?\C:\foo\.\x` will fail to canonicalize
+                // because it contains `.`. That path can be constructed by using
+                // `PathBuf::join` to concatenate a UNC path `\\?\C:\foo` with
+                // a "normal" path `.\x`.
+                // Try to fix it automatically by stripping the UNC prefix and retry
+                // `canonicalize`. `C:\foo\.\x` would be canonicalized without errors.
+                if cfg!(windows) {
+                    if let Some(without_unc) = path.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
+                        self.load_file(without_unc.as_ref(), opts, visited, errors);
+                        return;
+                    }
+                }
+
+                tracing::debug!(?err, ?path, "not loading config file");
+
+                // If it is absolute, record it in `files` anyway. This is important to
+                // record that we've loaded the repo's config file even if the config file
+                // doesn't exist.
+                if path.is_absolute() {
+                    self.files.push((path.to_path_buf(), None));
                 }
             }
         }
@@ -398,9 +535,11 @@ impl ConfigSet {
                 } => {
                     if !skip_include {
                         if let Some(content) = crate::builtin::get(include_path) {
-                            let text = Text::from(content);
-                            let path = Path::new(include_path);
-                            self.load_file_content(path, text, opts, visited, errors);
+                            if !content.is_empty() {
+                                let text = Text::from(content);
+                                let path = Path::new(include_path);
+                                self.load_file_content(path, text, opts, visited, errors);
+                            }
                         } else {
                             let full_include_path =
                                 path.parent().unwrap().join(expand_path(include_path));
@@ -412,163 +551,14 @@ impl ConfigSet {
         }
     }
 
-    pub fn files(&self) -> &[PathBuf] {
-        &self.files
-    }
+    pub fn clear_unpinned(&mut self) {
+        self.sections.clear();
+        self.secondary = None;
 
-    pub fn to_string(&self) -> String {
-        let mut result = String::new();
-
-        for section in self.sections().iter() {
-            result.push('[');
-            result.push_str(section.as_ref());
-            result.push_str("]\n");
-
-            for key in self.keys(section).iter() {
-                let value = self.get_considering_unset(section, key);
-                #[cfg(test)]
-                {
-                    let values = self.get_sources(section, key);
-                    assert_eq!(values.last().map(|v| v.value().clone()), value);
-                }
-                if let Some(value) = value {
-                    if let Some(value) = value {
-                        result.push_str(key);
-                        result.push('=');
-                        // When a newline delimited list is loaded, the whitespace around each
-                        // entry is trimmed. In order for the serialized config to be parsable, we
-                        // need some indentation after each newline. Since this whitespace will be
-                        // stripped on load, it shouldn't hurt anything.
-                        let value = value.replace('\n', "\n ");
-                        result.push_str(&value);
-                        result.push('\n');
-                    } else {
-                        // None indicates the value was unset.
-                        result.push_str("%unset ");
-                        result.push_str(key);
-                        result.push('\n');
-                    }
-                }
-            }
-
-            result.push('\n');
-        }
-
-        result
-    }
-
-    /// Drop configs from sources that are outside `allowed_locations` or
-    /// `allowed_configs`.
-    ///
-    /// This function is being removed but we need logging to understand its
-    /// side-effect.
-    pub fn ensure_location_supersets(
-        &mut self,
-        allowed_locations: Option<HashSet<&str>>,
-        allowed_configs: Option<HashSet<(&str, &str)>>,
-    ) {
-        for (sname, section) in self.sections.iter_mut() {
-            for (kname, values) in section.items.iter_mut() {
-                let orig_active_value = values.last().cloned();
-
-                let mut remove_idxs: Vec<usize> = Vec::new();
-
-                // The value index, if any, that will be in effect after removals.
-                let mut new_active_idx: Option<usize> = None;
-
-                // value with a larger index takes precedence.
-                for (index, value) in values.iter().enumerate() {
-                    // Get the filename of the value's rc location
-                    if let Some((path, _)) = value.location() {
-                        let location: Option<String> = path
-                            .file_name()
-                            .and_then(|f| f.to_str())
-                            .map(|s| s.to_string());
-                        // If only certain locations are allowed, and this isn't one of them, remove
-                        // it. If location is None, it came from inmemory, so don't filter it.
-                        if let Some(location) = location {
-                            if crate::builtin::get(location.as_str()).is_none()
-                                && allowed_locations
-                                    .as_ref()
-                                    .map(|a| a.contains(location.as_str()))
-                                    == Some(false)
-                                && allowed_configs
-                                    .as_ref()
-                                    .map(|a| a.contains(&(sname, kname)))
-                                    != Some(true)
-                            {
-                                tracing::trace!(
-                                    target: "configset::validate",
-                                    "dropping {}.{} set by {} ({})",
-                                    sname.as_ref(),
-                                    kname.as_ref(),
-                                    path.display().to_string(),
-                                    value
-                                        .value()
-                                        .as_ref()
-                                        .map(|v| v.as_ref())
-                                        .unwrap_or_default(),
-                                );
-                                remove_idxs.push(index);
-                                continue;
-                            }
-                        }
-                    }
-
-                    new_active_idx = Some(index);
-                }
-
-                // The goal is to leave invalid values as non-active sources so
-                // they can be seen via the "config" command.
-
-                let mut to_splice = Vec::new();
-                for remove_idx in remove_idxs.iter().rev() {
-                    // Add something to the source to indicate it was marked invalid.
-                    values[*remove_idx].source =
-                        [values[*remove_idx].source.as_ref(), "(invalid - dropped)"]
-                            .join(" ")
-                            .into();
-
-                    // Keep track of invalid values that are after the desired
-                    // "active" value - we have to do something with them.
-                    if new_active_idx.is_some_and(|new_active_idx| *remove_idx > new_active_idx) {
-                        to_splice.push(values.remove(*remove_idx));
-                    }
-                }
-
-                if let Some(new_active_idx) = new_active_idx {
-                    // If there is an active value, insert invalid values before
-                    // it so they don't take effect.
-                    values.splice(new_active_idx..new_active_idx, to_splice);
-                } else {
-                    // If there is no active value, insert a dummy "unset" value.
-                    values.push(ValueSource {
-                        value: None,
-                        source: "(invalid - dummy)".into(),
-                        location: None,
-                    });
-                }
-
-                // If the removal changes the config, log it as mismatched.
-                if let (Some(before_remove), Some(after_remove)) =
-                    (orig_active_value, values.last())
-                {
-                    if before_remove.value != after_remove.value {
-                        let source = match before_remove.location() {
-                            None => before_remove.source().to_string(),
-                            Some(l) => l.0.display().to_string(),
-                        };
-                        tracing::info!(
-                             target: "config_mismatch",
-                             config=&format!("{sname}.{kname}"),
-                             expected=after_remove.value.clone().unwrap_or_default().as_ref(),
-                             actual=before_remove.value.clone().unwrap_or_default().as_ref(),
-                             source=source,
-                        );
-                    }
-                }
-            }
-        }
+        // Not technically correct since "pinned" configs could have
+        // been loaded from files, but probably doesn't matter either
+        // way.
+        self.files.clear();
     }
 }
 
@@ -588,7 +578,7 @@ impl Options {
         mut self,
         filter: Box<dyn Fn(Text, Text, Option<Text>) -> Option<(Text, Text, Option<Text>)>>,
     ) -> Self {
-        self.filters.push(Arc::new(filter));
+        self.filters.push(Rc::new(filter));
         self
     }
 
@@ -611,9 +601,14 @@ impl Options {
     ) -> Option<(Text, Text, Option<Text>)> {
         self.filters
             .iter()
-            .fold(Some((section, name, value)), move |acc, func| {
-                acc.and_then(|(s, n, v)| func(s, n, v))
-            })
+            .try_fold((section, name, value), move |(s, n, v), func| func(s, n, v))
+    }
+
+    /// Mark config insertions as "pinned". This places them in a higher priority area
+    /// separate from regular configs, making them easier to maintain.
+    pub fn pin(mut self, pin: bool) -> Self {
+        self.pin = Some(pin);
+        self
     }
 }
 
@@ -629,7 +624,7 @@ pub(crate) mod tests {
     use std::io::Write;
 
     use configmodel::ConfigExt;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     use super::*;
     use crate::convert::ByteCount;
@@ -937,7 +932,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_include() {
-        let dir = TempDir::new("test_parse_include").unwrap();
+        let dir = TempDir::with_prefix("test_parse_include.").unwrap();
         write_file(
             dir.path().join("rootrc"),
             "[x]\n\
@@ -1002,7 +997,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_parse_include_builtin() {
-        let dir = TempDir::new("test_parse_include").unwrap();
+        let dir = TempDir::with_prefix("test_parse_include.").unwrap();
         write_file(dir.path().join("rootrc"), "%include builtin:git.rc\n");
 
         let mut cfg = ConfigSet::new();
@@ -1011,8 +1006,6 @@ pub(crate) mod tests {
             &"test_parse_include_builtin".into(),
         );
         assert!(errors.is_empty());
-
-        assert_eq!(cfg.get("remotenames", "hoist"), Some(Text::from("remote")));
     }
 
     #[test]
@@ -1020,7 +1013,7 @@ pub(crate) mod tests {
         use std::env;
         env::set_var("FOO", "f");
 
-        let dir = TempDir::new("test_parse_include_expand").unwrap();
+        let dir = TempDir::with_prefix("test_parse_include_expand.").unwrap();
         write_file(
             dir.path().join("rootrc"),
             "%include ./${FOO}1/$FOO/3.rc\n\
@@ -1042,7 +1035,7 @@ pub(crate) mod tests {
     fn test_named() {
         let mut cfg = ConfigSet::new();
         assert_eq!(cfg.layer_name(), "ConfigSet");
-        cfg.named("foo");
+        cfg = cfg.named("foo");
         assert_eq!(cfg.layer_name(), "foo");
     }
 
@@ -1091,59 +1084,6 @@ space_list=value1.a value1.b
         let errors = cfg2.parse(serialized, &"".into());
         assert!(errors.is_empty(), "cfg2.parse had errors {:?}", errors);
         assert_eq!(cfg.sections(), cfg2.sections());
-    }
-
-    #[test]
-    fn test_allowed_locations() {
-        let mut cfg = ConfigSet::new();
-
-        fn set(
-            cfg: &mut ConfigSet,
-            section: &'static str,
-            key: &'static str,
-            value: &'static str,
-            location: &'static str,
-        ) {
-            cfg.set_internal(
-                Text::from_static(section),
-                Text::from_static(key),
-                Some(Text::from_static(value)),
-                Some(ValueLocation {
-                    path: Arc::new(Path::new(location).to_owned()),
-                    content: Text::from_static(""),
-                    location: 0..1,
-                }),
-                &Options::new().source(Text::from_static("source")),
-            );
-        }
-
-        set(&mut cfg, "section1", "key1", "value1", "subset1");
-        set(&mut cfg, "section2", "key2", "value2", "subset2");
-
-        let mut allow_list = HashSet::new();
-        allow_list.insert("subset1");
-
-        cfg.ensure_location_supersets(Some(allow_list.clone()), None);
-        assert_eq!(
-            cfg.get("section1", "key1"),
-            Some(Text::from_static("value1"))
-        );
-        assert_eq!(cfg.get("section2", "key2"), None);
-
-        // Check that allow_configs allows the config through, even if allow_locations did not.
-        let mut allow_configs = HashSet::new();
-        allow_configs.insert(("section2", "key2"));
-
-        set(&mut cfg, "section2", "key2", "value2", "subset2");
-        cfg.ensure_location_supersets(Some(allow_list), Some(allow_configs));
-        assert_eq!(
-            cfg.get("section1", "key1"),
-            Some(Text::from_static("value1"))
-        );
-        assert_eq!(
-            cfg.get("section2", "key2"),
-            Some(Text::from_static("value2"))
-        );
     }
 
     #[test]
@@ -1205,41 +1145,6 @@ x = 2
                 .collect::<Vec<_>>(),
             ["test2", "test1"]
         );
-    }
-
-    #[test]
-    fn test_verifier_removal() {
-        let mut cfg = ConfigSet::new();
-
-        fn set(
-            cfg: &mut ConfigSet,
-            section: &'static str,
-            key: &'static str,
-            value: &'static str,
-            location: &'static str,
-        ) {
-            cfg.set_internal(
-                Text::from_static(section),
-                Text::from_static(key),
-                Some(Text::from_static(value)),
-                Some(ValueLocation {
-                    path: Arc::new(Path::new(location).to_owned()),
-                    content: Text::from_static(""),
-                    location: 0..1,
-                }),
-                &Options::new().source(Text::from_static("source")),
-            );
-        }
-
-        // This test verifies that allowed location removal and subset removal interact nicely
-        // together.
-        set(&mut cfg, "section", "key", "value", "subset");
-        set(&mut cfg, "section", "key", "value2", "super");
-
-        let mut allowed_locations = HashSet::new();
-        allowed_locations.insert("super");
-
-        cfg.ensure_location_supersets(Some(allowed_locations), None);
     }
 
     #[test]
@@ -1309,5 +1214,74 @@ x = 2
             3
         );
         assert_eq!(cfg.get_or("foo", "float", || 42f32).unwrap(), 1.42f32);
+    }
+
+    #[test]
+    fn test_pinned() {
+        let mut cfg = ConfigSet::new();
+
+        let pin = Options {
+            pin: Some(true),
+            ..Default::default()
+        };
+        cfg.set("shared_sec", "value", Some("pin"), &pin);
+        cfg.set("pin_sec", "value", Some("pin"), &pin);
+
+        let dont_pin = Options {
+            pin: Some(false),
+            ..Default::default()
+        };
+        cfg.set("shared_sec", "value", Some("main"), &dont_pin);
+        cfg.set("main_sec", "value", Some("main"), &dont_pin);
+
+        assert_eq!(cfg.sections(), vec!["shared_sec", "pin_sec", "main_sec"]);
+        assert_eq!(cfg.keys("main_sec"), vec!["value"]);
+        assert_eq!(cfg.keys("pin_sec"), vec!["value"]);
+        assert_eq!(cfg.keys("shared_sec"), vec!["value"]);
+
+        assert_eq!(cfg.get("shared_sec", "value"), Some("pin".into()));
+
+        let sources = cfg.get_sources("shared_sec", "value");
+        assert_eq!(sources.len(), 2);
+
+        cfg.clear_unpinned();
+
+        assert_eq!(cfg.sections(), vec!["shared_sec", "pin_sec"]);
+        assert_eq!(cfg.keys("shared_sec"), vec!["value"]);
+
+        let sources = cfg.get_sources("shared_sec", "value");
+        assert_eq!(sources.len(), 1);
+    }
+
+    #[test]
+    fn test_wrap_maintains_pinned_config() {
+        let mut cfg = ConfigSet::new();
+
+        cfg.set(
+            "pinned",
+            "pinned",
+            Some("pinned"),
+            &Options::default().pin(true),
+        );
+
+        cfg.set(
+            "not-pinned",
+            "not-pinned",
+            Some("not-pinned"),
+            &Options::default().pin(false),
+        );
+
+        let mut wrapped = ConfigSet::wrap(Arc::new(cfg));
+
+        assert_eq!(wrapped.get("pinned", "pinned"), Some("pinned".into()));
+        assert_eq!(
+            wrapped.get("not-pinned", "not-pinned"),
+            Some("not-pinned".into())
+        );
+
+        wrapped.clear_unpinned();
+
+        assert_eq!(wrapped.get("pinned", "pinned"), Some("pinned".into()));
+        assert_eq!(wrapped.get("not-pinned", "not-pinned"), None);
     }
 }

@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Copyright (c) Mercurial Contributors.
 #
@@ -9,6 +11,8 @@
 # a file-level merge failed
 
   $ setconfig devel.segmented-changelog-rev-compat=true
+  $ setconfig commands.update.check=none
+
   $ eagerepo
   $ hg init repo
   $ cd repo

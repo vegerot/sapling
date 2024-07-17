@@ -90,7 +90,7 @@ impl MononokeIdentitySetExt for MononokeIdentitySet {
         self.iter().map(ToString::to_string).join(",")
     }
 
-    fn identity_type_filtered_concat(&self, id_type: &str) -> Option<String> {
+    fn identity_type_filtered_concat(&self, _id_type: &str) -> Option<String> {
         None
     }
 }
@@ -115,6 +115,10 @@ impl AclProvider for DummyAclProvider {
 
     async fn tier_acl(&self, _name: &str) -> Result<BoxPermissionChecker> {
         Ok(Box::new(AlwaysAllow))
+    }
+
+    async fn commitcloud_workspace_acl(&self, _name: &str) -> Result<Option<BoxPermissionChecker>> {
+        Ok(Some(Box::new(AlwaysAllow)))
     }
 
     async fn group(&self, _name: &str) -> Result<BoxMembershipChecker> {

@@ -8,9 +8,7 @@
 from __future__ import absolute_import
 
 import ctypes
-import getpass
 import os
-import sys
 import time
 
 from sapling import blackbox, encoding, json, progress, pycompat, util
@@ -42,12 +40,11 @@ def getclientforrepo(repo):
 
 
 class Unavailable(Exception):
-    def __init__(self, msg, warn=True, invalidate=False):
+    def __init__(self, msg, warn=True):
         self.msg = msg
         self.warn = warn
         if self.msg == "timed out waiting for response":
             self.warn = False
-        self.invalidate = invalidate
 
     def __str__(self):
         if self.warn:
@@ -118,7 +115,7 @@ class client:
     def getcurrentclock(self):
         result = self.command("clock")
         if not hasattr(result, "clock"):
-            raise Unavailable("clock result is missing clock value", invalidate=True)
+            raise Unavailable("clock result is missing clock value")
         return result.clock
 
     def clearconnection(self):
@@ -129,11 +126,7 @@ class client:
 
     @util.propertycache
     def _user(self):
-        try:
-            return getpass.getuser()
-        except KeyError:
-            # couldn't figure out our user
-            return None
+        return util.getuser()
 
     def _command(self, *args):
         with util.traced("watchman-command", args=json.dumps(args[1:])) as span:
@@ -377,7 +370,7 @@ class state_update:
     def enter(self):
         # Make sure we have a wlock prior to sending notifications to watchman.
         # We don't want to race with other actors. In the update case,
-        # merge.update is going to take the wlock almost immediately. We are
+        # merge.merge/goto is going to take the wlock almost immediately. We are
         # effectively extending the lock around several short sanity checks.
         if self.oldnode is None:
             self.oldnode = self.repo["."].node()

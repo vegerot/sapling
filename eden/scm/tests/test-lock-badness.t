@@ -1,6 +1,7 @@
 #chg-compatible
+#debugruntest-incompatible
 
-#require unix-permissions no-root no-windows
+#require unix-permissions no-root no-windows no-eden
 
   $ configure modernclient
 
@@ -56,19 +57,20 @@ One process waiting for another for a significant period of time (longer than th
 
   $ cat > hooks.py << EOF
   > import time
-  > def sleeplong(**x): time.sleep(3.1)
-  > def sleepshort(**x): time.sleep(0.1)
+  > def sleeplong(**x):
+  >     import os
+  >     os.system("touch sleeping")
+  >     time.sleep(2)
   > EOF
   $ echo b > b/b
   $ hg -R b ci -A -m b --config hooks.precommit="python:`pwd`/hooks.py:sleeplong" > stdout &
-  $ hg -R b up -q --config hooks.pre-update="python:`pwd`/hooks.py:sleepshort" \
-  > > preup-stdout 2>preup-stderr
+Wait until bg process has entered critical section.
+  $ while [ ! -f sleeping ]; do sleep 0.01; done
+  $ LOG=repolock=warn hg -R b up -q --config ui.timeout.warn=0 . > preup-stdout 2>preup-stderr
   $ wait
   $ cat preup-stdout
-  $ cat preup-stderr
-  waiting for lock on working directory of b held by process '*' on host '*' (glob)
-  (hint: run 'hg debugprocesstree *' to see related processes) (glob)
-  got lock after * seconds (glob) (?)
+  $ grep repolock preup-stderr | head -1
+   WARN repolock: lock contended name="wlock" contents="*" (glob)
   $ cat stdout
   adding b
 
@@ -81,7 +83,7 @@ One process waiting for another for short period of time. No warning.
   > EOF
   $ echo b > b/c
   $ hg -R b ci -A -m b --config hooks.precommit="python:`pwd`/hooks.py:sleepone" > stdout &
-  $ hg -R b up -q --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" \
+  $ hg -R b up -q --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" . \
   > > preup-stdout 2>preup-stderr
   $ wait
   $ cat preup-stdout
@@ -93,7 +95,7 @@ On processs waiting on another, warning after a long time.
 
   $ echo b > b/d
   $ hg -R b ci -A -m b --config hooks.precommit="python:`pwd`/hooks.py:sleepone" > stdout &
-  $ hg -R b up -q --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" \
+  $ hg -R b up -q --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" . \
   > --config ui.timeout.warn=250 \
   > > preup-stdout 2>preup-stderr
   $ wait
@@ -106,7 +108,7 @@ On processs waiting on another, warning disabled.
 
   $ echo b > b/e
   $ hg -R b ci -A -m b --config hooks.precommit="python:`pwd`/hooks.py:sleepone" > stdout &
-  $ hg -R b up -q --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" \
+  $ hg -R b up -q --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" . \
   > --config ui.timeout.warn=-1 \
   > > preup-stdout 2>preup-stderr
   $ wait
@@ -121,7 +123,7 @@ On processs waiting on another, warning after a long time (debug output on)
 
   $ echo b > b/f
   $ hg -R b ci -A -m b --config hooks.precommit="python:`pwd`/hooks.py:sleepone" > stdout &
-  $ hg -R b up --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" \
+  $ hg -R b up --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" . \
   > --config ui.timeout.warn=250 --debug\
   > > preup-stdout 2>preup-stderr
   $ wait
@@ -139,7 +141,7 @@ On processs waiting on another, warning disabled, (debug output on)
 
   $ echo b > b/g
   $ hg -R b ci -A -m b --config hooks.precommit="python:`pwd`/hooks.py:sleepone" > stdout &
-  $ hg -R b up --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" \
+  $ hg -R b up --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" . \
   > --config ui.timeout.warn=-1 --debug\
   > > preup-stdout 2>preup-stderr
   $ wait
@@ -152,30 +154,6 @@ On processs waiting on another, warning disabled, (debug output on)
   got lock after * seconds (glob) (?)
   $ cat stdout
   adding g
-
-#if windows
-Pushing to a local read-only repo that can't be locked
-
-  $ chmod 100 a/.hg/store
-
-  $ hg -R b push a
-  pushing to a
-  searching for changes
-  abort: could not lock repository a: Permission denied
-  [255]
-
-  $ chmod 700 a/.hg/store
-
-Having an empty lock file
-  $ cd a
-  $ touch .hg/wlock
-  $ hg backout # a command which always acquires a lock
-  abort: malformed lock file ($TESTTMP/a/.hg/wlock)
-  (run hg debuglocks)
-  [255]
-  $ rm .hg/wlock
-
-#else
 
 Having an empty lock file
   $ cd a
@@ -203,6 +181,5 @@ Having an empty undolog lock file
   undolog/lock:  free
   prefetchlock:  free
   infinitepushbackup.lock: free
-#endif
 
   $ cd ..

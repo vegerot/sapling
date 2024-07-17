@@ -7,10 +7,11 @@
 
 use std::ops::BitAnd;
 use std::ops::BitOr;
+use std::ops::BitOrAssign;
 use std::ops::Not;
 use std::ops::Sub;
 
-use edenapi_types::FileAttributes as EdenApiFileAttributes;
+use edenapi_types::FileAttributes as SaplingRemoteApiFileAttributes;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -22,9 +23,9 @@ pub struct FileAttributes {
     pub aux_data: bool,
 }
 
-impl From<FileAttributes> for EdenApiFileAttributes {
+impl From<FileAttributes> for SaplingRemoteApiFileAttributes {
     fn from(v: FileAttributes) -> Self {
-        EdenApiFileAttributes {
+        SaplingRemoteApiFileAttributes {
             content: v.content,
             aux_data: v.aux_data,
         }
@@ -89,6 +90,12 @@ impl BitOr for FileAttributes {
             content: self.content | rhs.content,
             aux_data: self.aux_data | rhs.aux_data,
         }
+    }
+}
+
+impl BitOrAssign for FileAttributes {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = *self | rhs;
     }
 }
 

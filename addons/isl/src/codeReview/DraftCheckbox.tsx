@@ -7,18 +7,14 @@
 
 import type {CommitInfo} from '../types';
 
-import {Tooltip} from '../Tooltip';
 import {t, T} from '../i18n';
-import {persistAtomToConfigEffect} from '../persistAtomToConfigEffect';
+import {configBackedAtom} from '../jotaiUtils';
 import {codeReviewProvider} from './CodeReviewInfo';
-import {VSCodeCheckbox} from '@vscode/webview-ui-toolkit/react';
-import {atom, useRecoilState, useRecoilValue} from 'recoil';
+import {Checkbox} from 'isl-components/Checkbox';
+import {Tooltip} from 'isl-components/Tooltip';
+import {useAtom, useAtomValue} from 'jotai';
 
-export const submitAsDraft = atom<boolean>({
-  key: 'submitAsDraft',
-  default: false,
-  effects: [persistAtomToConfigEffect('isl.submitAsDraft')],
-});
+export const submitAsDraft = configBackedAtom<boolean>('isl.submitAsDraft', false);
 
 export function SubmitAsDraftCheckbox({
   commitsToBeSubmit,
@@ -26,8 +22,8 @@ export function SubmitAsDraftCheckbox({
 }:
   | {commitsToBeSubmit: Array<CommitInfo>; forceShow?: undefined}
   | {forceShow: true; commitsToBeSubmit?: undefined}) {
-  const [isDraft, setIsDraft] = useRecoilState(submitAsDraft);
-  const provider = useRecoilValue(codeReviewProvider);
+  const [isDraft, setIsDraft] = useAtom(submitAsDraft);
+  const provider = useAtomValue(codeReviewProvider);
   if (
     !forceShow &&
     (provider == null ||
@@ -41,10 +37,7 @@ export function SubmitAsDraftCheckbox({
     return null;
   }
   return (
-    <VSCodeCheckbox
-      className="submit-as-draft-checkbox"
-      checked={isDraft}
-      onChange={e => setIsDraft((e.target as HTMLInputElement).checked)}>
+    <Checkbox checked={isDraft} onChange={checked => setIsDraft(checked)}>
       <Tooltip
         title={
           forceShow
@@ -56,6 +49,6 @@ export function SubmitAsDraftCheckbox({
         }>
         <T>Submit as Draft</T>
       </Tooltip>
-    </VSCodeCheckbox>
+    </Checkbox>
   );
 }

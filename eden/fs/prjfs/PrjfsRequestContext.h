@@ -8,10 +8,11 @@
 #include "folly/portability/Windows.h"
 
 #include <ProjectedFSLib.h> // @manual
+
+#include "eden/common/utils/ImmediateFuture.h"
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/inodes/RequestContext.h"
 #include "eden/fs/prjfs/PrjfsChannel.h"
-#include "eden/fs/utils/ImmediateFuture.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 namespace facebook::eden {
 
@@ -44,13 +45,30 @@ class PrjfsRequestContext : public RequestContext {
         channel_(std::move(channel)),
         commandId_(prjfsData.CommandId) {}
 
-  ImmediateFuture<folly::Unit> catchErrors(ImmediateFuture<folly::Unit>&& fut) {
-    return std::move(fut).thenTry([this](folly::Try<folly::Unit>&& try_) {
-      auto result = tryToHResult(try_);
-      if (result != S_OK) {
-        sendError(result);
-      }
-    });
+  folly::ReadMostlyWeakPtr<PrjfsChannelInner> getChannelForAsyncUse() {
+    return folly::ReadMostlyWeakPtr<PrjfsChannelInner>{channel_};
+  }
+
+  ImmediateFuture<folly::Unit> catchErrors(
+      ImmediateFuture<folly::Unit>&& fut,
+      EdenStatsPtr stats,
+      StatsGroupBase::Counter PrjfsStats::*countSuccessful,
+      StatsGroupBase::Counter PrjfsStats::*countFailure) {
+    return std::move(fut).thenTry(
+        [this, stats = std::move(stats), countSuccessful, countFailure](
+            folly::Try<folly::Unit>&& try_) {
+          auto result = tryToHResult(try_);
+          if (result != S_OK) {
+            if (stats && countFailure) {
+              stats->increment(countFailure);
+            }
+            sendError(result);
+          } else {
+            if (stats && countSuccessful) {
+              stats->increment(countSuccessful);
+            }
+          }
+        });
   }
 
   void sendSuccess() const {

@@ -7,9 +7,8 @@
 
 #include "eden/fs/nfs/rpc/RpcServer.h"
 
-#include <folly/executors/QueuedImmediateExecutor.h>
 #include <folly/portability/GTest.h>
-#include "eden/fs/telemetry/NullStructuredLogger.h"
+#include "eden/common/telemetry/NullStructuredLogger.h"
 
 namespace {
 
@@ -22,8 +21,10 @@ struct RpcServerTest : ::testing::Test {
     return RpcServer::create(
         std::make_shared<TestServerProcessor>(),
         &evb,
-        std::make_shared<folly::QueuedImmediateExecutor>(),
-        std::make_shared<NullStructuredLogger>());
+        folly::getUnsafeMutableGlobalCPUExecutor(),
+        std::make_shared<NullStructuredLogger>(),
+        /*maximumInFlightRequests=*/1000,
+        /*highNfsRequestsLogInterval=*/std::chrono::minutes{10});
   }
 
   folly::EventBase evb;

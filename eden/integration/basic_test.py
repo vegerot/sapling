@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 import errno
 import json
 import os
@@ -34,7 +36,7 @@ class BasicTestBase(testcase.EdenRepoTest):
         self.repo.commit("Initial commit.")
 
         self.expected_mount_entries = {".eden", "adir", "bdir", "hello", "slink"}
-        if self.repo.get_type() == "hg":
+        if self.repo.get_type() in ["hg", "filteredhg"]:
             self.expected_mount_entries.add(".hg")
 
 

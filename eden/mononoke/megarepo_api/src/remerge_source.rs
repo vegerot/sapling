@@ -100,6 +100,7 @@ impl<'a> RemergeSource<'a> {
 
         let mut new_remapping_state = old_remapping_state.clone();
         new_remapping_state.set_source_changeset(source_name.clone(), remerge_cs_id);
+        new_remapping_state.set_bookmark(target.bookmark.clone());
 
         let source_config = find_source_config(source_name, &config)?;
 
@@ -178,7 +179,7 @@ impl<'a> RemergeSource<'a> {
             return Err(MegarepoError::request(anyhow!(
                 "Neither {} nor its first parent {:?} point to a target location {}",
                 actual_target_location,
-                parents.get(0),
+                parents.first(),
                 expected_target_location,
             )));
         }

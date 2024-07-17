@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use anyhow::anyhow;
 use bytes::Bytes;
 use edenapi_types::wire::pull::WirePullFastForwardRequest;
 use edenapi_types::wire::pull::WirePullLazyRequest;
@@ -16,6 +17,7 @@ use gotham::state::State;
 use gotham_derive::StateData;
 use gotham_derive::StaticResponseExtender;
 use gotham_ext::error::HttpError;
+use gotham_ext::middleware::request_context::RequestContext;
 use gotham_ext::response::BytesBody;
 use mercurial_types::HgChangesetId;
 use serde::Deserialize;
@@ -23,10 +25,9 @@ use types::HgId;
 
 use crate::context::ServerContext;
 use crate::errors::MononokeErrorExt;
-use crate::handlers::EdenApiMethod;
 use crate::handlers::HandlerInfo;
+use crate::handlers::SaplingRemoteApiMethod;
 use crate::middleware::request_dumper::RequestDumper;
-use crate::middleware::RequestContext;
 use crate::utils::cbor;
 use crate::utils::get_repo;
 use crate::utils::parse_wire_request;
@@ -44,7 +45,10 @@ pub struct PullLazyParams {
 pub async fn pull_lazy(state: &mut State) -> Result<BytesBody<Bytes>, HttpError> {
     let params = PullLazyParams::take_from(state);
 
-    state.put(HandlerInfo::new(&params.repo, EdenApiMethod::PullLazy));
+    state.put(HandlerInfo::new(
+        &params.repo,
+        SaplingRemoteApiMethod::PullLazy,
+    ));
     let request = parse_wire_request::<WirePullLazyRequest>(state).await?;
     if let Some(rd) = RequestDumper::try_borrow_mut_from(state) {
         rd.add_request(&request);
@@ -53,6 +57,16 @@ pub async fn pull_lazy(state: &mut State) -> Result<BytesBody<Bytes>, HttpError>
     let sctx = ServerContext::borrow_from(state);
     let rctx = RequestContext::borrow_from(state).clone();
     let hg_repo_ctx = get_repo(sctx, &rctx, &params.repo, None).await?;
+
+    if justknobs::eval(
+        "scm/mononoke:disable_pull_lazy",
+        None,
+        Some(hg_repo_ctx.repo().name()),
+    )
+    .map_err(HttpError::e500)?
+    {
+        return Err(HttpError::e500(anyhow!("pull_lazy is disabled")));
+    }
 
     let common: Vec<HgChangesetId> = request.common.into_iter().map(Into::into).collect();
     let missing: Vec<HgChangesetId> = request.missing.into_iter().map(Into::into).collect();
@@ -90,7 +104,7 @@ pub async fn pull_fast_forward_master(state: &mut State) -> Result<BytesBody<Byt
 
     state.put(HandlerInfo::new(
         &params.repo,
-        EdenApiMethod::PullFastForwardMaster,
+        SaplingRemoteApiMethod::PullFastForwardMaster,
     ));
     let request = parse_wire_request::<WirePullFastForwardRequest>(state).await?;
     if let Some(rd) = RequestDumper::try_borrow_mut_from(state) {
@@ -100,6 +114,18 @@ pub async fn pull_fast_forward_master(state: &mut State) -> Result<BytesBody<Byt
     let sctx = ServerContext::borrow_from(state);
     let rctx = RequestContext::borrow_from(state).clone();
     let hg_repo_ctx = get_repo(sctx, &rctx, &params.repo, None).await?;
+
+    if justknobs::eval(
+        "scm/mononoke:disable_pull_fast_forward_master",
+        None,
+        Some(hg_repo_ctx.repo().name()),
+    )
+    .map_err(HttpError::e500)?
+    {
+        return Err(HttpError::e500(anyhow!(
+            "pull_fast_forward_master is disabled"
+        )));
+    }
 
     let old_master: HgChangesetId = request.old_master.into();
     let new_master: HgChangesetId = request.new_master.into();

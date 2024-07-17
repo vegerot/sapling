@@ -1,5 +1,6 @@
 #chg-compatible
 #require mononoke
+#debugruntest-incompatible
   $ setconfig experimental.allowfilepeer=True
 
   $ . "$TESTDIR/library.sh"
@@ -37,7 +38,7 @@ Shallow clone from full
   treestate
   windowssymlinks
 
-  $ hg goto
+  $ hg goto tip
   fetching tree '' 05bd2758dd7a25912490d0633b8975bf52bfab06
   1 trees fetched over 0.00s
   fetching tree 'dir' 8a87e5128a9877c501d5a20c32dbd2103a54afad
@@ -47,6 +48,7 @@ Shallow clone from full
 Log on a file without -f
 
   $ hg log dir/y
+  warning: file log can be slow on large repos - use -f to speed it up
   commit:      79c51fb96423
   bookmark:    default/master
   hoistedname: master
@@ -102,6 +104,7 @@ Log on a file from inside a directory
 
   $ cd dir
   $ hg log y
+  warning: file log can be slow on large repos - use -f to speed it up
   commit:      79c51fb96423
   bookmark:    default/master
   hoistedname: master

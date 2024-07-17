@@ -19,7 +19,6 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Error;
 use async_trait::async_trait;
-use blobrepo::ChangesetFetcher;
 use blobrepo_hg::BlobRepoHg;
 use blobstore::Blobstore;
 use blobstore::Loadable;
@@ -31,6 +30,7 @@ use changesets::deserialize_cs_entries;
 use changesets::ChangesetEntry;
 use changesets::Changesets;
 use clap::Parser;
+use commit_graph::CommitGraph;
 use context::CoreContext;
 use executor_lib::RepoShardedProcess;
 use executor_lib::RepoShardedProcessExecutor;
@@ -66,6 +66,7 @@ use repo_blobstore::RepoBlobstore;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedData;
 use repo_derived_data::RepoDerivedDataRef;
+use repo_identity::RepoIdentity;
 use scuba_ext::MononokeScubaSampleBuilder;
 use sharding_ext::RepoShard;
 use slog::error;
@@ -90,9 +91,11 @@ pub struct Repo {
     #[facet]
     bonsai_hg_mapping: dyn BonsaiHgMapping,
     #[facet]
-    changeset_fetcher: dyn ChangesetFetcher,
+    commit_graph: CommitGraph,
     #[facet]
     filestore_config: FilestoreConfig,
+    #[facet]
+    repo_identity: RepoIdentity,
 }
 
 /// Tool to calculate repo statistic

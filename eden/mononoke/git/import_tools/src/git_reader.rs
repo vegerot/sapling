@@ -14,13 +14,19 @@ use std::sync::Mutex;
 
 use anyhow::anyhow;
 use anyhow::bail;
+use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Result;
+use async_trait::async_trait;
+use auto_impl::auto_impl;
 use bytes::Bytes;
+use git_types::ObjectContent;
 use gix_hash::ObjectId;
+use gix_object::Commit;
 use gix_object::Kind;
-use gix_object::Object;
 use gix_object::ObjectRef;
+use gix_object::Tag;
+use gix_object::Tree;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -32,10 +38,66 @@ use tokio::sync::oneshot;
 
 type ObjectSender = oneshot::Sender<Result<ObjectContent>>;
 
-#[derive(Clone, Debug)]
-pub struct ObjectContent {
-    pub parsed: Object,
-    pub raw: Bytes,
+#[async_trait]
+#[auto_impl(&, Arc, Box)]
+pub trait GitReader: Clone + Send + Sync + 'static {
+    async fn get_object(&self, oid: &gix_hash::oid) -> Result<ObjectContent>;
+
+    async fn read_tag(&self, oid: &gix_hash::oid) -> Result<Tag> {
+        let object = self.get_object(oid).await?;
+        object
+            .parsed
+            .try_into_tag()
+            .map_err(|_| format_err!("{} is not a tag", oid))
+    }
+
+    async fn read_commit(&self, oid: &gix_hash::oid) -> Result<Commit> {
+        let object = self.get_object(oid).await?;
+        object
+            .parsed
+            .try_into_commit()
+            .map_err(|_| format_err!("{} is not a commit", oid))
+    }
+
+    async fn read_tree(&self, oid: &gix_hash::oid) -> Result<Tree> {
+        let object = self.get_object(oid).await?;
+        object
+            .parsed
+            .try_into_tree()
+            .map_err(|_| format_err!("{} is not a tree", oid))
+    }
+
+    async fn read_raw_object(&self, oid: &gix_hash::oid) -> Result<Bytes> {
+        self.get_object(oid)
+            .await
+            .map(|obj| obj.raw)
+            .with_context(|| format!("Error while fetching Git object for ID {}", oid))
+    }
+
+    async fn peel_to_commit(&self, mut oid: ObjectId) -> Result<Option<ObjectId>> {
+        let mut object = self.get_object(&oid).await?.parsed;
+        while let Some(tag) = object.as_tag() {
+            oid = tag.target;
+            object = self.get_object(&oid).await?.parsed;
+        }
+
+        Ok(object.as_commit().map(|_| oid))
+    }
+
+    async fn is_annotated_tag(&self, object_id: &ObjectId) -> Result<bool> {
+        Ok(self
+            .get_object(object_id)
+            .await
+            .with_context(|| {
+                format_err!(
+                    "Failed to fetch git object {} for checking if its a tag",
+                    object_id,
+                )
+            })?
+            .parsed
+            .as_tag()
+            .is_some())
+    }
 }
 
 /// Uses `git-cat-file` to read a git repository's ODB directly
@@ -136,6 +198,13 @@ impl GitRepoReader {
     }
 }
 
+#[async_trait]
+impl GitReader for GitRepoReader {
+    async fn get_object(&self, oid: &gix_hash::oid) -> Result<ObjectContent> {
+        self.get_object(oid).await
+    }
+}
+
 fn parse_kind_and_size(header: &str) -> Result<(Kind, usize)> {
     if header == "missing" {
         bail!("Object is missing");
@@ -223,8 +292,7 @@ async fn read_objects_task(
             // We have an object. Let's try and read it.
 
             // We need to read size bytes, and then send it on as an object to unblock our listener
-            let mut bytes = Vec::new();
-            bytes.resize(size, 0u8);
+            let mut bytes: Vec<u8> = vec![0; size];
             reader
                 .read_exact(&mut bytes)
                 .await

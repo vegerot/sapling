@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
 Test temp file used with an editor has the expected suffix.
@@ -9,7 +11,7 @@ Test temp file used with an editor has the expected suffix.
 Create an editor that writes its arguments to stdout and set it to $HGEDITOR.
 
   $ cat > editor.sh << EOF
-  > echo "\$@"
+  > printf "%s\n" "\$@"
   > exit 1
   > EOF
   $ hg add editor.sh
@@ -18,8 +20,8 @@ Create an editor that writes its arguments to stdout and set it to $HGEDITOR.
 
 Verify that the path for a commit editor has the expected suffix.
 
-  $ hg commit
-  *.commit.hg.txt (glob)
+  $ SL_IDENTITY=sl hg commit
+  *.commit.sl.txt (glob)
   abort: edit failed: sh exited with status 1
   [255]
 
@@ -31,8 +33,8 @@ Verify that the path for a histedit editor has the expected suffix.
   > histedit=
   > EOF
   $ hg commit --message 'At least one commit for histedit.'
-  $ hg histedit
-  *.histedit.hg.txt (glob)
+  $ SL_IDENTITY=sl hg histedit
+  *.histedit.sl.txt (glob)
   abort: edit failed: sh exited with status 1
   [255]
 

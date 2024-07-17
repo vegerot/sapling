@@ -5,11 +5,11 @@
  * GNU General Public License version 2.
  */
 
-#include "eden/fs/testharness/TempFile.h"
+#include "eden/common/testharness/TempFile.h"
 
 #include <folly/portability/Unistd.h>
 
-#include "eden/fs/utils/SystemError.h"
+#include "eden/common/utils/SystemError.h"
 
 using folly::StringPiece;
 using folly::test::TemporaryDirectory;

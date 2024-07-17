@@ -50,14 +50,6 @@ use crate::CombinedBookmarkUpdateLogEntry;
 use crate::CommitsInBundle;
 use crate::Repo;
 
-#[derive(Clone)]
-pub struct PreparedBookmarkUpdateLogEntry {
-    pub log_entry: BookmarkUpdateLogEntry,
-    pub bundle_file: Arc<NamedTempFile>,
-    pub timestamps_file: Arc<NamedTempFile>,
-    pub cs_id: Option<(ChangesetId, HgChangesetId)>,
-}
-
 pub struct BundlePreparer {
     repo: Repo,
     base_retry_delay_ms: u64,
@@ -540,6 +532,7 @@ impl BookmarkLogEntryBatch {
 mod test {
 
     use bonsai_hg_mapping::BonsaiHgMapping;
+    use bookmarks::BookmarkUpdateLogId;
     use bookmarks::Bookmarks;
     use changeset_fetcher::ChangesetFetcher;
     use changesets::Changesets;
@@ -549,6 +542,7 @@ mod test {
     use mononoke_types::RepositoryId;
     use repo_blobstore::RepoBlobstore;
     use repo_derived_data::RepoDerivedData;
+    use repo_identity::RepoIdentity;
     use tests_utils::drawdag::create_from_dag;
 
     use super::*;
@@ -579,6 +573,9 @@ mod test {
 
         #[facet]
         pub commit_graph: CommitGraph,
+
+        #[facet]
+        pub repo_identity: RepoIdentity,
     }
 
     #[fbinit::test]
@@ -1002,13 +999,13 @@ mod test {
     }
 
     fn create_bookmark_log_entry(
-        id: i64,
+        id: u64,
         bookmark_name: BookmarkKey,
         from_changeset_id: Option<ChangesetId>,
         to_changeset_id: Option<ChangesetId>,
     ) -> BookmarkUpdateLogEntry {
         BookmarkUpdateLogEntry {
-            id,
+            id: BookmarkUpdateLogId(id),
             repo_id: RepositoryId::new(0),
             bookmark_name,
             from_changeset_id,

@@ -5,9 +5,7 @@
 
 import os
 import os.path
-import shlex
 import shutil
-import subprocess
 import sys
 import tarfile
 import tempfile
@@ -15,8 +13,11 @@ from typing import Dict, List, Optional, Tuple
 
 import bindings
 
-from .. import error
+from bindings import webview
+
+from .. import error, pycompat
 from ..i18n import _
+from ..node import hex
 
 from . import util
 from .cmdtable import command
@@ -51,14 +52,49 @@ DEFAULT_PORT = 3011
         (
             "",
             "platform",
-            "",
+            "browser",
             _(
                 "which environment ISL is being embedded in, used to support IDE integrations (ADVANCED)"
             ),
         ),
+        (
+            "",
+            "app",
+            None,
+            _(
+                "Use a native OS window or Chrome-like browser to open ISL in a standalone window. "
+                + "Use --no-app to use a normal browser tab instead.",
+            ),
+        ),
+        (
+            "",
+            "browser",
+            "",
+            _(
+                "Path to a specific Chrome-like browser "
+                + "to open ISL in as a standalone window (ADVANCED)"
+            ),
+        ),
+        (
+            "",
+            "dev",
+            False,
+            _(
+                "Spawn in dev mode on port 3000. ISL must have already been built from source. "
+                + " See addons/isl/README.md for more information. (ADVANCED)"
+            ),
+        ),
+        (
+            "",
+            "session",
+            "",
+            _(
+                "Provide a specific ID for this ISL session used in analytics. (ADVANCED)"
+            ),
+        ),
     ],
 )
-def isl_cmd(ui, repo, *args, **opts):
+def isl_cmd(ui, repo, **opts):
     """launch Sapling Web GUI on localhost
 
     Sapling Web is a collection of web-based tools including Interactive Smartlog,
@@ -66,6 +102,8 @@ def isl_cmd(ui, repo, *args, **opts):
     reordering, or rebasing commits.
     Running this command launches a web server that makes Sapling Web and
     Interactive Smartlog available in a local web browser.
+    When possible, this command opens a separate OS window,
+    either using a webview or a Chrome-like browser with --app.
 
     Examples:
 
@@ -100,57 +138,38 @@ def isl_cmd(ui, repo, *args, **opts):
     kill = opts.get("kill")
     force = opts.get("force")
     platform = opts.get("platform")
-    return launch_server(
-        ui,
-        cwd=repo.root,
-        port=port,
-        open_isl=open_isl,
-        json_output=json_output,
-        foreground=foreground,
-        force=force,
-        kill=kill,
-        platform=platform,
+    browser = opts.get("browser")
+    app = opts.get("app")
+    if app is None:
+        app = "web" not in pycompat.sysargv
+    dev = opts.get("dev")
+    session = opts.get("session")
+
+    force_no_app = ui.configbool("web", "force-no-app")
+
+    isl_args, server_cwd = get_dev_isl_args_cwd(ui) if dev else get_isl_args_cwd(ui)
+    nodepath, entrypoint = isl_args
+    webview.open_isl(
+        {
+            "repoCwd": repo.root,
+            "port": port,
+            "noOpen": not open_isl,
+            "json": json_output,
+            "foreground": foreground,
+            "force": force,
+            "kill": kill,
+            "platform": platform,
+            "slcommand": util.hgcmd()[0],
+            "slversion": util.version(),
+            "serverCwd": server_cwd,
+            "nodepath": nodepath,
+            "entrypoint": entrypoint,
+            "browser": None if browser == "" else browser,
+            "noApp": force_no_app or not app,
+            "dev": dev,
+            "session": session,
+        }
     )
-
-
-def launch_server(
-    ui,
-    *,
-    cwd,
-    port=DEFAULT_PORT,
-    open_isl=True,
-    json_output=False,
-    foreground=False,
-    kill=False,
-    force=False,
-    platform=None,
-):
-    isl_args, isl_cwd = get_isl_args_cwd(ui)
-    args = [
-        "--port",
-        str(port),
-        "--command",
-        util.hgcmd()[0],
-        "--cwd",
-        cwd,
-        "--sl-version",
-        util.version(),
-    ]
-    if not open_isl:
-        args.append("--no-open")
-    if json_output:
-        args.append("--json")
-    if foreground:
-        args.append("--foreground")
-    if force:
-        args.append("--force")
-    if kill:
-        args.append("--kill")
-    if platform:
-        args += ["--platform", str(platform)]
-    full_args = isl_args + args
-    ui.note_err(_("running %s\n") % (shlex.join(full_args),))
-    subprocess.call(full_args, cwd=isl_cwd)
 
 
 def untar(tar_path, dest_dir) -> Dict[str, str]:
@@ -176,10 +195,17 @@ def untar(tar_path, dest_dir) -> Dict[str, str]:
             if os.path.isdir(dest_dir):
                 to_delete_dir = f"{dest_dir}.to-delete"
                 shutil.rmtree(to_delete_dir, ignore_errors=True)
-                os.rename(dest_dir, to_delete_dir)
+                try:
+                    os.rename(dest_dir, to_delete_dir)
+                except FileExistsError:
+                    # If the "to_delete_dir" exists and failed to delete,
+                    # pick a subdir inside it to move to.
+                    # This usually happens on Windows.
+                    randon_name = hex(os.urandom(5))
+                    os.rename(dest_dir, os.path.join(to_delete_dir, randon_name))
                 shutil.rmtree(to_delete_dir, ignore_errors=True)
                 os.makedirs(dest_dir, exist_ok=True)
-            if sys.version_info > (3, 11):
+            if hasattr(tarfile, "data_filter"):
                 tar.extractall(dest_dir, filter="data")
             else:
                 tar.extractall(dest_dir)
@@ -210,9 +236,15 @@ def find_nodejs(ui) -> str:
 
 def get_isl_args_cwd(ui) -> Tuple[List[str], str]:
     # find "isl-dist.tar.xz"
-    candidates = ui.configlist("web", "isl-dist-path") + ["isl-dist.tar.xz"]
+    isl_dist_name = "isl-dist.tar.xz"
+    candidates = ui.configlist("web", "isl-dist-path") + [
+        os.path.join("..", "lib", isl_dist_name),
+        isl_dist_name,
+    ]
+    exe_dir = os.path.dirname(os.path.realpath(sys.executable))
     isl_tar_path = resolve_path(
-        candidates, lambda p: os.path.join(os.path.dirname(sys.executable), p)
+        candidates,
+        lambda p: os.path.join(exe_dir, p),
     )
     if isl_tar_path is None:
         raise error.Abort(_("ISL is not available with this @prog@ install"))
@@ -230,3 +262,11 @@ def get_isl_args_cwd(ui) -> Tuple[List[str], str]:
     node_path = find_nodejs(ui)
     entry_point = tar_metadata.get("entry_point") or "isl-server/dist/run-proxy.js"
     return [node_path, entry_point], dest_dir
+
+
+def get_dev_isl_args_cwd(ui) -> Tuple[List[str], str]:
+    node_path = find_nodejs(ui)
+    entry_point = "isl-server/dist/run-proxy.js"
+    return [node_path, entry_point], os.path.normpath(
+        os.path.join(os.path.dirname(sys.executable), "..", "addons")
+    )

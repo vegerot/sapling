@@ -35,7 +35,7 @@ import subprocess
 import sys
 import traceback
 
-from sapling import dispatch, encoding, extensions, pycompat, registrar, util
+from sapling import alerts, dispatch, encoding, extensions, pycompat, registrar, util
 
 
 configtable = {}
@@ -61,8 +61,7 @@ def _handlecommandexception(orig, ui):
     ui.log("command_exception", "%s\n%s\n", warning, trace)
     exctype = sys.exc_info()[0]
     exctypename = "None" if exctype is None else exctype.__name__
-    ui.log(
-        "hgerrors",
+    ui.log_exception(
         "exception has occurred: %s",
         warning,
         exception_type=exctypename,
@@ -74,6 +73,8 @@ def _handlecommandexception(orig, ui):
     script = ui.config("errorredirect", "script")
     if not script:
         return orig(ui)
+
+    alerts.print_matching_alerts_for_exception(ui, trace)
 
     # run the external script
     env = encoding.environ.copy()

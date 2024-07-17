@@ -333,6 +333,10 @@ impl MononokeApp {
         &self.env.config_store
     }
 
+    pub fn configs(&self) -> Arc<MononokeConfigs> {
+        self.configs.clone()
+    }
+
     /// The repo configs for this app.
     pub fn repo_configs(&self) -> Arc<RepoConfigs> {
         self.configs.repo_configs()
@@ -368,12 +372,17 @@ impl MononokeApp {
         &self.env.readonly_storage
     }
 
-    /// Create a basic CoreContext without scuba logging.  Good choice for
-    /// simple CLI tools like admin.
+    /// Create a basic CoreContext.
     ///
-    /// Warning: returned context doesn't provide any scuba logging!
+    /// This is a good choice for simple CLI tools like admin.  It will
+    /// contain basic logging, and also scuba logging if configured by the
+    /// command line arguments.
     pub fn new_basic_context(&self) -> CoreContext {
-        CoreContext::new_with_logger(self.env.fb, self.logger().clone())
+        CoreContext::new_with_logger_and_scuba(
+            self.env.fb,
+            self.logger().clone(),
+            self.env.scuba_sample_builder.clone(),
+        )
     }
 
     /// Return repo factory used by app.
@@ -482,6 +491,24 @@ impl MononokeApp {
         let repo = self
             .repo_factory
             .build(repo_name, repo_config, common_config)
+            .await?;
+        Ok(repo)
+    }
+
+    /// Open a named repository.
+    /// FIXME should pass a String but I need to figure out how get the repo config
+    pub async fn open_named_repo<Repo>(&self, repo_id: RepositoryId) -> Result<Repo>
+    where
+        Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>,
+    {
+        let repo_configs = self.repo_configs();
+        let (repo_name, repo_config) = repo_configs
+            .get_repo_config(repo_id)
+            .ok_or_else(|| anyhow!("unknown repoid: {:?}", repo_id))?;
+        let common_config = self.repo_configs().common.clone();
+        let repo = self
+            .repo_factory
+            .build(repo_name.clone(), repo_config.clone(), common_config)
             .await?;
         Ok(repo)
     }

@@ -29,28 +29,28 @@
  */
 
 #include "eden/fs/service/StartupLogger.h"
-#include "eden/fs/telemetry/SessionId.h"
+#include "eden/common/telemetry/SessionId.h"
 
 #include <folly/Exception.h>
 #include <folly/File.h>
 #include <folly/FileUtil.h>
-#include <folly/experimental/TestUtil.h>
 #include <folly/init/Init.h>
 #include <folly/logging/xlog.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
-#include <signal.h>
+#include <folly/testing/TestUtil.h>
 #include <sysexits.h>
 #include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
 #include <string>
 #include <thread>
+#include "eden/common/utils/FileUtils.h"
+#include "eden/common/utils/SpawnedProcess.h"
 #include "eden/fs/service/StartupStatusSubscriber.h"
-#include "eden/fs/utils/FileUtils.h"
-#include "eden/fs/utils/SpawnedProcess.h"
 
 using namespace facebook::eden;
 using namespace std::chrono_literals;

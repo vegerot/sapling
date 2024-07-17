@@ -17,18 +17,20 @@ use anyhow::anyhow;
 use anyhow::Context as _;
 use anyhow::Error;
 use async_trait::async_trait;
-use basename_suffix_skeleton_manifest::RootBasenameSuffixSkeletonManifest;
+use basename_suffix_skeleton_manifest_v3::RootBssmV3DirectoryId;
 use blame::RootBlameV2;
 use bookmarks::ArcBookmarkUpdateLog;
 use bookmarks::ArcBookmarks;
 use bookmarks::BookmarkCategory;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLog;
+use bookmarks::BookmarkUpdateLogId;
 use bookmarks::BookmarkUpdateLogRef;
 use bookmarks::Bookmarks;
 use bookmarks::BookmarksRef;
 use bookmarks::BookmarksSubscription;
 use bookmarks::Freshness;
+use bookmarks_cache::BookmarksCache;
 use bookmarks_types::Bookmark;
 use bookmarks_types::BookmarkKind;
 use bookmarks_types::BookmarkPagination;
@@ -53,10 +55,14 @@ use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures_stats::TimedFutureExt;
 use futures_watchdog::WatchdogExt;
+use git_types::MappedGitCommitId;
+use git_types::RootGitDeltaManifestId;
+use git_types::TreeHandle;
 use itertools::Itertools;
 use lock_ext::RwLockExt;
 use mercurial_derivation::MappedHgChangesetId;
 use mononoke_types::ChangesetId;
+use mononoke_types::DerivableType;
 use mononoke_types::Timestamp;
 use phases::ArcPhases;
 use repo_derived_data::ArcRepoDerivedData;
@@ -70,7 +76,6 @@ use slog::warn;
 use stats::prelude::*;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tunables::tunables;
 use unodes::RootUnodeManifestId;
 
 mod warmers;
@@ -164,35 +169,49 @@ impl WarmBookmarksCacheBuilder {
         phases: &ArcPhases,
     ) -> Result<(), Error> {
         self.add_derived_data_warmers(
-            vec![MappedHgChangesetId::NAME, FilenodesOnlyPublic::NAME],
+            &[MappedHgChangesetId::VARIANT, FilenodesOnlyPublic::VARIANT],
             repo_derived_data,
         )?;
         self.add_public_phase_warmer(phases);
         Ok(())
     }
 
-    fn add_derived_data_warmers<'name, Name>(
+    pub fn add_git_warmers(
         &mut self,
-        types: impl IntoIterator<Item = &'name Name>,
         repo_derived_data: &ArcRepoDerivedData,
-    ) -> Result<(), Error>
-    where
-        Name: 'name + AsRef<str> + ?Sized,
-    {
-        let types = types.into_iter().map(AsRef::as_ref).collect::<HashSet<_>>();
+        phases: &ArcPhases,
+    ) -> Result<(), Error> {
+        self.add_derived_data_warmers(
+            &[
+                MappedGitCommitId::VARIANT,
+                TreeHandle::VARIANT,
+                RootGitDeltaManifestId::VARIANT,
+            ],
+            repo_derived_data,
+        )?;
+        self.add_public_phase_warmer(phases);
+        Ok(())
+    }
+
+    fn add_derived_data_warmers<'a>(
+        &mut self,
+        types: impl IntoIterator<Item = &'a DerivableType>,
+        repo_derived_data: &ArcRepoDerivedData,
+    ) -> Result<(), Error> {
+        let types = types.into_iter().collect::<HashSet<_>>();
 
         let config = repo_derived_data.config();
         for ty in types.iter() {
-            if !config.is_enabled(ty) {
+            if !config.is_enabled(**ty) {
                 return Err(anyhow!(
                     "{} is not enabled for {}",
-                    ty,
+                    ty.name(),
                     self.repo_identity.name()
                 ));
             }
         }
 
-        if types.contains(MappedHgChangesetId::NAME) {
+        if types.contains(&MappedHgChangesetId::VARIANT) {
             self.warmers
                 .push(create_derived_data_warmer::<MappedHgChangesetId>(
                     &self.ctx,
@@ -200,60 +219,80 @@ impl WarmBookmarksCacheBuilder {
                 ));
         }
 
-        if types.contains(RootUnodeManifestId::NAME) {
+        if types.contains(&RootUnodeManifestId::VARIANT) {
             self.warmers
                 .push(create_derived_data_warmer::<RootUnodeManifestId>(
                     &self.ctx,
                     repo_derived_data.clone(),
                 ));
         }
-        if types.contains(RootFsnodeId::NAME) {
+        if types.contains(&RootFsnodeId::VARIANT) {
             self.warmers
                 .push(create_derived_data_warmer::<RootFsnodeId>(
                     &self.ctx,
                     repo_derived_data.clone(),
                 ));
         }
-        if types.contains(RootSkeletonManifestId::NAME) {
+        if types.contains(&RootSkeletonManifestId::VARIANT) {
             self.warmers
                 .push(create_derived_data_warmer::<RootSkeletonManifestId>(
                     &self.ctx,
                     repo_derived_data.clone(),
                 ));
         }
-        if types.contains(RootBlameV2::NAME) {
+        if types.contains(&RootBlameV2::VARIANT) {
             self.warmers.push(create_derived_data_warmer::<RootBlameV2>(
                 &self.ctx,
                 repo_derived_data.clone(),
             ));
         }
-        if types.contains(ChangesetInfo::NAME) {
+        if types.contains(&ChangesetInfo::VARIANT) {
             self.warmers
                 .push(create_derived_data_warmer::<ChangesetInfo>(
                     &self.ctx,
                     repo_derived_data.clone(),
                 ));
         }
-        // deleted manifest share the same name
-        if types.contains(RootDeletedManifestV2Id::NAME) {
+        if types.contains(&RootDeletedManifestV2Id::VARIANT) {
             self.warmers
                 .push(create_derived_data_warmer::<RootDeletedManifestV2Id>(
                     &self.ctx,
                     repo_derived_data.clone(),
                 ));
         }
-        if types.contains(RootFastlog::NAME) {
+        if types.contains(&RootFastlog::VARIANT) {
             self.warmers.push(create_derived_data_warmer::<RootFastlog>(
                 &self.ctx,
                 repo_derived_data.clone(),
             ));
         }
-        if types.contains(RootBasenameSuffixSkeletonManifest::NAME) {
-            self.warmers.push(create_derived_data_warmer::<
-                RootBasenameSuffixSkeletonManifest,
-            >(&self.ctx, repo_derived_data.clone()));
+        if types.contains(&RootBssmV3DirectoryId::VARIANT) {
+            self.warmers
+                .push(create_derived_data_warmer::<RootBssmV3DirectoryId>(
+                    &self.ctx,
+                    repo_derived_data.clone(),
+                ));
         }
-
+        if types.contains(&TreeHandle::VARIANT) {
+            self.warmers.push(create_derived_data_warmer::<TreeHandle>(
+                &self.ctx,
+                repo_derived_data.clone(),
+            ));
+        }
+        if types.contains(&MappedGitCommitId::VARIANT) {
+            self.warmers
+                .push(create_derived_data_warmer::<MappedGitCommitId>(
+                    &self.ctx,
+                    repo_derived_data.clone(),
+                ));
+        }
+        if types.contains(&RootGitDeltaManifestId::VARIANT) {
+            self.warmers
+                .push(create_derived_data_warmer::<RootGitDeltaManifestId>(
+                    &self.ctx,
+                    repo_derived_data.clone(),
+                ));
+        }
         Ok(())
     }
 
@@ -281,27 +320,6 @@ impl WarmBookmarksCacheBuilder {
         )
         .await
     }
-}
-
-#[async_trait]
-#[facet::facet]
-pub trait BookmarksCache: Send + Sync {
-    async fn get(
-        &self,
-        ctx: &CoreContext,
-        bookmark: &BookmarkKey,
-    ) -> Result<Option<ChangesetId>, Error>;
-
-    async fn list(
-        &self,
-        ctx: &CoreContext,
-        prefix: &BookmarkPrefix,
-        pagination: &BookmarkPagination,
-        limit: Option<u64>,
-    ) -> Result<Vec<(BookmarkKey, (ChangesetId, BookmarkKind))>, Error>;
-
-    /// Awaits the completion of any ongoing update.
-    async fn sync(&self, ctx: &CoreContext);
 }
 
 /// A drop-in replacement for warm bookmark cache that doesn't
@@ -341,7 +359,7 @@ impl BookmarksCache for NoopBookmarksCache {
                 BookmarkCategory::ALL,
                 BookmarkKind::ALL_PUBLISHING,
                 pagination,
-                limit.unwrap_or(std::u64::MAX),
+                limit.unwrap_or(u64::MAX),
             )
             .map_ok(|(book, cs_id)| {
                 let kind = *book.kind();
@@ -629,8 +647,6 @@ pub struct LatestUnderivedBookmarkEntry {
     maybe_id_ts: Option<(BookmarkUpdateLogId, Timestamp)>,
 }
 
-pub struct BookmarkUpdateLogId(pub u64);
-
 /// Searches bookmark log for latest entry for which everything is derived. Note that we consider log entry that
 /// deletes a bookmark to be derived.
 pub async fn find_latest_derived_and_underived(
@@ -645,7 +661,9 @@ pub async fn find_latest_derived_and_underived(
     let history_depth_limits = vec![0, 10, 50, 100, 1000, 10000];
 
     for (prev_limit, limit) in history_depth_limits.into_iter().tuple_windows() {
-        debug!(ctx.logger(), "{} bookmark, limit {}", book, limit);
+        if prev_limit > 0 {
+            debug!(ctx.logger(), "{} bookmark, limit {}", book, limit);
+        }
         // Note that since new entries might be inserted to the bookmark log,
         // the next call to `list_bookmark_log_entries(...)` might return
         // entries that were already returned on the previous call `list_bookmark_log_entries(...)`.
@@ -659,7 +677,7 @@ pub async fn find_latest_derived_and_underived(
                 Freshness::MaybeStale,
             )
             .map_ok(|(id, maybe_cs_id, _, ts)| {
-                let id = BookmarkUpdateLogId(id);
+                let id = id.into();
                 (maybe_cs_id, Some((id, ts)))
             })
             .try_collect::<Vec<_>>()
@@ -775,39 +793,12 @@ impl BookmarksCoordinator {
 
         let cur_bookmarks = self.bookmarks.with_read(|bookmarks| bookmarks.clone());
 
-        let new_bookmarks = if tunables()
-            .warm_bookmark_cache_disable_subscription()
-            .unwrap_or_default()
-        {
-            let books = self
-                .repo
-                .bookmarks()
-                .list(
-                    ctx.clone(),
-                    Freshness::MaybeStale,
-                    &BookmarkPrefix::empty(),
-                    BookmarkCategory::ALL,
-                    BookmarkKind::ALL_PUBLISHING,
-                    &BookmarkPagination::FromStart,
-                    std::u64::MAX,
-                )
-                .map_ok(|(book, cs_id)| {
-                    let kind = *book.kind();
-                    (book.into_key(), (cs_id, kind))
-                })
-                .try_collect::<HashMap<_, _>>()
-                .await
-                .context("Error fetching bookmarks")?;
+        self.sub
+            .refresh(ctx)
+            .await
+            .context("Error refreshing subscription")?;
 
-            Cow::Owned(books)
-        } else {
-            self.sub
-                .refresh(ctx)
-                .await
-                .context("Error refreshing subscription")?;
-
-            Cow::Borrowed(self.sub.bookmarks())
-        };
+        let new_bookmarks = Cow::Borrowed(self.sub.bookmarks());
 
         let mut changed_bookmarks = vec![];
         // Find bookmarks that were moved/created and spawn an updater
@@ -939,19 +930,19 @@ impl BookmarksCoordinator {
                         notify_sync_complete.notify_waiters();
                     }
 
-                    let delay_ms = match tunables()
-                        .warm_bookmark_cache_poll_interval_ms()
-                        .unwrap_or_default()
-                        .try_into()
-                    {
-                        Ok(duration) if duration > 0 => duration,
-                        _ => 1000,
-                    };
+                    const FALLBACK_WBC_POLL_INTERVAL_MS: u64 = 5000;
+                    let delay = Duration::from_millis(
+                        justknobs::get_as::<u64>(
+                            "scm/mononoke:warm_bookmark_cache_poll_interval_ms",
+                            None,
+                        )
+                        .unwrap_or(FALLBACK_WBC_POLL_INTERVAL_MS),
+                    );
 
                     // Receiving a sync notification interrupts sleep and forces
                     // waiting for all updaters to finish in the next iteration
                     let notified = notify_sync_start.notified();
-                    let sleep = tokio::time::sleep(Duration::from_millis(delay_ms));
+                    let sleep = tokio::time::sleep(delay);
 
                     futures::pin_mut!(notified, sleep);
 
@@ -1122,7 +1113,7 @@ async fn single_bookmark_updater(
             staleness_reporter(ts);
         }
 
-        let bookmark_log_id = maybe_id_ts.as_ref().map(|(id, _)| id.0);
+        let bookmark_log_id = maybe_id_ts.as_ref().map(|(id, _)| u64::from(*id));
         let maybe_ts = maybe_id_ts.map(|(_, ts)| ts);
 
         let ctx = ctx.clone().with_mutated_scuba(|mut scuba| {
@@ -1250,7 +1241,7 @@ mod tests {
             .with_blobstore(blobstore)
             .build()
             .await?;
-        Linear::initrepo(fb, &repo.blob_repo).await;
+        Linear::init_repo(fb, &repo.blob_repo).await?;
         let ctx = CoreContext::test_mock(fb);
 
         let mut warmers: Vec<Warmer> = Vec::new();
@@ -1483,7 +1474,14 @@ mod tests {
         .await?;
 
         bookmark(&ctx, &repo.blob_repo, "master").delete().await?;
-        update_and_wait_for_bookmark(&ctx, &mut coordinator, &master_book, None).await?;
+        // This check should not be successful in deleting master because it is protected
+        update_and_wait_for_bookmark(
+            &ctx,
+            &mut coordinator,
+            &master_book,
+            Some((master, BookmarkKind::PullDefaultPublishing)),
+        )
+        .await?;
 
         Ok(())
     }
@@ -1900,7 +1898,7 @@ mod tests {
     async fn test_single_bookmarks_no_history(fb: FacebookInit) -> Result<(), Error> {
         let factory = TestRepoFactory::new(fb)?;
         let repo: InnerRepo = factory.build().await?;
-        Linear::initrepo(fb, &repo.blob_repo).await;
+        Linear::init_repo(fb, &repo.blob_repo).await?;
         let ctx = CoreContext::test_mock(fb);
 
         let bookmarks = Arc::new(RwLock::new(HashMap::new()));

@@ -8,13 +8,20 @@
 #ifdef _WIN32
 
 #include "eden/fs/inodes/PrjfsDispatcherImpl.h"
+
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
 #include <cpptoml.h>
-#include <folly/executors/QueuedImmediateExecutor.h>
 #include <folly/logging/xlog.h>
 #include <folly/stop_watch.h>
 #include <optional>
+
+#include "eden/common/telemetry/StructuredLogger.h"
+#include "eden/common/utils/FaultInjector.h"
+#include "eden/common/utils/FileUtils.h"
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/SystemError.h"
+#include "eden/common/utils/UnboundedQueueExecutor.h"
 #include "eden/fs/config/CheckoutConfig.h"
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/FileInode.h"
@@ -23,12 +30,7 @@
 #include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/telemetry/EdenStats.h"
-#include "eden/fs/telemetry/StructuredLogger.h"
-#include "eden/fs/utils/FaultInjector.h"
-#include "eden/fs/utils/FileUtils.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/SystemError.h"
-#include "eden/fs/utils/UnboundedQueueExecutor.h"
+#include "eden/fs/telemetry/LogEvent.h"
 
 namespace facebook::eden {
 
@@ -187,6 +189,189 @@ ImmediateFuture<std::vector<PrjfsDirEntry>> PrjfsDispatcherImpl::opendir(
       });
 }
 
+namespace {
+bool isNonEdenFsPathDirectory(AbsolutePath path) {
+  // TODO(sggutier): This might actually be another EdenFS repo instead of a
+  // regular file. We should try to consider the case where the other EdenFS
+  // repo in turn points out to somewhere inside of the EdenFS repo that
+  // initiated this call, as trying to recursively resolve symlinks on this
+  // manner might cause issues.
+  boost::system::error_code ec;
+  auto boostPath = boost::filesystem::path(path.asString());
+  auto fileType = boost::filesystem::status(boostPath, ec).type();
+  return fileType == boost::filesystem::directory_file;
+}
+} // namespace
+
+std::variant<AbsolutePath, RelativePath>
+PrjfsDispatcherImpl::determineTargetType(
+    RelativePath symlink,
+    string_view targetStringView) {
+  // Creating absolute path symlinks with a variety of tools (e.g.,
+  // mklink on Windows or os.symlink on Python) makes the created
+  // symlinks start with an UNC prefix. However, there could be tools
+  // that create symlinks that don't add this prefix.
+  // TODO: Make this line also consider tools that do not add an UNC
+  // prefix to absolute path symlinks.
+  auto targetString = targetStringView.starts_with(detail::kUNCPrefix)
+      ? std::string(targetStringView)
+      : fmt::format(
+            "{}{}{}",
+            mount_->getPath() + symlink.dirname(),
+            kDirSeparatorStr,
+            targetStringView);
+  AbsolutePath absTarget;
+  try {
+    absTarget = canonicalPath(targetString);
+  } catch (const std::exception& exc) {
+    XLOG(DBG6) << "unable to normalize target " << symlink.asString() << ": "
+               << exc.what();
+    throw exc;
+  }
+  RelativePath target;
+  try {
+    // Symlink points inside of EdenFS
+    return RelativePath(mount_->getPath().relativize(absTarget));
+  } catch (const std::exception&) {
+    // Symlink points outside of EdenFS
+    return absTarget;
+  }
+}
+
+ImmediateFuture<std::variant<AbsolutePath, RelativePath>>
+PrjfsDispatcherImpl::resolveSymlinkPath(
+    RelativePath path,
+    const ObjectFetchContextPtr& context,
+    const size_t remainingRecursionDepth) {
+  std::vector<RelativePath> pathParts;
+  std::transform(
+      path.paths().begin(),
+      path.paths().end(),
+      std::back_inserter(pathParts),
+      [](const auto& p) { return RelativePath(p); });
+  return resolveSymlinkPathImpl(
+      std::move(path),
+      context,
+      std::move(pathParts),
+      0,
+      remainingRecursionDepth);
+}
+
+ImmediateFuture<std::variant<AbsolutePath, RelativePath>>
+PrjfsDispatcherImpl::resolveSymlinkPathImpl(
+    RelativePath path,
+    const ObjectFetchContextPtr& context,
+    std::vector<RelativePath> pathParts,
+    const size_t solvedLen,
+    const size_t remainingRecursionDepth) {
+  if (solvedLen >= pathParts.size() || remainingRecursionDepth == 0) {
+    // Either everything is resolved or we should give up due to recursion depth
+    return std::move(path);
+  }
+  RelativePath target = pathParts[solvedLen];
+  return mount_->getTreeOrTreeEntry(target, context)
+      .thenValue(
+          [this,
+           path = path.copy(),
+           symlink = std::move(target),
+           context = context.copy(),
+           pathParts = std::move(pathParts),
+           solvedLen,
+           remainingRecursionDepth](
+              std::variant<std::shared_ptr<const Tree>, TreeEntry>
+                  treeOrTreeEntry) mutable
+          -> ImmediateFuture<std::variant<AbsolutePath, RelativePath>> {
+            if (std::holds_alternative<std::shared_ptr<const Tree>>(
+                    treeOrTreeEntry)) {
+              // Everything up to the current component is a directory and ok,
+              // keep normalizing the rest of the path
+              return resolveSymlinkPathImpl(
+                  std::move(path),
+                  context,
+                  std::move(pathParts),
+                  solvedLen + 1,
+                  remainingRecursionDepth);
+            }
+            auto& entry = std::get<TreeEntry>(treeOrTreeEntry);
+            if (entry.getDtype() != dtype_t::Symlink) {
+              // Some part of the path is a file; it does not make sense to keep
+              // trying to resolve the rest
+              return std::move(path);
+            }
+            return mount_->getObjectStore()
+                ->getBlob(entry.getHash(), context)
+                .thenValue(
+                    [this,
+                     context = context.copy(),
+                     symlink = std::move(symlink),
+                     path = std::move(path),
+                     pathParts = std::move(pathParts),
+                     solvedLen,
+                     remainingRecursionDepth](
+                        std::shared_ptr<const Blob> blob) mutable
+                    -> ImmediateFuture<
+                        std::variant<AbsolutePath, RelativePath>> {
+                      // Resolve the symlink at this point and replace it in the
+                      // path, then keep normalizing
+                      auto content = blob->asString();
+                      std::replace(content.begin(), content.end(), '/', '\\');
+                      std::variant<AbsolutePath, RelativePath> resolvedTarget;
+                      try {
+                        resolvedTarget = determineTargetType(symlink, content);
+                      } catch (const std::exception&) {
+                        // The symlink target is invalid, just give up
+                        return std::move(path);
+                      }
+                      std::optional<RelativePath> remainingPath = std::nullopt;
+                      if (solvedLen != pathParts.size() - 1) {
+                        // Even after partially resolving a symlink in the path,
+                        // it's possible that we have a remainder in the path
+                        // that needs to be attached to it. For instance, if we
+                        // are resolving a path like a/b/c/x/y/z, c is a symlink
+                        // to ../w, and the rest are regular directories then
+                        // after replacing c by its symlink, resolvedTarget
+                        // would be a/w . However, we still need to attach x/y/z
+                        // to it. In this case, remainingPath would be x/y/z.
+                        std::vector<RelativePathPiece> suffixes(
+                            path.rsuffixes().begin(), path.rsuffixes().end());
+                        remainingPath = RelativePath(
+                            suffixes[pathParts.size() - solvedLen - 2]);
+                      }
+                      if (std::holds_alternative<AbsolutePath>(
+                              resolvedTarget)) {
+                        // The symlink target is absolute, but we are resolving
+                        // a relative path. This means that the symlink target
+                        // is outside of EdenFS. In this case, we can only
+                        // return the absolute path.
+                        auto absPath = std::get<AbsolutePath>(resolvedTarget);
+                        if (remainingPath.has_value()) {
+                          absPath = absPath + remainingPath.value();
+                        }
+                        return absPath;
+                      }
+                      auto newPath = std::get<RelativePath>(resolvedTarget);
+                      if (remainingPath.has_value()) {
+                        newPath = newPath + remainingPath.value();
+                      }
+                      // We need to rebuild the paths here, so we don't pass
+                      // pathParts. Also, we cannot make assumptions about the
+                      // position we are in as canonicalizing the path might
+                      // have set us back so we don't pass solvedLen either
+                      return resolveSymlinkPath(
+                          std::move(newPath),
+                          context,
+                          remainingRecursionDepth - 1);
+                    });
+          })
+      .thenError(
+          [path = path.copy()](const folly::exception_wrapper&)
+              -> ImmediateFuture<std::variant<AbsolutePath, RelativePath>> {
+            // Something is wrong in the path, stop caring and return the entire
+            // path
+            return std::move(path);
+          });
+}
+
 ImmediateFuture<bool> PrjfsDispatcherImpl::isFinalSymlinkPathDirectory(
     RelativePath symlink,
     string_view targetStringView,
@@ -215,72 +400,74 @@ ImmediateFuture<bool> PrjfsDispatcherImpl::isFinalSymlinkPathDirectory(
   }
 
   return makeImmediateFutureWith([&]() -> ImmediateFuture<bool> {
-           // Creating absolute path symlinks with a variety of tools (e.g.,
-           // mklink on Windows or os.symlink on Python) makes the created
-           // symlinks start with an UNC prefix. However, there could be tools
-           // that create symlinks that don't add this prefix.
-           // TODO: Make this line also consider tools that do not add an UNC
-           // prefix to absolute path symlinks.
-           auto targetString = targetStringView.starts_with(detail::kUNCPrefix)
-               ? std::string(targetStringView)
-               : fmt::format(
-                     "{}{}{}",
-                     mount_->getPath() + symlink.dirname(),
-                     kDirSeparatorStr,
-                     targetStringView);
-           AbsolutePath absTarget;
+           RelativePath target;
+           std::variant<AbsolutePath, RelativePath> resolvedTarget;
            try {
-             absTarget = canonicalPath(targetString);
-           } catch (const std::exception& exc) {
-             XLOG(DBG6) << "unable to resolve target for symlink "
-                        << symlink.asString() << ": " << exc.what();
+             resolvedTarget = determineTargetType(symlink, targetStringView);
+           } catch (const std::exception&) {
              return false;
            }
-           RelativePath target;
-           try {
-             target = RelativePath(mount_->getPath().relativize(absTarget));
-           } catch (const std::exception&) {
+           if (std::holds_alternative<RelativePath>(resolvedTarget)) {
+             target = std::get<RelativePath>(resolvedTarget);
+           } else {
              // Symlink points outside of EdenFS; make the system solve it for
              // us
-             boost::system::error_code ec;
-             auto boostPath = boost::filesystem::path(absTarget.asString());
-             auto fileType = boost::filesystem::status(boostPath, ec).type();
-             return fileType == boost::filesystem::directory_file;
+             return isNonEdenFsPathDirectory(
+                 std::get<AbsolutePath>(resolvedTarget));
            }
            // This recursively goes through symlinks until it gets the first
            // entry that is not a symlink. Symlink cycles are prevented by the
            // check above.
-           return mount_->getTreeOrTreeEntry(target, context)
+           return resolveSymlinkPath(target, context)
                .thenValue(
-                   [this,
-                    target,
-                    context = context.copy(),
-                    remainingRecursionDepth](
-                       std::variant<std::shared_ptr<const Tree>, TreeEntry>
-                           treeOrTreeEntry) mutable -> ImmediateFuture<bool> {
-                     if (std::holds_alternative<std::shared_ptr<const Tree>>(
-                             treeOrTreeEntry)) {
-                       return true;
+                   [this, remainingRecursionDepth, context = context.copy()](
+                       std::variant<AbsolutePath, RelativePath> resolvedTarget)
+                       -> ImmediateFuture<bool> {
+                     if (std::holds_alternative<AbsolutePath>(resolvedTarget)) {
+                       return isNonEdenFsPathDirectory(
+                           std::get<AbsolutePath>(resolvedTarget));
                      }
-                     auto entry = std::get<TreeEntry>(treeOrTreeEntry);
-                     if (entry.getDtype() != dtype_t::Symlink) {
-                       return false;
-                     }
-                     return mount_->getObjectStore()
-                         ->getBlob(entry.getHash(), context)
-                         .thenValue([this,
-                                     context = context.copy(),
-                                     path = target,
-                                     remainingRecursionDepth](
-                                        std::shared_ptr<const Blob> blob) {
-                           auto content = blob->asString();
-                           return isFinalSymlinkPathDirectory(
-                               path,
-                               content,
-                               context,
-                               remainingRecursionDepth - 1);
-                         });
-                   });
+                     RelativePath target =
+                         std::get<RelativePath>(resolvedTarget);
+                     return mount_->getTreeOrTreeEntry(target, context)
+                         .thenValue(
+                             [this,
+                              target = std::move(target),
+                              context = context.copy(),
+                              remainingRecursionDepth](
+                                 std::variant<
+                                     std::shared_ptr<const Tree>,
+                                     TreeEntry> treeOrTreeEntry) mutable
+                             -> ImmediateFuture<bool> {
+                               if (std::holds_alternative<
+                                       std::shared_ptr<const Tree>>(
+                                       treeOrTreeEntry)) {
+                                 return true;
+                               }
+                               auto entry =
+                                   std::get<TreeEntry>(treeOrTreeEntry);
+                               if (entry.getDtype() != dtype_t::Symlink) {
+                                 return false;
+                               }
+                               return mount_->getObjectStore()
+                                   ->getBlob(entry.getHash(), context)
+                                   .thenValue([this,
+                                               context = context.copy(),
+                                               path = std::move(target),
+                                               remainingRecursionDepth](
+                                                  std::shared_ptr<const Blob>
+                                                      blob) mutable {
+                                     auto content = blob->asString();
+                                     return isFinalSymlinkPathDirectory(
+                                         std::move(path),
+                                         content,
+                                         context,
+                                         remainingRecursionDepth - 1);
+                                   });
+                             });
+                   })
+               .thenError(
+                   [](const folly::exception_wrapper&) { return false; });
          })
       .ensure([this, symlink] {
         auto sptr = symlinkCheck_.wlock();
@@ -640,20 +827,18 @@ ImmediateFuture<OnDiskState> recheckDiskState(
     std::chrono::steady_clock::time_point receivedAt,
     int retry,
     OnDiskStateTypes expectedType) {
-  if (mount.getCheckoutConfig()->getEnableWindowsSymlinks()) {
-    const auto elapsed = std::chrono::steady_clock::now() - receivedAt;
-    const auto delay =
-        mount.getEdenConfig()->prjfsDirectoryCreationDelay.getValue();
-    if (elapsed < delay) {
-      // See comment on EdenConfig::prjfsDirectoryCreationDelay for what's
-      // going on here.
-      auto timeToSleep =
-          std::chrono::duration_cast<folly::HighResDuration>(delay - elapsed);
-      return ImmediateFuture{folly::futures::sleep(timeToSleep)}.thenValue(
-          [&mount, path = path.copy(), retry, receivedAt](folly::Unit&&) {
-            return getOnDiskState(mount, path, receivedAt, retry);
-          });
-    }
+  const auto elapsed = std::chrono::steady_clock::now() - receivedAt;
+  const auto delay =
+      mount.getEdenConfig()->prjfsDirectoryCreationDelay.getValue();
+  if (elapsed < delay) {
+    // See comment on EdenConfig::prjfsDirectoryCreationDelay for what's
+    // going on here.
+    auto timeToSleep =
+        std::chrono::duration_cast<folly::HighResDuration>(delay - elapsed);
+    return ImmediateFuture{folly::futures::sleep(timeToSleep)}.thenValue(
+        [&mount, path = path.copy(), retry, receivedAt](folly::Unit&&) {
+          return getOnDiskState(mount, path, receivedAt, retry);
+        });
   }
   return OnDiskState(expectedType);
 }
@@ -1190,12 +1375,24 @@ PrjfsDispatcherImpl::waitForPendingNotifications() {
   // ProjectedFS queue and therefore may still be pending when the future
   // complete. This is expected and therefore not a bug.
   folly::stop_watch<std::chrono::microseconds> timer{};
-  return ImmediateFuture{
-      folly::via(getNotificationExecutor(), [this, timer = std::move(timer)]() {
-        this->mount_->getStats()->addDuration(
-            &PrjfsStats::filesystemSync, timer.elapsed());
-        return folly::unit;
-      }).semi()};
+  return ImmediateFuture{folly::via(
+                             getNotificationExecutor(),
+                             [this, timer = std::move(timer)]() {
+                               this->mount_->getStats()->addDuration(
+                                   &PrjfsStats::filesystemSync,
+                                   timer.elapsed());
+                               this->mount_->getStats()->increment(
+                                   &PrjfsStats::filesystemSyncSuccessful);
+                               return folly::unit;
+                             })
+                             .semi()}
+      .thenError(
+          [this](const folly::exception_wrapper& ew)
+              -> ImmediateFuture<folly::Unit> {
+            this->mount_->getStats()->increment(
+                &PrjfsStats::filesystemSyncFailure);
+            ew.throw_exception();
+          });
 }
 
 } // namespace facebook::eden

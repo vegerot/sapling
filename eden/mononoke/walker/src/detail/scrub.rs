@@ -473,7 +473,7 @@ async fn run_one(
         move |ctx: &CoreContext, repo_params: &RepoWalkParams| {
             let repo_name = repo_params.repo.repo_identity().name().to_string();
             cloned!(ctx, repo_params.scheduled_max);
-            async move |walk_output, run_start, chunk_num, checkpoint_name| {
+            move |walk_output, run_start, chunk_num, checkpoint_name| async move {
                 let walk_progress = progress_stream(quiet, &progress_state, walk_output);
                 let loading = loading_stream(
                     command.limit_data_fetch,
@@ -510,6 +510,7 @@ async fn run_one(
     let walk_state = SamplingWalkVisitor::new(
         repo_params.include_node_types.clone(),
         repo_params.include_edge_types.clone(),
+        repo_params.exclude_nodes.clone(),
         command.sampling_options,
         None,
         command.sampler,

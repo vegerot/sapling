@@ -8,10 +8,9 @@ from sapling import commands, localrepo, ui as uimod
 
 u = uimod.ui.load()
 
-u.setconfig("workingcopy", "rust-status", "false")
-
 u.write("% creating repo\n")
-repo = localrepo.localrepository(u, "repo", create=True)
+localrepo.localrepository(u, "repo", create=True)
+repo = localrepo.localrepository(u, "repo")
 os.chdir("repo")
 
 f = open("test.py", "w")

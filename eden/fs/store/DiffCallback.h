@@ -7,8 +7,8 @@
 
 #pragma once
 
-#include "eden/fs/utils/DirType.h"
-#include "eden/fs/utils/PathFuncs.h"
+#include "eden/common/utils/DirType.h"
+#include "eden/common/utils/PathFuncs.h"
 
 namespace folly {
 class exception_wrapper;
@@ -27,8 +27,8 @@ class TreeEntry;
  */
 class DiffCallback {
  public:
-  DiffCallback() {}
-  virtual ~DiffCallback() {}
+  DiffCallback() = default;
+  virtual ~DiffCallback() = default;
 
   virtual void ignoredPath(RelativePathPiece path, dtype_t type) = 0;
   virtual void addedPath(RelativePathPiece path, dtype_t type) = 0;

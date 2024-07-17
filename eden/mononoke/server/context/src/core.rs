@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use clientinfo::ClientInfo;
+use clientinfo::ClientRequestInfo;
 use fbinit::FacebookInit;
 use metadata::Metadata;
 use scribe_ext::Scribe;
@@ -40,6 +42,28 @@ impl CoreContext {
     pub fn new_with_logger(fb: FacebookInit, logger: Logger) -> Self {
         let session = SessionContainer::new_with_defaults(fb);
         session.new_context(logger, MononokeScubaSampleBuilder::with_discard())
+    }
+
+    pub fn new_with_logger_and_client_info(
+        fb: FacebookInit,
+        logger: Logger,
+        client_info: ClientInfo,
+    ) -> Self {
+        let mut metadata = Metadata::default();
+        metadata.add_client_info(client_info);
+        let session = SessionContainer::builder(fb)
+            .metadata(Arc::new(metadata))
+            .build();
+        session.new_context(logger, MononokeScubaSampleBuilder::with_discard())
+    }
+
+    pub fn new_with_logger_and_scuba(
+        fb: FacebookInit,
+        logger: Logger,
+        scuba: MononokeScubaSampleBuilder,
+    ) -> Self {
+        let session = SessionContainer::new_with_defaults(fb);
+        session.new_context(logger, scuba)
     }
 
     // Context for bulk processing like scrubbing or bulk backfilling
@@ -121,6 +145,10 @@ impl CoreContext {
 
     pub fn metadata(&self) -> &Metadata {
         self.session.metadata()
+    }
+
+    pub fn client_request_info(&self) -> Option<&ClientRequestInfo> {
+        self.metadata().client_request_info()
     }
 
     pub fn session(&self) -> &SessionContainer {

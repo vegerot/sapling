@@ -156,7 +156,7 @@ def _flattenresponse(response: Sized, sort: bool = False):
     optionalrepo=True,
 )
 def debugapi(ui, repo=None, **opts) -> None:
-    """send an EdenAPI request and print its output
+    """send an SaplingRemoteAPI request and print its output
 
     The endpoint name is the method name defined on the edenapi object.
 
@@ -178,9 +178,11 @@ def debugapi(ui, repo=None, **opts) -> None:
 
     client = repo and repo.edenapi or edenapi.getclient(ui)
     func = getattr(client, endpoint)
-
-    response = func(*params)
-    response = _flattenresponse(response, sort=opts.get("sort"))
+    try:
+        response = func(*params)
+        response = _flattenresponse(response, sort=opts.get("sort"))
+    except error.HttpError as e:
+        raise error.Abort(e)
     formatted = bindings.pprint.pformat(response)
     ui.write(_("%s\n") % formatted)
 
@@ -191,6 +193,14 @@ def debugapplystreamclonebundle(ui, repo, fname) -> None:
     f = hg.openpath(ui, fname)
     gen = exchange.readbundle(ui, f, fname)
     gen.apply(repo)
+
+
+@command("debugbacktrace|debugbt", [], _("PID"), norepo=True)
+def debugbacktrace(ui, pid) -> None:
+    """attempt to extract backtraces for a specified pid"""
+    from .. import dbgutil
+
+    dbgutil.backtrace_all(ui, int(pid))
 
 
 @command(
@@ -214,6 +224,178 @@ def debugbindag(ui, repo, rev=None, output=None) -> None:
     parentrevs = repo.changelog.parentrevs
     data = dagparser.bindag(revs, parentrevs)
     util.writefile(output or "dag.out", data)
+
+
+def _runbisect(repo, range, bad, skip, node_to_infos=None):
+    """run bisect till completion. yield (i, action, state, nodes, candidate_count, isgood)
+
+    i: iteration count, starts from 1
+    action: 'good' | 'bad' | 'skip' | 'done'
+    state: hbisect state
+    nodes: candidates picked by hbisect.bisect
+    candidate_count: count of remaining candiates
+    isgood: returned by hbisect.bisect
+
+    node_to_infos: optional defaultdict(list), node -> bisect info
+    """
+    import itertools
+
+    from .. import hbisect
+
+    cl = repo.changelog
+    dag = cl.dag
+
+    good = range - bad - skip
+
+    heads = dag.heads(range)
+    roots = dag.roots(range)
+
+    if len(heads) != 1 or len(roots) != 1:
+        raise error.ProgrammingError(
+            "bisect range must have exactly one head and one root"
+        )
+
+    head = heads[0]
+    root = roots[0]
+
+    if (
+        len(bad & dag.sort([head, root])) != 1
+        or len(good & dag.sort([head, root])) != 1
+    ):
+        raise error.ProgrammingError("head and root must be one good one bad")
+
+    if head in bad:
+        first_good, first_bad = root, head
+    else:
+        first_good, first_bad = head, root
+
+    if node_to_infos is not None:
+        node_to_infos[first_good].append("initial good")
+        node_to_infos[first_bad].append("initial bad")
+
+    hbisect.resetstate(repo)
+    state = hbisect.load_state(repo)
+    state["good"] = [first_good]
+    state["bad"] = [first_bad]
+
+    # matches the main "bisect" command implementation, but works in a loop
+    for i in itertools.count(1):
+        nodes, candidate_count, isgood, badnode, goodnode = hbisect.bisect(repo, state)
+
+        if candidate_count == 0:
+            yield i, "done", state, nodes, candidate_count, isgood
+            break
+
+        assert len(nodes) == 1  # only a single node can be tested next
+        node = nodes[0]
+
+        if node in good:
+            action = "good"
+        elif node in bad:
+            action = "bad"
+        else:
+            assert node in skip
+            action = "skip"
+
+        state["current"] = [node]
+        state[action].append(node)
+        if node_to_infos is not None:
+            node_to_infos[node].append(f"#{i} {action}")
+        yield i, action, state, nodes, candidate_count, isgood
+
+
+@command(
+    "debugbisect",
+    [
+        ("r", "range", [], _("bisect range")),
+        ("b", "bad", [], _("bad set")),
+        ("s", "skip", [], _("(non-lazy) skip set")),
+    ],
+)
+def debugbisect(ui, repo, **opts):
+    """show bisect steps given a bisect range"""
+    import textwrap
+
+    from .. import hbisect, templatekw
+
+    cl = repo.changelog
+    range = cl.tonodes(scmutil.revrange(repo, opts["range"]))
+    bad = cl.tonodes(scmutil.revrange(repo, opts["bad"]))
+    skip = cl.tonodes(scmutil.revrange(repo, opts["skip"]))
+
+    node_to_infos = collections.defaultdict(list)
+    displayer = cmdutil.show_changeset(ui, repo, {"template": "{desc|firstline}\n"})
+
+    # matches the main "bisect" command implementation, but works in a loop
+    ui.pushbuffer()
+    for i, action, state, nodes, candidate_count, isgood in _runbisect(
+        repo, range, bad, skip, node_to_infos
+    ):
+        if action == "done":
+            hbisect.printresult(ui, repo, state, displayer, nodes, isgood)
+        else:
+            assert len(nodes) == 1
+            node = nodes[0]
+            ui.write(
+                f"#{'%-2d' % i} choose {repo[node].description().splitlines()[0]},{'%3d' % candidate_count} remaining, marked as {action}\n"
+            )
+    steps = textwrap.indent(ui.popbuffer(), "  ")
+
+    # Draw a graph of chosen nodes.
+    @templatekw.templatekeyword("debugbisect")
+    def debugbisect(repo, ctx, templ, **args):
+        return " ".join(node_to_infos.get(ctx.node()) or [])
+
+    ui.pushbuffer()
+    cmdutil.graphlog(
+        ui,
+        repo,
+        [],
+        {
+            "rev": [hex(n) for n in node_to_infos],
+            "template": "{desc|firstline}: {debugbisect}",
+        },
+    )
+    graph = textwrap.indent(ui.popbuffer(), "  ")
+    templatekw.keywords.pop("debugbisect", None)
+
+    ui.write("Graph:\n%s\nSteps:\n%s" % (graph.rstrip(), steps))
+
+
+@command(
+    "debugbisectall",
+    [
+        ("r", "range", [], _("bisect range")),
+        ("s", "skip", [], _("(non-lazy) skip set")),
+    ],
+)
+def debugbisectall(ui, repo, **opts):
+    """enumerate all "first bad" commits, show bisect step distribution"""
+    cl = repo.changelog
+    dag = cl.dag
+    range = cl.tonodes(scmutil.revrange(repo, opts["range"]))
+    skip = cl.tonodes(scmutil.revrange(repo, opts["skip"]))
+
+    first_bad_candidates = range - skip - dag.roots(range)
+    step_to_desc_list = collections.defaultdict(list)
+    counts = []
+    for first_bad in first_bad_candidates:
+        bad = dag.range([first_bad], range)
+        step_count = len(list(_runbisect(repo, range, bad, skip))) - 1
+        step_to_desc_list[step_count].append(
+            repo[first_bad].description().splitlines()[0]
+        )
+        counts.append(step_count)
+    for step_count, desc_list in sorted(step_to_desc_list.items()):
+        desc_list.sort()
+        ui.write(" %3d |%3d: %s\n" % (step_count, len(desc_list), " ".join(desc_list)))
+    if counts:
+        counts.sort()
+        p = lambda n: counts[min(len(counts) * n // 100, len(counts) - 1)]
+        avg = sum(counts) / len(counts)
+        ui.write(
+            "p50=%d  p75=%d  p90=%d  average=%.2f steps\n" % (p(50), p(75), p(90), avg)
+        )
 
 
 @command(
@@ -248,7 +430,6 @@ def debugbuilddag(
      - "*p" is a fork at parent p, which is a backref
      - "*p1/p2" is a merge of parents p1 and p2, which are backrefs
      - "/p2" is a merge of the preceding node and p2
-     - "@branch" sets the named branch for subsequent nodes
      - "#...\\n" is a comment up to the end of the line
 
     Whitespace between the above elements is ignored.
@@ -290,7 +471,6 @@ def debugbuilddag(
         tr = repo.transaction("builddag")
 
         at = -1
-        atbranch = "default"
         nodeids = []
         id = 0
 
@@ -374,7 +554,6 @@ def debugbuilddag(
                         fctxfn,
                         date=(id, 0),
                         user="debugbuilddag",
-                        extra={"branch": atbranch},
                     )
                     nodeid = repo.commitctx(cx)
                     nodeids.append(nodeid)
@@ -385,9 +564,6 @@ def debugbuilddag(
                     bookmarks.addbookmarks(
                         repo, tr, [name], rev=hex(tonode(id)), force=True, inactive=True
                     )
-                elif type == "a":
-                    ui.note(_x("branch %s\n" % data))
-                    atbranch = data
                 prog.value = id
         tr.close()
     finally:
@@ -1502,39 +1678,9 @@ def debugignore(ui, repo, *files, **opts) -> None:
         # Show all the patterns
         ui.write("%s\n" % repr(ignore))
     else:
-        explain = getattr(ignore, "explain", None)
-
-        # The below code can be removed after hgignore is removed.
-        visitdir = ignore.visitdir
         m = scmutil.match(repo[None], pats=files)
         for f in m.files():
-            # The matcher supports "explain", use it.
-            if explain:
-                explanation = explain(f)
-                if explanation:
-                    ui.write(_x("%s\n") % explain(f))
-                    continue
-
-            nf = util.normpath(f)
-            ignored = None
-            if nf != ".":
-                if ignore(nf):
-                    ignored = nf
-                else:
-                    for p in util.finddirs(nf):
-                        if visitdir(p) == "all":
-                            ignored = p
-                            break
-            if ignored:
-                if ignored == nf:
-                    ui.write(_("%s is ignored\n") % m.uipath(f))
-                else:
-                    ui.write(
-                        _("%s is ignored because of containing folder %s\n")
-                        % (m.uipath(f), ignored)
-                    )
-            else:
-                ui.write(_("%s is not ignored\n") % m.uipath(f))
+            ui.write(_x("%s\n") % ignore.explain(f))
 
 
 @command(
@@ -1549,12 +1695,6 @@ def debugindex(ui, repo, file_=None, **opts) -> None:
     format = opts.get("format", 0)
     if format not in (0, 1):
         raise error.Abort(_("unknown format %d") % format)
-
-    generaldelta = r.version & revlog.FLAG_GENERALDELTA
-    if generaldelta:
-        basehdr = " delta"
-    else:
-        basehdr = "  base"
 
     if ui.debugflag:
         shortfn = hex
@@ -1580,10 +1720,6 @@ def debugindex(ui, repo, file_=None, **opts) -> None:
 
     for i in r:
         node = r.node(i)
-        if generaldelta:
-            base = r.deltaparent(i)
-        else:
-            base = r.chainbase(i)
         if format == 0:
             try:
                 pp = r.parents(node)
@@ -1940,6 +2076,53 @@ def debuglabelcomplete(ui, repo, *args) -> None:
     debugnamecomplete(ui, repo, *args)
 
 
+@command("debuglistpythonstd", cmdutil.formatteropts, norepo=True)
+def debuglistpythonstd(ui, **opts):
+    """list python std modules referred by the application
+
+    Only list pure, std, root modules imported from disk. This is intended to
+    be used together with ``python-modules`` to reduce overhead importing,
+    especially on Windows.
+
+    Only works with Python >= 3.10.
+    """
+    from .. import dispatch, hgdemandimport
+
+    with hgdemandimport.deactivated():
+        dispatch._preimportmodules()
+
+    try:
+        stdlib_module_names = sys.stdlib_module_names
+    except AttributeError:
+        # Python < 3.10
+        stdlib_module_names = set()
+
+    fm = ui.formatter("debuglistpythonstd", opts)
+    for name, mod in sorted(sys.modules.items()):
+        if "." in name or name not in stdlib_module_names:
+            continue
+        try:
+            origin = mod.__spec__.origin
+            # Skip builtin, frozen, or bindings.
+            if origin in {"frozen", "built-in", None}:
+                continue
+            # Skip native or non-existed.
+            if not any(origin.endswith(p) for p in (".pyc", ".py")) or (
+                not os.path.exists(origin) and ".zip" not in origin
+            ):
+                continue
+        except AttributeError:
+            # Skip missing __spec__.
+            continue
+
+        fm.startitem()
+        fm.plain("%s" % name)
+        fm.data(name=name)
+        fm.plain("\n")
+
+    fm.end()
+
+
 @command(
     "debuglocks|debuglock",
     [
@@ -2100,91 +2283,6 @@ def debugmakepublic(ui, repo, *revs, **opts) -> None:
         if delete:
             raise error.Abort(_("--delete only supports narrow-heads"))
         phase(ui, repo, rev=revspec, public=True, force=True, draft=False, secret=False)
-
-
-@command("debugmergestate", [], "")
-def debugmergestate(ui, repo, *args) -> None:
-    """print merge state"""
-
-    def _hashornull(h):
-        if h == nullhex:
-            return "null"
-        else:
-            return h
-
-    def printrecords():
-        for rtype, record in records:
-            # pretty print some record types
-            if rtype == "L":
-                ui.write(_x("local: %s\n") % record)
-            elif rtype == "O":
-                ui.write(_x("other: %s\n") % record)
-            elif rtype == "m":
-                driver, mdstate = record.split("\0", 1)
-                ui.write(_x('merge driver: %s (state "%s")\n') % (driver, mdstate))
-            elif rtype in "FDC":
-                r = record.split("\0")
-                f, state, hash, lfile, afile, anode, ofile = r[0:7]
-                onode, flags = r[7:9]
-                ui.write(
-                    _x('file: %s (record type "%s", state "%s", hash %s)\n')
-                    % (f, rtype, state, _hashornull(hash))
-                )
-                ui.write(_x('  local path: %s (flags "%s")\n') % (lfile, flags))
-                ui.write(
-                    _x("  ancestor path: %s (node %s)\n") % (afile, _hashornull(anode))
-                )
-                ui.write(
-                    _x("  other path: %s (node %s)\n") % (ofile, _hashornull(onode))
-                )
-            elif rtype == "f":
-                filename, rawextras = record.split("\0", 1)
-                extras = rawextras.split("\0")
-                i = 0
-                extrastrings = []
-                while i < len(extras):
-                    extrastrings.append(_x("%s = %s") % (extras[i], extras[i + 1]))
-                    i += 2
-
-                ui.write(
-                    _x("file extras: %s (%s)\n") % (filename, ", ".join(extrastrings))
-                )
-            elif rtype == "l":
-                labels = record.split("\0", 2)
-                labels = [l for l in labels if len(l) > 0]
-                ui.write(_x("labels:\n"))
-                ui.write(_x("  local: %s\n" % labels[0]))
-                ui.write(_x("  other: %s\n" % labels[1]))
-                if len(labels) > 2:
-                    ui.write(_x("  base:  %s\n" % labels[2]))
-            else:
-                ui.write(
-                    _x("unrecognized entry: %s\t%s\n")
-                    % (rtype, record.replace("\0", "\t"))
-                )
-
-    # Avoid mergestate.read() since it may raise an exception for unsupported
-    # merge state records. We shouldn't be doing this, but this is OK since this
-    # command is pretty low-level.
-    ms = mergemod.mergestate(repo)
-
-    # sort so that reasonable information is on top
-    records = ms._readrecords()
-    order = "LOml"
-
-    def key(r):
-        idx = order.find(r[0])
-        if idx == -1:
-            return (1, r[1])
-        else:
-            return (0, idx)
-
-    records.sort(key=key)
-
-    if not records:
-        ui.write(_x("no merge state found\n"))
-    else:
-        printrecords()
 
 
 @command(
@@ -2942,7 +3040,7 @@ def debugsmallcommitmetadata(ui, repo, value: str = "", **opts) -> None:
             else:
                 entries = commitmeta.finddelete(node=node, category=category)
             fm.plain(_("Deleted the following entries:\n"))
-            for ((node_, category_), value_) in entries.items():
+            for (node_, category_), value_ in entries.items():
                 formatitem(fm, node_, category_, value_)
         else:
             # Delete single
@@ -2962,7 +3060,7 @@ def debugsmallcommitmetadata(ui, repo, value: str = "", **opts) -> None:
             else:
                 entries = commitmeta.find(node=node, category=category)
             fm.plain(_("Found the following entries:\n"))
-            for ((node_, category_), value_) in entries.items():
+            for (node_, category_), value_ in entries.items():
                 formatitem(fm, node_, category_, value_)
         else:
             # Read single
@@ -3310,15 +3408,15 @@ def debugprogress(
                     ui.write(_x("processed %d items\n") % i)
     else:
         with progress.bar(ui, _("progressing"), total=num, formatfunc=formatfunc) as p:
-            for i in range(num):
+            for i in range(1, num + 1):
                 if nested:
                     with progress.bar(
                         ui, _("nested progressing"), total=5, formatfunc=formatfunc
                     ) as p2:
-                        for j in range(5):
-                            p2.value = (j, "item %s" % j)
+                        for j in range(1, 6):
                             if sleep:
                                 time.sleep(sleep)
+                            p2.value = (j, "item %s" % j)
 
                 if sleep:
                     time.sleep(sleep)
@@ -3548,12 +3646,13 @@ def debugresetheads(ui, repo) -> None:
 
 
 @command(
-    "debugruntest|debugrt",
+    "debugruntest|debugrt|.t",
     [
         ("i", "fix", False, _("update tests to match output")),
         ("j", "jobs", 0, _("number of jobs to run in parallel")),
         ("x", "ext", [], _("extension modules to import")),
         ("d", "direct", False, _("run without isolation")),
+        ("", "record", False, _("record test state")),
     ],
     norepo=True,
 )
@@ -3675,6 +3774,8 @@ def debugruntest(ui, *paths, **opts) -> int:
 
     exts = ["sapling.testing.ext.hg", "sapling.testing.ext.python"]
     exts += opts.get("ext") or []
+    if opts.get("record"):
+        exts.append("sapling.testing.ext.record")
     jobs = opts.get("jobs") or 0
 
     # limit concurrency for stable order
@@ -3692,7 +3793,7 @@ def debugruntest(ui, *paths, **opts) -> int:
     with extensions.wrappedfunction(
         mputil,
         "_args_from_interpreter_flags",
-        _args
+        _args,
         # pyre-fixme[6]: For 1st param expected `List[str]` but got `Tuple[Any, ...]`.
     ), TestRunner(paths, jobs=jobs, exts=exts, isolate=isolate) as r:
         for item in r:
@@ -3754,6 +3855,46 @@ def debugruntest(ui, *paths, **opts) -> int:
     return ret
 
 
+@command(
+    "debugrestoretest",
+    [
+        ("l", "line", 1, _("line number (starts with 1)")),
+        ("c", "case", "", _("test case")),
+        ("", "record-if-needed", False, _("record test state if not already present")),
+    ],
+    _("TEST_FILE"),
+    norepo=True,
+)
+def debugrestoretest(ui, test_file, **opts):
+    """restore test state based on previously recorded data"""
+    from sapling.testing.ext import record
+
+    filename = os.path.realpath(test_file)
+    testcase = opts.get("case") or None
+    loc = int(opts.get("line") or 1) - 1  # line starts from 1, loc starts from 0
+
+    metalog = record.try_locate_metalog(filename, testcase, loc)
+    if metalog is None:
+        if opts.get("record_if_needed"):
+            ui.status_err(_("recording test state\n"))
+            ui.pushbuffer()
+            debugruntest(ui, test_file, record=True)
+            output = ui.popbuffer(errors="backslashreplace")
+            metalog = record.try_locate_metalog(filename, testcase, loc)
+            if metalog is None:
+                ui.status_err(_("output from recording: %s\n") % output)
+                raise error.Abort(_("still no recording"))
+        else:
+            raise error.Abort(
+                _("no recording found for test"),
+                hint=_("use '@prog@ .t --record' to record a test run"),
+            )
+    script_path = record.restore_state_script(metalog)
+    if ui.formatted:
+        ui.status_err(("Run or source the script to enter the testing environment:\n"))
+    ui.write(("%s\n") % script_path)
+
+
 @command("debugthrowrustexception", [], "")
 def debugthrowrustexception(ui, _repo) -> None:
     """cause an error to be returned from rust and propagated to python"""
@@ -3770,38 +3911,6 @@ def debugthrowrustbail(ui, _repo) -> None:
 def debugthrowexception(ui, _repo):
     """cause an intentional exception to be raised in the command"""
     raise error.IntentionalError("intentional failure in debugthrowexception")
-
-
-@command(
-    "debugscmstore",
-    [
-        ("", "mode", "", _("entity type to fetch, 'file' or 'tree'")),
-        (
-            "",
-            "path",
-            "",
-            _("input file containing keys to fetch (hgid,path separated by newlines)"),
-        ),
-        ("", "python", False, _("signal rust command dispatch to fall back to python")),
-        (
-            "",
-            "local",
-            False,
-            _("only check for the entity locally, don't make a remote request"),
-        ),
-    ],
-)
-def debugscmstore(
-    ui, repo, mode=None, path=None, python: bool = False, local: bool = False
-) -> None:
-    if mode not in ["file", "tree"]:
-        raise error.Abort("mode must be one of 'file' and 'tree'")
-    if path is None:
-        raise error.Abort("path is required")
-    if mode == "tree":
-        repo.manifestlog.treescmstore.test_fetch(path, local)
-    if mode == "file":
-        repo.fileslog.filescmstore.test_fetch(path, local)
 
 
 @command("debugrevlogclone", [], _("source"))
@@ -3887,3 +3996,55 @@ def debugcommitmessage(ui, repo, *args):
         committext = cmdutil.buildcommittext(repo, ctx, extramsg)
 
     ui.status(committext)
+
+
+@command(
+    "debugwatchmansubscribe",
+    [("", "timeout", 2, "seconds of inactivity before exitting")],
+)
+def debugwatchmansubscribe(ui, repo, **opts) -> None:
+    """subscribe to watchman events"""
+
+    import json
+
+    from sapling.ext.extlib import pywatchman, watchmanclient
+
+    client = pywatchman.client(
+        sendEncoding="bser",
+        recvEncoding="bser",
+    )
+
+    root = watchmanclient.getcanonicalpath(repo.root)
+    client.query("watch", root)
+    client.query(
+        "subscribe",
+        root,
+        "test-subscription",
+        {
+            "expression": [
+                "not",
+                [
+                    "anyof",
+                    ["dirname", ui.identity.dotdir()],
+                    ["name", ui.identity.dotdir(), "wholename"],
+                ],
+            ],
+            "empty_on_fresh_instance": True,
+            "defer": ["hg.update"],
+            "fields": ["name"],
+        },
+    )
+
+    start = time.time()
+    while time.time() - start < opts["timeout"]:
+        while True:
+            try:
+                client.receive()
+            except pywatchman.SocketTimeout:
+                break
+
+        while events := client.getSubscription("test-subscription"):
+            for event in events:
+                if event:
+                    ui.write("%s\n" % json.dumps(event, indent=2, sort_keys=True))
+            start = time.time()

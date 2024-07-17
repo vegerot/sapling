@@ -8,14 +8,16 @@
 use anyhow::bail;
 use anyhow::Error;
 use anyhow::Result;
-use bytes_old::BufMut;
-use bytes_old::Bytes;
-use bytes_old::BytesMut;
-use tokio_codec::Decoder;
-use tokio_codec::Encoder;
+use byteorder::BigEndian;
+use byteorder::ByteOrder;
+use bytes::Buf;
+use bytes::BufMut;
+use bytes::Bytes;
+use bytes::BytesMut;
+use tokio_util::codec::Decoder;
+use tokio_util::codec::Encoder;
 
 use crate::errors::ErrorKind;
-use crate::utils::BytesExt;
 
 /// A bundle2 chunk.
 ///
@@ -30,13 +32,13 @@ use crate::utils::BytesExt;
 /// There are two special kinds of chunks:
 ///
 /// 1. An "empty chunk", which is simply a chunk of size 0. This is represented
-///    as a Normal chunk below with an empty Bytes.
+///    as a Normal chunk below with an empty BytesOld.
 /// 2. An "error chunk", which is a chunk with size -1 and no data. Error chunks
 ///    interrupt a chunk stream and are followed by a new part.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Chunk(ChunkInner);
 
-// This is separate to prevent constructing chunks with unexpected Bytes objects.
+// This is separate to prevent constructing chunks with unexpected BytesOld objects.
 #[derive(Clone, Debug, PartialEq)]
 enum ChunkInner {
     Normal(Bytes),
@@ -44,13 +46,13 @@ enum ChunkInner {
 }
 
 impl Chunk {
-    pub fn new<T: Into<Bytes>>(val: T) -> Result<Self> {
+    pub fn new(val: impl Into<Bytes>) -> Result<Self> {
         let bytes: Bytes = val.into();
-        if bytes.len() > i32::max_value() as usize {
+        if bytes.len() > i32::MAX as usize {
             bail!(ErrorKind::Bundle2Chunk(format!(
                 "chunk of length {} exceeds maximum {}",
                 bytes.len(),
-                i32::max_value()
+                i32::MAX
             )));
         }
         Ok(Chunk(ChunkInner::Normal(bytes)))
@@ -97,24 +99,22 @@ impl Chunk {
     }
 }
 
-/// Encode a bundle2 chunk into a bytestream.
 #[derive(Debug)]
-pub struct ChunkEncoder;
+pub struct NewChunkEncoder;
 
-impl Encoder for ChunkEncoder {
-    type Item = Chunk;
+impl Encoder<Chunk> for NewChunkEncoder {
     type Error = Error;
 
     fn encode(&mut self, item: Chunk, dst: &mut BytesMut) -> Result<()> {
         match item.0 {
             ChunkInner::Normal(bytes) => {
                 dst.reserve(4 + bytes.len());
-                dst.put_i32_be(bytes.len() as i32);
+                dst.put_i32(bytes.len() as i32);
                 dst.put_slice(&bytes);
             }
             ChunkInner::Error => {
                 dst.reserve(4);
-                dst.put_i32_be(-1);
+                dst.put_i32(-1);
             }
         }
         Ok(())
@@ -134,9 +134,9 @@ impl Decoder for ChunkDecoder {
             return Ok(None);
         }
 
-        let len = src.peek_i32();
+        let len = BigEndian::read_i32(&src[..4]);
         if len == -1 {
-            src.drain_i32();
+            src.get_i32();
             return Ok(Some(Chunk::error()));
         }
         if len < 0 {
@@ -151,8 +151,8 @@ impl Decoder for ChunkDecoder {
             return Ok(None);
         }
 
-        src.drain_i32();
-        let chunk = Chunk::new(src.split_to(len))?;
+        src.get_i32();
+        let chunk = Chunk::new(src.split_to(len).freeze())?;
         Ok(Some(chunk))
     }
 }
@@ -162,22 +162,20 @@ mod test {
     use std::io::Cursor;
 
     use assert_matches::assert_matches;
-    use futures::compat::Future01CompatExt;
-    use futures_old::stream;
-    use futures_old::Future;
-    use futures_old::Sink;
-    use futures_old::Stream;
+    use futures::stream;
+    use futures::SinkExt;
+    use futures::TryStreamExt;
     use quickcheck::quickcheck;
     use quickcheck::TestResult;
-    use tokio_codec::FramedRead;
-    use tokio_codec::FramedWrite;
+    use tokio_util::codec::FramedRead;
+    use tokio_util::codec::FramedWrite;
 
     use super::*;
 
     #[test]
     fn test_empty_chunk() {
         let mut buf = BytesMut::with_capacity(4);
-        buf.put_i32_be(0);
+        buf.put_i32(0);
 
         let mut decoder = ChunkDecoder;
         let chunk = decoder.decode(&mut buf).unwrap().unwrap();
@@ -191,7 +189,7 @@ mod test {
     #[test]
     fn test_error_chunk() {
         let mut buf = BytesMut::with_capacity(4);
-        buf.put_i32_be(-1);
+        buf.put_i32(-1);
 
         let mut decoder = ChunkDecoder;
         let chunk = decoder.decode(&mut buf).unwrap().unwrap();
@@ -205,7 +203,7 @@ mod test {
     #[test]
     fn test_invalid_chunk() {
         let mut buf = BytesMut::with_capacity(4);
-        buf.put_i32_be(-2);
+        buf.put_i32(-2);
 
         let mut decoder = ChunkDecoder;
         let chunk_err = decoder.decode(&mut buf);
@@ -238,30 +236,28 @@ mod test {
         let chunks_res: Vec<Result<Chunk>> = chunks.clone().into_iter().map(Ok).collect();
 
         let cursor = Cursor::new(Vec::with_capacity(32 * 1024));
-        let sink = FramedWrite::new(cursor, ChunkEncoder);
+        let mut sink = FramedWrite::new(cursor, NewChunkEncoder);
 
-        let encode_fut = sink
-            .send_all(stream::iter_ok(chunks_res).and_then(|x| x))
-            .map_err(|err| panic!("{:#?}", err))
-            .and_then(move |(sink, _)| {
-                let mut cursor = sink.into_inner();
-                cursor.set_position(0);
+        let encode_fut = async move {
+            sink.send_all(&mut stream::iter(chunks_res)).await.unwrap();
+            let mut cursor = sink.into_inner();
+            cursor.set_position(0);
 
-                // cursor will now have the encoded byte stream. Run it through the decoder.
-                let stream = FramedRead::new(cursor, ChunkDecoder);
+            // cursor will now have the encoded byte stream. Run it through the decoder.
+            let stream = FramedRead::new(cursor, ChunkDecoder);
 
-                let collector: Vec<Chunk> = Vec::with_capacity(count);
-                collector.send_all(stream.map_err(|err| {
+            let mut collector: Vec<Chunk> = Vec::with_capacity(count);
+            collector
+                .send_all(&mut stream.map_err(|err| {
                     panic!("Unexpected error: {}", err);
                 }))
-            })
-            .map(move |(collector, _)| {
-                assert_eq!(collector, chunks);
-            })
-            .map_err(|err| panic!("{:#?}", err));
+                .await
+                .unwrap();
+            assert_eq!(collector, chunks);
+        };
 
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(encode_fut.compat()).unwrap();
+        rt.block_on(encode_fut);
 
         TestResult::passed()
     }

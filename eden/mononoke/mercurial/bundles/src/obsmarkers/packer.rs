@@ -12,9 +12,12 @@ use anyhow::Error;
 use anyhow::Result;
 use byteorder::BigEndian;
 use byteorder::ByteOrder;
-use bytes_old::BufMut;
-use futures_old::stream::iter_result;
-use futures_old::Stream;
+use bytes::BufMut;
+use futures::future;
+use futures::stream;
+use futures::Stream;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use mercurial_types::HgChangesetId;
 use mononoke_types::DateTime;
 
@@ -24,24 +27,29 @@ use crate::chunk::Chunk;
 const VERSION: u8 = 1;
 
 pub fn obsmarkers_packer_stream(
-    pairs_stream: impl Stream<Item = (HgChangesetId, Vec<HgChangesetId>), Error = Error>,
+    pairs_stream: impl Stream<Item = Result<(HgChangesetId, Vec<HgChangesetId>), Error>>,
     time: DateTime,
     metadata: Vec<MetadataEntry>,
-) -> impl Stream<Item = Chunk, Error = Error> {
+) -> impl Stream<Item = Result<Chunk, Error>> {
     let version_chunk = Chunk::new(vec![VERSION]);
 
     let chunks_stream = pairs_stream.and_then(move |(predecessor, successors)| {
-        prepare_obsmarker_chunk(&predecessor, &successors, &time, &metadata)
+        future::ready(prepare_obsmarker_chunk(
+            &predecessor,
+            &successors,
+            &time,
+            &metadata,
+        ))
     });
 
-    iter_result(vec![version_chunk]).chain(chunks_stream)
+    stream::once(future::ready(version_chunk)).chain(chunks_stream)
 }
 
 fn prepare_obsmarker_chunk(
     predecessor: &HgChangesetId,
-    successors: &Vec<HgChangesetId>,
+    successors: &[HgChangesetId],
     time: &DateTime,
-    metadata: &Vec<MetadataEntry>,
+    metadata: &[MetadataEntry],
 ) -> Result<Chunk> {
     // Reserve space, fill it with zeros before writing out our data.
     let mut v: Vec<u8> = vec![0; 19];
@@ -100,17 +108,14 @@ fn prepare_obsmarker_chunk(
 #[cfg(test)]
 mod test {
     use anyhow::Error;
-    use futures_ext::StreamExt;
-    use futures_old::stream;
-    use futures_old::Async;
-    use futures_old::Poll;
     use mercurial_types_mocks::nodehash;
     use quickcheck::quickcheck;
+    use tokio::runtime::Runtime;
 
     use super::*;
 
     fn long_string() -> String {
-        String::from_utf8(vec![b'T'; u16::max_value() as usize]).unwrap()
+        String::from_utf8(vec![b'T'; u16::MAX as usize]).unwrap()
     }
 
     fn size_matches(data: &[u8]) -> bool {
@@ -161,9 +166,9 @@ mod test {
     fn content_matches(
         data: &[u8],
         predecessor: &HgChangesetId,
-        successors: &Vec<HgChangesetId>,
+        successors: &[HgChangesetId],
         time: &DateTime,
-        metadata: &Vec<MetadataEntry>,
+        metadata: &[MetadataEntry],
     ) -> bool {
         BigEndian::read_f64(&data[4..]) == time.timestamp_secs() as f64
             && BigEndian::read_i16(&data[12..]) == time.tz_offset_minutes()
@@ -178,13 +183,13 @@ mod test {
 
     quickcheck! {
         fn test_prepare_no_metadata(predecessor: HgChangesetId, successors: Vec<HgChangesetId>, time: DateTime) -> bool {
-            let chunk = prepare_obsmarker_chunk(&predecessor, &successors, &time, &vec![]);
+            let chunk = prepare_obsmarker_chunk(&predecessor, &successors, &time, &[]);
             chunk.is_ok() && size_matches(&chunk.unwrap().into_bytes().unwrap())
         }
 
         fn test_prepare_metadata(predecessor: HgChangesetId, successors: Vec<HgChangesetId>, time: DateTime, metadata: Vec<MetadataEntry>) -> bool {
             let chunk = prepare_obsmarker_chunk(&predecessor, &successors, &time, &metadata);
-            let max_size = u8::max_value() as usize;
+            let max_size = u8::MAX as usize;
 
             if metadata.len() > max_size || successors.len() > max_size {
                 // NOTE: With the default quickcheck configuration, we won't exercise this. We
@@ -197,7 +202,7 @@ mod test {
         }
 
         fn test_roundtrip(predecessor: HgChangesetId, successors: Vec<HgChangesetId>, time: DateTime, metadata: Vec<MetadataEntry>) -> bool {
-            let metadata = metadata.into_iter().take(4).collect(); // See above
+            let metadata = metadata.into_iter().take(4).collect::<Vec<_>>(); // See above
             let chunk = prepare_obsmarker_chunk(&predecessor, &successors, &time, &metadata);
             chunk.is_ok() && content_matches(&chunk.unwrap().into_bytes().unwrap(), &predecessor, &successors, &time, &metadata)
         }
@@ -215,7 +220,7 @@ mod test {
     #[test]
     fn test_successor_count_overflow() {
         let time = DateTime::now();
-        let successors = vec![nodehash::TWOS_CSID; u16::max_value() as usize];
+        let successors = vec![nodehash::TWOS_CSID; u16::MAX as usize];
         let metadata = vec![];
         let chunk = prepare_obsmarker_chunk(&nodehash::ONES_CSID, &successors, &time, &metadata);
         assert!(chunk.is_err());
@@ -225,10 +230,10 @@ mod test {
     fn test_metadata_count_overflow() {
         let entry = MetadataEntry::new("key", "value");
         let time = DateTime::now();
-        let metadata = vec![entry; u16::max_value() as usize];
+        let metadata = vec![entry; u16::MAX as usize];
         let chunk = prepare_obsmarker_chunk(
             &nodehash::ONES_CSID,
-            &vec![nodehash::TWOS_CSID],
+            &[nodehash::TWOS_CSID],
             &time,
             &metadata,
         );
@@ -242,7 +247,7 @@ mod test {
         let metadata = vec![entry];
         let chunk = prepare_obsmarker_chunk(
             &nodehash::ONES_CSID,
-            &vec![nodehash::TWOS_CSID],
+            &[nodehash::TWOS_CSID],
             &time,
             &metadata,
         );
@@ -256,7 +261,7 @@ mod test {
         let metadata = vec![entry];
         let chunk = prepare_obsmarker_chunk(
             &nodehash::ONES_CSID,
-            &vec![nodehash::TWOS_CSID],
+            &[nodehash::TWOS_CSID],
             &time,
             &metadata,
         );
@@ -265,19 +270,8 @@ mod test {
 
     fn stream_for_pairs(
         pairs: Vec<(HgChangesetId, Vec<HgChangesetId>)>,
-    ) -> impl Stream<Item = (HgChangesetId, Vec<HgChangesetId>), Error = Error> {
-        stream::iter_ok(pairs).boxify()
-    }
-
-    fn extract_chunk(wrapped: Poll<Option<Chunk>, Error>) -> Result<Chunk> {
-        if let Ok(Async::Ready(Some(chunk))) = wrapped {
-            return Ok(chunk);
-        }
-        Err(Error::msg("no chunk"))
-    }
-
-    fn extract_vec(wrapped: Poll<Option<Chunk>, Error>) -> Result<Vec<u8>> {
-        Ok(extract_chunk(wrapped)?.into_bytes()?.to_vec())
+    ) -> impl Stream<Item = Result<(HgChangesetId, Vec<HgChangesetId>), Error>> {
+        stream::iter(pairs).map(anyhow::Ok)
     }
 
     #[test]
@@ -288,31 +282,37 @@ mod test {
         ]);
         let time = DateTime::now();
         let meta = vec![];
-        let mut packer = obsmarkers_packer_stream(pairs_stream, time, meta.clone());
+        let packer = obsmarkers_packer_stream(pairs_stream, time, meta.clone());
 
-        let r1 = extract_vec(packer.poll()).unwrap();
+        let runtime = Runtime::new().unwrap();
+        let mut chunks = runtime
+            .block_on(packer.try_collect::<Vec<Chunk>>())
+            .unwrap()
+            .into_iter();
+
+        let r1 = chunks.next().unwrap().into_bytes().unwrap().to_vec();
         assert_eq!(r1, vec![VERSION]);
 
-        let r2 = extract_vec(packer.poll()).unwrap();
+        let r2 = chunks.next().unwrap().into_bytes().unwrap().to_vec();
         assert!(size_matches(&r2));
         assert!(content_matches(
             &r2,
             &nodehash::ONES_CSID,
-            &vec![nodehash::TWOS_CSID],
+            &[nodehash::TWOS_CSID],
             &time,
             &meta
         ));
 
-        let r3 = extract_vec(packer.poll()).unwrap();
+        let r3 = chunks.next().unwrap().into_bytes().unwrap().to_vec();
         assert!(size_matches(&r3));
         assert!(content_matches(
             &r3,
             &nodehash::THREES_CSID,
-            &vec![nodehash::FOURS_CSID],
+            &[nodehash::FOURS_CSID],
             &time,
             &meta
         ));
 
-        assert!(extract_vec(packer.poll()).is_err());
+        assert!(chunks.next().is_none());
     }
 }

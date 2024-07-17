@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 
-from sapling import pycompat, registrar, util
+from sapling import pycompat, registrar, tracing, util
 
 
 pathformat = "/tmp/trace-%(pid)s-%(time)s.log"
@@ -111,6 +111,9 @@ def uisetup(ui) -> None:
         util.signal(sig2, printmemory)
 
 
+_runningpid = None
+
+
 def reposetup(ui, repo) -> None:
     # Do not track known long-running commands.
     if not repo.local():
@@ -119,9 +122,14 @@ def reposetup(ui, repo) -> None:
     if not interval or interval <= 0:
         return
 
-    knownlongruning = (
-        ui.cmdname in {"debugedenimporthelper", "web"} and not util.istest()
-    )
+    # Only start one sigtrace thread per-process.
+    mypid = os.getpid()
+    global _runningpid
+    if _runningpid == mypid:
+        return
+    _runningpid = mypid
+
+    knownlongruning = ui.cmdname in {"web"} and not util.istest()
 
     def writesigtracethread(path, interval):
         try:
@@ -133,7 +141,7 @@ def reposetup(ui, repo) -> None:
                 util.gcdir(dir, 60 * 10)
 
                 if knownlongruning:
-                    forcefile = "force_sigtrace_%s" % (os.getpid(),)
+                    forcefile = "force_sigtrace_%s" % (mypid,)
                     if repo.localvfs.exists(forcefile):
                         repo.localvfs.tryunlink(forcefile)
                     else:
@@ -143,7 +151,9 @@ def reposetup(ui, repo) -> None:
         except Exception:
             pass
 
-    path = repo.localvfs.join("sigtrace", "pid-%s-%s" % (os.getpid(), ui.cmdname))
+    tracing.debug("starting sigtrace thread", target="ext::sigtrace")
+
+    path = repo.localvfs.join("sigtrace", "pid-%s-%s" % (mypid, ui.cmdname))
     thread = threading.Thread(
         target=writesigtracethread, args=(path, interval), name="sigtracethread"
     )

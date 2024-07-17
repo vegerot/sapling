@@ -12,8 +12,8 @@ use anyhow::Error;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bookmarks::Bookmarks;
 use borrowed::borrowed;
-use changeset_fetcher::ChangesetFetcher;
 use changesets::Changesets;
+use commit_graph::CommitGraph;
 use context::CoreContext;
 use fbinit::FacebookInit;
 use filestore::FilestoreConfig;
@@ -26,6 +26,7 @@ use mononoke_types::ChangesetId;
 use mononoke_types::NonRootMPath;
 use repo_blobstore::RepoBlobstore;
 use repo_derived_data::RepoDerivedData;
+use repo_identity::RepoIdentity;
 use test_repo_factory::TestRepoFactory;
 use tests_utils::create_commit;
 use tests_utils::store_files;
@@ -47,9 +48,11 @@ struct TestRepo {
     #[facet]
     filestore_config: FilestoreConfig,
     #[facet]
-    changeset_fetcher: dyn ChangesetFetcher,
+    commit_graph: CommitGraph,
     #[facet]
     changesets: dyn Changesets,
+    #[facet]
+    repo_identity: RepoIdentity,
 }
 
 // File with multiple changes and a merge
@@ -182,7 +185,7 @@ async fn test_blame_version(fb: FacebookInit, version: BlameVersion) -> Result<(
         .with_config_override(|config| {
             config
                 .derived_data_config
-                .get_active_config()
+                .get_active_config_mut()
                 .expect("No enabled derived data types config")
                 .blame_version = version
         })
@@ -303,12 +306,12 @@ async fn test_blame_size_rejected_version(
         .with_config_override(|config| {
             config
                 .derived_data_config
-                .get_active_config()
+                .get_active_config_mut()
                 .expect("No enabled derived data types config")
                 .blame_version = version;
             config
                 .derived_data_config
-                .get_active_config()
+                .get_active_config_mut()
                 .expect("No enabled derived data types config")
                 .blame_filesize_limit = Some(4);
         })
@@ -341,7 +344,7 @@ async fn test_blame_copy_source(fb: FacebookInit) -> Result<(), Error> {
         .with_config_override(|config| {
             config
                 .derived_data_config
-                .get_active_config()
+                .get_active_config_mut()
                 .expect("No enabled derived data types config")
                 .blame_version = BlameVersion::V2
         })

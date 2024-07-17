@@ -6,7 +6,6 @@
  */
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
@@ -16,6 +15,7 @@ use anyhow::Result;
 use byteorder::BigEndian;
 use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
+use fs_err::File;
 use memmap2::Mmap;
 use memmap2::MmapOptions;
 use thiserror::Error;
@@ -227,15 +227,14 @@ impl DataIndex {
 
         // Write fanout
         // `locations` will contain the eventual offset that each value will be written to.
-        let mut locations: Vec<u32> = Vec::with_capacity(values.len());
-        unsafe { locations.set_len(values.len()) };
-        FanoutTable::write(
+        let locations = FanoutTable::write(
             writer,
             if options.large { 2 } else { 1 },
             &mut values.iter().map(|x| x.0),
             ENTRY_LEN,
-            Some(&mut locations),
-        )?;
+            Some(values.len()),
+        )?
+        .expect("`locations` must be `Some` since `Some(locations_size)` was provided.");
 
         // Map from hgid to location
         let mut nodelocations: HashMap<HgId, u32> = HashMap::new();
@@ -267,8 +266,8 @@ impl DataIndex {
         let (start, end) = FanoutTable::get_bounds(self.get_fanout_slice(), hgid)?;
         let start = start + self.index_start;
         let end = match end {
-            Option::None => self.mmap.len(),
-            Option::Some(pos) => pos + self.index_start,
+            None => self.mmap.len(),
+            Some(pos) => pos + self.index_start,
         };
 
         let entry_offset = match self.binary_search(hgid, &self.mmap[start..end]) {

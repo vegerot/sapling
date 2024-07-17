@@ -1,3 +1,6 @@
+
+#require no-eden
+
 #chg-compatible
   $ setconfig experimental.allowfilepeer=True
 
@@ -117,7 +120,7 @@
   adding manifests
   adding file changes
 
-  $ hg up
+  $ hg up tip
   3 files updated, 0 files merged, 0 files removed, 0 files unresolved
   4 files fetched over 1 fetches - (4 misses, 0.00% hit ratio) over *s (glob) (?)
   $ cat a
@@ -179,22 +182,9 @@
   383ce605500277f879b7460a16ba620eb6930b7f
 
 test the file size limit by changing it to something really small
-  $ cat > ../sizelimit.py <<EOF
-  > from __future__ import absolute_import
-  > import sapling.ext.remotefilelog.remotefilelog as remotefilelog
-  > 
-  > def uisetup(ui):
-  >     remotefilelog._maxentrysize = ui.configint('sizelimit', 'sizelimit')
-  > EOF
-  $ cat >> .hg/hgrc << EOF
-  > [extensions]
-  > sizelimit = `pwd`/../sizelimit.py
-  > [sizelimit]
-  > sizelimit = 10
-  > EOF
-
   $ echo "A moderately short sentence." > longfile
   $ hg add longfile
-  $ hg ci -m longfile
+  $ hg ci -m longfile --config commit.file-size-limit=10
   abort: longfile: size of 29 bytes exceeds maximum size of 10 bytes!
+  (use '--config commit.file-size-limit=N' to override)
   [255]

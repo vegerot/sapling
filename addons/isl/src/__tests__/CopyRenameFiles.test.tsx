@@ -18,12 +18,9 @@ import {
   closeCommitInfoSidebar,
   simulateRepoConnected,
 } from '../testUtils';
-import {fireEvent, render, screen} from '@testing-library/react';
-import {act} from 'react-dom/test-utils';
+import {fireEvent, render, screen, act, waitFor} from '@testing-library/react';
 
-jest.mock('../MessageBus');
-
-describe('CommitTreeList', () => {
+describe('CopyRenameFiles', () => {
   beforeEach(() => {
     resetTestMessages();
     render(<App />);
@@ -39,7 +36,7 @@ describe('CommitTreeList', () => {
         value: [
           COMMIT('1', 'some public base', '0', {phase: 'public'}),
           COMMIT('a', 'My Commit', '1'),
-          COMMIT('b', 'Another Commit', 'a', {isHead: true}),
+          COMMIT('b', 'Another Commit', 'a', {isDot: true}),
         ],
       });
     });
@@ -98,7 +95,7 @@ describe('CommitTreeList', () => {
     expect(screen.queryByText(ignoreRTL('path/moved/file.txt'))).not.toBeInTheDocument();
   });
 
-  it('selecting renamed files selects removed file as well', () => {
+  it('selecting renamed files selects removed file as well', async () => {
     act(() => {
       simulateUncommittedChangedFiles({
         value: [
@@ -121,23 +118,22 @@ describe('CommitTreeList', () => {
       fireEvent.click(modifiedFileCheckboxes[1]);
     });
     // create a commit
-    act(() => {
-      fireEvent.click(screen.getByTestId('quick-commit-button'));
-    });
-
-    expectMessageSentToServer({
-      type: 'runOperation',
-      operation: expect.objectContaining({
-        args: [
-          'commit',
-          '--addremove',
-          '--message',
-          expect.anything(),
-          // both moved and removed file are passed, even though we only selected the single moved file
-          {type: 'repo-relative-file', path: 'path/moved/file.txt'},
-          {type: 'repo-relative-file', path: 'path/original/file.txt'},
-        ] as Array<CommandArg>,
-      }),
+    fireEvent.click(screen.getByTestId('quick-commit-button'));
+    await waitFor(() => {
+      expectMessageSentToServer({
+        type: 'runOperation',
+        operation: expect.objectContaining({
+          args: [
+            'commit',
+            '--addremove',
+            '--message',
+            expect.anything(),
+            // both moved and removed file are passed, even though we only selected the single moved file
+            {type: 'repo-relative-file', path: 'path/moved/file.txt'},
+            {type: 'repo-relative-file', path: 'path/original/file.txt'},
+          ] as Array<CommandArg>,
+        }),
+      });
     });
   });
 });

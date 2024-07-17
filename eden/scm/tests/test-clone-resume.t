@@ -1,12 +1,13 @@
-#debugruntest-compatible
 
-  $ configure modern
+#require no-eden
+
+
   $ setconfig devel.segmented-changelog-rev-compat=true
   $ setconfig clone.nativecheckout=True
-  $ newserver server
+  $ setconfig checkout.use-rust=true
 
 Create a repo that touches a few files
-  $ newremoterepo client1
+  $ newclientrepo client1 test:server
   $ mkdir dir1 dir2
   $ touch dir1/x
   $ touch dir2/x
@@ -15,11 +16,14 @@ Create a repo that touches a few files
   $ cd ..
 
 Bare clone the repo
-  $ newremoterepo client2
+  $ newclientrepo client2
+  $ setconfig paths.default=test:server
   $ hg pull -q
 
 Set a failpoint to force incomplete checkout.
-  $ FAILPOINTS=checkout-post-progress=return hg checkout tip --config remotefilelog.debug=False --config devel.silence-crash=True
+  $ FAILPOINTS=checkout-post-progress=return hg checkout tip
+  abort: checkout errors:
+   Error set by checkout-post-progress FAILPOINTS
   [255]
 
 Verify we see the warning for other commands
@@ -32,19 +36,12 @@ Verify we see the warning for other commands
 
 Verify we cannot specify --continue and a rev
   $ hg checkout master --continue
-  warning: this repository appears to have not finished cloning - run 'hg checkout --continue' to resume the clone
-  abort: cannot specify --continue and a update revision
+  abort: can't specify a destination commit and --continue
   [255]
 
 Verify the checkout resumes where it left off
-  $ EDENSCM_LOG=checkout=debug hg checkout --continue
-  warning: this repository appears to have not finished cloning - run 'hg checkout --continue' to resume the clone
-  continuing checkout to '*' (glob)
-  DEBUG checkout::prefetch: skip prefetch for non-lazychangelog
-   INFO from_diff: checkout::actions: enter
-   INFO from_diff: checkout::actions: exit
-  DEBUG checkout: Skipping checking out 2 files since they're already written
-  2 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ SL_LOG=checkout=debug hg checkout --continue 2>&1 | grep skipped_count
+  DEBUG checkout:apply_store: checkout: skipped files based on progress skipped_count=2
 
 Verify we can disable resumable checkouts
   $ hg checkout -q null
@@ -52,6 +49,7 @@ Verify we can disable resumable checkouts
   $ chmod -R a-w dir2
   $ hg checkout tip --config checkout.resumable=False
   abort: * (glob)
+   dir2/x: Permission denied (os error 13) (unix-permissions !)
   [255]
   $ chmod -R a+w dir2
   $ test -f .hg/updateprogress

@@ -10,14 +10,15 @@ use configloader::hg::ConfigSetHgExt;
 use configloader::Text;
 use minibench::bench;
 use minibench::elapsed;
+use repo_minimal_info::RepoMinimalInfo;
 
 fn main() {
     bench("parse 645KB file", || {
         let mut config_file = String::new();
         for _ in 0..100 {
-            for section in b'a'..b'z' {
+            for section in b'a'..=b'z' {
                 config_file += &format!("[{ch}{ch}{ch}{ch}]\n", ch = section as char);
-                for name in b'a'..b'z' {
+                for name in b'a'..=b'z' {
                     config_file += &format!("{ch}{ch}{ch} = {ch}{ch}{ch}\n", ch = name as char);
                 }
             }
@@ -32,7 +33,7 @@ fn main() {
     bench("load system and user", || {
         elapsed(|| {
             let mut cfg = ConfigSet::new();
-            cfg.load::<String, String>(None, None).unwrap();
+            cfg.load(None, Default::default()).unwrap();
         })
     });
 
@@ -41,9 +42,10 @@ fn main() {
         let path = dir.path();
         std::fs::create_dir(path.join(".hg")).unwrap();
         std::fs::create_dir(path.join(".sl")).unwrap();
+        let repo = RepoMinimalInfo::from_repo_root(path.to_path_buf()).unwrap();
         elapsed(|| {
             let mut cfg = ConfigSet::new();
-            cfg.load::<String, String>(Some(path), None).unwrap();
+            cfg.load(Some(&repo), Default::default()).unwrap();
         })
     });
 }

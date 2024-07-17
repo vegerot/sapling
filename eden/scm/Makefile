@@ -21,6 +21,18 @@ PYTHON := python
 endif
 PYTHON3 := python3
 
+BUCK_BUILD_MODE = @fbcode//mode/opt
+ifeq ($(OS),Windows_NT)
+  BUCK_BUILD_MODE := @fbcode//mode/opt-win
+else
+  UNAME_S := $(shell uname -s)
+  ifeq ($(UNAME_S),Darwin)
+    BUCK_BUILD_MODE := @fbcode//mode/opt-mac
+  endif
+endif
+
+PYTHON_MINOR_VERSION=$(shell $(shell $(PYTHON3) contrib/pick_python.py $(PYTHON3)) -c "import sys; print(sys.version_info.minor)")
+
 ifeq ($(RUST_DEBUG),1)
 RUST_FLAG = --debug
 endif
@@ -37,6 +49,7 @@ OSXVERSIONFLAGS ?= $(shell echo $$OSXVERSIONFLAGS)
 
 HGNAME ?= hg
 SL_NAME = sl
+ISL_NAME ?= isl-dist.tar.xz
 
 # Set this to e.g. "mingw32" to use a non-default compiler.
 COMPILER=
@@ -74,39 +87,35 @@ oss: HGNAME=$(SL_NAME)
 oss: local
 
 install-oss: oss
-	$(shell $(PYTHON3) contrib/pick_python.py $(PYTHON3)) setup.py $(PURE) \
-	  install --root="$(DESTDIR)/" --prefix="$(PREFIX)" \
-	  --install-lib="$(PREFIX)"/lib/python3.$(shell $(shell $(PYTHON3) contrib/pick_python.py $(PYTHON3)) -c "import sys; print(sys.version_info.minor)")/site-packages \
-	  --install-scripts="$(PREFIX)/bin" --force
+	mkdir -p $(DESTDIR)/$(PREFIX)/bin
+	cp $(SL_NAME) $(DESTDIR)/$(PREFIX)/bin
+	mkdir -p $(DESTDIR)/$(PREFIX)/lib
+	cp isl-dist.tar.xz $(DESTDIR)/$(PREFIX)/lib
 
 local:
-	SAPLING_OSS_BUILD=$(OSS) \
+	SAPLING_OSS_BUILD=$(OSS) HGNAME=$(HGNAME) \
 	  $(shell $(PYTHON3) contrib/pick_python.py $(PYTHON3)) setup.py $(PURE) \
 	  build_interactive_smartlog \
-	  build_py -c -d . \
 	  build_clib $(COMPILERFLAG) \
-	  build_ext $(COMPILERFLAG) -i \
 	  build_rust_ext -i -l $(RUST_FLAG) \
 	  build_mo
 ifeq ($(OS),Windows_NT)
-	cp build/scripts-3*/$(HGNAME).exe $(HGNAME).exe
+	cp build/scripts-3.$(PYTHON_MINOR_VERSION)/$(HGNAME).exe $(HGNAME).exe
 else
 	$(RM) $(HGNAME)
-	cp build/scripts-3*/$(HGNAME) $(HGNAME)
+	cp build/scripts-3.$(PYTHON_MINOR_VERSION)/$(HGNAME) $(HGNAME)
 endif
 
 hg:
 	SAPLING_SKIP_OTHER_RUST_BINARIES=true $(shell $(PYTHON3) contrib/pick_python.py $(PYTHON3)) setup.py $(PURE) \
-	  build_py -c -d . \
 	  build_clib $(COMPILERFLAG) \
-	  build_ext $(COMPILERFLAG) -i \
 	  build_rust_ext -i -l $(RUST_FLAG) \
 	  build_mo
 ifeq ($(OS),Windows_NT)
-	cp build/scripts-3*/$(HGNAME).exe $(HGNAME).exe
+	cp build/scripts-3.$(PYTHON_MINOR_VERSION)/$(HGNAME).exe $(HGNAME).exe
 else
 	$(RM) $(HGNAME)
-	cp build/scripts-3*/$(HGNAME) $(HGNAME)
+	cp build/scripts-3.$(PYTHON_MINOR_VERSION)/$(HGNAME) $(HGNAME)
 endif
 
 build:
@@ -204,6 +213,12 @@ i18n/hg.pot: $(PYFILES) $(DOCFILES) i18n/posplit i18n/hggettext
 	msgmerge --no-location --update $@.tmp $^
 	mv -f $@.tmp $@
 
+buck:
+	cp $(shell buck2 build $(BUCK_BUILD_MODE) fbcode//eden/scm:hg --show-full-simple-output) $(HGNAME)
+
+buck-isl:
+	cp $(shell buck2 build $(BUCK_BUILD_MODE) fbcode//eden/addons:isl-tar --show-full-simple-output) $(ISL_NAME)
+
 # Packaging targets
 
-.PHONY: help all local build cleanbutpackages clean install install-home install-getdeps getdepsbuild deb hg
+.PHONY: help all local build cleanbutpackages clean install install-home install-getdeps getdepsbuild deb hg buck

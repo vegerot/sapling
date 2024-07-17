@@ -12,12 +12,12 @@
 #include <utility>
 
 #include "eden/common/os/ProcessId.h"
+#include "eden/common/telemetry/RequestMetricsScope.h"
 #include "eden/fs/fuse/FuseChannel.h"
 #include "eden/fs/inodes/RequestContext.h"
 #include "eden/fs/store/ImportPriority.h"
 #include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/telemetry/EdenStats.h"
-#include "eden/fs/telemetry/RequestMetricsScope.h"
 #include "eden/fs/utils/FsChannelTypes.h"
 
 namespace facebook::eden {
@@ -81,20 +81,35 @@ class FuseRequestContext : public RequestContext {
    */
   folly::Future<folly::Unit> catchErrors(
       folly::Future<folly::Unit>&& fut,
-      Notifier* FOLLY_NULLABLE notifier) {
-    return std::move(fut).thenTryInline([this, notifier](
+      Notifier* FOLLY_NULLABLE notifier,
+      EdenStatsPtr stats,
+      StatsGroupBase::Counter FuseStats::*countSuccessful,
+      StatsGroupBase::Counter FuseStats::*countFailure) {
+    return std::move(fut).thenTryInline([this,
+                                         notifier,
+                                         stats = std::move(stats),
+                                         countSuccessful,
+                                         countFailure](
                                             folly::Try<folly::Unit>&& try_) {
       if (try_.hasException()) {
-        if (auto* err = try_.tryGetExceptionObject<folly::FutureTimeout>()) {
-          timeoutErrorHandler(*err, notifier);
+        if (stats && countFailure) {
+          stats->increment(countFailure);
+        }
+        if (auto* futureTimeoutErr =
+                try_.tryGetExceptionObject<folly::FutureTimeout>()) {
+          timeoutErrorHandler(*futureTimeoutErr, notifier);
         } else if (
-            auto* err = try_.tryGetExceptionObject<std::system_error>()) {
-          systemErrorHandler(*err, notifier);
-        } else if (auto* err = try_.tryGetExceptionObject<std::exception>()) {
-          genericErrorHandler(*err, notifier);
+            auto* systemErr = try_.tryGetExceptionObject<std::system_error>()) {
+          systemErrorHandler(*systemErr, notifier);
+        } else if (auto* ex = try_.tryGetExceptionObject<std::exception>()) {
+          genericErrorHandler(*ex, notifier);
         } else {
           genericErrorHandler(
               std::runtime_error{"unknown exception type"}, notifier);
+        }
+      } else {
+        if (stats && countSuccessful) {
+          stats->increment(countSuccessful);
         }
       }
     });

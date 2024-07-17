@@ -5,8 +5,6 @@
  * GNU General Public License version 2.
  */
 
-use std::collections::HashSet;
-use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,13 +14,13 @@ use anyhow::Result;
 use configmodel::convert::ByteCount;
 use configmodel::Config;
 use configmodel::ConfigExt;
-use hgstore::strip_metadata;
+use fs_err as fs;
+use hgstore::strip_hg_file_metadata;
 use hgtime::HgTime;
 use minibytes::Bytes;
 use regex::Regex;
 use tracing::info_span;
 use types::Key;
-use types::RepoPathBuf;
 
 use crate::datastore::ContentDataStore;
 use crate::datastore::ContentMetadata;
@@ -101,22 +99,24 @@ impl ContentStore {
         let max_bytes_per_log =
             config.get_opt::<ByteCount>("indexedlog", "data.max-bytes-per-log")?;
         let max_bytes = config.get_opt::<ByteCount>("remotefilelog", "cachelimit")?;
-        let config = IndexedLogHgIdDataStoreConfig {
+        let log_config = IndexedLogHgIdDataStoreConfig {
             max_log_count,
             max_bytes_per_log,
             max_bytes,
         };
 
         repair_str += &IndexedLogHgIdDataStore::repair(
+            config,
             get_indexedlogdatastore_path(&shared_path)?,
-            &config,
-            StoreType::Shared,
+            &log_config,
+            StoreType::Rotated,
         )?;
         if let Some(local_path) = local_path {
             repair_str += &IndexedLogHgIdDataStore::repair(
+                config,
                 get_indexedlogdatastore_path(local_path)?,
-                &config,
-                StoreType::Local,
+                &log_config,
+                StoreType::Permanent,
             )?;
         }
         repair_str += &LfsStore::repair(shared_path)?;
@@ -127,25 +127,17 @@ impl ContentStore {
 
 impl LegacyStore for ContentStore {
     /// Some blobs may contain copy-from metadata, let's strip it. For more details about the
-    /// copy-from metadata, see `strip_metadata`.
+    /// copy-from metadata, see `strip_hg_file_metadata`.
     ///
     /// XXX: This should only be used on `ContentStore` that are storing actual
     /// file content, tree stores should use the `get` method instead.
     fn get_file_content(&self, key: &Key) -> Result<Option<Bytes>> {
         if let StoreResult::Found(vec) = self.get(StoreKey::hgid(key.clone()))? {
             let bytes = vec.into();
-            let (bytes, _) = strip_metadata(&bytes)?;
+            let (bytes, _) = strip_hg_file_metadata(&bytes)?;
             Ok(Some(bytes))
         } else {
             Ok(None)
-        }
-    }
-
-    fn get_logged_fetches(&self) -> HashSet<RepoPathBuf> {
-        if let Some(remote_store) = &self.remote_store {
-            remote_store.take_seen()
-        } else {
-            HashSet::new()
         }
     }
 
@@ -411,10 +403,11 @@ impl<'a> ContentStoreBuilder<'a> {
                     max_bytes,
                 };
                 Arc::new(IndexedLogHgIdDataStore::new(
+                    self.config,
                     get_indexedlogdatastore_path(&cache_path)?,
                     extstored_policy,
                     &config,
-                    StoreType::Shared,
+                    StoreType::Rotated,
                 )?)
             };
 
@@ -431,7 +424,7 @@ impl<'a> ContentStoreBuilder<'a> {
         let shared_lfs_store = if let Some(shared_lfs_shared) = self.shared_lfs_shared {
             shared_lfs_shared
         } else {
-            Arc::new(LfsStore::shared(&cache_path, self.config)?)
+            Arc::new(LfsStore::rotated(&cache_path, self.config)?)
         };
         blob_stores.add(shared_lfs_store.clone());
 
@@ -482,10 +475,11 @@ impl<'a> ContentStoreBuilder<'a> {
                             max_bytes: None,
                         };
                         Arc::new(IndexedLogHgIdDataStore::new(
+                            self.config,
                             get_indexedlogdatastore_path(local_path.as_ref().unwrap())?,
                             extstored_policy,
                             &config,
-                            StoreType::Local,
+                            StoreType::Permanent,
                         )?)
                     };
 
@@ -507,7 +501,7 @@ impl<'a> ContentStoreBuilder<'a> {
                 let local_lfs_store = if let Some(shared_lfs_local) = self.shared_lfs_local {
                     shared_lfs_local
                 } else {
-                    Arc::new(LfsStore::local(local_path.unwrap(), self.config)?)
+                    Arc::new(LfsStore::permanent(local_path.unwrap(), self.config)?)
                 };
                 blob_stores.add(local_lfs_store.clone());
                 datastore.add(local_lfs_store.clone());
@@ -656,9 +650,9 @@ mod tests {
     use crate::types::ContentHash;
 
     #[cfg(feature = "fb")]
-    fn prepare_lfs_mocks(blob: &TestBlob) -> Vec<Mock> {
-        let m1 = get_lfs_batch_mock(200, &[blob]);
-        let mut m2 = get_lfs_download_mock(200, blob);
+    fn prepare_lfs_mocks(server: &mut mockito::ServerGuard, blob: &TestBlob) -> Vec<Mock> {
+        let m1 = get_lfs_batch_mock(server, 200, &[blob]);
+        let mut m2 = get_lfs_download_mock(server, 200, blob);
         m2.push(m1);
         m2
     }
@@ -873,10 +867,11 @@ mod tests {
             max_bytes: None,
         };
         let store = IndexedLogHgIdDataStore::new(
+            &config,
             get_indexedlogdatastore_path(&localdir)?,
             ExtStoredPolicy::Use,
             &indexed_log_config,
-            StoreType::Local,
+            StoreType::Permanent,
         )?;
         assert_eq!(
             store.get(StoreKey::hgid(k1))?,
@@ -961,7 +956,7 @@ mod tests {
         let localdir = TempDir::new()?;
         let config = make_config(&cachedir);
 
-        let lfs_store = LfsStore::local(&localdir, &config)?;
+        let lfs_store = LfsStore::permanent(&localdir, &config)?;
         let k1 = key("a", "2");
         let delta = Delta {
             data: Bytes::from(&[1, 2, 3, 4][..]),
@@ -988,7 +983,7 @@ mod tests {
         let mut lfs_cache_dir = cachedir.path().to_path_buf();
         lfs_cache_dir.push("test");
         create_dir(&lfs_cache_dir)?;
-        let lfs_store = LfsStore::shared(&lfs_cache_dir, &config)?;
+        let lfs_store = LfsStore::rotated(&lfs_cache_dir, &config)?;
         let k1 = key("a", "2");
         let delta = Delta {
             data: Bytes::from(&[1, 2, 3, 4][..]),
@@ -1010,7 +1005,8 @@ mod tests {
     fn test_lfs_blob() -> Result<()> {
         let cachedir = TempDir::new()?;
         let localdir = TempDir::new()?;
-        let config = make_lfs_config(&cachedir, "test_lfs_blob");
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &cachedir, "test_lfs_blob");
 
         let k1 = key("a", "2");
         let delta = Delta {
@@ -1032,7 +1028,8 @@ mod tests {
     fn test_lfs_metadata() -> Result<()> {
         let cachedir = TempDir::new()?;
         let localdir = TempDir::new()?;
-        let config = make_lfs_config(&cachedir, "test_lfs_metadata");
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &cachedir, "test_lfs_metadata");
 
         let k1 = key("a", "2");
         let data = Bytes::from(&[1, 2, 3, 4, 5][..]);
@@ -1063,7 +1060,8 @@ mod tests {
     fn test_lfs_multiplexer() -> Result<()> {
         let cachedir = TempDir::new()?;
         let localdir = TempDir::new()?;
-        let config = make_lfs_config(&cachedir, "test_lfs_multiplexer");
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &cachedir, "test_lfs_multiplexer");
 
         let k1 = key("a", "2");
         let delta = Delta {
@@ -1076,7 +1074,7 @@ mod tests {
         store.add(&delta, &Default::default())?;
         store.flush()?;
 
-        let lfs_store = LfsStore::local(&localdir, &config)?;
+        let lfs_store = LfsStore::permanent(&localdir, &config)?;
         let stored = lfs_store.get(StoreKey::hgid(k1))?;
         assert_eq!(stored, StoreResult::Found(delta.data.as_ref().to_vec()));
         Ok(())
@@ -1086,7 +1084,8 @@ mod tests {
     fn test_repack_one_datapack_lfs() -> Result<()> {
         let cachedir = TempDir::new()?;
         let localdir = TempDir::new()?;
-        let mut config = make_lfs_config(&cachedir, "test_repack_one_datapack_lfs");
+        let server = mockito::Server::new();
+        let mut config = make_lfs_config(&server, &cachedir, "test_repack_one_datapack_lfs");
         setconfig(&mut config, "lfs", "threshold", "10M");
 
         let k1 = key("a", "2");
@@ -1227,9 +1226,10 @@ mod tests {
 
             let cachedir = TempDir::new()?;
             let localdir = TempDir::new()?;
-            let config = make_lfs_config(&cachedir, "test_lfs_remote");
+            let mut server = mockito::Server::new();
+            let config = make_lfs_config(&server, &cachedir, "test_lfs_remote");
             let blob = example_blob();
-            let _lfs_mocks = prepare_lfs_mocks(&blob);
+            let _lfs_mocks = prepare_lfs_mocks(&mut server, &blob);
 
             let k = key("a", "1");
 
@@ -1265,7 +1265,9 @@ mod tests {
         fn test_lfs_fallback_on_missing_blob() -> Result<()> {
             let cachedir = TempDir::new()?;
             let localdir = TempDir::new()?;
-            let mut config = make_lfs_config(&cachedir, "test_lfs_fallback_on_missing_blob");
+            let server = mockito::Server::new();
+            let mut config =
+                make_lfs_config(&server, &cachedir, "test_lfs_fallback_on_missing_blob");
 
             let lfsdir = TempDir::new()?;
             setconfig(
@@ -1333,11 +1335,12 @@ mod tests {
         fn test_lfs_prefetch_once() -> Result<()> {
             let _env_lock = crate::env_lock();
             let blob = example_blob();
-            let _lfs_mocks = prepare_lfs_mocks(&blob);
+            let mut server = mockito::Server::new();
+            let _lfs_mocks = prepare_lfs_mocks(&mut server, &blob);
 
             let cachedir = TempDir::new()?;
             let localdir = TempDir::new()?;
-            let config = make_lfs_config(&cachedir, "test_lfs_prefetch_once");
+            let config = make_lfs_config(&server, &cachedir, "test_lfs_prefetch_once");
 
             let k1 = key("a", "1");
             let k2 = key("a", "2");

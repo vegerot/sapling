@@ -1,6 +1,7 @@
-#debugruntest-compatible
 #if osx
-#require security
+#require security no-eden
+#else
+#require no-eden
 #endif
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #

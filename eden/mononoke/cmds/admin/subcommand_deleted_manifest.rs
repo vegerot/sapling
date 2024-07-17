@@ -13,21 +13,22 @@ use anyhow::Error;
 use blobrepo::BlobRepo;
 use blobrepo_hg::BlobRepoHg;
 use blobstore::Loadable;
-use changeset_fetcher::ChangesetFetcherArc;
 use clap_old::App;
 use clap_old::Arg;
 use clap_old::ArgMatches;
 use clap_old::SubCommand;
+use clientinfo::ClientEntryPoint;
+use clientinfo::ClientInfo;
 use cloned::cloned;
 use cmdlib::args;
 use cmdlib::args::MononokeMatches;
 use cmdlib::helpers;
+use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use deleted_manifest::DeletedManifestOps;
 use deleted_manifest::RootDeletedManifestV2Id;
 use derived_data::BonsaiDerived;
 use fbinit::FacebookInit;
-use futures::compat::Stream01CompatExt;
 use futures::future;
 use futures::StreamExt;
 use futures::TryStreamExt;
@@ -39,7 +40,6 @@ use mononoke_types::ChangesetId;
 use mononoke_types::DeletedManifestV2Id;
 use mononoke_types::NonRootMPath;
 use repo_blobstore::RepoBlobstoreRef;
-use revset::AncestorsNodeStream;
 use slog::debug;
 use slog::Logger;
 
@@ -103,7 +103,11 @@ pub async fn subcommand_deleted_manifest<'a>(
     sub_matches: &'a ArgMatches<'_>,
 ) -> Result<(), SubcommandError> {
     let repo: BlobRepo = args::not_shardmanager_compatible::open_repo(fb, &logger, matches).await?;
-    let ctx = CoreContext::new_with_logger(fb, logger.clone());
+    let ctx = CoreContext::new_with_logger_and_client_info(
+        fb,
+        logger.clone(),
+        ClientInfo::default_with_entry_point(ClientEntryPoint::MononokeAdmin),
+    );
 
     match sub_matches.subcommand() {
         (COMMAND_MANIFEST, Some(matches)) => {
@@ -159,7 +163,7 @@ async fn subcommand_manifest(
         .await?;
     entries.sort_by_key(|(path, _)| path.clone());
     for (path, mf_id) in entries {
-        println!("{}/ {:?}", NonRootMPath::display_opt(path.as_ref()), mf_id);
+        println!("{}/ {:?}", MPath::display_opt(&path), mf_id);
     }
     Ok(())
 }
@@ -170,8 +174,10 @@ async fn subcommand_verify(
     cs_id: ChangesetId,
     limit: u64,
 ) -> Result<(), Error> {
-    let mut csids = AncestorsNodeStream::new(ctx.clone(), &repo.changeset_fetcher_arc(), cs_id)
-        .compat()
+    let mut csids = repo
+        .commit_graph()
+        .ancestors_difference_stream(&ctx, vec![cs_id], vec![])
+        .await?
         .take(limit as usize);
     while let Some(cs_id) = csids.try_next().await? {
         verify_single_commit(ctx.clone(), repo.clone(), cs_id).await?

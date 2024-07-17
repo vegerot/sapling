@@ -1,6 +1,8 @@
 #chg-compatible
+#debugruntest-incompatible
   $ setconfig devel.segmented-changelog-rev-compat=true
   $ setconfig experimental.allowfilepeer=True
+  $ setconfig ui.ignorerevnum=true
 
 Set up extension and repos
 
@@ -186,8 +188,7 @@ Test that tracking isn't over-eager on rebase
   $ hg bookmarks -v
    * c                         ff58066d17c3            [remote/a: 1 ahead, 2 behind]
   $ hg rebase -s .
-  abort: no matching bookmark to rebase - please rebase to an explicit rev or bookmark
-  (run 'hg heads' to see all heads)
+  abort: you must specify a destination (-d) for the rebase
   [255]
   $ hg log -G -T '{node|short} {bookmarks} {remotebookmarks}\n'
   @  ff58066d17c3 c

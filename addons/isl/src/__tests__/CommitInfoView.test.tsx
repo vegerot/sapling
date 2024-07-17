@@ -5,12 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {Hash} from '../types';
-
 import App from '../App';
-import * as commitMessageFields from '../CommitInfoView/CommitMessageFields';
 import platform from '../platform';
-import {CommitInfoTestUtils, ignoreRTL} from '../testQueries';
+import {CommitInfoTestUtils, CommitTreeListTestUtils, ignoreRTL} from '../testQueries';
 import {
   resetTestMessages,
   expectMessageSentToServer,
@@ -19,15 +16,14 @@ import {
   closeCommitInfoSidebar,
   simulateUncommittedChangedFiles,
   simulateMessageFromServer,
+  openCommitInfoSidebar,
+  waitForWithTick,
 } from '../testUtils';
-import {CommandRunner, SucceedableRevset} from '../types';
-import {fireEvent, render, screen, waitFor, within} from '@testing-library/react';
+import {CommandRunner, succeedableRevset} from '../types';
+import {fireEvent, render, screen, waitFor, within, act} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import {act} from 'react-dom/test-utils';
 
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
-
-jest.mock('../MessageBus');
 
 const {
   withinCommitInfo,
@@ -49,10 +45,6 @@ const {
 describe('CommitInfoView', () => {
   beforeEach(() => {
     resetTestMessages();
-    // Use OSS message fields for tests, even internally for consistency
-    jest
-      .spyOn(commitMessageFields, 'getDefaultCommitMessageSchema')
-      .mockImplementation(() => commitMessageFields.OSSDefaultFieldSchema);
   });
 
   it('shows loading spinner on mount', () => {
@@ -65,6 +57,7 @@ describe('CommitInfoView', () => {
     beforeEach(() => {
       render(<App />);
       act(() => {
+        openCommitInfoSidebar();
         expectMessageSentToServer({
           type: 'subscribe',
           kind: 'smartlogCommits',
@@ -74,18 +67,13 @@ describe('CommitInfoView', () => {
           value: [
             COMMIT('1', 'some public base', '0', {phase: 'public'}),
             COMMIT('a', 'My Commit', '1'),
-            COMMIT('b', 'Head Commit', 'a', {isHead: true}),
+            COMMIT('b', 'Head Commit', 'a', {isDot: true}),
           ],
         });
       });
     });
 
     describe('drawer', () => {
-      it('starts with commit info open', () => {
-        expect(screen.getByTestId('commit-info-view')).toBeInTheDocument();
-        expect(screen.getByText('Commit Info')).toBeInTheDocument();
-      });
-
       it('can close commit info sidebar by clicking label', () => {
         expect(screen.getByTestId('commit-info-view')).toBeInTheDocument();
         expect(screen.getByText('Commit Info')).toBeInTheDocument();
@@ -127,7 +115,7 @@ describe('CommitInfoView', () => {
               COMMIT('1', 'some public base', '0', {phase: 'public'}),
               COMMIT('a', 'My Commit', '1', {filesSample: [{path: 'src/ca.js', status: 'M'}]}),
               COMMIT('b', 'Head Commit', 'a', {
-                isHead: true,
+                isDot: true,
                 filesSample: [{path: 'src/cb.js', status: 'M'}],
                 totalFileCount: 1,
               }),
@@ -192,7 +180,7 @@ describe('CommitInfoView', () => {
             value: [
               COMMIT('1', 'some public base', '0', {phase: 'public'}),
               COMMIT('a', 'Head Commit', '1', {
-                isHead: true,
+                isDot: true,
                 filesSample: new Array(25)
                   .fill(null)
                   .map((_, i) => ({path: `src/file${i}.txt`, status: 'M'})),
@@ -236,6 +224,7 @@ describe('CommitInfoView', () => {
             type: 'runOperation',
             operation: {
               args: [
+                {type: 'config', key: 'amend.autorestack', value: 'always'},
                 'amend',
                 '--addremove',
                 {type: 'repo-relative-file', path: 'src/file2.js'},
@@ -244,7 +233,7 @@ describe('CommitInfoView', () => {
               ],
               id: expect.anything(),
               runner: CommandRunner.Sapling,
-              trackEventName: 'AmendOperation',
+              trackEventName: 'AmendFileSubsetOperation',
             },
           }),
         );
@@ -268,7 +257,7 @@ describe('CommitInfoView', () => {
         expect(amendButton?.disabled).toBe(true);
       });
 
-      it('shows optimistic uncommitted changes', () => {
+      it('shows optimistic uncommitted changes', async () => {
         act(() => {
           simulateUncommittedChangedFiles({
             value: [],
@@ -277,12 +266,15 @@ describe('CommitInfoView', () => {
 
         expect(screen.queryByText('Amend and Submit')).not.toBeInTheDocument();
 
+        jest.spyOn(platform, 'confirm').mockImplementation(() => Promise.resolve(true));
         act(() => {
           fireEvent.click(screen.getByText('Uncommit'));
         });
 
-        expect(withinCommitInfo().queryByText(ignoreRTL('cb.js'))).toBeInTheDocument();
-        expect(screen.queryByText('Amend and Submit')).toBeInTheDocument();
+        await waitFor(() => {
+          expect(withinCommitInfo().queryByText(ignoreRTL('cb.js'))).toBeInTheDocument();
+          expect(screen.queryByText('Amend and Submit')).toBeInTheDocument();
+        });
       });
     });
 
@@ -295,7 +287,7 @@ describe('CommitInfoView', () => {
               COMMIT('a', 'My Commit', '1', {description: 'Summary: First commit in the stack'}),
               COMMIT('b', 'Head Commit', 'a', {
                 description: 'Summary: stacked commit',
-                isHead: true,
+                isDot: true,
               }),
             ],
           });
@@ -453,10 +445,24 @@ describe('CommitInfoView', () => {
           });
         });
 
-        it('focuses topmost field (title) when both title and description start being edited simultaneously', async () => {
+        it('focuses topmost field when all fields start being edited', async () => {
+          act(() => {
+            simulateUncommittedChangedFiles({value: [{path: 'src/file1.js', status: 'M'}]});
+          });
           // edit fields, then switch selected commit and switch back to edit both fields together
-          clickToEditTitle();
-          clickToEditDescription();
+          fireEvent.click(screen.getByText('Amend as...', {exact: false}));
+
+          await waitFor(() => {
+            expect(getTitleEditor()).toHaveFocus();
+            expect(getDescriptionEditor()).not.toHaveFocus();
+          });
+        });
+
+        it('focuses topmost edited field when loading from saved state', async () => {
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
           {
             act(() => {
               userEvent.type(getTitleEditor(), ' hello new title');
@@ -524,15 +530,19 @@ describe('CommitInfoView', () => {
           it('enables metaedit button if fields are edited', () => {
             clickToSelectCommit('a');
 
-            clickToEditTitle();
-            clickToEditDescription();
+            act(() => {
+              clickToEditTitle();
+              clickToEditDescription();
+            });
           });
 
           it('runs metaedit', async () => {
             clickToSelectCommit('a');
 
-            clickToEditTitle();
-            clickToEditDescription();
+            act(() => {
+              clickToEditTitle();
+              clickToEditDescription();
+            });
 
             {
               act(() => {
@@ -554,10 +564,10 @@ describe('CommitInfoView', () => {
                   args: [
                     'metaedit',
                     '--rev',
-                    SucceedableRevset('a'),
+                    succeedableRevset('a'),
                     '--message',
                     expect.stringMatching(
-                      /^My Commit hello new title\n+Summary: First commit in the stack\nhello new text/,
+                      /^My Commit hello new title\n+(Summary:\s+)?First commit in the stack\nhello new text/,
                     ),
                   ],
                   id: expect.anything(),
@@ -571,8 +581,10 @@ describe('CommitInfoView', () => {
           it('disables metaedit button with spinner while running', async () => {
             clickToSelectCommit('a');
 
-            clickToEditTitle();
-            clickToEditDescription();
+            act(() => {
+              clickToEditTitle();
+              clickToEditDescription();
+            });
             {
               act(() => {
                 userEvent.type(getTitleEditor(), ' hello new title');
@@ -587,7 +599,9 @@ describe('CommitInfoView', () => {
               fireEvent.click(amendMessageButton!);
             });
 
-            await waitFor(() => expect(amendMessageButton).toBeDisabled());
+            await waitForWithTick(() => {
+              expect(amendMessageButton).toBeDisabled();
+            });
           });
         });
 
@@ -599,8 +613,10 @@ describe('CommitInfoView', () => {
               }),
             );
 
-            clickToEditTitle();
-            clickToEditDescription();
+            act(() => {
+              clickToEditTitle();
+              clickToEditDescription();
+            });
 
             {
               act(() => {
@@ -616,11 +632,12 @@ describe('CommitInfoView', () => {
                 type: 'runOperation',
                 operation: {
                   args: [
+                    {type: 'config', key: 'amend.autorestack', value: 'always'},
                     'amend',
                     '--addremove',
                     '--message',
                     expect.stringMatching(
-                      /^Head Commit hello new title\n+Summary: stacked commit\nhello new text/,
+                      /^Head Commit hello new title\n+(Summary:\s+)?stacked commit\nhello new text/,
                     ),
                   ],
                   id: expect.anything(),
@@ -712,7 +729,7 @@ describe('CommitInfoView', () => {
             expect(amendMessageButton).toBeDisabled();
           });
 
-          it('shows amend message instead of amend when there are only message changes', async () => {
+          it('shows amend message instead of amend when there are only message changes', () => {
             act(() => {
               simulateUncommittedChangedFiles({
                 value: [{path: 'src/file1.js', status: 'M'}],
@@ -733,8 +750,10 @@ describe('CommitInfoView', () => {
               within(screen.getByTestId('commit-info-actions-bar')).queryByText('Amend'),
             ).toBeInTheDocument();
 
-            clickToEditTitle();
-            clickToEditDescription();
+            act(() => {
+              clickToEditTitle();
+              clickToEditDescription();
+            });
 
             // no uncommitted changes, and message is being changed
             expect(
@@ -853,7 +872,7 @@ describe('CommitInfoView', () => {
                   'commit',
                   '--addremove',
                   '--message',
-                  expect.stringMatching(/^new commit title\n+(Summary: )?my description/),
+                  expect.stringMatching(/^new commit title\n+(Summary:\s+)?my description/),
                 ],
                 id: expect.anything(),
                 runner: CommandRunner.Sapling,
@@ -907,8 +926,10 @@ describe('CommitInfoView', () => {
 
       describe('edited messages indicator', () => {
         it('does not show edited message indicator when fields are not actually changed', () => {
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
           expectIsEditingTitle();
           expectIsEditingDescription();
 
@@ -926,8 +947,10 @@ describe('CommitInfoView', () => {
         });
 
         it('shows edited message indicator when title changed', () => {
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
 
           expect(screen.queryByTestId('unsaved-message-indicator')).not.toBeInTheDocument();
 
@@ -944,8 +967,10 @@ describe('CommitInfoView', () => {
         });
 
         it('shows edited message indicator when description changed', () => {
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
 
           expect(screen.queryByTestId('unsaved-message-indicator')).not.toBeInTheDocument();
 
@@ -964,8 +989,10 @@ describe('CommitInfoView', () => {
         it('appears for other commits', () => {
           clickToSelectCommit('a');
 
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
 
           expect(screen.queryByTestId('unsaved-message-indicator')).not.toBeInTheDocument();
 
@@ -1079,8 +1106,10 @@ describe('CommitInfoView', () => {
         });
 
         it('does not cancel if you do not confirm', async () => {
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
           const confirmSpy = jest
             .spyOn(platform, 'confirm')
             .mockImplementation(() => Promise.resolve(false));
@@ -1120,7 +1149,7 @@ describe('CommitInfoView', () => {
 
           clickAmendButton();
 
-          await waitFor(() => {
+          await waitForWithTick(() => {
             expectIsNOTEditingTitle();
             expectIsNOTEditingDescription();
             expect(confirmSpy).not.toHaveBeenCalled();
@@ -1129,22 +1158,17 @@ describe('CommitInfoView', () => {
       });
 
       describe('optimistic state', () => {
-        const clickGotoCommit = (hash: Hash) => {
-          const gotoButton = within(screen.getByTestId(`commit-${hash}`)).getByText('Goto');
-          fireEvent.click(gotoButton);
-        };
-
-        it('takes previews into account when rendering head', () => {
-          clickGotoCommit('a');
+        it('takes previews into account when rendering head', async () => {
+          await CommitTreeListTestUtils.clickGoto('a');
           // while optimistic state happening...
           // show new commit in commit info without clicking it (because head is auto-selected)
           expect(withinCommitInfo().queryByText('My Commit')).toBeInTheDocument();
           expect(withinCommitInfo().queryByText('You are here')).toBeInTheDocument();
         });
 
-        it('shows new head when running goto', () => {
+        it('shows new head when running goto', async () => {
           clickToSelectCommit('b'); // explicitly select
-          clickGotoCommit('a');
+          await CommitTreeListTestUtils.clickGoto('a');
 
           expect(withinCommitInfo().queryByText('My Commit')).toBeInTheDocument();
           expect(withinCommitInfo().queryByText('You are here')).toBeInTheDocument();
@@ -1153,8 +1177,10 @@ describe('CommitInfoView', () => {
         it('renders metaedit operation smoothly', async () => {
           clickToSelectCommit('a');
 
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
           act(() => {
             userEvent.type(getTitleEditor(), ' with change!');
             userEvent.type(getDescriptionEditor(), '\nmore stuff!');
@@ -1215,7 +1241,7 @@ describe('CommitInfoView', () => {
                 COMMIT('a', 'My Commit', '1'),
                 COMMIT('b', 'Head Commit', 'a'),
                 COMMIT('c', 'New Commit', 'b', {
-                  isHead: true,
+                  isDot: true,
                   description: 'Summary: Message!',
                 }),
               ],
@@ -1262,13 +1288,15 @@ describe('CommitInfoView', () => {
                 COMMIT('1', 'some public base', '0', {phase: 'public'}),
                 COMMIT('a', 'My Commit', '1'),
                 COMMIT('b', 'Head Commit', 'a'),
-                COMMIT('c', 'New Commit', 'b', {isHead: true, description: 'Summary: Message!'}),
+                COMMIT('c', 'New Commit', 'b', {isDot: true, description: 'Summary: Message!'}),
               ],
             });
           });
 
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
           // now you can edit just fine
           expectIsEditingTitle();
           expectIsEditingDescription();
@@ -1281,8 +1309,10 @@ describe('CommitInfoView', () => {
             }),
           );
 
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
           act(() => {
             userEvent.type(getTitleEditor(), ' Hey');
             userEvent.type(getDescriptionEditor(), '\nHello');
@@ -1313,7 +1343,7 @@ describe('CommitInfoView', () => {
                 COMMIT('1', 'some public base', '0', {phase: 'public'}),
                 COMMIT('a', 'My Commit', '1'),
                 COMMIT('b2', 'Head Commit Hey', 'a', {
-                  isHead: true,
+                  isDot: true,
                   description: 'Summary: stacked commit\nHello',
                 }),
               ],
@@ -1462,23 +1492,7 @@ describe('CommitInfoView', () => {
       });
     });
 
-    describe('Public commits in amend mode', () => {
-      beforeEach(() => {
-        act(() => {
-          simulateCommits({
-            value: [
-              COMMIT('1', 'some public base', '0', {phase: 'public', isHead: true}),
-              COMMIT('a', 'My Commit', '1'),
-              COMMIT('b', 'Head Commit', 'a'),
-            ],
-          });
-        });
-      });
-
-      it('shows public label', () => {
-        expect(withinCommitInfo().getByText('Public')).toBeInTheDocument();
-      });
-
+    function expectAmendDisabled() {
       it('does not allow submitting', () => {
         expect(withinCommitInfo().queryByText('Submit')).not.toBeInTheDocument();
       });
@@ -1497,6 +1511,45 @@ describe('CommitInfoView', () => {
         expectIsNOTEditingTitle();
         expectIsNOTEditingDescription();
       });
+    }
+
+    describe('Public commits in amend mode', () => {
+      beforeEach(() => {
+        act(() => {
+          simulateCommits({
+            value: [
+              COMMIT('1', 'some public base', '0', {phase: 'public', isDot: true}),
+              COMMIT('a', 'My Commit', '1'),
+              COMMIT('b', 'Head Commit', 'a'),
+            ],
+          });
+        });
+      });
+
+      it('shows public label', () => {
+        expect(withinCommitInfo().getByText('Public')).toBeInTheDocument();
+      });
+
+      expectAmendDisabled();
+    });
+
+    describe('Obsoleted commits in amend mode', () => {
+      beforeEach(() => {
+        act(() => {
+          simulateCommits({
+            value: [
+              COMMIT('1', 'some public base', '0', {phase: 'public'}),
+              COMMIT('a', 'My Commit V1', '1', {
+                successorInfo: {hash: 'b', type: 'amend'},
+                isDot: true,
+              }),
+              COMMIT('b', 'Head Commit', '1'),
+            ],
+          });
+        });
+      });
+
+      expectAmendDisabled();
     });
   });
 });

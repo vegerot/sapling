@@ -7,17 +7,17 @@
 
 import type {ServerPlatform} from '../src/serverPlatform';
 import type {PlatformName} from 'isl/src/types';
-import type {AddressInfo} from 'net';
+import type {AddressInfo} from 'node:net';
 
 import {repositoryCache} from '../src/RepositoryCache';
 import {CLOSED_AND_SHOULD_NOT_RECONNECT_CODE} from '../src/constants';
 import {onClientConnection} from '../src/index';
 import {areTokensEqual} from './proxyUtils';
-import fs from 'fs';
-import http from 'http';
 import {grammars} from 'isl/src/generated/textmate/TextMateGrammarManifest';
-import path from 'path';
-import urlModule from 'url';
+import fs from 'node:fs';
+import http from 'node:http';
+import path from 'node:path';
+import urlModule from 'node:url';
 import WebSocket from 'ws';
 
 const ossSmartlogDir = path.join(__dirname, '../../isl');
@@ -54,17 +54,21 @@ export function startServer({
   slVersion,
   foreground,
 }: StartServerArgs): Promise<StartServerResult> {
+  const originalProcessCwd = process.cwd();
+  const serverRoot = path.isAbsolute(ossSmartlogDir)
+    ? ossSmartlogDir
+    : path.join(originalProcessCwd, ossSmartlogDir);
+
   return new Promise(resolve => {
     try {
-      const manifest = JSON.parse(
-        fs.readFileSync(path.join(ossSmartlogDir, 'build/asset-manifest.json'), 'utf-8'),
-      ) as {files: Array<string>};
-      for (const file of Object.values(manifest.files)) {
-        if (!file.startsWith('/')) {
-          resolve({type: 'error', error: `expected entry to start with / but was: \`${file}\``});
-        }
+      const files = JSON.parse(
+        fs.readFileSync(path.join(serverRoot, 'build/assetList.json'), 'utf-8'),
+      ) as Array<string>;
 
-        requestUrlToResource[file] = file.slice(1);
+      for (const file of files) {
+        // `file` might have OS slash like `"assets\\stylex.0f7433cc.css".
+        // Normalize it to URL slash.
+        requestUrlToResource['/' + file.replace(/\\/g, '/')] = file;
       }
     } catch (e) {
       // ignore...
@@ -111,7 +115,7 @@ export function startServer({
           const relativePath = requestUrlToResource[pathname];
           let contents: string | Buffer;
           try {
-            contents = await fs.promises.readFile(path.join(ossSmartlogDir, 'build', relativePath));
+            contents = await fs.promises.readFile(path.join(serverRoot, 'build', relativePath));
           } catch (e: unknown) {
             res.writeHead(500, {'Content-Type': 'text/plain'});
             res.end(htmlEscape((e as Error).toString()));
@@ -156,11 +160,13 @@ export function startServer({
       let providedToken: string | undefined;
       let cwd: string | undefined;
       let platform: string | undefined;
+      let sessionId: string | undefined;
       if (connectionRequest.url) {
         const searchParams = getSearchParams(connectionRequest.url);
         providedToken = searchParams.get('token');
         const cwdParam = searchParams.get('cwd');
         platform = searchParams.get('platform') as string;
+        sessionId = searchParams.get('sessionId');
         if (cwdParam) {
           cwd = decodeURIComponent(cwdParam);
         }
@@ -186,15 +192,18 @@ export function startServer({
         case 'androidStudioRemote':
           platformImpl = (await import('../platform/androidStudioRemoteServerPlatform')).platform;
           break;
-        case 'standalone':
-          platformImpl = (await import('../platform/standaloneServerPlatform')).platform;
-          break;
         case 'webview':
           platformImpl = (await import('../platform/webviewServerPlatform')).platform;
+          break;
+        case 'chromelike_app':
+          platformImpl = (await import('../platform/chromelikeAppServerPlatform')).platform;
           break;
         default:
         case undefined:
           break;
+      }
+      if (sessionId != null && platformImpl) {
+        platformImpl.sessionId = sessionId;
       }
 
       const dispose = onClientConnection({
@@ -207,7 +216,7 @@ export function startServer({
           const dispose = () => emitter.off('message', handler);
           return {dispose};
         },
-        cwd: cwd ?? process.cwd(),
+        cwd: cwd ?? originalProcessCwd,
         logFileLocation: logFileLocation === 'stdout' ? undefined : logFileLocation,
         command,
         version: slVersion,
@@ -239,9 +248,13 @@ export function startServer({
     server.on('error', onError);
 
     // return succesful result when the server is successfully listening
-    server.on('listening', () =>
-      resolve({type: 'success', port: (server.address() as AddressInfo).port, pid: process.pid}),
-    );
+    server.on('listening', () => {
+      // Chdir to drive root so the "cwd" directory can be deleted on Windows.
+      if (process.platform === 'win32') {
+        process.chdir('\\');
+      }
+      resolve({type: 'success', port: (server.address() as AddressInfo).port, pid: process.pid});
+    });
   });
 }
 

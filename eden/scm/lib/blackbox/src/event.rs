@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use anyhow::Result;
+use clientinfo::get_client_request_info;
 use serde_alt::serde_alt;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
@@ -132,9 +133,9 @@ pub enum Event {
         value: Value,
     },
 
-    /// An EdenApi HTTP request was dispatched.
+    /// An SaplingRemoteApi HTTP request was dispatched.
     #[serde(rename = "EA", alias = "edenapi")]
-    EdenApi {
+    SaplingRemoteApi {
         #[serde(rename = "U")]
         url: Option<String>,
         #[serde(rename = "T")]
@@ -459,7 +460,7 @@ pub enum NetworkOp {
     HttpGetPack,
 
     #[serde(rename = "E", alias = "edenapi")]
-    EdenApiRequest,
+    SaplingRemoteApiRequest,
 }
 
 #[serde_alt]
@@ -644,7 +645,12 @@ impl fmt::Display for Event {
                     .join(" ")
             )?,
             Debug { value } => write!(f, "[debug] {}", json_to_string(value))?,
-            Exception { msg } => write!(f, "[command_exception] {}", msg)?,
+            Exception { msg } => write!(
+                f,
+                "[command_exception] {}, client correlator: {}",
+                msg,
+                get_client_request_info().correlator
+            )?,
             Finish {
                 exit_code,
                 max_rss,

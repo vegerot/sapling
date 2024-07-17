@@ -20,11 +20,9 @@ use types::key::Key;
 use types::parents::Parents;
 
 use crate::Blake3;
-use crate::ContentId;
 use crate::InvalidHgId;
 use crate::ServerError;
 use crate::Sha1;
-use crate::Sha256;
 use crate::UploadToken;
 
 /// Tombstone string that replaces the content of redacted files.
@@ -66,18 +64,19 @@ impl FileError {
 /// File "aux data", requires an additional mononoke blobstore lookup. See mononoke_types::ContentMetadataV2.
 #[auto_wire]
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
-#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
 pub struct FileAuxData {
     #[id(0)]
     pub total_size: u64,
-    #[id(1)]
-    pub content_id: ContentId,
+    // #[id(1)] # deprecated
     #[id(2)]
     pub sha1: Sha1,
-    #[id(3)]
-    pub sha256: Sha256,
+    // #[id(3)] # deprecated
     #[id(4)]
-    pub seeded_blake3: Option<Blake3>,
+    pub blake3: Blake3,
+    // None 'file_header_metadata' would mean file_header_metadata is not fetched/not known if it is present
+    // Empty metadata would be translated into empty blob
+    #[id(5)]
+    pub file_header_metadata: Option<Bytes>,
 }
 
 /// File content
@@ -167,6 +166,37 @@ pub struct FileEntry {
     pub aux_data: Option<FileAuxData>,
 }
 
+impl FileAuxData {
+    /// Calculate `FileAuxData` from file content.
+    pub fn from_content(data: &[u8]) -> Self {
+        let sha1 = {
+            use sha1::Digest;
+            let mut hash = sha1::Sha1::new();
+            hash.update(data);
+            let bytes: [u8; Sha1::len()] = hash.finalize().into();
+            Sha1::from(bytes)
+        };
+        let blake3 = {
+            use blake3::Hasher;
+            #[cfg(fbcode_build)]
+            let key = blake3_constants::BLAKE3_HASH_KEY;
+            #[cfg(not(fbcode_build))]
+            let key = b"20220728-2357111317192329313741#";
+            let mut hasher = Hasher::new_keyed(key);
+            hasher.update(data.as_ref());
+            let hashed_bytes: [u8; Blake3::len()] = hasher.finalize().into();
+            Blake3::from(hashed_bytes)
+        };
+        let total_size = data.len() as _;
+        Self {
+            total_size,
+            sha1,
+            blake3,
+            file_header_metadata: None, // can't be calculated
+        }
+    }
+}
+
 impl FileEntry {
     pub fn new(key: Key, parents: Parents) -> Self {
         Self {
@@ -242,9 +272,7 @@ pub struct FileSpec {
 #[derive(Clone, Default, Debug, Eq, PartialEq, Serialize)]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
 pub struct FileRequest {
-    // TODO(meyer): Deprecate keys field
-    #[id(0)]
-    pub keys: Vec<Key>,
+    // #[id(0)] # deprecated
     #[id(1)]
     pub reqs: Vec<FileSpec>,
 }
@@ -256,6 +284,19 @@ impl Arbitrary for FileContent {
         Self {
             hg_file_blob: Bytes::from(bytes),
             metadata: Arbitrary::arbitrary(g),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "for-tests"))]
+impl Arbitrary for FileAuxData {
+    fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+        let bytes: Vec<u8> = Arbitrary::arbitrary(g);
+        Self {
+            total_size: Arbitrary::arbitrary(g),
+            sha1: Arbitrary::arbitrary(g),
+            blake3: Arbitrary::arbitrary(g),
+            file_header_metadata: Some(Bytes::from(bytes)),
         }
     }
 }

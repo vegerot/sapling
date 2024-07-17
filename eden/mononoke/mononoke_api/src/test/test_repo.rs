@@ -22,14 +22,13 @@ use chrono::TimeZone;
 use cross_repo_sync::update_mapping_with_version;
 use cross_repo_sync::CommitSyncRepos;
 use cross_repo_sync::CommitSyncer;
+use cross_repo_sync::SubmoduleDeps;
 use cross_repo_sync_test_utils::init_small_large_repo;
 use fbinit::FacebookInit;
 use fixtures::BranchUneven;
 use fixtures::Linear;
 use fixtures::ManyFilesDirs;
 use fixtures::TestRepoFixture;
-use futures::stream::TryStreamExt;
-use futures::FutureExt;
 use live_commit_sync_config::TestLiveCommitSyncConfigSource;
 use maplit::hashmap;
 use metaconfig_types::CommitSyncConfigVersion;
@@ -47,12 +46,9 @@ use synced_commit_mapping::ArcSyncedCommitMapping;
 use tests_utils::bookmark;
 use tests_utils::resolve_cs_id;
 use tests_utils::CreateCommitContext;
-use tunables::tunables;
-use tunables::with_tunables_async;
-use tunables::MononokeTunables;
 
+use crate::repo::XRepoLookupExactBehaviour;
 use crate::BookmarkFreshness;
-use crate::ChangesetFileOrdering;
 use crate::ChangesetId;
 use crate::ChangesetIdPrefix;
 use crate::ChangesetPrefixSpecifier;
@@ -65,9 +61,9 @@ use crate::FileType;
 use crate::HgChangesetId;
 use crate::HgChangesetIdPrefix;
 use crate::Mononoke;
-use crate::MononokePath;
 use crate::TreeEntry;
 use crate::TreeId;
+use crate::XRepoLookupSyncBehaviour;
 
 #[fbinit::test]
 async fn commit_info_by_hash(fb: FacebookInit) -> Result<(), Error> {
@@ -268,546 +264,6 @@ async fn commit_is_ancestor_of(fb: FacebookInit) -> Result<(), Error> {
         );
     }
     Ok(())
-}
-
-async fn commit_find_files_impl(fb: FacebookInit) -> Result<(), Error> {
-    let ctx = CoreContext::test_mock(fb);
-    let mononoke = Mononoke::new_test(vec![(
-        "test".to_string(),
-        ManyFilesDirs::get_custom_test_repo(fb).await,
-    )])
-    .await?;
-    let repo = mononoke
-        .repo(ctx, "test")
-        .await?
-        .expect("repo exists")
-        .build()
-        .await?;
-    let hash = "b0d1bf77898839595ee0f0cba673dd6e3be9dadaaa78bc6dd2dea97ca6bee77e";
-    let cs_id = ChangesetId::from_str(hash)?;
-    let cs = repo.changeset(cs_id).await?.expect("changeset exists");
-
-    // Find everything
-    let mut files: Vec<_> = cs
-        .find_files_unordered(None, None)
-        .await?
-        .try_collect()
-        .await?;
-    files.sort();
-    let expected_files = vec![
-        MononokePath::try_from("1")?,
-        MononokePath::try_from("2")?,
-        MononokePath::try_from("dir1/file_1_in_dir1")?,
-        MononokePath::try_from("dir1/file_2_in_dir1")?,
-        MononokePath::try_from("dir1/subdir1/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_2")?,
-        MononokePath::try_from("dir2/file_1_in_dir2")?,
-    ];
-    assert_eq!(files, expected_files);
-
-    // Find everything ordered
-    let files: Vec<_> = cs
-        .find_files(
-            None,
-            None,
-            None,
-            ChangesetFileOrdering::Ordered { after: None },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    assert_eq!(files, expected_files);
-
-    // Find everything after a particular file
-    let files: Vec<_> = cs
-        .find_files(
-            None,
-            None,
-            None,
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    let expected_files = vec![
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_2")?,
-        MononokePath::try_from("dir2/file_1_in_dir2")?,
-    ];
-    assert_eq!(files, expected_files);
-
-    // Prefixes
-    let mut files: Vec<_> = cs
-        .find_files_unordered(
-            Some(vec![
-                MononokePath::try_from("dir1/subdir1/subsubdir1")?,
-                MononokePath::try_from("dir2")?,
-            ]),
-            None,
-        )
-        .await?
-        .try_collect()
-        .await?;
-    files.sort();
-    let expected_files = vec![
-        MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?,
-        MononokePath::try_from("dir2/file_1_in_dir2")?,
-    ];
-    assert_eq!(files, expected_files);
-
-    // Prefixes ordered, starting at the root.  (This has no real effect on
-    // the output vs `after: None`, but exercise the code path anyway).
-    let files: Vec<_> = cs
-        .find_files(
-            Some(vec![
-                MononokePath::try_from("dir1/subdir1/subsubdir1")?,
-                MononokePath::try_from("dir2")?,
-            ]),
-            None,
-            None,
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    assert_eq!(files, expected_files);
-
-    // Prefixes ordered after
-    let files: Vec<_> = cs
-        .find_files(
-            Some(vec![
-                MononokePath::try_from("dir1/subdir1/subsubdir1")?,
-                MononokePath::try_from("dir2")?,
-            ]),
-            None,
-            None,
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    let expected_files = vec![MononokePath::try_from("dir2/file_1_in_dir2")?];
-    assert_eq!(files, expected_files);
-
-    // Basenames
-    let mut files: Vec<_> = cs
-        .find_files_unordered(None, Some(vec![String::from("file_1")]))
-        .await?
-        .try_collect()
-        .await?;
-    files.sort();
-    let expected_files = vec![
-        MononokePath::try_from("dir1/subdir1/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-    ];
-    assert_eq!(files, expected_files);
-
-    // Basenames ordered
-    let files: Vec<_> = cs
-        .find_files(
-            None,
-            Some(vec![String::from("file_1")]),
-            None,
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    assert_eq!(files, expected_files);
-
-    // Basenames ordered after
-    let files: Vec<_> = cs
-        .find_files(
-            None,
-            Some(vec![String::from("file_1")]),
-            None,
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    let expected_files = vec![MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?];
-    assert_eq!(files, expected_files);
-
-    // Basenames and Prefixes
-    let mut files: Vec<_> = cs
-        .find_files_unordered(
-            Some(vec![
-                MononokePath::try_from("dir1/subdir1/subsubdir2")?,
-                MononokePath::try_from("dir2")?,
-            ]),
-            Some(vec![String::from("file_2"), String::from("file_1_in_dir2")]),
-        )
-        .await?
-        .try_collect()
-        .await?;
-    files.sort();
-    let expected_files = vec![
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_2")?,
-        MononokePath::try_from("dir2/file_1_in_dir2")?,
-    ];
-    assert_eq!(files, expected_files);
-
-    // Basenames and Prefixes ordered
-    let mut files: Vec<_> = cs
-        .find_files(
-            Some(vec![
-                MononokePath::try_from("dir1/subdir1/subsubdir2")?,
-                MononokePath::try_from("dir2")?,
-            ]),
-            Some(vec![String::from("file_2"), String::from("file_1_in_dir2")]),
-            None,
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    let expected_files = vec![
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_2")?,
-        MononokePath::try_from("dir2/file_1_in_dir2")?,
-    ];
-    files.sort();
-    assert_eq!(files, expected_files);
-
-    // Basenames and Prefixes ordered after
-    let files: Vec<_> = cs
-        .find_files(
-            Some(vec![
-                MononokePath::try_from("dir1/subdir1/subsubdir2")?,
-                MononokePath::try_from("dir2")?,
-            ]),
-            Some(vec![String::from("file_2"), String::from("file_1_in_dir2")]),
-            None,
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("dir1a/file_1_in_dir2")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    let expected_files = vec![MononokePath::try_from("dir2/file_1_in_dir2")?];
-    assert_eq!(files, expected_files);
-
-    // Suffixes
-    let mut files: Vec<_> = cs
-        .find_files(
-            None,
-            None,
-            Some(vec![String::from("_1"), String::from("_2")]),
-            ChangesetFileOrdering::Unordered,
-        )
-        .await?
-        .try_collect()
-        .await?;
-    files.sort();
-    let expected_files = vec![
-        MononokePath::try_from("dir1/subdir1/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_2")?,
-    ];
-    assert_eq!(files, expected_files);
-
-    // Suffixes, ordered
-    let files: Vec<_> = cs
-        .find_files(
-            None,
-            None,
-            Some(vec![String::from("_1"), String::from("_2")]),
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    let expected_files = vec![
-        MononokePath::try_from("dir1/subdir1/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_2")?,
-    ];
-    assert_eq!(files, expected_files);
-
-    // Suffixes, ordered after
-    let files: Vec<_> = cs
-        .find_files(
-            None,
-            None,
-            Some(vec![String::from("_1"), String::from("_2")]),
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    let expected_files = vec![
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_2")?,
-    ];
-    assert_eq!(files, expected_files);
-
-    // Suffixes, prefixes
-    let mut files: Vec<_> = cs
-        .find_files(
-            Some(vec![
-                MononokePath::try_from("dir1/subdir1/subsubdir1")?,
-                MononokePath::try_from("dir1/subdir1/subsubdir2")?,
-            ]),
-            None,
-            Some(vec![String::from("1"), String::from("2")]),
-            ChangesetFileOrdering::Unordered,
-        )
-        .await?
-        .try_collect()
-        .await?;
-    files.sort();
-    let expected_files = vec![
-        MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_2")?,
-    ];
-    assert_eq!(files, expected_files);
-
-    // Suffixes, prefixes, ordered
-    let files: Vec<_> = cs
-        .find_files(
-            Some(vec![
-                MononokePath::try_from("dir1/subdir1/subsubdir1")?,
-                MononokePath::try_from("dir1/subdir1/subsubdir2")?,
-            ]),
-            None,
-            Some(vec![String::from("1"), String::from("2")]),
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    let expected_files = vec![
-        MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_2")?,
-    ];
-    assert_eq!(files, expected_files);
-
-    // Suffixes, prefixes, ordered after
-    let files: Vec<_> = cs
-        .find_files(
-            Some(vec![
-                MononokePath::try_from("dir1/subdir1/subsubdir1")?,
-                MononokePath::try_from("dir1/subdir1/subsubdir2")?,
-            ]),
-            None,
-            Some(vec![String::from("1"), String::from("2")]),
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    let expected_files = vec![
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_2")?,
-    ];
-    assert_eq!(files, expected_files);
-
-    // Suffixes, basenames
-    let mut files: Vec<_> = cs
-        .find_files(
-            None,
-            Some(vec![String::from("file_1_in_dir2")]),
-            Some(vec![String::from("1")]),
-            ChangesetFileOrdering::Unordered,
-        )
-        .await?
-        .try_collect()
-        .await?;
-    files.sort();
-    let expected_files = vec![
-        MononokePath::try_from("1")?,
-        MononokePath::try_from("dir1/file_1_in_dir1")?,
-        MononokePath::try_from("dir1/file_2_in_dir1")?,
-        MononokePath::try_from("dir1/subdir1/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?,
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-        MononokePath::try_from("dir2/file_1_in_dir2")?,
-    ];
-    assert_eq!(files, expected_files);
-
-    // Suffixes, basenames, ordered
-    let files: Vec<_> = cs
-        .find_files(
-            None,
-            Some(vec![String::from("file_1_in_dir2")]),
-            Some(vec![String::from("1")]),
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    // BSSM have different but consistent orders
-    let expected_files = if tunables()
-        .disable_basename_suffix_skeleton_manifest()
-        .unwrap_or_default()
-    {
-        vec![
-            MononokePath::try_from("1")?,
-            MononokePath::try_from("dir1/file_1_in_dir1")?,
-            MononokePath::try_from("dir1/file_2_in_dir1")?,
-            MononokePath::try_from("dir1/subdir1/file_1")?,
-            MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?,
-            MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-            MononokePath::try_from("dir2/file_1_in_dir2")?,
-        ]
-    } else {
-        vec![
-            MononokePath::try_from("1")?,
-            MononokePath::try_from("dir1/subdir1/file_1")?,
-            MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?,
-            MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-            MononokePath::try_from("dir1/file_1_in_dir1")?,
-            MononokePath::try_from("dir1/file_2_in_dir1")?,
-            MononokePath::try_from("dir2/file_1_in_dir2")?,
-        ]
-    };
-    assert_eq!(files, expected_files);
-
-    // Suffixes, basenames, ordered after
-    let files: Vec<_> = cs
-        .find_files(
-            None,
-            Some(vec![String::from("file_1_in_dir2")]),
-            Some(vec![String::from("1")]),
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir1/file_1")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    let expected_files = if tunables()
-        .disable_basename_suffix_skeleton_manifest()
-        .unwrap_or_default()
-    {
-        vec![
-            MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-            MononokePath::try_from("dir2/file_1_in_dir2")?,
-        ]
-    } else {
-        vec![
-            MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-            MononokePath::try_from("dir1/file_1_in_dir1")?,
-            MononokePath::try_from("dir1/file_2_in_dir1")?,
-            MononokePath::try_from("dir2/file_1_in_dir2")?,
-        ]
-    };
-    assert_eq!(files, expected_files);
-
-    // Suffixes, basenames, prefixes
-    let mut files: Vec<_> = cs
-        .find_files(
-            Some(vec![
-                MononokePath::try_from("dir1/subdir1/subsubdir2")?,
-                MononokePath::try_from("dir2")?,
-            ]),
-            Some(vec![String::from("file_1_in_dir2")]),
-            Some(vec![String::from("1")]),
-            ChangesetFileOrdering::Unordered,
-        )
-        .await?
-        .try_collect()
-        .await?;
-    files.sort();
-    let expected_files = vec![
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-        MononokePath::try_from("dir2/file_1_in_dir2")?,
-    ];
-    assert_eq!(files, expected_files);
-
-    // Suffixes, basenames, prefixes, ordered
-    let files: Vec<_> = cs
-        .find_files(
-            Some(vec![
-                MononokePath::try_from("dir1/subdir1/subsubdir2")?,
-                MononokePath::try_from("dir2")?,
-            ]),
-            Some(vec![String::from("file_1_in_dir2")]),
-            Some(vec![String::from("1")]),
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    let expected_files = vec![
-        MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?,
-        MononokePath::try_from("dir2/file_1_in_dir2")?,
-    ];
-    assert_eq!(files, expected_files);
-
-    // Suffixes, basenames, prefixes, ordered after
-    let files: Vec<_> = cs
-        .find_files(
-            Some(vec![
-                MononokePath::try_from("dir1/subdir1/subsubdir2")?,
-                MononokePath::try_from("dir2")?,
-            ]),
-            Some(vec![String::from("file_1_in_dir2")]),
-            Some(vec![String::from("1")]),
-            ChangesetFileOrdering::Ordered {
-                after: Some(MononokePath::try_from("dir1/subdir1/subsubdir2/file_1")?),
-            },
-        )
-        .await?
-        .try_collect()
-        .await?;
-    let expected_files = vec![MononokePath::try_from("dir2/file_1_in_dir2")?];
-    assert_eq!(files, expected_files);
-
-    Ok(())
-}
-
-#[fbinit::test]
-async fn commit_find_files_with_bssm(fb: FacebookInit) {
-    let tunables = MononokeTunables::default();
-    tunables.update_bools(&hashmap! {
-        "enable_bssm_suffix_query".to_string() => true
-    });
-    with_tunables_async(tunables, commit_find_files_impl(fb).boxed())
-        .await
-        .unwrap();
-}
-
-#[fbinit::test]
-async fn commit_find_files_without_bssm(fb: FacebookInit) {
-    let tunables = MononokeTunables::default();
-    tunables.update_bools(&hashmap! {
-        "disable_basename_suffix_skeleton_manifest".to_string() => true
-    });
-    with_tunables_async(tunables, commit_find_files_impl(fb).boxed())
-        .await
-        .unwrap();
 }
 
 #[fbinit::test]
@@ -1121,7 +577,13 @@ async fn xrepo_commit_lookup_simple(fb: FacebookInit) -> Result<(), Error> {
     );
     // Confirm that a cross-repo lookup for an unsynced commit just fails
     let cs = smallrepo
-        .xrepo_commit_lookup(&largerepo, small_master_cs_id, None)
+        .xrepo_commit_lookup(
+            &largerepo,
+            small_master_cs_id,
+            None,
+            XRepoLookupSyncBehaviour::SyncIfAbsent,
+            XRepoLookupExactBehaviour::WorkingCopyEquivalence,
+        )
         .await?
         .expect("changeset should exist");
     let large_master_cs_id = resolve_cs_id(&ctx, largerepo.blob_repo(), "master").await?;
@@ -1132,7 +594,13 @@ async fn xrepo_commit_lookup_simple(fb: FacebookInit) -> Result<(), Error> {
         "remapping {} from large to small", large_master_cs_id
     );
     let cs = largerepo
-        .xrepo_commit_lookup(&smallrepo, large_master_cs_id, None)
+        .xrepo_commit_lookup(
+            &smallrepo,
+            large_master_cs_id,
+            None,
+            XRepoLookupSyncBehaviour::SyncIfAbsent,
+            XRepoLookupExactBehaviour::WorkingCopyEquivalence,
+        )
         .await?
         .expect("changeset should exist");
     assert_eq!(cs.id(), small_master_cs_id);
@@ -1167,7 +635,13 @@ async fn xrepo_commit_lookup_draft(fb: FacebookInit) -> Result<(), Error> {
             .await?;
 
     let cs = largerepo
-        .xrepo_commit_lookup(&smallrepo, new_large_draft, None)
+        .xrepo_commit_lookup(
+            &smallrepo,
+            new_large_draft,
+            None,
+            XRepoLookupSyncBehaviour::SyncIfAbsent,
+            XRepoLookupExactBehaviour::WorkingCopyEquivalence,
+        )
         .await?;
     assert!(cs.is_some());
     let bcs = cs
@@ -1185,7 +659,13 @@ async fn xrepo_commit_lookup_draft(fb: FacebookInit) -> Result<(), Error> {
             .commit()
             .await?;
     let cs = smallrepo
-        .xrepo_commit_lookup(&largerepo, new_small_draft, None)
+        .xrepo_commit_lookup(
+            &largerepo,
+            new_small_draft,
+            None,
+            XRepoLookupSyncBehaviour::SyncIfAbsent,
+            XRepoLookupExactBehaviour::WorkingCopyEquivalence,
+        )
         .await?;
     assert!(cs.is_some());
     let bcs = cs
@@ -1231,7 +711,13 @@ async fn xrepo_commit_lookup_public(fb: FacebookInit) -> Result<(), Error> {
         .await?;
 
     let cs = largerepo
-        .xrepo_commit_lookup(&smallrepo, new_large_public, None)
+        .xrepo_commit_lookup(
+            &smallrepo,
+            new_large_public,
+            None,
+            XRepoLookupSyncBehaviour::SyncIfAbsent,
+            XRepoLookupExactBehaviour::WorkingCopyEquivalence,
+        )
         .await?;
     assert!(cs.is_some());
     let bcs = cs
@@ -1252,7 +738,13 @@ async fn xrepo_commit_lookup_public(fb: FacebookInit) -> Result<(), Error> {
         .set_to(new_small_public)
         .await?;
     let res = smallrepo
-        .xrepo_commit_lookup(&largerepo, new_small_public, None)
+        .xrepo_commit_lookup(
+            &largerepo,
+            new_small_public,
+            None,
+            XRepoLookupSyncBehaviour::SyncIfAbsent,
+            XRepoLookupExactBehaviour::WorkingCopyEquivalence,
+        )
         .await;
     assert!(res.is_err());
 
@@ -1288,7 +780,13 @@ async fn xrepo_commit_lookup_config_changing_live(fb: FacebookInit) -> Result<()
             .await?;
 
     let first_small = largerepo
-        .xrepo_commit_lookup(&smallrepo, first_large, None)
+        .xrepo_commit_lookup(
+            &smallrepo,
+            first_large,
+            None,
+            XRepoLookupSyncBehaviour::SyncIfAbsent,
+            XRepoLookupExactBehaviour::WorkingCopyEquivalence,
+        )
         .await?;
     let file_changes: Vec<_> = first_small
         .unwrap()
@@ -1336,6 +834,7 @@ async fn xrepo_commit_lookup_config_changing_live(fb: FacebookInit) -> Result<()
     let commit_sync_repos = CommitSyncRepos::new(
         largerepo.inner_repo().clone(),
         smallrepo.inner_repo().clone(),
+        SubmoduleDeps::ForSync(HashMap::new()),
         &common_config,
     )?;
 
@@ -1364,7 +863,13 @@ async fn xrepo_commit_lookup_config_changing_live(fb: FacebookInit) -> Result<()
             .await?;
 
     let second_small = largerepo
-        .xrepo_commit_lookup(&smallrepo, second_large, None)
+        .xrepo_commit_lookup(
+            &smallrepo,
+            second_large,
+            None,
+            XRepoLookupSyncBehaviour::SyncIfAbsent,
+            XRepoLookupExactBehaviour::WorkingCopyEquivalence,
+        )
         .await?;
     let file_changes: Vec<_> = second_small
         .unwrap()
@@ -1399,7 +904,7 @@ async fn init_x_repo(
         ),
         commit_sync_config.clone(),
         mapping.clone(),
-        Arc::new(lv_cfg),
+        lv_cfg,
     )
     .await?;
     lv_cfg_src.add_config(commit_sync_config);

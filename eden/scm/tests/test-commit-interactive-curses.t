@@ -1,8 +1,7 @@
-#debugruntest-compatible
 
   $ eagerepo
   $ configure mutation-norecord
-#require tic
+#require tic no-eden
 
 Set up a repo
 

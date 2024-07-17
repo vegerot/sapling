@@ -1,6 +1,10 @@
-#chg-compatible
+
+#require no-eden
+
+#inprocess-hg-incompatible
 
   $ setconfig devel.segmented-changelog-rev-compat=true
+  $ setconfig commands.update.check=none
 
 test merge-tools configuration - mostly exercising filemerge.py
 

@@ -11,13 +11,13 @@ use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use bufsize::SizeCounter;
-use bytes_old::BufMut;
-use bytes_old::BytesMut;
+use bytes::Buf;
+use bytes::BufMut;
+use bytes::BytesMut;
 use mercurial_types::delta::Delta;
 use mercurial_types::delta::Fragment;
 
 use crate::errors::ErrorKind;
-use crate::utils::BytesExt;
 
 const DELTA_HEADER_LEN: usize = 12;
 
@@ -35,9 +35,9 @@ pub fn decode_delta(buf: BytesMut) -> Result<Delta> {
         // new length: i32
         // content (new length bytes)
         // ---
-        let start = buf.drain_i32();
-        let end = buf.drain_i32();
-        let new_len = buf.drain_i32();
+        let start = buf.get_i32();
+        let end = buf.get_i32();
+        let new_len = buf.get_i32();
         // TODO: handle negative values for all the above
 
         let delta_len = (new_len as usize) + DELTA_HEADER_LEN;
@@ -77,9 +77,9 @@ pub fn encoded_len(delta: &Delta) -> usize {
 
 pub fn encode_delta<B: BufMut>(delta: &Delta, out: &mut B) {
     for fragment in delta.fragments() {
-        out.put_i32_be(fragment.start as i32);
-        out.put_i32_be(fragment.end as i32);
-        out.put_i32_be(fragment.content.len() as i32);
+        out.put_i32(fragment.start as i32);
+        out.put_i32(fragment.end as i32);
+        out.put_i32(fragment.content.len() as i32);
         out.put_slice(&fragment.content[..]);
     }
 }
@@ -126,7 +126,9 @@ mod test {
             let mut out = vec![];
             encode_delta(&delta, &mut out);
             assert_eq!(encoded_len(&delta), out.len());
-            delta == decode_delta(out.into()).unwrap()
+            let mut out_bytes = BytesMut::with_capacity(out.len());
+            out_bytes.extend_from_slice(&out);
+            delta == decode_delta(out_bytes).unwrap()
         }
     }
 }

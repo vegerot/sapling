@@ -1,11 +1,13 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
   $ enable amend
   $ setconfig experimental.evolution=obsolete
   $ setconfig experimental.narrow-heads=false
   $ setconfig visibility.enabled=true
-  $ setconfig mutation.record=true mutation.enabled=true mutation.date="0 0"
+  $ setconfig mutation.record=true mutation.enabled=true
 
   $ newrepo
   $ echo "base" > base

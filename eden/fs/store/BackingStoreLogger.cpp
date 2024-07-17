@@ -9,11 +9,11 @@
 
 #include <folly/Conv.h>
 
+#include "eden/common/telemetry/StructuredLogger.h"
 #include "eden/common/utils/ProcessInfoCache.h"
+#include "eden/common/utils/UnboundedQueueExecutor.h"
 #include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/telemetry/LogEvent.h"
-#include "eden/fs/telemetry/StructuredLogger.h"
-#include "eden/fs/utils/UnboundedQueueExecutor.h"
 
 namespace facebook::eden {
 
@@ -69,6 +69,15 @@ void BackingStoreLogger::logImport(
       break;
     case ObjectFetchContext::ObjectType::Tree:
       typeString = "Tree";
+      break;
+    case ObjectFetchContext::RootTree:
+      typeString = "Root Tree";
+      break;
+    case ObjectFetchContext::ManifestForRoot:
+      typeString = "Manifest For Root";
+      break;
+    case ObjectFetchContext::PrefetchBlob:
+      typeString = "Prefetch Blob";
       break;
     case ObjectFetchContext::ObjectType::kObjectTypeEnumMax:
       // invalid string prolly good here

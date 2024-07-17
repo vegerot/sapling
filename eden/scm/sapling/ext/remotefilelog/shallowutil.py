@@ -9,7 +9,6 @@ from __future__ import absolute_import
 import errno
 import os
 import struct
-import sys
 import typing
 from collections import defaultdict
 from typing import Dict, IO, Mapping
@@ -118,19 +117,6 @@ def parsemeta(text, flags=0):
             s = text.index(b"\1\n", 2)
             text = text[s + 2 :]
     return meta or {}, text
-
-
-def sumdicts(*dicts):
-    """Adds all the values of *dicts together into one dictionary. This assumes
-    the values in *dicts are all summable.
-
-    e.g. [{'a': 4', 'b': 2}, {'b': 3, 'c': 1}] -> {'a': 4, 'b': 5, 'c': 1}
-    """
-    result = defaultdict(lambda: 0)
-    for dict in dicts:
-        for k, v in pycompat.iteritems(dict):
-            result[k] += v
-    return result
 
 
 def prefixkeys(dict, prefix):

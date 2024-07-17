@@ -12,8 +12,8 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include "eden/common/utils/UnixSocket.h"
 #include "eden/fs/privhelper/PrivHelperConn.h"
-#include "eden/fs/utils/UnixSocket.h"
 
 namespace folly {
 class EventBase;
@@ -108,7 +108,8 @@ class PrivHelperServer : private UnixSocket::ReceiveCallback {
   void sanityCheckMountPoint(const std::string& mountPoint);
 
   // These methods are virtual so we can override them during unit tests
-  virtual folly::File fuseMount(const char* mountPath, bool readOnly);
+  virtual folly::File
+  fuseMount(const char* mountPath, bool readOnly, const char* vfsType);
   virtual void nfsMount(
       std::string mountPath,
       folly::SocketAddress mountdPort,

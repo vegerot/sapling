@@ -1,6 +1,5 @@
-#require fsmonitor
+#require fsmonitor no-eden
 
-  $ configure modernclient
   $ newclientrepo repo
   $ echo >> file1
   $ echo >> file2
@@ -32,7 +31,7 @@ Defeat same-second behavior difference
 
 # Reverting a file to clean does cause a treestate flush.
   $ echo > file1
-  $ EDENSCM_LOG=workingcopy::watchmanfs::treestate=debug hg status 2>&1 | grep flushing || true
+  $ EDENSCM_LOG=workingcopy::filesystem::watchmanfs::treestate=debug hg status 2>&1 | grep flushing || true
 
 # Setup 3 edits for the next test
   $ echo >> file1

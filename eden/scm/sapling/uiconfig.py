@@ -12,11 +12,8 @@ from __future__ import absolute_import
 
 import contextlib
 import os
-import random
-import time
-from typing import List, Optional, Tuple
 
-from bindings import configloader
+from bindings import configloader, context
 
 from . import configitems, error, pycompat, util
 from .encoding import unifromlocal, unitolocal
@@ -38,7 +35,7 @@ def optional(func, s):
 class uiconfig:
     """Config portion of the ui object"""
 
-    def __init__(self, src=None, rcfg=None):
+    def __init__(self, src=None, rctx=None):
         """Create a fresh new uiconfig object.
 
         Or copy from an existing uiconfig object.
@@ -48,17 +45,15 @@ class uiconfig:
         self.logmeasuredtimes = False
 
         if src:
+            self._rctx = src._rctx
             self._rcfg = src._rcfg.clone()
             self._unserializable = src._unserializable.copy()
-            self._pinnedconfigs = src._pinnedconfigs.copy()
             self._knownconfig = src._knownconfig
         else:
-            self._rcfg = rcfg or configloader.config()
+            self._rctx = rctx or context.context()
+            self._rcfg = self._rctx.config()
             # map from IDs to unserializable Python objects.
             self._unserializable = {}
-            # config "pinned" that cannot be loaded from files.
-            # ex. --config flags
-            self._pinnedconfigs = set()
             self._knownconfig = configitems.coreitems
 
         self.fixconfig()
@@ -81,7 +76,7 @@ class uiconfig:
 
     def reload(self, ui, repopath):
         # The actual config expects the non-shared root directory.
-        self._rcfg.reload(repopath, list(self._pinnedconfigs))
+        self._rcfg.reload(repopath)
 
         # fixconfig expects the non-shard repo root, without the .hg.
         self.fixconfig(root=repopath)
@@ -104,7 +99,6 @@ class uiconfig:
             source,
             sections,
             remap and remap.items(),
-            list(self._pinnedconfigs),
         )
         if errors:
             raise error.ParseError("\n\n".join(errors))
@@ -172,7 +166,6 @@ class uiconfig:
             self._unserializable[replacement] = value
             value = replacement
 
-        self._pinnedconfigs.add((section, name))
         self._rcfg.set(section, name, value, source or "ui.setconfig")
         self.fixconfig(section=section)
 
@@ -478,7 +471,6 @@ class uiconfig:
         {(section, name) : value}"""
         backup = self._rcfg.clone()
         unserializablebackup = dict(self._unserializable)
-        pinnedbackup = set(self._pinnedconfigs)
         try:
             for (section, name), value in overrides.items():
                 self.setconfig(section, name, value, source)
@@ -486,7 +478,6 @@ class uiconfig:
         finally:
             self._rcfg = backup
             self._unserializable = unserializablebackup
-            self._pinnedconfigs = pinnedbackup
 
             # just restoring ui.quiet config to the previous value is not enough
             # as it does not update ui.quiet class member

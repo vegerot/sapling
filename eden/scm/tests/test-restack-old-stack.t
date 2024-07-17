@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This software may be used and distributed according to the terms of the
@@ -8,7 +10,7 @@
 
   $ eagerepo
   $ enable remotenames amend rebase
-  $ setconfig experimental.narrow-heads=true visibility.enabled=true mutation.record=true mutation.enabled=true "mutation.date=0 0" experimental.evolution= remotenames.rename.default=remote
+  $ setconfig experimental.narrow-heads=true visibility.enabled=true mutation.record=true mutation.enabled=true experimental.evolution= remotenames.rename.default=remote
 
 # Test restack behavior with old stacks.
 

@@ -41,6 +41,7 @@ use gotham::state::State;
 use gotham_derive::StateData;
 use gotham_derive::StaticResponseExtender;
 use gotham_ext::error::HttpError;
+use gotham_ext::middleware::request_context::RequestContext;
 use gotham_ext::response::TryIntoResponse;
 use hyper::Body;
 use mercurial_types::HgFileNodeId;
@@ -52,19 +53,18 @@ use rate_limiting::Metric;
 use serde::Deserialize;
 use types::Key;
 
-use super::handler::EdenApiContext;
-use super::EdenApiHandler;
-use super::EdenApiMethod;
+use super::handler::SaplingRemoteApiContext;
 use super::HandlerInfo;
 use super::HandlerResult;
+use super::SaplingRemoteApiHandler;
+use super::SaplingRemoteApiMethod;
 use crate::context::ServerContext;
 use crate::errors::ErrorKind;
-use crate::middleware::RequestContext;
 use crate::utils::cbor_stream_filtered_errors;
 use crate::utils::get_repo;
 
-/// XXX: This number was chosen arbitrarily.
-const MAX_CONCURRENT_FILE_FETCHES_PER_REQUEST: usize = 10;
+// The size is optimized for the batching settings in EdenFs.
+const MAX_CONCURRENT_FILE_FETCHES_PER_REQUEST: usize = 32;
 
 const MAX_CONCURRENT_UPLOAD_FILENODES_PER_REQUEST: usize = 1000;
 
@@ -85,12 +85,12 @@ pub struct UploadFileQueryString {
 pub struct Files2Handler;
 
 #[async_trait]
-impl EdenApiHandler for Files2Handler {
+impl SaplingRemoteApiHandler for Files2Handler {
     type Request = FileRequest;
     type Response = FileResponse;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::Files2;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::Files2;
     const ENDPOINT: &'static str = "/files2";
 
     fn sampling_rate(_request: &Self::Request) -> NonZeroU64 {
@@ -98,28 +98,26 @@ impl EdenApiHandler for Files2Handler {
     }
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
         let ctx = repo.ctx().clone();
 
-        let len = request.keys.len() + request.reqs.len();
-        let reqs = request
-            .keys
-            .into_iter()
-            .map(|key| FileSpec {
-                key,
-                attrs: FileAttributes {
-                    content: true,
-                    aux_data: false,
-                },
-            })
-            .chain(request.reqs);
-        ctx.perf_counters()
-            .add_to_counter(PerfCounterType::EdenapiFiles, len as i64);
-        let fetches =
-            reqs.map(move |FileSpec { key, attrs }| fetch_file_response(repo.clone(), key, attrs));
+        let fetches = request.reqs.into_iter().map({
+            let ctx = ctx.clone();
+            move |FileSpec { key, attrs }| {
+                if attrs.content {
+                    ctx.perf_counters()
+                        .increment_counter(PerfCounterType::EdenapiFiles);
+                }
+                if attrs.aux_data {
+                    ctx.perf_counters()
+                        .increment_counter(PerfCounterType::EdenapiFilesAuxData);
+                }
+                fetch_file_response(repo.clone(), key, attrs)
+            }
+        });
 
         Ok(stream::iter(fetches)
             .buffer_unordered(MAX_CONCURRENT_FILE_FETCHES_PER_REQUEST)
@@ -164,30 +162,42 @@ async fn fetch_file(
     let parents = ctx.hg_parents().into();
     let mut file = FileEntry::new(key.clone(), parents);
 
-    if attrs.content {
-        let (data, metadata) = ctx
-            .content()
-            .await
-            .with_context(|| ErrorKind::FileFetchFailed(key.clone()))?;
+    let fetch_content = async {
+        if attrs.content {
+            Ok(Some(ctx.content().await.with_context(|| {
+                ErrorKind::FileFetchFailed(key.clone())
+            })?))
+        } else {
+            anyhow::Ok(None)
+        }
+    };
 
+    let fetch_aux_data = async {
+        if attrs.aux_data {
+            Ok(Some(ctx.content_metadata().await.with_context(|| {
+                ErrorKind::FileAuxDataFetchFailed(key.clone())
+            })?))
+        } else {
+            anyhow::Ok(None)
+        }
+    };
+
+    let (content, aux_data) = futures::try_join!(fetch_content, fetch_aux_data)?;
+
+    if let Some((hg_file_blob, metadata)) = content {
         file = file.with_content(FileContent {
-            hg_file_blob: data,
+            hg_file_blob,
             metadata,
         });
     }
 
-    if attrs.aux_data {
-        let content_metadata = ctx
-            .content_metadata()
-            .await
-            .with_context(|| ErrorKind::FileFetchFailed(key.clone()))?;
-
+    if let Some(content_metadata) = aux_data {
         file = file.with_aux_data(FileAuxData {
             total_size: content_metadata.total_size,
-            content_id: content_metadata.content_id.into(),
             sha1: content_metadata.sha1.into(),
-            sha256: content_metadata.sha256.into(),
-            seeded_blake3: Some(content_metadata.seeded_blake3.into()),
+            blake3: content_metadata.seeded_blake3.into(),
+            // TODO: implement support for file header metadata
+            file_header_metadata: None,
         });
     }
 
@@ -226,7 +236,10 @@ pub async fn upload_file(state: &mut State) -> Result<impl TryIntoResponse, Http
     let params = UploadFileParams::take_from(state);
     let query_string = UploadFileQueryString::take_from(state);
 
-    state.put(HandlerInfo::new(&params.repo, EdenApiMethod::UploadFile));
+    state.put(HandlerInfo::new(
+        &params.repo,
+        SaplingRemoteApiMethod::UploadFile,
+    ));
 
     let rctx = RequestContext::borrow_from(state).clone();
     let sctx = ServerContext::borrow_from(state);
@@ -324,16 +337,16 @@ async fn store_hg_filenode(
 pub struct UploadHgFilenodesHandler;
 
 #[async_trait]
-impl EdenApiHandler for UploadHgFilenodesHandler {
+impl SaplingRemoteApiHandler for UploadHgFilenodesHandler {
     type Request = Batch<UploadHgFilenodeRequest>;
     type Response = UploadTokensResponse;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::UploadHgFilenodes;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::UploadHgFilenodes;
     const ENDPOINT: &'static str = "/upload/filenodes";
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
@@ -351,16 +364,16 @@ impl EdenApiHandler for UploadHgFilenodesHandler {
 pub struct DownloadFileHandler;
 
 #[async_trait]
-impl EdenApiHandler for DownloadFileHandler {
+impl SaplingRemoteApiHandler for DownloadFileHandler {
     type Request = UploadToken;
     type Response = Bytes;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::DownloadFile;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::DownloadFile;
     const ENDPOINT: &'static str = "/download/file";
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();

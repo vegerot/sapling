@@ -6,17 +6,14 @@
  */
 
 import type {CodeReviewProvider} from './CodeReviewProvider';
+import type {KindOfChange, PollKind} from './WatchForChanges';
 import type {TrackEventName} from './analytics/eventNames';
-import type {ServerSideTracker} from './analytics/serverSideTracker';
-import type {Logger} from './logger';
-import type {ExecaError} from 'execa';
+import type {ConfigLevel, ResolveCommandConflictOutput} from './commands';
+import type {RepositoryContext} from './serverTypes';
 import type {
   CommitInfo,
-  CommitPhaseType,
   Disposable,
   CommandArg,
-  SmartlogCommits,
-  SuccessorInfo,
   UncommittedChanges,
   ChangedFile,
   RepoInfo,
@@ -31,10 +28,17 @@ import type {
   CodeReviewSystem,
   Revset,
   PreferredSubmitCommand,
-  RepoRelativePath,
   FetchedUncommittedChanges,
   FetchedCommits,
   ShelvedChange,
+  CommitCloudSyncState,
+  Hash,
+  ConfigName,
+  Alert,
+  RepoRelativePath,
+  SettableConfigName,
+  StableInfo,
+  CwdInfo,
 } from 'isl/src/types';
 import type {Comparison} from 'shared/Comparison';
 
@@ -42,112 +46,55 @@ import {Internal} from './Internal';
 import {OperationQueue} from './OperationQueue';
 import {PageFocusTracker} from './PageFocusTracker';
 import {WatchForChanges} from './WatchForChanges';
+import {parseAlerts} from './alerts';
+import {
+  MAX_SIMULTANEOUS_CAT_CALLS,
+  READ_COMMAND_TIMEOUT_MS,
+  computeNewConflicts,
+  extractRepoInfoFromUrl,
+  findDotDir,
+  findRoot,
+  getConfigs,
+  getExecParams,
+  runCommand,
+  setConfig,
+} from './commands';
 import {DEFAULT_DAYS_OF_COMMITS_TO_LOAD, ErrorShortMessages} from './constants';
 import {GitHubCodeReviewProvider} from './github/githubCodeReviewProvider';
 import {isGithubEnterprise} from './github/queryGraphQL';
-import {handleAbortSignalOnProcess, serializeAsyncCall} from './utils';
+import {
+  CHANGED_FILES_FIELDS,
+  CHANGED_FILES_INDEX,
+  CHANGED_FILES_TEMPLATE,
+  COMMIT_END_MARK,
+  FETCH_TEMPLATE,
+  SHELVE_FETCH_TEMPLATE,
+  attachStableLocations,
+  parseCommitInfoOutput,
+  parseShelvedCommitsOutput,
+} from './templates';
+import {
+  findPublicAncestor,
+  handleAbortSignalOnProcess,
+  isExecaError,
+  serializeAsyncCall,
+} from './utils';
 import execa from 'execa';
-import {CommandRunner} from 'isl/src/types';
-import os from 'os';
-import path from 'path';
+import {
+  settableConfigNames,
+  allConfigNames,
+  CommitCloudBackupStatus,
+  CommandRunner,
+} from 'isl/src/types';
+import fs from 'node:fs';
+import path from 'node:path';
 import {revsetArgsForComparison} from 'shared/Comparison';
 import {LRU} from 'shared/LRU';
 import {RateLimiter} from 'shared/RateLimiter';
 import {TypedEventEmitter} from 'shared/TypedEventEmitter';
 import {exists} from 'shared/fs';
 import {removeLeadingPathSep} from 'shared/pathUtils';
-import {notEmpty, randomId, unwrap} from 'shared/utils';
-
-export const COMMIT_END_MARK = '<<COMMIT_END_MARK>>';
-export const NULL_CHAR = '\0';
-const ESCAPED_NULL_CHAR = '\\0';
-
-const HEAD_MARKER = '@';
-const MAX_FETCHED_FILES_PER_COMMIT = 25;
-const MAX_SIMULTANEOUS_CAT_CALLS = 4;
-/** Timeout for non-operation commands. Operations like goto and rebase are expected to take longer,
- * but status, log, cat, etc should typically take <10s. */
-const READ_COMMAND_TIMEOUT_MS = 40_000;
-
-const FIELDS = {
-  hash: '{node}',
-  title: '{desc|firstline}',
-  author: '{author}',
-  date: '{date|isodatesec}',
-  phase: '{phase}',
-  bookmarks: `{bookmarks % '{bookmark}${ESCAPED_NULL_CHAR}'}`,
-  remoteBookmarks: `{remotenames % '{remotename}${ESCAPED_NULL_CHAR}'}`,
-  parents: `{parents % "{node}${ESCAPED_NULL_CHAR}"}`,
-  isHead: `{ifcontains(rev, revset('.'), '${HEAD_MARKER}')}`,
-  filesAdded: '{file_adds|json}',
-  filesModified: '{file_mods|json}',
-  filesRemoved: '{file_dels|json}',
-  successorInfo: '{mutations % "{operation}:{successors % "{node}"},"}',
-  cloesestPredecessors: '{predecessors % "{node},"}',
-  // This would be more elegant as a new built-in template
-  diffId: '{if(phabdiff, phabdiff, github_pull_request_number)}',
-  stableCommitMetadata: Internal.stableCommitConfig?.template ?? '',
-  // Description must be last
-  description: '{desc}',
-};
-
-type ConflictFileData = {contents: string; exists: boolean; isexec: boolean; issymlink: boolean};
-export type ResolveCommandConflictOutput = [
-  | {
-      command: null;
-      conflicts: [];
-      pathconflicts: [];
-    }
-  | {
-      command: string;
-      command_details: {cmd: string; to_abort: string; to_continue: string};
-      conflicts: Array<{
-        base: ConflictFileData;
-        local: ConflictFileData;
-        output: ConflictFileData;
-        other: ConflictFileData;
-        path: string;
-      }>;
-      pathconflicts: Array<never>;
-    },
-];
-
-function fromEntries<V>(entries: Array<[string, V]>): {
-  [key: string]: V;
-} {
-  // Object.fromEntries() is available in Node v12 and later.
-  if (typeof Object.fromEntries === 'function') {
-    return Object.fromEntries(entries);
-  }
-
-  const obj: {
-    [key: string]: V;
-  } = {};
-  for (const [key, value] of entries) {
-    obj[key] = value;
-  }
-  return obj;
-}
-
-const FIELD_INDEX = fromEntries(Object.keys(FIELDS).map((key, i) => [key, i])) as {
-  [key in Required<keyof typeof FIELDS>]: number;
-};
-const FETCH_TEMPLATE = [...Object.values(FIELDS), COMMIT_END_MARK].join('\n');
-
-const SHELVE_FIELDS = {
-  hash: '{node}',
-  name: '{shelvename}',
-  author: '{author}',
-  date: '{date|isodatesec}',
-  filesAdded: '{file_adds|json}',
-  filesModified: '{file_mods|json}',
-  filesRemoved: '{file_dels|json}',
-  description: '{desc}',
-};
-const SHELVE_FIELD_INDEX = fromEntries(Object.keys(SHELVE_FIELDS).map((key, i) => [key, i])) as {
-  [key in Required<keyof typeof SHELVE_FIELDS>]: number;
-};
-const SHELVE_FETCH_TEMPLATE = [...Object.values(SHELVE_FIELDS), COMMIT_END_MARK].join('\n');
+import {notEmpty, randomId, nullthrows} from 'shared/utils';
 
 /**
  * This class is responsible for providing information about the working copy
@@ -160,7 +107,7 @@ const SHELVE_FETCH_TEMPLATE = [...Object.values(SHELVE_FIELDS), COMMIT_END_MARK]
  * Prefer using `RepositoryCache.getOrCreate()` to access and dispose `Repository`s.
  */
 export class Repository {
-  public IGNORE_COMMIT_MESSAGE_LINES_REGEX = /^((?:HG|SL):.*)/gm;
+  public IGNORE_COMMIT_MESSAGE_LINES_REGEX = /^((?:HG|SL):.*)\n?/gm;
 
   private mergeConflicts: MergeConflicts | undefined = undefined;
   private uncommittedChanges: FetchedUncommittedChanges | null = null;
@@ -189,6 +136,17 @@ export class Repository {
   private pageFocusTracker = new PageFocusTracker();
   public codeReviewProvider?: CodeReviewProvider;
 
+  /**
+   * Config: milliseconds to hold off log/status refresh during the start of a command.
+   * This is to avoid showing messy indeterminate states (like millions of files changed
+   * during a long distance checkout, or commit graph changed but '.' is out of sync).
+   *
+   * Default: 10 seconds. Can be set by the `isl.hold-off-refresh-ms` setting.
+   */
+  public configHoldOffRefreshMs = 10000;
+
+  private configRateLimiter = new RateLimiter(1);
+
   private currentVisibleCommitRangeIndex = 0;
   private visibleCommitRanges: Array<number | undefined> = [
     DEFAULT_DAYS_OF_COMMITS_TO_LOAD,
@@ -196,27 +154,62 @@ export class Repository {
     undefined,
   ];
 
+  /**
+   * Additional commits to include in batched `log` fetch,
+   * used for additional remote bookmarks / known stable commit hashes.
+   * After fetching commits, stable names will be added to commits in "stableCommitMetadata"
+   */
+  public stableLocations: Array<StableInfo> = [];
+
+  /**
+   * The context used when the repository was created.
+   * This is needed for subscriptions to have access to ANY logger, etc.
+   * Avoid using this, and prefer using the correct context for a given connection.
+   */
+  public initialConnectionContext: RepositoryContext;
+
   /**  Prefer using `RepositoryCache.getOrCreate()` to access and dispose `Repository`s. */
-  constructor(
-    public info: ValidatedRepoInfo,
-    public logger: Logger,
-    /** Analytics Tracker that was valid when this repo was created. Since Repository's can be reused,
-     * there may be other trackers associated with this repo, which are not accounted for.
-     * This tracker should only be used for things that are shared among multiple consumers of this repo,
-     * like uncommitted changes.
-     */
-    public trackerBestEffort: ServerSideTracker,
-  ) {
+  constructor(public info: ValidatedRepoInfo, ctx: RepositoryContext) {
+    this.initialConnectionContext = ctx;
+
     const remote = info.codeReviewSystem;
     if (remote.type === 'github') {
-      this.codeReviewProvider = new GitHubCodeReviewProvider(remote, logger);
+      this.codeReviewProvider = new GitHubCodeReviewProvider(remote, ctx.logger);
     }
 
     if (remote.type === 'phabricator' && Internal?.PhabricatorCodeReviewProvider != null) {
-      this.codeReviewProvider = new Internal.PhabricatorCodeReviewProvider(remote, logger);
+      this.codeReviewProvider = new Internal.PhabricatorCodeReviewProvider(
+        remote,
+        this.initialConnectionContext,
+      );
     }
 
-    this.watchForChanges = new WatchForChanges(info, logger, this.pageFocusTracker, kind => {
+    const shouldWait = (): boolean => {
+      const startTime = this.operationQueue.getRunningOperationStartTime();
+      if (startTime == null) {
+        return false;
+      }
+      // Prevent auto-refresh during the first 10 seconds of a running command.
+      // When a command is running, the intermediate state can be messy:
+      // - status errors out (edenfs), is noisy (long distance goto)
+      // - commit graph and the `.` are updated separately and hard to predict
+      // Let's just rely on optimistic state to provide the "clean" outcome.
+      // In case the command takes a long time to run, allow refresh after
+      // the time period.
+      // Fundementally, the intermediate states have no choice but have to
+      // be messy because filesystems are not transactional (and reading in
+      // `sl` is designed to be lock-free).
+      const elapsedMs = Date.now() - startTime.valueOf();
+      const result = elapsedMs < this.configHoldOffRefreshMs;
+      return result;
+    };
+    const callback = (kind: KindOfChange, pollKind?: PollKind) => {
+      if (pollKind !== 'force' && shouldWait()) {
+        // Do nothing. This is fine because after the operation
+        // there will be a refresh.
+        ctx.logger.info('polling prevented from shouldWait');
+        return;
+      }
       if (kind === 'uncommitted changes') {
         this.fetchUncommittedChanges();
       } else if (kind === 'commits') {
@@ -234,18 +227,19 @@ export class Repository {
           this.getAllDiffIds(),
         );
       }
-    });
+    };
+    this.watchForChanges = new WatchForChanges(info, ctx.logger, this.pageFocusTracker, callback);
 
     this.operationQueue = new OperationQueue(
-      this.logger,
       (
+        ctx: RepositoryContext,
         operation: RunnableOperation,
-        cwd: string,
         handleCommandProgress,
         signal: AbortSignal,
-      ): Promise<void> => {
+      ): Promise<unknown> => {
+        const {cwd} = ctx;
         if (operation.runner === CommandRunner.Sapling) {
-          return this.runOperation(operation, handleCommandProgress, cwd, signal);
+          return this.runOperation(ctx, operation, handleCommandProgress, signal);
         } else if (operation.runner === CommandRunner.CodeReviewProvider) {
           const normalizedArgs = this.normalizeOperationArgs(cwd, operation.args);
           if (this.codeReviewProvider?.runExternalCommand == null) {
@@ -264,10 +258,10 @@ export class Repository {
           );
         } else if (operation.runner === CommandRunner.InternalArcanist) {
           const normalizedArgs = this.normalizeOperationArgs(cwd, operation.args);
-          return (
-            Internal.runArcanistCommand?.(cwd, normalizedArgs, handleCommandProgress, signal) ??
-            Promise.resolve()
-          );
+          if (Internal.runArcanistCommand == null) {
+            return Promise.reject(Error('InternalArcanist runner is not supported'));
+          }
+          return Internal.runArcanistCommand(cwd, normalizedArgs, handleCommandProgress, signal);
         }
         return Promise.resolve();
       },
@@ -301,6 +295,21 @@ export class Repository {
     this.checkForMergeConflicts();
 
     this.disposables.push(() => subscription.dispose());
+
+    this.applyConfigInBackground(ctx);
+
+    const headTracker = this.subscribeToHeadCommit(head => {
+      const allCommits = this.getSmartlogCommits();
+      const ancestor = findPublicAncestor(allCommits?.commits.value, head);
+      this.initialConnectionContext.tracker.track('HeadCommitChanged', {
+        extras: {
+          hash: head.hash,
+          public: ancestor?.hash,
+          bookmarks: ancestor?.remoteBookmarks,
+        },
+      });
+    });
+    this.disposables.push(headTracker.dispose);
   }
 
   public nextVisibleCommitRangeInDays(): number | undefined {
@@ -308,6 +317,10 @@ export class Repository {
       this.currentVisibleCommitRangeIndex++;
     }
     return this.visibleCommitRanges[this.currentVisibleCommitRangeIndex];
+  }
+
+  public isPathInsideRepo(p: AbsolutePath): boolean {
+    return path.normalize(p).startsWith(this.info.repoRoot);
   }
 
   /**
@@ -333,14 +346,14 @@ export class Repository {
   }
 
   public checkForMergeConflicts = serializeAsyncCall(async () => {
-    this.logger.info('checking for merge conflicts');
+    this.initialConnectionContext.logger.info('checking for merge conflicts');
     // Fast path: check if .sl/merge dir changed
     const wasAlreadyInConflicts = this.mergeConflicts != null;
     if (!wasAlreadyInConflicts) {
       const mergeDirExists = await exists(path.join(this.info.dotdir, 'merge'));
       if (!mergeDirExists) {
         // Not in a conflict
-        this.logger.info(
+        this.initialConnectionContext.logger.info(
           `conflict state still the same (${
             wasAlreadyInConflicts ? 'IN merge conflict' : 'NOT in conflict'
           })`,
@@ -366,10 +379,11 @@ export class Repository {
       const proc = await this.runCommand(
         ['resolve', '--tool', 'internal:dumpjson', '--all'],
         'GetConflictsCommand',
+        this.initialConnectionContext,
       );
       output = JSON.parse(proc.stdout) as ResolveCommandConflictOutput;
     } catch (err) {
-      this.logger.error(`failed to check for merge conflicts: ${err}`);
+      this.initialConnectionContext.logger.error(`failed to check for merge conflicts: ${err}`);
       // To avoid being stuck in "loading" state forever, let's pretend there's no conflicts.
       this.mergeConflicts = undefined;
       this.mergeConflictsEmitter.emit('change', this.mergeConflicts);
@@ -377,20 +391,70 @@ export class Repository {
     }
 
     this.mergeConflicts = computeNewConflicts(this.mergeConflicts, output, fetchStartTimestamp);
-    this.logger.info(`repo ${this.mergeConflicts ? 'IS' : 'IS NOT'} in merge conflicts`);
+    this.initialConnectionContext.logger.info(
+      `repo ${this.mergeConflicts ? 'IS' : 'IS NOT'} in merge conflicts`,
+    );
     if (this.mergeConflicts) {
       const maxConflictsToLog = 20;
       const remainingConflicts = (this.mergeConflicts.files ?? [])
         .filter(conflict => conflict.status === 'U')
         .map(conflict => conflict.path)
         .slice(0, maxConflictsToLog);
-      this.logger.info('remaining files with conflicts: ', remainingConflicts);
+      this.initialConnectionContext.logger.info(
+        'remaining files with conflicts: ',
+        remainingConflicts,
+      );
     }
     this.mergeConflictsEmitter.emit('change', this.mergeConflicts);
+
+    if (!wasAlreadyInConflicts && this.mergeConflicts) {
+      this.initialConnectionContext.tracker.track('EnterMergeConflicts', {
+        extras: {numConflicts: this.mergeConflicts.files?.length ?? 0},
+      });
+    } else if (wasAlreadyInConflicts && !this.mergeConflicts) {
+      this.initialConnectionContext.tracker.track('ExitMergeConflicts', {extras: {}});
+    }
   });
 
   public getMergeConflicts(): MergeConflicts | undefined {
     return this.mergeConflicts;
+  }
+
+  public async getMergeTool(ctx: RepositoryContext): Promise<string | null> {
+    // treat undefined as "not cached", and null as "not configured"/invalid
+    if (ctx.cachedMergeTool !== undefined) {
+      return ctx.cachedMergeTool;
+    }
+    const tool = ctx.knownConfigs?.get('ui.merge') ?? 'internal:merge';
+    let usesCustomMerge = tool !== 'internal:merge';
+
+    if (usesCustomMerge) {
+      // TODO: we could also check merge-tools.${tool}.disabled here
+      const customToolUsesGui =
+        (
+          await this.forceGetConfig(ctx, `merge-tools.${tool}.gui`).catch(() => undefined)
+        )?.toLowerCase() === 'true';
+      if (!customToolUsesGui) {
+        ctx.logger.warn(
+          `configured custom merge tool '${tool}' is not a GUI tool, using :merge3 instead`,
+        );
+        usesCustomMerge = false;
+      } else {
+        ctx.logger.info(`using configured custom GUI merge tool ${tool}`);
+      }
+      ctx.tracker.track('UsingExternalMergeTool', {
+        extras: {
+          tool,
+          isValid: usesCustomMerge,
+        },
+      });
+    } else {
+      ctx.logger.info(`using default :merge3 merge tool`);
+    }
+
+    const mergeTool = usesCustomMerge ? tool : null;
+    ctx.cachedMergeTool = mergeTool;
+    return mergeTool;
   }
 
   /**
@@ -398,27 +462,45 @@ export class Repository {
    * Resulting RepoInfo may have null fields if cwd is not a valid repo root.
    * Throws if `command` is not found.
    */
-  static async getRepoInfo(command: string, logger: Logger, cwd: string): Promise<RepoInfo> {
-    const [repoRoot, dotdir, pathsDefault, pullRequestDomain, preferredSubmitCommand] =
-      await Promise.all([
-        findRoot(command, logger, cwd).catch((err: Error) => err),
-        findDotDir(command, logger, cwd),
-        // TODO: This should actually use expanded paths, since the config won't handle custom schemes.
-        // However, `sl debugexpandpaths` is currently too slow and impacts startup time.
-        getConfig(command, logger, cwd, 'paths.default').then(value => value ?? ''),
-        getConfig(command, logger, cwd, 'github.pull_request_domain'),
-        getConfig(command, logger, cwd, 'github.preferred_submit_command').then(
-          value => value || undefined,
-        ),
-      ]);
+  static async getRepoInfo(ctx: RepositoryContext): Promise<RepoInfo> {
+    const {cmd, cwd, logger} = ctx;
+    const [repoRoot, dotdir, configs] = await Promise.all([
+      findRoot(ctx).catch((err: Error) => err),
+      findDotDir(ctx),
+      // TODO: This should actually use expanded paths, since the config won't handle custom schemes.
+      // However, `sl debugexpandpaths` is currently too slow and impacts startup time.
+      getConfigs(ctx, [
+        'paths.default',
+        'github.pull_request_domain',
+        'github.preferred_submit_command',
+      ]),
+    ]);
+    const pathsDefault = configs.get('paths.default') ?? '';
+    const preferredSubmitCommand = configs.get('github.preferred_submit_command');
+
     if (repoRoot instanceof Error) {
-      return {type: 'invalidCommand', command};
+      // first check that the cwd exists
+      const cwdExists = await exists(cwd);
+      if (!cwdExists) {
+        return {type: 'cwdDoesNotExist', cwd};
+      }
+
+      return {
+        type: 'invalidCommand',
+        command: cmd,
+        path: process.env.PATH,
+      };
     }
     if (repoRoot == null || dotdir == null) {
+      // A seemingly invalid repo may just be from EdenFS not running properly
+      if (await isUnhealthyEdenFs(cwd)) {
+        return {type: 'edenFsUnhealthy', cwd};
+      }
       return {type: 'cwdNotARepository', cwd};
     }
 
     let codeReviewSystem: CodeReviewSystem;
+    let pullRequestDomain;
     if (Internal.isMononokePath?.(pathsDefault)) {
       // TODO: where should we be getting this from? arcconfig instead? do we need this?
       const repo = pathsDefault.slice(pathsDefault.lastIndexOf('/') + 1);
@@ -441,11 +523,12 @@ export class Repository {
       } else {
         codeReviewSystem = {type: 'unknown', path: pathsDefault};
       }
+      pullRequestDomain = configs.get('github.pull_request_domain');
     }
 
     const result: RepoInfo = {
       type: 'success',
-      command,
+      command: cmd,
       dotdir,
       repoRoot,
       codeReviewSystem,
@@ -457,21 +540,48 @@ export class Repository {
   }
 
   /**
+   * Determine basic information about a cwd, without fetching the full RepositoryInfo.
+   * Useful to determine if a cwd is valid and find the repo root without constructing a Repository.
+   */
+  static async getCwdInfo(ctx: RepositoryContext): Promise<CwdInfo> {
+    const root = await findRoot(ctx).catch((err: Error) => err);
+
+    if (root instanceof Error || root == null) {
+      return {cwd: ctx.cwd};
+    }
+
+    const [realCwd, realRoot] = await Promise.all([
+      fs.promises.realpath(ctx.cwd),
+      fs.promises.realpath(root),
+    ]);
+    // Since we found `root` for this particular `cwd`, we expect realpath(root) is a prefix of realpath(cwd).
+    // That is, the relative path does not contain any ".." components.
+    const repoRelativeCwd = path.relative(realRoot, realCwd);
+    return {
+      cwd: ctx.cwd,
+      repoRoot: realRoot,
+      repoRelativeCwdLabel: path.normalize(path.join(path.basename(realRoot), repoRelativeCwd)),
+    };
+  }
+
+  /**
    * Run long-lived command which mutates the repository state.
    * Progress is streamed back as it comes in.
    * Operations are run immediately. For queueing, see OperationQueue.
+   * This promise resolves when the operation exits.
    */
   async runOrQueueOperation(
+    ctx: RepositoryContext,
     operation: RunnableOperation,
     onProgress: (progress: OperationProgress) => void,
-    tracker: ServerSideTracker,
-    cwd: string,
   ): Promise<void> {
-    await this.operationQueue.runOrQueueOperation(operation, onProgress, tracker, cwd);
+    const result = await this.operationQueue.runOrQueueOperation(ctx, operation, onProgress);
 
-    // After any operation finishes, make sure we poll right away,
-    // so the UI is guarnateed to get the latest data.
-    this.watchForChanges.poll('force');
+    if (result !== 'skipped') {
+      // After any operation finishes, make sure we poll right away,
+      // so the UI is guarnateed to get the latest data.
+      this.watchForChanges.poll('force');
+    }
   }
 
   /**
@@ -481,16 +591,38 @@ export class Repository {
     this.operationQueue.abortRunningOperation(operationId);
   }
 
+  /** The currently running operation tracked by the server. */
+  getRunningOperation() {
+    return this.operationQueue.getRunningOperation();
+  }
+
   private normalizeOperationArgs(cwd: string, args: Array<CommandArg>): Array<string> {
-    const repoRoot = unwrap(this.info.repoRoot);
-    return args.map(arg => {
+    const repoRoot = nullthrows(this.info.repoRoot);
+    const illegalArgs = new Set(['--cwd', '--config', '--insecure', '--repository', '-R']);
+    return args.flatMap(arg => {
       if (typeof arg === 'object') {
         switch (arg.type) {
+          case 'config':
+            if (!(settableConfigNames as ReadonlyArray<string>).includes(arg.key)) {
+              throw new Error(`config ${arg.key} not allowed`);
+            }
+            return ['--config', `${arg.key}=${arg.value}`];
           case 'repo-relative-file':
-            return path.normalize(path.relative(cwd, path.join(repoRoot, arg.path)));
+            return [path.normalize(path.relative(cwd, path.join(repoRoot, arg.path)))];
+          case 'exact-revset':
+            if (arg.revset.startsWith('-')) {
+              // don't allow revsets to be used as flags
+              throw new Error('invalid revset');
+            }
+            return [arg.revset];
           case 'succeedable-revset':
-            return `max(successors(${arg.revset}))`;
+            return [`max(successors(${arg.revset}))`];
+          case 'optimistic-revset':
+            return [`max(successors(${arg.revset}))`];
         }
+      }
+      if (illegalArgs.has(arg)) {
+        throw new Error(`argument '${arg}' is not allowed`);
       }
       return arg;
     });
@@ -500,22 +632,37 @@ export class Repository {
    * Called by this.operationQueue in response to runOrQueueOperation when an operation is ready to actually run.
    */
   private async runOperation(
+    ctx: RepositoryContext,
     operation: RunnableOperation,
     onProgress: OperationCommandProgressReporter,
-    cwd: string,
     signal: AbortSignal,
   ): Promise<void> {
+    const {cwd} = ctx;
     const cwdRelativeArgs = this.normalizeOperationArgs(cwd, operation.args);
     const {stdin} = operation;
+
+    const env = await Promise.all([
+      Internal.additionalEnvForCommand?.(operation),
+      this.getMergeToolEnvVars(ctx),
+    ]);
+
     const {command, args, options} = getExecParams(
       this.info.command,
       cwdRelativeArgs,
       cwd,
       stdin ? {input: stdin} : undefined,
-      Internal.additionalEnvForCommand?.(operation),
+      {
+        ...env[0],
+        ...env[1],
+      },
     );
 
-    this.logger.log('run operation: ', command, cwdRelativeArgs.join(' '));
+    ctx.logger.log('run operation: ', command, cwdRelativeArgs.join(' '));
+
+    const commandBlocklist = new Set(['debugshell', 'dbsh', 'debugsh']);
+    if (args.some(arg => commandBlocklist.has(arg))) {
+      throw new Error(`command "${args.join(' ')}" is not allowed`);
+    }
 
     const execution = execa(command, args, {...options, stdout: 'pipe', stderr: 'pipe'});
     // It would be more appropriate to call this in reponse to execution.on('spawn'), but
@@ -532,14 +679,47 @@ export class Repository {
       onProgress('exit', exitCode || 0);
     });
     signal.addEventListener('abort', () => {
-      this.logger.log('kill operation: ', command, cwdRelativeArgs.join(' '));
+      ctx.logger.log('kill operation: ', command, cwdRelativeArgs.join(' '));
     });
     handleAbortSignalOnProcess(execution, signal);
     await execution;
   }
 
+  /**
+   * Get environment variables to set up which merge tool to use during an operation.
+   * If you're using the default merge tool, use :merge3 instead for slightly better merge information.
+   * If you've configured a custom merge tool, make sure we don't overwrite it...
+   * ...unless the custom merge tool is *not* a GUI tool, like vimdiff, which would not be interactable in ISL.
+   */
+  async getMergeToolEnvVars(ctx: RepositoryContext): Promise<Record<string, string> | undefined> {
+    const tool = await this.getMergeTool(ctx);
+    return tool != null
+      ? // allow sl to use the already configured merge tool
+        {}
+      : // otherwise, use 3-way merge
+        {
+          HGMERGE: ':merge3',
+          SL_MERGE: ':merge3',
+        };
+  }
+
   setPageFocus(page: string, state: PageVisibility) {
     this.pageFocusTracker.setState(page, state);
+    this.initialConnectionContext.tracker.track('FocusChanged', {extras: {state}});
+  }
+
+  private refcount = 0;
+  ref() {
+    this.refcount++;
+    if (this.refcount === 1) {
+      this.watchForChanges.setupWatchmanSubscriptions();
+    }
+  }
+  unref() {
+    this.refcount--;
+    if (this.refcount === 0) {
+      this.watchForChanges.disposeWatchmanSubscriptions();
+    }
   }
 
   /** Return the latest fetched value for UncommittedChanges. */
@@ -563,7 +743,11 @@ export class Repository {
     try {
       this.uncommittedChangesBeginFetchingEmitter.emit('start');
       // Note `status -tjson` run with PLAIN are repo-relative
-      const proc = await this.runCommand(['status', '-Tjson', '--copies'], 'StatusCommand');
+      const proc = await this.runCommand(
+        ['status', '-Tjson', '--copies'],
+        'StatusCommand',
+        this.initialConnectionContext,
+      );
       const files = (JSON.parse(proc.stdout) as UncommittedChanges).map(change => ({
         ...change,
         path: removeLeadingPathSep(change.path),
@@ -576,10 +760,12 @@ export class Repository {
       };
       this.uncommittedChangesEmitter.emit('change', this.uncommittedChanges);
     } catch (err) {
-      this.logger.error('Error fetching files: ', err);
+      this.initialConnectionContext.logger.error('Error fetching files: ', err);
       if (isExecaError(err)) {
         if (err.stderr.includes('checkout is currently in progress')) {
-          this.logger.info('Ignoring `hg status` error caused by in-progress checkout');
+          this.initialConnectionContext.logger.info(
+            'Ignoring `sl status` error caused by in-progress checkout',
+          );
           return;
         }
       }
@@ -631,18 +817,38 @@ export class Repository {
     try {
       this.smartlogCommitsBeginFetchingEmitter.emit('start');
       const visibleCommitDayRange = this.visibleCommitRanges[this.currentVisibleCommitRangeIndex];
-      const revset = !visibleCommitDayRange
-        ? 'smartlog()'
-        : // filter default smartlog query by date range
-          `smartlog(((interestingbookmarks() + heads(draft())) & date(-${visibleCommitDayRange})) + .)`;
+
+      const primaryRevset = '(interestingbookmarks() + heads(draft()))';
+
+      // Revset to fetch for commits, e.g.:
+      // smartlog(interestingbookmarks() + heads(draft()) + .)
+      // smartlog((interestingbookmarks() + heads(draft()) & date(-14)) + .)
+      // smartlog((interestingbookmarks() + heads(draft()) & date(-14)) + . + present(a1b2c3d4))
+      const revset = `smartlog(${[
+        !visibleCommitDayRange
+          ? primaryRevset
+          : // filter default smartlog query by date range
+            `(${primaryRevset} & date(-${visibleCommitDayRange}))`,
+        '.', // always include wdir parent
+        // stable locations hashes may be newer than the repo has, wrap in `present()` to only include if available.
+        ...this.stableLocations.map(location => `present(${location.hash})`),
+      ]
+        .filter(notEmpty)
+        .join(' + ')})`;
+
       const proc = await this.runCommand(
         ['log', '--template', FETCH_TEMPLATE, '--rev', revset],
         'LogCommand',
+        this.initialConnectionContext,
       );
-      const commits = parseCommitInfoOutput(this.logger, proc.stdout.trim());
+      const commits = parseCommitInfoOutput(
+        this.initialConnectionContext.logger,
+        proc.stdout.trim(),
+      );
       if (commits.length === 0) {
         throw new Error(ErrorShortMessages.NoCommitsFetched);
       }
+      attachStableLocations(commits, this.stableLocations);
       this.smartlogCommits = {
         fetchStartTimestamp,
         fetchCompletedTimestamp: Date.now(),
@@ -658,7 +864,7 @@ export class Repository {
       if (isExecaError(error) && error.stderr.includes('Please check your internet connection')) {
         error = Error('Network request failed. Please check your internet connection.');
       }
-      this.logger.error('Error fetching commits: ', error);
+      this.initialConnectionContext.logger.error('Error fetching commits: ', error);
       this.smartlogCommitsChangesEmitter.emit('change', {
         fetchStartTimestamp,
         fetchCompletedTimestamp: Date.now(),
@@ -667,14 +873,19 @@ export class Repository {
     }
   });
 
+  /** Get the current head commit if loaded */
+  getHeadCommit(): CommitInfo | undefined {
+    return this.smartlogCommits?.commits.value?.find(commit => commit.isDot);
+  }
+
   /** Watch for changes to the head commit, e.g. from checking out a new commit */
   subscribeToHeadCommit(callback: (head: CommitInfo) => unknown) {
-    let headCommit = this.smartlogCommits?.commits.value?.find(commit => commit.isHead);
+    let headCommit = this.getHeadCommit();
     if (headCommit != null) {
       callback(headCommit);
     }
     const onData = (data: FetchedCommits) => {
-      const newHead = data?.commits.value?.find(commit => commit.isHead);
+      const newHead = data?.commits.value?.find(commit => commit.isDot);
       if (newHead != null && newHead.hash !== headCommit?.hash) {
         callback(newHead);
         headCommit = newHead;
@@ -689,21 +900,15 @@ export class Repository {
   }
 
   private catLimiter = new RateLimiter(MAX_SIMULTANEOUS_CAT_CALLS, s =>
-    this.logger.info('[cat]', s),
+    this.initialConnectionContext.logger.info('[cat]', s),
   );
   /** Return file content at a given revset, e.g. hash or `.` */
-  public cat(file: AbsolutePath, rev: Revset): Promise<string> {
+  public cat(ctx: RepositoryContext, file: AbsolutePath, rev: Revset): Promise<string> {
     return this.catLimiter.enqueueRun(async () => {
       // For `sl cat`, we want the output of the command verbatim.
       const options = {stripFinalNewline: false};
-      return (
-        await this.runCommand(
-          ['cat', file, '--rev', rev],
-          'CatCommand',
-          /*cwd=*/ undefined,
-          options,
-        )
-      ).stdout;
+      return (await this.runCommand(['cat', file, '--rev', rev], 'CatCommand', ctx, options))
+        .stdout;
     });
   }
 
@@ -713,6 +918,7 @@ export class Repository {
    * Note: the line will including trailing newline.
    */
   public async blame(
+    ctx: RepositoryContext,
     filePath: string,
     hash: string,
   ): Promise<Array<[line: string, info: CommitInfo | undefined]>> {
@@ -720,7 +926,7 @@ export class Repository {
     const output = await this.runCommand(
       ['blame', filePath, '-Tjson', '--change', '--rev', hash],
       'BlameCommand',
-      undefined,
+      ctx,
       undefined,
       /* don't timeout */ 0,
     );
@@ -739,9 +945,9 @@ export class Repository {
     // We don't get all the info we need from the  blame command, so we run `sl log` on the hashes.
     // TODO: we could make the blame command return this directly, which is probably faster.
     // TODO: We don't actually need all the fields in FETCH_TEMPLATE for blame. Reducing this template may speed it up as well.
-    const commits = await this.lookupCommits([...hashes]);
+    const commits = await this.lookupCommits(ctx, [...hashes]);
     const t3 = Date.now();
-    this.logger.info(
+    ctx.logger.info(
       `Fetched ${commits.size} commits for blame. Blame took ${(t2 - t1) / 1000}s, commits took ${
         (t3 - t2) / 1000
       }s`,
@@ -749,8 +955,113 @@ export class Repository {
     return blame[0].lines.map(({node, line}) => [line, commits.get(node)]);
   }
 
+  public async getCommitCloudState(ctx: RepositoryContext): Promise<CommitCloudSyncState> {
+    const lastChecked = new Date();
+
+    const [extension, backupStatuses, cloudStatus] = await Promise.allSettled([
+      this.forceGetConfig(ctx, 'extensions.commitcloud'),
+      this.fetchCommitCloudBackupStatuses(ctx),
+      this.fetchCommitCloudStatus(ctx),
+    ]);
+    if (extension.status === 'fulfilled' && extension.value !== '') {
+      return {
+        lastChecked,
+        isDisabled: true,
+      };
+    }
+
+    if (backupStatuses.status === 'rejected') {
+      return {
+        lastChecked,
+        syncError: backupStatuses.reason,
+      };
+    } else if (cloudStatus.status === 'rejected') {
+      return {
+        lastChecked,
+        workspaceError: cloudStatus.reason,
+      };
+    }
+
+    return {
+      lastChecked,
+      ...cloudStatus.value,
+      commitStatuses: backupStatuses.value,
+    };
+  }
+
+  private async fetchCommitCloudBackupStatuses(
+    ctx: RepositoryContext,
+  ): Promise<Map<Hash, CommitCloudBackupStatus>> {
+    const revset = 'draft() - backedup()';
+    const commitCloudBackupStatusTemplate = `{dict(
+      hash="{node}",
+      backingup="{backingup}",
+      date="{date|isodatesec}"
+      )|json}\n`;
+
+    const output = await this.runCommand(
+      ['log', '--rev', revset, '--template', commitCloudBackupStatusTemplate],
+      'CommitCloudSyncBackupStatusCommand',
+      ctx,
+    );
+
+    const rawObjects = output.stdout.trim().split('\n');
+    const parsedObjects = rawObjects
+      .map(rawObject => {
+        try {
+          return JSON.parse(rawObject) as {hash: Hash; backingup: 'True' | 'False'; date: string};
+        } catch (err) {
+          return null;
+        }
+      })
+      .filter(notEmpty);
+
+    const now = new Date();
+    const TEN_MIN = 10 * 60 * 1000;
+    const statuses = new Map<Hash, CommitCloudBackupStatus>(
+      parsedObjects.map(obj => [
+        obj.hash,
+        obj.backingup === 'True'
+          ? CommitCloudBackupStatus.InProgress
+          : now.valueOf() - new Date(obj.date).valueOf() < TEN_MIN
+          ? CommitCloudBackupStatus.Pending
+          : CommitCloudBackupStatus.Failed,
+      ]),
+    );
+    return statuses;
+  }
+
+  private async fetchCommitCloudStatus(ctx: RepositoryContext): Promise<{
+    lastBackup: Date | undefined;
+    currentWorkspace: string;
+    workspaceChoices: Array<string>;
+  }> {
+    const [cloudStatusOutput, cloudListOutput] = await Promise.all([
+      this.runCommand(['cloud', 'status'], 'CommitCloudStatusCommand', ctx),
+      this.runCommand(['cloud', 'list'], 'CommitCloudListCommand', ctx),
+    ]);
+
+    const currentWorkspace =
+      /Workspace: ([a-zA-Z/0-9._-]+)/.exec(cloudStatusOutput.stdout)?.[1] ?? 'default';
+    const lastSyncTimeStr = /Last Sync Time: (.*)/.exec(cloudStatusOutput.stdout)?.[1];
+    const lastBackup = lastSyncTimeStr != null ? new Date(lastSyncTimeStr) : undefined;
+    const workspaceChoices = cloudListOutput.stdout
+      .split('\n')
+      .map(line => /^ {8}([a-zA-Z/0-9._-]+)(?: \(connected\))?/.exec(line)?.[1] as string)
+      .filter(l => l != null);
+
+    return {
+      lastBackup,
+      currentWorkspace,
+      workspaceChoices,
+    };
+  }
+
   private commitCache = new LRU<string, CommitInfo>(100); // TODO: normal commits fetched from smartlog() aren't put in this cache---this is mostly for blame right now.
-  public async lookupCommits(hashes: Array<string>): Promise<Map<string, CommitInfo>> {
+  public async lookupCommits(
+    ctx: RepositoryContext,
+    hashes: Array<string>,
+  ): Promise<Map<string, CommitInfo>> {
     const hashesToFetch = hashes.filter(hash => this.commitCache.get(hash) == undefined);
 
     const commits =
@@ -759,8 +1070,9 @@ export class Repository {
         : await this.runCommand(
             ['log', '--template', FETCH_TEMPLATE, '--rev', hashesToFetch.join('+')],
             'LookupCommitsCommand',
+            ctx,
           ).then(output => {
-            return parseCommitInfoOutput(this.logger, output.stdout.trim());
+            return parseCommitInfoOutput(ctx.logger, output.stdout.trim());
           });
 
     const result = new Map();
@@ -781,15 +1093,138 @@ export class Repository {
     return result;
   }
 
-  public async getShelvedChanges(): Promise<Array<ShelvedChange>> {
+  public async fetchSignificantLinesOfCode(
+    ctx: RepositoryContext,
+    hash: Hash,
+    excludedFiles: string[],
+  ): Promise<number> {
+    const exclusions = excludedFiles.flatMap(file => [
+      '-X',
+      absolutePathForFileInRepo(file, this) ?? file,
+    ]);
+
+    const output = (
+      await this.runCommand(
+        ['diff', '--stat', '-B', '-X', '**__generated__**', ...exclusions, '-c', hash],
+        'SlocCommand',
+        ctx,
+      )
+    ).stdout;
+
+    const sloc = this.parseSlocFrom(output);
+
+    ctx.logger.info('Fetched SLOC for commit:', hash, output, `SLOC: ${sloc}`);
+    return sloc;
+  }
+  public async fetchPendingAmendSignificantLinesOfCode(
+    ctx: RepositoryContext,
+    hash: Hash,
+    includedFiles: string[],
+  ): Promise<number> {
+    if (includedFiles.length === 0) {
+      return 0; // don't bother running sl diff if there are no files to include
+    }
+    const inclusions = includedFiles.flatMap(file => [
+      '-I',
+      absolutePathForFileInRepo(file, this) ?? file,
+    ]);
+
+    const output = (
+      await this.runCommand(
+        ['diff', '--stat', '-B', '-X', '**__generated__**', ...inclusions, '-r', '.^'],
+        'PendingSlocCommand',
+        ctx,
+      )
+    ).stdout;
+
+    if (output.trim() === '') {
+      return 0;
+    }
+    const sloc = this.parseSlocFrom(output);
+
+    ctx.logger.info('Fetched Pending AMEND SLOC for commit:', hash, output, `SLOC: ${sloc}`);
+    return sloc;
+  }
+  public async fetchPendingSignificantLinesOfCode(
+    ctx: RepositoryContext,
+    hash: Hash,
+    includedFiles: string[],
+  ): Promise<number> {
+    if (includedFiles.length === 0) {
+      return 0; // don't bother running sl diff if there are no files to include
+    }
+    const inclusions = includedFiles.flatMap(file => [
+      '-I',
+      absolutePathForFileInRepo(file, this) ?? file,
+    ]);
+
+    const output = (
+      await this.runCommand(
+        ['diff', '--stat', '-B', '-X', '**__generated__**', ...inclusions],
+        'PendingSlocCommand',
+        ctx,
+      )
+    ).stdout;
+    const sloc = this.parseSlocFrom(output);
+
+    ctx.logger.info('Fetched Pending SLOC for commit:', hash, output, `SLOC: ${sloc}`);
+    return sloc;
+  }
+  private parseSlocFrom(output: string) {
+    const lines = output.trim().split('\n');
+    const changes = lines[lines.length - 1];
+    const diffStatRe = /\d+ files changed, (\d+) insertions\(\+\), (\d+) deletions\(-\)/;
+    const diffStatMatch = changes.match(diffStatRe);
+    const insertions = parseInt(diffStatMatch?.[1] ?? '0', 10);
+    const deletions = parseInt(diffStatMatch?.[2] ?? '0', 10);
+    const sloc = insertions + deletions;
+    return sloc;
+  }
+
+  public async getAllChangedFiles(ctx: RepositoryContext, hash: Hash): Promise<Array<ChangedFile>> {
+    const output = (
+      await this.runCommand(
+        ['log', '--template', CHANGED_FILES_TEMPLATE, '--rev', hash],
+        'LookupAllCommitChangedFilesCommand',
+        ctx,
+      )
+    ).stdout;
+
+    const [chunk] = output.split(COMMIT_END_MARK, 1);
+
+    const lines = chunk.trim().split('\n');
+    if (lines.length < Object.keys(CHANGED_FILES_FIELDS).length) {
+      return [];
+    }
+
+    const files: Array<ChangedFile> = [
+      ...(JSON.parse(lines[CHANGED_FILES_INDEX.filesModified]) as Array<string>).map(path => ({
+        path,
+        status: 'M' as const,
+      })),
+      ...(JSON.parse(lines[CHANGED_FILES_INDEX.filesAdded]) as Array<string>).map(path => ({
+        path,
+        status: 'A' as const,
+      })),
+      ...(JSON.parse(lines[CHANGED_FILES_INDEX.filesRemoved]) as Array<string>).map(path => ({
+        path,
+        status: 'R' as const,
+      })),
+    ];
+
+    return files;
+  }
+
+  public async getShelvedChanges(ctx: RepositoryContext): Promise<Array<ShelvedChange>> {
     const output = (
       await this.runCommand(
         ['log', '--rev', 'shelved()', '--template', SHELVE_FETCH_TEMPLATE],
         'GetShelvesCommand',
+        ctx,
       )
     ).stdout;
 
-    const shelves = parseShelvedCommitsOutput(this.logger, output.trim());
+    const shelves = parseShelvedCommitsOutput(ctx.logger, output.trim());
     // sort by date ascending
     shelves.sort((a, b) => b.date.getTime() - a.date.getTime());
     return shelves;
@@ -803,7 +1238,37 @@ export class Repository {
     );
   }
 
-  public async runDiff(comparison: Comparison, contextLines = 4): Promise<string> {
+  public async getActiveAlerts(ctx: RepositoryContext): Promise<Array<Alert>> {
+    const result = await this.runCommand(['config', '-Tjson', 'alerts'], 'GetAlertsCommand', ctx, {
+      reject: false,
+    });
+    if (result.exitCode !== 0 || !result.stdout) {
+      return [];
+    }
+    try {
+      const configs = JSON.parse(result.stdout) as [{name: string; value: unknown}];
+      const alerts = parseAlerts(configs);
+      ctx.logger.info('Found active alerts:', alerts);
+      return alerts;
+    } catch (e) {
+      return [];
+    }
+  }
+
+  public async getRagePaste(ctx: RepositoryContext): Promise<string> {
+    const output = await this.runCommand(['rage'], 'RageCommand', ctx, undefined, 90_000);
+    const match = /P\d{9,}/.exec(output.stdout);
+    if (match) {
+      return match[0];
+    }
+    throw new Error('No paste found in rage output: ' + output.stdout);
+  }
+
+  public async runDiff(
+    ctx: RepositoryContext,
+    comparison: Comparison,
+    contextLines = 4,
+  ): Promise<string> {
     const output = await this.runCommand(
       [
         'diff',
@@ -816,6 +1281,7 @@ export class Repository {
         String(contextLines),
       ],
       'DiffCommand',
+      ctx,
     );
     return output.stdout;
   }
@@ -824,17 +1290,12 @@ export class Repository {
     args: Array<string>,
     /** Which event name to track for this command. If undefined, generic 'RunCommand' is used. */
     eventName: TrackEventName | undefined,
-    cwd?: string,
+    ctx: RepositoryContext,
     options?: execa.Options,
     timeout?: number,
-    /**
-     * Optionally provide a more specific tracker. If not provided, the best-effort tracker for the repo is used.
-     * Prefer passing an exact tracker when available, or else cwd/session id/platform/version could be inaccurate.
-     */
-    tracker: ServerSideTracker = this.trackerBestEffort,
   ) {
     const id = randomId();
-    return tracker.operation(
+    return ctx.tracker.operation(
       eventName ?? 'RunCommand',
       'RunCommandError',
       {
@@ -842,340 +1303,98 @@ export class Repository {
         extras: eventName == null ? {args} : undefined,
         operationId: `isl:${id}`,
       },
-      () =>
+      async () =>
         runCommand(
-          this.info.command,
+          ctx,
           args,
-          this.logger,
-          unwrap(cwd ?? this.info.repoRoot),
           {
             ...options,
-            env: {...options?.env, ...Internal.additionalEnvForCommand?.(id)} as NodeJS.ProcessEnv,
+            env: {
+              ...options?.env,
+              ...((await Internal.additionalEnvForCommand?.(id)) ?? {}),
+            } as NodeJS.ProcessEnv,
           },
           timeout ?? READ_COMMAND_TIMEOUT_MS,
         ),
     );
   }
 
-  public getConfig(configName: string): Promise<string | undefined> {
-    return getConfig(this.info.command, this.logger, this.info.repoRoot, configName);
+  /** Read a config. The config name must be part of `allConfigNames`. */
+  public async getConfig(
+    ctx: RepositoryContext,
+    configName: ConfigName,
+  ): Promise<string | undefined> {
+    return (await this.getKnownConfigs(ctx)).get(configName);
   }
-  public setConfig(level: ConfigLevel, configName: string, configValue: string): Promise<void> {
-    return setConfig(
-      this.info.command,
-      this.logger,
-      this.info.repoRoot,
-      level,
-      configName,
-      configValue,
+
+  /**
+   * Read a single config, forcing a new dedicated call to `sl config`.
+   * Prefer `getConfig` to batch fetches when possible.
+   */
+  public async forceGetConfig(
+    ctx: RepositoryContext,
+    configName: string,
+  ): Promise<string | undefined> {
+    const result = (await runCommand(ctx, ['config', configName])).stdout;
+    this.initialConnectionContext.logger.info(
+      `loaded configs from ${ctx.cwd}: ${configName} => ${result}`,
     );
+    return result;
   }
-}
 
-/** Run an sl command (without analytics). */
-async function runCommand(
-  command_: string,
-  args_: Array<string>,
-  logger: Logger,
-  cwd: string,
-  options_?: execa.Options,
-  timeout: number = READ_COMMAND_TIMEOUT_MS,
-): Promise<execa.ExecaReturnValue<string>> {
-  const {command, args, options} = getExecParams(command_, args_, cwd, options_);
-  logger.log('run command: ', command, args[0]);
-  const result = execa(command, args, options);
-
-  let timedOut = false;
-  if (timeout > 0) {
-    const timeoutId = setTimeout(() => {
-      result.kill('SIGTERM', {forceKillAfterTimeout: 5_000});
-      logger.error(`Timed out waiting for ${command} ${args[0]} to finish`);
-      timedOut = true;
-    }, timeout);
-    result.on('exit', () => {
-      clearTimeout(timeoutId);
+  /** Load all "known" configs. Cached on `this`. */
+  public getKnownConfigs(
+    ctx: RepositoryContext,
+  ): Promise<ReadonlyMap<ConfigName, string | undefined>> {
+    if (ctx.knownConfigs != null) {
+      return Promise.resolve(ctx.knownConfigs);
+    }
+    return this.configRateLimiter.enqueueRun(async () => {
+      if (ctx.knownConfigs == null) {
+        // Fetch all configs using one command.
+        const knownConfig = new Map<ConfigName, string>(
+          await getConfigs<ConfigName>(ctx, allConfigNames),
+        );
+        ctx.knownConfigs = knownConfig;
+      }
+      return ctx.knownConfigs;
     });
   }
 
-  try {
-    const val = await result;
-    return val;
-  } catch (err: unknown) {
-    if (isExecaError(err)) {
-      if (err.killed) {
-        if (timedOut) {
-          throw new Error('Timed out');
+  public setConfig(
+    ctx: RepositoryContext,
+    level: ConfigLevel,
+    configName: SettableConfigName,
+    configValue: string,
+  ): Promise<void> {
+    if (!settableConfigNames.includes(configName)) {
+      return Promise.reject(
+        new Error(`config ${configName} not in allowlist for settable configs`),
+      );
+    }
+    // Attempt to avoid racy config read/write.
+    return this.configRateLimiter.enqueueRun(() => setConfig(ctx, level, configName, configValue));
+  }
+
+  /** Load and apply configs to `this` in background. */
+  private applyConfigInBackground(ctx: RepositoryContext) {
+    this.getConfig(ctx, 'isl.hold-off-refresh-ms').then(configValue => {
+      if (configValue != null) {
+        const numberValue = parseInt(configValue, 10);
+        if (numberValue >= 0) {
+          this.configHoldOffRefreshMs = numberValue;
         }
-        throw new Error('Killed');
       }
-    }
-    throw err;
+    });
   }
 }
 
-function isExecaError(err: unknown): err is ExecaError {
-  return typeof err === 'object' && err != null && 'exitCode' in err;
-}
-
-export const __TEST__ = {
-  runCommand,
-};
-
-/**
- * Root of the repository where the .sl folder lives.
- * Throws only if `command` is invalid, so this check can double as validation of the `sl` command */
-async function findRoot(
-  command: string,
-  logger: Logger,
-  cwd: string,
-): Promise<AbsolutePath | undefined> {
-  try {
-    return (await runCommand(command, ['root'], logger, cwd)).stdout;
-  } catch (error) {
-    if (
-      ['ENOENT', 'EACCES'].includes((error as {code: string}).code) ||
-      // On Windows, we won't necessarily get an actual ENOENT error code in the error,
-      // because execa does not attempt to detect this.
-      // Other spawning libraries like node-cross-spawn do, which is the approach we can take.
-      // We can do this because we know how `root` uses exit codes.
-      // https://github.com/sindresorhus/execa/issues/469#issuecomment-859924543
-      (os.platform() === 'win32' && (error as {exitCode: number}).exitCode === 1)
-    ) {
-      logger.error(`command ${command} not found`, error);
-      throw error;
-    }
-  }
-}
-
-async function findDotDir(
-  command: string,
-  logger: Logger,
-  cwd: string,
-): Promise<AbsolutePath | undefined> {
-  try {
-    return (await runCommand(command, ['root', '--dotdir'], logger, cwd)).stdout;
-  } catch (error) {
-    logger.error(`Failed to find repository dotdir in ${cwd}`, error);
-    return undefined;
-  }
-}
-
-async function getConfig(
-  command: string,
-  logger: Logger,
-  cwd: string,
-  configName: string,
-): Promise<string | undefined> {
-  try {
-    return (await runCommand(command, ['config', configName], logger, cwd)).stdout.trim();
-  } catch {
-    // `config` exits with status 1 if config is not set. This is not an error.
-    return undefined;
-  }
-}
-type ConfigLevel = 'user' | 'system' | 'local';
-async function setConfig(
-  command: string,
-  logger: Logger,
-  cwd: string,
-  level: ConfigLevel,
-  configName: string,
-  configValue: string,
-): Promise<void> {
-  await runCommand(command, ['config', `--${level}`, configName, configValue], logger, cwd);
-}
-
-function getExecParams(
-  command: string,
-  args_: Array<string>,
-  cwd: string,
-  options_?: execa.Options,
-  env?: NodeJS.ProcessEnv | Record<string, string>,
-): {
-  command: string;
-  args: Array<string>;
-  options: execa.Options;
-} {
-  let args = [...args_, '--noninteractive'];
-  // expandHomeDir is not supported on windows
-  if (process.platform !== 'win32') {
-    // commit/amend have unconventional ways of escaping slashes from messages.
-    // We have to 'unescape' to make it work correctly.
-    args = args.map(arg => arg.replace(/\\\\/g, '\\'));
-  }
-  const [commandName] = args;
-  if (EXCLUDE_FROM_BLACKBOX_COMMANDS.has(commandName)) {
-    args.push('--config', 'extensions.blackbox=!');
-  }
-  const options: execa.Options = {
-    ...options_,
-    env: {
-      ...options_?.env,
-      ...env,
-      LANG: 'en_US.utf-8', // make sure to use unicode if user hasn't set LANG themselves
-      // TODO: remove when SL_ENCODING is used everywhere
-      HGENCODING: 'UTF-8',
-      SL_ENCODING: 'UTF-8',
-      // override any custom aliases a user has defined.
-      SL_AUTOMATION: 'true',
-      // Prevent user-specified merge tools from attempting to
-      // open interactive editors.
-      HGMERGE: ':merge3',
-      SL_MERGE: ':merge3',
-      EDITOR: undefined,
-    } as unknown as NodeJS.ProcessEnv,
-    cwd,
-  };
-
-  if (args_[0] === 'status') {
-    // Take a lock when running status so that multiple status calls in parallel don't overload watchman
-    args.push('--config', 'fsmonitor.watchman-query-lock=True');
-  }
-
-  // TODO: we could run with systemd for better OOM protection when on linux
-  return {command, args, options};
-}
-
-// Avoid spamming the blackbox with read-only commands.
-const EXCLUDE_FROM_BLACKBOX_COMMANDS = new Set(['cat', 'config', 'diff', 'log', 'show', 'status']);
-
-/**
- * Extract CommitInfos from log calls that use FETCH_TEMPLATE.
- */
-export function parseCommitInfoOutput(logger: Logger, output: string): SmartlogCommits {
-  const revisions = output.split(COMMIT_END_MARK);
-  const commitInfos: Array<CommitInfo> = [];
-  for (const chunk of revisions) {
-    try {
-      const lines = chunk.trim().split('\n');
-      if (lines.length < Object.keys(FIELDS).length) {
-        continue;
-      }
-      const files: Array<ChangedFile> = [
-        ...(JSON.parse(lines[FIELD_INDEX.filesModified]) as Array<string>).map(path => ({
-          path,
-          status: 'M' as const,
-        })),
-        ...(JSON.parse(lines[FIELD_INDEX.filesAdded]) as Array<string>).map(path => ({
-          path,
-          status: 'A' as const,
-        })),
-        ...(JSON.parse(lines[FIELD_INDEX.filesRemoved]) as Array<string>).map(path => ({
-          path,
-          status: 'R' as const,
-        })),
-      ];
-      commitInfos.push({
-        hash: lines[FIELD_INDEX.hash],
-        title: lines[FIELD_INDEX.title],
-        author: lines[FIELD_INDEX.author],
-        date: new Date(lines[FIELD_INDEX.date]),
-        parents: splitLine(lines[FIELD_INDEX.parents]) as string[],
-        phase: lines[FIELD_INDEX.phase] as CommitPhaseType,
-        bookmarks: splitLine(lines[FIELD_INDEX.bookmarks]),
-        remoteBookmarks: splitLine(lines[FIELD_INDEX.remoteBookmarks]),
-        isHead: lines[FIELD_INDEX.isHead] === HEAD_MARKER,
-        filesSample: files.slice(0, MAX_FETCHED_FILES_PER_COMMIT),
-        totalFileCount: files.length,
-        successorInfo: parseSuccessorData(lines[FIELD_INDEX.successorInfo]),
-        closestPredecessors: splitLine(lines[FIELD_INDEX.cloesestPredecessors], ','),
-        description: lines
-          .slice(FIELD_INDEX.description + 1 /* first field of description is title; skip it */)
-          .join('\n'),
-        diffId: lines[FIELD_INDEX.diffId] != '' ? lines[FIELD_INDEX.diffId] : undefined,
-        stableCommitMetadata:
-          lines[FIELD_INDEX.stableCommitMetadata] != ''
-            ? Internal.stableCommitConfig?.parse(lines[FIELD_INDEX.stableCommitMetadata])
-            : undefined,
-      });
-    } catch (err) {
-      logger.error('failed to parse commit');
-    }
-  }
-  return commitInfos;
-}
-
-export function parseShelvedCommitsOutput(logger: Logger, output: string): Array<ShelvedChange> {
-  const shelves = output.split(COMMIT_END_MARK);
-  const commitInfos: Array<ShelvedChange> = [];
-  for (const chunk of shelves) {
-    try {
-      const lines = chunk.trim().split('\n');
-      if (lines.length < Object.keys(SHELVE_FIELDS).length) {
-        continue;
-      }
-      const files: Array<ChangedFile> = [
-        ...(JSON.parse(lines[SHELVE_FIELD_INDEX.filesModified]) as Array<string>).map(path => ({
-          path,
-          status: 'M' as const,
-        })),
-        ...(JSON.parse(lines[SHELVE_FIELD_INDEX.filesAdded]) as Array<string>).map(path => ({
-          path,
-          status: 'A' as const,
-        })),
-        ...(JSON.parse(lines[SHELVE_FIELD_INDEX.filesRemoved]) as Array<string>).map(path => ({
-          path,
-          status: 'R' as const,
-        })),
-      ];
-      commitInfos.push({
-        hash: lines[SHELVE_FIELD_INDEX.hash],
-        name: lines[SHELVE_FIELD_INDEX.name],
-        date: new Date(lines[SHELVE_FIELD_INDEX.date]),
-        filesSample: files.slice(0, MAX_FETCHED_FILES_PER_COMMIT),
-        totalFileCount: files.length,
-        description: lines.slice(SHELVE_FIELD_INDEX.description).join('\n'),
-      });
-    } catch (err) {
-      logger.error('failed to parse shelved change');
-    }
-  }
-  return commitInfos;
-}
-
-export function parseSuccessorData(successorData: string): SuccessorInfo | undefined {
-  const [successorString] = successorData.split(',', 1); // we're only interested in the first available mutation
-  if (!successorString) {
-    return undefined;
-  }
-  const successor = successorString.split(':');
-  return {
-    hash: successor[1],
-    type: successor[0],
-  };
-}
-function splitLine(line: string, separator = NULL_CHAR): Array<string> {
-  return line.split(separator).filter(e => e.length > 0);
-}
-
-/**
- * extract repo info from a remote url, typically for GitHub or GitHub Enterprise,
- * in various formats:
- * https://github.com/owner/repo
- * https://github.com/owner/repo.git
- * github.com/owner/repo.git
- * git@github.com:owner/repo.git
- * ssh:git@github.com:owner/repo.git
- * ssh://git@github.com/owner/repo.git
- * git+ssh:git@github.com:owner/repo.git
- *
- * or similar urls with GitHub Enterprise hostnames:
- * https://ghe.myCompany.com/owner/repo
- */
-export function extractRepoInfoFromUrl(
-  url: string,
-): {repo: string; owner: string; hostname: string} | null {
-  const match =
-    /(?:https:\/\/(.*)\/|(?:git\+ssh:\/\/|ssh:\/\/)?(?:git@)?([^:/]*)[:/])([^/]+)\/(.+?)(?:\.git)?$/.exec(
-      url,
-    );
-
-  if (match == null) {
-    return null;
-  }
-
-  const [, hostname1, hostname2, owner, repo] = match;
-  return {owner, repo, hostname: hostname1 ?? hostname2};
+export function repoRelativePathForAbsolutePath(
+  absolutePath: AbsolutePath,
+  repo: Repository,
+  pathMod = path,
+): RepoRelativePath {
+  return pathMod.relative(repo.info.repoRoot, absolutePath);
 }
 
 /**
@@ -1202,55 +1421,6 @@ export function absolutePathForFileInRepo(
   }
 }
 
-export function repoRelativePathForAbsolutePath(
-  absolutePath: AbsolutePath,
-  repo: Repository,
-  pathMod = path,
-): RepoRelativePath {
-  return pathMod.relative(repo.info.repoRoot, absolutePath);
-}
-
-function computeNewConflicts(
-  previousConflicts: MergeConflicts,
-  commandOutput: ResolveCommandConflictOutput,
-  fetchStartTimestamp: number,
-): MergeConflicts | undefined {
-  const newConflictData = commandOutput?.[0];
-  if (newConflictData?.command == null) {
-    return undefined;
-  }
-
-  const conflicts: MergeConflicts = {
-    state: 'loaded',
-    command: newConflictData.command,
-    toContinue: newConflictData.command_details.to_continue,
-    toAbort: newConflictData.command_details.to_abort,
-    files: [],
-    fetchStartTimestamp,
-    fetchCompletedTimestamp: Date.now(),
-  };
-
-  const previousFiles = previousConflicts?.files ?? [];
-
-  const newConflictSet = new Set(newConflictData.conflicts.map(conflict => conflict.path));
-  const previousFilesSet = new Set(previousFiles.map(file => file.path));
-  const newlyAddedConflicts = new Set(
-    [...newConflictSet].filter(file => !previousFilesSet.has(file)),
-  );
-  // we may have seen conflicts before, some of which might now be resolved.
-  // Preserve previous ordering by first pulling from previous files
-  conflicts.files = previousFiles.map(conflict =>
-    newConflictSet.has(conflict.path)
-      ? {path: conflict.path, status: 'U'}
-      : // 'R' is overloaded to mean "removed" for `sl status` but 'Resolved' for `sl resolve --list`
-        // let's re-write this to make the UI layer simpler.
-        {path: conflict.path, status: 'Resolved'},
-  );
-  if (newlyAddedConflicts.size > 0) {
-    conflicts.files.push(
-      ...[...newlyAddedConflicts].map(conflict => ({path: conflict, status: 'U' as const})),
-    );
-  }
-
-  return conflicts;
+function isUnhealthyEdenFs(cwd: string): Promise<boolean> {
+  return exists(path.join(cwd, 'README_EDEN.txt'));
 }

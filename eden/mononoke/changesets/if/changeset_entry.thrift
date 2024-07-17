@@ -5,7 +5,7 @@
  * GNU General Public License version 2.
  */
 
-include "eden/mononoke/mononoke_types/if/mononoke_types_thrift.thrift"
+include "eden/mononoke/mononoke_types/serialization/id.thrift"
 
 # Memcache constants. Should be change when we want to invalidate memcache
 # entries
@@ -18,8 +18,8 @@ typedef i32 RepoId (rust.newtype)
 typedef i64 GenerationNum (rust.newtype)
 
 struct ChangesetEntry {
-  1: required RepoId repo_id;
-  2: required mononoke_types_thrift.ChangesetId cs_id;
-  3: required list<mononoke_types_thrift.ChangesetId> parents;
-  4: required GenerationNum gen;
+  1: RepoId repo_id;
+  2: id.ChangesetId cs_id;
+  3: list<id.ChangesetId> parents;
+  4: GenerationNum gen;
 } (rust.exhaustive)

@@ -35,7 +35,7 @@ def _assignobjects(objects, repo) -> None:
         {
             # Shortcuts
             "b": bindings,
-            "e": sapling,
+            "s": sapling,
             "x": ext,
             "td": bindings.tracing.tracingdata,
             # Modules
@@ -124,7 +124,7 @@ def _startipython(ui, repo, env) -> None:
         sapling.__path__ and sapling.__path__[0],
     ) + (
         "\n\nAvailable variables:\n"
-        " e:  sapling\n"
+        " s:  sapling\n"
         " x:  sapling.ext\n"
         " b:  bindings\n"
         " ui: the ui object\n"
@@ -142,6 +142,14 @@ def _startipython(ui, repo, env) -> None:
         )
 
     util.get_main_io().disable_progress()
+
+    try:
+        # Enable site-packages before loading IPython
+        import site
+
+        site.main()
+    except Exception:
+        pass
 
     have_ipython = False
     try:
@@ -183,6 +191,12 @@ Available IPython magics (auto magic is on, `%` is optional):
     if util.istest():
         # Disable history during tests.
         config.HistoryAccessor.enabled = False
+
+    # Insert a dummy SIGINT handler to workaround a prompt-toolkit bug.
+    # See https://github.com/prompt-toolkit/python-prompt-toolkit/commit/6a24c99f7db0729d60d7d56f9759db617f266164
+    import signal
+
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
     globals().update(env)
     shell = InteractiveShellEmbed.instance(

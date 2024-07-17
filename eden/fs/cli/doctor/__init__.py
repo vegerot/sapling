@@ -9,7 +9,7 @@
 import os
 import shlex
 import sys
-from datetime import date, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from textwrap import dedent
 from typing import Dict, List, Optional, Set
@@ -30,6 +30,9 @@ from eden.fs.cli.doctor.util import (
     get_dependent_repos,
     hg_doctor_in_backing_repo,
 )
+
+from facebook.eden.constants import STATS_MOUNTS_STATS
+
 from facebook.eden.ttypes import GetStatInfoParams, MountState
 from fb303_core.ttypes import fb303_status
 
@@ -85,6 +88,7 @@ def cure_what_ails_you(
     *,
     debug: bool = False,
     fast: bool = False,
+    min_severity_to_report: ProblemSeverity = ProblemSeverity.ADVICE,
     mount_table: Optional[mtab.MountTable] = None,
     fs_util: Optional[filesystem.FsUtil] = None,
     proc_utils: Optional[proc_utils_mod.ProcUtils] = None,
@@ -97,6 +101,7 @@ def cure_what_ails_you(
         dry_run,
         debug,
         fast,
+        min_severity_to_report,
         mount_table,
         fs_util,
         proc_utils,
@@ -240,7 +245,9 @@ class EdenDoctorChecker:
         # Get information about the checkouts currently known to the running
         # edenfs process
         with self.instance.get_thrift_client_legacy() as client:
-            internal_stats = client.getStatInfo(GetStatInfoParams())
+            internal_stats = client.getStatInfo(
+                GetStatInfoParams(statsMask=STATS_MOUNTS_STATS)
+            )
             mount_point_info = internal_stats.mountPointInfo or {}
 
             for mount in client.listMounts():
@@ -254,9 +261,11 @@ class EdenDoctorChecker:
                 checkout = CheckoutInfo(
                     self.instance,
                     path,
-                    backing_repo=Path(os.fsdecode(mount.backingRepoPath))
-                    if mount.backingRepoPath is not None
-                    else None,
+                    backing_repo=(
+                        Path(os.fsdecode(mount.backingRepoPath))
+                        if mount.backingRepoPath is not None
+                        else None
+                    ),
                     running_state_dir=Path(os.fsdecode(mount.edenClientPath)),
                     state=mount_state,
                     mount_inode_info=mount_point_info.get(mount.mountPoint),
@@ -364,6 +373,7 @@ class EdenDoctorChecker:
 class EdenDoctor(EdenDoctorChecker):
     fixer: ProblemFixer
     dry_run: bool
+    min_severity_to_report: ProblemSeverity
 
     def __init__(
         self,
@@ -371,6 +381,7 @@ class EdenDoctor(EdenDoctorChecker):
         dry_run: bool,
         debug: bool,
         fast: bool,
+        min_severity_to_report: ProblemSeverity,
         mount_table: Optional[mtab.MountTable] = None,
         fs_util: Optional[filesystem.FsUtil] = None,
         proc_utils: Optional[proc_utils_mod.ProcUtils] = None,
@@ -379,11 +390,22 @@ class EdenDoctor(EdenDoctorChecker):
         out: Optional[ui.Output] = None,
     ) -> None:
         self.dry_run = dry_run
+        self.min_severity_to_report = min_severity_to_report
         out = out if out is not None else ui.get_output()
         if dry_run:
-            self.fixer = DryRunFixer(instance, out, debug)
+            self.fixer = DryRunFixer(
+                instance,
+                out,
+                debug,
+                min_severity_to_report,
+            )
         else:
-            self.fixer = ProblemFixer(instance, out, debug)
+            self.fixer = ProblemFixer(
+                instance,
+                out,
+                debug,
+                min_severity_to_report,
+            )
 
         super().__init__(
             instance,
@@ -412,6 +434,14 @@ class EdenDoctor(EdenDoctorChecker):
                 num_problems=fixer.num_problems,
                 problems=fixer.problem_types.union(fixer.ignored_problem_types),
                 problem_description=fixer.problem_description,
+                num_failed_fixes=fixer.num_failed_fixes,
+                num_manual_fixes=fixer.num_manual_fixes,
+                num_no_fixes=fixer.num_no_fixes,
+                num_advisory_fixes=fixer.num_advisory_fixes,
+                problem_failed_fixes=fixer.problem_failed_fixes,
+                problem_manual_fixes=fixer.problem_manual_fixes,
+                problem_no_fixes=fixer.problem_no_fixes,
+                problem_advisory_fixes=fixer.problem_advisory_fixes,
             )
 
         if fixer.num_problems == 0:
@@ -442,12 +472,26 @@ class EdenDoctor(EdenDoctorChecker):
             out.writeln(
                 f"Failed to fix {problem_count(fixer.num_failed_fixes)}.", fg=out.RED
             )
+
+        if fixer.num_advisory_fixes:
+            out.writeln(
+                f"{fixer.num_advisory_fixes} issue{'' if fixer.num_advisory_fixes==1 else 's'} with recommended fixes.",
+                fg=out.YELLOW,
+            )
+
         if fixer.num_manual_fixes:
             if fixer.num_manual_fixes == 1:
                 msg = "1 issue requires manual attention."
             else:
                 msg = f"{fixer.num_manual_fixes} issues require manual attention."
             out.writeln(msg, fg=out.YELLOW)
+
+        if fixer.num_no_fixes:
+            if fixer.num_no_fixes == 1:
+                msg = "No standard fix for 1 issue."
+            else:
+                msg = f"No standard fix for {fixer.num_no_fixes} issues."
+            out.writeln(msg, fg=out.RED)
 
         if fixer.num_fixed_problems == fixer.num_problems:
             return 0
@@ -488,12 +532,16 @@ class EdenfsPrivHelperNotHealthy(Problem):
 class EdenfsStarting(Problem):
     def __init__(self) -> None:
         remediation = '''\
-Please wait for edenfs to finish starting. You can watch it's progress with
+Please wait for edenfs to finish starting. You can watch its progress with
 `eden status --wait`.
 
 If EdenFS seems to be taking too long to start you can try restarting it
 with "eden restart --force"'''
-        super().__init__("EdenFS is currently still starting.", remediation=remediation)
+        super().__init__(
+            "EdenFS is currently still starting.",
+            remediation=remediation,
+            severity=ProblemSeverity.ADVICE,
+        )
 
 
 class EdenfsStopping(Problem):
@@ -553,7 +601,22 @@ class NestedCheckout(Problem):
         super().__init__(
             f"""\
 edenfs reports that checkout {checkout.path} is nested within an existing checkout {existing_checkout.path}
-Nested checkouts are usually not intended and can cause spurious behavior.\n"""
+Nested checkouts are usually not intended and can cause spurious behavior.""",
+            f"Consider running `eden rm {checkout.path}` to remove misplaced repo(s)\n",
+            severity=ProblemSeverity.ADVICE,
+        )
+
+
+class CheckoutInsideBackingRepo(Problem):
+    def __init__(
+        self, checkout: CheckoutInfo, existing_checkout: config_mod.EdenCheckout
+    ) -> None:
+        super().__init__(
+            f"""\
+edenfs reports that checkout {checkout.path} is created within backing repo of an existing checkout {existing_checkout.path} (backing repo: {existing_checkout.get_backing_repo_path()})
+Checkouts inside backing repo are usually not intended and can cause spurious behavior.""",
+            f"Consider running `eden rm {checkout.path}` to remove misplaced repo(s)\n",
+            severity=ProblemSeverity.ADVICE,
         )
 
 
@@ -615,12 +678,18 @@ def check_mount(
 
     try:
         # Check if this checkout is nested inside another one
-        existing_checkout, rel_path = config_mod.detect_nested_checkout(
+        problem_type, existing_checkout = config_mod.detect_checkout_path_problem(
             checkout.path,
             instance,
         )
-        if existing_checkout is not None and rel_path is not None:
-            tracker.add_problem(NestedCheckout(checkout, existing_checkout))
+
+        if problem_type is not None and existing_checkout is not None:
+            if problem_type == config_mod.CheckoutPathProblemType.NESTED_CHECKOUT:
+                tracker.add_problem(NestedCheckout(checkout, existing_checkout))
+            if problem_type == config_mod.CheckoutPathProblemType.INSIDE_BACKING_REPO:
+                tracker.add_problem(
+                    CheckoutInsideBackingRepo(checkout, existing_checkout)
+                )
     except Exception as ex:
         raise RuntimeError("Failed to detect nested checkout") from ex
 
@@ -694,7 +763,7 @@ def check_running_mount(
         except Exception as ex:
             raise RuntimeError("Failed to check loaded content integrity") from ex
 
-    if config.scm_type == "hg":
+    if config.scm_type in ["hg", "filteredhg"]:
         try:
             check_hg.check_hg(tracker, checkout)
         except Exception as ex:
@@ -876,19 +945,61 @@ the old directory from before the EdenFS checkouts were mounted.
     return StaleWorkingDirectory(msg)
 
 
+class BadEdenFsVersion(Problem):
+    def __init__(self, running_version: str, reasons: List[str]) -> None:
+        reasons_string = "\n    ".join(reasons)
+        help_string = f"""\
+The version of EdenFS that is running on your machine is:
+    {running_version}
+This version is known to have issue:
+    {reasons_string}
+"""
+
+        remediation_string = 'Run `edenfsctl restart{"" if sys.platform == "win32" else " --graceful"}` to migrate to the newer version to avoid these issues.'
+        super().__init__(
+            dedent(help_string), remediation_string, severity=ProblemSeverity.ADVICE
+        )
+
+
 class OutOfDateVersion(Problem):
-    def __init__(self, help_string: str) -> None:
-        super().__init__(help_string, severity=ProblemSeverity.ADVICE)
+    def __init__(self, installed_version: str, running_version: str) -> None:
+        help_string = f"""\
+The version of EdenFS that is installed on your machine is:
+    {installed_version}
+but the version of EdenFS that is currently running is:
+    {running_version}
+"""
+
+        remediation_string = """Consider running `edenfsctl restart --graceful` to migrate to the newer version,
+which may have important bug fixes or performance improvements.
+"""
+        super().__init__(
+            dedent(help_string),
+            dedent(remediation_string),
+            severity=ProblemSeverity.ADVICE,
+        )
 
 
 def check_edenfs_version(tracker: ProblemTracker, instance: EdenInstance) -> None:
-    def date_from_version(version: str) -> date:
-        return datetime.strptime(version, "%Y%m%d").date()
-
+    # get released version parts
     rver, release = instance.get_running_version_parts()
     if not rver or not release:
         # This could be a dev build that returns the empty
         # string for both of these values.
+        return
+
+    # check for bad eden fs running version
+    bad_version_reasons_map = instance.get_known_bad_edenfs_versions()
+    running_version = version.format_eden_version((rver, release))
+    running_version_str = (
+        f"fb.eden {running_version}"
+        if sys.platform == "win32"
+        else f"fb-eden-{running_version}.x86_64"
+    )
+    if running_version in bad_version_reasons_map:
+        reasons = bad_version_reasons_map[running_version]
+        tracker.add_problem(BadEdenFsVersion(running_version_str, reasons))
+        # if bad version, don't check for out of date version
         return
 
     # get installed version parts
@@ -897,35 +1008,22 @@ def check_edenfs_version(tracker: ProblemTracker, instance: EdenInstance) -> Non
         # dev build of eden client returns empty strings here
         return
 
-    # check if the runnig version is more than two weeks old
-    daysgap = date_from_version(iversion) - date_from_version(rver)
+    # check if the running version is more than two weeks old
+    iversion_date = version.date_from_version(iversion)
+    rversion_date = version.date_from_version(rver)
+    if not iversion_date or not rversion_date:
+        return
+    daysgap = iversion_date - rversion_date
     if daysgap.days < 14:
         return
 
-    running_version = version.format_eden_version((rver, release))
     installed_version = version.format_eden_version((iversion, irelease))
-
-    if sys.platform == "win32":
-        help_string = f"""\
-The version of EdenFS that is installed on your machine is:
-    fb.eden {installed_version}
-but the version of EdenFS that is currently running is:
-    fb.eden {running_version}
-
-Consider running `edenfsctl restart` to migrate to the newer version,
-which may have important bug fixes or performance improvements.
-"""
-    else:
-        help_string = f"""\
-The version of EdenFS that is installed on your machine is:
-    fb-eden-{installed_version}.x86_64
-but the version of EdenFS that is currently running is:
-    fb-eden-{running_version}.x86_64
-
-Consider running `edenfsctl restart --graceful` to migrate to the newer version,
-which may have important bug fixes or performance improvements.
-"""
-    tracker.add_problem(OutOfDateVersion(dedent(help_string)))
+    installed_version_str = (
+        f"fb.eden {installed_version}"
+        if sys.platform == "win32"
+        else f"fb-eden-{installed_version}.x86_64"
+    )
+    tracker.add_problem(OutOfDateVersion(installed_version_str, running_version_str))
 
 
 class SlowHgImportProblem(Problem):
@@ -948,7 +1046,7 @@ def check_slow_hg_import(tracker: ProblemTracker, instance: EdenInstance) -> Non
     threshold = timedelta(seconds=threshold_s)
 
     with instance.get_thrift_client_legacy() as client:
-        max_duration_us = client.getCounter("store.hg.live_import.max_duration_us")
+        max_duration_us = client.getCounter("store.sapling.live_import.max_duration_us")
 
     max_duration = timedelta(microseconds=max_duration_us)
     if max_duration > threshold:

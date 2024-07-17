@@ -1,9 +1,9 @@
-#chg-compatible
+#require no-eden
 
-  $ configure modernclient
   $ configure mutation-norecord
-  $ enable conflictinfo rebase
+  $ enable conflictinfo rebase copytrace
   $ setconfig experimental.rebase-long-labels=True
+  $ setconfig copytrace.dagcopytrace=True
 
 1) Make the repo
   $ newclientrepo basic
@@ -52,25 +52,130 @@
   [1]
 
 5) Get the paths:
-  $ hg resolve --tool internal:dumpjson --all
+  $ hg resolve --tool internal:dumpjson --all | pp
   [
-   {
-    "command": "merge",
-    "command_details": {"cmd": "merge", "to_abort": "goto --clean", "to_continue": "merge --continue"},
-    "conflicts": [{"base": {"contents": "Unconflicted base, F1\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": "Second conflicted version, F1\n", "exists": true, "isexec": false, "issymlink": false}, "other": {"contents": "First conflicted version, F1\n", "exists": true, "isexec": false, "issymlink": false}, "output": {"contents": "<<<<<<< working copy: 13124abb51b9 b - test: second version, b\nSecond conflicted version, F1\n=======\nFirst conflicted version, F1\n>>>>>>> merge rev:    6dd692b7db4a a - test: first version, a\n", "exists": true, "isexec": false, "issymlink": false, "path": "$TESTTMP/basic/F1"}, "path": "F1"}, {"base": {"contents": "Unconflicted base, F2\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": "Second conflicted version, F2\n", "exists": true, "isexec": false, "issymlink": false}, "other": {"contents": "First conflicted version, F2\n", "exists": true, "isexec": false, "issymlink": false}, "output": {"contents": "<<<<<<< working copy: 13124abb51b9 b - test: second version, b\nSecond conflicted version, F2\n=======\nFirst conflicted version, F2\n>>>>>>> merge rev:    6dd692b7db4a a - test: first version, a\n", "exists": true, "isexec": false, "issymlink": false, "path": "$TESTTMP/basic/F2"}, "path": "F2"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "merge",
+      "command_details": {
+        "cmd": "merge",
+        "to_abort": "goto --clean",
+        "to_continue": "merge --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "Unconflicted base, F1\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": "Second conflicted version, F1\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "other": {
+            "contents": "First conflicted version, F1\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "output": {
+            "contents": "<<<<<<< working copy: 13124abb51b9 b - test: second version, b\nSecond conflicted version, F1\n=======\nFirst conflicted version, F1\n>>>>>>> merge rev:    6dd692b7db4a a - test: first version, a\n",
+            "contents:merge3": "<<<<<<< dest\nSecond conflicted version, F1\n||||||| base\nUnconflicted base, F1\n=======\nFirst conflicted version, F1\n>>>>>>> source\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false,
+            "path": "$TESTTMP/basic/F1"
+          },
+          "path": "F1"
+        },
+        {
+          "base": {
+            "contents": "Unconflicted base, F2\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": "Second conflicted version, F2\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "other": {
+            "contents": "First conflicted version, F2\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "output": {
+            "contents": "<<<<<<< working copy: 13124abb51b9 b - test: second version, b\nSecond conflicted version, F2\n=======\nFirst conflicted version, F2\n>>>>>>> merge rev:    6dd692b7db4a a - test: first version, a\n",
+            "contents:merge3": "<<<<<<< dest\nSecond conflicted version, F2\n||||||| base\nUnconflicted base, F2\n=======\nFirst conflicted version, F2\n>>>>>>> source\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false,
+            "path": "$TESTTMP/basic/F2"
+          },
+          "path": "F2"
+        }
+      ],
+      "hashes": {
+        "local": "13124abb51b9fbac518b2b8722df68e012ecfc58",
+        "other": "6dd692b7db4a573115a661237cb90b506bccc45d"
+      },
+      "pathconflicts": []
+    }
   ]
 
 6) Only requested paths get dumped
-  $ hg resolve --tool internal:dumpjson F2
+  $ hg resolve --tool internal:dumpjson F2 | pp
   [
-   {
-    "command": "merge",
-    "command_details": {"cmd": "merge", "to_abort": "goto --clean", "to_continue": "merge --continue"},
-    "conflicts": [{"base": {"contents": "Unconflicted base, F2\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": "Second conflicted version, F2\n", "exists": true, "isexec": false, "issymlink": false}, "other": {"contents": "First conflicted version, F2\n", "exists": true, "isexec": false, "issymlink": false}, "output": {"contents": "<<<<<<< working copy: 13124abb51b9 b - test: second version, b\nSecond conflicted version, F2\n=======\nFirst conflicted version, F2\n>>>>>>> merge rev:    6dd692b7db4a a - test: first version, a\n", "exists": true, "isexec": false, "issymlink": false, "path": "$TESTTMP/basic/F2"}, "path": "F2"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "merge",
+      "command_details": {
+        "cmd": "merge",
+        "to_abort": "goto --clean",
+        "to_continue": "merge --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "Unconflicted base, F2\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": "Second conflicted version, F2\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "other": {
+            "contents": "First conflicted version, F2\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "output": {
+            "contents": "<<<<<<< working copy: 13124abb51b9 b - test: second version, b\nSecond conflicted version, F2\n=======\nFirst conflicted version, F2\n>>>>>>> merge rev:    6dd692b7db4a a - test: first version, a\n",
+            "contents:merge3": "<<<<<<< dest\nSecond conflicted version, F2\n||||||| base\nUnconflicted base, F2\n=======\nFirst conflicted version, F2\n>>>>>>> source\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false,
+            "path": "$TESTTMP/basic/F2"
+          },
+          "path": "F2"
+        }
+      ],
+      "hashes": {
+        "local": "13124abb51b9fbac518b2b8722df68e012ecfc58",
+        "other": "6dd692b7db4a573115a661237cb90b506bccc45d"
+      },
+      "pathconflicts": []
+    }
   ]
 
 7) Ensure the paths point to the right contents:
@@ -142,14 +247,52 @@ tldr: Since we can premerge, the working copy is backed up to an origfile.
   use 'hg resolve' to retry unresolved file merges or 'hg goto -C .' to abandon
   [1]
 
-  $ hg resolve --tool=internal:dumpjson --all
+  $ hg resolve --tool=internal:dumpjson --all | pp
   [
-   {
-    "command": "merge",
-    "command_details": {"cmd": "merge", "to_abort": "goto --clean", "to_continue": "merge --continue"},
-    "conflicts": [{"base": {"contents": "base\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": "some local changes\n", "exists": true, "isexec": false, "issymlink": false}, "other": {"contents": "other change\n", "exists": true, "isexec": false, "issymlink": false}, "output": {"contents": "<<<<<<< working copy: fd7d10c36158 - test: dest\nsome local changes\n=======\nother change\n>>>>>>> merge rev:    9b65ba2922f0 - test: source\n", "exists": true, "isexec": false, "issymlink": false, "path": "$TESTTMP/foo/file"}, "path": "file"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "merge",
+      "command_details": {
+        "cmd": "merge",
+        "to_abort": "goto --clean",
+        "to_continue": "merge --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "base\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": "some local changes\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "other": {
+            "contents": "other change\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "output": {
+            "contents": "<<<<<<< working copy: fd7d10c36158 - test: dest\nsome local changes\n=======\nother change\n>>>>>>> merge rev:    9b65ba2922f0 - test: source\n",
+            "contents:merge3": "<<<<<<< dest\nsome local changes\n||||||| base\nbase\n=======\nother change\n>>>>>>> source\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false,
+            "path": "$TESTTMP/foo/file"
+          },
+          "path": "file"
+        }
+      ],
+      "hashes": {
+        "local": "fd7d10c36158e4f6e713ca1c40ddebce2b55a868",
+        "other": "9b65ba2922f0e466c10e5344d8691afa631e353b"
+      },
+      "pathconflicts": []
+    }
   ]
 
 Test case 0b: Like #0 but with a corner case: source deleted, local changed
@@ -185,14 +328,51 @@ tldr: Since we couldn't premerge, the working copy is left alone.
   use 'hg resolve' to retry unresolved file merges or 'hg goto -C .' to abandon
   [1]
 
-  $ hg resolve --tool=internal:dumpjson --all
+  $ hg resolve --tool=internal:dumpjson --all | pp
   [
-   {
-    "command": "merge",
-    "command_details": {"cmd": "merge", "to_abort": "goto --clean", "to_continue": "merge --continue"},
-    "conflicts": [{"base": {"contents": "base\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": "some local changes\n", "exists": true, "isexec": true, "issymlink": false}, "other": {"contents": null, "exists": false, "isexec": null, "issymlink": null}, "output": {"contents": "some local changes\n", "exists": true, "isexec": true, "issymlink": false, "path": "$TESTTMP/foo/file"}, "path": "file"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "merge",
+      "command_details": {
+        "cmd": "merge",
+        "to_abort": "goto --clean",
+        "to_continue": "merge --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "base\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": "some local changes\n",
+            "exists": true,
+            "isexec": true,
+            "issymlink": false
+          },
+          "other": {
+            "contents": null,
+            "exists": false,
+            "isexec": null,
+            "issymlink": null
+          },
+          "output": {
+            "contents": "some local changes\n",
+            "exists": true,
+            "isexec": true,
+            "issymlink": false,
+            "path": "$TESTTMP/foo/file"
+          },
+          "path": "file"
+        }
+      ],
+      "hashes": {
+        "local": "fd7d10c36158e4f6e713ca1c40ddebce2b55a868",
+        "other": "25c2ef28f4c763dd5068d3aa96cafa1342fe5280"
+      },
+      "pathconflicts": []
+    }
   ]
 
 Test case 1: Source deleted, dest changed
@@ -223,14 +403,51 @@ Test case 1: Source deleted, dest changed
   use (c)hanged version, (d)elete, or leave (u)nresolved? u
   unresolved conflicts (see hg resolve, then hg rebase --continue)
   [1]
-  $ hg resolve --tool=internal:dumpjson --all
+  $ hg resolve --tool=internal:dumpjson --all | pp
   [
-   {
-    "command": "rebase",
-    "command_details": {"cmd": "rebase", "to_abort": "rebase --abort", "to_continue": "rebase --continue"},
-    "conflicts": [{"base": {"contents": "base\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": "change\n", "exists": true, "isexec": false, "issymlink": false}, "other": {"contents": null, "exists": false, "isexec": null, "issymlink": null}, "output": {"contents": "change\n", "exists": true, "isexec": false, "issymlink": false, "path": "$TESTTMP/foo/file"}, "path": "file"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "rebase",
+      "command_details": {
+        "cmd": "rebase",
+        "to_abort": "rebase --abort",
+        "to_continue": "rebase --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "base\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": "change\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "other": {
+            "contents": null,
+            "exists": false,
+            "isexec": null,
+            "issymlink": null
+          },
+          "output": {
+            "contents": "change\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false,
+            "path": "$TESTTMP/foo/file"
+          },
+          "path": "file"
+        }
+      ],
+      "hashes": {
+        "local": "fd7d10c36158e4f6e713ca1c40ddebce2b55a868",
+        "other": "25c2ef28f4c763dd5068d3aa96cafa1342fe5280"
+      },
+      "pathconflicts": []
+    }
   ]
 Test case 1b: Like #1 but with a merge, with local changes
   $ reset
@@ -261,14 +478,51 @@ Test case 1b: Like #1 but with a merge, with local changes
   use 'hg resolve' to retry unresolved file merges or 'hg goto -C .' to abandon
   [1]
 
-  $ hg resolve --tool=internal:dumpjson --all
+  $ hg resolve --tool=internal:dumpjson --all | pp
   [
-   {
-    "command": "merge",
-    "command_details": {"cmd": "merge", "to_abort": "goto --clean", "to_continue": "merge --continue"},
-    "conflicts": [{"base": {"contents": "base\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": "some local changes\n", "exists": true, "isexec": false, "issymlink": false}, "other": {"contents": null, "exists": false, "isexec": null, "issymlink": null}, "output": {"contents": "some local changes\n", "exists": true, "isexec": false, "issymlink": false, "path": "$TESTTMP/foo/file"}, "path": "file"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "merge",
+      "command_details": {
+        "cmd": "merge",
+        "to_abort": "goto --clean",
+        "to_continue": "merge --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "base\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": "some local changes\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "other": {
+            "contents": null,
+            "exists": false,
+            "isexec": null,
+            "issymlink": null
+          },
+          "output": {
+            "contents": "some local changes\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false,
+            "path": "$TESTTMP/foo/file"
+          },
+          "path": "file"
+        }
+      ],
+      "hashes": {
+        "local": "fd7d10c36158e4f6e713ca1c40ddebce2b55a868",
+        "other": "25c2ef28f4c763dd5068d3aa96cafa1342fe5280"
+      },
+      "pathconflicts": []
+    }
   ]
 Test case 2: Source changed, dest deleted
   $ reset
@@ -294,18 +548,56 @@ Test case 2: Source changed, dest deleted
 
   $ hg rebase -d 'desc(dest)' -s 'desc(source)'
   rebasing ec87889f5f90 "source"
-  other [source (being rebased)] changed file which local [dest (rebasing onto)] deleted
-  use (c)hanged version, leave (d)eleted, leave (u)nresolved, or input (r)enamed path? u
+  other [source (being rebased)] changed file which local [dest (rebasing onto)] is missing
+  hint: the missing file was probably deleted by commit 66a38a15024c in the branch rebasing onto
+  use (c)hanged version, leave (d)eleted, or leave (u)nresolved, or input (r)enamed path? u
   unresolved conflicts (see hg resolve, then hg rebase --continue)
   [1]
-  $ hg resolve --tool=internal:dumpjson --all
+  $ hg resolve --tool=internal:dumpjson --all | pp
   [
-   {
-    "command": "rebase",
-    "command_details": {"cmd": "rebase", "to_abort": "rebase --abort", "to_continue": "rebase --continue"},
-    "conflicts": [{"base": {"contents": "base\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": null, "exists": false, "isexec": null, "issymlink": null}, "other": {"contents": "change\n", "exists": true, "isexec": false, "issymlink": false}, "output": {"contents": null, "exists": false, "isexec": null, "issymlink": null, "path": "$TESTTMP/foo/file"}, "path": "file"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "rebase",
+      "command_details": {
+        "cmd": "rebase",
+        "to_abort": "rebase --abort",
+        "to_continue": "rebase --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "base\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": null,
+            "exists": false,
+            "isexec": null,
+            "issymlink": null
+          },
+          "other": {
+            "contents": "change\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "output": {
+            "contents": null,
+            "exists": false,
+            "isexec": null,
+            "issymlink": null,
+            "path": "$TESTTMP/foo/file"
+          },
+          "path": "file"
+        }
+      ],
+      "hashes": {
+        "local": "66a38a15024ce5297f27bab5b7f17870de6d0d96",
+        "other": "ec87889f5f908dd874cf31122628f081037e4bf5"
+      },
+      "pathconflicts": []
+    }
   ]
 Test case 3: Source changed, dest moved
   $ reset
@@ -335,13 +627,17 @@ Test case 3: Source changed, dest moved
   $ hg up -q 'desc(source)' # source
   $ cat file_newloc # Should follow:
   change
-  $ hg resolve --tool=internal:dumpjson --all
+  $ hg resolve --tool=internal:dumpjson --all | pp
   [
-   {
-    "command": null,
-    "conflicts": [],
-    "pathconflicts": []
-   }
+    {
+      "command": null,
+      "conflicts": [],
+      "hashes": {
+        "local": null,
+        "other": null
+      },
+      "pathconflicts": []
+    }
   ]
 Test case 4: Source changed, dest moved (w/o copytracing)
   $ reset
@@ -365,20 +661,58 @@ Test case 4: Source changed, dest moved (w/o copytracing)
      deleted:
   
 
-  $ hg rebase -d 'desc(dest)' -s 'desc(source)' --config experimental.copytrace=off
+  $ hg rebase -d 'desc(dest)' -s 'desc(source)' --config extensions.copytrace=!
   rebasing ec87889f5f90 "source"
-  other [source (being rebased)] changed file which local [dest (rebasing onto)] deleted
-  use (c)hanged version, leave (d)eleted, leave (u)nresolved, or input (r)enamed path? u
+  other [source (being rebased)] changed file which local [dest (rebasing onto)] is missing
+  hint: if this is due to a renamed file, you can manually input the renamed path
+  use (c)hanged version, leave (d)eleted, or leave (u)nresolved, or input (r)enamed path? u
   unresolved conflicts (see hg resolve, then hg rebase --continue)
   [1]
-  $ hg resolve --tool=internal:dumpjson --all
+  $ hg resolve --tool=internal:dumpjson --all | pp
   [
-   {
-    "command": "rebase",
-    "command_details": {"cmd": "rebase", "to_abort": "rebase --abort", "to_continue": "rebase --continue"},
-    "conflicts": [{"base": {"contents": "base\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": null, "exists": false, "isexec": null, "issymlink": null}, "other": {"contents": "change\n", "exists": true, "isexec": false, "issymlink": false}, "output": {"contents": null, "exists": false, "isexec": null, "issymlink": null, "path": "$TESTTMP/foo/file"}, "path": "file"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "rebase",
+      "command_details": {
+        "cmd": "rebase",
+        "to_abort": "rebase --abort",
+        "to_continue": "rebase --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "base\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": null,
+            "exists": false,
+            "isexec": null,
+            "issymlink": null
+          },
+          "other": {
+            "contents": "change\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "output": {
+            "contents": null,
+            "exists": false,
+            "isexec": null,
+            "issymlink": null,
+            "path": "$TESTTMP/foo/file"
+          },
+          "path": "file"
+        }
+      ],
+      "hashes": {
+        "local": "d168768b462ba7bdf7d27a2c2e317362498a0a65",
+        "other": "ec87889f5f908dd874cf31122628f081037e4bf5"
+      },
+      "pathconflicts": []
+    }
   ]
 Test case 5: Source moved, dest changed
   $ reset
@@ -414,6 +748,7 @@ Test case 5: Source moved, dest changed
    {
     "command": null,
     "conflicts": [],
+    "hashes": {"local": null, "other": null},
     "pathconflicts": []
    }
   ]
@@ -439,20 +774,57 @@ Test case 6: Source moved, dest changed (w/o copytracing)
      deleted:
   
 
-  $ hg rebase -d 'desc(dest)' -s 'desc(source)' --config experimental.copytrace=off
+  $ hg rebase -d 'desc(dest)' -s 'desc(source)' --config extensions.copytrace=!
   rebasing e6e7483a8950 "source"
   local [dest (rebasing onto)] changed file which other [source (being rebased)] deleted
   use (c)hanged version, (d)elete, or leave (u)nresolved? u
   unresolved conflicts (see hg resolve, then hg rebase --continue)
   [1]
-  $ hg resolve --tool=internal:dumpjson --all
+  $ hg resolve --tool=internal:dumpjson --all | pp
   [
-   {
-    "command": "rebase",
-    "command_details": {"cmd": "rebase", "to_abort": "rebase --abort", "to_continue": "rebase --continue"},
-    "conflicts": [{"base": {"contents": "base\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": "change\n", "exists": true, "isexec": false, "issymlink": false}, "other": {"contents": null, "exists": false, "isexec": null, "issymlink": null}, "output": {"contents": "change\n", "exists": true, "isexec": false, "issymlink": false, "path": "$TESTTMP/foo/file"}, "path": "file"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "rebase",
+      "command_details": {
+        "cmd": "rebase",
+        "to_abort": "rebase --abort",
+        "to_continue": "rebase --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "base\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": "change\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "other": {
+            "contents": null,
+            "exists": false,
+            "isexec": null,
+            "issymlink": null
+          },
+          "output": {
+            "contents": "change\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false,
+            "path": "$TESTTMP/foo/file"
+          },
+          "path": "file"
+        }
+      ],
+      "hashes": {
+        "local": "fd7d10c36158e4f6e713ca1c40ddebce2b55a868",
+        "other": "e6e7483a895027a7b6f8146011cce3b46ef5d8d6"
+      },
+      "pathconflicts": []
+    }
   ]
 Test case 7: Source is a directory, dest is a file (base is still a file)
   $ reset
@@ -522,18 +894,55 @@ Test case 8: Source is a file, dest is a directory (base is still a file)
   ($TESTTMP/foo/file: mode 0o52, uid 42, gid 42) (?)
   ($TESTTMP/foo: mode 0o52, uid 42, gid 42) (?)
   [255]
-  $ hg resolve --tool=internal:dumpjson --all
+  $ hg resolve --tool=internal:dumpjson --all | pp
   [
-   {
-    "command": "rebase",
-    "command_details": {"cmd": "rebase", "to_abort": "rebase --abort", "to_continue": "rebase --continue"},
-    "conflicts": [{"base": {"contents": "base\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": null, "exists": false, "isexec": null, "issymlink": null}, "other": {"contents": "change\n", "exists": true, "isexec": false, "issymlink": false}, "output": {"contents": null, "exists": false, "isexec": null, "issymlink": null, "path": "$TESTTMP/foo/file"}, "path": "file"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "rebase",
+      "command_details": {
+        "cmd": "rebase",
+        "to_abort": "rebase --abort",
+        "to_continue": "rebase --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "base\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": null,
+            "exists": false,
+            "isexec": null,
+            "issymlink": null
+          },
+          "other": {
+            "contents": "change\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "output": {
+            "contents": null,
+            "exists": false,
+            "isexec": null,
+            "issymlink": null,
+            "path": "$TESTTMP/foo/file"
+          },
+          "path": "file"
+        }
+      ],
+      "hashes": {
+        "local": "1803169f37a9243ff3ba460d0cc4b95347fa0d82",
+        "other": "ec87889f5f908dd874cf31122628f081037e4bf5"
+      },
+      "pathconflicts": []
+    }
   ]
 Test case 9: Source is a binary file, dest is a file (base is still a file)
   $ reset
-  $ printf '\0\xE1' > file # 0xE1 is an unfinished 2-byte utf-8 sequence
+  >>> with open("file", "wb") as f: f.write(b"\0\xE1") and None # 0xE1 is an unfinished 2-byte utf-8 sequence
   $ hg commit -Aqm "source"
   $ hg up -q 'desc(base)'
   $ echo "change" > file
@@ -551,7 +960,6 @@ Test case 9: Source is a binary file, dest is a file (base is still a file)
   o  (01813a66ce08dcc7d684f337c68bd61a4982de10) base
      affected: file
      deleted:
-  
 
   $ hg rebase -d 'desc(dest)' -s 'desc(source)'
   rebasing f974f4b40bb1 "source"
@@ -560,23 +968,60 @@ Test case 9: Source is a binary file, dest is a file (base is still a file)
   warning: 1 conflicts while merging file! (edit, then use 'hg resolve --mark')
   unresolved conflicts (see hg resolve, then hg rebase --continue)
   [1]
-  $ cat -v file # The local version should be left in the working copy
+  $ cat file # The local version should be left in the working copy
   change
-  $ hg resolve --tool=internal:dumpjson --all
+  $ hg resolve --tool=internal:dumpjson --all | pp
   [
-   {
-    "command": "rebase",
-    "command_details": {"cmd": "rebase", "to_abort": "rebase --abort", "to_continue": "rebase --continue"},
-    "conflicts": [{"base": {"contents": "base\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": "change\n", "exists": true, "isexec": false, "issymlink": false}, "other": {"contents": null, "exists": true, "isexec": false, "issymlink": false}, "output": {"contents": "change\n", "exists": true, "isexec": false, "issymlink": false, "path": "$TESTTMP/foo/file"}, "path": "file"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "rebase",
+      "command_details": {
+        "cmd": "rebase",
+        "to_abort": "rebase --abort",
+        "to_continue": "rebase --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "base\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": "change\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "other": {
+            "contents": null,
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "output": {
+            "contents": "change\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false,
+            "path": "$TESTTMP/foo/file"
+          },
+          "path": "file"
+        }
+      ],
+      "hashes": {
+        "local": "fd7d10c36158e4f6e713ca1c40ddebce2b55a868",
+        "other": "f974f4b40bb140e46fe56a47978cfabe5fd82916"
+      },
+      "pathconflicts": []
+    }
   ]
 Test case 10: Source is a file, dest is a binary file (base is still a file)
   $ reset
   $ echo "change" > file
   $ hg commit -Aqm "source"
   $ hg up -q 'desc(base)'
-  $ printf '\0\xE1' > file # 0xE1 is an unfinished 2-byte utf-8 sequence
+  >>> with open("file", "wb") as f: f.write(b"\0\xE1") and None # 0xE1 is an unfinished 2-byte utf-8 sequence
   $ hg commit -Aqm "dest"
   $ hg up -q 'desc(dest)'
   $ logg
@@ -591,7 +1036,6 @@ Test case 10: Source is a file, dest is a binary file (base is still a file)
   o  (01813a66ce08dcc7d684f337c68bd61a4982de10) base
      affected: file
      deleted:
-  
 
   $ hg rebase -d 'desc(dest)' -s 'desc(source)'
   rebasing ec87889f5f90 "source"
@@ -600,14 +1044,51 @@ Test case 10: Source is a file, dest is a binary file (base is still a file)
   warning: 1 conflicts while merging file! (edit, then use 'hg resolve --mark')
   unresolved conflicts (see hg resolve, then hg rebase --continue)
   [1]
-  $ hg resolve --tool=internal:dumpjson --all
+  $ hg resolve --tool=internal:dumpjson --all | pp
   [
-   {
-    "command": "rebase",
-    "command_details": {"cmd": "rebase", "to_abort": "rebase --abort", "to_continue": "rebase --continue"},
-    "conflicts": [{"base": {"contents": "base\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": null, "exists": true, "isexec": false, "issymlink": false}, "other": {"contents": "change\n", "exists": true, "isexec": false, "issymlink": false}, "output": {"contents": null, "exists": true, "isexec": false, "issymlink": false, "path": "$TESTTMP/foo/file"}, "path": "file"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "rebase",
+      "command_details": {
+        "cmd": "rebase",
+        "to_abort": "rebase --abort",
+        "to_continue": "rebase --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "base\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": null,
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "other": {
+            "contents": "change\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "output": {
+            "contents": null,
+            "exists": true,
+            "isexec": false,
+            "issymlink": false,
+            "path": "$TESTTMP/foo/file"
+          },
+          "path": "file"
+        }
+      ],
+      "hashes": {
+        "local": "dba9f6032ce22b062d671e030ed4650cc74e3c85",
+        "other": "ec87889f5f908dd874cf31122628f081037e4bf5"
+      },
+      "pathconflicts": []
+    }
   ]
 Test case 11: Source is a symlink, dest is a file (base is still a file)
   $ reset
@@ -639,16 +1120,53 @@ Test case 11: Source is a symlink, dest is a file (base is still a file)
   warning: 1 conflicts while merging file! (edit, then use 'hg resolve --mark')
   unresolved conflicts (see hg resolve, then hg rebase --continue)
   [1]
-  $ cat -v file
+  $ cat file
   change
-  $ hg resolve --tool=internal:dumpjson --all
+  $ hg resolve --tool=internal:dumpjson --all | pp
   [
-   {
-    "command": "rebase",
-    "command_details": {"cmd": "rebase", "to_abort": "rebase --abort", "to_continue": "rebase --continue"},
-    "conflicts": [{"base": {"contents": "base\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": "change\n", "exists": true, "isexec": false, "issymlink": false}, "other": {"contents": "somepath", "exists": true, "isexec": false, "issymlink": true}, "output": {"contents": "change\n", "exists": true, "isexec": false, "issymlink": false, "path": "$TESTTMP/foo/file"}, "path": "file"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "rebase",
+      "command_details": {
+        "cmd": "rebase",
+        "to_abort": "rebase --abort",
+        "to_continue": "rebase --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "base\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": "change\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "other": {
+            "contents": "somepath",
+            "exists": true,
+            "isexec": false,
+            "issymlink": true
+          },
+          "output": {
+            "contents": "change\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false,
+            "path": "$TESTTMP/foo/file"
+          },
+          "path": "file"
+        }
+      ],
+      "hashes": {
+        "local": "fd7d10c36158e4f6e713ca1c40ddebce2b55a868",
+        "other": "06aece48b59fc832b921a114492f962a5b358b22"
+      },
+      "pathconflicts": []
+    }
   ]
 Test case 12: Source is a file, dest is a symlink (base is still a file)
   $ reset
@@ -684,14 +1202,51 @@ Test case 12: Source is a file, dest is a symlink (base is still a file)
   Does not exist
   $ ls file
   file
-  $ hg resolve --tool=internal:dumpjson --all
+  $ hg resolve --tool=internal:dumpjson --all | pp
   [
-   {
-    "command": "rebase",
-    "command_details": {"cmd": "rebase", "to_abort": "rebase --abort", "to_continue": "rebase --continue"},
-    "conflicts": [{"base": {"contents": "base\n", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": "somepath", "exists": true, "isexec": false, "issymlink": true}, "other": {"contents": "change\n", "exists": true, "isexec": false, "issymlink": false}, "output": {"contents": "somepath", "exists": true, "isexec": false, "issymlink": true, "path": "$TESTTMP/foo/file"}, "path": "file"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "rebase",
+      "command_details": {
+        "cmd": "rebase",
+        "to_abort": "rebase --abort",
+        "to_continue": "rebase --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "base\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": "somepath",
+            "exists": true,
+            "isexec": false,
+            "issymlink": true
+          },
+          "other": {
+            "contents": "change\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "output": {
+            "contents": "somepath",
+            "exists": true,
+            "isexec": false,
+            "issymlink": true,
+            "path": "$TESTTMP/foo/file"
+          },
+          "path": "file"
+        }
+      ],
+      "hashes": {
+        "local": "c4bbf66fc0d73a7b05e64344fa86a678e19c35a2",
+        "other": "ec87889f5f908dd874cf31122628f081037e4bf5"
+      },
+      "pathconflicts": []
+    }
   ]
   $ cd ..
 
@@ -724,12 +1279,125 @@ mergestate (like shelve):
   warning: 1 conflicts while merging b! (edit, then use 'hg resolve --mark')
   unresolved conflicts (see 'hg resolve', then 'hg unshelve --continue')
   [1]
-  $ hg resolve --tool=internal:dumpjson --all
+  $ hg resolve --tool=internal:dumpjson --all | pp
   [
-   {
-    "command": "unshelve",
-    "command_details": {"cmd": "unshelve", "to_abort": "unshelve --abort", "to_continue": "unshelve --continue"},
-    "conflicts": [{"base": {"contents": "", "exists": true, "isexec": false, "issymlink": false}, "local": {"contents": "b", "exists": true, "isexec": false, "issymlink": false}, "other": {"contents": "state\n", "exists": true, "isexec": false, "issymlink": false}, "output": {"contents": "<<<<<<< dest (rebasing onto):   488e1b7e7341 b - test: b\nb=======\nstate\n>>>>>>> source (being rebased): b0582bede31d - test: shelve changes to: c\n", "exists": true, "isexec": false, "issymlink": false, "path": "$TESTTMP/command_details/b"}, "path": "b"}],
-    "pathconflicts": []
-   }
+    {
+      "command": "unshelve",
+      "command_details": {
+        "cmd": "unshelve",
+        "to_abort": "unshelve --abort",
+        "to_continue": "unshelve --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": "b",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "other": {
+            "contents": "state\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "output": {
+            "contents": "<<<<<<< dest (rebasing onto):    488e1b7e7341 b - test: b\nb=======\nstate\n>>>>>>> source (being rebased):  b0582bede31d - test: shelve changes to: c\n",
+            "contents:merge3": "<<<<<<< dest\nb||||||| base\n=======\nstate\n>>>>>>> source\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false,
+            "path": "$TESTTMP/command_details/b"
+          },
+          "path": "b"
+        }
+      ],
+      "hashes": {
+        "local": "488e1b7e73412c8f887fb3ed9b9666d5958ee997",
+        "other": "b0582bede31d7681921cea37ec06afc204d6e8f2"
+      },
+      "pathconflicts": []
+    }
+  ]
+
+Source deleted, dest changed, file is deleted after conflict is entered
+  $ reset
+  $ echo "change" > file
+  $ hg commit -Aqm "dest"
+  $ hg up -q 'desc(base)'
+  $ hg rm file
+  $ hg commit -Aqm "source"
+  $ hg up -q 'desc(dest)'
+  $ logg
+  o  (25c2ef28f4c763dd5068d3aa96cafa1342fe5280) source
+  │  affected: file
+  │  deleted: file
+  │
+  │ @  (fd7d10c36158e4f6e713ca1c40ddebce2b55a868) dest
+  ├─╯  affected: file
+  │    deleted:
+  │
+  o  (01813a66ce08dcc7d684f337c68bd61a4982de10) base
+     affected: file
+     deleted:
+  
+  $ hg rebase -d 'desc(dest)' -s 'desc(source)'
+  rebasing 25c2ef28f4c7 "source"
+  local [dest (rebasing onto)] changed file which other [source (being rebased)] deleted
+  use (c)hanged version, (d)elete, or leave (u)nresolved? u
+  unresolved conflicts (see hg resolve, then hg rebase --continue)
+  [1]
+  $ hg rm file
+  $ hg resolve --tool=internal:dumpjson --all | pp
+  [
+    {
+      "command": "rebase",
+      "command_details": {
+        "cmd": "rebase",
+        "to_abort": "rebase --abort",
+        "to_continue": "rebase --continue"
+      },
+      "conflicts": [
+        {
+          "base": {
+            "contents": "base\n",
+            "exists": true,
+            "isexec": false,
+            "issymlink": false
+          },
+          "local": {
+            "contents": null,
+            "exists": false,
+            "isexec": null,
+            "issymlink": null
+          },
+          "other": {
+            "contents": null,
+            "exists": false,
+            "isexec": null,
+            "issymlink": null
+          },
+          "output": {
+            "contents": null,
+            "exists": false,
+            "isexec": null,
+            "issymlink": null,
+            "path": "$TESTTMP/foo/file"
+          },
+          "path": "file"
+        }
+      ],
+      "hashes": {
+        "local": "fd7d10c36158e4f6e713ca1c40ddebce2b55a868",
+        "other": "25c2ef28f4c763dd5068d3aa96cafa1342fe5280"
+      },
+      "pathconflicts": []
+    }
   ]

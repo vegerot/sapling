@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, List, Optional, Tuple
 
-from sapling import error, git, hintutil
+from sapling import error, formatter, git, hintutil, templatekw
+from sapling.context import changectx
 from sapling.i18n import _
 from sapling.node import hex, nullid
 from sapling.result import Result
@@ -20,10 +21,12 @@ from .gh_submit import PullRequestDetails, PullRequestState, Repository
 from .github_repo_util import check_github_repo, GitHubRepo
 from .none_throws import none_throws
 from .pr_parser import get_pull_request_for_context
-from .pull_request_body import create_pull_request_title_and_body, firstline
+from .pull_request_body import create_pull_request_title_and_body, title_and_body
+
 from .pullrequest import PullRequestId
 from .pullrequeststore import PullRequestStore
 from .run_git_command import run_git_command
+from .templates import _GITHUB_PULL_REQUEST_URL_REVCACHE_KEY
 
 
 def submit(ui, repo, *args, **opts) -> int:
@@ -170,6 +173,24 @@ async def update_commits_in_stack(
         params = await create_serial_strategy_params(
             ui, partitions, github_repo, origin
         )
+
+    max_pull_requests_to_create = ui.configint("github", "max-prs-to-create", "5")
+    if (
+        max_pull_requests_to_create >= 0
+        and params.pull_requests_to_create
+        and len(params.pull_requests_to_create) > max_pull_requests_to_create
+    ):
+        raise error.Abort(
+            _(
+                "refused to create %d pull requests, max is %d\nif you want to create %d pull requests at once, run again with `--config github.max-prs-to-create=-1`"
+            )
+            % (
+                len(params.pull_requests_to_create),
+                max_pull_requests_to_create,
+                len(params.pull_requests_to_create),
+            )
+        )
+
     refs_to_update = params.refs_to_update
 
     gitdir = None
@@ -261,16 +282,23 @@ async def rewrite_pull_request_body(
         base = none_throws(partitions[index + 1][0].head_branch_name)
 
     head_commit_data = partition[0]
-    commit_msg = head_commit_data.get_msg()
+
+    pr = head_commit_data.pr
+    assert pr
+
+    title = None
+    if ui.configbool("github", "preserve-pull-request-description"):
+        commit_msg_or_title_body = (pr.title, pr.body)
+    else:
+        commit_msg_or_title_body = head_commit_data.get_msg()
+
     title, body = create_pull_request_title_and_body(
-        commit_msg,
+        commit_msg_or_title_body,
         pr_numbers_and_num_commits,
         index,
         repository,
         reviewstack=ui.configbool("github", "pull-request-include-reviewstack"),
     )
-    pr = head_commit_data.pr
-    assert pr
 
     if pr.state != PullRequestState.OPEN:
         ui.status_err(
@@ -299,6 +327,36 @@ class SerialStrategyParams:
     # The str in the Tuple is the head branch name for the commit.
     pull_requests_to_create: List[Tuple[CommitData, str]]
     repository: Optional[Repository]
+
+
+def get_pr_branch_name(
+    ui, ctx: changectx, upstream_repository: Repository, pull_request_number: int
+) -> str:
+    template = ui.config(
+        "github",
+        "pr.branch-name-template",
+        "pr{github_pull_request_number}",
+    )
+    tmpl = formatter.maketemplater(ui, template)
+
+    props = templatekw.keywords.copy()
+    props["templ"] = tmpl
+    props["ctx"] = ctx
+    props["repo"] = ctx.repo()
+    props["cache"] = {}
+    # In order to support {github_pull_request_number} etc., we need to inject
+    # artificial pull-request info, since the repo doesn't yet have a real link
+    # between the commit and the PR.
+    props["revcache"] = {
+        _GITHUB_PULL_REQUEST_URL_REVCACHE_KEY: PullRequestId(
+            hostname=upstream_repository.hostname,
+            owner=upstream_repository.owner,
+            name=upstream_repository.name,
+            number=pull_request_number,
+        )
+    }
+    branch_name = tmpl.render(props)
+    return branch_name
 
 
 async def create_serial_strategy_params(
@@ -351,8 +409,12 @@ async def create_serial_strategy_params(
                     next_pull_request_number = result.unwrap()
             else:
                 next_pull_request_number += 1
-            # Consider including username in branch_name?
-            branch_name = f"pr{next_pull_request_number}"
+            branch_name = get_pr_branch_name(
+                ui=ui,
+                ctx=top.ctx,
+                upstream_repository=repository,
+                pull_request_number=next_pull_request_number,
+            )
             refs_to_update.append(f"{hex(top.node)}:refs/heads/{branch_name}")
             top.head_branch_name = branch_name
             pull_requests_to_create.append((top, branch_name))
@@ -386,8 +448,8 @@ async def create_pull_requests_serially(
         if workflow == SubmitWorkflow.SINGLE and parent:
             base = none_throws(parent.head_branch_name)
 
-        body = commit.get_msg()
-        title = firstline(body)
+        commit_msg = commit.get_msg()
+        title, body = title_and_body(commit_msg)
         result = await gh_submit.create_pull_request(
             hostname=repository.hostname,
             owner=owner,
@@ -486,9 +548,13 @@ async def create_placeholder_strategy_params(
         for commit_needs_pr, number in zip(
             commits_that_need_pull_requests, issue_numbers
         ):
-            # Consider including username in branch_name?
-            branch_name = f"pr{number}"
             commit = commit_needs_pr.commit
+            branch_name = get_pr_branch_name(
+                ui=ui,
+                ctx=commit.ctx,
+                upstream_repository=repository,
+                pull_request_number=number,
+            )
             commit.head_branch_name = branch_name
             refs_to_update.append(f"{hex(commit.node)}:refs/heads/{branch_name}")
             params = PullRequestParams(
@@ -643,7 +709,7 @@ async def get_repo(hostname: str, owner: str, name: str) -> Repository:
 
 async def derive_commit_data(node: bytes, repo, store: PullRequestStore) -> CommitData:
     ctx = repo[node]
-    pr_id = get_pull_request_for_context(store, ctx)
+    pr_id = get_pull_request_for_context(store, repo, ctx)
     pr = await get_pull_request_details_or_throw(pr_id) if pr_id else None
     msg = None
     if pr:

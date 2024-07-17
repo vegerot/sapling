@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 This is needed to avoid treemanifestserver extension "leaking" into client repos.
 #inprocess-hg-incompatible
@@ -42,7 +44,7 @@ Add drafts:
   > master   desc(B)
   > EOS
 
-Prepare another test case backed by a server repo that speaks EdenAPI
+Prepare another test case backed by a server repo that speaks SaplingRemoteAPI
 
   $ newremoterepo
   $ setconfig paths.default=test:e
@@ -77,8 +79,7 @@ Rebuild using segmented changelog
 
   $ hg debugrebuildchangelog
   backed up 4 commits to commits-4-0000.bak
-  imported clone data with tip 26805aba1e600a82e93661149f2313866a221a7b
-  pulling latest commits
+  imported public commit graph with master: 26805aba1e600a82e93661149f2313866a221a7b
   recreating 4 local commits
   changelog rebuilt
 
@@ -105,12 +106,11 @@ Unshelve works:
 
 Test pull error does not end up with a broken repo:
 
-  $ FAILPOINTS=debugrebuildchangelog-before-pull=return hg debugrebuildchangelog
+  $ FAILPOINTS=debugrebuildchangelog-add-draft=return hg debugrebuildchangelog
   backed up 3 commits to commits-3-0000.bak
-  imported clone data with tip 26805aba1e600a82e93661149f2313866a221a7b
-  pulling latest commits
+  imported public commit graph with master: 26805aba1e600a82e93661149f2313866a221a7b
   restoring changelog from previous state
-  abort: failpoint 'debugrebuildchangelog-before-pull' set by FAILPOINTS
+  abort: failpoint 'debugrebuildchangelog-add-draft' set by FAILPOINTS
   [255]
 
   $ hg log -r 'all()' --git -T '{desc} {remotenames} {bookmarks}' -G

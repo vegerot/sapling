@@ -14,7 +14,7 @@ use anyhow::bail;
 use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Result;
-use edenapi::api::EdenApi;
+use edenapi::api::SaplingRemoteApi;
 use edenapi_types::AnyFileContentId;
 use edenapi_types::AnyId;
 use edenapi_types::BonsaiChangesetContent;
@@ -25,7 +25,6 @@ use edenapi_types::RepoPathBuf;
 use edenapi_types::SnapshotRawData;
 use edenapi_types::SnapshotRawFiles;
 use edenapi_types::UploadSnapshotResponse;
-use futures::StreamExt;
 use futures::TryStreamExt;
 use minibytes::Bytes;
 
@@ -69,7 +68,7 @@ fn load_files(
 }
 
 pub async fn upload_snapshot(
-    api: &(impl EdenApi + ?Sized),
+    api: &(impl SaplingRemoteApi + ?Sized),
     data: SnapshotRawData,
     custom_duration_secs: Option<u64>,
     copy_from_bubble_id: Option<NonZeroU64>,
@@ -128,11 +127,8 @@ pub async fn upload_snapshot(
         id
     } else {
         api.ephemeral_prepare(custom_duration_secs.map(Duration::from_secs), labels)
-            .await?
-            .entries
-            .next()
             .await
-            .context("Failed to create ephemeral bubble")??
+            .context("Failed to create ephemeral bubble")?
             .bubble_id
     };
     let file_content_tokens = {
@@ -153,7 +149,7 @@ pub async fn upload_snapshot(
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?
     };
-    let mut response = api
+    let changeset_response = api
         .upload_bonsai_changeset(
             BonsaiChangesetContent {
                 hg_parents,
@@ -202,12 +198,9 @@ pub async fn upload_snapshot(
             },
             Some(bubble_id),
         )
-        .await?;
-    let changeset_response = response
-        .entries
-        .next()
         .await
-        .context("Failed to create changeset")??;
+        .context("Failed to create changeset")?;
+
     Ok(UploadSnapshotResponse {
         changeset_token: changeset_response.token,
         bubble_id,

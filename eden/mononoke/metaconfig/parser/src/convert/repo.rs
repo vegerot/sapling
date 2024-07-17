@@ -24,6 +24,9 @@ use metaconfig_types::ComparableRegex;
 use metaconfig_types::CrossRepoCommitValidation;
 use metaconfig_types::DerivedDataConfig;
 use metaconfig_types::DerivedDataTypesConfig;
+use metaconfig_types::GitConcurrencyParams;
+use metaconfig_types::GitDeltaManifestV2Config;
+use metaconfig_types::GitDeltaManifestVersion;
 use metaconfig_types::GlobalrevConfig;
 use metaconfig_types::HgSyncConfig;
 use metaconfig_types::HookBypass;
@@ -34,6 +37,7 @@ use metaconfig_types::InfinitepushNamespace;
 use metaconfig_types::InfinitepushParams;
 use metaconfig_types::LfsParams;
 use metaconfig_types::LoggingDestination;
+use metaconfig_types::MetadataLoggerConfig;
 use metaconfig_types::PushParams;
 use metaconfig_types::PushrebaseFlags;
 use metaconfig_types::PushrebaseParams;
@@ -52,8 +56,10 @@ use metaconfig_types::UpdateLoggingConfig;
 use metaconfig_types::WalkerConfig;
 use metaconfig_types::WalkerJobParams;
 use metaconfig_types::WalkerJobType;
+use metaconfig_types::ZelosConfig;
 use mononoke_types::path::MPath;
 use mononoke_types::ChangesetId;
+use mononoke_types::DerivableType;
 use mononoke_types::NonRootMPath;
 use mononoke_types::PrefixTrie;
 use mononoke_types::RepositoryId;
@@ -65,6 +71,8 @@ use repos::RawCommitIdentityScheme;
 use repos::RawCrossRepoCommitValidationConfig;
 use repos::RawDerivedDataConfig;
 use repos::RawDerivedDataTypesConfig;
+use repos::RawGitConcurrencyParams;
+use repos::RawGitDeltaManifestV2Config;
 use repos::RawHgSyncConfig;
 use repos::RawHookConfig;
 use repos::RawHookManagerParams;
@@ -72,6 +80,7 @@ use repos::RawInfinitepushParams;
 use repos::RawLfsParams;
 use repos::RawLoggingDestination;
 use repos::RawLoggingDestinationScribe;
+use repos::RawMetadataLoggerConfig;
 use repos::RawPushParams;
 use repos::RawPushrebaseParams;
 use repos::RawPushrebaseRemoteMode;
@@ -89,6 +98,7 @@ use repos::RawUpdateLoggingConfig;
 use repos::RawWalkerConfig;
 use repos::RawWalkerJobParams;
 use repos::RawWalkerJobType;
+use repos::RawZelosConfig;
 
 use crate::convert::Convert;
 use crate::errors::ConfigurationError;
@@ -150,6 +160,7 @@ impl Convert for RawHookConfig {
         let config = HookConfig {
             bypass,
             options: self.config_json,
+            log_only: self.log_only.unwrap_or_default(),
             strings: self.config_strings.unwrap_or_default(),
             ints: self.config_ints.unwrap_or_default(),
             ints_64: self.config_ints_64.unwrap_or_default(),
@@ -231,6 +242,10 @@ impl Convert for RawPushParams {
         let default = PushParams::default();
         Ok(PushParams {
             pure_push_allowed: self.pure_push_allowed.unwrap_or(default.pure_push_allowed),
+            unbundle_commit_limit: self
+                .unbundle_commit_limit
+                .map(|limit| limit.try_into())
+                .transpose()?,
         })
     }
 }
@@ -449,8 +464,22 @@ impl Convert for RawDerivedDataTypesConfig {
     type Output = DerivedDataTypesConfig;
 
     fn convert(self) -> Result<Self::Output> {
-        let types = self.types.into_iter().collect();
-        let mapping_key_prefixes = self.mapping_key_prefixes.into_iter().collect();
+        let types = self
+            .types
+            .into_iter()
+            .map(|ty| DerivableType::from_name(&ty))
+            .collect::<Result<_>>()?;
+        let ephemeral_bubbles_disabled_types = self
+            .ephemeral_bubbles_disabled_types
+            .unwrap_or_default()
+            .into_iter()
+            .map(|ty| DerivableType::from_name(&ty))
+            .collect::<Result<_>>()?;
+        let mapping_key_prefixes = self
+            .mapping_key_prefixes
+            .into_iter()
+            .map(|(k, _v)| Ok((DerivableType::from_name(&k)?, _v)))
+            .collect::<Result<_>>()?;
         let unode_version = match self.unode_version {
             None => UnodeVersion::default(),
             Some(1) => return Err(anyhow!("unode version 1 has been deprecated")),
@@ -464,13 +493,47 @@ impl Convert for RawDerivedDataTypesConfig {
             Some(2) => BlameVersion::V2,
             Some(version) => return Err(anyhow!("unknown blame version {}", version)),
         };
+        let git_delta_manifest_version = match self.git_delta_manifest_version {
+            None => GitDeltaManifestVersion::default(),
+            Some(1) => GitDeltaManifestVersion::V1,
+            Some(2) => GitDeltaManifestVersion::V2,
+            Some(version) => return Err(anyhow!("unknown git delta manifest version {}", version)),
+        };
+        let git_delta_manifest_v2_config = self
+            .git_delta_manifest_v2_config
+            .map(|raw| raw.convert())
+            .transpose()?;
+
+        let derivation_batch_sizes = self
+            .derivation_batch_sizes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| Ok((DerivableType::from_name(&k)?, v.try_into()?)))
+            .collect::<Result<_>>()?;
+
         Ok(DerivedDataTypesConfig {
             types,
+            ephemeral_bubbles_disabled_types,
             mapping_key_prefixes,
             unode_version,
             blame_filesize_limit,
             hg_set_committer_extra: self.hg_set_committer_extra.unwrap_or(false),
             blame_version,
+            git_delta_manifest_version,
+            git_delta_manifest_v2_config,
+            derivation_batch_sizes,
+        })
+    }
+}
+
+impl Convert for RawGitDeltaManifestV2Config {
+    type Output = GitDeltaManifestV2Config;
+
+    fn convert(self) -> Result<Self::Output> {
+        Ok(GitDeltaManifestV2Config {
+            max_inlined_object_size: self.max_inlined_object_size as usize,
+            max_inlined_delta_size: self.max_inlined_delta_size as u64,
+            delta_chunk_size: self.delta_chunk_size as u64,
         })
     }
 }
@@ -540,7 +603,7 @@ impl Convert for RawSegmentedChangelogConfig {
             default: Option<Duration>,
         ) -> Result<Option<Duration>> {
             match maybe_secs {
-                Some(secs) if secs == 0 => Ok(None),
+                Some(0) => Ok(None),
                 Some(secs) => Ok(Some(Duration::from_secs(secs.try_into()?))),
                 None => Ok(default),
             }
@@ -716,7 +779,38 @@ impl Convert for RawCommitGraphConfig {
         Ok(CommitGraphConfig {
             scuba_table: self.scuba_table,
             preloaded_commit_graph_blobstore_key: self.preloaded_commit_graph_blobstore_key,
+            disable_commit_graph_v2_with_empty_common: self
+                .disable_commit_graph_v2_with_empty_common,
         })
+    }
+}
+
+impl Convert for RawMetadataLoggerConfig {
+    type Output = MetadataLoggerConfig;
+
+    fn convert(self) -> Result<Self::Output> {
+        Ok(MetadataLoggerConfig {
+            bookmarks: self
+                .bookmarks
+                .into_iter()
+                .map(BookmarkKey::new)
+                .collect::<Result<_>>()?,
+            sleep_interval_secs: self.sleep_interval_secs.try_into()?,
+        })
+    }
+}
+
+impl Convert for RawZelosConfig {
+    type Output = ZelosConfig;
+
+    fn convert(self) -> Result<Self::Output> {
+        match self {
+            Self::local_zelos_port(port) => Ok(ZelosConfig::Local {
+                port: port.try_into()?,
+            }),
+            Self::zelos_tier(tier) => Ok(ZelosConfig::Remote { tier }),
+            Self::UnknownField(f) => Err(anyhow!("Unknown variant {} of RawZelosConfig", f)),
+        }
     }
 }
 
@@ -725,7 +819,7 @@ impl Convert for RawShardedService {
 
     fn convert(self) -> Result<Self::Output> {
         let service = match self {
-            RawShardedService::EDEN_API => ShardedService::EdenApi,
+            RawShardedService::EDEN_API => ShardedService::SaplingRemoteApi,
             RawShardedService::SOURCE_CONTROL_SERVICE => ShardedService::SourceControlService,
             RawShardedService::DERIVED_DATA_SERVICE => ShardedService::DerivedDataService,
             RawShardedService::LAND_SERVICE => ShardedService::LandService,
@@ -739,6 +833,8 @@ impl Convert for RawShardedService {
             RawShardedService::DERIVED_DATA_TAILER => ShardedService::DerivedDataTailer,
             RawShardedService::ALIAS_VERIFY => ShardedService::AliasVerify,
             RawShardedService::DRAFT_COMMIT_DELETION => ShardedService::DraftCommitDeletion,
+            RawShardedService::MONONOKE_GIT_SERVER => ShardedService::MononokeGitServer,
+            RawShardedService::REPO_METADATA_LOGGER => ShardedService::RepoMetadataLogger,
             v => return Err(anyhow!("Invalid value {} for enum ShardedService", v)),
         };
         Ok(service)
@@ -753,8 +849,23 @@ impl Convert for RawShardingModeConfig {
             status: self
                 .status
                 .into_iter()
-                .map(|(k, v)| anyhow::Ok((k.convert()?, v)))
-                .collect::<Result<_>>()?,
+                // Since this is a simple type conversion, the only error that can be encountered would be due to an
+                // unknown enum value. If that happens, it means we have a config that has more values than the code understands. In
+                // such a case, it should be safe to ignore this unknown value cause the existing code can work without it.
+                .filter_map(|(k, v)| k.convert().map(|k| (k, v)).ok())
+                .collect(),
+        })
+    }
+}
+
+impl Convert for RawGitConcurrencyParams {
+    type Output = GitConcurrencyParams;
+
+    fn convert(self) -> Result<Self::Output> {
+        Ok(GitConcurrencyParams {
+            trees_and_blobs: self.trees_and_blobs.try_into()?,
+            commits: self.commits.try_into()?,
+            tags: self.tags.try_into()?,
         })
     }
 }

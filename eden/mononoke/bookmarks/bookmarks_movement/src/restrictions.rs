@@ -17,17 +17,19 @@ use mononoke_types::ChangesetId;
 use repo_authorization::AuthorizationContext;
 use repo_cross_repo::RepoCrossRepoRef;
 use repo_identity::RepoIdentityRef;
-use tunables::tunables;
 
 use crate::BookmarkMovementError;
 use crate::Repo;
 
 pub(crate) fn should_run_hooks(authz: &AuthorizationContext, reason: BookmarkUpdateReason) -> bool {
     if authz.is_service() {
-        reason == BookmarkUpdateReason::Pushrebase
-            && tunables()
-                .enable_hooks_on_service_pushrebase()
-                .unwrap_or_default()
+        let disable_running_hooks_in_pushredirected_repo = justknobs::eval(
+            "scm/mononoke:enable_hooks_on_service_pushrebase",
+            None,
+            None,
+        )
+        .unwrap_or_default();
+        reason == BookmarkUpdateReason::Pushrebase && disable_running_hooks_in_pushredirected_repo
     } else {
         true
     }
@@ -137,7 +139,8 @@ pub(crate) async fn ensure_ancestor_of(
         .await?)
 }
 
-pub fn check_bookmark_sync_config(
+pub async fn check_bookmark_sync_config(
+    ctx: &CoreContext,
     repo: &(impl RepoIdentityRef + RepoCrossRepoRef),
     bookmark: &BookmarkKey,
     kind: BookmarkKind,
@@ -147,7 +150,8 @@ pub fn check_bookmark_sync_config(
             if repo
                 .repo_cross_repo()
                 .live_commit_sync_config()
-                .push_redirector_enabled_for_public(repo.repo_identity().id())
+                .push_redirector_enabled_for_public(ctx, repo.repo_identity().id())
+                .await?
             {
                 return Err(BookmarkMovementError::PushRedirectorEnabledForPublishing {
                     bookmark: bookmark.clone(),
@@ -158,7 +162,8 @@ pub fn check_bookmark_sync_config(
             if repo
                 .repo_cross_repo()
                 .live_commit_sync_config()
-                .push_redirector_enabled_for_draft(repo.repo_identity().id())
+                .push_redirector_enabled_for_draft(ctx, repo.repo_identity().id())
+                .await?
             {
                 return Err(BookmarkMovementError::PushRedirectorEnabledForScratch {
                     bookmark: bookmark.clone(),

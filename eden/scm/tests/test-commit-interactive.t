@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
 
@@ -1426,7 +1428,7 @@ random text in random positions is still an error
   abort: error parsing patch: unhandled transition: file -> other
   [255]
 
-  $ hg up -C
+  $ hg up -C .
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
 Ignore win32text deprecation warning for now:
@@ -1687,3 +1689,19 @@ even if none of mode, size and timestamp is changed on the filesystem
   n   0         -1 unset               subdir/f1
   $ hg status -A subdir/f1
   M subdir/f1
+
+Test that filemode changes work on interactive
+  $ hg goto -C . -q
+  $ chmod +x subdir/f1
+  $ hg commit -i -d '24 0' -m bleh <<EOF
+  > y
+  > EOF
+  diff --git a/subdir/f1 b/subdir/f1
+  old mode 100644
+  new mode 100755
+  examine changes to 'subdir/f1'? [Ynesfdaq?] y
+  $ hg st -m
+  $ hg diff -r .^ --git
+  diff --git a/subdir/f1 b/subdir/f1
+  old mode 100644
+  new mode 100755

@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use anyhow::format_err;
 use anyhow::Context;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
@@ -15,9 +16,10 @@ use bookmarks_movement::BookmarkUpdatePolicy;
 use bookmarks_movement::BookmarkUpdateTargets;
 use bookmarks_movement::UpdateBookmarkOp;
 use bytes::Bytes;
+use cross_repo_sync::CandidateSelectionHint;
+use cross_repo_sync::CommitSyncContext;
 use hook_manager::manager::HookManagerRef;
 use mononoke_types::ChangesetId;
-use tunables::tunables;
 
 use crate::errors::MononokeError;
 use crate::repo::RepoContext;
@@ -31,6 +33,7 @@ impl RepoContext {
         old_target: Option<ChangesetId>,
         allow_non_fast_forward: bool,
         pushvars: Option<&HashMap<String, Bytes>>,
+        affected_changesets_limit: Option<usize>,
     ) -> Result<(), MononokeError> {
         self.start_write()?;
 
@@ -55,8 +58,9 @@ impl RepoContext {
             old_target: ChangesetId,
             allow_non_fast_forward: bool,
             pushvars: Option<&'a HashMap<String, Bytes>>,
+            affected_changesets_limit: Option<usize>,
         ) -> UpdateBookmarkOp<'a> {
-            let mut op = UpdateBookmarkOp::new(
+            let op = UpdateBookmarkOp::new(
                 bookmark,
                 BookmarkUpdateTargets {
                     old: old_target,
@@ -68,15 +72,10 @@ impl RepoContext {
                     BookmarkUpdatePolicy::FastForwardOnly
                 },
                 BookmarkUpdateReason::ApiRequest,
+                affected_changesets_limit,
             )
             .with_pushvars(pushvars);
-            if !tunables()
-                .disable_commit_scribe_logging_scs()
-                .unwrap_or_default()
-            {
-                op = op.log_new_public_commits_to_scribe();
-            }
-            op
+            op.log_new_public_commits_to_scribe()
         }
         if let Some(redirector) = self.push_redirector.as_ref() {
             let large_bookmark = redirector.small_to_large_bookmark(bookmark).await?;
@@ -87,16 +86,32 @@ impl RepoContext {
                 )));
             }
             let ctx = self.ctx();
-            let (target, old_target) = futures::try_join!(
-                redirector.get_small_to_large_commit_equivalent(ctx, target),
-                redirector.get_small_to_large_commit_equivalent(ctx, old_target),
-            )?;
-            make_move_op(
+            let target = redirector
+                .small_to_large_commit_syncer
+                .sync_commit(
+                    ctx,
+                    target,
+                    CandidateSelectionHint::Only,
+                    CommitSyncContext::PushRedirector,
+                    false,
+                )
+                .await?
+                .ok_or_else(|| {
+                    format_err!(
+                        "Error in move_bookmark absence of corresponding commit in target repo for {}",
+                        target,
+                    )
+                })?;
+            let old_target = redirector
+                .get_small_to_large_commit_equivalent(ctx, old_target)
+                .await?;
+            let log_id = make_move_op(
                 &large_bookmark,
                 target,
                 old_target,
                 allow_non_fast_forward,
                 pushvars,
+                affected_changesets_limit,
             )
             .run(
                 self.ctx(),
@@ -106,7 +121,7 @@ impl RepoContext {
             )
             .await?;
             // Wait for bookmark to catch up on small repo
-            redirector.backsync_latest(ctx).await?;
+            redirector.ensure_backsynced(ctx, log_id).await?;
         } else {
             make_move_op(
                 bookmark,
@@ -114,6 +129,7 @@ impl RepoContext {
                 old_target,
                 allow_non_fast_forward,
                 pushvars,
+                affected_changesets_limit,
             )
             .run(
                 self.ctx(),

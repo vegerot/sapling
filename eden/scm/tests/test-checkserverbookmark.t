@@ -1,3 +1,6 @@
+
+#require no-eden
+
 #chg-compatible
 
   $ . "$TESTDIR/hgsql/library.sh"

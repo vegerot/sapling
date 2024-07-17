@@ -1,6 +1,10 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 https://bz.mercurial-scm.org/1175
+
+  $ setconfig commands.update.check=none
 
   $ newrepo repo
   $ touch a
@@ -14,10 +18,7 @@ https://bz.mercurial-scm.org/1175
   1 files updated, 0 files merged, 1 files removed, 0 files unresolved
 
   $ hg mv a a2
-  $ hg up
-  note: possible conflict - a was renamed multiple times to:
-   a2
-   a1
+  $ hg up 'desc(1)'
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
   $ hg ci -m2
@@ -90,5 +91,3 @@ https://bz.mercurial-scm.org/show_bug.cgi?id=4476
   changeset:   3903775176ed
   summary:     a
   
-
-

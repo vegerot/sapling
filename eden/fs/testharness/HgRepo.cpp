@@ -18,8 +18,8 @@
 #include <folly/portability/Unistd.h>
 #include <sys/stat.h>
 
+#include "eden/common/utils/FileUtils.h"
 #include "eden/fs/model/Hash.h"
-#include "eden/fs/utils/FileUtils.h"
 
 using folly::StringPiece;
 using std::string;
@@ -83,7 +83,8 @@ SpawnedProcess HgRepo::invokeHg(
 
 void HgRepo::hgInit(
     AbsolutePathPiece cacheDirectory,
-    std::vector<std::string> extraArgs) {
+    std::vector<std::string> extraArgs,
+    bool isEagerRepo) {
   XLOG(DBG1) << "creating new hg repository at " << path_;
 
   // Invoke SpawnedProcess directly here rather than using our hg() helper
@@ -94,25 +95,42 @@ void HgRepo::hgInit(
   SpawnedProcess::Options opts;
   opts.environment() = hgEnv_;
   opts.executablePath(hgCmd_);
+
+  if (isEagerRepo) {
+    std::vector<std::string> config{
+        "--config",
+        "format.use-eager-repo=True",
+    };
+    args.insert(args.end(), config.begin(), config.end());
+  }
+
   SpawnedProcess p(args, std::move(opts));
   p.waitChecked();
 
-  appendToRequires("remotefilelog\n");
+  if (isEagerRepo) {
+    appendToHgrc(fmt::format(
+        "[paths]\n"
+        "default = eager:{}\n",
+        path_.value()));
+  } else {
+    appendToRequires("remotefilelog\n");
+    appendToHgrc(fmt::format(
+        "[remotefilelog]\n"
+        "server = false\n"
+        "reponame = test\n"
+        "cachepath = {}\n",
+        cacheDirectory));
+  }
 
-  appendToHgrc(fmt::format(
-      "[extensions]\n"
-      "remotefilelog =\n"
-      "remotenames =\n"
-      "treemanifest =\n"
-      "[treemanifest]\n"
-      "treeonly = true\n"
-      "[remotefilelog]\n"
-      "server = false\n"
-      "reponame = test\n"
-      "cachepath = {}\n"
-      "[scmstore]\n"
-      "backingstore = true\n",
-      cacheDirectory));
+  appendToHgrc(
+      fmt::format("[extensions]\n"
+                  "remotefilelog =\n"
+                  "remotenames =\n"
+                  "treemanifest =\n"
+                  "[treemanifest]\n"
+                  "treeonly = true\n"
+                  "[scmstore]\n"
+                  "backingstore = true\n"));
 }
 
 void HgRepo::cloneFrom(
@@ -168,6 +186,17 @@ RootId HgRepo::commit(StringPiece message) {
 
 Hash20 HgRepo::getManifestForCommit(const RootId& commit) {
   auto output = hg("log", "-r", commit.value(), "-T{manifest}\\n");
+  return Hash20{folly::rtrimWhitespace(output)};
+}
+
+Hash20 HgRepo::getHgIdForFile(
+    const RootId& commit,
+    RelativePathPiece repoRelPath) {
+  auto command = fmt::format(
+      "print(hex(repo['{}']['{}'].filenode()))",
+      commit.value(),
+      repoRelPath.asString());
+  auto output = hg("dbsh", "-c", std::move(command));
   return Hash20{folly::rtrimWhitespace(output)};
 }
 

@@ -7,10 +7,11 @@
 
 #include "eden/fs/store/BlobAccess.h"
 #include <folly/MapUtil.h>
+
+#include "eden/common/utils/ImmediateFuture.h"
 #include "eden/fs/model/Blob.h"
 #include "eden/fs/store/BlobCache.h"
 #include "eden/fs/store/IObjectStore.h"
-#include "eden/fs/utils/ImmediateFuture.h"
 
 namespace facebook::eden {
 
@@ -19,9 +20,9 @@ BlobAccess::BlobAccess(
     std::shared_ptr<BlobCache> blobCache)
     : objectStore_{std::move(objectStore)}, blobCache_{std::move(blobCache)} {}
 
-BlobAccess::~BlobAccess() {}
+BlobAccess::~BlobAccess() = default;
 
-folly::Future<BlobCache::GetResult> BlobAccess::getBlob(
+ImmediateFuture<BlobCache::GetResult> BlobAccess::getBlob(
     const ObjectId& hash,
     const ObjectFetchContextPtr& context,
     BlobCache::Interest interest) {
@@ -36,9 +37,7 @@ folly::Future<BlobCache::GetResult> BlobAccess::getBlob(
         auto interestHandle =
             blobCache->insert(std::move(hash), blob, interest);
         return BlobCache::GetResult{std::move(blob), std::move(interestHandle)};
-      })
-      .semi()
-      .via(&folly::QueuedImmediateExecutor::instance());
+      });
 }
 
 } // namespace facebook::eden

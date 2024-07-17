@@ -13,12 +13,12 @@ use std::str::FromStr;
 use anyhow::bail;
 use anyhow::Error;
 use anyhow::Result;
-use bytes_old::Bytes;
-use bytes_old::BytesMut;
+use bytes::Bytes;
+use bytes::BytesMut;
 use hex::FromHex;
 use mercurial_types::HgChangesetId;
 use mercurial_types::HgManifestId;
-use mononoke_types::NonRootMPath;
+use mononoke_types::path::MPath;
 use nom::alt;
 use nom::apply;
 use nom::call;
@@ -474,9 +474,9 @@ fn utf8_string_complete(inp: &[u8]) -> IResult<&[u8], String> {
     }
 }
 
-/// Parse an Option<NonRootMPath>; assumes that input is complete.
-fn path_complete(inp: &[u8]) -> IResult<&[u8], Option<NonRootMPath>> {
-    match NonRootMPath::new_opt(inp) {
+/// Parse an MPath; assumes that input is complete.
+fn path_complete(inp: &[u8]) -> IResult<&[u8], MPath> {
+    match MPath::new(inp) {
         Ok(path) => IResult::Done(b"", path),
         Err(_) => IResult::Error(Err::Code(ErrorKind::Custom(BAD_PATH_ERR_CODE))),
     }
@@ -1192,6 +1192,7 @@ mod test_parse {
     use maplit::btreeset;
     use maplit::hashmap;
     use maplit::hashset;
+    use mononoke_types::path::MPath;
 
     use super::*;
 
@@ -1235,7 +1236,7 @@ mod test_parse {
 
         // check for short inputs
         for l in 0..inbytes.len() - 1 {
-            let mut buf = BytesMut::from(inbytes[0..l].to_vec());
+            let mut buf = BytesMut::from(&inbytes[0..l]);
             match parse_request(&mut buf) {
                 Ok(None) => {}
                 Ok(Some(val)) => panic!(
@@ -1257,7 +1258,7 @@ mod test_parse {
 
         // check for exact and extra
         for l in 0..extra.len() {
-            let mut buf = BytesMut::from(inbytes.to_vec());
+            let mut buf = BytesMut::from(inbytes);
             buf.extend_from_slice(&extra[0..l]);
             let buflen = buf.len();
             match parse_request(&mut buf) {
@@ -1486,7 +1487,7 @@ mod test_parse {
         test_parse(
             inp,
             Request::Single(SingleRequest::Gettreepack(GettreepackArgs {
-                rootdir: None,
+                rootdir: MPath::ROOT,
                 mfnodes: vec![hash_ones_manifest()],
                 basemfnodes: btreeset![hash_ones_manifest()],
                 directories: vec![],
@@ -1510,7 +1511,7 @@ mod test_parse {
         test_parse(
             inp,
             Request::Single(SingleRequest::Gettreepack(GettreepackArgs {
-                rootdir: NonRootMPath::new_opt("ololo").unwrap(),
+                rootdir: MPath::new("ololo").unwrap(),
                 mfnodes: vec![hash_ones_manifest(), hash_twos_manifest()],
                 basemfnodes: btreeset![hash_twos_manifest(), hash_ones_manifest()],
                 directories: vec![Bytes::from("".as_bytes())],
@@ -1534,7 +1535,7 @@ mod test_parse {
         test_parse(
             inp,
             Request::Single(SingleRequest::Gettreepack(GettreepackArgs {
-                rootdir: NonRootMPath::new_opt("ololo").unwrap(),
+                rootdir: MPath::new("ololo").unwrap(),
                 mfnodes: vec![hash_ones_manifest(), hash_twos_manifest()],
                 basemfnodes: btreeset![hash_twos_manifest(), hash_ones_manifest()],
                 directories: vec![Bytes::from(",".as_bytes()), Bytes::from(";".as_bytes())],
@@ -1555,7 +1556,7 @@ mod test_parse {
         test_parse(
             inp,
             Request::Single(SingleRequest::Gettreepack(GettreepackArgs {
-                rootdir: None,
+                rootdir: MPath::ROOT,
                 mfnodes: vec![hash_ones_manifest()],
                 basemfnodes: btreeset![hash_ones_manifest()],
                 directories: vec![Bytes::from(b"".as_ref()), Bytes::from(b"foo".as_ref())],

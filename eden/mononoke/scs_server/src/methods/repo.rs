@@ -31,12 +31,12 @@ use mononoke_api::CreateInfo;
 use mononoke_api::FileId;
 use mononoke_api::FileType;
 use mononoke_api::MononokeError;
-use mononoke_api::MononokePath;
 use mononoke_api::RepoContext;
 use mononoke_api::StoreRequest;
 use mononoke_types::hash::GitSha1;
 use mononoke_types::hash::Sha1;
 use mononoke_types::hash::Sha256;
+use mononoke_types::path::MPath;
 use repo_authorization::AuthorizationContext;
 use source_control as thrift;
 
@@ -400,11 +400,11 @@ impl SourceControlServiceImpl {
     async fn convert_create_commit_changes(
         repo: &RepoContext,
         changes: BTreeMap<String, thrift::RepoCreateCommitParamsChange>,
-    ) -> Result<BTreeMap<MononokePath, CreateChange>, errors::ServiceError> {
+    ) -> Result<BTreeMap<MPath, CreateChange>, errors::ServiceError> {
         let changes = changes
             .into_iter()
             .map(|(path, change)| async move {
-                let path = MononokePath::try_from(&path).map_err(|e| {
+                let path = MPath::try_from(&path).map_err(|e| {
                     errors::invalid_request(format!("invalid path '{}': {}", path, e))
                 })?;
                 let change = Self::convert_create_commit_change(repo, change).await?;
@@ -462,7 +462,7 @@ impl SourceControlServiceImpl {
         params: thrift::RepoCreateStackParams,
     ) -> Result<thrift::RepoCreateStackResponse, errors::ServiceError> {
         let repo = self
-            .repo_for_service(ctx, &repo, params.service_identity.clone())
+            .repo_for_service(ctx.clone(), &repo, params.service_identity.clone())
             .await?;
         let repo = &repo;
 
@@ -489,17 +489,6 @@ impl SourceControlServiceImpl {
             .create_changeset_stack(stack_parents, info_stack, changes_stack, bubble)
             .await?;
 
-        // Prepare derived data if we were asked to.  Simple implementation
-        // that doesn't support parallel derivation or dependencies between types.
-        if let Some(prepare_types) = &params.prepare_derived_data_types {
-            let csids = stack.iter().map(|c| c.id()).collect::<Vec<_>>();
-            for derived_data_type in prepare_types {
-                let derivable_type = DerivableType::from_request(derived_data_type)?;
-                repo.prepare_derived_data(derivable_type, csids.clone())
-                    .await?;
-            }
-        }
-
         // If you ask for a git identity back, then we'll assume that you supplied one to us
         // and set it. Later, when we can derive a git commit hash, this'll become more
         // open, because we'll only do the check if you ask for a hash different to the
@@ -512,6 +501,19 @@ impl SourceControlServiceImpl {
                 repo.set_git_mapping_from_changeset(changeset).await?;
             }
         }
+
+        // Prepare derived data if we were asked to, excluding Git types
+        if let Some(prepare_types) = &params.prepare_derived_data_types {
+            let csids = stack.iter().map(|c| c.id()).collect::<Vec<_>>();
+            let derived_data_types = prepare_types
+                .iter()
+                .map(DerivableType::from_request)
+                .collect::<Result<Vec<_>, _>>()?;
+            repo.derive_bulk(&ctx, csids, &derived_data_types, None)
+                .await
+                .context("Deriving non Git types")?;
+        }
+
         let identity_schemes = &params.identity_schemes;
         let commit_ids = stream::iter(stack.into_iter().map(|changeset| async move {
             map_commit_identity(&changeset, identity_schemes).await
@@ -656,6 +658,7 @@ impl SourceControlServiceImpl {
             &BookmarkKey::new(&params.bookmark).map_err(Into::<MononokeError>::into)?,
             changeset.id(),
             pushvars.as_ref(),
+            None,
         )
         .await?;
         Ok(thrift::RepoCreateBookmarkResponse {
@@ -695,6 +698,7 @@ impl SourceControlServiceImpl {
             old_changeset_id,
             params.allow_non_fast_forward_move,
             pushvars.as_ref(),
+            None,
         )
         .await?;
         Ok(thrift::RepoMoveBookmarkResponse {
@@ -740,19 +744,19 @@ impl SourceControlServiceImpl {
     /// are ready to be used later without incurring a performance penalty for repeated
     /// preparation.
     ///
-    /// For now, concretely, "preparing" means deriving the fsnode data for a batch of commits.
+    /// For now, concretely, "preparing" means deriving the provided derived data type for a batch of commits.
     ///
-    /// * The provided batch of commits must be in topological order.
-    /// * The dependencies and ancestors of all commits in the batch must have already been derived.
+    /// * The dependencies and ancestors of most commits in the batch must have already been derived.
     ///
-    /// If these conditions are not met, an error will be returned.
+    /// If these conditions are not met, this endpoint may take an unbounded time to derive all
+    /// ancestors and timeout.
     pub(crate) async fn repo_prepare_commits(
         &self,
         ctx: CoreContext,
         repo: thrift::RepoSpecifier,
         params: thrift::RepoPrepareCommitsParams,
     ) -> Result<thrift::RepoPrepareCommitsResponse, errors::ServiceError> {
-        let repo = self.repo(ctx, &repo).await?;
+        let repo = self.repo(ctx.clone(), &repo).await?;
         // Convert thrift commit ids to bonsai changeset ids
         let changesets = try_join_all(
             params
@@ -764,16 +768,17 @@ impl SourceControlServiceImpl {
                 .map(|specifier| repo.changeset(specifier)),
         )
         .await?;
-        let cs_ids = std::iter::zip(params.commits, changesets)
+        let csids = std::iter::zip(params.commits, changesets)
             .map(|(commit, cs)| {
                 cs.map(|cs| cs.id())
                     .ok_or_else(|| errors::commit_not_found(commit.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let derived_data_type = DerivableType::from_request(&params.derived_data_type)?;
 
-        // Derive data of the requested type for the batch of desired commits
-        let derivable_type = DerivableType::from_request(&params.derived_data_type)?;
-        repo.prepare_derived_data(derivable_type, cs_ids).await?;
+        const CONCURRENCY: u64 = 1000;
+        repo.derive_bulk(&ctx, csids, &[derived_data_type], Some(CONCURRENCY))
+            .await?;
 
         Ok(thrift::RepoPrepareCommitsResponse {
             ..Default::default()

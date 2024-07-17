@@ -15,7 +15,6 @@
 //! network byte order (big endian).
 //!
 //! ```text
-//!
 //! .datapack
 //!     The pack itself is a series of revision deltas with some basic header
 //!     information on each. A revision delta may be a fulltext, represented by
@@ -75,13 +74,11 @@
 //!                  <deltabase location: 4 byte signed int>
 //!                  <pack entry offset: 8 byte unsigned int>
 //!                  <pack entry size: 8 byte unsigned int>
-//!
 //! ```
 //! [1]: new in version 1.
 
 use std::cell::RefCell;
 use std::fmt;
-use std::fs::File;
 use std::io::Cursor;
 use std::io::Read;
 use std::mem::take;
@@ -94,6 +91,7 @@ use anyhow::Error;
 use anyhow::Result;
 use byteorder::BigEndian;
 use byteorder::ReadBytesExt;
+use fs_err::File;
 use lz4_pyframe::decompress;
 use memmap2::Mmap;
 use memmap2::MmapOptions;
@@ -308,6 +306,10 @@ impl DataPack {
         })
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn len(&self) -> usize {
         self.mmap.len()
     }
@@ -520,7 +522,7 @@ pub mod tests {
     use crate::datastore::Metadata;
     use crate::mutabledatapack::MutableDataPack;
 
-    pub fn make_datapack(tempdir: &TempDir, deltas: &Vec<(Delta, Metadata)>) -> DataPack {
+    pub fn make_datapack(tempdir: &TempDir, deltas: &[(Delta, Metadata)]) -> DataPack {
         let mutdatapack = MutableDataPack::new(tempdir.path(), DataPackVersion::One);
         for (delta, metadata) in deltas.iter() {
             mutdatapack.add(delta, metadata).unwrap();

@@ -323,7 +323,7 @@ class simplecommitctx(context.committablectx):
             "mutinfo": mutinfo,
             "user": user,
         }
-        super(simplecommitctx, self).__init__(self, text or name, **opts)
+        super().__init__(repo, text or name, **opts)
         self._repo = repo
         self._filemap = filemap
         self._parents = parentctxs
@@ -645,7 +645,7 @@ def _drawdagintransaction(repo, text: str, tr, **opts) -> None:
                 repo.ui.write("%s %s\n" % (short(n), name))
     if opts.get("write_env"):
         path = opts.get("write_env")
-        with open(path, "w") as f:
+        with open(path, "wb") as f:
             for name, n in sorted(committed.items()):
                 if name and name not in existed:
-                    f.write("%s=%s\n" % (name, hex(n)))
+                    f.write(("%s=%s\n" % (name, hex(n))).encode())

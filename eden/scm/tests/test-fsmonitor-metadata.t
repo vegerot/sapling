@@ -1,7 +1,6 @@
 #chg-compatible
-#require fsmonitor
+#require fsmonitor no-eden
 
-  $ configure modernclient
 
   $ newclientrepo
   $ echo foo > foo

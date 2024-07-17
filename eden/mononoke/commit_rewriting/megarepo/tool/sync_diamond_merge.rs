@@ -12,13 +12,12 @@
 //! USE WITH CARE!
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
-use blobrepo::AsBlobRepo;
-use blobrepo::BlobRepo;
 use blobrepo_utils::convert_diff_result_into_file_change_for_diamond_merge;
 use blobstore::Loadable;
 use bookmarks::BookmarkKey;
@@ -32,11 +31,16 @@ use commit_transformation::upload_commits;
 use context::CoreContext;
 use cross_repo_sync::create_commit_syncers;
 use cross_repo_sync::rewrite_commit;
+use cross_repo_sync::submodule_metadata_file_prefix_and_dangling_pointers;
 use cross_repo_sync::update_mapping_with_version;
 use cross_repo_sync::CandidateSelectionHint;
 use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncOutcome;
 use cross_repo_sync::CommitSyncer;
+use cross_repo_sync::InMemoryRepo;
+use cross_repo_sync::Large;
+use cross_repo_sync::SubmoduleDeps;
+use cross_repo_sync::SubmoduleExpansionData;
 use cross_repo_sync::Syncers;
 use futures::compat::Future01CompatExt;
 use futures::future::FutureExt;
@@ -57,16 +61,18 @@ use mercurial_derivation::DeriveHgChangeset;
 use mercurial_types::HgFileNodeId;
 use mercurial_types::HgManifestId;
 use metaconfig_types::CommitSyncConfigVersion;
-use mononoke_api_types::InnerRepo;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::FileChange;
 use mononoke_types::NonRootMPath;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_identity::RepoIdentityRef;
 use slog::info;
 use slog::warn;
 use sorted_vector_map::SortedVectorMap;
 use synced_commit_mapping::SqlSyncedCommitMapping;
+
+use crate::Repo;
 
 /// The function syncs merge commit M from a small repo into a large repo.
 /// It's designed to handle a case described below
@@ -115,8 +121,9 @@ use synced_commit_mapping::SqlSyncedCommitMapping;
 /// ```
 pub async fn do_sync_diamond_merge(
     ctx: &CoreContext,
-    small_repo: InnerRepo,
-    large_repo: InnerRepo,
+    small_repo: &Repo,
+    large_repo: &Repo,
+    submodule_deps: SubmoduleDeps<Repo>,
     small_merge_cs_id: ChangesetId,
     mapping: SqlSyncedCommitMapping,
     onto_bookmark: BookmarkKey,
@@ -129,19 +136,19 @@ pub async fn do_sync_diamond_merge(
     );
 
     let parents = small_repo
-        .blob_repo
         .changeset_fetcher()
         .get_parents(ctx, small_merge_cs_id)
         .await?;
 
     let (p1, p2) = validate_parents(parents)?;
 
-    let new_branch = find_new_branch_oldest_first(ctx.clone(), &small_repo, p1, p2).await?;
+    let new_branch = find_new_branch_oldest_first(ctx.clone(), small_repo, p1, p2).await?;
 
     let syncers = create_commit_syncers(
         ctx,
         small_repo.clone(),
         large_repo.clone(),
+        submodule_deps,
         mapping,
         live_commit_sync_config,
         lease,
@@ -175,6 +182,7 @@ pub async fn do_sync_diamond_merge(
                 cs_id,
                 CandidateSelectionHint::Only,
                 CommitSyncContext::SyncDiamondMerge,
+                None,
             )
             .await?;
     }
@@ -190,8 +198,8 @@ pub async fn do_sync_diamond_merge(
     let (rewritten, version_for_merge) = create_rewritten_merge_commit(
         ctx.clone(),
         small_merge_cs_id,
-        &small_repo,
-        &large_repo,
+        small_repo,
+        large_repo,
         &syncers,
         small_root,
         onto_value,
@@ -200,7 +208,15 @@ pub async fn do_sync_diamond_merge(
 
     let new_merge_cs_id = rewritten.get_changeset_id();
     info!(ctx.logger(), "uploading merge commit {}", new_merge_cs_id);
-    upload_commits(ctx, vec![rewritten], &small_repo.blob_repo, &large_repo).await?;
+    let submodule_expansion_content_ids = Vec::<(Arc<Repo>, HashSet<_>)>::new();
+    upload_commits(
+        ctx,
+        vec![rewritten],
+        &small_repo,
+        &large_repo,
+        submodule_expansion_content_ids,
+    )
+    .await?;
 
     update_mapping_with_version(
         ctx,
@@ -228,9 +244,9 @@ pub async fn do_sync_diamond_merge(
 async fn create_rewritten_merge_commit(
     ctx: CoreContext,
     small_merge_cs_id: ChangesetId,
-    small_repo: &InnerRepo,
-    large_repo: &InnerRepo,
-    syncers: &Syncers<SqlSyncedCommitMapping, InnerRepo>,
+    small_repo: &Repo,
+    large_repo: &Repo,
+    syncers: &Syncers<SqlSyncedCommitMapping, Repo>,
     small_root: ChangesetId,
     onto_value: ChangesetId,
 ) -> Result<(BonsaiChangeset, CommitSyncConfigVersion), Error> {
@@ -276,7 +292,36 @@ async fn create_rewritten_merge_commit(
         p1 => onto_value,
         p2 => remapped_p2,
     };
-    let maybe_rewritten = rewrite_commit(
+
+    let (x_repo_submodule_metadata_file_prefix, dangling_submodule_pointers) =
+        submodule_metadata_file_prefix_and_dangling_pointers(
+            small_repo.repo_identity().id(),
+            &root_version,
+            syncers.small_to_large.live_commit_sync_config.clone(),
+        )
+        .await?;
+
+    let submodule_deps = syncers.small_to_large.get_submodule_deps();
+
+    let large_repo_id = Large(large_repo.repo_identity().id());
+    let fallback_repos = vec![Arc::new(small_repo.clone())]
+        .into_iter()
+        .chain(submodule_deps.repos())
+        .collect::<Vec<_>>();
+    let large_in_memory_repo = InMemoryRepo::from_repo(large_repo, fallback_repos)?;
+    let submodule_expansion_data = match submodule_deps {
+        SubmoduleDeps::ForSync(deps) => Some(SubmoduleExpansionData {
+            submodule_deps: deps,
+            x_repo_submodule_metadata_file_prefix: x_repo_submodule_metadata_file_prefix.as_str(),
+            large_repo_id,
+            large_repo: large_in_memory_repo,
+            dangling_submodule_pointers,
+        }),
+        SubmoduleDeps::NotNeeded | SubmoduleDeps::NotAvailable => None,
+    };
+
+    let source_repo = syncers.small_to_large.get_source_repo();
+    let rewrite_res = rewrite_commit(
         &ctx,
         merge_bcs,
         &remapped_parents,
@@ -284,12 +329,15 @@ async fn create_rewritten_merge_commit(
             .small_to_large
             .get_mover_by_version(&version_p1)
             .await?,
-        syncers.small_to_large.get_source_repo(),
+        source_repo,
         Default::default(),
+        Default::default(),
+        submodule_expansion_data,
     )
     .await?;
-    let mut rewritten =
-        maybe_rewritten.ok_or_else(|| Error::msg("merge commit was unexpectedly rewritten out"))?;
+    let mut rewritten = rewrite_res
+        .rewritten
+        .ok_or_else(|| Error::msg("merge commit was unexpectedly rewritten out"))?;
 
     let mut additional_file_changes = generate_additional_file_changes(
         ctx.clone(),
@@ -314,12 +362,12 @@ async fn create_rewritten_merge_commit(
 async fn generate_additional_file_changes(
     ctx: CoreContext,
     root: ChangesetId,
-    large_repo: &(impl AsBlobRepo + RepoBlobstoreRef),
-    large_to_small: &CommitSyncer<SqlSyncedCommitMapping, InnerRepo>,
+    large_repo: &Repo,
+    large_to_small: &CommitSyncer<SqlSyncedCommitMapping, Repo>,
     onto_value: ChangesetId,
     version: &CommitSyncConfigVersion,
 ) -> Result<SortedVectorMap<NonRootMPath, FileChange>, Error> {
-    let bonsai_diff = find_bonsai_diff(ctx.clone(), large_repo.as_blob_repo(), root, onto_value)
+    let bonsai_diff = find_bonsai_diff(ctx.clone(), large_repo, root, onto_value)
         .collect()
         .compat()
         .await?;
@@ -348,7 +396,7 @@ async fn generate_additional_file_changes(
 
 async fn remap_commit(
     ctx: CoreContext,
-    small_to_large_commit_syncer: &CommitSyncer<SqlSyncedCommitMapping, InnerRepo>,
+    small_to_large_commit_syncer: &CommitSyncer<SqlSyncedCommitMapping, Repo>,
     cs_id: ChangesetId,
 ) -> Result<(ChangesetId, CommitSyncConfigVersion), Error> {
     let maybe_sync_outcome = small_to_large_commit_syncer
@@ -388,12 +436,12 @@ fn find_root(new_branch: &Vec<BonsaiChangeset>) -> Result<ChangesetId, Error> {
         }
     }
 
-    validate_roots(roots).map(|root| *root)
+    validate_roots(roots).copied()
 }
 
 async fn find_new_branch_oldest_first(
     ctx: CoreContext,
-    small_repo: &InnerRepo,
+    small_repo: &Repo,
     p1: ChangesetId,
     p2: ChangesetId,
 ) -> Result<Vec<BonsaiChangeset>, Error> {
@@ -405,7 +453,7 @@ async fn find_new_branch_oldest_first(
             cloned!(ctx, small_repo);
             move |cs| {
                 cloned!(ctx, small_repo);
-                async move { Ok(cs.load(&ctx, small_repo.blob_repo.repo_blobstore()).await?) }
+                async move { Ok(cs.load(&ctx, small_repo.repo_blobstore()).await?) }
             }
         })
         .try_buffered(100)
@@ -423,7 +471,7 @@ fn validate_parents(parents: Vec<ChangesetId>) -> Result<(ChangesetId, Changeset
         ));
     }
     let p1 = parents
-        .get(0)
+        .first()
         .ok_or_else(|| Error::msg("not a merge commit"))?;
     let p2 = parents
         .get(1)
@@ -438,14 +486,14 @@ fn validate_roots(roots: Vec<&ChangesetId>) -> Result<&ChangesetId, Error> {
     }
 
     roots
-        .get(0)
+        .first()
         .cloned()
         .ok_or_else(|| Error::msg("no roots found, this is not a diamond merge"))
 }
 
 fn find_bonsai_diff(
     ctx: CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     ancestor: ChangesetId,
     descendant: ChangesetId,
 ) -> BoxStream<BonsaiDiffFileChange<HgFileNodeId>, Error> {
@@ -473,7 +521,7 @@ fn find_bonsai_diff(
 
 fn id_to_manifestid(
     ctx: CoreContext,
-    repo: BlobRepo,
+    repo: Repo,
     bcs_id: ChangesetId,
 ) -> impl Future<Item = HgManifestId, Error = Error> {
     async move {

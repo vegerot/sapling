@@ -6,7 +6,7 @@
  */
 
 import App from '../App';
-import {ignoreRTL} from '../testQueries';
+import {CommitInfoTestUtils, ignoreRTL} from '../testQueries';
 import {
   resetTestMessages,
   expectMessageSentToServer,
@@ -15,12 +15,11 @@ import {
   simulateUncommittedChangedFiles,
   closeCommitInfoSidebar,
   simulateRepoConnected,
+  commitInfoIsOpen,
+  openCommitInfoSidebar,
 } from '../testUtils';
 import {CommandRunner} from '../types';
-import {fireEvent, render, screen, waitFor} from '@testing-library/react';
-import {act} from 'react-dom/test-utils';
-
-jest.mock('../MessageBus');
+import {fireEvent, render, screen, waitFor, within, act} from '@testing-library/react';
 
 describe('CommitTreeList', () => {
   beforeEach(() => {
@@ -61,7 +60,7 @@ describe('CommitTreeList', () => {
           value: [
             COMMIT('1', 'some public base', '0', {phase: 'public'}),
             COMMIT('a', 'My Commit', '1'),
-            COMMIT('b', 'Another Commit', 'a', {isHead: true}),
+            COMMIT('b', 'Another Commit', 'a', {isDot: true}),
           ],
         });
       });
@@ -116,7 +115,7 @@ describe('CommitTreeList', () => {
         act(() => {
           simulateCommits({
             value: [
-              COMMIT('1', 'some public base', '0', {phase: 'public', isHead: true}),
+              COMMIT('1', 'some public base', '0', {phase: 'public', isDot: true}),
               COMMIT('a', 'My Commit', '1', {successorInfo: {hash: 'a2', type: 'land'}}),
               COMMIT('b', 'Another Commit', 'a'),
             ],
@@ -224,9 +223,13 @@ describe('CommitTreeList', () => {
           const ignoredFileCheckboxes = document.querySelectorAll(
             '.changed-files .changed-file.file-ignored input[type="checkbox"]',
           );
-          expect(ignoredFileCheckboxes).toHaveLength(2); // file_untracked.js and file_missing.js
+          const missingFileCheckboxes = document.querySelectorAll(
+            '.changed-files .changed-file.file-missing input[type="checkbox"]',
+          );
+          expect(ignoredFileCheckboxes).toHaveLength(1); // file_untracked.js
+          expect(missingFileCheckboxes).toHaveLength(1); // file_missing.js
           act(() => {
-            fireEvent.click(ignoredFileCheckboxes[0]);
+            fireEvent.click(missingFileCheckboxes[0]);
           });
 
           const addremove = screen.getByTestId('addremove-button');
@@ -280,11 +283,107 @@ describe('CommitTreeList', () => {
           value: [
             COMMIT('1', 'some public base', '0', {phase: 'public'}),
             COMMIT('a', 'My Commit', '1', {successorInfo: {hash: 'a2', type: 'land'}}),
-            COMMIT('b', 'Another Commit', 'a', {isHead: true}),
+            COMMIT('b', 'Another Commit', 'a', {isDot: true}),
           ],
         });
       });
       expect(screen.getByText('Landed as a newer commit', {exact: false})).toBeInTheDocument();
+    });
+
+    it('shows button to open sidebar', () => {
+      act(() => {
+        simulateCommits({
+          value: [
+            COMMIT('1', 'some public base', '0', {phase: 'public'}),
+            COMMIT('a', 'Commit A', '1', {isDot: true}),
+            COMMIT('b', 'Commit B', '1'),
+          ],
+        });
+      });
+      expect(commitInfoIsOpen()).toBeFalsy();
+
+      // doesn't appear for public commits
+      expect(
+        within(screen.getByTestId('commit-1')).queryByTestId('open-commit-info-button'),
+      ).not.toBeInTheDocument();
+
+      const openButton = within(screen.getByTestId('commit-b')).getByTestId(
+        'open-commit-info-button',
+      );
+      expect(openButton).toBeInTheDocument();
+      // screen reader accessible
+      expect(screen.getByLabelText('Open commit "Commit B"')).toBeInTheDocument();
+      fireEvent.click(openButton);
+      expect(commitInfoIsOpen()).toBeTruthy();
+      expect(CommitInfoTestUtils.withinCommitInfo().getByText('Commit B')).toBeInTheDocument();
+    });
+
+    it('sets to amend mode when clicking open button', () => {
+      act(() => {
+        simulateCommits({
+          value: [
+            COMMIT('1', 'some public base', '0', {phase: 'public'}),
+            COMMIT('a', 'Commit A', '1', {isDot: true}),
+            COMMIT('b', 'Commit B', '1'),
+          ],
+        });
+      });
+      act(() => {
+        openCommitInfoSidebar();
+      });
+      CommitInfoTestUtils.clickCommitMode();
+
+      const openButton = within(screen.getByTestId('commit-b')).getByTestId(
+        'open-commit-info-button',
+      );
+      expect(openButton).toBeInTheDocument();
+      fireEvent.click(openButton);
+      expect(commitInfoIsOpen()).toBeTruthy();
+      expect(CommitInfoTestUtils.withinCommitInfo().getByText('Commit B')).toBeInTheDocument();
+    });
+  });
+
+  describe('render dag subset', () => {
+    describe('obsolete stacks', () => {
+      beforeEach(() => {
+        render(<App />);
+        act(() => {
+          simulateRepoConnected();
+          closeCommitInfoSidebar();
+          expectMessageSentToServer({
+            type: 'subscribe',
+            kind: 'smartlogCommits',
+            subscriptionID: expect.anything(),
+          });
+          simulateCommits({
+            value: [
+              COMMIT('1', 'some public base', '0', {phase: 'public'}),
+              COMMIT('a', 'Commit A', '1', {successorInfo: {hash: 'a2', type: 'rebase'}}),
+              COMMIT('b', 'Commit B', 'a', {successorInfo: {hash: 'b2', type: 'rebase'}}),
+              COMMIT('c', 'Commit C', 'b', {successorInfo: {hash: 'c2', type: 'rebase'}}),
+              COMMIT('d', 'Commit D', 'c', {successorInfo: {hash: 'd2', type: 'rebase'}}),
+              COMMIT('e', 'Commit E', 'd', {isDot: true}),
+            ],
+          });
+        });
+      });
+      it('hides obsolete stacks by default', () => {
+        expect(screen.queryByText('Commit A')).toBeInTheDocument();
+        expect(screen.queryByText('Commit B')).not.toBeInTheDocument();
+        expect(screen.queryByText('Commit C')).not.toBeInTheDocument();
+        expect(screen.queryByText('Commit D')).toBeInTheDocument();
+        expect(screen.queryByText('Commit E')).toBeInTheDocument();
+      });
+
+      it('can configure to not hide obsolete stacks', () => {
+        fireEvent.click(screen.getByTestId('settings-gear-button'));
+        fireEvent.click(screen.getByTestId('condense-obsolete-stacks'));
+        expect(screen.queryByText('Commit A')).toBeInTheDocument();
+        expect(screen.queryByText('Commit B')).toBeInTheDocument();
+        expect(screen.queryByText('Commit C')).toBeInTheDocument();
+        expect(screen.queryByText('Commit D')).toBeInTheDocument();
+        expect(screen.queryByText('Commit E')).toBeInTheDocument();
+      });
     });
   });
 });

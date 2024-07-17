@@ -5,6 +5,8 @@
  * GNU General Public License version 2.
  */
 
+#![feature(let_chains)]
+
 pub mod bundle2;
 pub mod bundle2_encode;
 pub mod capabilities;
@@ -32,23 +34,19 @@ mod utils;
 
 use std::fmt;
 
-use anyhow::bail;
 use anyhow::Error;
 use anyhow::Result;
-use bytes_old::Bytes;
-use futures::compat::Future01CompatExt;
-use futures::compat::Stream01CompatExt;
+use bytes::Bytes;
+use futures::channel::mpsc;
+use futures::channel::oneshot;
 use futures::future::BoxFuture;
-use futures::future::FutureExt;
+use futures::sink::SinkExt;
 use futures::stream::BoxStream;
+use futures::stream::Stream;
 use futures::stream::StreamExt;
-use futures_ext::BoxFuture as OldBoxFuture;
-use futures_ext::BoxStream as OldBoxStream;
-use futures_ext::SinkToAsyncWrite;
-use futures_old::sync::mpsc;
-use futures_old::sync::oneshot;
-use futures_old::Future as OldFuture;
-use futures_old::Stream as OldStream;
+use futures::FutureExt;
+use tokio_util::io::CopyToBytes;
+use tokio_util::io::SinkWriter;
 
 pub use crate::bundle2_encode::Bundle2EncodeBuilder;
 pub use crate::part_header::PartHeader;
@@ -66,8 +64,8 @@ pub enum Bundle2Item<'a> {
     ),
     B2xInfinitepush(PartHeader, BoxStream<'a, Result<changegroup::Part>>),
     B2xTreegroup2(PartHeader, BoxStream<'a, Result<wirepack::Part>>),
-    // B2xInfinitepushBookmarks returns Bytes because this part is not going to be used.
-    B2xInfinitepushBookmarks(PartHeader, BoxStream<'a, Result<bytes_old::Bytes>>),
+    // B2xInfinitepushBookmarks returns BytesOld because this part is not going to be used.
+    B2xInfinitepushBookmarks(PartHeader, BoxStream<'a, Result<Bytes>>),
     B2xInfinitepushMutation(
         PartHeader,
         BoxStream<'a, Result<Vec<mercurial_mutation::HgMutationEntry>>>,
@@ -126,106 +124,38 @@ impl<'a> fmt::Debug for Bundle2Item<'a> {
     }
 }
 
-impl<'a> From<OldBundle2Item> for Bundle2Item<'a> {
-    fn from(this: OldBundle2Item) -> Self {
-        use crate::OldBundle2Item::*;
-        match this {
-            Start(header) => Bundle2Item::Start(header),
-            Changegroup(header, stream) => {
-                Bundle2Item::Changegroup(header, stream.compat().boxed())
-            }
-            B2xCommonHeads(header, stream) => {
-                Bundle2Item::B2xCommonHeads(header, stream.compat().boxed())
-            }
-            B2xInfinitepush(header, stream) => {
-                Bundle2Item::B2xInfinitepush(header, stream.compat().boxed())
-            }
-            B2xTreegroup2(header, stream) => {
-                Bundle2Item::B2xTreegroup2(header, stream.compat().boxed())
-            }
-            // B2xInfinitepushBookmarks returns Bytes because this part is not going to be used.
-            B2xInfinitepushBookmarks(header, stream) => {
-                Bundle2Item::B2xInfinitepushBookmarks(header, stream.compat().boxed())
-            }
-            B2xInfinitepushMutation(header, stream) => {
-                Bundle2Item::B2xInfinitepushMutation(header, stream.compat().boxed())
-            }
-            B2xRebasePack(header, stream) => {
-                Bundle2Item::B2xRebasePack(header, stream.compat().boxed())
-            }
-            B2xRebase(header, stream) => Bundle2Item::B2xRebase(header, stream.compat().boxed()),
-            Replycaps(header, future) => Bundle2Item::Replycaps(header, future.compat().boxed()),
-            Pushkey(header, future) => Bundle2Item::Pushkey(header, future.compat().boxed()),
-            Pushvars(header, future) => Bundle2Item::Pushvars(header, future.compat().boxed()),
-        }
-    }
-}
-
-pub(crate) enum OldBundle2Item {
-    Start(StreamHeader),
-    Changegroup(PartHeader, OldBoxStream<changegroup::Part, Error>),
-    B2xCommonHeads(
-        PartHeader,
-        OldBoxStream<mercurial_types::HgChangesetId, Error>,
-    ),
-    B2xInfinitepush(PartHeader, OldBoxStream<changegroup::Part, Error>),
-    B2xTreegroup2(PartHeader, OldBoxStream<wirepack::Part, Error>),
-    // B2xInfinitepushBookmarks returns Bytes because this part is not going to be used.
-    B2xInfinitepushBookmarks(PartHeader, OldBoxStream<bytes_old::Bytes, Error>),
-    B2xInfinitepushMutation(
-        PartHeader,
-        OldBoxStream<Vec<mercurial_mutation::HgMutationEntry>, Error>,
-    ),
-    B2xRebasePack(PartHeader, OldBoxStream<wirepack::Part, Error>),
-    B2xRebase(PartHeader, OldBoxStream<changegroup::Part, Error>),
-    Replycaps(PartHeader, OldBoxFuture<capabilities::Capabilities, Error>),
-    Pushkey(PartHeader, OldBoxFuture<(), Error>),
-    Pushvars(PartHeader, OldBoxFuture<(), Error>),
-}
-
 /// Given bundle parts, returns a stream of Bytes that represent an encoded bundle with these parts
-pub fn create_bundle_stream<C: Into<Option<async_compression::CompressorType>>>(
+pub fn create_bundle_stream_new(
     parts: Vec<part_encode::PartEncodeBuilder>,
-    ct: C,
-) -> impl OldStream<Item = bytes_old::Bytes, Error = Error> {
+) -> impl Stream<Item = Result<Bytes, Error>> {
     let (sender, receiver) = mpsc::channel::<Bytes>(1);
     // Sends either and empty Bytes if bundle generation was successful or an error.
     // Empty Bytes are used just to make chaining of streams below easier.
     let (result_sender, result_receiver) = oneshot::channel::<Result<Bytes>>();
-    // Bundle2EncodeBuilder accepts writer which implements AsyncWrite. To workaround that we
-    // use SinkToAsyncWrite. It implements AsyncWrite trait and sends everything that was written
-    // into the Sender
-    let mut bundle = Bundle2EncodeBuilder::new(SinkToAsyncWrite::new(sender));
-    bundle.set_compressor_type(ct);
+    let mut bundle = Bundle2EncodeBuilder::new(SinkWriter::new(
+        CopyToBytes::new(sender)
+            .sink_map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}"))),
+    ));
     for part in parts {
         bundle.add_part(part);
     }
 
-    tokio::spawn(
-        bundle
-            .build()
-            .then(move |val| {
-                // Ignore send errors, because they can only happen if receiver was deallocated already
-                match val {
-                    Ok(_) => {
-                        // Bundle was successfully generated, so there is nothing add.
-                        // So just add empty bytes.
-                        let _ = result_sender.send(Ok(Bytes::new()));
-                    }
-                    Err(err) => {
-                        let _ = result_sender.send(Err(err));
-                    }
-                };
-                Result::<_, Error>::Ok(())
-            })
-            .compat(),
-    );
+    tokio::spawn(async move {
+        match bundle.build().await {
+            Ok(_) => {
+                // Bundle was successfully generated, so there is nothing add.
+                // So just add empty bytes.
+                let _ = result_sender.send(Ok(Bytes::new()));
+            }
+            Err(err) => {
+                let _ = result_sender.send(Err(err));
+            }
+        }
+
+        anyhow::Ok(())
+    });
 
     receiver
         .map(Ok)
-        .chain(result_receiver.into_stream().map_err(|_err| ()))
-        .then(|entry| match entry {
-            Ok(res) => res,
-            Err(()) => bail!("error while receiving gettreepack response from the channel"),
-        })
+        .chain(result_receiver.map(|res| anyhow::Ok(res??)).into_stream())
 }

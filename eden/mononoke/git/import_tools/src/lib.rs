@@ -6,23 +6,32 @@
  */
 
 #![feature(try_blocks)]
+#![feature(trait_alias)]
 
-mod git_reader;
+pub mod bookmark;
+pub mod git_reader;
+pub mod git_uploader;
 mod gitimport_objects;
 mod gitlfs;
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
+use std::str;
+use std::sync::Arc;
 use std::sync::RwLock;
 
 use anyhow::bail;
 use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
+use anyhow::Result;
 use bytes::Bytes;
 use cloned::cloned;
 use context::CoreContext;
+use futures::stream;
+use futures::try_join;
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryFutureExt;
@@ -41,18 +50,22 @@ use sorted_vector_map::SortedVectorMap;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::task;
 
+pub use crate::bookmark::set_bookmark;
+pub use crate::bookmark::BookmarkOperation;
+use crate::git_reader::GitReader;
 pub use crate::git_reader::GitRepoReader;
-pub use crate::gitimport_objects::convert_time_to_datetime;
+pub use crate::git_uploader::GitUploader;
+pub use crate::git_uploader::ReuploadCommits;
 pub use crate::gitimport_objects::oid_to_sha1;
-use crate::gitimport_objects::read_raw_object;
+pub use crate::gitimport_objects::BackfillDerivation;
 pub use crate::gitimport_objects::CommitMetadata;
 pub use crate::gitimport_objects::ExtractedCommit;
 pub use crate::gitimport_objects::GitLeaf;
 pub use crate::gitimport_objects::GitManifest;
 pub use crate::gitimport_objects::GitTree;
-pub use crate::gitimport_objects::GitUploader;
 pub use crate::gitimport_objects::GitimportPreferences;
 pub use crate::gitimport_objects::GitimportTarget;
 pub use crate::gitimport_objects::TagMetadata;
@@ -68,43 +81,54 @@ pub const BRANCH_REF_PREFIX: &str = "refs/heads/";
 pub const TAG_REF_PREFIX: &str = "refs/tags/";
 
 // TODO: Try to produce copy-info?
-async fn find_file_changes<S, U>(
+async fn find_file_changes<S, U, R>(
     ctx: &CoreContext,
     lfs: &GitImportLfs,
-    reader: &GitRepoReader,
-    uploader: U,
+    reader: Arc<R>,
+    uploader: Arc<U>,
     changes: S,
-) -> Result<SortedVectorMap<NonRootMPath, U::Change>, Error>
+) -> Result<SortedVectorMap<NonRootMPath, U::Change>>
 where
-    S: Stream<Item = Result<BonsaiDiffFileChange<GitLeaf>, Error>>,
+    S: Stream<Item = Result<BonsaiDiffFileChange<GitLeaf>>>,
     U: GitUploader,
+    R: GitReader,
 {
     changes
         .map_ok(|change| async {
+            cloned!(ctx, reader, uploader, lfs);
             task::spawn({
-                cloned!(ctx, reader, uploader, lfs);
                 async move {
                     match change {
                         BonsaiDiffFileChange::Changed(path, ty, GitLeaf(oid))
                         | BonsaiDiffFileChange::ChangedReusedId(path, ty, GitLeaf(oid)) => {
-                            let git_bytes = if ty == FileType::GitSubmodule {
-                                // The OID for a submodule is a commit in
-                                // another repository, so there is no data to
+                            if ty == FileType::GitSubmodule {
+                                // The OID for a submodule is a commit in another repository, so there is no data to
                                 // store.
-                                Bytes::new()
+                                uploader
+                                    .upload_file(&ctx, &lfs, &path, ty, oid, Bytes::new())
+                                    .await
+                                    .map(|change| (path, change))
                             } else {
-                                let object = reader.get_object(&oid).await?;
+                                let object =
+                                    reader.get_object(&oid).await.context("reader.get_object")?;
                                 let blob = object
                                     .parsed
                                     .try_into_blob()
                                     .map_err(|_| format_err!("{} is not a blob", oid))?;
-                                Bytes::from(blob.data)
-                            };
 
-                            uploader
-                                .upload_file(&ctx, &lfs, &path, ty, oid, git_bytes)
-                                .await
-                                .map(|change| (path, change))
+                                let upload_packfile =
+                                    uploader.upload_packfile_base_item(&ctx, oid, object.raw);
+                                let upload_git_blob = uploader.upload_file(
+                                    &ctx,
+                                    &lfs,
+                                    &path,
+                                    ty,
+                                    oid,
+                                    Bytes::from(blob.data),
+                                );
+                                let (_, change) = try_join!(upload_packfile, upload_git_blob)?;
+                                anyhow::Ok((path, change))
+                            }
                         }
                         BonsaiDiffFileChange::Deleted(path) => Ok((path, U::deleted())),
                     }
@@ -117,65 +141,80 @@ where
         .await
 }
 
+// A running tally of mappings for the imported commits, starting from the roots
+// Uses a RwLock internally to allow writing in concurrent settings
 pub struct GitimportAccumulator {
-    inner: LinkedHashMap<ObjectId, ChangesetId>,
+    roots: HashMap<ObjectId, ChangesetId>,
+    inner: RwLock<LinkedHashMap<ObjectId, ChangesetId>>,
 }
 
 impl GitimportAccumulator {
-    pub fn new() -> Self {
+    // Create a new accumulator from these known roots
+    pub fn from_roots(roots: HashMap<ObjectId, ChangesetId>) -> Self {
         Self {
-            inner: LinkedHashMap::new(),
+            roots,
+            inner: RwLock::new(LinkedHashMap::new()),
         }
     }
 
+    // How many new commit mappings were accumulated
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.inner.read().expect("lock poisoned").len()
     }
 
+    // No new commit mappings were accumulated
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.inner.read().expect("lock poisoned").is_empty()
     }
 
-    pub fn insert(&mut self, oid: ObjectId, cs_id: ChangesetId) {
-        self.inner.insert(oid, cs_id);
+    // Insert a new commit mapping
+    pub fn insert(&self, oid: ObjectId, cs_id: ChangesetId) {
+        self.inner
+            .write()
+            .expect("lock poisoned")
+            .insert(oid, cs_id);
     }
 
+    // Insert many new commit mappings
+    pub fn extend(&self, mappings: Vec<(ObjectId, ChangesetId)>) {
+        self.inner.write().expect("lock poisoned").extend(mappings);
+    }
+
+    // Get a commit mapping from the roots or the inserted mappings
     pub fn get(&self, oid: &gix_hash::oid) -> Option<ChangesetId> {
-        self.inner.get(oid).copied()
+        self.roots
+            .get(oid)
+            .copied()
+            .or_else(|| self.inner.read().expect("lock poisoned").get(oid).copied())
+    }
+
+    // Extract the newly imported mappings from this accumulator, ending its life
+    pub fn into_inner(self) -> LinkedHashMap<ObjectId, ChangesetId> {
+        self.inner.into_inner().expect("lock poisoned")
+    }
+
+    pub fn roots(&self) -> &'_ HashMap<ObjectId, ChangesetId> {
+        &self.roots
     }
 }
 
-pub async fn is_annotated_tag(
-    path: &Path,
-    prefs: &GitimportPreferences,
-    object_id: &ObjectId,
-) -> Result<bool, Error> {
-    let reader = GitRepoReader::new(&prefs.git_command_path, path).await?;
-    Ok(reader
-        .get_object(object_id)
-        .await
-        .with_context(|| {
-            format_err!(
-                "Failed to fetch git object {} for checking if its a tag",
-                object_id,
-            )
-        })?
-        .parsed
-        .as_tag()
-        .is_some())
+pub fn stored_tag_name(tag_name: String) -> String {
+    tag_name
+        .strip_prefix("refs/")
+        .map(|s| s.to_string())
+        .unwrap_or(tag_name)
 }
 
-pub async fn create_changeset_for_annotated_tag<Uploader: GitUploader>(
+pub async fn create_changeset_for_annotated_tag<Uploader: GitUploader, Reader: GitReader>(
     ctx: &CoreContext,
-    uploader: &Uploader,
-    path: &Path,
-    prefs: &GitimportPreferences,
+    uploader: Arc<Uploader>,
+    reader: Arc<Reader>,
     tag_id: &ObjectId,
+    maybe_tag_name: Option<String>,
     original_changeset_id: &ChangesetId,
-) -> Result<ChangesetId, Error> {
-    let reader = GitRepoReader::new(&prefs.git_command_path, path).await?;
+) -> Result<ChangesetId> {
     // Get the parsed Git Tag
-    let tag_metadata = TagMetadata::new(ctx, *tag_id, &reader)
+    let tag_metadata = TagMetadata::new(ctx, *tag_id, maybe_tag_name, &reader)
         .await
         .with_context(|| format_err!("Failed to create TagMetadata from git tag {}", tag_id))?;
     // Create the corresponding changeset for the Git Tag at Mononoke end
@@ -186,31 +225,36 @@ pub async fn create_changeset_for_annotated_tag<Uploader: GitUploader>(
     Ok(changeset_id)
 }
 
-pub async fn upload_git_tag<Uploader: GitUploader>(
+pub async fn upload_git_tag<Uploader: GitUploader, Reader: GitReader>(
     ctx: &CoreContext,
-    uploader: &Uploader,
-    path: &Path,
-    prefs: &GitimportPreferences,
+    uploader: Arc<Uploader>,
+    reader: Arc<Reader>,
     tag_id: &ObjectId,
-) -> Result<(), Error> {
-    let reader = GitRepoReader::new(&prefs.git_command_path, path).await?;
-    let tag_bytes = read_raw_object(&reader, tag_id)
+) -> Result<()> {
+    let tag_bytes = reader
+        .read_raw_object(tag_id)
         .await
         .with_context(|| format_err!("Failed to fetch git tag {}", tag_id))?;
+    let raw_tag_bytes = tag_bytes.clone();
+    // Upload Packfile Item for the Git Tag
+    let upload_packfile = async {
+        uploader
+            .upload_packfile_base_item(ctx, *tag_id, tag_bytes)
+            .await
+            .with_context(|| format_err!("Failed to upload packfile item for git tag {}", tag_id))
+    };
     // Upload Git Tag
-    uploader
-        .upload_object(ctx, *tag_id, tag_bytes)
-        .await
-        .with_context(|| format_err!("Failed to upload raw git tag {}", tag_id,))
+    let upload_git_tag = async {
+        uploader
+            .upload_object(ctx, *tag_id, raw_tag_bytes)
+            .await
+            .with_context(|| format_err!("Failed to upload raw git tag {}", tag_id))
+    };
+    try_join!(upload_packfile, upload_git_tag)?;
+    Ok(())
 }
 
-pub async fn gitimport_acc<Uploader: GitUploader>(
-    ctx: &CoreContext,
-    path: &Path,
-    uploader: &Uploader,
-    target: &GitimportTarget,
-    prefs: &GitimportPreferences,
-) -> Result<GitimportAccumulator, Error> {
+fn repo_name(prefs: &GitimportPreferences, path: &Path) -> String {
     let repo_name = if let Some(name) = &prefs.gitrepo_name {
         String::from(name)
     } else {
@@ -221,46 +265,95 @@ pub async fn gitimport_acc<Uploader: GitUploader>(
         };
         String::from(name_path.to_string_lossy())
     };
-    let dry_run = prefs.dry_run;
+    repo_name
+}
 
-    let reader = GitRepoReader::new(&prefs.git_command_path, path).await?;
-    let roots = target.get_roots();
-    // TODO - remove this
-    let nb_commits_to_import = target.get_nb_commits(&prefs.git_command_path, path).await?;
+pub async fn gitimport<Uploader: GitUploader>(
+    ctx: &CoreContext,
+    path: &Path,
+    uploader: Arc<Uploader>,
+    target: &GitimportTarget,
+    prefs: &GitimportPreferences,
+) -> Result<LinkedHashMap<ObjectId, ChangesetId>> {
+    let repo_name = repo_name(prefs, path);
+    let reader = Arc::new(
+        GitRepoReader::new(&prefs.git_command_path, path)
+            .await
+            .context("GitRepoReader::new")?,
+    );
+    let acc = GitimportAccumulator::from_roots(target.get_roots().clone());
+    let all_commits = target
+        .list_commits(&prefs.git_command_path, path)
+        .await
+        .context("target.list_commits")?
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .context(
+            "Failure in converting Result<Vec<commits>> to Vec<commits> in target.list_commits",
+        )?;
+    let nb_commits_to_import = all_commits.len();
     if 0 == nb_commits_to_import {
         info!(ctx.logger(), "Nothing to import for repo {}.", repo_name);
-        return Ok(GitimportAccumulator::new());
+        return Ok(acc.into_inner());
     }
+    let acc = GitimportAccumulator::from_roots(target.get_roots().clone());
+    import_commit_contents(ctx, repo_name, all_commits, uploader, reader, prefs, acc).await
+}
 
-    let acc = RwLock::new(GitimportAccumulator::new());
+pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
+    ctx: &CoreContext,
+    repo_name: String,
+    all_commits: Vec<ObjectId>,
+    uploader: Arc<Uploader>,
+    reader: Arc<Reader>,
+    prefs: &GitimportPreferences,
+    acc: GitimportAccumulator,
+) -> Result<LinkedHashMap<ObjectId, ChangesetId>> {
+    let nb_commits_to_import = all_commits.len();
+    let dry_run = prefs.dry_run;
+    let backfill_derivation = prefs.backfill_derivation.clone();
+    let acc = Arc::new(acc);
 
-    // Kick off a stream that consumes the walk and prepared commits. Then, produce the Bonsais.
-    target
-        .list_commits(&prefs.git_command_path, path)
-        .await?
-        .try_filter_map({
-            let acc = &acc;
-            let uploader = &uploader;
-            let repo_name = &repo_name;
-            move |oid| async move {
-                if let Some(bcs_id) = uploader.check_commit_uploaded(ctx, &oid).await? {
-                    acc.write().expect("lock poisoned").insert(oid, bcs_id);
-                    let git_sha1 = oid_to_sha1(&oid)?;
-                    info!(
-                        ctx.logger(),
-                        "GitRepo:{} commit {} of {} - Oid:{} => Bid:{} (already exists)",
-                        repo_name,
-                        acc.read().expect("lock poisoned").len(),
-                        nb_commits_to_import,
-                        git_sha1.to_brief(),
-                        bcs_id.to_brief()
-                    );
-                    Ok(None)
-                } else {
-                    Ok(Some(oid))
-                }
+    // How many commits to query from bonsai git mapping per SQL query.
+    const SQL_CONCURRENCY: usize = 10_000;
+    let mappings: Vec<(ObjectId, ChangesetId)> = stream::iter(all_commits.clone())
+        // Ignore any error. This is an optional optimization
+        .chunks(SQL_CONCURRENCY)
+        .map(|v| v.into_iter().collect::<Vec<_>>())
+        .map(|oids| {
+            cloned!(uploader, ctx);
+            async move {
+                uploader
+                    .preload_uploaded_commits(&ctx, oids.as_slice())
+                    .await
+                    .context("preload_uploaded_commits")
             }
         })
+        .buffered(prefs.concurrency)
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    acc.extend(mappings);
+    let n_existing_commits = acc.len();
+    if n_existing_commits > 0 {
+        info!(
+            ctx.logger(),
+            "GitRepo:{} {} of {} commit(s) already exist",
+            repo_name,
+            n_existing_commits,
+            nb_commits_to_import,
+        );
+    }
+    // Filter out the commits that we have already synced in the past
+    let relevant_commits = all_commits
+        .into_iter()
+        .filter(|oid| acc.get(oid).is_none())
+        .collect::<Vec<_>>();
+    // Kick off a stream that consumes the walk and prepared commits. Then, produce the Bonsais.
+    let mut commits_with_file_changes_stream = stream::iter(relevant_commits)
+        .map(Ok)
         .map_ok(|oid| {
             cloned!(ctx, reader, uploader, prefs.lfs, prefs.submodules);
             async move {
@@ -272,116 +365,163 @@ pub async fn gitimport_acc<Uploader: GitUploader>(
 
                         let diff = extracted_commit.diff(&ctx, &reader, submodules);
                         let file_changes =
-                            find_file_changes(&ctx, &lfs, &reader, uploader, diff).await?;
-
+                            find_file_changes(&ctx, &lfs, reader.clone(), uploader.clone(), diff)
+                                .await
+                                .context("find_file_changes")?;
                         Result::<_, Error>::Ok((extracted_commit, file_changes))
                     }
                 })
                 .await?
             }
         })
-        .try_buffered(prefs.concurrency)
-        .and_then(|(extracted_commit, file_changes)| {
-            let acc = &acc;
-            let uploader = &uploader;
-            let repo_name = &repo_name;
-            let reader = &reader;
-            async move {
-                let oid = extracted_commit.metadata.oid;
-                let bonsai_parents = extracted_commit
-                    .metadata
-                    .parents
-                    .iter()
-                    .map(|p| {
-                        roots
-                            .get(p)
-                            .copied()
-                            .or_else(|| acc.read().expect("lock poisoned").get(p))
-                            .ok_or_else(|| {
+        .try_buffered(prefs.concurrency);
+    // Create a channel to send the commits that have been converted into bonsais. Asynchronously, we will receive the commits
+    // and call finalize batch on them (for deriving data) without blocking the import of commits
+    let (tx, mut rx) = mpsc::channel(prefs.concurrency);
+    // Spawn off an async consumer that would finalize batches of commits which have been imported into Mononoke
+    let batch_finalizer = tokio::spawn({
+        cloned!(backfill_derivation, ctx, acc, uploader, repo_name,);
+        async move {
+            while let Some(incoming) = rx.recv().await {
+                cloned!(backfill_derivation, ctx, acc, uploader, repo_name,);
+                task::spawn(async move {
+                    let finalized_chunk = uploader
+                        .finalize_batch(&ctx, dry_run, backfill_derivation, incoming, &acc)
+                        .await
+                        .context("finalize_batch")?;
+                    // Only log progress after every batch to avoid log-spew and wasted time
+                    if let Some((last_git_sha1, last_bcs_id)) = finalized_chunk.last() {
+                        info!(
+                            ctx.logger(),
+                            "GitRepo:{} commit {} of {} - Oid:{} => Bid:{}",
+                            &repo_name,
+                            acc.len(),
+                            nb_commits_to_import,
+                            last_git_sha1.to_brief(),
+                            last_bcs_id.to_brief()
+                        );
+                    }
+                    anyhow::Ok(())
+                })
+                .await??;
+            }
+            anyhow::Ok(())
+        }
+    });
+    let mut batch_buffer = Vec::with_capacity(prefs.concurrency);
+    // Sequentially consume the stream of commits and their associated file changes by uploading them to Mononoke, storing
+    // the raw git commit and trees and adding the bonsai git mapping.
+    while let Some((extracted_commit, file_changes)) =
+        commits_with_file_changes_stream.try_next().await?
+    {
+        let oid = extracted_commit.metadata.oid;
+        // Before generating the corresponding changeset at Mononoke end, upload the raw git commit
+        // and the git tree pointed to by the git commit.
+        extracted_commit
+            .changed_trees(ctx, &reader)
+            .map_ok(|entry| {
+                cloned!(oid, uploader, reader, ctx);
+                async move {
+                    tokio::spawn(async move {
+                        let tree_for_commit =
+                            reader.read_raw_object(&entry.0).await.with_context(|| {
                                 format_err!(
-                                    "Couldn't find parent: {} in local list of imported commits",
-                                    p
+                                    "Failed to fetch git tree {} for commit {}",
+                                    entry.0,
+                                    oid
+                                )
+                            })?;
+                        let tree_bytes = tree_for_commit.clone();
+                        // Upload packfile base item for given tree object and the raw Git tree
+                        let packfile_item_upload = async {
+                            uploader
+                            .upload_packfile_base_item(&ctx, entry.0, tree_for_commit)
+                            .await
+                            .with_context(|| {
+                                format_err!(
+                                    "Failed to upload packfile item for git tree {} for commit {}",
+                                    entry.0,
+                                    oid
                                 )
                             })
+                        };
+                        let git_tree_upload = async {
+                            uploader
+                                .upload_object(&ctx, entry.0, tree_bytes)
+                                .await
+                                .with_context(|| {
+                                    format_err!(
+                                        "Failed to upload raw git tree {} for commit {}",
+                                        entry.0,
+                                        oid
+                                    )
+                                })
+                        };
+                        try_join!(packfile_item_upload, git_tree_upload)?;
+                        anyhow::Ok(())
                     })
-                    .collect::<Result<Vec<_>, _>>()
-                    .with_context(|| format_err!("While looking for parents of {}", oid))?;
-
-                // Before generating the corresponding changeset at Mononoke end, upload the raw git commit
-                // and the git tree pointed to by the git commit.
-                let tree_for_commit = read_raw_object(reader, &extracted_commit.tree_oid)
-                    .await
-                    .with_context(|| {
-                        format_err!(
-                            "Failed to fetch git tree {} for commit {}",
-                            extracted_commit.tree_oid,
-                            oid
-                        )
-                    })?;
-                // Upload Git Tree
-                uploader
-                    .upload_object(ctx, extracted_commit.tree_oid, tree_for_commit)
-                    .await
-                    .with_context(|| {
-                        format_err!(
-                            "Failed to upload raw git tree {} for commit {}",
-                            extracted_commit.tree_oid,
-                            oid
-                        )
-                    })?;
-                // Upload Git commit
-                uploader
-                    .upload_object(ctx, oid, extracted_commit.original_commit)
-                    .await
-                    .with_context(|| format_err!("Failed to upload raw git commit {}", oid))?;
-                let (int_cs, bcs_id) = uploader
-                    .generate_changeset_for_commit(
-                        ctx,
-                        bonsai_parents,
-                        extracted_commit.metadata,
-                        file_changes,
-                        dry_run,
-                    )
-                    .await?;
-                acc.write().expect("lock poisoned").insert(oid, bcs_id);
-
-                let git_sha1 = oid_to_sha1(&oid)?;
-                info!(
-                    ctx.logger(),
-                    "GitRepo:{} commit {} of {} - Oid:{} => Bid:{}",
-                    &repo_name,
-                    acc.read().expect("lock poisoned").len(),
-                    nb_commits_to_import,
-                    git_sha1.to_brief(),
-                    bcs_id.to_brief()
-                );
-                Ok((int_cs, git_sha1))
-            }
-        })
-        // Chunk together into Vec<std::result::Result<(bcs, oid), Error> >
-        .chunks(prefs.concurrency)
-        // Go from Vec<Result<X,Y>> -> Result<Vec<X>,Y>
-        .map(|v| v.into_iter().collect::<Result<Vec<_>, Error>>())
-        .try_for_each(|v| async {
-            cloned!(ctx, uploader);
-            task::spawn(async move { uploader.finalize_batch(&ctx, dry_run, v).await }).await?
-        })
-        .await?;
+                    .await?
+                }
+            })
+            .try_buffer_unordered(100)
+            .try_collect()
+            .await?;
+        // Upload packfile base item for Git commit and the raw Git commit
+        let packfile_item_upload = async {
+            uploader
+                .upload_packfile_base_item(ctx, oid, extracted_commit.original_commit.clone())
+                .await
+                .with_context(|| {
+                    format_err!("Failed to upload packfile item for git commit {}", oid)
+                })
+        };
+        let git_commit_upload = async {
+            uploader
+                .upload_object(ctx, oid, extracted_commit.original_commit.clone())
+                .await
+                .with_context(|| format_err!("Failed to upload raw git commit {}", oid))
+        };
+        try_join!(packfile_item_upload, git_commit_upload)?;
+        // Upload Git commit
+        let int_cs = uploader
+            .generate_intermediate_changeset_for_commit(
+                ctx,
+                extracted_commit.metadata,
+                file_changes,
+                &acc,
+                dry_run,
+            )
+            .await
+            .context("generate_changeset_for_commit")?;
+        let git_sha1 = oid_to_sha1(&oid)?;
+        batch_buffer.push((git_sha1, int_cs));
+        if batch_buffer.len() == prefs.concurrency {
+            // We have the required batch size of commits, send it for finalization
+            tx.send(batch_buffer)
+                .await
+                .context("Receiver dropped while sending Vec<(bonsai_id, git_sha1)>")?;
+            batch_buffer = Vec::with_capacity(prefs.concurrency);
+        }
+    }
+    // If there are still changesets pending to be processed, send them through
+    if !batch_buffer.is_empty() {
+        tx.send(batch_buffer)
+            .await
+            .context("Receiver dropped while sending Vec<(bonsai_id, git_sha1)>")?;
+    }
+    // Drop the sender since we finished sending all the changesets to the finalizer
+    drop(tx);
+    // Ensure that the batch finalization has completed before we exit
+    batch_finalizer
+        .await
+        .context("Error while running finalize_batch for commits")?
+        .context("Panic while running finalize_batch for commits")?;
 
     debug!(ctx.logger(), "Completed git import for repo {}.", repo_name);
-    Ok(acc.into_inner().expect("lock poisoned"))
-}
-
-pub async fn gitimport(
-    ctx: &CoreContext,
-    path: &Path,
-    uploader: &impl GitUploader,
-    target: &GitimportTarget,
-    prefs: &GitimportPreferences,
-) -> Result<LinkedHashMap<ObjectId, ChangesetId>, Error> {
-    Ok(gitimport_acc(ctx, path, uploader, target, prefs)
-        .await?
-        .inner)
+    let acc = Arc::try_unwrap(acc).map_err(|_| {
+        anyhow::anyhow!("Expected only one strong reference to GitimportAccumulator at this point")
+    })?;
+    Ok(acc.into_inner())
 }
 
 /// Object representing Git refs. maybe_tag_id will only
@@ -406,7 +546,7 @@ pub async fn read_symref(
     symref_name: &str,
     path: &Path,
     prefs: &GitimportPreferences,
-) -> Result<GitSymbolicRefsEntry, Error> {
+) -> Result<GitSymbolicRefsEntry> {
     let mut command = Command::new(&prefs.git_command_path)
         .current_dir(path)
         .env_clear()
@@ -448,10 +588,37 @@ pub async fn read_symref(
     Ok(symref_entry)
 }
 
+/// Resolve git rev using `git rev-parse --verfify`
+pub async fn resolve_rev(
+    rev: &str,
+    path: &Path,
+    prefs: &GitimportPreferences,
+) -> Result<Option<ObjectId>> {
+    let output = Command::new(&prefs.git_command_path)
+        .current_dir(path)
+        .env_clear()
+        .kill_on_drop(false)
+        .stdout(Stdio::piped())
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("--end-of-options")
+        .arg(rev)
+        .output()
+        .await
+        .with_context(|| format!("failed to run git with {:?}", prefs.git_command_path))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let oid_str = str::from_utf8(&output.stdout)?;
+    let oid_str = oid_str.trim();
+    let oid: ObjectId = oid_str.parse().context("reading refs")?;
+    Ok(Some(oid))
+}
+
 pub async fn read_git_refs(
     path: &Path,
     prefs: &GitimportPreferences,
-) -> Result<BTreeMap<GitRef, ObjectId>, Error> {
+) -> Result<BTreeMap<GitRef, ObjectId>> {
     let reader = GitRepoReader::new(&prefs.git_command_path, path).await?;
 
     let mut command = Command::new(&prefs.git_command_path)
@@ -509,23 +676,26 @@ pub async fn read_git_refs(
     Ok(refs)
 }
 
-pub async fn import_tree_as_single_bonsai_changeset(
+pub async fn import_tree_as_single_bonsai_changeset<Uploader: GitUploader>(
     ctx: &CoreContext,
     path: &Path,
-    uploader: impl GitUploader,
+    uploader: Arc<Uploader>,
     git_cs_id: ObjectId,
     prefs: &GitimportPreferences,
-) -> Result<ChangesetId, Error> {
-    let reader = GitRepoReader::new(&prefs.git_command_path, path).await?;
+) -> Result<ChangesetId> {
+    let acc = GitimportAccumulator::from_roots(HashMap::new());
+    let reader = Arc::new(GitRepoReader::new(&prefs.git_command_path, path).await?);
 
     let sha1 = oid_to_sha1(&git_cs_id)?;
 
-    let extracted_commit = ExtractedCommit::new(ctx, git_cs_id, &reader)
+    let mut extracted_commit = ExtractedCommit::new(ctx, git_cs_id, &reader)
         .await
         .with_context(|| format!("While extracting {}", git_cs_id))?;
+    // Discard the parents: the commit we want to create has no parents
+    extracted_commit.metadata.parents = Vec::new();
 
     let diff = extracted_commit.diff_root(ctx, &reader, prefs.submodules);
-    let file_changes = find_file_changes(ctx, &prefs.lfs, &reader, uploader.clone(), diff).await?;
+    let file_changes = find_file_changes(ctx, &prefs.lfs, reader, uploader.clone(), diff).await?;
 
     // Before generating the corresponding changeset at Mononoke end, upload the raw git commit.
     uploader
@@ -534,17 +704,29 @@ pub async fn import_tree_as_single_bonsai_changeset(
         .with_context(|| format_err!("Failed to upload raw git commit {}", git_cs_id))?;
 
     uploader
-        .generate_changeset_for_commit(
+        .generate_intermediate_changeset_for_commit(
             ctx,
-            vec![],
             extracted_commit.metadata,
             file_changes,
+            &acc,
             prefs.dry_run,
         )
-        .and_then(|(cs, id)| {
+        .and_then(|int_cs| {
             uploader
-                .finalize_batch(ctx, prefs.dry_run, vec![(cs, sha1)])
-                .map_ok(move |_| id)
+                .finalize_batch(
+                    ctx,
+                    prefs.dry_run,
+                    prefs.backfill_derivation.clone(),
+                    vec![(sha1, int_cs)],
+                    &acc,
+                )
+                .map_ok(|batch| {
+                    batch
+                        .into_iter()
+                        .last()
+                        .expect("Finalize batch should produce a changeset for each sha1")
+                        .1
+                })
         })
         .await
 }

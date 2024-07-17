@@ -52,17 +52,28 @@
 //! let values: Vec<DerivedDataType> = manager.fetch_derived_batch(ctx, cs_ids, None).await?;
 //! ```
 
+use std::collections::HashMap;
+
 use anyhow::Error;
+use anyhow::Result;
 use async_trait::async_trait;
+use blobstore::Blobstore;
 use context::CoreContext;
 use context::SessionClass;
+use filestore::FetchKey;
+use futures::stream;
+use futures::stream::StreamExt;
+use futures::stream::TryStreamExt;
 use mononoke_types::ChangesetId;
+use mononoke_types::ContentId;
+use mononoke_types::ContentMetadataV2;
 use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
 
 pub mod batch;
 
 pub use derived_data_manager::DerivationError;
+pub use derived_data_manager::SharedDerivationError;
 pub use metaconfig_types::DerivedDataTypesConfig;
 
 pub mod macro_export {
@@ -75,6 +86,7 @@ pub mod macro_export {
 
     pub use super::BonsaiDerived;
     pub use super::DerivationError;
+    pub use super::SharedDerivationError;
 }
 
 /// Trait for accessing data that can be derived from bonsai changesets, such
@@ -97,7 +109,7 @@ pub trait BonsaiDerived: Sized + Send + Sync + Clone + 'static {
         ctx: &CoreContext,
         repo: &(impl RepoDerivedDataRef + Send + Sync),
         csid: ChangesetId,
-    ) -> Result<Self, DerivationError>;
+    ) -> Result<Self, SharedDerivationError>;
 
     /// Fetch the derived data in cases where we might not want to trigger
     /// derivation, e.g. when scrubbing.
@@ -142,7 +154,7 @@ macro_rules! impl_bonsai_derived_via_manager {
                 ctx: &$crate::macro_export::CoreContext,
                 repo: &(impl $crate::macro_export::RepoDerivedDataRef + Send + Sync),
                 csid: $crate::macro_export::ChangesetId,
-            ) -> Result<Self, $crate::macro_export::DerivationError> {
+            ) -> Result<Self, $crate::macro_export::SharedDerivationError> {
                 repo.repo_derived_data().derive::<Self>(ctx, csid).await
             }
 
@@ -172,13 +184,42 @@ macro_rules! impl_bonsai_derived_via_manager {
 }
 
 pub fn override_ctx(mut ctx: CoreContext, repo: impl RepoIdentityRef) -> CoreContext {
-    let use_bg_class = tunables::tunables()
-        .by_repo_derived_data_use_background_session_class(repo.repo_identity().name());
-    if let Some(true) = use_bg_class {
+    let use_bg_class = justknobs::eval(
+        "scm/mononoke:derived_data_use_background_session_class",
+        None,
+        Some(repo.repo_identity().name()),
+    )
+    .unwrap_or_default();
+    if use_bg_class {
         ctx.session_mut()
             .override_session_class(SessionClass::BackgroundUnlessTooSlow);
         ctx
     } else {
         ctx
     }
+}
+
+/// Prefetch content metadata for a set of content ids.
+pub async fn prefetch_content_metadata(
+    ctx: &CoreContext,
+    blobstore: &impl Blobstore,
+    content_ids: impl IntoIterator<Item = ContentId>,
+) -> Result<HashMap<ContentId, ContentMetadataV2>> {
+    stream::iter(content_ids)
+        .map({
+            move |content_id| {
+                Ok(async move {
+                    match filestore::get_metadata(blobstore, ctx, &FetchKey::Canonical(content_id))
+                        .await?
+                    {
+                        Some(metadata) => Ok(Some((content_id, metadata))),
+                        None => Ok(None),
+                    }
+                })
+            }
+        })
+        .try_buffered(100)
+        .try_filter_map(|maybe_metadata| async move { Ok(maybe_metadata) })
+        .try_collect()
+        .await
 }

@@ -13,8 +13,8 @@ use anyhow::Result;
 use bytes::BufMut;
 use bytes::Bytes;
 use bytes::BytesMut;
-use futures::sync::mpsc;
-use futures_ext::BoxStream;
+use futures::channel::mpsc;
+use futures::stream::BoxStream;
 use metadata::Metadata;
 use netstring::NetstringDecoder;
 use netstring::NetstringEncoder;
@@ -36,7 +36,7 @@ pub struct SshEncoder {
 
 pub struct Stdio {
     pub metadata: Arc<Metadata>,
-    pub stdin: BoxStream<Bytes, io::Error>,
+    pub stdin: BoxStream<'static, Result<Bytes, io::Error>>,
     pub stdout: mpsc::Sender<Bytes>,
     pub stderr: mpsc::UnboundedSender<Bytes>,
 }
@@ -153,7 +153,7 @@ impl SshEncoder {
         match &mut self.compressor {
             Some(compressor) => {
                 let buflen = zstd_safe::compress_bound(input.len());
-                if buflen >= zstd_safe::dstream_out_size() {
+                if buflen >= zstd_safe::DStream::out_size() {
                     return Err(anyhow!(
                         "block is too big to compress in to a single zstd block"
                     ));

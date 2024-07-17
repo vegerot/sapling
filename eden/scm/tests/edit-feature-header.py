@@ -41,9 +41,10 @@ FEATURES = [
     Feature("chg", "#chg-compatible\n"),
     Feature("no-chg", "#chg-incompatible\n"),
     Feature("debugruntest", "#debugruntest-compatible\n"),
+    Feature("no-debugruntest", "#debugruntest-incompatible\n"),
+    Feature("no-modern-config", "#modern-config-incompatible\n"),
     Feature("no-treemanifest", "  $ disable treemanifest\n"),
     Feature("no-ignore-revnum", "  $ setconfig ui.ignorerevnum=false\n"),
-    Feature("py2", "#require py2\n"),
     Feature("no-inprocess-hg", "#inprocess-hg-incompatible\n"),
     Feature("rev-compat", "  $ setconfig devel.segmented-changelog-rev-compat=true\n"),
     Feature("eagerepo", "  $ eagerepo\n"),
@@ -141,7 +142,8 @@ def main(args):
     newfeaturepaths = edit(featurepaths)
     newpathfeatures = transpose(newfeaturepaths)
 
-    for path, wantedfeatures in newpathfeatures.items():
+    for path in set(newpathfeatures) | set(pathfeatures):
+        wantedfeatures = newpathfeatures.get(path) or []
         if wantedfeatures == pathfeatures.get(path):
             # nothing changed
             continue

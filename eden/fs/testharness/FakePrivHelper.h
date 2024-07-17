@@ -8,8 +8,8 @@
 #pragma once
 
 #include <folly/futures/Future.h>
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/privhelper/PrivHelper.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 #include <memory>
 #include <string>
@@ -28,7 +28,7 @@ class FakeFuse;
  */
 class FakePrivHelper final : public PrivHelper {
  public:
-  FakePrivHelper() {}
+  FakePrivHelper() = default;
 
   class MountDelegate {
    public:
@@ -51,7 +51,8 @@ class FakePrivHelper final : public PrivHelper {
   void detachEventBase() override;
   folly::Future<folly::File> fuseMount(
       folly::StringPiece mountPath,
-      bool readOnly) override;
+      bool readOnly,
+      std::optional<folly::StringPiece> vfsType) override;
   folly::Future<folly::Unit> nfsMount(
       folly::StringPiece mountPath,
       folly::SocketAddress mountdAddr,

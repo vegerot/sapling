@@ -4,8 +4,6 @@
 # GNU General Public License version 2.
 
 """Eden implementation for the dirstatemap class."""
-
-import errno
 import stat
 from typing import BinaryIO, Dict
 
@@ -92,7 +90,7 @@ class eden_dirstate_map(treestate.treestatemap):
         m = {
             k: (v[0], v[1], v[2])
             for k, v in self._items()
-            if not (v[0] == "n" and v[2] == MERGE_STATE_NOT_APPLICABLE)
+            if v[0] != "n" or v[2] != MERGE_STATE_NOT_APPLICABLE or k in self.copymap
         }
         eden_dirstate_serializer.write(st, parents, m, self.copymap)
         st.close()

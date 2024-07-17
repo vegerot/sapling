@@ -7,6 +7,8 @@
 
 import type {ValueObject} from 'immutable';
 
+import {isPromise} from './utils';
+import deepEqual from 'fast-deep-equal';
 import {isValueObject, is, List} from 'immutable';
 
 type LRUKey = LRUHashKey | ValueObject;
@@ -132,12 +134,25 @@ type CacheOpts<This> = {
 
   /**
    * If set, and cache is not set, create cache of the given size.
-   * Default value: 10.
+   * Default value: 200.
    */
   cacheSize?: number;
 
   /** If set, use the returned values as extra cache keys. */
   getExtraKeys?: (this: This) => unknown[];
+
+  /**
+   * Cached functions are expected to be "pure" - give same output
+   * for the same inputs. If set to true, compare the cached value
+   * with a fresh recalculation and throws on mismatch.
+   */
+  audit?: boolean;
+
+  /**
+   * Track the `cache` so it can be cleared by `clearTrackedCache`.
+   * Default: true.
+   */
+  track?: boolean;
 };
 
 type DecoratorFunc = (target: unknown, propertyKey: string, descriptor: PropertyDescriptor) => void;
@@ -185,9 +200,28 @@ export function cached<T, F extends AnyFunction<T>>(
   }
 }
 
+const trackedCaches = new Set<WeakRef<LRUWithStats>>();
+
+/** Clear tracked LRU caches. By default, `@cached` */
+export function clearTrackedCache() {
+  for (const weakRef of trackedCaches) {
+    const cache = weakRef.deref();
+    if (cache === undefined) {
+      trackedCaches.delete(weakRef);
+    } else {
+      cache.clear();
+    }
+  }
+}
+
 function cachedFunction<T, F extends AnyFunction<T>>(func: F, opts?: CacheOpts<T>): F & WithCache {
-  const cache: LRUWithStats = opts?.cache ?? new LRU(opts?.cacheSize ?? 10);
+  const cache: LRUWithStats = opts?.cache ?? new LRU(opts?.cacheSize ?? 200);
+  const audit = opts?.audit ?? false;
   const getExtraKeys = opts?.getExtraKeys;
+  const track = opts?.track ?? true;
+  if (track) {
+    trackedCaches.add(new WeakRef(cache));
+  }
   const cachedFunc = function (this: T, ...args: Parameters<F>): ReturnType<F> {
     const stats = cache.stats;
     if (!args.every(isCachable)) {
@@ -202,12 +236,30 @@ function cachedFunction<T, F extends AnyFunction<T>>(func: F, opts?: CacheOpts<T
       if (stats != null) {
         stats.hit = (stats.hit ?? 0) + 1;
       }
+      if (audit) {
+        const result = func.apply(this, args) as ReturnType<F>;
+        const equal = isValueObject(result)
+          ? is(result, cachedValue)
+          : deepEqual(result, cachedValue);
+        if (!equal) {
+          const argsStr = args.map(a => a.toString()).join(', ');
+          throw new Error(
+            `cached value mismatch on ${func.name}(${argsStr}): cached ${cachedValue}, actual ${result}`,
+          );
+        }
+      }
       return cachedValue as ReturnType<F>;
     }
     if (stats != null) {
       stats.miss = (stats.miss ?? 0) + 1;
     }
     const result = func.apply(this, args) as ReturnType<F>;
+    if (isPromise(result)) {
+      return result.then((value: unknown) => {
+        cache.set(cacheKey, value);
+        return value;
+      });
+    }
     cache.set(cacheKey, result);
     return result;
   };
@@ -235,6 +287,25 @@ function cacheDecorator<T>(opts?: CacheOpts<T>) {
     const originalFunc = descriptor.value;
     descriptor.value = cachedFunction(originalFunc, {...opts, getExtraKeys});
   };
+}
+
+/** Cache an "instance" function like `this.foo`. */
+export function cachedMethod<T, F extends AnyFunction<T>>(originalFunc: F, opts?: CacheOpts<T>): F {
+  const getExtraKeys =
+    opts?.getExtraKeys ??
+    function (this: T): unknown[] {
+      // Use `this` as extra key if it's a value object (hash + eq).
+      if (isValueObject(this)) {
+        return [this];
+      }
+      // Scan through cachable properties.
+      if (this != null && typeof this === 'object') {
+        return Object.values(this).filter(isCachable);
+      }
+      // Give up - do not add extra cache keys.
+      return [];
+    };
+  return cachedFunction(originalFunc, {...opts, getExtraKeys});
 }
 
 const cachableTypeNames = new Set([

@@ -31,13 +31,15 @@ SCRIBE_LOGS_DIR="$TESTTMP/scribe_logs"
 if [[ -n "$DB_SHARD_NAME" ]]; then
   MONONOKE_DEFAULT_START_TIMEOUT=600
   MONONOKE_LFS_DEFAULT_START_TIMEOUT=60
-  MONONOKE_SCS_DEFAULT_START_TIMEOUT=120
+  MONONOKE_GIT_SERVICE_DEFAULT_START_TIMEOUT=60
+  MONONOKE_SCS_DEFAULT_START_TIMEOUT=300
   MONONOKE_LAND_SERVICE_DEFAULT_START_TIMEOUT=120
 else
   MONONOKE_DEFAULT_START_TIMEOUT=60
   MONONOKE_LFS_DEFAULT_START_TIMEOUT=60
+  MONONOKE_GIT_SERVICE_DEFAULT_START_TIMEOUT=60
   # First scsc call takes a while as scs server is doing derivation
-  MONONOKE_SCS_DEFAULT_START_TIMEOUT=120
+  MONONOKE_SCS_DEFAULT_START_TIMEOUT=300
   MONONOKE_LAND_SERVICE_DEFAULT_START_TIMEOUT=120
   MONONOKE_DDS_DEFAULT_START_TIMEOUT=120
 fi
@@ -59,8 +61,8 @@ mkdir -p "${LOCAL_CONFIGERATOR_PATH}"
 
 export ACL_FILE="$TESTTMP/acls.json"
 
-# The path for tunables. Do not write directly to this! Use merge_tunables instead.
-export MONONOKE_TUNABLES_PATH="${LOCAL_CONFIGERATOR_PATH}/mononoke_tunables.json"
+export MONONOKE_JUST_KNOBS_OVERRIDES_PATH="${LOCAL_CONFIGERATOR_PATH}/just_knobs.json"
+cp "${TEST_FIXTURES}/just_knobs.json" "$MONONOKE_JUST_KNOBS_OVERRIDES_PATH"
 
 function get_configerator_relative_path {
   realpath --relative-to "${LOCAL_CONFIGERATOR_PATH}" "$1"
@@ -78,7 +80,7 @@ fi
 
 COMMON_ARGS=(
   --mysql-master-only
-  --tunables-config "$(get_configerator_relative_path "${MONONOKE_TUNABLES_PATH}")"
+  --just-knobs-config-path "$(get_configerator_relative_path "${MONONOKE_JUST_KNOBS_OVERRIDES_PATH}")"
   --local-configerator-path "${LOCAL_CONFIGERATOR_PATH}"
   --log-exclude-tag "futures_watchdog"
   --with-test-megarepo-configs-client=true
@@ -117,6 +119,8 @@ function get_free_socket {
   "$GET_FREE_SOCKET"
 }
 
+ZELOS_PORT=$(get_free_socket)
+
 function mononoke_host {
   if [[ $LOCALIP == *":"* ]]; then
     # ipv6, surround in brackets
@@ -143,6 +147,10 @@ function land_service_address {
   echo -n "$(mononoke_host):$LAND_SERVICE_PORT"
 }
 
+function mononoke_git_service_address {
+  echo -n "$(mononoke_host):$MONONOKE_GIT_SERVICE_PORT"
+}
+
 function dds_address {
   echo -n "$(mononoke_host):$DDS_PORT"
 }
@@ -161,11 +169,19 @@ function random_int() {
 function sslcurlas {
   local name="$1"
   shift
-  curl --noproxy localhost --cert "$TEST_CERTDIR/$name.crt" --cacert "$TEST_CERTDIR/root-ca.crt" --key "$TEST_CERTDIR/$name.key" "$@"
+  curl --noproxy localhost -H 'x-client-info: {"request_info": {"entry_point": "CurlTest", "correlator": "test"}}' --cert "$TEST_CERTDIR/$name.crt" --cacert "$TEST_CERTDIR/root-ca.crt" --key "$TEST_CERTDIR/$name.key" "$@"
 }
 
 function sslcurl {
   sslcurlas proxy "$@"
+}
+
+function sslcurl_noclientinfo_test {
+  curl --noproxy localhost --cert "$TEST_CERTDIR/proxy.crt" --cacert "$TEST_CERTDIR/root-ca.crt" --key "$TEST_CERTDIR/proxy.key" "$@"
+}
+
+function curltest {
+  curl -H 'x-client-info: {"request_info": {"entry_point": "CurlTest", "correlator": "test"}}' "$@"
 }
 
 function mononoke {
@@ -191,10 +207,10 @@ function mononoke {
   GLOG_minloglevel=5 \
     "$MONONOKE_SERVER" "$@" \
     --scribe-logging-directory "$TESTTMP/scribe_logs" \
-    --ca-pem "$TEST_CERTDIR/root-ca.crt" \
-    --private-key "$TEST_CERTDIR/localhost.key" \
-    --cert "$TEST_CERTDIR/localhost.crt" \
-    --ssl-ticket-seeds "$TEST_CERTDIR/server.pem.seeds" \
+    --tls-ca "$TEST_CERTDIR/root-ca.crt" \
+    --tls-private-key "$TEST_CERTDIR/localhost.key" \
+    --tls-certificate "$TEST_CERTDIR/localhost.crt" \
+    --tls-ticket-seeds "$TEST_CERTDIR/server.pem.seeds" \
     --land-service-client-cert="$TEST_CERTDIR/proxy.crt" \
     --land-service-client-private-key="$TEST_CERTDIR/proxy.key" \
     --debug \
@@ -317,9 +333,10 @@ function mononoke_x_repo_sync() {
   GLOG_minloglevel=5 "$MONONOKE_X_REPO_SYNC" \
     "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
+    --source-repo-id="$source_repo_id" \
+    --target-repo-id="$target_repo_id" \
     --mononoke-config-path "$TESTTMP/mononoke-config" \
-    --source-repo-id "$source_repo_id" \
-    --target-repo-id "$target_repo_id" \
+    --scuba-dataset "file://$TESTTMP/x_repo_sync_scuba_logs" \
     "$@"
 }
 
@@ -429,6 +446,14 @@ function mononoke_backfill_bonsai_blob_mapping {
     --mononoke-config-path "$TESTTMP"/mononoke-config "$@"
 }
 
+function repo_metadata_logger {
+  GLOG_minloglevel=5 "$REPO_METADATA_LOGGER" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
+    --scuba-dataset "file://$TESTTMP/metadata_logger_scuba_logs" \
+    --mononoke-config-path "$TESTTMP"/mononoke-config "$@"
+}
+
 function mononoke_admin_source_target {
   local source_repo_id=$1
   shift
@@ -446,6 +471,10 @@ function mononoke_admin_source_target {
 function strip_glog {
   # based on https://our.internmc.facebook.com/intern/wiki/LogKnock/Log_formats/#regex-for-glog
   sed -E -e 's%^[VDIWECF][[:digit:]]{4} [[:digit:]]{2}:?[[:digit:]]{2}:?[[:digit:]]{2}(\.[[:digit:]]+)?\s+(([0-9a-f]+)\s+)?(\[([^]]+)\]\s+)?(\(([^\)]+)\)\s+)?(([a-zA-Z0-9_./-]+):([[:digit:]]+))\]\s+%%'
+}
+
+function with_stripped_logs {
+  "$@" 2>&1 | strip_glog
 }
 
 function wait_for_json_record_count {
@@ -525,6 +554,16 @@ function force_update_configerator {
   sslcurl -X POST -fsS "https://localhost:$MONONOKE_SOCKET/control/force_update_configerator"
 }
 
+# We can't use the "with client certs" option everywhere
+# because it breaks connecting to ephemeral mysql instances.
+function start_and_wait_for_mononoke_server_with_client_certs {
+    THRIFT_TLS_CL_CA_PATH="$TEST_CERTDIR/root-ca.crt" \
+    THRIFT_TLS_CL_CERT_PATH="$TEST_CERTDIR/proxy.crt" \
+    THRIFT_TLS_CL_KEY_PATH="$TEST_CERTDIR/proxy.key" \
+    mononoke "$@"
+    wait_for_mononoke
+}
+
 function start_and_wait_for_mononoke_server {
     mononoke "$@"
     wait_for_mononoke
@@ -574,11 +613,12 @@ edenapi.cert=$TEST_CERTDIR/${OVERRIDE_CLIENT_CERT:-client0}.crt
 edenapi.key=$TEST_CERTDIR/${OVERRIDE_CLIENT_CERT:-client0}.key
 edenapi.prefix=localhost
 edenapi.cacerts=$TEST_CERTDIR/root-ca.crt
+
+[checkout]
+use-rust=false
+
 [workingcopy]
-use-rust=False
-rust-status=False
-[status]
-use-rust=False
+rust-checkout=false
 EOF
 }
 
@@ -586,6 +626,7 @@ function setup_common_config {
     setup_mononoke_config "$@"
     setup_common_hg_configs
     setup_configerator_configs
+    setup_common_jks
 }
 
 function get_bonsai_svnrev_mapping {
@@ -602,6 +643,13 @@ function get_bonsai_hg_mapping {
 
 function get_bonsai_globalrev_mapping {
   sqlite3 "$TESTTMP/monsql/sqlite_dbs" "select hex(bcs_id), globalrev from bonsai_globalrev_mapping order by globalrev";
+}
+
+function set_bonsai_globalrev_mapping {
+  REPO_ID="$1"
+  BCS_ID="$2"
+  GLOBALREV="$3"
+  sqlite3 "$TESTTMP/monsql/sqlite_dbs" "INSERT INTO bonsai_globalrev_mapping (repo_id, bcs_id, globalrev) VALUES ($REPO_ID, X'$BCS_ID', $GLOBALREV)";
 }
 
 function setup_mononoke_config {
@@ -683,6 +731,17 @@ ACLS
   fi
 }
 
+function setup_common_jks() {
+  merge_just_knobs <<EOF
+{
+  "bools": {
+    "scm/mononoke:pushredirect_use_xdb": false,
+    "scm/mononoke:pushredirect_disable_configerator": false
+  }
+}
+EOF
+}
+
 function db_config() {
   local blobstorename="$1"
   if [[ -n "$DB_SHARD_NAME" ]]; then
@@ -690,6 +749,7 @@ function db_config() {
     echo "primary = { db_address = \"$DB_SHARD_NAME\" }"
     echo "filenodes = { unsharded = { db_address = \"$DB_SHARD_NAME\" } }"
     echo "mutation = { db_address = \"$DB_SHARD_NAME\" }"
+    echo "commit_cloud = { db_address = \"$DB_SHARD_NAME\" }"
   else
     echo "[$blobstorename.metadata.local]"
     echo "local_db_path = \"$TESTTMP/monsql\""
@@ -913,14 +973,16 @@ function setup_mononoke_repo_config {
   local reponame="$1"
   local reponame_urlencoded
   reponame_urlencoded="$(urlencode encode "$reponame")"
+  everstore_local_path="$TESTTMP/everstore_${reponame_urlencoded}"
   local storageconfig="$2"
   mkdir -p "repos/$reponame_urlencoded"
   mkdir -p "repo_definitions/$reponame_urlencoded"
   mkdir -p "$TESTTMP/monsql"
   mkdir -p "$TESTTMP/$reponame_urlencoded"
-  mkdir -p "$TESTTMP/traffic-replay-blobstore"
+  mkdir -p "$everstore_local_path"
   cat > "repos/$reponame_urlencoded/server.toml" <<CONFIG
 hash_validation_percentage=100
+everstore_local_path="$everstore_local_path"
 CONFIG
 
   cat > "repo_definitions/$reponame_urlencoded/server.toml" <<CONFIG
@@ -941,6 +1003,12 @@ fi
 if [[ -n "${SCUBA_LOGGING_PATH:-}" ]]; then
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 scuba_local_path="$SCUBA_LOGGING_PATH"
+CONFIG
+fi
+
+if [[ -n "${HOOKS_SCUBA_LOGGING_PATH:-}" ]]; then
+  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
+scuba_table_hooks="file://$HOOKS_SCUBA_LOGGING_PATH"
 CONFIG
 fi
 
@@ -1001,6 +1069,11 @@ regex="$ONLY_FAST_FORWARD_BOOKMARK_REGEX"
 only_fast_forward=true
 CONFIG
 fi
+
+  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
+[metadata_logger_config]
+bookmarks=["master"]
+CONFIG
 
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 [pushrebase]
@@ -1077,6 +1150,12 @@ pure_push_allowed = true
 CONFIG
 fi
 
+if [[ -n "${UNBUNDLE_COMMIT_LIMIT}" ]]; then
+  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
+unbundle_commit_limit = ${UNBUNDLE_COMMIT_LIMIT}
+CONFIG
+fi
+
 if [[ -n "${CACHE_WARMUP_BOOKMARK:-}" ]]; then
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 [cache_warmup]
@@ -1116,7 +1195,31 @@ CONFIG
 else
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 [derived_data_config.available_configs.default]
-types=["blame", "changeset_info", "deleted_manifest", "fastlog", "filenodes", "fsnodes", "unodes", "hgchangesets", "skeleton_manifests", "bssm"]
+types=[
+  "blame",
+  "changeset_info",
+  "deleted_manifest",
+  "fastlog",
+  "filenodes",
+  "fsnodes",
+  "git_commits",
+  "git_delta_manifests",
+  "git_trees",
+  "unodes",
+  "hgchangesets",
+  "hg_augmented_manifests",
+  "skeleton_manifests",
+  "bssm_v3",
+  "test_manifests",
+  "test_sharded_manifests"
+]
+CONFIG
+fi
+
+if [[ -n "${OTHER_DERIVED_DATA:-}" ]]; then
+  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
+[derived_data_config.available_configs.other]
+types = $OTHER_DERIVED_DATA
 CONFIG
 fi
 
@@ -1153,9 +1256,6 @@ if [[ -n "${ENABLE_API_WRITES:-}" ]]; then
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 [source_control_service]
 permit_writes = true
-[[bookmarks]]
-regex=".*"
-hooks_skip_ancestors_of=["master_bookmark"]
 CONFIG
 fi
 
@@ -1182,6 +1282,11 @@ if [[ -n "${COMMIT_SCRIBE_CATEGORY:-}" ]]; then
 new_commit_logging_destination = { scribe = { scribe_category = "$COMMIT_SCRIBE_CATEGORY" } }
 CONFIG
 fi
+
+cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
+  [zelos_config]
+  local_zelos_port = $ZELOS_PORT
+CONFIG
 
 }
 
@@ -1367,8 +1472,9 @@ function wait_for_bookmark_update() {
   local bookmark="$2"
   local target="$3"
   local scheme="${4:-hg}"
+  local sleep_time="${SLEEP_TIME:-2}"
   local attempt=1
-  sleep 2
+  sleep "$sleep_time"
   while [[ "$(scsc lookup -S "$scheme" -R "$repo" -B "$bookmark")" != "$target" ]]
   do
     attempt=$((attempt + 1))
@@ -1377,7 +1483,7 @@ function wait_for_bookmark_update() {
         echo "bookmark move of $bookmark to $target has not happened"
         return 1
     fi
-    sleep 2
+    sleep "$sleep_time"
   done
 }
 
@@ -1401,7 +1507,7 @@ function wait_for_bookmark_delete() {
 function get_bookmark_value_edenapi {
   local repo="$1"
   local bookmark="$2"
-  REPONAME="$repo" hgedenapi debugapi -e bookmarks -i "[\"$bookmark\"]" | jq ".$bookmark"
+  REPONAME="$repo" hgedenapi debugapi -e bookmarks -i "[\"$bookmark\"]" | jq -r ".\"$bookmark\""
 }
 
 function wait_for_bookmark_move_away_edenapi() {
@@ -1421,6 +1527,24 @@ function wait_for_bookmark_move_away_edenapi() {
     fi
     sleep 2
     flush_mononoke_bookmarks
+  done
+}
+
+function wait_for_git_bookmark_move() {
+  local bookmark_name="$1"
+  local last_bookmark_target="$2"
+  local attempt=1
+  last_status_regex="$last_bookmark_target\s+$bookmark_name"
+  last_status="$last_bookmark_target$bookmark_name"
+  while [[ "$(git_client ls-remote --quiet | grep -E "$last_status_regex" | tr -d '[:space:]')" == "$last_status" ]]
+  do
+    attempt=$((attempt + 1))
+    if [[ $attempt -gt 30 ]]
+    then
+        echo "bookmark move of $bookmark away from $last_bookmark_target has not happened"
+        return 1
+    fi
+    sleep 2
   done
 }
 
@@ -1580,6 +1704,45 @@ function lfs_server {
   truncate -s 0 "$log"
 }
 
+function git_client {
+  git_client_as "client0" "$@"
+}
+
+function git_client_as {
+  local name="$1"
+  shift
+  git -c http.sslCAInfo="$TEST_CERTDIR/root-ca.crt" -c http.sslCert="$TEST_CERTDIR/$name.crt" -c http.sslKey="$TEST_CERTDIR/$name.key" "$@"
+}
+
+function mononoke_git_service {
+  # Set Git related environment variables
+  local bound_addr_file log
+  bound_addr_file="$TESTTMP/mononoke_git_service_addr.txt"
+  log="${TESTTMP}/mononoke_git_service.out"
+  rm -f "$bound_addr_file"
+  GLOG_minloglevel=5 "$MONONOKE_GIT_SERVER" "$@" \
+    --tls-ca "$TEST_CERTDIR/root-ca.crt" \
+    --tls-private-key "$TEST_CERTDIR/localhost.key" \
+    --tls-certificate "$TEST_CERTDIR/localhost.crt" \
+    --tls-ticket-seeds "$TEST_CERTDIR/server.pem.seeds" \
+    --listen-port 0 \
+    --scuba-dataset "file://$TESTTMP/scuba.json" \
+    --log-level DEBUG \
+    --mononoke-config-path "$TESTTMP/mononoke-config" \
+    --bound-address-file "$TESTTMP/mononoke_git_service_addr.txt" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" >> "$log" 2>&1 &
+  export MONONOKE_GIT_SERVICE_PID=$!
+  echo "$MONONOKE_GIT_SERVICE_PID" >> "$DAEMON_PIDS"
+
+  export MONONOKE_GIT_SERVICE_PORT
+  wait_for_server "Mononoke Git Service" "MONONOKE_GIT_SERVICE_PORT" "$log" \
+    "${MONONOKE_GIT_SERVICE_START_TIMEOUT:-"$MONONOKE_GIT_SERVICE_DEFAULT_START_TIMEOUT"}" "$bound_addr_file"
+
+  export MONONOKE_GIT_SERVICE_BASE_URL
+  MONONOKE_GIT_SERVICE_BASE_URL="https://localhost:$MONONOKE_GIT_SERVICE_PORT/repos/git/ro"
+}
+
 # Run an hg binary configured with the settings required to talk to Mononoke
 function hgmn {
   reponame_urlencoded="$(urlencode encode "$REPONAME")"
@@ -1587,7 +1750,7 @@ function hgmn {
 }
 
 # Run an hg binary configured with the settings require to talk to Mononoke
-# via EdenAPI
+# via SaplingRemoteAPI
 function hgedenapi {
   hgmn \
     --config "edenapi.url=https://localhost:$MONONOKE_SOCKET/edenapi" \
@@ -1616,11 +1779,6 @@ reponame=$1
 cachepath=$TESTTMP/cachepath
 server=True
 shallowtrees=True
-[workingcopy]
-rust-status=False
-use-rust=False
-[status]
-use-rust=False
 EOF
 }
 
@@ -1664,7 +1822,7 @@ EOF
 }
 
 function hgmn_clone() {
-  quiet hgmn clone --shallow  --config remotefilelog.reponame="$REPONAME" "$@" --config extensions.treemanifest= --config treemanifest.treeonly=True && \
+  quiet hgmn clone --shallow  --config extensions.remotenames= --config remotefilelog.reponame="$REPONAME" "$@" --config extensions.treemanifest= --config treemanifest.treeonly=True && \
   cat >> "$2"/.hg/hgrc <<EOF
 [extensions]
 treemanifest=
@@ -1726,7 +1884,7 @@ EOF
 
 # Does all the setup necessary for hook tests
 function hook_test_setup() {
-  setup_mononoke_config
+  HOOKS_SCUBA_LOGGING_PATH="$TESTTMP/hooks-scuba.json" setup_mononoke_config
   cd "$TESTTMP/mononoke-config" || exit 1
 
   reponame_urlencoded="$(urlencode encode "$REPONAME")"
@@ -1786,12 +1944,12 @@ EOF
 
 function setup_hg_lfs() {
   cat >> .hg/hgrc <<EOF
-[extensions]
-lfs=
 [lfs]
 url=$1
 threshold=$2
 usercache=$3
+[remotefilelog]
+lfs=True
 EOF
 }
 
@@ -1971,6 +2129,11 @@ function log() {
   hg log -G -T "{desc} [{phase};rev={rev};{node|short}] {remotenames}" "$@" | sed 's/^[ \t]*$/$/'
 }
 
+function log_globalrev() {
+  # Prepend "$" to the end of the log output to prevent having trailing whitespaces
+  hg log -G -T "{desc} [{phase};globalrev={globalrev};{node|short}] {remotenames}" "$@" | sed 's/^[ \t]*$/$/'
+}
+
 # Default setup that many of the test use
 function default_setup_pre_blobimport() {
   setup_common_config "$@"
@@ -2058,7 +2221,7 @@ function git() {
   GIT_AUTHOR_DATE="${GIT_AUTHOR_DATE:-$date}" \
   GIT_AUTHOR_NAME="$name" \
   GIT_AUTHOR_EMAIL="$email" \
-  command git "$@"
+  command git -c protocol.file.allow=always "$@"
 }
 
 function git_set_only_author() {
@@ -2069,7 +2232,7 @@ function git_set_only_author() {
   GIT_AUTHOR_DATE="$date" \
   GIT_AUTHOR_NAME="$name" \
   GIT_AUTHOR_EMAIL="$email" \
-  command git "$@"
+  command git -c protocol.file.allow=always "$@"
 }
 
 function summarize_scuba_json() {
@@ -2091,7 +2254,7 @@ if [ -z "$HAS_FB" ]; then
   }
 
   function format_single_scuba_sample_strip_server_info {
-      jq -S 'del(.[].server_tier, .[].tw_task_id, .[].tw_handle)'
+      jq -S 'del(.[].server_tier, .[].tw_task_id, .[].tw_handle, .[].datacenter, .[].region, .[].region_datacenter_prefix)'
   }
 fi
 
@@ -2265,29 +2428,11 @@ function sqlite3() {
   command sqlite3 -cmd '.timeout 1000' "$@"
 }
 
-function merge_tunables() {
+function merge_just_knobs() {
   local new
-  new="$(jq -s '.[0] * .[1]' "$MONONOKE_TUNABLES_PATH" -)"
-  printf "%s" "$new" > "$MONONOKE_TUNABLES_PATH"
-  # This may fail if Mononoke is not started. No big deal.
-  force_update_configerator >/dev/null 2>&1 || true
+  new="$(jq -s '.[0] * .[1]' "$MONONOKE_JUST_KNOBS_OVERRIDES_PATH" -)"
+  printf "%s" "$new" > "$MONONOKE_JUST_KNOBS_OVERRIDES_PATH"
 }
-
-function init_tunables() {
-  if [[ ! -f "$MONONOKE_TUNABLES_PATH" ]]; then
-    cat >> "$MONONOKE_TUNABLES_PATH" <<EOF
-{
-  "ints": {
-    "commit_graph_writes_timeout_ms": 10000
-  }
-}
-EOF
-  fi
-}
-
-# Always initialize tunables, since they're required by our binaries to start
-# unless explicitly disabled (but we don't do that in tests).
-init_tunables
 
 function packer() {
   "$MONONOKE_PACKER" \
@@ -2344,7 +2489,7 @@ function derived_data_client() {
   THRIFT_TLS_CL_KEY_PATH="$TEST_CERTDIR/client0.key" \
   THRIFT_TLS_CL_CA_PATH="$TEST_CERTDIR/root-ca.crt" \
   GLOG_minloglevel=5 "$DERIVED_DATA_CLIENT" \
-  -h "localhost:$DDS_PORT" \
+  --host "localhost:$DDS_PORT" \
   "$@"
 }
 
@@ -2398,4 +2543,14 @@ function zeloscli() {
   PORT=$1
   shift
   "$ZELOSCLI" --server localhost:"$PORT" -x "$@" 2>/dev/null
+}
+
+function x_repo_lookup() {
+  SOURCE_REPO="$1"
+  TARGET_REPO="$2"
+  HASH="$3"
+  TRANSLATED=$(REPONAME=$SOURCE_REPO hgedenapi debugapi -e committranslateids -i "[{'Hg': '$HASH'}]" -i "'Hg'" -i "'$SOURCE_REPO'" -i "'$TARGET_REPO'")
+  hgedenapi debugshell <<EOF
+print(hex(${TRANSLATED}[0]["translated"]["Hg"]))
+EOF
 }

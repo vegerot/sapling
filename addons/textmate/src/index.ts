@@ -10,17 +10,17 @@ import type {
   GrammarContribution,
   GrammarSource,
   NormalizedLanguageExtensionPoint,
-} from './AbstractLanguageExtension';
-import type AbstractLanguageExtension from './AbstractLanguageExtension';
-import type {LanguageExtensionAmendment} from './languageExtensionAmendments';
+} from './AbstractLanguageExtension.js';
+import type AbstractLanguageExtension from './AbstractLanguageExtension.js';
+import type {LanguageExtensionAmendment} from './languageExtensionAmendments.js';
 
-import LanguageExtensionOnDisk from './LanguageExtensionOnDisk';
-import builtInExtensions from './extensions';
-import languageExtensionAmendments from './languageExtensionAmendments';
-import assert from 'assert';
-import {promises as fs} from 'fs';
+import LanguageExtensionOnDisk from './LanguageExtensionOnDisk.js';
+import builtInExtensions from './extensions.js';
+import languageExtensionAmendments from './languageExtensionAmendments.js';
 import minimist from 'minimist';
-import pathMod from 'path';
+import assert from 'node:assert';
+import {promises as fs} from 'node:fs';
+import pathMod from 'node:path';
 import prettier from 'prettier';
 
 const GENERATED_SIGIL = '\x40generated';
@@ -254,8 +254,8 @@ async function writeGrammarFiles(
    * @param filepath file to write
    * @param contents TypeScript source code to write (will be formatted by Prettier)
    */
-  function createTypeScriptFile(filepath: string, contents: string): Promise<void> {
-    const formattedContents = prettier.format(contents, {
+  async function createTypeScriptFile(filepath: string, contents: string): Promise<void> {
+    const formattedContents = await prettier.format(contents, {
       ...prettierOptions,
       filepath,
     });
@@ -516,7 +516,7 @@ function normalizeAutoClosingPairs(languageConfiguration: NormalizedLanguageExte
     return;
   }
 
-  const {autoClosingPairs} = languageConfiguration.configuration;
+  const {autoClosingPairs} = languageConfiguration.configuration ?? {};
   if (!Array.isArray(autoClosingPairs)) {
     return;
   }

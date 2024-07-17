@@ -1,5 +1,4 @@
-#debugruntest-compatible
-#require windows
+#require windows no-eden
 
   $ setconfig experimental.windows-symlinks=False
 

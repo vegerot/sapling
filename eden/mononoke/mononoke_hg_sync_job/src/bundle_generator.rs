@@ -15,18 +15,17 @@ use async_trait::async_trait;
 use blobstore::Loadable;
 use bookmarks::BookmarkKey;
 use borrowed::borrowed;
-use bytes_old::Bytes as BytesOld;
+use bytes::Bytes;
+use bytes::BytesMut;
 use cloned::cloned;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
-use futures::compat::Stream01CompatExt;
 use futures::future;
 use futures::stream;
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryFutureExt;
 use futures::TryStreamExt;
-use futures_01_ext::StreamExt as _;
 use getbundle_response::create_filenodes;
 use getbundle_response::create_manifest_entries_stream;
 use getbundle_response::get_manifests_and_filenodes;
@@ -36,7 +35,7 @@ use maplit::hashmap;
 use mercurial_bundles::capabilities::encode_capabilities;
 use mercurial_bundles::capabilities::Capabilities;
 use mercurial_bundles::changegroup::CgVersion;
-use mercurial_bundles::create_bundle_stream;
+use mercurial_bundles::create_bundle_stream_new;
 use mercurial_bundles::parts;
 use mercurial_derivation::DeriveHgChangeset;
 use mercurial_revlog::RevlogChangeset;
@@ -73,7 +72,7 @@ pub async fn create_bundle<'a>(
     filenode_verifier: &'a FilenodeVerifier,
     push_vars: Option<HashMap<String, bytes::Bytes>>,
     filter_changesets: Arc<dyn FilterExistingChangesets>,
-) -> Result<(BytesOld, HashMap<HgChangesetId, (ChangesetId, Timestamp)>)> {
+) -> Result<(Bytes, HashMap<HgChangesetId, (ChangesetId, Timestamp)>)> {
     let mut commits_to_push: Vec<_> = find_commits_to_push(
         ctx,
         repo,
@@ -193,6 +192,8 @@ impl FilenodeVerifier {
             .values()
             .flat_map(|entries| entries.iter())
             .filter_map(|entry| {
+                // This pattern is used to convert a ref to tuple into a tuple of refs.
+                #[allow(clippy::map_identity)]
                 entry
                     .maybe_get_lfs_pointer()
                     .map(|(sha256, size)| (sha256, size))
@@ -223,7 +224,7 @@ async fn create_bundle_impl(
     session_lfs_params: SessionLfsParams,
     filenode_verifier: &FilenodeVerifier,
     push_vars: Option<HashMap<String, bytes::Bytes>>,
-) -> Result<BytesOld> {
+) -> Result<Bytes> {
     let any_commits = !commits_to_push.is_empty();
     let changelog_entries = {
         // These clones are not necessary for futures 0.3 but we need compat for
@@ -239,7 +240,7 @@ async fn create_bundle_impl(
                 }
             })
             .buffered(100)
-            .and_then(async move |(hg_cs_id, cs)| {
+            .and_then(|(hg_cs_id, cs)| async move {
                 let revlogcs = RevlogChangeset::new_from_parts(
                     cs.parents().clone(),
                     cs.manifestid().clone(),
@@ -297,19 +298,20 @@ async fn create_bundle_impl(
             filenode_verifier
                 .verify_entries(&ctx, &prepared_filenode_entries)
                 .await?;
-            anyhow::Ok(
-                create_filenodes(ctx.clone(), repo.clone(), prepared_filenode_entries).compat(),
-            )
+            anyhow::Ok(create_filenodes(
+                ctx.clone(),
+                repo.clone(),
+                prepared_filenode_entries,
+            ))
         }
     })
     .try_flatten()
-    .boxed()
-    .compat();
+    .boxed();
 
     if any_commits {
         bundle2_parts.push(parts::changegroup_part(
-            changelog_entries.boxed().compat(),
-            Some(filenode_entries.boxify()),
+            changelog_entries,
+            Some(filenode_entries),
             cg_version,
         )?);
 
@@ -317,10 +319,7 @@ async fn create_bundle_impl(
             create_manifest_entries_stream(
                 ctx.clone(),
                 repo.repo_blobstore().clone(),
-                manifests
-                    .into_iter()
-                    .map(|(path, m_id, cs_id)| (path.into(), m_id, cs_id))
-                    .collect(),
+                manifests.into_iter().collect(),
             ),
             parts::StoreInHgCache::Yes,
         )?);
@@ -332,11 +331,10 @@ async fn create_bundle_impl(
         maybe_to.map(|x| x.to_string()).unwrap_or_default(),
     )?);
 
-    let compression = None;
-    create_bundle_stream(bundle2_parts, compression)
-        .compat()
-        .try_concat()
-        .await
+    let bytes = create_bundle_stream_new(bundle2_parts)
+        .try_collect::<BytesMut>()
+        .await?;
+    Ok(bytes.freeze())
 }
 
 async fn fetch_timestamps(
@@ -376,16 +374,14 @@ async fn find_commits_to_push<'a>(
             hg_server_heads.into_iter().collect(),
         )
         .await?
-        .map_ok(async move |bcs_id| {
+        .map_ok(move |bcs_id| async move {
             let hg_cs_id = repo.derive_hg_changeset(ctx, bcs_id).await?;
             Ok((bcs_id, hg_cs_id))
         })
         .try_buffered(100))
 }
 
-// TODO(stash): this should generate different capabilities depending on whether client
-// supports changegroup3 or not
-fn create_capabilities() -> BytesOld {
+fn create_capabilities() -> Bytes {
     // List of capabilities that was copied from real bundle generated by Mercurial client.
     let caps_ref = hashmap! {
         "HG20" => vec![],

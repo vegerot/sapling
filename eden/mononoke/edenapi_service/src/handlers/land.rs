@@ -13,38 +13,41 @@ use async_trait::async_trait;
 use bookmarks_movement::BookmarkKindRestrictions;
 use bytes::Bytes;
 use edenapi_types::HgId;
+use edenapi_types::LandStackData;
 use edenapi_types::LandStackRequest;
 use edenapi_types::LandStackResponse;
+use edenapi_types::ServerError;
 use futures::stream;
 use futures::StreamExt;
 use hooks::PushAuthoredBy;
 use mercurial_types::HgChangesetId;
 use mercurial_types::HgNodeHash;
 use mononoke_api_hg::HgRepoContext;
+use repo_identity::RepoIdentityRef;
 
-use super::handler::EdenApiContext;
-use super::EdenApiHandler;
-use super::EdenApiMethod;
+use super::handler::SaplingRemoteApiContext;
 use super::HandlerResult;
+use super::SaplingRemoteApiHandler;
+use super::SaplingRemoteApiMethod;
 use crate::errors::ErrorKind;
 
 /// Rebase a stack of commits onto a bookmark, and update the bookmark to the top of the newly-rebased stack.
 pub struct LandStackHandler;
 
 #[async_trait]
-impl EdenApiHandler for LandStackHandler {
+impl SaplingRemoteApiHandler for LandStackHandler {
     type Request = LandStackRequest;
     type Response = LandStackResponse;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::LandStack;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::LandStack;
     const ENDPOINT: &'static str = "/land";
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
-        Ok(stream::once(land_stack(
+        Ok(stream::once(land_stack_response(
             ectx.repo(),
             request.bookmark,
             request.head,
@@ -59,13 +62,27 @@ impl EdenApiHandler for LandStackHandler {
     }
 }
 
-async fn land_stack(
+async fn land_stack_response(
     repo: HgRepoContext,
     bookmark: String,
     head_hgid: HgId,
     base_hgid: HgId,
     pushvars: HashMap<String, Bytes>,
 ) -> Result<LandStackResponse, Error> {
+    Ok(LandStackResponse {
+        data: land_stack(repo, bookmark, head_hgid, base_hgid, pushvars)
+            .await
+            .map_err(|e| ServerError::generic(format!("{:?}", e))),
+    })
+}
+
+async fn land_stack(
+    repo: HgRepoContext,
+    bookmark: String,
+    head_hgid: HgId,
+    base_hgid: HgId,
+    pushvars: HashMap<String, Bytes>,
+) -> Result<LandStackData, Error> {
     let repo = repo.repo();
 
     let head = HgChangesetId::new(HgNodeHash::from(head_hgid));
@@ -84,6 +101,13 @@ async fn land_stack(
         .ok_or(ErrorKind::HgIdNotFound(base_hgid))?
         .id();
 
+    let force_local_pushrebase = justknobs::eval(
+        "scm/mononoke:edenapi_force_local_pushrebase",
+        None,
+        Some(repo.inner_repo().repo_identity().name()),
+    )
+    .unwrap_or(false);
+
     let pushrebase_outcome = repo
         .land_stack(
             bookmark,
@@ -96,6 +120,7 @@ async fn land_stack(
             },
             BookmarkKindRestrictions::AnyKind,
             PushAuthoredBy::User,
+            force_local_pushrebase,
         )
         .await?;
 
@@ -147,7 +172,7 @@ async fn land_stack(
 
     let old_to_new_hgids = old_hgids?.into_iter().zip(new_hgids?.into_iter()).collect();
 
-    Ok(LandStackResponse {
+    Ok(LandStackData {
         new_head: new_head_hgid,
         old_to_new_hgids,
     })

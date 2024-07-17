@@ -3,10 +3,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-import os
 import re
-
-from hghave import require
+from pathlib import Path
 
 
 def checkpath(path, dllnames):
@@ -22,6 +20,6 @@ def checkpath(path, dllnames):
 
 
 checkpath(
-    "%s/../sapling/win32.py" % os.environ.get("RUNTESTDIR", "."),
+    f"{Path(__file__).parent}/../sapling/win32.py",
     ["_kernel32", "_advapi32", "_user32", "_crypt32"],
 )

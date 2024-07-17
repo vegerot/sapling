@@ -1,5 +1,4 @@
-#debugruntest-compatible
-#require git
+#require git no-eden
 
   $ eagerepo
   $ . $TESTDIR/git.sh
@@ -8,17 +7,8 @@ Make sure that Windows is unable to check out paths with `..\` in their path.
   $ mkdir brokengitrepo
   $ tar -xf $TESTDIR/brokengitrepo.tar.gz -C $TESTTMP/brokengitrepo
 #if windows
-  $ hg clone --git "$TESTTMP/brokengitrepo" brokencopy 2>&1 | tail -n 10
-  error.UncategorizedNativeError: Can't write 'RepoPath("..\\windowstroublemaker.txt")' after handling error "Can't write into ..\windowstroublemaker.txt
-  
-  Caused by:
-      0: Invalid component in "..\windowstroublemaker.txt"
-      1: Invalid path component "..""
-  
-  Caused by:
-      0: Can't write into ..\windowstroublemaker.txt
-      1: Invalid component in "..\windowstroublemaker.txt"
-      2: Invalid path component ".."
+  $ hg clone --git "$TESTTMP/brokengitrepo" brokencopy 2>&1 | grep UncategorizedNativeError
+  error.UncategorizedNativeError: *error writing files* (glob)
 
 #else
   $ hg clone --git "$TESTTMP/brokengitrepo" brokencopy

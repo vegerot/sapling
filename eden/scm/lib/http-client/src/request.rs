@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering::AcqRel;
 use std::time::Duration;
 use std::time::SystemTime;
 
-use curl::easy::Easy2;
+use clientinfo::CLIENT_INFO_HEADER;
 use curl::easy::HttpVersion;
 use curl::easy::List;
 use http::header;
@@ -42,6 +42,7 @@ use crate::receiver::ChannelReceiver;
 use crate::receiver::Receiver;
 use crate::response::AsyncResponse;
 use crate::response::Response;
+use crate::Easy2H;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Method {
@@ -539,7 +540,7 @@ impl Request {
 
     pub fn set_client_info(&mut self, client_info: &Option<String>) -> &mut Self {
         if let Some(info) = client_info {
-            self.set_header("X-Client-Info", info);
+            self.set_header(CLIENT_INFO_HEADER, info);
         }
         self
     }
@@ -587,7 +588,7 @@ impl Request {
     /// concurrent requests or large requests that require
     /// progress reporting.
     pub fn send(self) -> Result<Response, HttpClientError> {
-        let mut easy: Easy2<Buffered> = self.try_into()?;
+        let mut easy: Easy2H = self.try_into()?;
         let res = easy.perform();
         let ctx = easy.get_mut().request_context_mut();
         let info = ctx.info().clone();
@@ -609,11 +610,11 @@ impl Request {
     pub async fn send_async(self) -> Result<AsyncResponse, HttpClientError> {
         let request_info = self.ctx().info().clone();
         let (receiver, streams) = ChannelReceiver::new();
-        let request = self.into_streaming(receiver);
+        let request = self.into_streaming(Box::new(receiver));
 
         // Spawn the request as another task, which will block
         // the worker it is scheduled on until completion.
-        let io_task = tokio::task::spawn_blocking(move || request.send());
+        let io_task = async_runtime::spawn_blocking(move || request.send());
 
         match AsyncResponse::new(streams, request_info).await {
             Ok(res) => Ok(res),
@@ -629,7 +630,7 @@ impl Request {
     /// Turn this `Request` into a streaming request. The
     /// received data for this request will be passed as
     /// it arrives to the given `Receiver`.
-    pub fn into_streaming<R>(self, receiver: R) -> StreamRequest<R> {
+    pub fn into_streaming(self, receiver: Box<dyn Receiver>) -> StreamRequest {
         StreamRequest {
             request: self,
             receiver,
@@ -638,10 +639,10 @@ impl Request {
 
     /// Turn this `Request` into a `curl::Easy2` handle using the given
     /// `Handler` to process the response.
-    pub(crate) fn into_handle<H: HandlerExt>(
+    pub(crate) fn into_handle(
         mut self,
-        create_handler: impl FnOnce(RequestContext) -> H,
-    ) -> Result<Easy2<H>, HttpClientError> {
+        create_handler: impl FnOnce(RequestContext) -> Box<dyn HandlerExt>,
+    ) -> Result<Easy2H, HttpClientError> {
         // Allow request creation listeners to configure the Request before we
         // use it, potentially overriding settings explicitly configured via
         // the methods on Request.
@@ -664,7 +665,7 @@ impl Request {
         }
         let handler = create_handler(self.ctx);
 
-        let mut easy = Easy2::new(handler);
+        let mut easy = Easy2H::new(handler);
 
         easy.url(url.as_str())?;
         easy.verbose(self.verbose)?;
@@ -750,15 +751,28 @@ impl Request {
             None => {}
         }
 
-        // Windows enables ssl revocation checking by default, which doesn't work inside the
-        // datacenter.
         #[cfg(windows)]
-        {
-            use curl::easy::SslOpt;
-            let mut ssl_opts = SslOpt::new();
-            ssl_opts.no_revoke(true);
-            easy.ssl_options(&ssl_opts)?;
-        }
+        unsafe {
+            // Call directly since curl crate doesn't expose CURLSSLOPT_NATIVE_CA option.
+            let rc = curl_sys::curl_easy_setopt(
+                easy.raw(),
+                curl_sys::CURLOPT_SSL_OPTIONS,
+                // Windows enables ssl revocation checking by default, which doesn't work inside the
+                // datacenter.
+                curl_sys::CURLSSLOPT_NO_REVOKE |
+                // When using openssl, this imports CAs from Windows cert store.
+                curl_sys::CURLSSLOPT_NATIVE_CA,
+            );
+            if rc == curl_sys::CURLE_OK {
+                Ok(())
+            } else {
+                let mut err = curl::Error::new(rc);
+                if let Some(msg) = easy.take_error_buf() {
+                    err.set_extra(msg);
+                }
+                Err(err)
+            }
+        }?;
 
         if let Some(cainfo) = self.cainfo {
             easy.cainfo(cainfo)?;
@@ -787,22 +801,22 @@ impl Request {
     }
 }
 
-impl TryFrom<Request> for Easy2<Buffered> {
+impl TryFrom<Request> for Easy2H {
     type Error = HttpClientError;
 
     fn try_from(req: Request) -> Result<Self, Self::Error> {
-        req.into_handle(Buffered::new)
+        req.into_handle(|c| Box::new(Buffered::new(c)))
     }
 }
 
-pub struct StreamRequest<R> {
+pub struct StreamRequest {
     pub(crate) request: Request,
-    pub(crate) receiver: R,
+    pub(crate) receiver: Box<dyn Receiver>,
 }
 
-impl<R: Receiver> StreamRequest<R> {
+impl StreamRequest {
     pub fn send(self) -> Result<(), HttpClientError> {
-        let mut easy: Easy2<Streaming<R>> = self.try_into()?;
+        let mut easy: Easy2H = self.try_into()?;
         let res = easy.perform().map_err(Into::into);
         let _ = easy
             .get_mut()
@@ -813,12 +827,12 @@ impl<R: Receiver> StreamRequest<R> {
     }
 }
 
-impl<R: Receiver> TryFrom<StreamRequest<R>> for Easy2<Streaming<R>> {
+impl TryFrom<StreamRequest> for Easy2H {
     type Error = HttpClientError;
 
-    fn try_from(req: StreamRequest<R>) -> Result<Self, Self::Error> {
+    fn try_from(req: StreamRequest) -> Result<Self, Self::Error> {
         let StreamRequest { request, receiver } = req;
-        request.into_handle(|ctx| Streaming::new(receiver, ctx))
+        request.into_handle(|ctx| Box::new(Streaming::new(receiver, ctx)))
     }
 }
 
@@ -905,7 +919,6 @@ mod tests {
     use http::header::HeaderName;
     use http::header::HeaderValue;
     use http::StatusCode;
-    use mockito::mock;
     use mockito::Matcher;
     use serde_json::json;
 
@@ -915,7 +928,9 @@ mod tests {
 
     #[test]
     fn test_get() -> Result<()> {
-        let mock = mock("GET", "/test")
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/test")
             .with_status(200)
             .match_header("X-Api-Key", "1234")
             .with_header("Content-Type", "text/plain")
@@ -923,7 +938,7 @@ mod tests {
             .with_body("Hello, world!")
             .create();
 
-        let url = Url::parse(&mockito::server_url())?.join("test")?;
+        let url = Url::parse(&server.url())?.join("test")?;
         let res = Request::get(url).header("X-Api-Key", "1234").send()?;
 
         mock.assert();
@@ -947,7 +962,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_get() -> Result<()> {
-        let mock = mock("GET", "/test")
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/test")
             .with_status(200)
             .match_header("X-Api-Key", "1234")
             .with_header("Content-Type", "text/plain")
@@ -955,7 +972,7 @@ mod tests {
             .with_body("Hello, world!")
             .create();
 
-        let url = Url::parse(&mockito::server_url())?.join("test")?;
+        let url = Url::parse(&server.url())?.join("test")?;
         let res = Request::get(url)
             .header("X-Api-Key", "1234")
             .send_async()
@@ -984,14 +1001,16 @@ mod tests {
 
     #[test]
     fn test_head() -> Result<()> {
-        let mock = mock("HEAD", "/test")
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("HEAD", "/test")
             .with_status(200)
             .match_header("X-Api-Key", "1234")
             .with_header("Content-Type", "text/plain")
             .with_header("X-Served-By", "mock")
             .create();
 
-        let url = Url::parse(&mockito::server_url())?.join("test")?;
+        let url = Url::parse(&server.url())?.join("test")?;
         let res = Request::head(url).header("X-Api-Key", "1234").send()?;
 
         mock.assert();
@@ -1017,13 +1036,15 @@ mod tests {
     fn test_post() -> Result<()> {
         let body = "foo=hello&bar=world";
 
-        let mock = mock("POST", "/test")
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/test")
             .with_status(201)
             .match_header("Content-Type", "application/x-www-form-urlencoded")
             .match_body(Matcher::Exact(body.into()))
             .create();
 
-        let url = Url::parse(&mockito::server_url())?.join("test")?;
+        let url = Url::parse(&server.url())?.join("test")?;
         let res = Request::post(url).body(body.as_bytes()).send()?;
 
         mock.assert();
@@ -1037,13 +1058,15 @@ mod tests {
         let body_bytes = vec![65; 1024 * 1024];
         let body = String::from_utf8_lossy(body_bytes.as_ref());
 
-        let mock = mock("POST", "/test")
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/test")
             .with_status(201)
             .match_header("Expect", Matcher::Missing)
             .match_body(Matcher::Exact(body.into()))
             .create();
 
-        let url = Url::parse(&mockito::server_url())?.join("test")?;
+        let url = Url::parse(&server.url())?.join("test")?;
         let res = Request::post(url).body(body_bytes).send()?;
 
         mock.assert();
@@ -1056,13 +1079,15 @@ mod tests {
     fn test_put() -> Result<()> {
         let body = "Hello, world!";
 
-        let mock = mock("PUT", "/test")
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("PUT", "/test")
             .with_status(201)
             .match_header("Content-Type", "text/plain")
             .match_body(Matcher::Exact(body.into()))
             .create();
 
-        let url = Url::parse(&mockito::server_url())?.join("test")?;
+        let url = Url::parse(&server.url())?.join("test")?;
         let res = Request::put(url)
             .header("Content-Type", "text/plain")
             .body(body.as_bytes())
@@ -1081,13 +1106,15 @@ mod tests {
             "hello": "world"
         });
 
-        let mock = mock("POST", "/test")
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/test")
             .with_status(201)
             .match_header("Content-Type", "application/json")
             .match_body(Matcher::Json(body.clone()))
             .create();
 
-        let url = Url::parse(&mockito::server_url())?.join("test")?;
+        let url = Url::parse(&server.url())?.join("test")?;
         let res = Request::post(url).json(&body)?.send()?;
 
         mock.assert();
@@ -1109,14 +1136,15 @@ mod tests {
             hello: "world",
         };
 
-        let mock = mock("POST", "/test")
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/test")
             .with_status(201)
             .match_header("Content-Type", "application/cbor")
-            // As of v0.25, mockito doesn't support matching binary bodies.
-            .match_body(Matcher::Any)
+            .match_body(serde_cbor::to_vec(&body)?)
             .create();
 
-        let url = Url::parse(&mockito::server_url())?.join("test")?;
+        let url = Url::parse(&server.url())?.join("test")?;
         let res = Request::post(url).cbor(&body)?.send()?;
 
         mock.assert();
@@ -1127,7 +1155,9 @@ mod tests {
 
     #[test]
     fn test_accept_encoding() -> Result<()> {
-        let mock = mock("GET", "/test")
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/test")
             .with_status(200)
             .match_header("Accept-Encoding", "zstd, gzip, foobar")
             .create();
@@ -1138,7 +1168,7 @@ mod tests {
             Encoding::Other("foobar".into()),
         ];
 
-        let url = Url::parse(&mockito::server_url())?.join("test")?;
+        let url = Url::parse(&server.url())?.join("test")?;
         let _ = Request::get(url).accept_encoding(encodings).send()?;
 
         mock.assert();
@@ -1179,8 +1209,12 @@ mod tests {
             }
         });
 
-        let mock = mock("HEAD", "/test_callback").with_status(200).create();
-        let url = Url::parse(&mockito::server_url())?.join("test_callback")?;
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("HEAD", "/test_callback")
+            .with_status(200)
+            .create();
+        let url = Url::parse(&server.url())?.join("test_callback")?;
         let _res = Request::head(url).send()?;
 
         mock.assert();
@@ -1196,7 +1230,10 @@ mod tests {
 
         // Make sure convert_cert defaults to cfg!(windows) and gets
         // passed along to request.
-        assert_eq!(cfg!(windows), client.get(url.clone()).convert_cert);
+        assert_eq!(
+            curl::Version::get().ssl_version() == Some("Schannel"),
+            client.get(url.clone()).convert_cert
+        );
 
         let client = HttpClient::from_config(Config {
             convert_cert: true,

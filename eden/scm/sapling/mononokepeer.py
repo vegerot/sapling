@@ -51,6 +51,7 @@ from .pycompat import decodeutf8, encodeutf8, iswindows
 NETSTRING_SEPARATOR = b":"
 NETSTRING_ENDING = b","
 
+
 # Matches IoStream in Mononoke
 class IoStream(Enum):
     STDIN = 0
@@ -361,7 +362,7 @@ class mononokepeer(stdiopeer.stdiopeer):
                     "Connection": "Upgrade",
                     "Upgrade": "websocket",
                 }
-                headers["X-Client-Info"] = self._clientinfo.into_json().decode()
+                headers["X-Client-Info"] = self._clientinfo.to_json().decode()
 
                 if self._cats:
                     headers["x-forwarded-cats"] = self._cats

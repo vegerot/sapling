@@ -1,12 +1,12 @@
 #chg-compatible
-#require bash
+#require bash no-eden
   $ setconfig experimental.allowfilepeer=True
 
   $ enable amend rebase histedit fbhistedit remotenames
   $ setconfig experimental.evolution=obsolete
   $ setconfig experimental.narrow-heads=true
   $ setconfig visibility.enabled=true
-  $ setconfig mutation.record=true mutation.enabled=true mutation.date="0 0"
+  $ setconfig mutation.record=true mutation.enabled=true
 
   $ . "$TESTDIR/library.sh"
   $ . "$TESTDIR/infinitepush/library.sh"
@@ -32,8 +32,6 @@ Amend the commit a couple of times and push to the scratch branch again
 Clone the repo again, and pull the scratch branch.
   $ cd ..
   $ hg clone ssh://user@dummy/repo client2 -q
-  fetching tree '' 4b17fc1185671dd0894412fdc3a15c72f0671bbe
-  1 trees fetched over 0.00s
   $ cd client2
   $ hg pull -q -B scratch/mybranch
 

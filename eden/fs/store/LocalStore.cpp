@@ -10,7 +10,6 @@
 #include <folly/ExceptionWrapper.h>
 #include <folly/Expected.h>
 #include <folly/String.h>
-#include <folly/futures/Future.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
 #include <folly/lang/Bits.h>
@@ -102,10 +101,10 @@ ImmediateFuture<StoreResult> LocalStore::getImmediateFuture(
   return makeImmediateFutureWith([&] { return get(keySpace, id); });
 }
 
-folly::Future<std::vector<StoreResult>> LocalStore::getBatch(
+ImmediateFuture<std::vector<StoreResult>> LocalStore::getBatch(
     KeySpace keySpace,
     const std::vector<folly::ByteRange>& keys) const {
-  return folly::makeFutureWith([keySpace, keys, this] {
+  return makeImmediateFutureWith([keySpace, keys, this] {
     std::vector<StoreResult> results;
     for (auto& key : keys) {
       results.emplace_back(get(keySpace, key));
@@ -115,7 +114,7 @@ folly::Future<std::vector<StoreResult>> LocalStore::getBatch(
 }
 
 ImmediateFuture<TreePtr> LocalStore::getTree(const ObjectId& id) const {
-  DurationScope stat{stats_, &LocalStoreStats::getTree};
+  DurationScope<EdenStats> stat{stats_, &LocalStoreStats::getTree};
   return getImmediateFuture(KeySpace::TreeFamily, id)
       .thenValue(
           [id, stat = std::move(stat), stats = stats_.copy()](
@@ -144,7 +143,7 @@ ImmediateFuture<TreePtr> LocalStore::getTree(const ObjectId& id) const {
 }
 
 ImmediateFuture<BlobPtr> LocalStore::getBlob(const ObjectId& id) const {
-  DurationScope stat{stats_, &LocalStoreStats::getBlob};
+  DurationScope<EdenStats> stat{stats_, &LocalStoreStats::getBlob};
   return getImmediateFuture(KeySpace::BlobFamily, id)
       .thenValue(
           [id, stat = std::move(stat), stats = stats_.copy()](
@@ -169,7 +168,7 @@ ImmediateFuture<BlobPtr> LocalStore::getBlob(const ObjectId& id) const {
 
 ImmediateFuture<BlobMetadataPtr> LocalStore::getBlobMetadata(
     const ObjectId& id) const {
-  DurationScope stat{stats_, &LocalStoreStats::getBlobMetadata};
+  DurationScope<EdenStats> stat{stats_, &LocalStoreStats::getBlobMetadata};
   return getImmediateFuture(KeySpace::BlobMetaDataFamily, id)
       .thenValue(
           [id, stat = std::move(stat), stats = stats_.copy()](
@@ -284,7 +283,7 @@ void LocalStore::WriteBatch::putBlob(const ObjectId& id, const Blob* blob) {
   put(KeySpace::BlobFamily, hashSlice, bodySlices);
 }
 
-LocalStore::WriteBatch::~WriteBatch() {}
+LocalStore::WriteBatch::~WriteBatch() = default;
 
 void LocalStore::periodicManagementTask(const EdenConfig& /* config */) {
   // Individual store subclasses can provide their own implementations for

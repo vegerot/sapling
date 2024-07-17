@@ -11,11 +11,13 @@ import serverAPI from '../ClientToServerAPI';
 import {tracker} from '../analytics';
 import {codeReviewProvider} from '../codeReview/CodeReviewInfo';
 import {T} from '../i18n';
+import {atomFamilyWeak} from '../jotaiUtils';
 import {uncommittedChangesWithPreviews} from '../previews';
 import {commitByHash} from '../serverAPIState';
 import {commitInfoViewCurrentCommits, commitMode} from './CommitInfoState';
-import {selectorFamily, useRecoilValue, useRecoilValueLoadable} from 'recoil';
-import {Icon} from 'shared/Icon';
+import {Icon} from 'isl-components/Icon';
+import {atom, useAtomValue} from 'jotai';
+import {loadable} from 'jotai/utils';
 import {tryJsonParse} from 'shared/utils';
 
 import './SuggestedReviewers.css';
@@ -76,11 +78,9 @@ export const recentReviewers = new RecentReviewers();
  */
 const cachedSuggestions = new Map<string, {lastFetch: number; reviewers: Array<string>}>();
 const MAX_SUGGESTION_CACHE_AGE = 2 * 60 * 1000;
-const suggestedReviewersForCommit = selectorFamily<Array<string>, string>({
-  key: 'suggestedReviewersForCommit',
-  get:
-    (hashOrHead: string | 'head' | undefined) =>
-    ({get}) => {
+const suggestedReviewersForCommit = atomFamilyWeak((hashOrHead: string | 'head' | undefined) => {
+  return loadable(
+    atom(get => {
       if (hashOrHead == null) {
         return [];
       }
@@ -99,7 +99,7 @@ const suggestedReviewersForCommit = selectorFamily<Array<string>, string>({
         context.paths.push(...uncommittedChanges.slice(0, 10).map(change => change.path));
       } else {
         const commit = get(commitByHash(hashOrHead));
-        if (commit?.isHead) {
+        if (commit?.isDot) {
           const uncommittedChanges = get(uncommittedChangesWithPreviews);
           context.paths.push(...uncommittedChanges.slice(0, 10).map(change => change.path));
         }
@@ -120,7 +120,8 @@ const suggestedReviewersForCommit = selectorFamily<Array<string>, string>({
         cachedSuggestions.set(hashOrHead, {lastFetch: Date.now(), reviewers: response.reviewers});
         return response.reviewers;
       });
-    },
+    }),
+  );
 });
 
 export function SuggestedReviewers({
@@ -130,21 +131,40 @@ export function SuggestedReviewers({
   existingReviewers: Array<string>;
   addReviewer: (value: string) => unknown;
 }) {
-  const provider = useRecoilValue(codeReviewProvider);
+  const provider = useAtomValue(codeReviewProvider);
   const recent = recentReviewers.getRecent().filter(s => !existingReviewers.includes(s));
-  const mode = useRecoilValue(commitMode);
-  const currentCommitInfoViewCommit = useRecoilValue(commitInfoViewCurrentCommits);
+  const mode = useAtomValue(commitMode);
+  const currentCommitInfoViewCommit = useAtomValue(commitInfoViewCurrentCommits);
   const currentCommit = currentCommitInfoViewCommit?.[0]; // assume we only have one commit
 
-  const key = currentCommit?.isHead && mode === 'commit' ? 'head' : currentCommit?.hash ?? '';
-  const suggestedReviewers = useRecoilValueLoadable(suggestedReviewersForCommit(key));
+  const key = currentCommit?.isDot && mode === 'commit' ? 'head' : currentCommit?.hash ?? '';
+  const suggestedReviewers = useAtomValue(suggestedReviewersForCommit(key));
 
-  const filteredSuggestions = suggestedReviewers
-    .valueMaybe()
-    ?.filter(s => !existingReviewers.includes(s));
+  const filteredSuggestions = (
+    suggestedReviewers.state === 'hasData' ? suggestedReviewers.data : []
+  ).filter(s => !existingReviewers.includes(s));
 
   return (
     <div className="suggested-reviewers" data-testid="suggested-reviewers">
+      {recent.length > 0 ? (
+        <div data-testid="recent-reviewers-list">
+          <div className="suggestion-header">
+            <T>Recent</T>
+          </div>
+          <div className="suggestions">
+            {recent.map(s => (
+              <Suggestion
+                key={s}
+                onClick={() => {
+                  addReviewer(s);
+                  tracker.track('AcceptSuggestedReviewer', {extras: {type: 'recent'}});
+                }}>
+                {s}
+              </Suggestion>
+            ))}
+          </div>
+        </div>
+      ) : null}
       {provider?.supportsSuggestedReviewers &&
       (filteredSuggestions == null || filteredSuggestions.length > 0) ? (
         <div data-testid="suggested-reviewers-list">
@@ -167,25 +187,6 @@ export function SuggestedReviewers({
                 {s}
               </Suggestion>
             )) ?? null}
-          </div>
-        </div>
-      ) : null}
-      {recent.length > 0 ? (
-        <div data-testid="recent-reviewers-list">
-          <div className="suggestion-header">
-            <T>Recent</T>
-          </div>
-          <div className="suggestions">
-            {recent.map(s => (
-              <Suggestion
-                key={s}
-                onClick={() => {
-                  addReviewer(s);
-                  tracker.track('AcceptSuggestedReviewer', {extras: {type: 'recent'}});
-                }}>
-                {s}
-              </Suggestion>
-            ))}
           </div>
         </div>
       ) : null}

@@ -9,18 +9,14 @@
 
 #![allow(non_camel_case_types)]
 
-use std::fs::read_dir;
-use std::io::Write;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::format_err;
 use anyhow::Error;
-use async_runtime::block_on;
-use async_runtime::stream_to_iter as block_on_stream;
 use configmodel::Config;
-use configmodel::ConfigExt;
 use cpython::*;
 use cpython_ext::ExtractInner;
 use cpython_ext::ExtractInnerRef;
@@ -29,15 +25,11 @@ use cpython_ext::PyNone;
 use cpython_ext::PyPath;
 use cpython_ext::PyPathBuf;
 use cpython_ext::ResultPyErrExt;
-use io::IO;
 use parking_lot::RwLock;
 use pyconfigloader::config;
 use revisionstore::repack;
-use revisionstore::scmstore::file_to_async_key_stream;
-use revisionstore::scmstore::FetchMode;
 use revisionstore::scmstore::FileAttributes;
 use revisionstore::scmstore::FileStore;
-use revisionstore::scmstore::FileStoreBuilder;
 use revisionstore::scmstore::TreeStore;
 use revisionstore::scmstore::TreeStoreBuilder;
 use revisionstore::ContentStore;
@@ -47,8 +39,6 @@ use revisionstore::DataPack;
 use revisionstore::DataPackStore;
 use revisionstore::DataPackVersion;
 use revisionstore::Delta;
-use revisionstore::EdenApiFileStore;
-use revisionstore::EdenApiTreeStore;
 use revisionstore::ExtStoredPolicy;
 use revisionstore::HgIdDataStore;
 use revisionstore::HgIdHistoryStore;
@@ -72,9 +62,12 @@ use revisionstore::RemoteDataStore;
 use revisionstore::RemoteHistoryStore;
 use revisionstore::RepackKind;
 use revisionstore::RepackLocation;
+use revisionstore::SaplingRemoteApiFileStore;
+use revisionstore::SaplingRemoteApiTreeStore;
 use revisionstore::StoreKey;
 use revisionstore::StoreResult;
 use revisionstore::StoreType;
+use types::fetch_mode::FetchMode;
 use types::Key;
 use types::NodeInfo;
 
@@ -276,39 +269,6 @@ py_class!(class datapack |py| {
     }
 });
 
-/// Scan the filesystem for files with `extensions`, and compute their size.
-fn compute_store_size<P: AsRef<Path>>(
-    storepath: P,
-    extensions: Vec<&str>,
-) -> Result<(usize, usize)> {
-    let dirents = read_dir(storepath)?;
-
-    assert_eq!(extensions.len(), 2);
-
-    let mut count = 0;
-    let mut size = 0;
-
-    for dirent in dirents {
-        let dirent = dirent?;
-        let path = dirent.path();
-
-        if let Some(file_ext) = path.extension() {
-            for extension in &extensions {
-                if extension == &file_ext {
-                    size += dirent.metadata()?.len();
-                    count += 1;
-                    break;
-                }
-            }
-        }
-    }
-
-    // We did count the indexes too, but we do not want them counted.
-    count /= 2;
-
-    Ok((size as usize, count))
-}
-
 py_class!(class datapackstore |py| {
     data store: Box<DataPackStore>;
     data path: PathBuf;
@@ -346,18 +306,6 @@ py_class!(class datapackstore |py| {
     def markforrefresh(&self) -> PyResult<PyObject> {
         self.store(py).force_rescan();
         Ok(Python::None(py))
-    }
-
-    def getmetrics(&self) -> PyResult<PyDict> {
-        let (size, count) = match compute_store_size(self.path(py), vec!["datapack", "dataidx"]) {
-            Ok((size, count)) => (size, count),
-            Err(_) => (0, 0),
-        };
-
-        let res = PyDict::new(py);
-        res.set_item(py, "numpacks", count)?;
-        res.set_item(py, "totalpacksize", size)?;
-        Ok(res)
     }
 });
 
@@ -428,18 +376,6 @@ py_class!(class historypackstore |py| {
         self.store(py).force_rescan();
         Ok(Python::None(py))
     }
-
-    def getmetrics(&self) -> PyResult<PyDict> {
-        let (size, count) = match compute_store_size(self.path(py), vec!["histpack", "histidx"]) {
-            Ok((size, count)) => (size, count),
-            Err(_) => (0, 0),
-        };
-
-        let res = PyDict::new(py);
-        res.set_item(py, "numpacks", count)?;
-        res.set_item(py, "totalpacksize", size)?;
-        Ok(res)
-    }
 });
 
 py_class!(class indexedlogdatastore |py| {
@@ -449,7 +385,13 @@ py_class!(class indexedlogdatastore |py| {
         let config = IndexedLogHgIdDataStoreConfig { max_log_count: None, max_bytes_per_log: None, max_bytes: None };
         indexedlogdatastore::create_instance(
             py,
-            Box::new(IndexedLogHgIdDataStore::new(path.as_path(), ExtStoredPolicy::Ignore, &config, StoreType::Local).map_pyerr(py)?),
+            Box::new(IndexedLogHgIdDataStore::new(
+                &BTreeMap::<&str, &str>::new(),
+                path.as_path(),
+                ExtStoredPolicy::Ignore,
+                &config,
+                StoreType::Permanent,
+            ).map_pyerr(py)?),
         )
     }
 
@@ -492,7 +434,7 @@ py_class!(class indexedloghistorystore |py| {
         let config = config.get_cfg(py);
         indexedloghistorystore::create_instance(
             py,
-            Box::new(IndexedLogHgIdHistoryStore::new(path.as_path(), &config, StoreType::Local).map_pyerr(py)?),
+            Box::new(IndexedLogHgIdHistoryStore::new(path.as_path(), &config, StoreType::Permanent).map_pyerr(py)?),
         )
     }
 
@@ -534,10 +476,11 @@ fn make_mutabledeltastore(
             max_bytes: None,
         };
         Arc::new(IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             indexedlogpath.as_path(),
             ExtStoredPolicy::Ignore,
             &config,
-            StoreType::Local,
+            StoreType::Permanent,
         )?)
     } else {
         return Err(format_err!("Foo"));
@@ -903,46 +846,46 @@ impl ExtractInnerRef for pyremotestore {
     }
 }
 
-// Python wrapper around an EdenAPI-backed remote store for files.
+// Python wrapper around an SaplingRemoteAPI-backed remote store for files.
 //
-// This type exists for the sole purpose of allowing an `EdenApiFileStore`
+// This type exists for the sole purpose of allowing an `SaplingRemoteApiFileStore`
 // to be passed from Rust to Python and back into Rust. It cannot be created
 // by Python code and does not expose any functionality to Python.
 py_class!(pub class edenapifilestore |py| {
-    data remote: Arc<EdenApiFileStore>;
+    data remote: Arc<SaplingRemoteApiFileStore>;
 });
 
 impl edenapifilestore {
-    pub fn new(py: Python, remote: Arc<EdenApiFileStore>) -> PyResult<Self> {
+    pub fn new(py: Python, remote: Arc<SaplingRemoteApiFileStore>) -> PyResult<Self> {
         edenapifilestore::create_instance(py, remote)
     }
 }
 
 impl ExtractInnerRef for edenapifilestore {
-    type Inner = Arc<EdenApiFileStore>;
+    type Inner = Arc<SaplingRemoteApiFileStore>;
 
     fn extract_inner_ref<'a>(&'a self, py: Python<'a>) -> &'a Self::Inner {
         self.remote(py)
     }
 }
 
-// Python wrapper around an EdenAPI-backed remote store for trees.
+// Python wrapper around an SaplingRemoteAPI-backed remote store for trees.
 //
-// This type exists for the sole purpose of allowing an `EdenApiTreeStore`
+// This type exists for the sole purpose of allowing an `SaplingRemoteApiTreeStore`
 // to be passed from Rust to Python and back into Rust. It cannot be created
 // by Python code and does not expose any functionality to Python.
 py_class!(pub class edenapitreestore |py| {
-    data remote: Arc<EdenApiTreeStore>;
+    data remote: Arc<SaplingRemoteApiTreeStore>;
 });
 
 impl edenapitreestore {
-    pub fn new(py: Python, remote: Arc<EdenApiTreeStore>) -> PyResult<Self> {
+    pub fn new(py: Python, remote: Arc<SaplingRemoteApiTreeStore>) -> PyResult<Self> {
         edenapitreestore::create_instance(py, remote)
     }
 }
 
 impl ExtractInnerRef for edenapitreestore {
-    type Inner = Arc<EdenApiTreeStore>;
+    type Inner = Arc<SaplingRemoteApiTreeStore>;
 
     fn extract_inner_ref<'a>(&'a self, py: Python<'a>) -> &'a Self::Inner {
         self.remote(py)
@@ -1046,11 +989,6 @@ py_class!(pub class contentstore |py| {
         store.metadata_py(py, name, node)
     }
 
-    def getloggedfetches(&self) -> PyResult<Vec<PyPathBuf>> {
-        let store = self.store(py);
-        Ok(store.get_logged_fetches().into_iter().map(|p| p.into()).collect::<Vec<PyPathBuf>>())
-    }
-
     def getsharedmutable(&self) -> PyResult<mutabledeltastore> {
         let store = self.store(py);
         mutabledeltastore::create_instance(py, store.get_shared_mutable())
@@ -1106,6 +1044,10 @@ py_class!(class metadatastore |py| {
         self.store(py).get_node_info_py(py, &name, node)
     }
 
+    def getlocalnodeinfo(&self, name: PyPathBuf, node: &PyBytes) -> PyResult<Option<PyTuple>> {
+        self.store(py).get_local_node_info_py(py, &name, node)
+    }
+
     def getmissing(&self, keys: &PyObject) -> PyResult<PyList> {
         self.store(py).get_missing_py(py, &mut keys.iter(py)?)
     }
@@ -1144,124 +1086,15 @@ impl ExtractInnerRef for metadatastore {
     }
 }
 
-// TODO(meyer): Make this a `BoxedRwStore` (and introduce such a concept). Will need to implement write
-// for FallbackStore.
-/// Construct a file ReadStore using the provided config, optionally falling back
-/// to the provided legacy HgIdDataStore.
-fn make_filescmstore<'a>(
-    path: Option<&'a Path>,
-    config: &'a dyn Config,
-    remote: Arc<PyHgIdRemoteStore>,
-    edenapi_filestore: Option<Arc<EdenApiFileStore>>,
-    suffix: Option<String>,
-) -> Result<(Arc<FileStore>, Arc<ContentStore>)> {
-    let mut builder = ContentStoreBuilder::new(&config);
-    let mut filestore_builder = FileStoreBuilder::new(&config);
-
-    if config.get_or_default::<bool>("scmstore", "auxindexedlog")? {
-        filestore_builder = filestore_builder.store_aux_data();
-    }
-
-    builder = if let Some(path) = path {
-        filestore_builder = filestore_builder.local_path(path);
-        builder.local_path(path)
-    } else {
-        builder.no_local_store()
-    };
-
-    if let Some(ref suffix) = suffix {
-        builder = builder.suffix(suffix);
-        filestore_builder = filestore_builder.suffix(suffix);
-    }
-
-    builder = if let Some(edenapi) = edenapi_filestore {
-        filestore_builder = filestore_builder.edenapi(edenapi.clone());
-        builder.remotestore(edenapi)
-    } else {
-        builder.remotestore(remote)
-    };
-
-    let indexedlog_local = filestore_builder.build_indexedlog_local()?;
-    let indexedlog_cache = filestore_builder.build_indexedlog_cache()?;
-    let lfs_local = filestore_builder.build_lfs_local()?;
-    let lfs_cache = filestore_builder.build_lfs_cache()?;
-
-    if let Some(indexedlog_local) = indexedlog_local {
-        filestore_builder = filestore_builder.indexedlog_local(indexedlog_local.clone());
-        builder = builder.shared_indexedlog_local(indexedlog_local);
-    }
-
-    if let Some(ref cache) = indexedlog_cache {
-        filestore_builder = filestore_builder.indexedlog_cache(cache.clone());
-        builder = builder.shared_indexedlog_shared(cache.clone());
-    }
-
-    if let Some(lfs_local) = lfs_local {
-        filestore_builder = filestore_builder.lfs_local(lfs_local.clone());
-        builder = builder.shared_lfs_local(lfs_local);
-    }
-
-    if let Some(lfs_cache) = lfs_cache {
-        filestore_builder = filestore_builder.lfs_cache(lfs_cache.clone());
-        builder = builder.shared_lfs_shared(lfs_cache);
-    }
-
-    let contentstore = Arc::new(builder.build()?);
-
-    filestore_builder = filestore_builder.contentstore(contentstore.clone());
-
-    let filestore = Arc::new(filestore_builder.build()?);
-
-    Ok((filestore, contentstore))
-}
-
 py_class!(pub class filescmstore |py| {
     data store: Arc<FileStore>;
     data contentstore: Arc<ContentStore>;
-
-    def __new__(_cls,
-        path: Option<PyPathBuf>,
-        config: config,
-        remote: pyremotestore,
-        edenapi: Option<edenapifilestore> = None,
-        suffix: Option<String> = None,
-    ) -> PyResult<filescmstore> {
-        // Extract Rust Values
-        let path = path.as_ref().map(|v| v.as_path());
-        let config = config.get_cfg(py);
-        let remote = remote.extract_inner(py);
-        let edenapi = edenapi.map(|v| v.extract_inner(py));
-
-        let (filestore, contentstore) = make_filescmstore(path, &config, remote, edenapi, suffix).map_pyerr(py)?;
-
-        filescmstore::create_instance(py, filestore, contentstore)
-    }
 
     def get_contentstore(&self) -> PyResult<contentstore> {
         contentstore::create_instance(py, self.contentstore(py).clone())
     }
 
-    def test_fetch(&self, path: PyPathBuf, local: bool) -> PyResult<PyNone> {
-        let fetch_mode = if local {  FetchMode::LocalOnly } else { FetchMode::AllowRemote };
-        let keys: Vec<_> = block_on_stream(block_on(file_to_async_key_stream(path.to_path_buf())).map_pyerr(py)?).collect();
-        let fetch_result = self.store(py).fetch(keys.into_iter(), FileAttributes { content: true, aux_data: true }, fetch_mode);
-
-        let io = IO::main().map_pyerr(py)?;
-        let mut stdout = io.output();
-
-        let (found, missing, _errors) = fetch_result.consume();
-
-        for (_, file) in found.into_iter() {
-            write!(stdout, "Successfully fetched file: {:#?}\n", file).map_pyerr(py)?;
-        }
-        for (key, _) in missing.into_iter() {
-            write!(stdout, "Failed to fetch file: {:#?}\n", key).map_pyerr(py)?;
-        }
-
-        Ok(PyNone)
-    }
-
-    def fetch_contentsha256(&self, keys: PyList) -> PyResult<PyList> {
+    def fetch_content_blake3(&self, keys: PyList) -> PyResult<PyList> {
         let keys = keys
             .iter(py)
             .map(|tuple| from_tuple_to_key(py, &tuple))
@@ -1272,22 +1105,18 @@ py_class!(pub class filescmstore |py| {
         let (found, missing, _errors) = fetch_result.consume();
         // TODO(meyer): FileStoreFetch should have utility methods to various consumer cases like this (get complete, get missing, transform to Result<EntireBatch>, transform to iterator of Result<IndividualFetch>, etc)
         // For now we just error with the first incomplete key, passing on the last recorded error if any are available.
-        if let Some((key, mut errors)) = missing.into_iter().next() {
-            if let Some(err) = errors.pop() {
-                return Err(err.context(format!("failed to fetch {}, received error", key))).map_pyerr(py);
-            } else {
-                return Err(format_err!("failed to fetch {}", key)).map_pyerr(py);
-            }
+        if let Some((key, err)) = missing.into_iter().next() {
+            return Err(err.context(format!("failed to fetch {}, received error", key))).map_pyerr(py);
         }
         for (key, storefile) in found.into_iter() {
             let key_tuple = from_key_to_tuple(py, &key).into_object();
-            let content_sha256 = storefile.aux_data().map_pyerr(py)?.content_sha256;
-            let content_sha256 = PyBytes::new(py, &content_sha256.into_inner());
+            let content_blake3 = storefile.aux_data().map_pyerr(py)?.blake3;
+            let content_blake3 = PyBytes::new(py, content_blake3.as_ref());
             let result_tuple = PyTuple::new(
                 py,
                 &[
                     key_tuple,
-                    content_sha256.into_object(),
+                    content_blake3.into_object(),
                 ],
             );
             results.append(py, result_tuple.into_object());
@@ -1332,7 +1161,14 @@ py_class!(pub class filescmstore |py| {
 
     def prefetch(&self, keys: PyList) -> PyResult<PyObject> {
         let store = self.store(py);
-        store.prefetch_py(py, keys)
+
+        let keys = keys
+            .iter(py)
+            .map(|tuple| from_tuple_to_key(py, &tuple))
+            .collect::<PyResult<Vec<Key>>>()?;
+        py.allow_threads(|| FileStore::prefetch(store, keys)).map_pyerr(py)?;
+
+        Ok(Python::None(py))
     }
 
     def markforrefresh(&self) -> PyResult<PyNone> {
@@ -1355,11 +1191,6 @@ py_class!(pub class filescmstore |py| {
         store.metadata_py(py, name, node)
     }
 
-    def getloggedfetches(&self) -> PyResult<Vec<PyPathBuf>> {
-        let store = self.store(py);
-        Ok(store.get_logged_fetches().into_iter().map(|p| p.into()).collect::<Vec<PyPathBuf>>())
-    }
-
     def getmetrics(&self) -> PyResult<Vec<PyTuple>> {
         let store = self.store(py);
         Ok(store.metrics().into_iter().map(|(k, v)| {
@@ -1373,9 +1204,9 @@ py_class!(pub class filescmstore |py| {
         }).collect::<Vec<PyTuple>>())
     }
 
-    def getsharedmutable(&self) -> PyResult<mutabledeltastore> {
+    def getsharedmutable(&self) -> PyResult<Self> {
         let store = self.store(py);
-        mutabledeltastore::create_instance(py, store.get_shared_mutable())
+        Self::create_instance(py, Arc::new(store.with_shared_only()), self.contentstore(py).clone())
     }
 });
 
@@ -1395,7 +1226,7 @@ fn make_treescmstore<'a>(
     path: Option<&'a Path>,
     config: &'a dyn Config,
     remote: Arc<PyHgIdRemoteStore>,
-    edenapi_treestore: Option<Arc<EdenApiTreeStore>>,
+    edenapi_treestore: Option<Arc<SaplingRemoteApiTreeStore>>,
     filestore: Option<Arc<FileStore>>,
     suffix: Option<String>,
 ) -> Result<(Arc<TreeStore>, Arc<ContentStore>)> {
@@ -1414,7 +1245,7 @@ fn make_treescmstore<'a>(
         treestore_builder = treestore_builder.suffix(suffix);
     }
 
-    // Extract EdenApiAdapter for scmstore construction later on
+    // Extract SaplingRemoteApiAdapter for scmstore construction later on
     builder = if let Some(edenapi) = edenapi_treestore {
         treestore_builder = treestore_builder.edenapi(edenapi.clone());
         builder.remotestore(edenapi)
@@ -1477,7 +1308,7 @@ py_class!(pub class treescmstore |py| {
         edenapi: Option<edenapitreestore> = None,
         filestore: Option<filescmstore> = None,
         suffix: Option<String> = None,
-    ) -> PyResult<treescmstore> {
+    ) -> PyResult<Self> {
         // Extract Rust Values
         let path = path.as_ref().map(|v| v.as_path());
         let config = config.get_cfg(py);
@@ -1487,30 +1318,11 @@ py_class!(pub class treescmstore |py| {
 
         let (treestore, contentstore) = make_treescmstore(path, &config, remote, edenapi, filestore, suffix).map_pyerr(py)?;
 
-        treescmstore::create_instance(py, treestore, contentstore)
+        Self::create_instance(py, treestore, contentstore)
     }
 
     def get_contentstore(&self) -> PyResult<contentstore> {
         contentstore::create_instance(py, self.contentstore(py).clone())
-    }
-
-    def test_fetch(&self, path: PyPathBuf, local: bool) -> PyResult<PyNone> {
-        let fetch_mode = if local {  FetchMode::LocalOnly } else { FetchMode::AllowRemote };
-        let keys: Vec<_> = block_on_stream(block_on(file_to_async_key_stream(path.to_path_buf())).map_pyerr(py)?).collect();
-        let fetch_result = self.store(py).fetch_batch(keys.into_iter(), fetch_mode);
-
-        let io = IO::main().map_pyerr(py)?;
-        let mut stdout = io.output();
-
-        let (found, missing, _errors) = fetch_result.consume();
-        for complete in found.into_iter() {
-            write!(stdout, "Successfully fetched tree: {:#?}\n", complete).map_pyerr(py)?;
-        }
-        for incomplete in missing.into_iter() {
-            write!(stdout, "Failed to fetch tree: {:#?}\n", incomplete).map_pyerr(py)?;
-        }
-
-        Ok(PyNone)
     }
 
     def get(&self, name: PyPathBuf, node: &PyBytes) -> PyResult<PyBytes> {
@@ -1535,17 +1347,17 @@ py_class!(pub class treescmstore |py| {
 
     def getmissing(&self, keys: &PyObject) -> PyResult<PyList> {
         let store = self.store(py);
-        store.get_missing_py(py, &mut keys.iter(py)?)
+        HgIdDataStorePyExt::get_missing_py(store, py, &mut keys.iter(py)?)
     }
 
     def add(&self, name: PyPathBuf, node: &PyBytes, deltabasenode: &PyBytes, delta: &PyBytes, metadata: Option<PyDict> = None) -> PyResult<PyObject> {
         let store = self.store(py);
-        store.add_py(py, &name, node, deltabasenode, delta, metadata)
+        HgIdMutableDeltaStorePyExt::add_py(store, py, &name, node, deltabasenode, delta, metadata)
     }
 
     def flush(&self) -> PyResult<Option<Vec<PyPathBuf>>> {
         let store = self.store(py);
-        store.flush_py(py)
+        HgIdMutableDeltaStorePyExt::flush_py(store, py)
     }
 
     def prefetch(&self, keys: PyList) -> PyResult<PyObject> {
@@ -1555,7 +1367,7 @@ py_class!(pub class treescmstore |py| {
 
     def markforrefresh(&self) -> PyResult<PyNone> {
         let store = self.store(py);
-        store.refresh_py(py)
+        HgIdDataStorePyExt::refresh_py(store, py)
     }
 
     def upload(&self, keys: PyList) -> PyResult<PyList> {
@@ -1571,12 +1383,6 @@ py_class!(pub class treescmstore |py| {
     def metadata(&self, name: &PyPath, node: &PyBytes) -> PyResult<PyDict> {
         let store = self.store(py);
         store.metadata_py(py, name, node)
-    }
-
-    def getloggedfetches(&self) -> PyResult<Vec<PyPathBuf>> {
-        let _ = py;
-        // TODO(meyer): Make sure we're only supposed to be tracking fetches for files, not trees.
-        Ok(Vec::new())
     }
 
     def getsharedmutable(&self) -> PyResult<mutabledeltastore> {

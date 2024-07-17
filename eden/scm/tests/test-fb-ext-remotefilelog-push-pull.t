@@ -1,7 +1,8 @@
+#debugruntest-incompatible
   $ setconfig experimental.allowfilepeer=True
 
   $ . "$TESTDIR/library.sh"
-  $ setconfig devel.print-metrics=1 devel.skip-metrics=scmstore,watchman
+  $ setconfig devel.print-metrics= devel.skip-metrics=scmstore,watchman
 
   $ hginit master
   $ cd master
@@ -16,8 +17,7 @@
 
   $ hgcloneshallow ssh://user@dummy/master shallow -q
   1 files fetched over 1 fetches - (1 misses, 0.00% hit ratio) over *s (glob) (?)
-  { metrics : { ssh : { connections : 2,
-                        getpack : { calls : 1,  revs : 1},
+  { metrics : { ssh : { connections : 1,
                         read : { bytes : *}, (glob)
                         write : { bytes : *}}}} (glob)
   $ hgcloneshallow ssh://user@dummy/master shallow2 -q
@@ -52,7 +52,7 @@ the server supports our custom getfiles method.
                         read : { bytes : *}, (glob)
                         write : { bytes : *}}}} (glob)
 
-  $ hg up
+  $ hg up tip
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   1 files fetched over 1 fetches - (1 misses, 0.00% hit ratio) over *s (glob) (?)
 
@@ -78,10 +78,6 @@ the server supports our custom getfiles method.
   adding manifests
   adding file changes
   4 files fetched over 2 fetches - (4 misses, 0.00% hit ratio) over 0.00s (?)
-  { metrics : { ssh : { connections : 2,
-                        getpack : { calls : 2,  revs : 2},
-                        read : { bytes : *}, (glob)
-                        write : { bytes : *}}}} (glob)
 
 # pull from shallow to shallow (ssh)
 
@@ -93,12 +89,11 @@ the server supports our custom getfiles method.
   adding manifests
   adding file changes
   2 files fetched over 1 fetches - (2 misses, 0.00% hit ratio) over *s (glob) (?)
-  { metrics : { ssh : { connections : 2,
-                        getpack : { calls : 1,  revs : 1},
+  { metrics : { ssh : { connections : 1,
                         read : { bytes : *}, (glob)
                         write : { bytes : *}}}} (glob)
 
-  $ hg up
+  $ hg up tip
   3 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ cat z
   z
@@ -124,7 +119,7 @@ the server supports our custom getfiles method.
                         write : { bytes : *}}}} (glob)
 
   $ cd ../shallow2
-  $ hg up
+  $ hg up tip
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ cat a
   a

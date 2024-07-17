@@ -50,6 +50,7 @@ use crate::commands::RepoSubcommandParams;
 use crate::detail::blobstore::replace_blobconfig;
 use crate::detail::blobstore::StatsScrubHandler;
 use crate::detail::graph::EdgeType;
+use crate::detail::graph::Node;
 use crate::detail::graph::NodeType;
 use crate::detail::graph::SqlShardInfo;
 use crate::detail::log;
@@ -135,13 +136,15 @@ pub async fn setup_common<'a>(
     let mysql_options = app.mysql_options();
 
     let walk_roots = common_args.walk_roots.parse_args()?;
+    let exclude_nodes = common_args.exclude_nodes.parse_args()?;
     let mut parsed_tail_params = parse_tail_params(
         app.fb,
         &common_args.tailing,
         mysql_options,
         &repos,
         &walk_roots,
-    )?;
+    )
+    .await?;
 
     let mut per_repo = Vec::new();
     let mut error_as_data_node_types_for_all_repos = error_as_data_node_types;
@@ -223,6 +226,7 @@ pub async fn setup_common<'a>(
             repo.clone(),
             &repo_conf,
             walk_roots.clone(),
+            exclude_nodes.clone(),
             tail_params.clone(),
             include_edge_types.clone(),
             included_nodes,
@@ -240,7 +244,6 @@ pub async fn setup_common<'a>(
             quiet: common_args.quiet,
             error_as_data_node_types: error_as_data_node_types_for_all_repos,
             error_as_data_edge_types,
-            repo_count,
         },
         per_repo,
     })
@@ -353,7 +356,7 @@ fn setup_repo_factory<'a>(
     repo_factory
 }
 
-fn parse_tail_params(
+async fn parse_tail_params(
     fb: FacebookInit,
     tail_args: &TailArgs,
     mysql_options: &MysqlOptions,
@@ -366,7 +369,9 @@ fn parse_tail_params(
         let tail_params = match parsed_tail_params.get(metadatadb_config) {
             Some(tail_params) => tail_params.clone(),
             None => {
-                let tail_params = tail_args.parse_args(fb, metadatadb_config, mysql_options)?;
+                let tail_params = tail_args
+                    .parse_args(fb, metadatadb_config, mysql_options)
+                    .await?;
                 parsed_tail_params.insert(metadatadb_config.clone(), tail_params.clone());
                 tail_params
             }
@@ -395,6 +400,7 @@ async fn setup_repo<'a>(
     repo_name: String,
     repo_config: &'a RepoConfig,
     walk_roots: Vec<OutgoingEdge>,
+    exclude_nodes: HashSet<Node>,
     mut tail_params: TailParams,
     include_edge_types: HashSet<EdgeType>,
     mut include_node_types: HashSet<NodeType>,
@@ -409,7 +415,7 @@ async fn setup_repo<'a>(
 
     // Only walk derived node types that the repo is configured to contain
     include_node_types.retain(|t| {
-        if let Some(t) = t.derived_data_name() {
+        if let Some(t) = t.derived_data_type() {
             repo_config.derived_data_config.is_enabled(t)
         } else {
             true
@@ -421,7 +427,7 @@ async fn setup_repo<'a>(
 
     if let Some(ref mut chunking) = tail_params.chunking {
         chunking.chunk_by.retain(|t| {
-            if let Some(t) = t.derived_data_name() {
+            if let Some(t) = t.derived_data_type() {
                 repo_config.derived_data_config.is_enabled(t)
             } else {
                 true
@@ -478,6 +484,7 @@ async fn setup_repo<'a>(
             scheduled_max,
             sql_shard_info,
             walk_roots,
+            exclude_nodes,
             include_node_types,
             include_edge_types,
             hash_validation_node_types,

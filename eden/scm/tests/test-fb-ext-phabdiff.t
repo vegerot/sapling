@@ -1,7 +1,8 @@
 #chg-compatible
+#debugruntest-incompatible
 
   $ eagerepo
-  $ enable phabdiff
+  $ enable fbcodereview
 
 Setup repo
 
@@ -77,6 +78,7 @@ Make sure the template keywords are documented correctly
   $ hg help templates | grep -E 'phabdiff|tasks'
       phabdiff      String. Return the phabricator diff id for a given hg rev.
       tasks         String. Return the tasks associated with given hg rev.
+      blame_phabdiffid
 
 Check singlepublicbase
 

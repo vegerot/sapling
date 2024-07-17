@@ -6,6 +6,8 @@
  */
 
 #![cfg_attr(not(fbcode_build), allow(unused_crate_dependencies))]
+
+mod augmented_manifest_tests;
 mod file_history_test;
 mod tracing_blobstore;
 mod utils;
@@ -13,16 +15,16 @@ mod utils;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(fbcode_build)]
 use std::time::Duration;
 
 use ::manifest::Entry;
 use ::manifest::Manifest;
 use ::manifest::ManifestOps;
 use anyhow::Error;
-use assert_matches::assert_matches;
+#[cfg(fbcode_build)]
 use async_trait::async_trait;
 use blobrepo::BlobRepo;
-use blobrepo_errors::ErrorKind;
 use blobrepo_hg::repo_commit::compute_changed_files;
 use blobrepo_hg::repo_commit::UploadEntries;
 use blobstore::Loadable;
@@ -67,6 +69,7 @@ use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
 use mononoke_types::FileChange;
 use mononoke_types::FileContents;
+use mononoke_types::GitLfs;
 use repo_blobstore::RepoBlobstoreArc;
 use repo_blobstore::RepoBlobstoreRef;
 use scuba_ext::MononokeScubaSampleBuilder;
@@ -651,6 +654,7 @@ async fn make_file_change<'a>(
         FileType::Regular,
         content_size,
         None,
+        GitLfs::FullContent,
     ))
 }
 
@@ -780,12 +784,12 @@ async fn test_get_manifest_from_bonsai(fb: FacebookInit) {
         .expect("merge should have succeeded");
         let entries = get_entries(ms_hash).await.unwrap();
 
-        assert!(entries.get("1").is_some());
-        assert!(entries.get("2").is_some());
-        assert!(entries.get("3").is_some());
-        assert!(entries.get("4").is_some());
-        assert!(entries.get("5").is_some());
-        assert!(entries.get("base").is_none());
+        assert!(entries.contains_key("1"));
+        assert!(entries.contains_key("2"));
+        assert!(entries.contains_key("3"));
+        assert!(entries.contains_key("4"));
+        assert!(entries.contains_key("5"));
+        assert!(!entries.contains_key("base"));
 
         // check trivial merge reuse of p1. This is different to Mercurial, but still OK.
         // It biases us towards looking at p1 history for a file whose content is identical
@@ -1665,11 +1669,7 @@ mod octopus_merges {
             .map(|_| ())
             .expect_err("Derivation should fail on conflict");
 
-        assert_matches!(
-            err.downcast_ref::<ErrorKind>(),
-            Some(ErrorKind::UnresolvedConflicts(_, _))
-        );
-
+        assert!(format!("{err:?}").contains("Unresolved conflict"));
         Ok(())
     }
 
@@ -1703,10 +1703,7 @@ mod octopus_merges {
             .map(|_| ())
             .expect_err("Derivation should fail on conflict");
 
-        assert_matches!(
-            err.downcast_ref::<ErrorKind>(),
-            Some(ErrorKind::UnresolvedConflicts(_, _))
-        );
+        assert!(format!("{err:?}").contains("Unresolved conflict"));
 
         Ok(())
     }

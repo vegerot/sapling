@@ -28,12 +28,14 @@ mod tests {
     use context::CoreContext;
     use cross_repo_sync::create_commit_syncers;
     use cross_repo_sync::CommitSyncContext;
+    use cross_repo_sync::SubmoduleDeps;
     use derived_data_manager::BonsaiDerivable;
     use derived_data_utils::derived_data_utils;
     use fbinit::FacebookInit;
     use futures::stream::TryStreamExt;
     use git_types::MappedGitCommitId;
     use git_types::RootGitDeltaManifestId;
+    use git_types::RootGitDeltaManifestV2Id;
     use git_types::TreeHandle;
     use live_commit_sync_config::CfgrLiveCommitSyncConfig;
     use live_commit_sync_config::LiveCommitSyncConfig;
@@ -64,6 +66,7 @@ mod tests {
     use movers::DefaultAction;
     use movers::Mover;
     use mutable_counters::MutableCountersRef;
+    use pushredirect::PushRedirectionConfigArc;
     use repo_blobstore::RepoBlobstoreRef;
     use repo_derived_data::RepoDerivedDataArc;
     use repo_derived_data::RepoDerivedDataRef;
@@ -106,12 +109,13 @@ mod tests {
             .with_config_override(|config| {
                 let config = config
                     .derived_data_config
-                    .get_active_config()
+                    .get_active_config_mut()
                     .expect("No enabled derived data types config");
                 // Repo import has no need of these derived data types
-                config.types.remove(TreeHandle::NAME);
-                config.types.remove(MappedGitCommitId::NAME);
-                config.types.remove(RootGitDeltaManifestId::NAME);
+                config.types.remove(&TreeHandle::VARIANT);
+                config.types.remove(&MappedGitCommitId::VARIANT);
+                config.types.remove(&RootGitDeltaManifestId::VARIANT);
+                config.types.remove(&RootGitDeltaManifestV2Id::VARIANT);
             })
             .with_id(RepositoryId::new(id))
             .build()
@@ -145,6 +149,7 @@ mod tests {
             commit_author: "commit_author".to_string(),
             commit_message: "commit_message".to_string(),
             datetime: DateTime::now(),
+            mark_not_synced_mapping: None,
             imported_cs_id: None,
             shifted_bcs_ids: None,
             gitimport_bcs_ids: None,
@@ -488,14 +493,18 @@ mod tests {
         test_source.insert_to_refresh(CONFIGERATOR_PUSHREDIRECT_ENABLE.to_string());
         test_source.insert_to_refresh(CONFIGERATOR_ALL_COMMIT_SYNC_CONFIGS.to_string());
 
-        let config_store = ConfigStore::new(test_source.clone(), Duration::from_millis(2), None);
-        let live_commit_sync_config = CfgrLiveCommitSyncConfig::new(ctx.logger(), &config_store)?;
-
         let repo0 = create_repo(fb, 0).await?;
+
+        let config_store = ConfigStore::new(test_source.clone(), Duration::from_millis(2), None);
+        let live_commit_sync_config = CfgrLiveCommitSyncConfig::new_with_xdb(
+            ctx.logger(),
+            &config_store,
+            repo0.push_redirection_config_arc(),
+        )?;
 
         insert_repo_config(0, &mut repos);
         assert!(
-            get_large_repo_config_if_pushredirected(&repo0, &live_commit_sync_config, &repos)
+            get_large_repo_config_if_pushredirected(&ctx, &repo0, &live_commit_sync_config, &repos)
                 .await?
                 .is_none()
         );
@@ -504,7 +513,7 @@ mod tests {
 
         insert_repo_config(1, &mut repos);
         assert!(
-            get_large_repo_config_if_pushredirected(&repo1, &live_commit_sync_config, &repos)
+            get_large_repo_config_if_pushredirected(&ctx, &repo1, &live_commit_sync_config, &repos)
                 .await?
                 .is_some()
         );
@@ -513,7 +522,7 @@ mod tests {
 
         insert_repo_config(2, &mut repos);
         assert!(
-            get_large_repo_config_if_pushredirected(&repo2, &live_commit_sync_config, &repos)
+            get_large_repo_config_if_pushredirected(&ctx, &repo2, &live_commit_sync_config, &repos)
                 .await?
                 .is_none()
         );
@@ -528,6 +537,7 @@ mod tests {
             map: hashmap! {
                 mp("dest_path_prefix/B") => mp("random_dir/B"),
             },
+            submodule_config: Default::default(),
         }
     }
 
@@ -540,6 +550,7 @@ mod tests {
                 mp("dest_path_prefix/B") => mp("random_dir/B"),
                 mp("dest_path_prefix/C") => mp("random_dir/C"),
             },
+            submodule_config: Default::default(),
         }
     }
 
@@ -549,6 +560,7 @@ mod tests {
             map: hashmap! {
                 mp("dest_path_prefix_2") => mp("dpp2"),
             },
+            submodule_config: Default::default(),
         }
     }
 
@@ -566,10 +578,12 @@ mod tests {
                 RepositoryId::new(1) => SmallRepoPermanentConfig {
                     bookmark_prefix: AsciiString::from_str("large_repo_bookmark/")
                         .unwrap(),
+                    common_pushrebase_bookmarks_map: HashMap::new(),
                 },
                 RepositoryId::new(2) => SmallRepoPermanentConfig {
                     bookmark_prefix: AsciiString::from_str("large_repo_bookmark_2/")
                         .unwrap(),
+                    common_pushrebase_bookmarks_map: HashMap::new(),
                 },
             },
             large_repo_id: commit_sync_config.large_repo_id,
@@ -628,6 +642,7 @@ mod tests {
             &ctx,
             small_repo_1.clone(),
             large_repo.clone(),
+            SubmoduleDeps::ForSync(HashMap::new()),
             mapping.clone(),
             live_commit_sync_config.clone(),
             Arc::new(InProcessLease::new()),
@@ -654,6 +669,7 @@ mod tests {
             &ctx,
             small_repo_2.clone(),
             large_repo.clone(),
+            SubmoduleDeps::ForSync(HashMap::new()),
             mapping.clone(),
             live_commit_sync_config,
             Arc::new(InProcessLease::new()),
@@ -707,6 +723,7 @@ mod tests {
             &ctx,
             small_repo.clone(),
             large_repo.clone(),
+            SubmoduleDeps::ForSync(HashMap::new()),
             mapping.clone(),
             live_commit_sync_config,
             Arc::new(InProcessLease::new()),
@@ -744,6 +761,7 @@ mod tests {
             &combined_mover,
             &cs_ids,
             cs_ids.last().unwrap(),
+            SubmoduleDeps::ForSync(HashMap::new()),
         )
         .await?;
 
@@ -795,7 +813,7 @@ mod tests {
         let blob_repo = repo.as_blob_repo();
 
         for derived_data_type in derived_data_types {
-            let derived_utils = derived_data_utils(ctx.fb, blob_repo, derived_data_type)?;
+            let derived_utils = derived_data_utils(ctx.fb, blob_repo, *derived_data_type)?;
             let pending = derived_utils
                 .pending(ctx.clone(), repo.repo_derived_data_arc(), cs_ids.to_vec())
                 .await?;
@@ -872,6 +890,7 @@ mod tests {
             &ctx,
             small_repo.clone(),
             large_repo.clone(),
+            SubmoduleDeps::ForSync(HashMap::new()),
             mapping.clone(),
             live_commit_sync_config,
             Arc::new(InProcessLease::new()),
@@ -909,6 +928,7 @@ mod tests {
             &combined_mover,
             &cs_ids,
             cs_ids.last().unwrap(),
+            SubmoduleDeps::ForSync(HashMap::new()),
         )
         .await?;
         let small_repo_cs_ids = back_sync_commits_to_small_repo(
@@ -954,6 +974,7 @@ mod tests {
             &ctx,
             small_repo.clone(),
             large_repo.clone(),
+            SubmoduleDeps::ForSync(HashMap::new()),
             mapping.clone(),
             live_commit_sync_config,
             Arc::new(InProcessLease::new()),

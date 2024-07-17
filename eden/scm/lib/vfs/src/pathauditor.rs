@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::borrow::Cow;
 use std::fs::symlink_metadata;
 use std::path::Path;
 use std::path::PathBuf;
@@ -43,11 +44,18 @@ static INVALID_COMPONENTS: Lazy<Vec<&'static str>> = Lazy::new(|| {
         .collect()
 });
 
+// From encoding.py: These unicode characters are ignored by HFS+ (Apple Technote 1150,
+// "Unicode Subtleties"), so we need to ignore them in some places for sanity.
+const IGNORED_HFS_CHARS: [char; 16] = [
+    '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+    '\u{202e}', '\u{206a}', '\u{206b}', '\u{206c}', '\u{206d}', '\u{206e}', '\u{206f}', '\u{feff}',
+];
+
 #[derive(thiserror::Error, Debug)]
 pub enum AuditError {
-    #[error("Can't read/write file through ancestor symlink \"{0}\"")]
+    #[error("can't read/write file through ancestor symlink \"{0}\"")]
     ThroughSymlink(RepoPathBuf),
-    #[error("Invalid path component \"{0}\"")]
+    #[error("invalid path component \"{0}\"")]
     InvalidComponent(String),
 }
 
@@ -77,7 +85,7 @@ impl PathAuditor {
     /// Make sure that it is safe to write/remove `path` from the repo.
     pub fn audit(&self, path: &RepoPath) -> Result<PathBuf> {
         audit_invalid_components(path.as_str())
-            .with_context(|| format!("Invalid component in \"{}\"", path))?;
+            .with_context(|| format!("invalid component in \"{}\"", path))?;
 
         let mut needs_recording_index = std::usize::MAX;
         for (i, parent) in path.reverse_parents().enumerate() {
@@ -85,7 +93,7 @@ impl PathAuditor {
             if !self.audited.contains_key(parent) {
                 // If fast check failed, do the stat syscall.
                 self.audit_fs(parent)
-                    .with_context(|| format!("Can't audit path \"{}\"", parent))?;
+                    .with_context(|| format!("path \"{}\" failed audit", path))?;
 
                 // If it passes the audit, we can't record them as audited just yet, since a parent
                 // may still fail the audit. Later we'll loop through and record successful audits.
@@ -135,14 +143,19 @@ fn valid_windows_component(component: &str) -> bool {
 /// It also checks that no trailing dots are part of the component and checks that shortnames
 /// on Windows are valid.
 fn audit_invalid_components(path: &str) -> Result<(), AuditError> {
-    let path = if cfg!(not(windows)) {
-        path.to_owned()
+    let path: Cow<str> = if cfg!(not(windows)) {
+        Cow::Borrowed(path)
     } else {
-        path.to_lowercase()
+        Cow::Owned(path.to_lowercase())
     };
     for s in path.split(SEPARATORS) {
-        if s.is_empty() || INVALID_COMPONENTS.contains(&s) || !valid_windows_component(s) {
-            return Err(AuditError::InvalidComponent(s.to_owned()));
+        let s = if s.contains(IGNORED_HFS_CHARS) {
+            Cow::Owned(s.replace(IGNORED_HFS_CHARS, ""))
+        } else {
+            Cow::Borrowed(s)
+        };
+        if s.is_empty() || INVALID_COMPONENTS.contains(&&*s) || !valid_windows_component(&s) {
+            return Err(AuditError::InvalidComponent(s.into_owned()));
         }
     }
     Ok(())
@@ -150,9 +163,8 @@ fn audit_invalid_components(path: &str) -> Result<(), AuditError> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::create_dir_all;
-    use std::fs::read_link;
-    use std::fs::remove_dir_all;
+    #[cfg(not(windows))]
+    use std::fs;
 
     use tempfile::TempDir;
 
@@ -214,7 +226,7 @@ mod tests {
         let link = root.as_ref().join("a");
         std::os::unix::fs::symlink(&other, &link)?;
         let canonical_other = other.as_ref().canonicalize()?;
-        assert_eq!(read_link(&link)?.canonicalize()?, canonical_other);
+        assert_eq!(fs::read_link(&link)?.canonicalize()?, canonical_other);
 
         let repo_path = RepoPath::from_str("a/b")?;
         assert!(auditor.audit(repo_path).is_err());
@@ -229,7 +241,7 @@ mod tests {
         let other = TempDir::new()?;
 
         let path = root.as_ref().join("a");
-        create_dir_all(&path)?;
+        fs::create_dir_all(&path)?;
 
         let auditor = PathAuditor::new(&root);
 
@@ -237,12 +249,12 @@ mod tests {
         let repo_path = RepoPath::from_str("a/b")?;
         auditor.audit(repo_path)?;
 
-        remove_dir_all(&path)?;
+        fs::remove_dir_all(&path)?;
 
         let link = root.as_ref().join("a");
         std::os::unix::fs::symlink(&other, &link)?;
         let canonical_other = other.as_ref().canonicalize()?;
-        assert_eq!(read_link(&link)?.canonicalize()?, canonical_other);
+        assert_eq!(fs::read_link(&link)?.canonicalize()?, canonical_other);
 
         // Even though "a" is now a symlink to outside the repo, the audit will succeed due to the
         // one performed just above.

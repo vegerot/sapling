@@ -7,18 +7,18 @@
 
 import type {Operation} from './operations/Operation';
 
+import {fetchStableLocations} from './BookmarksData';
 import {Internal} from './Internal';
-import {DOCUMENTATION_DELAY, Tooltip} from './Tooltip';
-import {VSCodeButtonDropdown} from './VSCodeButtonDropdown';
 import {t, T} from './i18n';
+import {configBackedAtom} from './jotaiUtils';
 import {PullOperation} from './operations/PullOperation';
-import {persistAtomToConfigEffect} from './persistAtomToConfigEffect';
+import {useRunOperation} from './operationsState';
 import {uncommittedChangesWithPreviews, useMostRecentPendingOperation} from './previews';
-import {relativeDate, RelativeDate} from './relativeDate';
-import {latestCommitTree, useRunOperation} from './serverAPIState';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {atom, useRecoilState, useRecoilValue} from 'recoil';
-import {Icon} from 'shared/Icon';
+import {Button} from 'isl-components/Button';
+import {ButtonDropdown} from 'isl-components/ButtonDropdown';
+import {Icon} from 'isl-components/Icon';
+import {DOCUMENTATION_DELAY, Tooltip} from 'isl-components/Tooltip';
+import {useAtom, useAtomValue} from 'jotai';
 
 import './PullButton.css';
 
@@ -30,11 +30,10 @@ const DEFAULT_PULL_BUTTON = {
   tooltip: t('Fetch latest repository and branch information from remote.'),
   allowWithUncommittedChanges: true,
 };
-const pullButtonChoiceKey = atom<string>({
-  key: 'pullButtonChoiceKey',
-  default: DEFAULT_PULL_BUTTON.id,
-  effects: [persistAtomToConfigEffect('isl.pull-button-choice')],
-});
+const pullButtonChoiceKey = configBackedAtom<string>(
+  'isl.pull-button-choice',
+  DEFAULT_PULL_BUTTON.id,
+);
 
 export type PullButtonOption = {
   id: string;
@@ -47,22 +46,15 @@ export type PullButtonOption = {
 
 export function PullButton() {
   const runOperation = useRunOperation();
-  // no need to use previews here, we only need the latest commits to find the last pull timestamp.
-  const latestCommits = useRecoilValue(latestCommitTree);
-  // assuming master is getting updated frequently, last pull time should equal the newest commit in the history.
-  const lastSync =
-    latestCommits.length === 0
-      ? null
-      : Math.max(...latestCommits.map(commit => commit.info.date.valueOf()));
 
   const pullButtonOptions: Array<PullButtonOption> = [];
   pullButtonOptions.push(DEFAULT_PULL_BUTTON, ...(Internal.additionalPullOptions ?? []));
 
-  const [dropdownChoiceKey, setDropdownChoiceKey] = useRecoilState(pullButtonChoiceKey);
+  const [dropdownChoiceKey, setDropdownChoiceKey] = useAtom(pullButtonChoiceKey);
   const currentChoice =
     pullButtonOptions.find(option => option.id === dropdownChoiceKey) ?? pullButtonOptions[0];
 
-  const trackedChanges = useRecoilValue(uncommittedChangesWithPreviews).filter(
+  const trackedChanges = useAtomValue(uncommittedChangesWithPreviews).filter(
     change => change.status !== '?',
   );
   const hasUncommittedChnages = trackedChanges.length > 0;
@@ -72,12 +64,6 @@ export function PullButton() {
 
   let tooltip =
     currentChoice.tooltip +
-    (lastSync == null
-      ? ''
-      : '\n\n' +
-        t('Latest fetched commit is $date old', {
-          replace: {$date: relativeDate(lastSync, {useRelativeForm: true})},
-        })) +
     (disabledFromUncommittedChanges == false
       ? ''
       : '\n\n' + t('Disabled due to uncommitted changes.'));
@@ -91,27 +77,28 @@ export function PullButton() {
     <Tooltip placement="bottom" delayMs={DOCUMENTATION_DELAY} title={tooltip}>
       <div className="pull-info">
         {pullButtonOptions.length > 1 ? (
-          <VSCodeButtonDropdown
-            appearance="secondary"
+          <ButtonDropdown
             buttonDisabled={!!isRunningPull || disabledFromUncommittedChanges}
             options={pullButtonOptions}
-            onClick={() => runOperation(currentChoice.getOperation())}
+            onClick={() => {
+              runOperation(currentChoice.getOperation());
+              fetchStableLocations();
+            }}
             onChangeSelected={choice => setDropdownChoiceKey(choice.id)}
             selected={currentChoice}
             icon={<Icon slot="start" icon={isRunningPull ? 'loading' : 'repo'} />}
           />
         ) : (
-          <VSCodeButton
-            appearance="secondary"
+          <Button
             disabled={!!isRunningPull}
             onClick={() => {
               runOperation(new PullOperation());
+              fetchStableLocations();
             }}>
             <Icon slot="start" icon={isRunningPull ? 'loading' : 'cloud-download'} />
             <T>Pull</T>
-          </VSCodeButton>
+          </Button>
         )}
-        {lastSync && <RelativeDate date={lastSync} useShortVariant />}
       </div>
     </Tooltip>
   );

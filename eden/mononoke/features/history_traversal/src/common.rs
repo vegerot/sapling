@@ -43,6 +43,8 @@ pub(crate) async fn find_possible_mutable_ancestors(
         stream::iter(mutable_csids.into_iter().map(anyhow::Ok))
             .try_filter_map({
                 move |mutated_at| async move {
+                    // Yield to avoid long polls with large numbers of ancestors.
+                    tokio::task::yield_now().await;
                     // First, we filter out csids that cannot be reached from here. These
                     // are attached to mutable renames that are either descendants of us, or
                     // in a completely unrelated tree of history.
@@ -54,8 +56,8 @@ pub(crate) async fn find_possible_mutable_ancestors(
                         // We also want to grab generation here, because we're going to sort
                         // by generation and consider "most recent" candidate first
                         let cs_gen = repo
-                            .changeset_fetcher()
-                            .get_generation_number(ctx, mutated_at)
+                            .commit_graph()
+                            .changeset_generation(ctx, mutated_at)
                             .await?;
                         Ok(Some((cs_gen, mutated_at)))
                     } else {

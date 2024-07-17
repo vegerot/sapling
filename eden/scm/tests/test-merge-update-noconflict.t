@@ -1,8 +1,22 @@
-#debugruntest-compatible
+#testcases rustcheckout pythoncheckout pythonrustcheckout
+
+#if rustcheckout
+  $ setconfig checkout.use-rust=true
+#endif
+
+#if pythoncheckout
+  $ setconfig checkout.use-rust=false
+  $ setconfig workingcopy.rust-checkout=false
+#endif
+
+#if pythonrustcheckout
+  $ setconfig checkout.use-rust=false
+  $ setconfig workingcopy.rust-checkout=true
+#endif
 
   $ eagerepo
   $ enable amend rebase
-  $ setconfig experimental.updatecheck=noconflict
+  $ setconfig commands.update.check=noconflict
 
 Updating w/ noconflict prints the conflicting changes:
   $ newrepo
@@ -26,5 +40,5 @@ Updating w/ noconflict prints the conflicting changes:
    b
    y
    z
-  (commit, shelve, goto --clean to discard all your changes, or update --merge to merge them)
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]

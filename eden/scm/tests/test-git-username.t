@@ -1,5 +1,4 @@
-#require git
-#debugruntest-compatible
+#require git no-eden
 
 Test that we validate certain username errors.
 

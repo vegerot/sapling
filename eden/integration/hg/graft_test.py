@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 import os
 
 from eden.integration.lib import hgrepo
@@ -57,10 +59,7 @@ class GraftTest(EdenHgTestCase):
         with self.assertRaises(hgrepo.HgError) as context:
             self.hg("graft", commit2)
         self.assertIn(
-            (
-                "warning: 1 conflicts while merging first.txt!"
-                " (edit, then use 'hg resolve --mark')\n"
-            ),
+            "warning: 1 conflicts while merging first.txt!",
             str(context.exception),
         )
         self.assertIn(

@@ -1,8 +1,9 @@
-#debugruntest-compatible
+
+#require no-eden
+
   $ setconfig experimental.allowfilepeer=True
 
   $ configure modern
-  $ setconfig 'infinitepush.branchpattern=re:(^hack/.*)'
   $ newserver server
 
   $ clone server client1

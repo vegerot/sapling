@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 #if no-windows no-osx
 

@@ -4,7 +4,7 @@ sidebar_position: 30
 
 ## rebase
 <!--
-  @generated SignedSource<<ff1197d75ec90e60bab3409eeb0c4442>>
+  @generated SignedSource<<94e5e47995f103ffe84f795fb37f9ec1>>
   Run `./scripts/generate-command-markdown.py` to regenerate.
 -->
 
@@ -38,6 +38,15 @@ If `--source` or `--rev` is used, special names `SRC` and `ALLSRC`
 can be used in `--dest`. Destination would be calculated per source
 revision with `SRC` substituted by that single source revision and
 `ALLSRC` substituted by all source revisions.
+
+If multiple `--rev`s are specified, they can be paired with multiple
+`--dest`s. For example:
+
+```
+rebase -r A+B -d X -r C::E -d Y
+```
+
+will rebase `A+B` to `X`, and rebase `C::E` to `Y`.
 
 If commits that you are rebasing consist entirely of changes that are
 already present in the destination, those commits are not moved (in
@@ -100,14 +109,6 @@ sl rebase --restack
 ```
 
 Configuration Options:
-
-You can make rebase require a destination if you set the following config
-option:
-
-```
-[commands]
-rebase.requiredest = True
-```
 
 By default, rebase will close the transaction after each commit. For
 performance purposes, you can configure rebase to use a single transaction

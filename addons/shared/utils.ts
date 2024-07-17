@@ -14,7 +14,7 @@ export function notEmpty<T>(value: T | null | undefined): value is T {
 /**
  * Throw if value is `null` or `undefined`.
  */
-export function unwrap<T>(value: T | undefined | null): T {
+export function nullthrows<T>(value: T | undefined | null): T {
   if (value == null) {
     throw new Error(`expected value not to be ${value}`);
   }
@@ -83,6 +83,14 @@ export function findParentWithClassName(
     }
   }
   return undefined;
+}
+
+/**
+ * Given a multi-line string, return the first line excluding '\n'.
+ * If no newlines in the string, return the whole string.
+ */
+export function firstLine(s: string): string {
+  return s.split('\n', 1)[0];
 }
 
 /**
@@ -162,4 +170,44 @@ export function partition<T>(a: Array<T>, predicate: (item: T) => boolean): [Arr
     (predicate(item) ? passed : failed).push(item);
   }
   return [passed, failed];
+}
+
+/**
+ * Like Array.filter, but separates elements that pass from those that don't pass and return both arrays.
+ * For example, partition([1, 2, 3], n => n % 2 === 0) returns [[2], [1, 3]]
+ */
+export function group<ArrayType, BucketType extends string | number>(
+  a: ReadonlyArray<ArrayType>,
+  bucket: (item: ArrayType) => BucketType,
+): Record<BucketType, Array<ArrayType> | undefined> {
+  const result = {} as Record<BucketType, Array<ArrayType>>;
+  for (const item of a) {
+    const b = bucket(item);
+    const existing = result[b] ?? [];
+    existing.push(item);
+    result[b] = existing;
+  }
+  return result;
+}
+
+/**
+ * Split string `s` with the `sep` once.
+ * If `s` does not contain `sep`, return undefined.
+ */
+export function splitOnce(s: string, sep: string): [string, string] | undefined {
+  const index = s.indexOf(sep);
+  if (index < 0) {
+    return undefined;
+  }
+  return [s.substring(0, index), s.substring(index + sep.length)];
+}
+
+/**
+ * Like Array's .map() but for iterators.
+ * Returns a new iterator applying a function to each value in the input.
+ */
+export function* mapIterable<T, R>(iterable: Iterable<T>, mapFn: (t: T) => R): IterableIterator<R> {
+  for (const item of iterable) {
+    yield mapFn(item);
+  }
 }

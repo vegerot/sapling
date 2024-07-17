@@ -1,6 +1,5 @@
-#debugruntest-compatible
 
-#require execbit
+#require execbit no-eden
 
   $ eagerepo
   $ cat >> $HGRCPATH <<EOF

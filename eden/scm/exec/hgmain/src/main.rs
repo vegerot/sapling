@@ -42,7 +42,7 @@ fn main() {
 
     // This code path is used by `open Sapling.app` on macOS.
     #[cfg(target_os = "macos")]
-    webview_app::maybe_become_webview_app();
+    webview_app::maybe_become_webview_app(false);
 
     let mut full_args = match dispatch::args() {
         Ok(args) => args,
@@ -66,7 +66,7 @@ fn main() {
         }
     }
 
-    match full_args.get(0).map(AsRef::as_ref) {
+    match full_args.first().map(AsRef::as_ref) {
         Some("buildinfo") => {
             // This code path keeps buildinfo-related symbols alive.
             #[cfg(feature = "buildinfo")]
@@ -82,6 +82,8 @@ fn main() {
             return;
         }
         Some(name) => {
+            #[cfg(windows)]
+            let name = name.strip_suffix(".exe").unwrap_or(name);
             if name.ends_with("python") || name.ends_with("python3") {
                 // Translate to the "debugpython" command.
                 // ex. "python foo.py" => "hg debugpython -- foo.py"
@@ -105,6 +107,9 @@ fn main() {
     #[cfg(windows)]
     windows::enable_vt_processing().unwrap();
 
+    #[cfg(feature = "cas")]
+    cas_client::register_constructor(thin_cas_client::construct);
+
     let mut io = clidispatch::io::IO::stdio();
 
     let _ = io.setup_term();
@@ -115,16 +120,20 @@ fn main() {
     // you might want to delay it for chg/pfc server's case.
     // See D44048693 for example.
 
-    let mut code = hgcommands::run_command(full_args, &io);
+    let mut code = commands::run_command(full_args, &io);
     if io.flush().is_err() {
         if code == 0 {
             code = 255;
         }
     }
-    drop(io);
+
+    tracing::debug!(target: "atexit", "calling atexit from main()");
+    tracing::debug!(target: "command_info", chg="off");
 
     // Run atexit handlers.
     atexit::drop_queued();
+
+    drop(io);
 
     std::process::exit(code);
 }

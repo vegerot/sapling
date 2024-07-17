@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
   $ setconfig edenapi.url=https://test_fail/foo

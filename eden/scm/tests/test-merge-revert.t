@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Copyright (c) Mercurial Contributors.
 #
@@ -7,6 +9,7 @@
 
   $ setconfig devel.segmented-changelog-rev-compat=true
   $ eagerepo
+  $ setconfig commands.update.check=none
 
   $ hg init repo
   $ cd repo
@@ -41,7 +44,7 @@
   $ hg id
   d29c767a4b52
 
-  $ hg goto
+  $ hg goto tip
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ hg diff
   $ hg status
@@ -53,7 +56,7 @@
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ echo 'changed file1' >> file1
 
-  $ hg goto
+  $ hg goto tip
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ hg diff
   $ hg status
@@ -75,7 +78,7 @@
   $ hg id
   08a16e8e4408
 
-  $ hg goto -C
+  $ hg goto -C .
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ hg diff
   $ hg status

@@ -56,6 +56,7 @@ wordsplitter = re.compile(rb"(\t+| +|[a-zA-Z0-9_\x80-\xff]+|[^ \ta-zA-Z0-9_\x80-
 
 PatchError = error.PatchError
 
+
 # public functions
 def split(stream):
     """return an iterator of individual patches from a stream"""
@@ -998,7 +999,7 @@ class header:
     diff_re = re.compile(b"diff -r .* (.*)$")
     allhunks_re = re.compile(b"(?:index|deleted file) ")
     pretty_re = re.compile(b"(?:new file|deleted file) ")
-    special_re = re.compile(b"(?:index|deleted|copy|rename) ")
+    special_re = re.compile(b"(?:index|deleted|copy|rename|old mode|new mode) ")
     newfile_re = re.compile(b"(?:new file)")
     copyre = re.compile(b"(?:copy|rename) from (.*)$")
 
@@ -3127,7 +3128,8 @@ def trydiff(
                     header.append(b"new mode %s" % mode2)
                 if copyop is not None:
                     if opts.showsimilarity:
-                        sim = similar.score(ctx1[path1], ctx2[path2]) * 100
+                        threshold = repo.ui.configint("patch", "similarity", 1) / 100.0
+                        sim = similar.score(ctx1[path1], ctx2[path2], threshold) * 100
                         header.append(b"similarity index %d%%" % sim)
                     header.append(b"%s from %s" % (copyop, encodeutf8(path1)))
                     header.append(b"%s to %s" % (copyop, encodeutf8(path2)))

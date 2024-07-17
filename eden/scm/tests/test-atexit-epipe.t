@@ -1,4 +1,4 @@
-#require bash
+#require bash no-eden
 
   $ eagerepo
   $ cat > a.py << EOF

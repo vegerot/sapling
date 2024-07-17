@@ -7,7 +7,7 @@
 
 #pragma once
 #include <folly/Synchronized.h>
-#include <folly/experimental/StringKeyedUnorderedMap.h>
+#include <folly/container/F14Map.h>
 #include "eden/fs/store/LocalStore.h"
 
 namespace facebook::eden {
@@ -37,7 +37,7 @@ class MemoryLocalStore final : public LocalStore {
       size_t bufSize = 0) override;
 
  private:
-  folly::Synchronized<std::vector<folly::StringKeyedUnorderedMap<std::string>>>
+  folly::Synchronized<std::vector<folly::F14NodeMap<std::string, std::string>>>
       storage_;
 };
 

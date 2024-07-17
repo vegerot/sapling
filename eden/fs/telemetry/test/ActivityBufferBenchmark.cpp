@@ -5,11 +5,12 @@
  * GNU General Public License version 2.
  */
 
+#include <folly/Exception.h>
 #include <folly/File.h>
 #include <folly/init/Init.h>
 #include <folly/portability/GFlags.h>
 #include <folly/stop_watch.h>
-#include "eden/fs/utils/SpawnedProcess.h"
+#include "eden/common/utils/SpawnedProcess.h"
 
 using namespace facebook::eden;
 

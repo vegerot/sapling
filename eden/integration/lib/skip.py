@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 import os
 import sys
 import unittest
@@ -82,7 +84,6 @@ if sys.platform == "win32":
         "start_test.StartTest": True,
         "start_test.StartWithRepoTestHg": True,
         "stats_test.GenericStatsTest": [
-            "test_writing_untracked_file_bumps_write_counter",  # counter not implemented for PrjFS (T147665665)
             "test_summary_counters_available",  # counter not implemented for PrjFS (T147669123)
         ],
         "stats_test.ObjectCacheStatsTest": [
@@ -132,7 +133,10 @@ if sys.platform == "win32":
             "test_truncation_upon_open_modifies_file",
         ],
         "hg.update_test.UpdateCacheInvalidationTest": [
-            "test_changing_file_contents_creates_new_inode_and_flushes_dcache"
+            "test_changing_file_contents_creates_new_inode_and_flushes_dcache",
+            # Similar to above, this test is marked flaky on the TestX UI. To avoid
+        # the FilteredFS mixin showing up as broken, we skip it altogether.
+            "test_file_locked_removal",
         ],
         "hg.update_test.UpdateTest": [
             # TODO: A \r\n is used
@@ -153,6 +157,14 @@ if sys.platform == "win32":
             # T146967686
             "test_detect_removed_file_from_dirty_placeholder_directory",
             "test_detect_removed_file_from_placeholder_directory",
+        ],
+        # This is broken on Vanilla EdenFS but only disabled through the TestX
+        # UI. To avoid the FilteredFS mixin showing up as broken, we skip it.
+        "hg.eden_journal_test.EdenJournalTest": [
+            "test_journal_position_write",
+            "test_journal_stream_changes_since",
+            "test_journal_stream_selected_changes_since",
+            "test_journal_stream_selected_changes_since_empty_glob",
         ],
     }
 elif sys.platform.startswith("linux") and not os.path.exists("/etc/redhat-release"):
@@ -294,8 +306,19 @@ elif sys.platform.startswith("darwin"):
         # S362020: Redirect tests leave behind garbage on macOS Sandcastle hosts
         TEST_DISABLED["redirect_test.RedirectTest"] = True
 
+    # Requires sudo. We don't have access to passwordless `sudo` on macOS
+    # Sandcastle hosts, so we should disable this test.
+    TEST_DISABLED["hg.storage_engine_test.FailsToOpenLocalStoreTestWithMounts"] = [
+        "test_restart_eden_with_local_store_that_fails_to_open"
+    ]
+    TEST_DISABLED["hg.storage_engine_test.FailsToOpenLocalStoreTest"] = [
+        "test_restart_eden_with_local_store_that_fails_to_open"
+    ]
+
 
 # Windows specific tests
+# we keep them in the build graph on linux so pyre will run and disable them
+# here
 if sys.platform != "win32":
     TEST_DISABLED.update(
         {
@@ -310,6 +333,7 @@ if sys.platform != "win32":
             "projfs_enumeration.ProjFSEnumerationInsufficientBuffer": True,
             "prjfs_match_fs.PrjfsMatchFsTest": True,
             "hg.symlink_test.SymlinkWindowsDisabledTest": True,
+            "hg.update_test.PrjFSStressTornReads": True,
         }
     )
 
@@ -423,6 +447,53 @@ try:
     add_fb_specific_skips(TEST_DISABLED)
 except ImportError:
     pass
+
+
+# We temporarily need to add skips for FilteredFS mixins. Do not add FilteredFS
+# specific skips here. Add them below to FILTERED_TEST_DISABLED instead.
+FILTEREDFS_PARITY = {}
+for (class_name, value_name) in TEST_DISABLED.items():
+    if class_name.endswith("Hg"):
+        FILTEREDFS_PARITY[class_name.replace("Hg", "FilteredHg")] = value_name
+    elif not class_name.endswith("FilteredHg") and not class_name.endswith("Git"):
+        FILTEREDFS_PARITY[class_name + "FilteredHg"] = value_name
+TEST_DISABLED.update(FILTEREDFS_PARITY)
+
+# Any future FilteredHg skips should be added here
+FILTEREDFS_TEST_DISABLED = {
+    # These tests will behave the exact same on FilteredFS. Duplicating them can
+    # cause issues on macOS (too many APFS subvolumes), so we'll disable the
+    # FilteredHg variants for now.
+    "redirect_test.RedirectTest": [
+        "test_list",
+        "test_fixup_mounts_things",
+        "test_add_absolute_target",
+        "test_redirect_no_config_dir",
+        "test_unmount_unmounts_things",
+        "test_list_no_legacy_bind_mounts",
+        "test_disallow_bind_mount_outside_repo",
+    ],
+    # These tests don't make sense to run on FilteredFS since the legacy
+    # filtering method doesn't work on FilteredFS.
+    "hg.legacy_filter_test.FilterTestTreeOnly": ["test_read_dir"],
+}
+for (testModule, disabled) in FILTEREDFS_TEST_DISABLED.items():
+    # We should add skips for all combinations of FilteredHg mixins.
+    other_mixins = ["", "NFS"] if sys.platform != "win32" else ["", "InMemory"]
+    for mixin in other_mixins:
+        # We need to be careful that we don't overwrite any pre-existing lists
+        # or bulk disables that were disabled by other criteria.
+        new_class_name = testModule + mixin + "FilteredHg"
+        prev_disabled = TEST_DISABLED.get(new_class_name)
+        if prev_disabled is None:
+            # There are no previously disabled tests, we're free to bulk add
+            TEST_DISABLED[new_class_name] = disabled
+        else:
+            # If there's a list of previously disabled tests, we need to append
+            # our list. Otherwise, we can no-op since all tests (including the
+            # ones we specified) are already disabled.
+            if isinstance(prev_disabled, list):
+                TEST_DISABLED[new_class_name] = prev_disabled + disabled
 
 
 def is_class_disabled(class_name: str) -> bool:

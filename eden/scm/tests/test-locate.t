@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # Portions Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This software may be used and distributed according to the terms of the
@@ -93,7 +95,7 @@
   t/e.h
   t/x
 
-# Issue294: hg remove --after dir fails when dir.* also exists
+# Issue294: hg remove dir fails when dir.* also exists
 
   $ cd ..
   $ rm -r t

@@ -9,7 +9,6 @@
 
 use std::sync::Arc;
 
-use anyhow::format_err;
 use anyhow::Result;
 use cpython::*;
 use cpython_ext::convert::register_into;
@@ -22,10 +21,10 @@ use revisionstore::RemoteDataStore;
 use revisionstore::StoreKey;
 use revisionstore::StoreResult;
 use storemodel::minibytes::Bytes;
-use storemodel::ReadFileContents;
+use storemodel::FileStore;
+use storemodel::KeyStore;
 use storemodel::TreeStore;
 use types::Key;
-use types::Node;
 use types::RepoPath;
 
 use crate::contentstore;
@@ -45,15 +44,12 @@ pub(crate) fn register(py: Python) {
 }
 
 impl contentstore {
-    fn to_dyn_treestore(&self, py: Python) -> Arc<dyn TreeStore + Send + Sync> {
+    fn to_dyn_treestore(&self, py: Python) -> Arc<dyn TreeStore> {
         let store = self.extract_inner(py) as Arc<dyn LegacyStore>;
         Arc::new(ManifestStore::new(store))
     }
 
-    fn to_read_file_contents(
-        &self,
-        py: Python,
-    ) -> Arc<dyn ReadFileContents<Error = anyhow::Error> + Send + Sync> {
+    fn to_read_file_contents(&self, py: Python) -> Arc<dyn FileStore> {
         let store = self.extract_inner(py) as Arc<dyn LegacyStore>;
         let store = ArcRemoteDataStore(store as Arc<_>);
         Arc::new(store)
@@ -61,10 +57,7 @@ impl contentstore {
 }
 
 impl filescmstore {
-    fn to_read_file_contents(
-        &self,
-        py: Python,
-    ) -> Arc<dyn ReadFileContents<Error = anyhow::Error> + Send + Sync> {
+    fn to_read_file_contents(&self, py: Python) -> Arc<dyn FileStore> {
         let store = self.extract_inner(py);
         let store = ArcFileStore(store);
         Arc::new(store)
@@ -72,16 +65,13 @@ impl filescmstore {
 }
 
 impl pyfilescmstore {
-    fn to_read_file_contents(
-        &self,
-        py: Python,
-    ) -> Arc<dyn ReadFileContents<Error = anyhow::Error> + Send + Sync> {
+    fn to_read_file_contents(&self, py: Python) -> Arc<dyn FileStore> {
         self.extract_inner(py)
     }
 }
 
 impl treescmstore {
-    fn to_dyn_treestore(&self, py: Python) -> Arc<dyn TreeStore + Send + Sync> {
+    fn to_dyn_treestore(&self, py: Python) -> Arc<dyn TreeStore> {
         let store = self.extract_inner(py) as Arc<dyn LegacyStore>;
         Arc::new(ManifestStore::new(store))
     }
@@ -89,7 +79,7 @@ impl treescmstore {
 
 // Legacy support for store in Python.
 // XXX: Check if it's used and drop support for it.
-fn py_to_dyn_treestore(_py: Python, obj: PyObject) -> Arc<dyn TreeStore + Send + Sync> {
+fn py_to_dyn_treestore(_py: Python, obj: PyObject) -> Arc<dyn TreeStore> {
     let store = Arc::new(PythonHgIdDataStore::new(obj)) as Arc<dyn LegacyStore>;
     Arc::new(ManifestStore::new(store))
 }
@@ -104,22 +94,20 @@ impl<T> ManifestStore<T> {
     }
 }
 
-impl<T: HgIdDataStore + RemoteDataStore> TreeStore for ManifestStore<T> {
-    fn get(&self, path: &RepoPath, node: Node) -> Result<Bytes> {
+impl<T: HgIdDataStore + RemoteDataStore> KeyStore for ManifestStore<T> {
+    fn get_local_content(
+        &self,
+        path: &RepoPath,
+        node: types::HgId,
+    ) -> anyhow::Result<Option<Bytes>> {
         if node.is_null() {
-            return Ok(Default::default());
+            return Ok(Some(Default::default()));
         }
         let key = Key::new(path.to_owned(), node);
         match self.underlying.get(StoreKey::hgid(key))? {
-            StoreResult::NotFound(key) => Err(format_err!("Key {:?} not found in manifest", key)),
-            StoreResult::Found(data) => Ok(data.into()),
+            StoreResult::NotFound(_key) => Ok(None),
+            StoreResult::Found(data) => Ok(Some(data.into())),
         }
-    }
-
-    fn insert(&self, _path: &RepoPath, _node: Node, _data: Bytes) -> Result<()> {
-        unimplemented!(
-            "At this time we don't expect to ever write manifest in rust using python stores."
-        );
     }
 
     fn prefetch(&self, keys: Vec<Key>) -> Result<()> {
@@ -136,3 +124,5 @@ impl<T: HgIdDataStore + RemoteDataStore> TreeStore for ManifestStore<T> {
         self.underlying.prefetch(&keys).map(|_| ())
     }
 }
+
+impl<T: HgIdDataStore + RemoteDataStore> TreeStore for ManifestStore<T> {}

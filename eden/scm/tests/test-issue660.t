@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Copyright (c) Mercurial Contributors.
 #
@@ -9,6 +11,7 @@
 # https://bz.mercurial-scm.org/322
 
   $ setconfig devel.segmented-changelog-rev-compat=true
+  $ setconfig commands.update.check=none
   $ eagerepo
 
   $ hg init repo
@@ -34,7 +37,7 @@
 
 # Removing shadow:
 
-  $ hg rm --after a
+  $ hg rm --mark a
 
 # Should succeed - shadow removed:
 
@@ -53,7 +56,7 @@
 
 # Removing shadow:
 
-  $ hg rm --after b/b
+  $ hg rm --mark b/b
 
 # Should succeed - shadow removed:
 
@@ -138,7 +141,7 @@
 
 # Removing shadow:
 
-  $ hg rm --after d/d/d
+  $ hg rm --mark d/d/d
 
 # Should succeed - shadow removed:
 

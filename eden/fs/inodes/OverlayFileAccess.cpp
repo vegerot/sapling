@@ -14,6 +14,7 @@
 #include <folly/logging/xlog.h>
 #include <folly/portability/OpenSSL.h>
 
+#include "eden/common/utils/Bug.h"
 #include "eden/fs/digest/Blake3.h"
 #include "eden/fs/inodes/FileInode.h"
 #include "eden/fs/inodes/InodeError.h"
@@ -22,7 +23,6 @@
 #include "eden/fs/inodes/OverlayFile.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/model/Blob.h"
-#include "eden/fs/utils/Bug.h"
 #include "folly/FileUtil.h"
 
 namespace facebook::eden {
@@ -31,7 +31,7 @@ constexpr size_t kHashingBufSize = 8192;
 
 template <typename Hasher>
 int hash(Hasher&& hasher, const OverlayFile& file) {
-  FileOffset off = FileContentStore::kHeaderLength;
+  FileOffset off = FsFileContentStore::kHeaderLength;
   uint8_t buf[kHashingBufSize];
   while (true) {
     const auto ret = file.preadNoInt(&buf, sizeof(buf), off);
@@ -71,7 +71,7 @@ OverlayFileAccess::State::State(size_t cacheSize) : entries{cacheSize} {
 }
 
 OverlayFileAccess::OverlayFileAccess(Overlay* overlay, size_t cacheSize)
-    : overlay_{overlay}, state_{folly::in_place, cacheSize} {}
+    : overlay_{overlay}, state_{std::in_place, cacheSize} {}
 
 OverlayFileAccess::~OverlayFileAccess() = default;
 
@@ -133,7 +133,7 @@ FileOffset OverlayFileAccess::getFileSize(InodeNumber ino, InodeBase* inode) {
         "unable to fstat overlay file");
   }
   auto st = ret.value();
-  if (st.st_size < static_cast<FileOffset>(FileContentStore::kHeaderLength)) {
+  if (st.st_size < static_cast<FileOffset>(FsFileContentStore::kHeaderLength)) {
     // Truncated overlay files can sometimes occur after a hard reboot
     // where the overlay file data was not flushed to disk before the
     // system powered off.
@@ -146,7 +146,7 @@ FileOffset OverlayFileAccess::getFileSize(InodeNumber ino, InodeBase* inode) {
   }
 
   auto size =
-      st.st_size - static_cast<FileOffset>(FileContentStore::kHeaderLength);
+      st.st_size - static_cast<FileOffset>(FsFileContentStore::kHeaderLength);
 
   // Update the cache if the version still matches.
   auto info = entry->info.wlock();
@@ -240,12 +240,15 @@ std::string OverlayFileAccess::readAllContents(FileInode& inode) {
   // TODO: implement readFile with pread instead of lseek.
   auto info = entry->info.wlock();
 
-  auto rc = entry->file.lseek(FileContentStore::kHeaderLength, SEEK_SET);
-  if (rc.hasError()) {
-    throw InodeError(
-        rc.error(),
-        inode.inodePtrFromThis(),
-        "unable to seek in materialized FileInode");
+  // Only the LegacyInodeCatalog uses header files
+  if (overlay_->getInodeCatalogType() == InodeCatalogType::Legacy) {
+    auto rc = entry->file.lseek(FsFileContentStore::kHeaderLength, SEEK_SET);
+    if (rc.hasError()) {
+      throw InodeError(
+          rc.error(),
+          inode.inodePtrFromThis(),
+          "unable to seek in materialized FileInode");
+    }
   }
   auto result = entry->file.readFile();
 
@@ -263,7 +266,7 @@ BufVec OverlayFileAccess::read(FileInode& inode, size_t size, FileOffset off) {
 
   auto buf = folly::IOBuf::createCombined(size);
   auto res = entry->file.preadNoInt(
-      buf->writableBuffer(), size, off + FileContentStore::kHeaderLength);
+      buf->writableBuffer(), size, off + FsFileContentStore::kHeaderLength);
 
   if (res.hasError()) {
     throw InodeError(
@@ -284,7 +287,7 @@ size_t OverlayFileAccess::write(
   auto entry = getEntryForInode(inode.getNodeId());
 
   auto xfer =
-      entry->file.pwritev(iov, iovcnt, off + FileContentStore::kHeaderLength);
+      entry->file.pwritev(iov, iovcnt, off + FsFileContentStore::kHeaderLength);
   if (xfer.hasError()) {
     throw InodeError(
         xfer.error(),
@@ -299,7 +302,7 @@ size_t OverlayFileAccess::write(
 
 void OverlayFileAccess::truncate(FileInode& inode, FileOffset size) {
   auto entry = getEntryForInode(inode.getNodeId());
-  auto result = entry->file.ftruncate(size + FileContentStore::kHeaderLength);
+  auto result = entry->file.ftruncate(size + FsFileContentStore::kHeaderLength);
   if (result.hasError()) {
     throw InodeError(
         result.error(),
@@ -331,7 +334,7 @@ void OverlayFileAccess::fallocate(
     uint64_t length) {
   auto entry = getEntryForInode(inode.getNodeId());
   auto result =
-      entry->file.fallocate(offset, length + FileContentStore::kHeaderLength);
+      entry->file.fallocate(offset, length + FsFileContentStore::kHeaderLength);
   if (result.hasError()) {
     throw InodeError(
         result.error(),

@@ -6,11 +6,13 @@
  */
 
 include "fb303/thrift/fb303_core.thrift"
-include "eden/mononoke/derived_data/changeset_info/if/changeset_info_thrift.thrift"
 include "eden/mononoke/git/git_types/if/git_types_thrift.thrift"
 include "eden/mononoke/filenodes/if/filenodes.thrift"
 include "eden/mononoke/mercurial/types/if/mercurial_thrift.thrift"
-include "eden/mononoke/mononoke_types/if/mononoke_types_thrift.thrift"
+include "eden/mononoke/mononoke_types/serialization/id.thrift"
+include "eden/mononoke/mononoke_types/serialization/changeset_info.thrift"
+include "eden/mononoke/mononoke_types/serialization/bssm.thrift"
+include "eden/mononoke/mononoke_types/serialization/test_manifest.thrift"
 
 struct DerivedDataType {
   1: string type_name;
@@ -44,6 +46,7 @@ struct DeriveRequest {
   3: binary changeset_id;
   4: string config_name;
   5: DerivationType derivation_type;
+  6: optional i64 bubble_id;
 } (rust.exhaustive)
 
 struct DeriveResponse {
@@ -70,14 +73,19 @@ union DerivedData {
   12: DerivedDataBasenameSuffixSkeletonManifest basename_suffix_skeleton_manifest;
   13: DerivedDataCommitHandle commit_handle;
   14: DerivedDataGitDeltaManifest git_delta_manifest;
+  15: DerivedDataTestManifest test_manifest;
+  16: DerivedDataTestShardedManifest test_sharded_manifest;
+  17: DerivedDataBssmV3 bssm_v3;
+  18: DerivedDataHgAugmentedManifest hg_augmented_manifest;
+  19: DerivedDataGitDeltaManifestV2 git_delta_manifest_v2;
 }
 
 union DerivedDataFsnode {
-  1: mononoke_types_thrift.FsnodeId root_fsnode_id;
+  1: id.FsnodeId root_fsnode_id;
 }
 
 union DerivedDataUnode {
-  1: mononoke_types_thrift.ManifestUnodeId root_unode_manifest_id;
+  1: id.ManifestUnodeId root_unode_manifest_id;
 }
 
 union DerivedDataFilenode {
@@ -90,7 +98,7 @@ struct DerivedDataFilenodePresent {
 } (rust.exhaustive)
 
 union DerivedDataFastlog {
-  1: mononoke_types_thrift.ChangesetId root_fastlog_id;
+  1: id.ChangesetId root_fastlog_id;
 }
 
 union DerivedDataBlame {
@@ -99,7 +107,7 @@ union DerivedDataBlame {
 }
 
 struct DerivedDataRootBlameV2 {
-  1: mononoke_types_thrift.ChangesetId changeset_id;
+  1: id.ChangesetId changeset_id;
   2: DerivedDataUnode unode;
 } (rust.exhaustive)
 
@@ -108,23 +116,35 @@ union DerivedDataHgChangeset {
 }
 
 union DerivedDataChangesetInfo {
-  1: changeset_info_thrift.ChangesetInfo changeset_info;
+  1: changeset_info.ChangesetInfo changeset_info;
 }
 
 union DerivedDataDeletedManifest {
-  1: mononoke_types_thrift.DeletedManifestId root_deleted_manifest_id;
+  1: id.DeletedManifestId root_deleted_manifest_id;
 }
 
 union DerivedDataDeletedManifestV2 {
-  1: mononoke_types_thrift.DeletedManifestV2Id root_deleted_manifest_v2_id;
+  1: id.DeletedManifestV2Id root_deleted_manifest_v2_id;
 }
 
 union DerivedDataBasenameSuffixSkeletonManifest {
-  1: mononoke_types_thrift.BssmDirectory root_basename_suffix_skeleton_manifest;
+  1: bssm.BssmDirectory root_basename_suffix_skeleton_manifest;
+}
+
+union DerivedDataBssmV3 {
+  1: id.BssmV3DirectoryId root_bssm_v3_directory_id;
+}
+
+union DerivedDataTestManifest {
+  1: test_manifest.TestManifestDirectory root_test_manifest_directory;
+}
+
+union DerivedDataTestShardedManifest {
+  1: test_manifest.TestShardedManifestDirectory root_test_sharded_manifest_directory;
 }
 
 union DerivedDataSkeletonManifest {
-  1: mononoke_types_thrift.SkeletonManifestId root_skeleton_manifest_id;
+  1: id.SkeletonManifestId root_skeleton_manifest_id;
 }
 
 union DerivedDataTreeHandle {
@@ -137,6 +157,13 @@ union DerivedDataCommitHandle {
 
 union DerivedDataGitDeltaManifest {
   1: git_types_thrift.GitDeltaManifestId root_git_delta_manifest_id;
+}
+
+union DerivedDataHgAugmentedManifest {
+  1: mercurial_thrift.HgNodeHash root_hg_augmented_manifest_id;
+}
+union DerivedDataGitDeltaManifestV2 {
+  1: git_types_thrift.GitDeltaManifestV2Id root_git_delta_manifest_v2_id;
 }
 
 struct DerivedDataTypeNotEnabled {
@@ -166,6 +193,11 @@ struct DisabledDerivation {
   3: string repo_name;
 } (rust.exhaustive)
 
+struct TypeDisabledForEphemeralBubbles {
+  1: string type_name;
+  2: i32 repo_id;
+} (rust.exhaustive)
+
 struct DisabledFilenodes {} (rust.exhaustive)
 
 union RequestErrorReason {
@@ -175,6 +207,7 @@ union RequestErrorReason {
   4: UnknownDerivedDataConfig unknown_derived_data_config;
   5: UnknownDerivationType unknown_derivation_type;
   6: DisabledDerivation disabled_derivation;
+  7: TypeDisabledForEphemeralBubbles type_disabled_for_ephemeral_bubbles;
 }
 
 safe permanent client exception RequestError {

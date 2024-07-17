@@ -8,17 +8,19 @@
 #include "eden/fs/fuse/FuseChannel.h"
 
 #include <folly/Random.h>
+#include <folly/executors/GlobalExecutor.h>
 #include <folly/logging/xlog.h>
 #include <folly/portability/GTest.h>
 #include <folly/test/TestUtils.h>
 
+#include "eden/common/telemetry/NullStructuredLogger.h"
+#include "eden/common/utils/CaseSensitivity.h"
+#include "eden/common/utils/EnumValue.h"
 #include "eden/common/utils/ProcessInfoCache.h"
 #include "eden/fs/fuse/FuseDispatcher.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/testharness/FakeFuse.h"
 #include "eden/fs/testharness/TestDispatcher.h"
-#include "eden/fs/utils/CaseSensitivity.h"
-#include "eden/fs/utils/EnumValue.h"
 
 using namespace facebook::eden;
 using namespace std::chrono_literals;
@@ -73,16 +75,20 @@ class FuseChannelTest : public ::testing::Test {
         nullptr,
         fuse_.start(),
         mountPath_,
+        folly::getUnsafeMutableGlobalCPUExecutor(),
         numThreads,
         std::move(testDispatcher),
         &straceLogger,
         std::make_shared<ProcessInfoCache>(),
         /*fsEventLogger=*/nullptr,
+        /*structuredLogger=*/std::make_shared<NullStructuredLogger>(),
         std::chrono::seconds(60),
         /*notifications=*/nullptr,
         CaseSensitivity::Sensitive,
         /*requireUtf8Path=*/true,
         /*maximumBackgroundRequests=*/12,
+        /*maximumInFlightRequests=*/1000,
+        /*highFuseRequestsLogInterval=*/std::chrono::minutes{10},
         /*useWriteBackCache=*/false,
         /*fuseTraceBusCapacity*/ kTraceBusCapacity);
   }

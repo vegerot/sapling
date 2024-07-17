@@ -20,7 +20,7 @@ use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
 use derived_data_manager::DerivationContext;
-use derived_data_service_if::types as thrift;
+use derived_data_service_if as thrift;
 use filenodes::FilenodeInfo;
 use filenodes::FilenodeResult;
 use filenodes::PreparedFilenode;
@@ -112,6 +112,7 @@ impl BonsaiDerivable for FilenodesOnlyPublic {
     const VARIANT: DerivableType = DerivableType::FileNodes;
 
     type Dependencies = dependencies![MappedHgChangesetId];
+    type PredecessorDependencies = dependencies![];
 
     async fn derive_single(
         ctx: &CoreContext,
@@ -126,7 +127,6 @@ impl BonsaiDerivable for FilenodesOnlyPublic {
         ctx: &CoreContext,
         derivation_ctx: &DerivationContext,
         bonsais: Vec<BonsaiChangeset>,
-        _gap_size: Option<usize>,
     ) -> Result<HashMap<ChangesetId, Self>> {
         let filenodes = derivation_ctx.filenodes()?;
         let prepared = derive_filenodes_in_batch(ctx, derivation_ctx, bonsais).await?;
@@ -187,12 +187,6 @@ impl BonsaiDerivable for FilenodesOnlyPublic {
         derivation_ctx: &DerivationContext,
         changeset_id: ChangesetId,
     ) -> Result<Option<Self>> {
-        if tunables::tunables()
-            .filenodes_disabled()
-            .unwrap_or_default()
-        {
-            return Ok(Some(FilenodesOnlyPublic::Disabled));
-        }
         let filenode_res = fetch_root_filenode(ctx, derivation_ctx, changeset_id).await?;
         let maybe_root_filenode = match filenode_res {
             FilenodeResult::Present(maybe_root_filenode) => maybe_root_filenode,

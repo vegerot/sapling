@@ -26,6 +26,8 @@ from __future__ import absolute_import
 import collections
 import errno
 import itertools
+
+import os
 import time
 from typing import Optional
 
@@ -531,7 +533,7 @@ def _docreatecmd(ui, repo, pats, opts) -> Optional[int]:
     # it might have been created previously and shelve just
     # reuses it
     try:
-        hg.update(repo, parent.node())
+        hg.update(repo, parent.node(), updatecheck="none")
     except Exception:
         # failed to update to the original revision, which has left us on the
         # (hidden) shelve commit.  Move directly to the original commit by
@@ -572,7 +574,7 @@ def _listshelvefileinfos(repo, shelvedir):
 def cleanupcmd(ui, repo) -> None:
     """subcommand that deletes all shelves"""
     with repo.wlock():
-        for (name, _type) in _listshelvefileinfos(repo, shelvedir):
+        for name, _type in _listshelvefileinfos(repo, shelvedir):
             suffix = name.rsplit(".", 1)[-1]
             if suffix in shelvefileextensions:
                 shelvedfile(repo, name).movetobackup()
@@ -612,7 +614,7 @@ def listshelves(repo):
             raise
         return []
     info = []
-    for (name, _type) in names:
+    for name, _type in names:
         pfx, sfx = name.rsplit(".", 1)
         if not pfx or sfx != patchextension:
             continue
@@ -730,7 +732,10 @@ def mergefiles(ui, repo, wctx, shelvectx) -> None:
         # revert will overwrite unknown files, so move them out of the way
         for file in repo.status(unknown=True).unknown:
             if file in files:
-                util.rename(file, scmutil.origpath(ui, repo, file))
+                util.rename(
+                    os.path.join(repo.root, file),
+                    os.path.join(repo.root, scmutil.origpath(ui, repo, file)),
+                )
         ui.pushbuffer(True)
         cmdutil.revert(
             ui,
@@ -891,7 +896,7 @@ def _rebaserestoredcommit(
             repo,
             **{
                 "rev": [shelvectx.hex()],
-                "dest": str(tmpwctx.hex()),
+                "dest": [tmpwctx.hex()],
                 "keep": False,
                 "tool": opts.get("tool", ""),
                 "extrafn": extrafn,
@@ -1243,15 +1248,6 @@ def shelvecmd(ui, repo, *pats, **opts):
 
 
 def extsetup(ui) -> None:
-    cmdutil.unfinishedstates.append(
-        [
-            shelvedstate._filename,
-            False,
-            False,
-            _("unshelve already in progress"),
-            _("use '@prog@ unshelve --continue' or '@prog@ unshelve --abort'"),
-        ]
-    )
     cmdutil.afterresolvedstates.append(
         (shelvedstate._filename, _("@prog@ unshelve --continue"))
     )

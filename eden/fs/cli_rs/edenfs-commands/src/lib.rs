@@ -25,6 +25,7 @@ mod config;
 mod debug;
 mod du;
 mod gc;
+mod handles;
 mod list;
 mod minitop;
 mod pid;
@@ -47,7 +48,7 @@ const DEFAULT_ETC_EDEN_DIR: &str = "C:\\ProgramData\\facebook\\eden";
 
 // Used to determine whether we should gate off certain oxidized edenfsctl commands
 const ROLLOUT_JSON: &str = "edenfsctl_rollout.json";
-const EXPERIMENTAL_COMMANDS: &[&str] = &["redirect"];
+const EXPERIMENTAL_COMMANDS: &[&str] = &[];
 
 type ExitCode = i32;
 
@@ -55,25 +56,27 @@ type ExitCode = i32;
 #[clap(
     name = "edenfsctl",
     disable_version_flag = true,
-    disable_help_flag = false
+    disable_help_flag = false,
+    next_help_heading = "GLOBAL OPTIONS"
 )]
 pub struct MainCommand {
-    /// The path to the directory where edenfs stores its internal state.
+    /// Path to directory where edenfs stores its internal state
     #[clap(global = true, long, parse(from_str = expand_path))]
     config_dir: Option<PathBuf>,
 
-    /// Path to directory that holds the system configuration files.
+    /// Path to directory that holds the system configuration files
     #[clap(global = true, long, parse(from_str = expand_path))]
     etc_eden_dir: Option<PathBuf>,
 
-    /// Path to directory where .edenrc config file is stored.
+    /// Path to directory where .edenrc config file is stored
     #[clap(global = true, long, parse(from_str = expand_path))]
     home_dir: Option<PathBuf>,
 
-    /// Path to directory within a checkout.
+    /// Path to directory within a checkout
     #[clap(global = true, long, parse(from_str = expand_path), hide = true)]
     checkout_dir: Option<PathBuf>,
 
+    /// Enable debug mode (more verbose logging, traceback, etc..)
     #[clap(global = true, long)]
     pub debug: bool,
 
@@ -108,6 +111,9 @@ pub enum TopLevelSubcommand {
     PrefetchProfile(crate::prefetch_profile::PrefetchCmd),
     #[clap(subcommand, alias = "redir")]
     Redirect(crate::redirect::RedirectCmd),
+    #[cfg(target_os = "windows")]
+    Handles(crate::handles::HandlesCmd),
+    Reloadconfig(crate::config::ReloadConfigCmd),
     #[clap(alias = "health")]
     Status(crate::status::StatusCmd),
     // Top(crate::top::TopCmd),
@@ -120,6 +126,7 @@ impl TopLevelSubcommand {
 
         match self {
             Config(cmd) => cmd,
+            Reloadconfig(cmd) => cmd,
             Fsconfig(cmd) => cmd,
             Debug(cmd) => cmd,
             Du(cmd) => cmd,
@@ -129,13 +136,15 @@ impl TopLevelSubcommand {
             Pid(cmd) => cmd,
             PrefetchProfile(cmd) => cmd,
             Redirect(cmd) => cmd,
+            #[cfg(target_os = "windows")]
+            Handles(cmd) => cmd,
             Status(cmd) => cmd,
             // Top(cmd) => cmd,
             Uptime(cmd) => cmd,
         }
     }
 
-    fn name(&self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         // TODO: Is there a way to extract the subcommand's name from clap?
         // Otherwise, there is a risk of divergence with clap's own attributes.
         match self {
@@ -144,11 +153,14 @@ impl TopLevelSubcommand {
             TopLevelSubcommand::Du(_) => "du",
             TopLevelSubcommand::Fsconfig(_) => "fsconfig",
             //TopLevelSubcommand::Gc(_) => "gc",
+            #[cfg(target_os = "windows")]
+            TopLevelSubcommand::Handles(_) => "handles",
             TopLevelSubcommand::List(_) => "list",
             TopLevelSubcommand::Minitop(_) => "minitop",
             TopLevelSubcommand::Pid(_) => "pid",
             TopLevelSubcommand::PrefetchProfile(_) => "prefetch-profile",
             TopLevelSubcommand::Redirect(_) => "redirect",
+            TopLevelSubcommand::Reloadconfig(_) => "reloadconfig",
             TopLevelSubcommand::Status(_) => "status",
             //TopLevelSubcommand::Top(_) => "top",
             TopLevelSubcommand::Uptime(_) => "uptime",
@@ -219,7 +231,7 @@ impl MainCommand {
 
     /// For experimental commands, we should check whether Chef enabled the command for our shard. If not, fall back to python cli
     pub fn is_enabled(&self) -> bool {
-        is_command_enabled(self.subcommand.name(), &self.etc_eden_dir)
+        is_command_enabled_in_rust(self.subcommand.name(), &self.etc_eden_dir, &None)
     }
 
     pub fn run(self) -> Result<ExitCode> {
@@ -250,9 +262,18 @@ impl MainCommand {
     }
 }
 
-pub fn is_command_enabled(name: &str, etc_eden_dir_override: &Option<PathBuf>) -> bool {
-    is_command_enabled_in_json(name, etc_eden_dir_override)
-        .unwrap_or_else(|| !EXPERIMENTAL_COMMANDS.contains(&name))
+pub fn is_command_enabled_in_rust(
+    name: &str,
+    etc_eden_dir_override: &Option<PathBuf>,
+    experimental_commands_override: &Option<Vec<&str>>,
+) -> bool {
+    is_command_enabled_in_json(name, etc_eden_dir_override).unwrap_or_else(|| {
+        let effective_exp_commands = match experimental_commands_override {
+            Some(vec) => vec,
+            None => EXPERIMENTAL_COMMANDS,
+        };
+        !effective_exp_commands.contains(&name)
+    })
 }
 
 fn is_command_enabled_in_json(name: &str, etc_eden_dir_override: &Option<PathBuf>) -> Option<bool> {

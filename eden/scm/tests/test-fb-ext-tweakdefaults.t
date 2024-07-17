@@ -1,11 +1,21 @@
 #chg-compatible
+#debugruntest-incompatible
+
+#testcases ruststatus pythonstatus
+
+#if pythonstatus
+  $ setconfig status.use-rust=false
+#endif
 
   $ setconfig devel.segmented-changelog-rev-compat=true
   $ . "$TESTDIR/histedit-helpers.sh"
 
-  $ enable amend histedit rebase tweakdefaults
-  $ setconfig experimental.updatecheck=noconflict
+  $ enable amend histedit rebase
+  $ setconfig commands.update.check=noconflict
   $ setconfig ui.suggesthgprev=True
+
+These are the actual default values for tweakdefaults.
+  $ setconfig tweakdefaults.logdefaultfollow=true tweakdefaults.graftkeepdate=false
 
 Setup repo
 
@@ -25,6 +35,7 @@ Updating to a specific date isn't blocked by our extensions'
 
   $ hg bookmark temp
   $ hg up -d "<today"
+  hint[date-option]: --date performs a slow scan. Consider using `bsearch` revset (hg help revset) instead.
   found revision ae5108b653e2f2d15099970dec82ee0198e23d98 from Thu Jan 01 00:00:00 1970 +0000
   1 files updated, 0 files merged, 1 files removed, 0 files unresolved
   (leaving bookmark temp)
@@ -99,8 +110,9 @@ Rebase fast forwards bookmark
   
   $ hg rebase -d 'desc(b)'
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  nothing to rebase - fast-forwarded to 5e0171bd5ee2
 
-  $ hg log -G -T '{desc} {bookmarks}\n'
+  $ hg log --all -G -T '{desc} {bookmarks}\n'
   @  b mybook
   │
   o  a2
@@ -121,8 +133,9 @@ Rebase works with hyphens
   
   $ hg rebase -d hyphen-dest
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  nothing to rebase - fast-forwarded to 5e0171bd5ee2
 
-  $ hg log --all -G -T '{desc} {bookmarks}\n'
+  $ hg log -G -T '{desc} {bookmarks}\n'
   @  b hyphen-book hyphen-dest mybook
   │
   o  a2
@@ -136,7 +149,7 @@ Rebase is blocked if you have conflicting changes
   $ hg rebase -d tip
   abort: 1 conflicting file changes:
    a
-  (commit, shelve, goto --clean to discard all your changes, or update --merge to merge them)
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
   $ hg revert -q --all
   $ hg up -qC hyphen-book

@@ -1,8 +1,4 @@
-#debugruntest-compatible
 
-  $ setconfig experimental.rustmatcher=true
-
-  $ configure modernclient
   $ newclientrepo
   $ mkdir dir
   $ cd dir

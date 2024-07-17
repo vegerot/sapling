@@ -1,4 +1,7 @@
-#debugruntest-compatible
+#modern-config-incompatible
+
+#require no-eden
+
   $ setconfig experimental.nativecheckout=true
   $ newserver server
 

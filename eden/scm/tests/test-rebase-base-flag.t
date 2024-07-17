@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
 Test the "--base" flag of the rebase command. (Tests unrelated to the "--base"

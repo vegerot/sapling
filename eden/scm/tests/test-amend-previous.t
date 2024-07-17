@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
 
@@ -21,8 +23,8 @@ Check help text for new options and removal of unsupported options.
       ease.
   
       - Use the "--newest" flag to always pick the newest of multiple parents
-        commits. You can set "amend.alwaysnewest" to true in your global
-        Mercurial config file to make this the default.
+        commits. You can set "amend.alwaysnewest" to true in your global Sapling
+        config file to make this the default.
       - Use the "--merge" flag to bring along uncommitted changes to the
         destination commit.
       - Use the "--bookmark" flag to move to the first ancestor commit with a
@@ -121,7 +123,7 @@ Test bookmark navigation.
 Test bookmark activation.
   $ hg up top
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  (activating bookmark top)
+  (changing active bookmark from root to top)
   $ hg previous 3
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   (leaving bookmark top)

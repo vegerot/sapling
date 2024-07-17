@@ -1,6 +1,7 @@
-#debugruntest-compatible
 
-  $ configure modernclient
+#require no-eden
+
+
   $ setconfig clone.use-rust=true
 
   $ newrepo
@@ -47,18 +48,20 @@ Clone can create a ".sl" repo.
   00changelog.i
   config
   dirstate
+  namejournal
+  namejournal_lock.data
+  namejournal_lock.lock
   reponame
   requires
   store
   treestate
-  updateprogress
   wlock.data
   wlock.lock
 
   $ cd cloned
 Status works in ".sl" repo
   $ LOG=configloader::hg=info hg status -A
-   INFO configloader::hg: loading config repo_path=$TESTTMP/cloned
+   INFO configloader::hg: loading config repo_path=* (glob)
   C foo
   $ cd ..
 
@@ -71,7 +74,7 @@ Test repo config loading
   > bar=baz
   > EOF
   $ hg config foo.bar --debug
-  $TESTTMP/for_testing_dothg_hgrc/.hg/hgrc:2:repo: baz
+  $TESTTMP/for_testing_dothg_hgrc/.hg/hgrc:2: baz
   $ mv .hg/hgrc .hg/config
   $ hg config foo.bar --debug
   [1]
@@ -81,7 +84,7 @@ Test repo config loading
   $ sl init
   $ cp ../for_testing_dothg_hgrc/.hg/config .sl/config
   $ hg config foo.bar --debug
-  $TESTTMP/for_testing_dotsl_config/.sl/config:2:repo: baz
+  $TESTTMP/for_testing_dotsl_config/.sl/config:2: baz
   $ mv .sl/config .sl/hgrc
   $ hg config foo.bar --debug
   [1]
@@ -91,3 +94,14 @@ Test we prefer ".sl" over ".hg"
   $ mkdir .hg
   $ hg root --dotdir
   $TESTTMP/repo2/.sl
+
+Can choose flavor of dot dir using REPO_IDENTITY override:
+  $ SL_IDENTITY=sl SL_REPO_IDENTITY=hg hg version -q
+  Sapling 4.4.2_dev
+  $ SL_IDENTITY=sl SL_REPO_IDENTITY=hg newrepo
+  $ ls .hg/requires
+  .hg/requires
+Works from within a repo of the opposite flavor:
+  $ SL_REPO_IDENTITY=sl hg init foo
+  $ ls foo/.sl/requires
+  foo/.sl/requires

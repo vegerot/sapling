@@ -8,10 +8,11 @@
 #pragma once
 
 #include <tuple>
+
+#include "eden/common/utils/CaseSensitivity.h"
 #include "eden/fs/inodes/FsChannel.h"
 #include "eden/fs/nfs/Mountd.h"
 #include "eden/fs/nfs/rpc/RpcServer.h"
-#include "eden/fs/utils/CaseSensitivity.h"
 
 namespace folly {
 class Executor;
@@ -33,9 +34,8 @@ class NfsServer {
    * Create a new NFS server.
    *
    * This will handle the lifetime of the various programs involved in the NFS
-   * protocol including mountd and nfsd. The requests will be serviced by a
-   * blocking thread pool initialized with numServicingThreads and
-   * maxInflightRequests.
+   * protocol including mountd and nfsd. The requests will be serviced by the
+   * passed in threadPool.
    *
    * One mountd program will be created per NfsServer, while one nfsd program
    * will be created per-mount point, this allows nfsd program to be only aware
@@ -44,10 +44,11 @@ class NfsServer {
   NfsServer(
       PrivHelper* privHelper,
       folly::EventBase* evb,
-      uint64_t numServicingThreads,
-      uint64_t maxInflightRequests,
+      std::shared_ptr<folly::Executor> threadPool,
       bool shouldRunOurOwnRpcbindServer,
-      const std::shared_ptr<StructuredLogger>& structuredLogger);
+      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      size_t maximumInFlightRequests,
+      std::chrono::nanoseconds highNfsRequestsLogInterval);
 
   /**
    * Bind the NfsServer to the passed in socket.
@@ -124,6 +125,8 @@ class NfsServer {
   std::shared_ptr<folly::Executor> threadPool_;
   std::shared_ptr<Rpcbindd> rpcbindd_;
   Mountd mountd_;
+  size_t maximumInFlightRequests_;
+  std::chrono::nanoseconds highNfsRequestsLogInterval_;
 };
 
 } // namespace facebook::eden

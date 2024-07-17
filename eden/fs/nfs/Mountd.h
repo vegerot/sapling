@@ -13,8 +13,8 @@
 #include <folly/File.h>
 #include <folly/SocketAddress.h>
 #include <folly/futures/Future.h>
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/inodes/InodeNumber.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 namespace folly {
 class Executor;
@@ -42,7 +42,9 @@ class Mountd {
   Mountd(
       folly::EventBase* evb,
       std::shared_ptr<folly::Executor> threadPool,
-      const std::shared_ptr<StructuredLogger>& structuredLogger);
+      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      size_t maximumInFlightRequests,
+      std::chrono::nanoseconds highNfsRequestsLogInterval);
 
   /**
    * Bind the RPC mountd program to the passed in address.

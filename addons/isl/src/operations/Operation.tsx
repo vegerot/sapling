@@ -7,13 +7,12 @@
 
 import type {
   ApplyMergeConflictsPreviewsFuncType,
-  ApplyPreviewsFuncType,
   ApplyUncommittedChangesPreviewsFuncType,
+  Dag,
   MergeConflictsPreviewContext,
-  PreviewContext,
   UncommittedChangesPreviewContext,
 } from '../previews';
-import type {CommandArg} from '../types';
+import type {CommandArg, RunnableOperation} from '../types';
 import type {TrackEventName} from 'isl-server/src/analytics/eventNames';
 
 import {CommandRunner} from '../types';
@@ -51,12 +50,6 @@ export abstract class Operation {
 
   public runner: CommandRunner = CommandRunner.Sapling;
 
-  /** Used to preview how this operation would affect the tree, if you ran it. */
-  makePreviewApplier?(context: PreviewContext): ApplyPreviewsFuncType | undefined;
-
-  /** Used to show how this operation will affect the tree, after it's finished running and we get new data from hg. */
-  makeOptimisticApplier?(context: PreviewContext): ApplyPreviewsFuncType | undefined;
-
   makeOptimisticUncommittedChangesApplier?(
     context: UncommittedChangesPreviewContext,
   ): ApplyUncommittedChangesPreviewsFuncType | undefined;
@@ -64,6 +57,29 @@ export abstract class Operation {
   makeOptimisticMergeConflictsApplier?(
     context: MergeConflictsPreviewContext,
   ): ApplyMergeConflictsPreviewsFuncType | undefined;
+
+  /** Effects to `dag` before confirming the operation. */
+  previewDag(dag: Dag): Dag {
+    return dag;
+  }
+
+  /**
+   * Effects to `dag` after confirming the operation.
+   * The operation is running or queued.
+   */
+  optimisticDag(dag: Dag): Dag {
+    return dag;
+  }
+
+  getRunnableOperation(): RunnableOperation {
+    return {
+      args: this.getArgs(),
+      id: this.id,
+      stdin: this.getStdin(),
+      runner: this.runner,
+      trackEventName: this.trackEventName,
+    };
+  }
 }
 
 /** Access static opName field of an operation */

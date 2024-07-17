@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
   $ setconfig format.use-segmented-changelog=true
@@ -68,7 +70,7 @@ Test rebasing of stack after fold.
   rebasing b762560d23fd "r4"
   merging mf
   $ showgraph
-  o  c480ccdc36c0 r4
+  o  222fc5a0f200 r4
   │
   @  fac8d040c80b r2
   │
@@ -92,16 +94,16 @@ Test rebasing of multiple children
   merging mf
   rebasing fac8d040c80b "r2"
   merging mf
-  rebasing c480ccdc36c0 "r4"
+  rebasing 222fc5a0f200 "r4"
   merging mf
   $ showgraph
-  o  6b8dd87db039 r4
+  o  04e715445afa r4
   │
   o  7fd219543f4f r2
   │
-  │ o  31892267fa07 r6
+  │ o  e15c1eeca58e r6
   │ │
-  │ o  c74bb9c4eec9 r5
+  │ o  b8e7ca6ba26e r5
   ├─╯
   @  bfc9ee54b8f4 r0
 
@@ -143,15 +145,15 @@ rebase is not on the topmost folded commit.
   rebasing b762560d23fd "r4"
   merging mf
   $ showgraph
-  o  a78a744630c5 r4
+  o  ff604a92f161 r4
   │
-  o  6032a3d5c310 r3
+  o  d54ce2378978 r3
   │
-  │ o  69b8281910bd r7
+  │ o  502304268c85 r7
   │ │
-  │ o  b494e86b0fcd r6
+  │ o  1f3a3c8ab199 r6
   │ │
-  │ o  3b418b2dcaeb r5
+  │ o  c1195e9b07dc r5
   ├─╯
   @  001b0872b432 r0
 
@@ -179,9 +181,9 @@ Also test that using node hashes instead of rev numbers works.
   rebasing f2987ebe5838 "r5"
   merging mf
   $ showgraph
-  o  064f4cd2992f r5
+  o  30b9661c9b66 r5
   │
-  o  e39a86ad4ff1 r4
+  o  d093dbfa5a2b r4
   │
   o  b36e18e69785 r1
   │
@@ -193,9 +195,9 @@ Test --no-rebase flag.
   $ showgraph
   o  b431410f50a9 r1
   │
-  │ o  064f4cd2992f r5
+  │ o  30b9661c9b66 r5
   │ │
-  │ x  e39a86ad4ff1 r4
+  │ x  d093dbfa5a2b r4
   │ │
   │ x  b36e18e69785 r1
   ├─╯
@@ -289,11 +291,11 @@ Test rebase with unrelated predecessors:
   $ hg debugbuilddag -m +6
   $ hg rebase -q -r 'desc(r2)' -r 'desc(r3)' -r 'desc(r4)' -d 'desc(r0)'
   $ showgraph
-  o  657a15828ddc r4
+  o  f30478ba2a09 r4
   │
-  o  529253ee297f r3
+  o  07b1d12d566f r3
   │
-  o  04b5fa612c4e r2
+  o  3d728bfe6347 r2
   │
   │ o  f2987ebe5838 r5
   │ │
@@ -306,10 +308,10 @@ Test rebase with unrelated predecessors:
   │ o  09bb8c08de89 r1
   ├─╯
   o  fdaccbb26270 r0
-  $ hg fold -q --exact 04b5fa612c4e 529253ee297f
+  $ hg fold -q --exact 3d728bfe6347 07b1d12d566f
 Don't restack r5 since it isn't related to our fold.
   $ showgraph
-  o  5a5dfc14d0aa r4
+  o  4073cfe527c3 r4
   │
   o  f240f06c8498 r2
   │

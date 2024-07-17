@@ -8,22 +8,41 @@
 import type {CodeReviewProvider} from '../CodeReviewProvider';
 import type {Logger} from '../logger';
 import type {
+  PullRequestCommentsQueryData,
+  PullRequestCommentsQueryVariables,
+  PullRequestReviewComment,
   PullRequestReviewDecision,
+  ReactionContent,
   YourPullRequestsQueryData,
   YourPullRequestsQueryVariables,
 } from './generated/graphql';
-import type {CodeReviewSystem, DiffSignalSummary, DiffId, Disposable, Result} from 'isl/src/types';
+import type {
+  CodeReviewSystem,
+  DiffSignalSummary,
+  DiffId,
+  Disposable,
+  Result,
+  DiffComment,
+} from 'isl/src/types';
+import type {ParsedDiff} from 'shared/patch/parse';
 
-import {PullRequestState, StatusState, YourPullRequestsQuery} from './generated/graphql';
+import {
+  PullRequestCommentsQuery,
+  PullRequestState,
+  StatusState,
+  YourPullRequestsQuery,
+} from './generated/graphql';
 import queryGraphQL from './queryGraphQL';
 import {TypedEventEmitter} from 'shared/TypedEventEmitter';
 import {debounce} from 'shared/debounce';
+import {parsePatch} from 'shared/patch/parse';
+import {notEmpty} from 'shared/utils';
 
 export type GitHubDiffSummary = {
   type: 'github';
   title: string;
   commitMessage: string;
-  state: PullRequestState | 'DRAFT';
+  state: PullRequestState | 'DRAFT' | 'MERGE_QUEUED';
   number: DiffId;
   url: string;
   commentCount: number;
@@ -64,7 +83,7 @@ export class GitHubCodeReviewProvider implements CodeReviewProvider {
           // This is not very easy with github's graphql API, which doesn't allow more than 5 "OR"s in a search query.
           // But if we used one-query-per-diff we would reach rate limiting too quickly.
           searchQuery: `repo:${this.codeReviewSystem.owner}/${this.codeReviewSystem.repo} is:pr author:@me`,
-          numToFetch: 100,
+          numToFetch: 50,
         });
         if (allSummaries?.search.nodes == null) {
           this.diffSummaries.emit('data', new Map());
@@ -85,6 +104,8 @@ export class GitHubCodeReviewProvider implements CodeReviewProvider {
               state:
                 summary.isDraft && summary.state === PullRequestState.Open
                   ? 'DRAFT'
+                  : summary.mergeQueueEntry != null
+                  ? 'MERGE_QUEUED'
                   : summary.state,
               number: id,
               url: summary.url,
@@ -109,26 +130,100 @@ export class GitHubCodeReviewProvider implements CodeReviewProvider {
     /* leading */ true,
   );
 
+  public async fetchComments(diffId: string): Promise<DiffComment[]> {
+    const response = await this.query<
+      PullRequestCommentsQueryData,
+      PullRequestCommentsQueryVariables
+    >(PullRequestCommentsQuery, {
+      url: this.getPrUrl(diffId),
+      numToFetch: 50,
+    });
+
+    if (response == null) {
+      throw new Error(`Failed to fetch comments for ${diffId}`);
+    }
+
+    const pr = response?.resource as
+      | (PullRequestCommentsQueryData['resource'] & {__typename: 'PullRequest'})
+      | undefined;
+
+    const comments = pr?.comments.nodes ?? [];
+
+    const inline =
+      pr?.reviews?.nodes?.filter(notEmpty).flatMap(review => review.comments.nodes) ?? [];
+
+    this.logger.info(`fetched ${comments?.length} comments for github PR ${diffId}}`);
+
+    return (
+      [...comments, ...inline]?.filter(notEmpty).map(comment => {
+        return {
+          author: comment.author?.login ?? '',
+          authorAvatarUri: comment.author?.avatarUrl,
+          html: comment.bodyHTML,
+          created: new Date(comment.createdAt),
+          filename: (comment as PullRequestReviewComment).path ?? undefined,
+          line: (comment as PullRequestReviewComment).line ?? undefined,
+          reactions:
+            comment.reactions?.nodes
+              ?.filter(
+                (reaction): reaction is {user: {login: string}; content: ReactionContent} =>
+                  reaction?.user?.login != null,
+              )
+              .map(reaction => ({
+                name: reaction.user.login,
+                reaction: reaction.content,
+              })) ?? [],
+          replies: [], // PR top level doesn't have nested replies, you just reply to their name
+        };
+      }) ?? []
+    );
+  }
+
   private query<D, V>(query: string, variables: V): Promise<D | undefined> {
     return queryGraphQL<D, V>(query, variables, this.codeReviewSystem.hostname);
   }
 
   public dispose() {
     this.diffSummaries.removeAllListeners();
+    this.triggerDiffSummariesFetch.dispose();
   }
 
   public getSummaryName(): string {
     return `github:${this.codeReviewSystem.hostname}/${this.codeReviewSystem.owner}/${this.codeReviewSystem.repo}`;
   }
 
+  public getPrUrl(diffId: DiffId): string {
+    return `https://${this.codeReviewSystem.hostname}/${this.codeReviewSystem.owner}/${this.codeReviewSystem.repo}/pull/${diffId}`;
+  }
+
   public getDiffUrlMarkdown(diffId: DiffId): string {
-    return `[#${diffId}](https://${this.codeReviewSystem.hostname}/${this.codeReviewSystem.owner}/${this.codeReviewSystem.repo}/pull/${diffId})`;
+    return `[#${diffId}](${this.getPrUrl(diffId)})`;
   }
 
   public getCommitHashUrlMarkdown(hash: string): string {
     return `[\`${hash.slice(0, 12)}\`](https://${this.codeReviewSystem.hostname}/${
       this.codeReviewSystem.owner
     }/${this.codeReviewSystem.repo}/commit/${hash})`;
+  }
+
+  getRemoteFileURL(
+    path: string,
+    publicCommitHash: string | null,
+    selectionStart?: {line: number; char: number},
+    selectionEnd?: {line: number; char: number},
+  ): string {
+    const {hostname, owner, repo} = this.codeReviewSystem;
+    let url = `https://${hostname}/${owner}/${repo}/blob/${publicCommitHash ?? 'HEAD'}/${path}`;
+    if (selectionStart != null) {
+      url += `#L${selectionStart.line + 1}`;
+      if (
+        selectionEnd &&
+        (selectionEnd.line !== selectionStart.line || selectionEnd.char !== selectionStart.char)
+      ) {
+        url += `C${selectionStart.char + 1}-L${selectionEnd.line + 1}C${selectionEnd.char + 1}`;
+      }
+    }
+    return url;
   }
 }
 

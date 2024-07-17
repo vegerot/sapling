@@ -9,10 +9,9 @@
     "allowSyntheticDefaultImports": true,
     "strict": true,
     "forceConsistentCasingInFileNames": true,
-    "importsNotUsedAsValues": "error",
     "noFallthroughCasesInSwitch": true,
     "sourceMap": true,
-    "module": "commonjs",
+    "module": "esnext",
     "moduleResolution": "node",
     "resolveJsonModule": true,
     "isolatedModules": true
@@ -21,8 +20,8 @@
     "webview/global.d.ts",
     "extension",
     "webview",
-    "extension.webpack.config.ts",
-    "webview.webpack.config.ts",
+    "vite-env.d.ts",
+    "rollup.extension.config.mjs",
     "__mocks__"
   ]
 }

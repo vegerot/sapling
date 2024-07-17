@@ -11,7 +11,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use anyhow::bail;
 use anyhow::Context;
 use anyhow::Error;
 use atomic_counter::AtomicCounter;
@@ -47,7 +46,6 @@ use mononoke_types::NonRootMPath;
 use multimap::MultiMap;
 use slog::debug;
 use tokio::sync::Mutex;
-use tunables::tunables;
 use unodes::RootUnodeManifestId;
 
 use crate::mapping::RootDeletedManifestIdCommon;
@@ -333,15 +331,15 @@ impl<Manifest: DeletedManifestCommon> DeletedManifestDeriver<Manifest> {
         let parent_tree_unodes: Vec<(ManifestUnode, Vec<ChangesetId>)> =
             stream::iter(parents_unode_ids.iter_all())
                 .map(Ok::<_, Error>)
-                .try_filter_map(
-                    async move |(unode_entry, parent_cs_ids)| match unode_entry {
+                .try_filter_map(|(unode_entry, parent_cs_ids)| async move {
+                    match unode_entry {
                         UnodeEntry::Directory(mf_unode) => Ok(Some((
                             mf_unode.load(ctx, blobstore).await?,
                             parent_cs_ids.clone(),
                         ))),
                         _ => Ok::<_, Error>(None),
-                    },
-                )
+                    }
+                })
                 .try_collect()
                 .await?;
 
@@ -616,14 +614,14 @@ pub(crate) async fn get_changes_list(
     let parent_unodes = parent_cs_ids.into_iter().map({
         move |cs_id| async move {
             let root_mf_id = derivation_ctx
-                .derive_dependency::<RootUnodeManifestId>(ctx, cs_id)
+                .fetch_dependency::<RootUnodeManifestId>(ctx, cs_id)
                 .await?;
             Ok(root_mf_id.manifest_unode_id().clone())
         }
     });
 
     let (root_unode_mf_id, parent_mf_ids) = future::try_join(
-        derivation_ctx.derive_dependency::<RootUnodeManifestId>(ctx, bcs_id),
+        derivation_ctx.fetch_dependency::<RootUnodeManifestId>(ctx, bcs_id),
         future::try_join_all(parent_unodes),
     )
     .await?;
@@ -732,20 +730,13 @@ impl<Root: RootDeletedManifestIdCommon> RootDeletedManifestDeriver<Root> {
         ctx: &CoreContext,
         derivation_ctx: &DerivationContext,
         bonsais: Vec<BonsaiChangeset>,
-        gap_size: Option<usize>,
     ) -> Result<HashMap<ChangesetId, Root>, Error> {
-        if gap_size.is_some() {
-            bail!("Gap size not supported in deleted manifest")
-        }
         let simple_stacks =
             split_bonsais_in_linear_stacks(&bonsais, FileConflicts::AnyChange.into())?;
         let id_to_bonsai: HashMap<ChangesetId, BonsaiChangeset> = bonsais
             .into_iter()
             .map(|bonsai| (bonsai.get_changeset_id(), bonsai))
             .collect();
-        let use_new_parallel = !tunables()
-            .deleted_manifest_disable_new_parallel_derivation()
-            .unwrap_or_default();
         borrowed!(id_to_bonsai);
         // Map of ids to derived values.
         // We need to be careful to use this for self-references, since the intermediate derived
@@ -766,12 +757,7 @@ impl<Root: RootDeletedManifestIdCommon> RootDeletedManifestDeriver<Root> {
                 .map_ok(|root: Root| root.id().clone())
                 .try_collect()
                 .await?;
-            if use_new_parallel {
-                Self::derive_single_stack(ctx, derivation_ctx, bonsais, parents, &mut derived)
-                    .await?;
-            } else {
-                Self::derive_serially(ctx, derivation_ctx, bonsais, &mut derived).await?;
-            }
+            Self::derive_single_stack(ctx, derivation_ctx, bonsais, parents, &mut derived).await?;
         }
         Ok(derived)
     }
@@ -870,14 +856,14 @@ pub(crate) async fn get_unodes(
     let parent_unodes = parent_cs_ids.into_iter().map({
         move |cs_id| async move {
             let root_mf_id = derivation_ctx
-                .derive_dependency::<RootUnodeManifestId>(ctx, cs_id)
+                .fetch_dependency::<RootUnodeManifestId>(ctx, cs_id)
                 .await?;
             Ok(root_mf_id.manifest_unode_id().clone())
         }
     });
 
     let (root_unode_mf_id, parent_unodes) = future::try_join(
-        derivation_ctx.derive_dependency::<RootUnodeManifestId>(ctx, bonsai.get_changeset_id()),
+        derivation_ctx.fetch_dependency::<RootUnodeManifestId>(ctx, bonsai.get_changeset_id()),
         // We're assuming that the commits have hanful of parents in (in most
         // cases <= 2) and iterating over all of them won't be a problem.
         // (which is the case for all our current repos)
@@ -901,6 +887,7 @@ mod test {
     use tests_utils::drawdag::changes;
     use tests_utils::drawdag::create_from_dag_with_changes;
     use tests_utils::drawdag::extend_from_dag_with_changes;
+    use unodes::RootUnodeManifestId;
 
     use super::*;
     use crate::test_utils::build_repo;
@@ -982,10 +969,19 @@ mod test {
         )
         .await?;
 
+        repo.repo_derived_data()
+            .manager()
+            .derive::<RootUnodeManifestId>(
+                &ctx,
+                *commits.get("H").expect("Drawdag failed us"),
+                None,
+            )
+            .await?;
+
         borrowed!(ctx, commits);
         let blobstore: &Arc<dyn Blobstore> = &blobstore;
 
-        let derive = async move |stack: Vec<&'static str>| {
+        let derive = |stack: Vec<&'static str>| async move {
             let bonsais = future::try_join_all(stack.iter().map(|c| {
                 commits
                     .get(*c)
@@ -1023,6 +1019,7 @@ mod test {
                 r##"
                     LAST - NEW
                 "##,
+                None,
                 changes! {
                     "NEW" => |c| {
                         let c = if has1 {

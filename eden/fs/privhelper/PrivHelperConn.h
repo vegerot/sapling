@@ -11,7 +11,7 @@
 #include <folly/io/Cursor.h>
 #include <cinttypes>
 #include <stdexcept>
-#include "eden/fs/utils/UnixSocket.h"
+#include "eden/common/utils/UnixSocket.h"
 
 namespace folly {
 class File;
@@ -91,11 +91,13 @@ class PrivHelperConn {
   static UnixSocket::Message serializeMountRequest(
       uint32_t xid,
       folly::StringPiece mountPoint,
-      bool readOnly);
+      bool readOnly,
+      std::optional<folly::StringPiece> vfsType);
   static void parseMountRequest(
       folly::io::Cursor& cursor,
       std::string& mountPoint,
-      bool& readOnly);
+      bool& readOnly,
+      std::string& vfsType);
 
   static UnixSocket::Message serializeMountNfsRequest(
       uint32_t xid,

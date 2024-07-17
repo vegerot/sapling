@@ -10,6 +10,8 @@ use std::cell::RefCell;
 use std::io::Read;
 #[cfg(not(windows))]
 use std::ops::Range;
+use std::sync::mpsc::channel;
+use std::time::Duration;
 
 use quickcheck::quickcheck;
 use tempfile::tempdir;
@@ -448,7 +450,7 @@ fn test_lookup_prefix_and_range() {
     )
     .unwrap();
 
-    let entries = vec![&b"aaa"[..], b"bb", b"bb"];
+    let entries = [&b"aaa"[..], b"bb", b"bb"];
 
     for entry in entries.iter() {
         log.append(entry).unwrap();
@@ -1477,6 +1479,54 @@ fn test_clone() {
 }
 
 #[test]
+fn test_is_changed_on_disk() {
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("log");
+    let mut log1 = Log::open(&log_path, Vec::new()).unwrap();
+    let mut log2 = Log::open(&log_path, Vec::new()).unwrap();
+
+    assert!(!log1.is_changed_on_disk());
+    assert!(!log2.is_changed_on_disk());
+
+    // no-op sync() does not set is_changed().
+    log1.sync().unwrap();
+    assert!(!log2.is_changed_on_disk());
+
+    // change before flush does not set is_changed().
+    log1.append([b'a'; 10]).unwrap();
+
+    assert!(!log1.is_changed_on_disk());
+    assert!(!log2.is_changed_on_disk());
+
+    // sync() does not set is_changed().
+    log1.sync().unwrap();
+    assert!(!log1.is_changed_on_disk());
+
+    // log2 should be able to detect the on-disk change from log1.
+    assert!(log2.is_changed_on_disk());
+
+    // is_changed() does not clear is_changed().
+    assert!(log2.is_changed_on_disk());
+
+    // read-only sync() should clear is_changed().
+    log2.sync().unwrap();
+    assert!(!log2.is_changed_on_disk());
+    // ... and not set other Logs' is_changed().
+    assert!(!log1.is_changed_on_disk());
+
+    log2.append([b'a'; 10]).unwrap();
+    log2.sync().unwrap();
+
+    // log1 should be able to detect the on-disk change from log2.
+    assert!(log1.is_changed_on_disk());
+
+    // read-write sync() should clear is_changed().
+    log1.append([b'a'; 10]).unwrap();
+    log1.sync().unwrap();
+    assert!(!log1.is_changed_on_disk());
+}
+
+#[test]
 fn test_multithread_sync() {
     let dir = tempdir().unwrap();
 
@@ -1558,6 +1608,36 @@ fn test_multithread_sync() {
     let log = open_opts.open(dir.path()).unwrap();
     let count = log.iter().count() as u64;
     assert_eq!(count, THREAD_COUNT as u64 * WRITE_COUNT_PER_THREAD as u64);
+}
+
+#[test]
+fn test_wait_for_changes() {
+    let dir = tempdir().unwrap();
+    let (tx, rx) = channel::<i32>();
+    let mut log = Log::open(&dir, Vec::new()).unwrap();
+
+    let mut wait = crate::log::Wait::from_log(&log).unwrap();
+    std::thread::spawn({
+        move || {
+            wait.wait_for_change().unwrap();
+            tx.send(101).unwrap();
+            wait.wait_for_change().unwrap();
+            tx.send(102).unwrap();
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(110));
+    assert!(rx.try_recv().is_err());
+
+    log.append(b"1").unwrap();
+    log.sync().unwrap();
+
+    assert_eq!(rx.recv().unwrap(), 101);
+
+    log.append(b"2").unwrap();
+    log.sync().unwrap();
+
+    assert_eq!(rx.recv().unwrap(), 102);
 }
 
 fn index_ref(data: &[u8]) -> Vec<IndexOutput> {

@@ -1,5 +1,4 @@
-#require git no-windows execbit
-#debugruntest-compatible
+#require git no-windows execbit no-eden
 
   $ . $TESTDIR/git.sh
 

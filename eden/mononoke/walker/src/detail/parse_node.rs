@@ -16,9 +16,9 @@ use mononoke_types::hash::Blake3;
 use mononoke_types::hash::GitSha1;
 use mononoke_types::hash::Sha1;
 use mononoke_types::hash::Sha256;
+use mononoke_types::path::MPath;
 use mononoke_types::FileUnodeId;
 use mononoke_types::ManifestUnodeId;
-use mononoke_types::NonRootMPath;
 use strum::IntoEnumIterator;
 
 use crate::detail::graph::AliasKey;
@@ -43,8 +43,8 @@ fn check_and_build_path(node_type: NodeType, parts: &[&str]) -> Result<WrappedPa
         ));
     }
     let mpath = match parts[1..].join(NODE_SEP).as_str() {
-        "/" => None,
-        p => Some(NonRootMPath::new(p)?),
+        "/" => MPath::ROOT,
+        p => MPath::new(p)?,
     };
     Ok(WrappedPath::from(mpath))
 }
@@ -86,10 +86,14 @@ where
 {
     type Err = <T as FromStr>::Err;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let inner = T::from_str(s)?;
+        let (inner, filenode_known_derived) = if let Some(s) = s.strip_suffix('+') {
+            (T::from_str(s)?, true)
+        } else {
+            (T::from_str(s)?, false)
+        };
         Ok(ChangesetKey {
             inner,
-            filenode_known_derived: false,
+            filenode_known_derived,
         })
     }
 }
@@ -398,26 +402,6 @@ mod tests {
                     node_type,
                     &parse_node(&format!(
                         "SkeletonManifestMapping{}{}",
-                        NODE_SEP, SAMPLE_BLAKE2
-                    ))?
-                    .get_type()
-                );
-            }
-            NodeType::BasenameSuffixSkeletonManifest => {
-                assert_eq!(
-                    node_type,
-                    &parse_node(&format!(
-                        "BasenameSuffixSkeletonManifest{}{}",
-                        NODE_SEP, SAMPLE_BLAKE2
-                    ))?
-                    .get_type()
-                );
-            }
-            NodeType::BasenameSuffixSkeletonManifestMapping => {
-                assert_eq!(
-                    node_type,
-                    &parse_node(&format!(
-                        "BasenameSuffixSkeletonManifestMapping{}{}",
                         NODE_SEP, SAMPLE_BLAKE2
                     ))?
                     .get_type()

@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 Revert interactive tests
 1 add and commit file f

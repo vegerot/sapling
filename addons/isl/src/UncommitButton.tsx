@@ -5,31 +5,27 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import {DOCUMENTATION_DELAY, Tooltip} from './Tooltip';
 import {codeReviewProvider, diffSummary} from './codeReview/CodeReviewInfo';
 import {t, T} from './i18n';
 import {UncommitOperation} from './operations/Uncommit';
-import {latestCommitTreeMap, latestHeadCommit, useRunOperation} from './serverAPIState';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilValue} from 'recoil';
+import {useRunOperation} from './operationsState';
+import foundPlatform from './platform';
+import {dagWithPreviews} from './previews';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {DOCUMENTATION_DELAY, Tooltip} from 'isl-components/Tooltip';
+import {useAtomValue} from 'jotai';
 
 export function UncommitButton() {
-  // TODO: use treeWithPreviews instead,
-  // otherwise there's bugs with disabling this button during previews
-  const headCommit = useRecoilValue(latestHeadCommit);
-  const treeMap = useRecoilValue(latestCommitTreeMap);
+  const dag = useAtomValue(dagWithPreviews);
+  const headCommit = dag.resolve('.');
 
-  const provider = useRecoilValue(codeReviewProvider);
-  const diff = useRecoilValue(diffSummary(headCommit?.diffId));
+  const provider = useAtomValue(codeReviewProvider);
+  const diff = useAtomValue(diffSummary(headCommit?.diffId));
   const isClosed = provider != null && diff.value != null && provider?.isDiffClosed(diff.value);
 
   const runOperation = useRunOperation();
-  if (!headCommit) {
-    return null;
-  }
-
-  const headTree = treeMap.get(headCommit.hash);
-  if (!headTree || headTree.children.length) {
+  if (!headCommit || dag.children(headCommit?.hash).size > 0) {
     // if the head commit has children, we can't uncommit
     return null;
   }
@@ -43,11 +39,23 @@ export function UncommitButton() {
       title={t(
         'Remove this commit, but keep its changes as uncommitted changes, as if you never ran commit.',
       )}>
-      <VSCodeButton
-        onClick={() => runOperation(new UncommitOperation(headCommit))}
-        appearance="secondary">
+      <Button
+        onClick={async () => {
+          const confirmed = await foundPlatform.confirm(
+            t('Are you sure you want to Uncommit?'),
+            t(
+              'Uncommitting will remove this commit, but keep its changes as uncommitted changes, as if you never ran commit.',
+            ),
+          );
+          if (!confirmed) {
+            return;
+          }
+          runOperation(new UncommitOperation(headCommit));
+        }}
+        icon>
+        <Icon icon="debug-step-out" slot="start" />
         <T>Uncommit</T>
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }

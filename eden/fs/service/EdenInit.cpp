@@ -9,11 +9,11 @@
 
 #include <boost/filesystem.hpp>
 
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/UserInfo.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/TomlFileConfigSource.h"
 #include "eden/fs/eden-config.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/UserInfo.h"
 
 using folly::StringPiece;
 
@@ -37,7 +37,8 @@ namespace {
 using namespace facebook::eden;
 
 constexpr StringPiece kDefaultUserConfigFile{".edenrc"};
-constexpr StringPiece kEdenfsConfigFile{"edenfs.rc"};
+constexpr StringPiece kEdenfsSystemConfigFile{"edenfs.rc"};
+constexpr StringPiece kEdenfsDynamicConfigFile{"edenfs_dynamic.rc"};
 
 void findEdenDir(EdenConfig& config) {
   // Get the initial path to the Eden directory.
@@ -109,7 +110,10 @@ std::unique_ptr<EdenConfig> getEdenConfig(UserInfo& identity) {
         folly::exceptionStr(ex).c_str()));
   }
   const auto systemConfigPath =
-      systemConfigDir + PathComponentPiece{kEdenfsConfigFile};
+      systemConfigDir + PathComponentPiece{kEdenfsSystemConfigFile};
+
+  const auto dynamicConfigPath =
+      systemConfigDir + PathComponentPiece{kEdenfsDynamicConfigFile};
 
   const std::string configPathStr = FLAGS_configPath;
   AbsolutePath userConfigPath;
@@ -130,6 +134,9 @@ std::unique_ptr<EdenConfig> getEdenConfig(UserInfo& identity) {
   auto systemConfigSource = std::make_shared<TomlFileConfigSource>(
       systemConfigPath, ConfigSourceType::SystemConfig);
 
+  auto dynamicConfigSource = std::make_shared<TomlFileConfigSource>(
+      dynamicConfigPath, ConfigSourceType::Dynamic);
+
   auto userConfigSource = std::make_shared<TomlFileConfigSource>(
       userConfigPath, ConfigSourceType::UserConfig);
 
@@ -143,7 +150,9 @@ std::unique_ptr<EdenConfig> getEdenConfig(UserInfo& identity) {
       identity.getHomeDirectory(),
       systemConfigDir,
       EdenConfig::SourceVector{
-          std::move(systemConfigSource), std::move(userConfigSource)});
+          std::move(systemConfigSource),
+          std::move(dynamicConfigSource),
+          std::move(userConfigSource)});
 
   // Determine the location of the Eden state directory, and update this value
   // in the EdenConfig object.  This also creates the directory if it does not

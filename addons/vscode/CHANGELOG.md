@@ -1,5 +1,327 @@
 # Changelog
 
+## 0.1.53
+
+### Jul 8 2024
+
+- Handle acting on optimistic commits without errors
+- Improve how long arguments to commands are rendered
+
+## 0.1.52
+
+### Jun 24 2024
+
+- Fix extra spaces when typing in a TextField
+- Made styling of some components more consistent
+- Don't consider Untitled files as unsaved
+- Fix split confirmation buttons to the top so they can always be clicked on small screens
+- Added ability to create a bookmark from the context menu
+- Fix a crash when selecting an optimistic commit in some cases
+- Made the size of the description in the Commit Info sidebar more consistent
+
+## 0.1.51
+
+### Jun 3 2024
+
+- Fix fields in the commit info view sometimes not focusing when you start editing them
+- Pressing the spacebar while a commit field is focused will now start editing the field
+- Add a config to turn off condensing stacks of obsolete commits
+- Show unsaved files under uncommitted changes, with actions to save all
+- When committing / amending, warn if there are unsaved files that are part of the repo, with option to save all
+- Add "only fill empty fields" option when filling a commit message from a previous commit, and make this the default
+- "Open all files" now won't open generated files by default, unless all changes are to generated files
+- "Open all files" when `workbench.editor.enablePreview` is true now skips using preview mode so more than one file is opened
+- Show number of selected changes that will be amended / commit, like "2/3"
+- Add context menu option to browse your repo at a given public commit, if enabled by the `fbcodereview.code-browser-url` config
+- Similarly, add context menu action to copy a file's url when right clicking on a file, if the `fbcodereview.code-browser-url` config is set up
+- Improve colors in high contrast themes (notably lines connecting to "You are here")
+- Fix commit info view fields not always tokenizing the last token
+
+## 0.1.50
+
+### May 15 2024
+
+- Auto-mark files with conflicts as resolved when saving them
+- Show cwds as relative paths from their repo repository
+- Automatically run custom configured merge tools instead of requiring a button press
+- Fix issue where changing available workspace folders in vscode doesn't update the available cwds in ISL
+- Show Split and Edit Stack modals immediately with a loading spinner
+- Delay loading Split and Edit Stack data until running commands have finished, to prevent stale data
+- Add selection checkboxes when viewing uncommitted changes in "tree" mode
+- Add button to clear out the current commit message in the commit info view
+- Reduce truncation of long bookmarks
+- Fix left/right arrows in interactive split sometimes not moving all selected lines
+
+## 0.1.49
+
+### May 2 2024
+
+- Updates to merge conflict handling
+  - Conflicts in deleted files can now be either deleted or marked as resolved
+  - Conflicts in deleted files are shown more clearly as being deleted, and why
+  - Show the commit being rebased on top of the destination, to make it easier to understand
+    - This feature will require a new version of Sapling to work
+  - Made labels more consistent, now use the terms "Source - being rebased" and "Dest - rebasing onto" consistently
+  - Support for external merge tools, if configured. See `sl help config.merge-tools` for more information.
+  - Automatically run merge drivers before continueing a rebase
+  - Make Continue / Abort conflict buttons more prominent
+- Quickly change your cwd via a dropdown button for the Repository Info & cwd dropdown. You can still open the menu for information.
+- Increase the drag target on the right side of commits so you can more easily drag and drop rebase
+- Purge added files when partially discaring, making discard more consistent
+- Handle commits with no titles, but also prevent them from being created by split
+- Merge driver output with `\r` is rendered better in command output
+
+## 0.1.48
+
+### Apr 19 2024
+
+- Fix wrong avatar briefly showing when making a new commit
+- Throttle Watchman subscription if it's firing too often
+- Only subscribe to Watchman while ISL is open
+- Show "Follower" on commits marked as followers via `sl pr follow` (Thanks to [@rejc2](https://github.com/rejc2)!)
+
+## 0.1.47
+
+### Apr 11 2024
+
+- Allow deleting bookmarks via context menu
+- Allow scrolling the list of shelves
+
+## 0.1.46
+
+### Apr 5 2024
+
+- Fix GitHub integrations not working
+- Syntax highlighting runs in a WebWorker so it doesn't slow down the UI
+  - Clicking buttons in Interactive Split can be as much as 10x faster now
+
+## 0.1.45
+
+### Apr 4 2024
+
+- Render comments from GitHub
+  - Click the comment icon next to the PR Badge to see comments
+  - includes inline comments and suggested changes
+
+## 0.1.44
+
+### Mar 29 2024
+
+- Added Bookmarks manager
+  - If you have multiple remote bookmarks, you can control which remote bookmarks are visible
+
+## 0.1.43
+
+### Mar 26 2024
+
+- Fix VS Code diff views sometimes having an empty left side
+- Improved behavior of `goto` when downloading commits
+- Fixed focus mode not allowing drag and drop rebases outside your stack
+- Fixed focus mode showing more commits than intended
+
+## 0.1.42
+
+### Mar 13 2024
+
+- Add "Focus mode" to hide commits other than the current stack
+- Add "Apply" button to unshelve without deleting the shelved changes
+- Shift click to select ranges of commits now prefers selecting without including branching children
+- Remember the collapsed state of generated files
+- Show inline spinner next to "you are here" while goto is running
+- If commit / amend / amend message hit an error, restore your typed commit message so you can try again
+- Clear quick commit title after committing
+- Hide generated file content by default in the Split UI
+- Ensure commit titles don't shrink too much in compact mode
+- Prevent successions from persisting commit message edits to different diffs
+- Elided obsolete commits will now be shown if selected
+- Fix last run command showing '?' 5 seconds after exiting
+- Fix issues when viewing commits after writing a commit message
+- Fix "Fold down" button in "Edit Stack" not working
+
+## 0.1.41
+
+### Mar 4 2024
+
+- Fix UI not refreshing after finishing queued commands
+- Add option to use "unified" diff view mode for comparison view
+  - By default, it uses "split" diff view on wide screens, and "unified" on small screens
+- Improve behavior when reconnecting, so commands don't look like they're stuck running
+- Some rendering improvements to the comparison view
+
+## 0.1.40
+
+### Feb 26 2024
+
+- Fix persisted state not loading correctly
+- Some visual fixes for new commit rendering
+- Improve keyboard shortcuts on windows by using ctrl instead of meta
+- Thanks to [@alex-statsig](https://github.com/alex-statsig) for several contributions in this release:
+  - Add file decorations ([#717](https://github.com/facebook/sapling/issues/717))
+  - Don't auto-close drawer when window isn't loaded ([#768](https://github.com/facebook/sapling/issues/768))
+  - Add "open in code review" context menu action ([#816](https://github.com/facebook/sapling/issues/816))
+  - Show blame by default ([#817](https://github.com/facebook/sapling/issues/817))
+  - Fix commit template loading ([#821](https://github.com/facebook/sapling/issues/821))
+
+## 0.1.39
+
+### Feb 21 2024
+
+- Copy rich links to Diffs instead of plain text
+- Better error message when no folders are mounted yet
+- Hide drawers when ISL isn't loaded, to avoid showing a spinner forever
+- Detect some files as generated via regex, such as Cargo.lock files. This regex is configurable.
+- Show error notification if opening a file fails
+- Remove "undefined" in tooltip for files
+- Allow specifying a custom command to open files (outside VS Code)
+- Fix some state not persisting, such as drawer collapsed state
+- Fix dragging commits in edit stack being misaligned with the cursor
+
+## 0.1.38
+
+### Feb 9 2024
+
+- Fix vscode extension not properly loading
+
+## 0.1.37
+
+### Feb 7 2024
+
+- Fill blank commit messages from previous commits
+- Context menu option to rebase a commit
+- Close other dropdowns when opening a menu from the top bar
+- Fix opening non-text files like images
+
+## 0.1.36
+
+### Jan 30 2024
+
+- Fixed an issue where Pull button and cwd selector didn't appear in some cases
+- Updated tooltips for download menu and commit mode selector
+
+## 0.1.35
+
+### Jan 25 2024
+
+- Reduced polling frequency when ISL not visible
+- Remove arrow from "diff" icon
+- Prevent acting on obsolete commits to prevent confusing commit duplication
+- Set to amend mode when opening a commit in the sidebar
+- Make list of commits to submit scrollable
+- Show a confirmation toast when copying hashes and other data to the clipboard
+- Improve "You are here" and commit selection in high-contrast themes
+- Updated Goto tooltip
+- Improvements to split UI tracking copied files
+- Make font sizes more consistent with ISL outside of vscode
+- Experimental DAG-based renderer, hidden behind an SL config `isl.experimental-graph-renderer=1`
+
+## 0.1.34
+
+### Dec 14 2023
+
+- Multiple improvements to Interactive Split
+  - Handles binary and copied/renamed files
+  - Shows file flag changes, like making a file executable
+  - Show file status (added/removed) in file header
+  - Long filenames wrap to multiple lines and don't break up the left/right arrows
+  - Show how a file was renamed or copied
+- Don't run status refreshing commands while an operation is running, to fix lots of random files being shown.
+- Fix conflicts sometimes not being shown when they should be
+
+## 0.1.33
+
+### Dec 11 2023
+
+- Add UI zoom setting
+- Confirm when uncommitting
+- Add date to temporary commit titles
+- Increase number of uncommitted files shown at once
+- Previewing system was rewritten with several improvements, such as commits not appearing duplicated during a rebase
+
+## 0.1.32
+
+### Nov 30 2023
+
+- Added "Combine" button when selecting multiple adjacent commits in a stack, to fold them together.
+  - The combine is previewed before running, so you can adjust the combined commit message.
+- Added Bulk actions dropdown to the top bar to add actions that act on all commits at once
+  - "rebase all draft commits" button to bulk rebase onto suggested locations
+  - "clean up all" button to hide all closed commits
+  - "select all" to select all draft commits, so you can take further actions in the sidebar
+  - Added shortcut to select all commits
+- When multiple commits are selected, allow rebasing them all from the selection sidebar
+- Commit titles are no longer directly focusable, so the UI doesn't show conflicting highlights. Buttons have better Aria labels to compensate.
+- Use more consistent focus colors
+- Fix "Temporary Commit" appearing in commit title by default
+- [#781](https://github.com/facebook/sapling/pull/781): Increase width of split column on large screens
+- [#782](https://github.com/facebook/sapling/pull/782): Reduces number of PRs fetched from GitHub to improve performance
+
+## 0.1.31
+
+### Nov 16 2023
+
+- Added more keyboard shortcuts and a list of shortcuts openable via Shift-?
+- Add config for amend restacking. This now defaults to "Always" instead of "No Conflict"
+- Allow drag & drop rebase when uncommitted changes have been optimistically removed
+- Fix empty titles eating into the summary
+- Add explicit ">" button next to commits to open them in the sidebar
+- Remove duplicates from values in typeaheads
+- Simplify "Hide" context menu item for non-stack commits
+- Rewrote edited messages implementation, fixing some weird behaviors
+
+## 0.1.30
+
+### Nov 8 2023
+
+- Bulk query generated files in batches of 400, so files are sorted by status before pagination in groups of 25.
+  - Also warns if there are too many files to correctly sort in one batch.
+- Improve handling of VS Code "modern" themes
+- Update icon for warning signals to be more consistent
+- Add border to icon-style buttons
+- Press backspace to preview hiding a commit
+- Make top bar sticky as you scroll
+- Add current stack base as a suggested rebase target
+- Show all changed files in the commit's files list in the sidebar
+- Allow opening a diff view of a deleted file
+- Allow reverting added files in the head commit
+
+## 0.1.29
+
+### Oct 26 2023
+
+- Add initial support for special handling for generated files
+  - Currently checks for "&#0064;generated" in the head of any files
+  - Eventually this will also be configurable by path to look for commons files
+  - Generated files are sorted below regular files in the list of uncommitted changes,
+    and the section is collapsed by default
+  - Generated files' content is hidden by default in the comparison view
+  - Also supports _partially generated_ files by looking for "&#0064;partially-generated". These files are marked as generated, but not collapsed.
+- Improve how obsolete commits behave with operations. If a commit is already obsolete (has a newer version from some operation, such as amending), operations will act on it specifically, instead of using the latest successor. This makes drag-and-drop rebase more predicatable when dragging onto commits which are obsolete and fixes some weird behaviors.
+- Add options to goto, rebase to same public base, and rebase on top when downloading (pulling) commits
+- Remember UI layout (commit info sidebar expansion/width) when reopening the page
+- Smarter auto-collapsing of the commit info sidebar, such as when resizing the window
+- Use a teal color for missing files to differentiate them from untracked files
+- Auto-close the cwd selector when changing the cwd
+- Fix weird padding on filenames in the comparison view
+- Fix filenames like #backup# rendering incorrectly
+- Merge commit messages when using Edit Stack
+- Use your commit template when making commits with quick commit or split
+- Fix minor rendering issues
+
+## 0.1.28
+
+### Oct 12 2023
+
+- Correct files appear in commit info while `commit` is running
+- Added a slight background color to icon buttons, to distinguish them from just text
+- Add a button to open the Split UI next to the current commit
+- Make the uncommit button less noticeable
+- Fix file names overflowing in the comparison view and split view
+- Add buttons to expand/collapse all files in the comparison view
+- Add a "compact" mode config option. This makes commits not wrap onto multiple lines as early, which increases the density of commits visible at the same time.
+- Remove language setting, since it we don't yet have any other translations.
+- Improvements to file chunk selection UX
+- Fix discarding subsets of files not actually deleting them from disk
+
 ## 0.1.27
 
 ### Sep 22 2023

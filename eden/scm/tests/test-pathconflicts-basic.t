@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
 Turn on treestate
@@ -8,6 +10,7 @@ Path conflict checking is currently disabled by default because of issue5716.
 Turn it on for this test.
 
   $ setconfig experimental.merge.checkpathconflicts=True
+  $ setconfig checkout.use-rust=true
 
   $ hg init repo
   $ cd repo
@@ -53,11 +56,12 @@ Basic update - local directory conflicts with remote file
   $ mkdir a
   $ echo 3 > a/b
   $ hg up file
-  a: untracked directory conflicts with file
-  abort: untracked files in working directory differ from files in requested revision
+  abort: 1 conflicting file changes:
+   a/b
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
   $ hg up --clean file
-  1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  1 files updated, 0 files merged, 1 files removed, 0 files unresolved
   (activating bookmark file)
 
 Repo state is ok
@@ -73,28 +77,32 @@ Basic update - untracked file conflicts with remote directory
 
   $ hg up -q 'desc(base)'
   $ echo untracked > a
-  $ hg up --config merge.checkunknown=warn dir
-  a: replacing untracked file
-  1 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  (activating bookmark dir)
-  $ cat a.orig
-  untracked
-  $ rm -f a.orig
+  $ hg up dir
+  abort: 1 conflicting file changes:
+   a
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
+  [255]
 
 Basic clean update - local directory conflicts with changed remote file
 
   $ hg up -q file
+  abort: 1 conflicting file changes:
+   a
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
+  [255]
   $ rm a
   $ mkdir a
   $ echo 4 > a/b
   $ hg up file2
-  abort: *: $TESTTMP/repo/a (glob)
+  abort: 1 conflicting file changes:
   (current process runs with uid 42) (?)
   ($TESTTMP/repo/a: mode 0o52, uid 42, gid 42) (?)
   ($TESTTMP/repo: mode 0o52, uid 42, gid 42) (?)
+   a/b
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
   $ hg up --clean file2
-  1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  1 files updated, 0 files merged, 1 files removed, 0 files unresolved
   (activating bookmark file2)
 
 Repo state is ok

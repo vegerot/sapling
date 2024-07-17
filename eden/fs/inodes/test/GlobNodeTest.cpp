@@ -6,16 +6,17 @@
  */
 
 #include "eden/fs/inodes/GlobNode.h"
+#include "eden/fs/utils/GlobResult.h"
 
 #include <utility>
 
 #include <folly/Conv.h>
 #include <folly/Exception.h>
 #include <folly/Range.h>
-#include <folly/experimental/TestUtil.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 #include <folly/test/TestUtils.h>
+#include <folly/testing/TestUtil.h>
 
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/model/TestOps.h"
@@ -27,8 +28,6 @@
 using namespace facebook::eden;
 using namespace folly::string_piece_literals;
 using namespace std::chrono_literals;
-
-using GlobResult = GlobNode::GlobResult;
 
 namespace {
 constexpr folly::Duration kSmallTimeout =
@@ -43,12 +42,12 @@ constexpr folly::Duration kSmallTimeout =
 folly::Future<std::vector<GlobResult>> evaluateGlob(
     TestMount& mount,
     GlobNode& globRoot,
-    std::shared_ptr<GlobNode::PrefetchList> prefetchHashes,
+    std::shared_ptr<PrefetchList> prefetchHashes,
     const RootId& commitHash) {
   auto rootInode = mount.getTreeInode(RelativePathPiece());
   auto objectStore = mount.getEdenMount()->getObjectStore();
-  auto globResults = std::make_shared<
-      folly::Synchronized<std::vector<GlobNode::GlobResult>>>();
+  auto globResults =
+      std::make_shared<folly::Synchronized<std::vector<GlobResult>>>();
   return globRoot
       .evaluate(
           std::move(objectStore),

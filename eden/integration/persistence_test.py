@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 import os
 import sys
 from typing import Dict
@@ -60,7 +62,7 @@ class PersistenceTest(testcase.EdenRepoTest):
 
         new_stats = [os.lstat(os.path.join(self.mount, path)) for path in inode_paths]
 
-        for (path, old_stat, new_stat) in zip(inode_paths, old_stats, new_stats):
+        for path, old_stat, new_stat in zip(inode_paths, old_stats, new_stats):
             self.assertEqual(
                 old_stat.st_ino,
                 new_stat.st_ino,

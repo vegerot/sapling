@@ -16,6 +16,7 @@ use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
 use bookmarks::BookmarksRef;
+#[cfg(fbcode_build)]
 use clientinfo::ClientEntryPoint;
 #[cfg(fbcode_build)]
 use clientinfo::ClientInfo;
@@ -44,7 +45,6 @@ use slog::trace;
 use slog::Logger;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
-use tunables::force_update_tunables;
 
 use crate::connection_acceptor;
 use crate::connection_acceptor::AcceptedConnection;
@@ -202,7 +202,7 @@ where
 
         if let Some(edenapi_path_and_query) = edenapi_path_and_query {
             let pq = http::uri::PathAndQuery::from_str(edenapi_path_and_query)
-                .context("Error translating EdenAPI request path")
+                .context("Error translating SaplingRemoteAPI request path")
                 .map_err(HttpError::internal)?;
             return self.handle_eden_api_request(req, pq, body).await;
         }
@@ -235,10 +235,7 @@ where
             .context("Invalid metadata")
             .map_err(HttpError::BadRequest)?;
 
-        let zstd_level: i32 = tunables::tunables()
-            .zstd_compression_level()
-            .unwrap_or_default()
-            .try_into()
+        let zstd_level = justknobs::get_as::<i32>("scm/mononoke:zstd_compression_level", None)
             .unwrap_or_default();
         let compression = match req.headers().get(HEADER_CLIENT_COMPRESSION) {
             Some(header_value) => match header_value.as_bytes() {
@@ -344,7 +341,6 @@ where
 
         if path == "/force_update_configerator" {
             self.acceptor().config_store.force_update_configs();
-            force_update_tunables();
             return Ok(ok);
         }
 
@@ -362,7 +358,7 @@ where
         uri_parts.path_and_query = Some(pq);
 
         req.uri = Uri::from_parts(uri_parts)
-            .context("Error translating EdenAPI request")
+            .context("Error translating SaplingRemoteAPI request")
             .map_err(HttpError::internal)?;
 
         if let Err(e) = bump_qps(&req.headers, self.acceptor().qps.as_deref()) {
@@ -482,6 +478,8 @@ mod h2m {
     ) -> Result<Metadata> {
         let debug = headers.contains_key(HEADER_CLIENT_DEBUG);
 
+        let _ = conn.pending.acceptor.common_config; // Fix compiler warning in OSS build
+
         Ok(Metadata::new(
             Some(&generate_session_id().to_string()),
             (*conn.identities).clone(),
@@ -493,6 +491,7 @@ mod h2m {
                     .transpose()?)
             })?,
             Some(conn.pending.addr.ip()),
+            Some(conn.pending.addr.port()),
         )
         .await)
     }
@@ -510,6 +509,7 @@ mod h2m {
 
     const HEADER_ENCODED_CLIENT_IDENTITY: &str = "x-fb-validated-client-encoded-identity";
     const HEADER_CLIENT_IP: &str = "tfb-orig-client-ip";
+    const HEADER_CLIENT_PORT: &str = "tfb-orig-client-port";
     const HEADER_FORWARDED_CATS: &str = "x-forwarded-cats";
 
     fn metadata_populate_trusted(
@@ -552,9 +552,10 @@ mod h2m {
             try_get_cats_idents(conn.pending.acceptor.fb.clone(), headers, internal_identity)?;
 
         if is_trusted {
-            if let (Some(encoded_identities), Some(client_address)) = (
+            if let (Some(encoded_identities), Some(client_address), Some(client_port)) = (
                 headers.get(HEADER_ENCODED_CLIENT_IDENTITY),
                 headers.get(HEADER_CLIENT_IP),
+                headers.get(HEADER_CLIENT_PORT),
             ) {
                 let json_identities = percent_decode(encoded_identities.as_ref())
                     .decode_utf8()
@@ -566,6 +567,11 @@ mod h2m {
                     .to_str()?
                     .parse::<IpAddr>()
                     .context("Invalid IP Address")?;
+
+                let client_port = client_port
+                    .to_str()?
+                    .parse::<u16>()
+                    .context("Invalid client port")?;
 
                 identities.extend(cats_identities.unwrap_or_default().into_iter());
 
@@ -580,11 +586,12 @@ mod h2m {
                             .transpose()?)
                     })?,
                     Some(ip_addr),
+                    Some(client_port),
                 )
                 .await;
 
                 let client_info = client_info.unwrap_or_else(|| {
-                    ClientInfo::default_with_entry_point(ClientEntryPoint::EdenAPI)
+                    ClientInfo::default_with_entry_point(ClientEntryPoint::SaplingRemoteApi)
                 });
                 metadata.add_client_info(client_info);
 
@@ -608,11 +615,13 @@ mod h2m {
                     .transpose()?)
             })?,
             Some(conn.pending.addr.ip()),
+            Some(conn.pending.addr.port()),
         )
         .await;
 
-        let client_info = client_info
-            .unwrap_or_else(|| ClientInfo::default_with_entry_point(ClientEntryPoint::EdenAPI));
+        let client_info = client_info.unwrap_or_else(|| {
+            ClientInfo::default_with_entry_point(ClientEntryPoint::SaplingRemoteApi)
+        });
         metadata.add_client_info(client_info);
 
         Ok(metadata)

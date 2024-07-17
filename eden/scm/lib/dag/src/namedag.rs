@@ -10,11 +10,14 @@
 //! Combination of IdMap and IdDag.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env::var;
 use std::fmt;
 use std::io;
 use std::ops::Deref;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -27,6 +30,7 @@ use futures::TryStreamExt;
 use nonblocking::non_blocking_result;
 
 use crate::clone::CloneData;
+use crate::default_impl;
 use crate::errors::bug;
 use crate::errors::programming;
 use crate::errors::DagError;
@@ -77,6 +81,7 @@ use crate::Level;
 use crate::Result;
 use crate::VerLink;
 use crate::VertexListWithOptions;
+use crate::VertexOptions;
 
 mod builder;
 #[cfg(any(test, feature = "indexedlog-backend"))]
@@ -105,7 +110,8 @@ where
     /// Lazily calculated.
     snapshot: RwLock<Option<Arc<Self>>>,
 
-    /// Heads added via `add_heads` that are not flushed yet.
+    /// Non-virtual heads added via `add_heads` that are not flushed yet.
+    /// They can be flushed by `flush()`.
     pending_heads: VertexListWithOptions,
 
     /// Path used to open this `NameDag`.
@@ -140,9 +146,22 @@ where
     /// and is intended to be implemented outside the `dag` crate.
     remote_protocol: Arc<dyn RemoteIdConvertProtocol>,
 
+    /// If set, clear and insert to the VIRTUAL group after reloading.
+    managed_virtual_group: Option<Arc<(Box<dyn Parents>, VertexListWithOptions /* derived */)>>,
+
     /// A negative cache. Vertexes that are looked up remotely, and the remote
     /// confirmed the vertexes are outside the master group.
     missing_vertexes_confirmed_by_remote: Arc<RwLock<HashSet<VertexName>>>,
+
+    /// Internal stats (for testing).
+    pub(crate) internal_stats: DagInternalStats,
+}
+
+/// Statistics of dag internals. Useful to check if fast paths are used.
+#[derive(Debug, Default)]
+pub struct DagInternalStats {
+    /// Bumps when sort(set) takes O(set) slow path.
+    pub sort_slow_path_count: AtomicUsize,
 }
 
 impl<D, M, P, S> AbstractNameDag<D, M, P, S>
@@ -163,19 +182,86 @@ where
     }
 }
 
+impl<IS, M, P, S> AbstractNameDag<IdDag<IS>, M, P, S>
+where
+    IS: IdDagStore,
+    IdDag<IS>: TryClone,
+    M: Send + Sync + IdMapWrite + IdMapAssignHead + TryClone + 'static,
+    P: Send + Sync + TryClone + 'static,
+    S: Send + Sync + TryClone + 'static,
+{
+    /// Set the content of the VIRTUAL group that survives reloading.
+    ///
+    /// `items` is a list of vertexes and parents.
+    ///
+    /// Existing content of the VIRTUAL group will be cleared before inserting
+    /// `items`. So this API feels declarative. As a comparison, `add_heads`
+    /// is imperative.
+    ///
+    /// This function calls `maybe_recreate_virtual_group` immediately to clear
+    /// and update contents in the VIRTUAL group. `maybe_recreate_virtual_group`
+    /// will be called automatically after graph changing operations:
+    /// `add_heads_and_flush`, `strip`, `flush`, `import_pull_data`.
+    pub async fn set_managed_virtual_group(
+        &mut self,
+        items: Option<Vec<(VertexName, Vec<VertexName>)>>,
+    ) -> Result<()> {
+        self.managed_virtual_group = items.map(|items| {
+            // Calculate `Parents` and `VertexListWithOptions` so they can be
+            // used in `maybe_recreate_virtual_group`.
+            let opts = VertexOptions {
+                reserve_size: 0,
+                desired_group: Group::VIRTUAL,
+            };
+            let heads: VertexListWithOptions = items
+                .iter()
+                .map(|(v, _p)| (v.clone(), opts.clone()))
+                .collect::<Vec<_>>()
+                .into();
+            let parents: HashMap<VertexName, Vec<VertexName>> = items.into_iter().collect();
+            let parents: Box<dyn Parents> = Box::new(parents);
+            Arc::new((parents, heads))
+        });
+        self.maybe_recreate_virtual_group().await
+    }
+
+    /// Clear vertexes in the VIRTUAL group.
+    pub(crate) async fn clear_virtual_group(&mut self) -> Result<()> {
+        let id_set = self.dag.all_ids_in_groups(&[Group::VIRTUAL])?;
+        if !id_set.is_empty() {
+            let removed = self.dag.strip(id_set)?;
+            for span in removed.iter_span_desc() {
+                self.map.remove_range(span.low, span.high).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// If `managed_virtual_group` is set, clear the VIRTUAL group and re-insert
+    /// based on `managed_virtual_group`.
+    async fn maybe_recreate_virtual_group(&mut self) -> Result<()> {
+        if let Some(maintained_virtual_group) = self.managed_virtual_group.as_ref() {
+            let maintained_virtual_group = maintained_virtual_group.clone();
+            self.clear_virtual_group().await?;
+            let parents = &maintained_virtual_group.0;
+            let head_opts = &maintained_virtual_group.1;
+            // Insert to the VIRTUAL group, using the a precalculated insertion order.
+            self.add_heads(parents.as_ref(), head_opts).await?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl<IS, M, P, S> DagPersistent for AbstractNameDag<IdDag<IS>, M, P, S>
 where
-    IS: IdDagStore + Persist,
+    IS: IdDagStore + Persist + StorageVersion,
     IdDag<IS>: TryClone + 'static,
     M: TryClone + IdMapAssignHead + Persist + Send + Sync + 'static,
     P: Open<OpenTarget = Self> + Send + Sync + 'static,
     S: TryClone + StorageVersion + Persist + Send + Sync + 'static,
 {
-    /// Add vertexes and their ancestors to the on-disk DAG.
-    ///
-    /// This is similar to calling `add_heads` followed by `flush`.
-    /// But is faster.
+    // See docstring in ops.rs for details.
     async fn add_heads_and_flush(
         &mut self,
         parents: &dyn Parents,
@@ -187,6 +273,9 @@ where
                 &self.pending_heads.vertexes(),
             ));
         }
+
+        // Clear the VIRTUAL group. Their parents might have changed in incompatible ways.
+        self.clear_virtual_group().await?;
 
         // Take lock.
         //
@@ -220,8 +309,11 @@ where
         drop(map_lock);
         drop(lock);
 
-        self.persisted_id_set = self.dag.all_ids_in_groups(&Group::ALL)?;
+        self.persisted_id_set = self.dag.all_ids_in_groups(&Group::PERSIST)?;
+        self.maybe_recreate_virtual_group().await?;
+
         debug_assert_eq!(self.dirty().await?.count().await?, 0);
+
         Ok(())
     }
 
@@ -245,7 +337,7 @@ where
         }
         // Previous version of the API requires `master_heads: &[Vertex]`.
         // Warn about possible misuses.
-        if !heads.vertexes_by_group(Group::NON_MASTER).is_empty() {
+        if heads.vertexes_by_group(Group::MASTER).len() != heads.len() {
             return programming(format!(
                 "NameDag::flush({:?}) is probably misused (group is not master)",
                 heads
@@ -260,12 +352,11 @@ where
 
         let parents: &(dyn DagAlgorithm + Send + Sync) = self;
         let non_master_heads: VertexListWithOptions = self.pending_heads.clone();
-        let seg_size = self.dag.get_new_segment_size();
-        new_name_dag.dag.set_new_segment_size(seg_size);
-        new_name_dag.set_remote_protocol(self.remote_protocol.clone());
-        new_name_dag.maybe_reuse_caches_from(self);
+        new_name_dag.inherit_configurations_from(self);
         let heads = heads.clone().chain(non_master_heads);
         new_name_dag.add_heads_and_flush(&parents, &heads).await?;
+        new_name_dag.maybe_recreate_virtual_group().await?;
+
         *self = new_name_dag;
         Ok(())
     }
@@ -293,7 +384,7 @@ where
         new.state.reload(&lock)?;
         new.map.reload(&map_lock)?;
         new.dag.reload(&dag_lock)?;
-        new.maybe_reuse_caches_from(self);
+        new.inherit_configurations_from(self);
         std::mem::swap(&mut to_insert, &mut *new.overlay_map_paths.lock().unwrap());
         new.flush_cached_idmap_with_lock(&map_lock).await?;
 
@@ -363,16 +454,21 @@ where
 impl<IS, M, P, S> AbstractNameDag<IdDag<IS>, M, P, S>
 where
     IS: Send + Sync + 'static,
+    IdDag<IS>: StorageVersion,
     M: Send + Sync + 'static,
     P: Send + Sync + 'static,
-    S: StorageVersion + Send + Sync + 'static,
+    S: Send + Sync + 'static,
 {
     /// Attempt to reuse caches from `other` if two `NameDag`s are compatible.
     /// Usually called when `self` is newly created.
     fn maybe_reuse_caches_from(&mut self, other: &Self) {
-        if self.state.storage_version() != other.state.storage_version()
-            || self.persisted_id_set.as_spans() != other.persisted_id_set.as_spans()
-        {
+        // No need to check IdMap (or "state" which includes both IdDag and IdMap).
+        // If IdMap is changed (ex. by flush_cached_idmap), the cache states
+        // (missing_vertexes_confirmed_by_remote, overlay_map) are still reusable.
+        let dag_version_mismatch = self.dag.storage_version() != other.dag.storage_version();
+        let persisted_id_mismatch =
+            self.persisted_id_set.as_spans() != other.persisted_id_set.as_spans();
+        if dag_version_mismatch || persisted_id_mismatch {
             tracing::debug!(target: "dag::cache", "cannot reuse cache");
             return;
         }
@@ -385,6 +481,23 @@ where
         self.overlay_map = other.overlay_map.clone();
         self.overlay_map_paths = other.overlay_map_paths.clone();
     }
+
+    /// Set the remote protocol for converting between Id and Vertex remotely.
+    ///
+    /// This is usually used on "sparse" ("lazy") Dag where the IdMap is incomplete
+    /// for vertexes in the master groups.
+    pub fn set_remote_protocol(&mut self, protocol: Arc<dyn RemoteIdConvertProtocol>) {
+        self.remote_protocol = protocol;
+    }
+
+    /// Inherit configurations like `managed_virtual_group` from `original`.
+    fn inherit_configurations_from(&mut self, original: &Self) {
+        let seg_size = original.dag.get_new_segment_size();
+        self.dag.set_new_segment_size(seg_size);
+        self.set_remote_protocol(original.remote_protocol.clone());
+        self.managed_virtual_group = original.managed_virtual_group.clone();
+        self.maybe_reuse_caches_from(original)
+    }
 }
 
 #[async_trait::async_trait]
@@ -396,16 +509,7 @@ where
     P: TryClone + Send + Sync + 'static,
     S: TryClone + Send + Sync + 'static,
 {
-    /// Add vertexes and their ancestors to the in-memory DAG.
-    ///
-    /// This does not write to disk. Use `add_heads_and_flush` to add heads
-    /// and write to disk more efficiently.
-    ///
-    /// The added vertexes are immediately query-able.
-    ///
-    /// Note: heads with `reserve_size > 0` must be passed in even if they
-    /// already exist and are not being added to the graph for the id
-    /// reservation to work correctly.
+    // See docstring in ops.rs for details.
     async fn add_heads(
         &mut self,
         parents: &dyn Parents,
@@ -417,34 +521,31 @@ where
         self.populate_missing_vertexes_for_add_heads(parents, &heads.vertexes())
             .await?;
 
-        // heads might require highest_group = MASTER. That might trigger
-        // id re-assigning if the NON_MASTER group is not empty. For simplicity,
-        // we don't want to deal with id reassignment here.
+        // This API takes `heads` with "desired_group"s. When a head already exists in a lower
+        // group than its "desired_group" we need to remove the higher-group id and re-assign
+        // the head and its ancestors to the lower group.
         //
-        // Practically, there are 2 use-cases:
-        // - Server wants highest_group = MASTER and it does not use NON_MASTER.
-        // - Client only needs highest_group = NON_MASTER (default) here.
+        // For simplicity, add_heads is *append-only* and does not want to deal with the
+        // reassignment. So if you have code like:
         //
-        // Support both cases. That is:
-        // - If highest_group = MASTER is specified, then NON_MASTER group
-        //   must be empty to ensure no id reassignment (checked below).
-        // - If highest_group = MASTER is not used, then it's okay whatever.
-        let master_heads = heads.vertexes_by_group(Group::MASTER);
-        if !master_heads.is_empty() {
-            let all = self.dag.all()?;
-            let has_non_master = match all.max() {
-                Some(id) => id.group() == Group::NON_MASTER,
-                None => false,
-            };
-            if has_non_master {
-                return programming(concat!(
-                    "add_heads() called with highest_group = MASTER but NON_MASTER group is not empty. ",
-                    "To avoid id reassignment this is not supported. ",
-                    "Pass highest_group = NON_MASTER, and call flush() (common on client use-case), ",
-                    "or avoid inserting to NON_MASTER group (common on server use-case).",
-                ));
-            }
-        }
+        //    let set1 = dag.range(x, y); // set1 is associated with the current dag, "dag v1".
+        //    dag.add_heads(...);
+        //    let set2 = dag.range(p, q); // set2 is associated with the updated dag, "dag v2".
+        //    let set3 = set2 & set1;
+        //
+        // The `set3` understands that the "dag v2" is a superset of "dag v1" (because add_heads
+        // does not strip ids), and can use fast paths - it can assume same ids in set2 and set3
+        // mean the same vertexes and ensure set3 is associated with "dag v2". If `add_heads`
+        // strips out commits, then the fast paths (note: not just for set3, also p and q) cannot
+        // be used.
+        //
+        // Practically, `heads` match one of these patterns:
+        // - (This use-case is going away): desired_group = MASTER for all heads. This is used by
+        //   old Mononoke server-side logic. The server only indexes the "main" branch. All vertexes
+        //   are in the MASTER group. To avoid misuse by the client-side, we check that there
+        //   is nothing outisde the MASTER group.
+        // - desired_group = NON_MASTER for all heads. This is used by Sapling client.
+        //   It might use desired_group = MASTER on add_heads_and_flush, but not here.
 
         // Performance-wise, add_heads + flush is slower than
         // add_heads_and_flush.
@@ -462,15 +563,28 @@ where
         let mut covered = self.dag().all_ids_in_groups(&Group::ALL)?;
         let mut reserved = calculate_initial_reserved(self, &covered, heads).await?;
         for (head, opts) in heads.vertex_options() {
-            let need_assigning = match self
-                .vertex_id_with_max_group(&head, opts.highest_group)
-                .await?
-            {
-                Some(id) => !self.dag.contains_id(id)?,
+            let need_assigning = match self.vertex_id_optional(&head).await? {
+                Some(id) => {
+                    if id.group() > opts.desired_group {
+                        return programming(format!(
+                            "add_heads: cannot re-assign {:?}:{:?} from {} to {} (desired), use add_heads_and_flush instead",
+                            head,
+                            id,
+                            id.group(),
+                            opts.desired_group
+                        ));
+                    } else {
+                        // In some cases (ex. old Mononoke use-case), the id exists in IdMap but
+                        // not IdDag. Still need to assign the id to IdDag.
+                        !self.dag.contains_id(id)?
+                    }
+                }
                 None => true,
             };
             if need_assigning {
-                let group = opts.highest_group;
+                let group = opts.desired_group;
+                // If any ancestors have incompatible group (ex. desired = MASTER, ancestor has
+                // NON_MASTER), then `assign_head` below will report an error.
                 let prepared_segments = self
                     .assign_head(head.clone(), parents, group, &mut covered, &reserved)
                     .await?;
@@ -479,11 +593,13 @@ where
                     let low = self.map.vertex_id(head.clone()).await? + 1;
                     update_reserved(&mut reserved, &covered, low, opts.reserve_size);
                 }
-                self.pending_heads.push((head, opts));
+                if group != Group::VIRTUAL {
+                    self.pending_heads.push((head, opts));
+                }
             }
         }
 
-        // Update segments in the NON_MASTER group.
+        // Update high level segments from the flat segments just inserted.
         self.dag
             .build_segments_from_prepared_flat_segments(&outcome)?;
 
@@ -495,10 +611,10 @@ where
 impl<IS, M, P, S> DagStrip for AbstractNameDag<IdDag<IS>, M, P, S>
 where
     IS: IdDagStore + Persist,
-    IdDag<IS>: TryClone,
+    IdDag<IS>: TryClone + StorageVersion,
     M: TryClone + Persist + IdMapWrite + IdConvert + Send + Sync + 'static,
     P: TryClone + Open<OpenTarget = Self> + Send + Sync + 'static,
-    S: TryClone + StorageVersion + Persist + Send + Sync + 'static,
+    S: TryClone + Persist + Send + Sync + 'static,
 {
     async fn strip(&mut self, set: &NameSet) -> Result<()> {
         if !self.pending_heads.is_empty() {
@@ -512,8 +628,7 @@ where
         // the stripped segments.
         let mut new: Self = self.path.open()?;
         let (lock, map_lock, dag_lock) = new.reload()?;
-        new.set_remote_protocol(self.remote_protocol.clone());
-        new.maybe_reuse_caches_from(self);
+        new.inherit_configurations_from(self);
 
         new.strip_with_lock(set, &map_lock).await?;
         new.persist(lock, map_lock, dag_lock)?;
@@ -579,6 +694,9 @@ where
 
         // Snapshot cannot be reused.
         self.invalidate_snapshot();
+
+        // Re-create the VIRTUAL group content.
+        self.maybe_recreate_virtual_group().await?;
 
         Ok(())
     }
@@ -674,7 +792,7 @@ where
         self.state.persist(&lock)?;
 
         self.invalidate_overlay_map()?;
-        self.persisted_id_set = self.dag.all_ids_in_groups(&Group::ALL)?;
+        self.persisted_id_set = self.dag.all_ids_in_groups(&Group::PERSIST)?;
 
         Ok(())
     }
@@ -684,11 +802,12 @@ where
 impl<IS, M, P, S> DagImportPullData for AbstractNameDag<IdDag<IS>, M, P, S>
 where
     IS: IdDagStore + Persist,
-    IdDag<IS>: TryClone,
+    IdDag<IS>: TryClone + StorageVersion,
     M: TryClone + IdMapAssignHead + Persist + Send + Sync + 'static,
     P: Open<OpenTarget = Self> + TryClone + Send + Sync + 'static,
-    S: StorageVersion + TryClone + Persist + Send + Sync + 'static,
+    S: TryClone + Persist + Send + Sync + 'static,
 {
+    // See docstring in ops.py for details.
     async fn import_pull_data(
         &mut self,
         clone_data: CloneData<VertexName>,
@@ -700,15 +819,13 @@ where
                 &self.pending_heads.vertexes(),
             ));
         }
-        let non_master_heads = heads.vertexes_by_group(Group::NON_MASTER);
-        if !non_master_heads.is_empty() {
-            return programming(format!(
-                concat!(
-                    "import_pull_data called with non-master heads ({:?}). ",
-                    "This is unsupported because the pull data is lazy and can only be inserted to the master group.",
-                ),
-                non_master_heads
-            ));
+        if let Some(group) = heads.max_desired_group() {
+            if group != Group::MASTER {
+                return programming(concat!(
+                    "import_pull_data should only take MASTER group heads. ",
+                    "Only MASTER group can contain lazy vertexes like what pull_data uses."
+                ));
+            }
         }
 
         for id in clone_data.flat_segments.parents_head_and_roots() {
@@ -723,8 +840,7 @@ where
         // Constructs a new graph so we don't expose a broken `self` state on error.
         let mut new: Self = self.path.open()?;
         let (lock, map_lock, dag_lock) = new.reload()?;
-        new.set_remote_protocol(self.remote_protocol.clone());
-        new.maybe_reuse_caches_from(self);
+        new.inherit_configurations_from(self);
 
         // Parents that should exist in the local graph. Look them up in 1 round-trip
         // and insert to the local graph.
@@ -806,11 +922,98 @@ where
             client_parents.into_iter().collect::<Result<Vec<Id>>>()?;
         }
 
-        // Prepare states used below.
-        let mut prepared_client_segments = PreparedFlatSegments::default();
-        let server_idmap = &clone_data.idmap;
-        let server_idmap_by_name: BTreeMap<&VertexName, Id> =
-            server_idmap.iter().map(|(&id, name)| (name, id)).collect();
+        // Prepare indexes and states used below.
+        /// Query server segments with some indexes.
+        struct ServerState<'a> {
+            seg_by_high: BTreeMap<Id, FlatSegment>,
+            idmap_by_name: BTreeMap<&'a VertexName, Id>,
+            idmap_by_id: &'a BTreeMap<Id, VertexName>,
+        }
+        let mut server = ServerState {
+            seg_by_high: clone_data
+                .flat_segments
+                .segments
+                .iter()
+                .map(|s| (s.high, s.clone()))
+                .collect(),
+            idmap_by_name: clone_data
+                .idmap
+                .iter()
+                .map(|(&id, name)| (name, id))
+                .collect(),
+            idmap_by_id: &clone_data.idmap,
+        };
+
+        impl<'a> ServerState<'a> {
+            /// Find the segment that contains the (server-side) Id.
+            fn seg_containing_id(&self, server_id: Id) -> Result<&FlatSegment> {
+                let seg = match self.seg_by_high.range(server_id..).next() {
+                    Some((_high, seg)) => {
+                        if seg.low <= server_id && seg.high >= server_id {
+                            Some(seg)
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                seg.ok_or_else(|| {
+                    DagError::Programming(format!(
+                        "server does not provide segment covering id {}",
+                        server_id
+                    ))
+                })
+            }
+
+            /// Split a server segment from `[ low --  middle -- high ]` to
+            /// `[ low -- middle ] [ middle + 1 -- high ]`.
+            fn split_seg(&mut self, high: Id, middle: Id) {
+                // This is useful when "middle" is a "parent" of another segment, like:
+                //    seg 1 (server): 100 -- 115 -- 120
+                //    seg 2 (server):                    121 -- 130, parents: [115]
+                // While the task is to ensure seg 2's head H is present, we can split seg 1:
+                //    seg 1a (server): 110 -- 115
+                //    seg 1b (server):            116 -- 120, parents: [115]
+                //    seg 2  (server):                       121 -- 130 (H), parents: [115]
+                // Then remap and insert seg 1a and seg 2 first to complete the "H" goal:
+                //    seg 1a (client): 10 -- 15
+                //    seg 2  (client):          16 -- 20 (H), parents: [15]
+                // The 10 ... 20 range is now continuous and friendly to merge to high-level
+                // segments. The rest of seg 1, seg 1b (server) can be picked up later when
+                // visiting from other heads.
+                let seg = self
+                    .seg_by_high
+                    .remove(&high)
+                    .expect("bug: invalid high passed to split_seg");
+                assert!(seg.low <= middle);
+                assert!(seg.high > middle);
+                assert!(self.idmap_by_id.contains_key(&middle));
+                let seg1 = FlatSegment {
+                    low: seg.low,
+                    high: middle,
+                    parents: seg.parents,
+                };
+                let seg2 = FlatSegment {
+                    low: middle + 1,
+                    high: seg.high,
+                    parents: vec![middle],
+                };
+                self.seg_by_high.insert(seg1.high, seg1);
+                self.seg_by_high.insert(seg2.high, seg2);
+            }
+
+            fn name_by_id(&self, id: Id) -> VertexName {
+                self.idmap_by_id
+                    .get(&id)
+                    .expect("IdMap should contain the `id`. It should be checked before.")
+                    .clone()
+            }
+
+            fn id_by_name(&self, name: &VertexName) -> Option<Id> {
+                self.idmap_by_name.get(name).copied()
+            }
+        }
+
         // `taken` is the union of `covered` and `reserved`, mainly used by `find_free_span`.
         let mut taken = {
             // Normally we would want `calculate_initial_reserved` here. But we calculate head
@@ -821,50 +1024,44 @@ where
             new.dag().all_ids_in_groups(&[Group::MASTER])?
         };
 
-        // Index used by lookups.
-        let server_seg_by_high: BTreeMap<Id, &FlatSegment> = clone_data
-            .flat_segments
-            .segments
-            .iter()
-            .map(|s| (s.high, s))
-            .collect();
-        let find_server_seg_contains_server_id = |server_id: Id| -> Result<&FlatSegment> {
-            let seg = match server_seg_by_high.range(server_id..).next() {
-                Some((_high, &seg)) => {
-                    if seg.low <= server_id && seg.high >= server_id {
-                        Some(seg)
-                    } else {
-                        None
-                    }
-                }
-                None => None,
-            };
-            seg.ok_or_else(|| {
-                DagError::Programming(format!(
-                    "server does not provide segment covering id {}",
-                    server_id
-                ))
-            })
-        };
+        // Output. Remapped segments to insert.
+        let mut prepared_client_segments = PreparedFlatSegments::default();
 
-        // Insert segments by visiting the heads.
+        // Insert segments by visiting the heads following the `VertexOptions` order.
         //
-        // Similar to `IdMap::assign_head`, but insert a segment at a time,
-        // not a vertex at a time.
+        // If a segment is not ready to be inserted (ex. its parents are still missing),
+        // their parents will be visited recursively. This has the nice effects
+        // comparing to `import_clone_data` which blindly takes the input as-is:
+        // - De-fragment `clone_data`: gaps or sub-optional segment order won't hurt.
+        // - Respect the local `VertexOptions`: respect the order and reserve_size
+        //   set locally if possible.
+        // - Ignore "bogus" unrelated sub-graph: if the `clone_data` contains more
+        //   segments then needed, they will be simply ignored.
+        //
+        // The implementation (of using a stack) is similar to `IdMap::assign_head`,
+        // but insert a segment at a time, not a vertex at a time.
         //
         // Only the MASTER group supports laziness. So we only care about it.
         for (head, opts) in heads.vertex_options() {
-            let mut stack: Vec<&FlatSegment> = vec![];
-            if let Some(&head_server_id) = server_idmap_by_name.get(&head) {
-                let head_server_seg = find_server_seg_contains_server_id(head_server_id)?;
-                stack.push(head_server_seg);
+            let mut stack: Vec<Id> = vec![];
+            if let Some(head_server_id) = server.id_by_name(&head) {
+                let _head_server_seg = server.seg_containing_id(head_server_id)?;
+                stack.push(head_server_id);
             }
 
-            while let Some(server_seg) = stack.pop() {
-                let high_vertex = server_idmap[&server_seg.high].clone();
+            while let Some(server_high) = stack.pop() {
+                let mut server_seg = server.seg_containing_id(server_high)?;
+                if server_high < server_seg.high {
+                    // Split the segment for more efficient high level segments.
+                    let seg_high = server_seg.high;
+                    server.split_seg(seg_high, server_high);
+                    server_seg = server.seg_containing_id(server_high)?;
+                    assert_eq!(server_high, server_seg.high);
+                }
+                let high_vertex = server.name_by_id(server_high);
                 let client_high_id = new
                     .map
-                    .vertex_id_with_max_group(&high_vertex, Group::NON_MASTER)
+                    .vertex_id_with_max_group(&high_vertex, Group::MAX)
                     .await?;
                 match client_high_id {
                     Some(id) if id.group() == Group::MASTER => {
@@ -873,7 +1070,7 @@ where
                         continue;
                     }
                     Some(id) => {
-                        // `id` in NON_MASTER group. This should not really happen because we have
+                        // `id` in non-MASTER group. This should not really happen because we have
                         // checked all "roots" are missing in the local graph. See `NeedSlowPath`
                         // above.
                         let e = NeedSlowPath(format!(
@@ -887,7 +1084,7 @@ where
 
                 let parent_server_ids = &server_seg.parents;
                 let parent_names: Vec<VertexName> = {
-                    let iter = parent_server_ids.iter().map(|id| server_idmap[id].clone());
+                    let iter = parent_server_ids.iter().map(|id| server.name_by_id(*id));
                     iter.collect()
                 };
 
@@ -896,7 +1093,7 @@ where
                 let mut missng_parent_server_ids = Vec::new();
 
                 // Calculate `parent_client_ids`, and `missng_parent_server_ids`.
-                // Intentiaonlly using `new.map` not `new` to bypass remote lookups.
+                // Intentionally using `new.map` not `new` to bypass remote lookups.
                 {
                     let client_id_res = new.map.vertex_id_batch(&parent_names).await?;
                     assert_eq!(client_id_res.len(), parent_server_ids.len());
@@ -921,30 +1118,28 @@ where
 
                 if !missng_parent_server_ids.is_empty() {
                     // Parents are not ready. Needs revisit this segment after inserting parents.
-                    stack.push(server_seg);
+                    stack.push(server_high);
                     // Insert missing parents.
                     // First parent, first insertion.
                     for &server_id in missng_parent_server_ids.iter().rev() {
-                        let parent_server_seg = find_server_seg_contains_server_id(server_id)?;
-                        stack.push(parent_server_seg);
+                        stack.push(server_id);
                     }
                     continue;
                 }
 
                 // All parents are present. Time to insert this segment.
                 // Find a suitable low..=high range.
-                let candidate_id = parent_client_ids
-                    .iter()
-                    .max()
-                    .copied()
-                    .unwrap_or(Group::MASTER.min_id())
-                    + 1;
+                let candidate_id = match parent_client_ids.iter().max().copied() {
+                    None => Group::MASTER.min_id(),
+                    Some(id) => id + 1,
+                };
                 let size = server_seg.high.0 - server_seg.low.0 + 1;
                 let span = find_free_span(&taken, candidate_id, size, false);
 
                 // Map the server_seg.low..=server_seg.high to client span.low..=span.high.
                 // Insert to IdMap.
-                for (&server_id, name) in server_idmap.range(server_seg.low..=server_seg.high) {
+                for (&server_id, name) in server.idmap_by_id.range(server_seg.low..=server_seg.high)
+                {
                     let client_id = server_id + span.low.0 - server_seg.low.0;
                     if client_id.group() != Group::MASTER {
                         return Err(crate::Error::IdOverflow(Group::MASTER));
@@ -978,6 +1173,10 @@ where
         }
 
         new.persist(lock, map_lock, dag_lock)?;
+
+        // Update maintained VIRTUAL group.
+        new.maybe_recreate_virtual_group().await?;
+
         *self = new;
         Ok(())
     }
@@ -1131,9 +1330,11 @@ where
                     overlay_map_id_set: self.overlay_map_id_set.clone(),
                     overlay_map_paths: Arc::clone(&self.overlay_map_paths),
                     remote_protocol: self.remote_protocol.clone(),
+                    managed_virtual_group: self.managed_virtual_group.clone(),
                     missing_vertexes_confirmed_by_remote: Arc::clone(
                         &self.missing_vertexes_confirmed_by_remote,
                     ),
+                    internal_stats: Default::default(),
                 };
                 let result = Arc::new(cloned);
                 *snapshot = Some(Arc::clone(&result));
@@ -1148,14 +1349,6 @@ where
 
     pub fn map(&self) -> &M {
         &self.map
-    }
-
-    /// Set the remote protocol for converting between Id and Vertex remotely.
-    ///
-    /// This is usually used on "sparse" ("lazy") Dag where the IdMap is incomplete
-    /// for vertexes in the master groups.
-    pub fn set_remote_protocol(&mut self, protocol: Arc<dyn RemoteIdConvertProtocol>) {
-        self.remote_protocol = protocol;
     }
 
     pub(crate) fn get_remote_protocol(&self) -> Arc<dyn RemoteIdConvertProtocol> {
@@ -1288,7 +1481,7 @@ where
             // as a remote "contains" check.
             if root_parents_id_set
                 .iter_desc()
-                .all(|i| i.group() == Group::NON_MASTER)
+                .all(|i| i.group() > Group::MASTER)
             {
                 tracing::debug!(target: "dag::definitelymissing", "root {:?} is not assigned (non-lazy parent)", &root);
                 unassigned_roots.push(root);
@@ -1432,7 +1625,7 @@ where
         let overlay = self.overlay_map.read().unwrap();
         let mut names = Vec::with_capacity(ids.len());
         for &id in ids {
-            if let Some(name) = overlay.lookup_vertex_name(id) {
+            if let Some(name) = overlay.lookup_vertex_name(id).cloned() {
                 names.push(name);
             } else {
                 return id.not_found();
@@ -1650,23 +1843,39 @@ where
             && matches!(hints.id_map_version(), Some(v) if v <= self.map_version())
         {
             tracing::debug!(target: "dag::algo::sort", "sort({:6?}) (fast path)", set);
-            Ok(set.clone())
-        } else {
-            tracing::warn!(target: "dag::algo::sort", "sort({:6?}) (slow path)", set);
-            let flags = extract_ancestor_flag_if_compatible(set.hints(), self.dag_version());
-            let mut spans = IdSet::empty();
-            let mut iter = set.iter().await?.chunks(1 << 17);
-            while let Some(names) = iter.next().await {
-                let names = names.into_iter().collect::<Result<Vec<_>>>()?;
-                let ids = self.vertex_id_batch(&names).await?;
-                for id in ids {
-                    spans.push(id?);
+            return Ok(set.clone());
+        } else if let Some(flat_set) = set.specialized_flatten_id() {
+            let dag_version = flat_set.dag.dag_version();
+            if dag_version <= self.dag_version() {
+                let mut flat_set = flat_set.into_owned();
+                if flat_set.is_reversed() {
+                    flat_set = flat_set.reversed();
                 }
+                flat_set.map = self.id_map_snapshot()?;
+                flat_set.dag = self.dag_snapshot()?;
+                tracing::debug!(target: "dag::algo::sort", "sort({:6?}) (fast path 2)", set);
+                return Ok(NameSet::from_query(flat_set));
+            } else {
+                tracing::info!(target: "dag::algo::sort", "sort({:6?}) (cannot use fast path 2 due to mismatched version)", set);
             }
-            let result = NameSet::from_spans_dag(spans, self)?;
-            result.hints().add_flags(flags);
-            Ok(result)
         }
+        tracing::warn!(target: "dag::algo::sort", "sort({:6?}) (slow path)", set);
+        self.internal_stats
+            .sort_slow_path_count
+            .fetch_add(1, Ordering::Release);
+        let flags = extract_ancestor_flag_if_compatible(set.hints(), self.dag_version());
+        let mut spans = IdSet::empty();
+        let mut iter = set.iter().await?.chunks(1 << 17);
+        while let Some(names) = iter.next().await {
+            let names = names.into_iter().collect::<Result<Vec<_>>>()?;
+            let ids = self.vertex_id_batch(&names).await?;
+            for id in ids {
+                spans.push(id?);
+            }
+        }
+        let result = NameSet::from_spans_dag(spans, self)?;
+        result.hints().add_flags(flags);
+        Ok(result)
     }
 
     /// Get ordered parent vertexes.
@@ -1907,6 +2116,15 @@ where
         Ok(result)
     }
 
+    async fn suggest_bisect(
+        &self,
+        roots: NameSet,
+        heads: NameSet,
+        skip: NameSet,
+    ) -> Result<(Option<VertexName>, NameSet, NameSet)> {
+        default_impl::suggest_bisect(self, roots, heads, skip).await
+    }
+
     /// Vertexes buffered in memory, not yet written to disk.
     async fn dirty(&self) -> Result<NameSet> {
         let all = self.dag().all()?;
@@ -2020,6 +2238,7 @@ where
             Ok(Some(id)) => Ok(Some(id)),
             Err(err) => Err(err),
             Ok(None) if self.is_vertex_lazy() => {
+                // Not exist in max_group from local data.
                 if let Some(id) = self.overlay_map.read().unwrap().lookup_vertex_id(name) {
                     return Ok(Some(id));
                 }
@@ -2031,14 +2250,14 @@ where
                 {
                     return Ok(None);
                 }
-                if max_group == Group::MASTER
+                if max_group != Group::MAX
                     && self
                         .map
-                        .vertex_id_with_max_group(name, Group::NON_MASTER)
+                        .vertex_id_with_max_group(name, Group::MAX)
                         .await?
                         .is_some()
                 {
-                    // If the vertex exists in the non-master group. Then it must be missing in the
+                    // If the vertex exists in the non-master groups. Then it must be missing in the
                     // master group.
                     return Ok(None);
                 }
@@ -2058,7 +2277,13 @@ where
         match self.map.vertex_name(id).await {
             Ok(name) => Ok(name),
             Err(crate::Error::IdNotFound(_)) if self.is_vertex_lazy() => {
-                if let Some(name) = self.overlay_map.read().unwrap().lookup_vertex_name(id) {
+                if let Some(name) = self
+                    .overlay_map
+                    .read()
+                    .unwrap()
+                    .lookup_vertex_name(id)
+                    .cloned()
+                {
                     return Ok(name);
                 }
                 // Only ids <= max(MASTER group) can be lazy.
@@ -2144,7 +2369,7 @@ where
             {
                 let map = self.overlay_map.read().unwrap();
                 for (r, id) in list.iter_mut().zip(ids) {
-                    if let Some(name) = map.lookup_vertex_name(*id) {
+                    if let Some(name) = map.lookup_vertex_name(*id).cloned() {
                         *r = Ok(name);
                     }
                 }
@@ -2312,9 +2537,9 @@ where
             let mut outcome = PreparedFlatSegments::default();
             let mut covered = self.dag().all_ids_in_groups(&Group::ALL)?;
             let mut reserved = calculate_initial_reserved(self, &covered, heads).await?;
-            for group in [Group::MASTER, Group::NON_MASTER] {
+            for group in Group::ALL {
                 for (vertex, opts) in heads.vertex_options() {
-                    if opts.highest_group != group {
+                    if opts.desired_group != group {
                         continue;
                     }
                     // Important: do not call self.map.assign_head. It does not trigger
@@ -2404,7 +2629,7 @@ async fn calculate_initial_reserved(
             continue;
         }
         if let Some(id) = map
-            .vertex_id_with_max_group(&vertex, opts.highest_group)
+            .vertex_id_with_max_group(&vertex, opts.desired_group)
             .await?
         {
             update_reserved(&mut reserved, covered, id + 1, opts.reserve_size);
@@ -2431,18 +2656,31 @@ fn update_reserved(reserved: &mut IdSet, covered: &IdSet, low: Id, reserve_size:
 /// `reserve_size` cannot be 0.
 fn find_free_span(covered: &IdSet, low: Id, reserve_size: u64, shrink_to_fit: bool) -> IdSpan {
     assert!(reserve_size > 0);
+    let original_low = low;
     let mut low = low;
     let mut high;
+    let mut count = 0;
     loop {
+        count += 1;
+        // First, bump 'low' to not overlap with a conflicted `span`.
+        //   [----covered_span----]
+        //      ^                  ^
+        //      original_low       bump to here
+        if let Some(span) = covered.span_contains(low) {
+            low = span.high + 1;
+        }
         high = (low + reserve_size - 1).min(low.group().max_id());
+        if reserve_size <= 1 && !covered.contains(low) {
+            // No need to go through complex (maybe O(N)) logic below.
+            break;
+        }
         // Try to reserve id..=id+reserve_size-1
-        let reserved = IdSet::from_spans(vec![low..=high]);
+        let reserved = IdSet::from_single_span(IdSpan::new(low, high));
         let intersected = reserved.intersection(covered);
         if let Some(span) = intersected.iter_span_asc().next() {
             // Overlap with existing covered spans. Decrease `high` so it
             // no longer overlap.
-            let last_free = span.low - 1;
-            if last_free >= low && shrink_to_fit {
+            if span.low > low && shrink_to_fit {
                 // Use the remaining part of the previous reservation.
                 //   [----------reserved--------------]
                 //             [--intersected--]
@@ -2453,6 +2691,7 @@ fn find_free_span(covered: &IdSet, low: Id, reserve_size: u64, shrink_to_fit: bo
                 //   [reserved] <- remaining of the previous reservation
                 //            ^
                 //            high
+                let last_free = span.low - 1;
                 high = last_free;
             } else {
                 // No space on the left side. Try the right side.
@@ -2468,6 +2707,16 @@ fn find_free_span(covered: &IdSet, low: Id, reserve_size: u64, shrink_to_fit: bo
             }
         }
         break;
+    }
+    if count >= 4096 {
+        tracing::warn!(
+            target: "dag::perf",
+            count=count,
+            low=?original_low,
+            reserve_size=reserve_size,
+            covered=?covered,
+            "PERF: find_free_span took too long",
+        );
     }
     let span = IdSpan::new(low, high);
     if !shrink_to_fit {
@@ -2590,5 +2839,20 @@ impl fmt::Debug for DebugId {
         }
         write!(f, "{:?}", self.id)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_free_span_overflow() {
+        let covered = IdSet::from(0..=6);
+        let reserve_size = 2;
+        for shrink_to_fit in [true, false] {
+            let span = find_free_span(&covered, Id(0), reserve_size, shrink_to_fit);
+            assert_eq!(span, IdSpan::from(7..=8));
+        }
     }
 }

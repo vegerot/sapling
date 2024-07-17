@@ -71,11 +71,6 @@ The following are configs to tune the behavior of copy tracing algorithm:
 """
 
 import codecs
-import collections
-
-import dbm
-import os
-import time
 
 from sapling import (
     cmdutil,
@@ -83,9 +78,8 @@ from sapling import (
     dispatch,
     extensions,
     filemerge,
-    git,
+    hgdemandimport,
     json,
-    node,
     phases,
     pycompat,
     registrar,
@@ -103,20 +97,6 @@ configitem("copytrace", "enableamendcopytrace", default=True)
 configitem("copytrace", "amendcopytracecommitlimit", default=100)
 configitem("copytrace", "dagcopytrace", default=False)
 
-defaultdict = collections.defaultdict
-_copytracinghint: str = (
-    "hint: if this message is due to a moved file, you can "
-    + "ask mercurial to attempt to automatically resolve this "
-    + "change by re-running with the --config=experimental.copytrace=on flag, but "
-    + "this will significantly slow down the operation, so you "
-    + "will need to be patient.\n"
-    + "Source control team is working on fixing this problem.\n"
-)
-
-
-def uisetup(ui) -> None:
-    extensions.wrapfunction(dispatch, "runcommand", _runcommand)
-
 
 def extsetup(ui) -> None:
     # With experimental.copytrace=off there can be cryptic merge errors.
@@ -124,7 +104,6 @@ def extsetup(ui) -> None:
     # enabled copytracing
     filemerge._localchangedotherdeletedmsg = _(
         "local%(l)s changed %(fd)s which other%(o)s deleted%(fa)s\n"
-        + _copytracinghint
         + "use (c)hanged version, (d)elete, or leave (u)nresolved?"
         "$$ &Changed $$ &Delete $$ &Unresolved"
     )
@@ -136,59 +115,8 @@ def extsetup(ui) -> None:
         "$$ &Changed $$ &Deleted $$ &Unresolved $$ &Renamed"
     )
 
-    extensions.wrapfunction(filemerge, "_filemerge", _filemerge)
     extensions.wrapfunction(copiesmod, "mergecopies", _mergecopies)
     extensions.wrapfunction(cmdutil, "amend", _amend)
-
-
-def _filemerge(
-    origfunc,
-    premerge,
-    repo,
-    wctx,
-    mynode,
-    orig,
-    fcd,
-    fco,
-    fca,
-    labels=None,
-    *args,
-    **kwargs,
-):
-
-    if premerge:
-        # copytracing worked if files to merge have different file names
-        # and filelog contents are different (fco.cmp(fcd) returns True if
-        # they are different). If filelog contents are the same then the file
-        # was moved in the rebase/graft/merge source, but wasn't changed in the
-        # rebase/graft/merge destination. This case mercurial would've handled
-        # even with disabled copytracing, so we don't want to log it.
-        if orig != fco.path() and fco.cmp(fcd):
-            # copytracing was in action, let's record it
-            if repo.ui.config("experimental", "copytrace") == "on":
-                msg = "success (fastcopytracing)"
-            else:
-                msg = "success"
-
-            try:
-                destctx = _getctxfromfctx(fcd)
-                srcctx = _getctxfromfctx(fco)
-                hexes = "%s, %s" % (_gethex(destctx), _gethex(srcctx))
-                paths = "%s, %s" % (orig, fco.path())
-                msg = "%s (%s; %s)" % (msg, hexes, paths)
-            except Exception as e:
-                # we don't expect any exceptions to happen, but to be 100%
-                # sure we don't break hg let's catch everything and log it
-                msg = "failed to log: %s" % (e,)
-            repo.ui.log("copytrace", msg=msg, reponame=_getreponame(repo, repo.ui))
-
-    return origfunc(
-        premerge, repo, wctx, mynode, orig, fcd, fco, fca, labels, *args, **kwargs
-    )
-
-
-def _runcommand(orig, lui, repo, cmd, fullargs, ui, *args, **kwargs):
-    return orig(lui, repo, cmd, fullargs, ui, *args, **kwargs)
 
 
 # Note: dbm._Database does not exist.
@@ -198,16 +126,19 @@ def opendbm(repo, flag):
     On some platforms, dbm is available, on others it's not,
     but gdbm is unfortunately not available everywhere, like on Windows.
     """
-    dbms = [(dbm.open, "amendcopytrace", dbm.error)]
+    with hgdemandimport.deactivated():
+        import dbm
 
-    for opener, fname, error in dbms:
-        path = repo.localvfs.join(fname)
-        try:
-            return (opener(path, flag), error)
-        except error:
-            continue
-        except ImportError:
-            continue
+        dbms = [(dbm.open, "amendcopytrace", dbm.error)]
+
+        for opener, fname, error in dbms:
+            path = repo.localvfs.join(fname)
+            try:
+                return (opener(path, flag), error)
+            except error:
+                continue
+            except ImportError:
+                continue
 
     return None, None
 
@@ -232,7 +163,7 @@ def _amend(orig, ui, repo, old, extra, pats, opts):
 
     This function collects the copytrace information from the working copy and
     stores it against the amended commit in a separate dbm file. Later,
-    in _domergecopies, this information will be merged with the rebase
+    in _mergecopies, this information will be merged with the rebase
     copytrace data to incorporate renames and copies made during the amend.
     """
 
@@ -355,28 +286,8 @@ def _getamendcopies(repo, dest, ancestor):
             pass
 
 
-def _mergecopies(orig, repo, cdst, csrc, base):
-    start = time.time()
-    try:
-        return _domergecopies(orig, repo, cdst, csrc, base)
-    except Exception as e:
-        # make sure we don't break clients
-        repo.ui.log(
-            "copytrace",
-            "Copytrace failed: %s" % e,
-            reponame=_getreponame(repo, repo.ui),
-        )
-        return {}, {}, {}, {}, {}
-    finally:
-        repo.ui.log(
-            "copytracingduration",
-            "",
-            copytracingduration=time.time() - start,
-        )
-
-
 @util.timefunction("mergecopies")
-def _domergecopies(orig, repo, cdst, csrc, base):
+def _mergecopies(orig, repo, cdst, csrc, base):
     """Fast copytracing using filename heuristics
 
     Handle one case where we assume there are no merge commits in
@@ -426,14 +337,13 @@ def _domergecopies(orig, repo, cdst, csrc, base):
 
     """
 
-    if repo.ui.config("experimental", "copytrace") == "on":
-        # user explicitly enabled copytracing - use it
-        return orig(repo, cdst, csrc, base)
+    # todo: make copy tracing support directory move detection
 
     # avoid silly behavior for parent -> working dir
     if csrc.node() is None and cdst.node() == repo.dirstate.p1():
         return repo.dirstate.copies(), {}, {}, {}, {}
 
+    orig_cdst = cdst
     if cdst.rev() is None:
         cdst = cdst.p1()
     if csrc.rev() is None:
@@ -441,35 +351,33 @@ def _domergecopies(orig, repo, cdst, csrc, base):
 
     copies = {}
 
-    ctx = csrc
     changedfiles = set()
     sourcecommitnum = 0
     sourcecommitlimit = repo.ui.configint("copytrace", "sourcecommitlimit")
     mdst = cdst.manifest()
-    while ctx != base:
-        if len(ctx.parents()) == 2:
+
+    if repo.ui.cmdname == "backout":
+        # for `backout` operation, `base` is the commit we want to backout and
+        # `csrc` is the parent of the `base` commit.
+        curr, target = base, csrc
+    else:
+        # for normal cases, `base` is the parent of `csrc`
+        curr, target = csrc, base
+
+    while curr != target:
+        if len(curr.parents()) == 2:
             # To keep things simple let's not handle merges
             return orig(repo, cdst, csrc, base)
-        changedfiles.update(ctx.files())
-        ctx = ctx.p1()
+        changedfiles.update(curr.files())
+        curr = curr.p1()
         sourcecommitnum += 1
         if sourcecommitnum > sourcecommitlimit:
             return orig(repo, cdst, csrc, base)
 
-    if _dagcopytraceenabled(repo.ui) and git.isgitformat(repo):
-        dag_copy_trace = repo._dagcopytrace
-        srcmissingfiles = [
-            f for f in changedfiles if f not in csrc and f in base and f in mdst
-        ]
-        for f in srcmissingfiles:
-            src_file = dag_copy_trace.trace_rename(base.node(), csrc.node(), f)
-            if src_file:
-                copies[src_file] = f
-    else:
-        cp = copiesmod._forwardcopies(base, csrc)
-        for dst, src in pycompat.iteritems(cp):
-            if src in mdst:
-                copies[dst] = src
+    cp = copiesmod.pathcopies(base, csrc)
+    for dst, src in _filtercopies(cp, base, cdst).items():
+        if src in orig_cdst or dst in orig_cdst:
+            copies[dst] = src
 
     # file is missing if it isn't present in the destination, but is present in
     # the base and present in the source.
@@ -481,26 +389,27 @@ def _domergecopies(orig, repo, cdst, csrc, base):
     repo.ui.metrics.gauge("copytrace_missingfiles", len(missingfiles))
     if missingfiles and _dagcopytraceenabled(repo.ui):
         dag_copy_trace = repo._dagcopytrace
-        for f in missingfiles:
-            dst_file = dag_copy_trace.trace_rename(csrc.node(), cdst.node(), f)
-            if dst_file:
-                copies[dst_file] = f
+        dst_copies = dag_copy_trace.trace_renames(
+            csrc.node(), cdst.node(), missingfiles
+        )
+        copies.update(_filtercopies(dst_copies, base, csrc))
 
     if repo.ui.configbool("copytrace", "enableamendcopytrace"):
         # Look for additional amend-copies.
         amend_copies = _getamendcopies(repo, cdst, base.p1())
         if amend_copies:
             repo.ui.debug("Loaded amend copytrace for %s" % cdst)
-            for dst, src in pycompat.iteritems(amend_copies):
+            for dst, src in _filtercopies(amend_copies, base, csrc).items():
                 if dst not in copies:
                     copies[dst] = src
 
     repo.ui.metrics.gauge("copytrace_copies", len(copies))
-    return _filtercopies(copies, cdst, csrc, base), {}, {}, {}, {}
+    return copies, {}, {}, {}, {}
 
 
-def _filtercopies(copies, cdst, csrc, base):
-    """Remove uninteresting copies if files are not changed.
+def _filtercopies(copies, base, otherctx):
+    """Remove uninteresting copies if a file is renamed in one side but not changed
+    in the other side.
 
     The mergecopies function is expected to report cases where one side renames
     a file, while the other side changed the file before the rename.
@@ -516,8 +425,7 @@ def _filtercopies(copies, cdst, csrc, base):
     newcopies = {}
     if copies:
         # Warm-up manifests
-        cdst.manifest()
-        csrc.manifest()
+        otherctx.manifest()
         base.manifest()
         for fdst, fsrc in copies.items():
             if fsrc not in base:
@@ -525,9 +433,7 @@ def _filtercopies(copies, cdst, csrc, base):
                 # wrong.
                 continue
             basenode = base[fsrc].filenode()
-            if fsrc in cdst and cdst[fsrc].filenode() == basenode:
-                continue
-            if fsrc in csrc and csrc[fsrc].filenode() == basenode:
+            if fsrc in otherctx and otherctx[fsrc].filenode() == basenode:
                 continue
             newcopies[fdst] = fsrc
     return newcopies
@@ -535,23 +441,3 @@ def _filtercopies(copies, cdst, csrc, base):
 
 def _dagcopytraceenabled(ui):
     return ui.configbool("copytrace", "dagcopytrace")
-
-
-def _getreponame(repo, ui):
-    reporoot = repo.origroot if hasattr(repo, "origroot") else ""
-    reponame = ui.config("paths", "default") or reporoot
-    if reponame:
-        reponame = os.path.basename(reponame)
-    return reponame
-
-
-def _getctxfromfctx(fctx):
-    if fctx.isabsent():
-        return fctx._ctx
-    else:
-        return fctx._changectx
-
-
-def _gethex(ctx):
-    # for workingctx return p1 hex
-    return ctx.hex() if ctx.hex() != node.wdirhex else ctx.p1().hex()

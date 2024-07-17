@@ -5,14 +5,12 @@
  * GNU General Public License version 2.
  */
 
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/config/EdenConfig.h"
-#include "eden/fs/utils/PathFuncs.h"
 
-#include <folly/experimental/TestUtil.h>
 #include <folly/portability/GTest.h>
 #include <folly/test/TestUtils.h>
-
-#include "eden/fs/utils/PathFuncs.h"
+#include <folly/testing/TestUtil.h>
 
 using namespace facebook::eden;
 using namespace std::chrono_literals;

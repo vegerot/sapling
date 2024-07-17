@@ -18,7 +18,7 @@ pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
     m.add(
         py,
         "incrementcounter",
-        py_fn!(py, increment_counter(key: &str, value: usize = 1)),
+        py_fn!(py, increment_counter(key: &str, value: u64 = 1)),
     )?;
     m.add(py, "summarize", py_fn!(py, summarize()))?;
 
@@ -36,13 +36,13 @@ pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
     Ok(m)
 }
 
-fn increment_counter(_py: Python, key: &str, value: usize) -> PyResult<PyNone> {
+fn increment_counter(_py: Python, key: &str, value: u64) -> PyResult<PyNone> {
     hg_metrics::increment_counter(key, value);
     Ok(PyNone)
 }
 
-fn summarize(_py: Python) -> PyResult<HashMap<String, usize>> {
-    Ok(hg_metrics::summarize().into_iter().collect())
+fn summarize(_py: Python) -> PyResult<HashMap<String, u64>> {
+    Ok(hg_metrics::summarize())
 }
 
 fn sampling_category(_py: Python, key: &str) -> PyResult<Option<String>> {

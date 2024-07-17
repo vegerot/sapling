@@ -17,12 +17,15 @@ use bookmarks::Bookmarks;
 use clap::Parser;
 use clap::ValueEnum;
 use cmdlib_displaying::display_content;
+use cmdlib_displaying::display_fsnode_manifest;
 use cmdlib_displaying::display_hg_manifest;
 use cmdlib_displaying::DisplayChangeset;
 use context::CoreContext;
 use ephemeral_blobstore::BubbleId;
 use ephemeral_blobstore::RepoEphemeralStore;
 use ephemeral_blobstore::RepoEphemeralStoreRef;
+use filestore::FetchKey;
+use fsnodes::RootFsnodeId;
 use manifest::Entry;
 use manifest::ManifestOps;
 use mercurial_types::HgChangesetId;
@@ -30,8 +33,11 @@ use mononoke_app::args::ChangesetArgs;
 use mononoke_app::args::RepoArgs;
 use mononoke_app::MononokeApp;
 use mononoke_types::path::MPath;
+use mononoke_types::ChangesetId;
 use repo_blobstore::RepoBlobstore;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_derived_data::RepoDerivedData;
+use repo_derived_data::RepoDerivedDataRef;
 
 /// Fetch commit, tree or file data.
 #[derive(Parser)]
@@ -72,12 +78,16 @@ pub struct Repo {
 
     #[facet]
     repo_ephemeral_store: RepoEphemeralStore,
+
+    #[facet]
+    repo_derived_data: RepoDerivedData,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, ValueEnum)]
 pub enum ManifestKind {
     Hg,
-    // TODO: Add unode manifest, fsnode and skmf support
+    Fsnode,
+    // TODO: Add unode manifest and skmf support
 }
 
 pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
@@ -100,7 +110,7 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
         Some(bubble_id) => {
             let bubble = repo
                 .repo_ephemeral_store()
-                .open_bubble(bubble_id)
+                .open_bubble(&ctx, bubble_id)
                 .await
                 .with_context(|| format!("Failed to open bubble {}", bubble_id))?;
             bubble.wrap_repo_blobstore(repo.repo_blobstore().clone())
@@ -135,9 +145,71 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
                     .ok_or_else(|| anyhow!("No Hg changeset for {}", changeset_id))?;
                 display_hg_entry(&ctx, &blobstore, hg_changeset_id, path).await?;
             }
+            ManifestKind::Fsnode => {
+                display_fsnode(&ctx, &repo, &blobstore, changeset_id, path).await?;
+            }
         },
     }
 
+    Ok(())
+}
+
+async fn display_content_info(
+    ctx: &CoreContext,
+    blobstore: &RepoBlobstore,
+    fetch_key: &FetchKey,
+) -> Result<()> {
+    let metadata = filestore::get_metadata(blobstore, ctx, fetch_key)
+        .await
+        .context("Failed to load metadata")?
+        .ok_or_else(|| anyhow!("Content for file {} not found", fetch_key))?;
+    writeln!(std::io::stdout(), "Size: {}", metadata.total_size)?;
+    writeln!(std::io::stdout(), "Content-Id: {}", metadata.content_id)?;
+    writeln!(std::io::stdout(), "Sha1: {}", metadata.sha1)?;
+    writeln!(std::io::stdout(), "Sha256: {}", metadata.sha256)?;
+    writeln!(std::io::stdout(), "Git-Sha1: {}", metadata.git_sha1)?;
+
+    let content = filestore::fetch_concat(blobstore, ctx, fetch_key.clone())
+        .await
+        .context("Failed to load content")?;
+    display_content(std::io::stdout(), content)?;
+    Ok(())
+}
+
+async fn display_fsnode(
+    ctx: &CoreContext,
+    repo: &Repo,
+    blobstore: &RepoBlobstore,
+    cs_id: ChangesetId,
+    path: &str,
+) -> Result<()> {
+    let root_fsnode_id = repo
+        .repo_derived_data()
+        .derive::<RootFsnodeId>(ctx, cs_id)
+        .await?;
+    let fsnode = if path.is_empty() {
+        Entry::Tree(root_fsnode_id.fsnode_id().clone())
+    } else {
+        let mpath = MPath::new(path).with_context(|| format!("Invalid path: {}", path))?;
+        root_fsnode_id
+            .fsnode_id()
+            .find_entry(ctx.clone(), blobstore.clone(), mpath)
+            .await?
+            .ok_or_else(|| anyhow!("Path does not exist: {}", path))?
+    };
+    match fsnode {
+        Entry::Leaf(fsnode_file) => {
+            writeln!(std::io::stdout(), "File-Type: {}", fsnode_file.file_type())?;
+            display_content_info(ctx, blobstore, &fsnode_file.content_id().clone().into()).await?;
+        }
+        Entry::Tree(id) => {
+            let manifest = id
+                .load(ctx, blobstore)
+                .await
+                .context("Failed to load manifest")?;
+            display_fsnode_manifest(std::io::stdout(), &manifest)?;
+        }
+    }
     Ok(())
 }
 
@@ -168,28 +240,8 @@ async fn display_hg_entry(
                 .load(ctx, blobstore)
                 .await
                 .context("Failed to load envelope")?;
-            let metadata = filestore::get_metadata(blobstore, ctx, &envelope.content_id().into())
-                .await
-                .context("Failed to load metadata")?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Content id {} for file {} in {} not found",
-                        id,
-                        path,
-                        hg_changeset_id,
-                    )
-                })?;
             writeln!(std::io::stdout(), "File-Type: {}", file_type)?;
-            writeln!(std::io::stdout(), "Size: {}", metadata.total_size)?;
-            writeln!(std::io::stdout(), "Content-Id: {}", metadata.content_id)?;
-            writeln!(std::io::stdout(), "Sha1: {}", metadata.sha1)?;
-            writeln!(std::io::stdout(), "Sha256: {}", metadata.sha256)?;
-            writeln!(std::io::stdout(), "Git-Sha1: {}", metadata.git_sha1)?;
-
-            let content = filestore::fetch_concat(blobstore, ctx, envelope.content_id())
-                .await
-                .context("Failed to load content")?;
-            display_content(std::io::stdout(), content)?;
+            display_content_info(ctx, blobstore, &envelope.content_id().into()).await?;
         }
         Entry::Tree(id) => {
             let manifest = id

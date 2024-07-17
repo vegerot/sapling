@@ -6,66 +6,53 @@
  */
 
 import type {CommitInfo} from './types';
-import type {Snapshot} from 'recoil';
 
-import {walkTreePostorder} from './getCommitTree';
+import {readAtom} from './jotaiUtils';
 import {AmendToOperation} from './operations/AmendToOperation';
-import {uncommittedSelectionReadonly} from './partialSelection';
-import {treeWithPreviews, uncommittedChangesWithPreviews} from './previews';
+import {uncommittedSelection} from './partialSelection';
+import {dagWithPreviews, uncommittedChangesWithPreviews} from './previews';
+import {latestSuccessorUnlessExplicitlyObsolete} from './successionUtils';
 
 /**
  * Amend --to allows amending to a parent commit other than head.
  * Only allowed on a commit that is a parent of head, and when
  * your current selection is not a partial selection.
  */
-export function isAmendToAllowedForCommit(commit: CommitInfo, snapshot: Snapshot): boolean {
-  if (commit.isHead) {
+export function isAmendToAllowedForCommit(commit: CommitInfo): boolean {
+  if (commit.isDot || commit.phase === 'public' || commit.successorInfo != null) {
     // no point, just amend normally
     return false;
   }
 
-  const uncommittedChanges = snapshot.getLoadable(uncommittedChangesWithPreviews).valueMaybe();
+  const uncommittedChanges = readAtom(uncommittedChangesWithPreviews);
   if (uncommittedChanges == null || uncommittedChanges.length === 0) {
     // nothing to amend
     return false;
   }
 
   // amend --to doesn't handle partial chunk selections, only entire files
-  const selection = snapshot.getLoadable(uncommittedSelectionReadonly).valueOrThrow();
+  const selection = readAtom(uncommittedSelection);
   const hasPartialSelection = selection.hasChunkSelection();
 
   if (hasPartialSelection) {
     return false;
   }
 
-  const trees = snapshot.getLoadable(treeWithPreviews).valueMaybe();
-  if (trees == null) {
+  const dag = readAtom(dagWithPreviews);
+  const head = dag?.resolve('.');
+  if (dag == null || head == null || !dag.has(commit.hash)) {
     return false;
   }
 
-  const {treeMap} = trees;
-  const tree = treeMap.get(commit.hash);
-  if (tree == null) {
-    return false;
-  }
-
-  // to amend --to, you must select parent of the head commit
-  for (const child of walkTreePostorder(tree.children)) {
-    if (child.info.isHead) {
-      // found the head commit
-      return true;
-    }
-  }
-
-  return false;
+  return dag.isAncestor(commit.hash, head.hash);
 }
 
-export function getAmendToOperation(commit: CommitInfo, snapshot: Snapshot): AmendToOperation {
-  const selection = snapshot.getLoadable(uncommittedSelectionReadonly).valueOrThrow();
-  const uncommittedChanges = snapshot.getLoadable(uncommittedChangesWithPreviews).valueOrThrow();
+export function getAmendToOperation(commit: CommitInfo): AmendToOperation {
+  const selection = readAtom(uncommittedSelection);
+  const uncommittedChanges = readAtom(uncommittedChangesWithPreviews);
 
   const paths = uncommittedChanges
     .filter(change => selection.isFullySelected(change.path))
     .map(change => change.path);
-  return new AmendToOperation(commit.hash, paths);
+  return new AmendToOperation(latestSuccessorUnlessExplicitlyObsolete(commit), paths);
 }

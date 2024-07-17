@@ -5,9 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {Placement} from './Tooltip';
+import type {Placement} from 'isl-components/Tooltip';
 
-import {Tooltip} from './Tooltip';
+import {t} from './i18n';
+import {Tooltip} from 'isl-components/Tooltip';
 
 type CommitTitleProps = React.HTMLAttributes<HTMLDivElement> & {
   commitMessage: string;
@@ -34,4 +35,8 @@ export function CommitTitle(props: CommitTitleProps) {
       </Tooltip>
     );
   }
+}
+
+export function temporaryCommitTitle() {
+  return t('Temporary Commit at $time', {replace: {$time: new Date().toLocaleString()}});
 }

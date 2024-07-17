@@ -8,15 +8,15 @@
 import type {ReactNode} from 'react';
 
 import * as en from './en/common.json';
-import EventEmitter from 'events';
 import React, {createContext, useContext, useEffect, useState} from 'react';
+import {TypedEventEmitter} from 'shared/TypedEventEmitter';
 
 /**
  * ISO 639-3 language code used to control which translation we use
  */
 type LanguageId = string;
 
-// TODO: these language files should be lazilly loaded rather than bundled with webpack
+// TODO: these language files should be lazilly loaded rather than bundled directly
 const langs: {[key: string]: {[key: string]: string}} = {
   en,
   // Add other languages here!
@@ -33,7 +33,7 @@ let currentLanguage: LanguageId =
   (typeof window !== 'undefined' ? window.saplingLanguage : null) ?? 'en';
 
 const I18nContext = createContext(currentLanguage);
-export const onChangeLanguage = new EventEmitter();
+export const onChangeLanguage = new TypedEventEmitter<'change', string>();
 
 /**
  * We need to re-render translated components when the language is changed.
@@ -43,7 +43,7 @@ export function I18nSupport({children}: {children: React.ReactNode}) {
   const [lang, setLang] = useState(currentLanguage);
   useEffect(() => {
     onChangeLanguage.on('change', setLang);
-    return () => void onChangeLanguage.removeListener('change', setLang);
+    return () => void onChangeLanguage.off('change', setLang);
   }, []);
   return <I18nContext.Provider value={lang}>{children}</I18nContext.Provider>;
 }
@@ -152,7 +152,9 @@ function translate(
       parts
         .map(part => options.replace?.[part] ?? part)
         // if we replace with a component, we need to set a key or react will complain
-        .map((part, i) => (typeof part === 'object' ? {...part, key: i} : part))
+        .map((part, i) =>
+          typeof part === 'object' ? ({...part, key: String(i)} as ReactNode) : part,
+        )
     );
   }
   return [result];

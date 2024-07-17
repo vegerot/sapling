@@ -17,12 +17,13 @@ import textwrap
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .. import sh
+from ..sh.bufio import BufIO
 from ..sh.osfs import OSFS
 from ..sh.types import Env, OnError, Scope
-from . import shext
+from . import hghave, shext
 from .diff import MultiLineMatcher
 
 
@@ -35,9 +36,11 @@ def hasfeature(feature: str) -> bool:
     False
     >>> hasfeature("false")
     False
+    >>> hasfeature("banana")
+    False
+    >>> hasfeature("no-banana")
+    True
     """
-    from . import hghave
-
     res = hghave.checkfeatures([feature])
     return all(not res.get(k) for k in ["error", "missing", "skipped"])
 
@@ -86,12 +89,13 @@ def checkoutput(
     endloc: int,
     indent: int,
     filename: str,
+    fallback_line_match: Optional[Callable[[str, str], bool]] = None,
 ):
     """compare output (a) with reference (b)
     report mismatch via globals()['mismatchcb']
     """
-    hasfeature = sys._getframe(1).f_globals.get("hasfeature")
-    matcher = MultiLineMatcher(b, hasfeature)
+    hasfeature = sys._getframe(2).f_globals.get("hasfeature")
+    matcher = MultiLineMatcher(b, hasfeature, fallback_line_match)
     # AssertionError usually means the test is already broken.
     # Report it as a mismatch to fail the test. Note: we don't raise here
     # to provide better error messages (ex. show line number of the assertion)
@@ -109,7 +113,7 @@ def checkoutput(
             indent=indent,
             filename=filename,
         )
-        cb = sys._getframe(1).f_globals.get("mismatchcb")
+        cb = sys._getframe(2).f_globals.get("mismatchcb")
         if cb:
             # callback "mismatchcb" is set - run by the testing.t.runtest()
             # report via callback, which handles rendering and autofix.
@@ -240,6 +244,7 @@ class TestTmp:
         self,
         updateglobalstate: bool = True,
         tmpprefix: str = "",
+        testcase: Optional[str] = None,
     ):
         """create a TestTmp environment (tmpdir, and a shinterp Env)
         Intended to be used in 'with' context.
@@ -249,8 +254,10 @@ class TestTmp:
         self._atexit = []
         self._updateglobalstate = updateglobalstate
         self._origpathenv = os.getenv("PATH") or os.defpath
+        self._fallbackmatch = None
         self._setup(tmpprefix)
         self._lastout = ""
+        self._testcase = testcase
 
     def atexit(self, func):
         # register a function to be called during tearing down
@@ -325,52 +332,60 @@ class TestTmp:
         if export:
             self.shenv.exportenv(name)
 
-    def requireexe(self, name: str, fullpath: Optional[str] = None):
+    def requireexe(self, name: str, fullpath: Optional[str] = None, symlink=False):
         """require an external binary"""
+        ext = ".exe" if os.name == "nt" else ""
         # find the program from PATH
         if fullpath is None:
-            ext = ""
-            if os.name == "nt":
-                ext = ".exe"
             paths = self._origpathenv.split(os.pathsep)
             paths += os.defpath.split(os.pathsep)
             for path in paths:
                 if path.startswith(str(self.path / "bin")):
                     continue
-                fullpath = os.path.join(path, f"{name}{ext}")
-                if os.path.isfile(fullpath):
+                exts = [".exe", ".bat"] if os.name == "nt" else [""]
+                found = False
+                for x in exts:
+                    fullpath = os.path.join(path, f"{name}{x}")
+                    if os.path.isfile(fullpath):
+                        found = True
+                        break
+                if found:
                     break
             if not fullpath:
                 raise unittest.SkipTest(f"missing exe: {name}")
         else:
             fullpath = os.path.realpath(fullpath)
         # add a function for sheval
+        orig_path = os.pathsep.join([str(self.path / "bin"), self._origpathenv])
         self.shenv.cmdtable[name] = shext.wrapexe(
-            fullpath, env_override={"PATH": self._origpathenv}
+            fullpath, env_override={"PATH": orig_path}
         )
         # write a shim in $TESTTMP/bin for os.system
         self.path.joinpath("bin").mkdir(exist_ok=True)
-        if os.name == "nt":
-            script = "\n".join(
-                [
-                    "@echo off",
-                    f"set PATH={self._origpathenv}",
-                    f'"{fullpath}" %*',
-                    "exit /B %errorlevel%",
-                ]
-            )
-            destpath = self.path / "bin" / f"{name}.bat"
+        if symlink:
+            os.symlink(fullpath, self.path / "bin" / (name + ext))
         else:
-            script = "\n".join(
-                [
-                    "#!/bin/sh",
-                    f"export PATH={repr(self._origpathenv)}",
-                    f'exec {fullpath} "$@"',
-                ]
-            )
-            destpath = self.path / "bin" / name
-        destpath.write_text(script)
-        destpath.chmod(0o555)
+            if os.name == "nt":
+                script = "\n".join(
+                    [
+                        "@echo off",
+                        f"set PATH={orig_path}",
+                        f'"{fullpath}" %*',
+                        "exit /B %errorlevel%",
+                    ]
+                )
+                destpath = self.path / "bin" / f"{name}.bat"
+            else:
+                script = "\n".join(
+                    [
+                        "#!/bin/sh",
+                        f"export PATH={repr(orig_path)}",
+                        f'exec {fullpath} "$@"',
+                    ]
+                )
+                destpath = self.path / "bin" / name
+            destpath.write_text(script)
+            destpath.chmod(0o555)
 
     def updatedglobalstate(self):
         """context manager that updates global states (pwd, environ, ...)"""
@@ -385,6 +400,14 @@ class TestTmp:
             if str(self.path) != self._origcwd:
                 os.chdir(str(self.path))
             shext.updateosenv(self.shenv.getexportedenv())
+
+        if self._testcase is not None:
+            if self._testcase in hghave.checks:
+                raise RuntimeError(
+                    f"test case {self._testcase} conflicts with an existing feature"
+                )
+            hghave.checks[self._testcase] = (True, f"test case {self._testcase}")
+
         return self
 
     def __exit__(self, et, ev, tb):
@@ -397,6 +420,10 @@ class TestTmp:
             if cwd != self._origcwd:
                 os.chdir(self._origcwd)
             shext.updateosenv(self._origenv)
+
+        if self._testcase is not None:
+            del hghave.checks[self._testcase]
+
         self._teardown()
 
     def _setup(self, tmpprefix):
@@ -415,7 +442,7 @@ class TestTmp:
             envvars=envvars,
             exportedenvvars=set(envvars),
             cmdtable=self._initialshellcmdtable(),
-            stdin=io.BytesIO(),
+            stdin=BufIO(),
         )
 
         pyenv = {
@@ -445,12 +472,51 @@ class TestTmp:
                 (re.escape("\\\\?\\"), ""),
             ]
 
-    @property
-    def checkoutput(self):
-        return checkoutput
+    def checkoutput(
+        self,
+        a: str,
+        b: str,
+        src: str,
+        srcloc: int,
+        outloc: int,
+        endloc: int,
+        indent: int,
+        filename: str,
+    ):
+        try:
+            return checkoutput(
+                a,
+                b,
+                src,
+                srcloc,
+                outloc,
+                endloc,
+                indent,
+                filename,
+                fallback_line_match=self._fallbackmatch,
+            )
+        finally:
+            self.post_checkoutput(a, b, src, srcloc, outloc, endloc, indent, filename)
+
+    def post_checkoutput(
+        self,
+        a: str,
+        b: str,
+        src: str,
+        srcloc: int,
+        outloc: int,
+        endloc: int,
+        indent: int,
+        filename: str,
+    ):
+        # Can be patched by extensions, like "record".
+        pass
 
     def require(self, feature: str) -> bool:
         return require(feature)
+
+    def registerfallbackmatch(self, fallback: Callable[[str, str], bool]):
+        self._fallbackmatch = fallback
 
     def hasfeature(self, feature: str) -> bool:
         return hasfeature(feature)

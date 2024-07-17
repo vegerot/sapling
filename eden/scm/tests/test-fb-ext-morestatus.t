@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 #inprocess-hg-incompatible
 
   $ eagerepo
@@ -14,9 +16,11 @@
   > EOF
   $ breakupdate() {
   >   setconfig extensions.breakupdate="$TESTTMP/breakupdate.py"
+  >   setconfig checkout.use-rust=false
   > }
   $ unbreakupdate() {
   >   disable breakupdate
+  >   setconfig checkout.use-rust=true
   > }
 
 Test An empty repo should return no extra output
@@ -81,17 +85,18 @@ Test graft state
   ? a.orig
   
   # The repository is in an unfinished *graft* state.
-  # Unresolved merge conflicts:
+  # Unresolved merge conflicts (1):
   # 
   #     a
   # 
   # To mark files as resolved:  hg resolve --mark FILE
   # To continue:                hg graft --continue
-  # To abort:                   hg goto --clean .    (warning: this will discard uncommitted changes)
+  # To abort:                   hg graft --abort
 
 
 Test hg status is normal after graft abort
-  $ hg up --clean -q
+  $ hg graft --abort -q
+  $ hg up --clean -q .
   $ hg status
   ? a.orig
   $ rm a.orig
@@ -111,7 +116,7 @@ Test unshelve state
   ? a.orig
   
   # The repository is in an unfinished *unshelve* state.
-  # Unresolved merge conflicts:
+  # Unresolved merge conflicts (1):
   # 
   #     a
   # 
@@ -142,16 +147,17 @@ Test rebase state
   ? a.orig
   
   # The repository is in an unfinished *rebase* state.
-  # Unresolved merge conflicts:
+  # Unresolved merge conflicts (1):
   # 
   #     a
   # 
   # To mark files as resolved:  hg resolve --mark FILE
   # To continue:                hg rebase --continue
   # To abort:                   hg rebase --abort
+  # To quit:                    hg rebase --quit
   # 
-  # Rebasing from 2977a57ce863 (remove content)
-  #            to 79361b8cdbb5 (add content)
+  # Rebasing 2977a57ce863 (remove content)
+  #       to 79361b8cdbb5 (add content)
 
 
 Test status in rebase state with resolved files
@@ -166,9 +172,10 @@ Test status in rebase state with resolved files
   # No unresolved merge conflicts.
   # To continue:                hg rebase --continue
   # To abort:                   hg rebase --abort
+  # To quit:                    hg rebase --quit
   # 
-  # Rebasing from 2977a57ce863 (remove content)
-  #            to 79361b8cdbb5 (add content)
+  # Rebasing 2977a57ce863 (remove content)
+  #       to 79361b8cdbb5 (add content)
 
 
 Test hg status is normal after rebase abort
@@ -187,6 +194,7 @@ Test rebase with an interrupted update:
   # The repository is in an unfinished *rebase* state.
   # To continue:                hg rebase --continue
   # To abort:                   hg rebase --abort
+  # To quit:                    hg rebase --quit
 
   $ hg rebase --abort -q
   rebase aborted
@@ -200,7 +208,7 @@ Test conflicted merge state
   ? a.orig
   
   # The repository is in an unfinished *merge* state.
-  # Unresolved merge conflicts:
+  # Unresolved merge conflicts (1):
   # 
   #     a
   # 
@@ -217,7 +225,7 @@ Test if listed files have a relative path to current location
   ? ../../a.orig
   
   # The repository is in an unfinished *merge* state.
-  # Unresolved merge conflicts:
+  # Unresolved merge conflicts (1):
   # 
   #     ../../a
   # 
@@ -228,7 +236,7 @@ Test if listed files have a relative path to current location
   $ cd ../..
 
 Test hg status is normal after merge abort
-  $ hg goto --clean -q
+  $ hg goto --clean -q .
   $ hg status
   ? a.orig
   $ rm a.orig

@@ -28,7 +28,7 @@ use serde_json::Value;
 pub use zstore::Id20;
 use zstore::Zstore;
 
-use crate::constants::*;
+use crate::constants::METALOG_TRACKED;
 use crate::Error;
 use crate::Result;
 
@@ -291,6 +291,11 @@ impl MetaLog {
         self.root.map.keys().map(AsRef::as_ref).collect()
     }
 
+    /// Internal use.
+    pub(crate) fn keys_iter<'a>(&'a self) -> impl Iterator<Item = String> + 'a {
+        self.root.map.keys().map(ToOwned::to_owned)
+    }
+
     /// Attempt to write pending changes to disk.
     ///
     /// Return the Id20 that can be passed to `open` for the new (or old) root.
@@ -375,7 +380,7 @@ impl MetaLog {
         }
         // The lastest root id in the in-process log is the same, but the
         // in-process log is outdated.
-        if log.is_changed() {
+        if log.is_changed_on_disk() {
             return Ok(true);
         }
         Ok(false)
@@ -406,6 +411,31 @@ impl MetaLog {
     /// Generate an error.
     pub fn error(&self, message: impl fmt::Display) -> Error {
         Error(format!("{:?}: {}", &self.path, message))
+    }
+
+    /// Block until the on-disk metalog gets changed.
+    /// If `keys` is not empty, wait until the given `keys` are changed.
+    /// Return the updated new metalog for waiting again.
+    pub fn wait_for_change(&self, keys: &[&str]) -> Result<Self> {
+        // Drop dirty changes.
+        let old_metalog = self.checkout(self.root_id())?;
+        let mut log_wait = ilog::Wait::from_log(&old_metalog.log.read())?;
+        'wait_loop: loop {
+            let new_metalog = Self::open(old_metalog.path.as_path(), None)?;
+            if keys.is_empty() {
+                if new_metalog.root_id() != old_metalog.root_id() {
+                    break 'wait_loop Ok(new_metalog);
+                }
+            } else {
+                for key in keys {
+                    if new_metalog.get_hash(key) != old_metalog.get_hash(key) {
+                        break 'wait_loop Ok(new_metalog);
+                    }
+                }
+            }
+            // Block.
+            log_wait.wait_for_change()?;
+        }
     }
 
     fn ilog_open_options() -> ilog::OpenOptions {
@@ -475,7 +505,7 @@ impl Repair<()> for MetaLog {
 
         // Write out good Root IDs.
         if good_root_ids.len() == root_ids.len() {
-            message += &"All Roots are verified.\n".to_string();
+            message += "All Roots are verified.\n";
         } else {
             message += &format!(
                 "Removing {} bad Root IDs.\n",
@@ -583,9 +613,12 @@ pub(crate) struct SerId20(#[serde(with = "types::serde_with::hgid::tuple")] pub(
 pub mod resolver {
     use std::collections::BTreeSet;
 
+    use minibytes::Bytes;
+
     use super::Id20;
     use super::MetaLog;
     use super::SerId20;
+    use crate::resolve::try_resolve_metalog_conflict;
     use crate::Result;
 
     /// Simple merge strategy: Only reject conflicted changes.
@@ -601,20 +634,32 @@ pub mod resolver {
     pub fn simple(this: &mut MetaLog, other: &MetaLog, ancestor: &MetaLog) -> Result<()> {
         let mut conflicts = BTreeSet::new();
         let mut resolved: Vec<(String, Option<Id20>)> = Vec::new();
-        for key in other.keys().iter().chain(this.keys().iter()) {
-            let ancestor_id = ancestor.root.map.get(&key.to_string()).map(|t| t.0);
-            let other_id = other.root.map.get(&key.to_string()).map(|t| t.0);
-            let this_id = this.root.map.get(&key.to_string()).map(|t| t.0);
+        let keys: BTreeSet<String> = other.keys_iter().chain(this.keys_iter()).collect();
+        for key in keys {
+            let ancestor_id = ancestor.root.map.get(&key).map(|t| t.0);
+            let other_id = other.root.map.get(&key).map(|t| t.0);
+            let this_id = this.root.map.get(&key).map(|t| t.0);
             match (
                 ancestor_id == this_id,
                 ancestor_id == other_id,
                 this_id == other_id,
             ) {
                 (false, false, false) => {
-                    conflicts.insert(key.to_string());
+                    let this_data = this.get(&key)?.unwrap_or_else(Bytes::new);
+                    let other_data = other.get(&key)?.unwrap_or_else(Bytes::new);
+                    let ancestor_data = ancestor.get(&key)?.unwrap_or_else(Bytes::new);
+                    match try_resolve_metalog_conflict(&key, this_data, &other_data, &ancestor_data)
+                    {
+                        None => {
+                            conflicts.insert(key);
+                        }
+                        Some(data) => {
+                            this.set(&key, &data)?;
+                        }
+                    }
                 }
                 (true, false, _) => {
-                    resolved.push((key.to_string(), other_id));
+                    resolved.push((key, other_id));
                 }
                 _ => {}
             }
@@ -642,6 +687,8 @@ mod tests {
     use std::io::Seek;
     use std::io::SeekFrom;
     use std::io::Write;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
 
     use indexedlog::DefaultOpenOptions;
     use quickcheck::quickcheck;
@@ -824,6 +871,36 @@ mod tests {
     }
 
     #[test]
+    fn test_default_resolver_application_conflict() {
+        let dir = TempDir::new().unwrap();
+        let mut metalog = MetaLog::open(&dir, None).unwrap();
+
+        let key = "visibleheads";
+
+        // Create ancestor
+        let ancestor_id = metalog.commit(commit_opt("ancestor", 0)).unwrap();
+
+        // Prepare "this" - uncommitted
+        let mut this = metalog.checkout(ancestor_id).unwrap();
+        this.set(key, b"v1\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
+            .unwrap();
+
+        // Prepare "other" - committed
+        let mut other = metalog.checkout(ancestor_id).unwrap();
+        other
+            .set(key, b"v1\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n")
+            .unwrap();
+        other.commit(commit_opt("other", 1)).unwrap();
+
+        // Commit "this" to trigger conflict resolution.
+        this.commit(commit_opt("this", 2)).unwrap();
+
+        // Check resolved content.
+        let resolved = this.get(key).unwrap().unwrap();
+        assert_eq!(resolved, b"v1\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+    }
+
+    #[test]
     fn test_custom_resolver() {
         let dir = TempDir::new().unwrap();
         let mut metalog = MetaLog::open(&dir, None).unwrap();
@@ -985,9 +1062,9 @@ mod tests {
         }
 
         // verify that delete on commit works
-        fs::create_dir(&dir.path().join("roots")).unwrap();
-        fs::create_dir(&dir.path().join("1")).unwrap();
-        fs::create_dir(&dir.path().join("1").join("roots")).unwrap();
+        fs::create_dir(dir.path().join("roots")).unwrap();
+        fs::create_dir(dir.path().join("1")).unwrap();
+        fs::create_dir(dir.path().join("1").join("roots")).unwrap();
         metalog3.set("00", b"xyz").unwrap();
         metalog3.commit(commit_opt("compact commit 3", 4)).unwrap();
         for path in &deleted_paths {
@@ -995,6 +1072,66 @@ mod tests {
         }
         assert!(&dir.path().join("current").exists());
         assert!(&dir.path().join("2").exists());
+    }
+
+    #[test]
+    fn test_wait_for_changes() {
+        let dir = TempDir::new().unwrap();
+
+        let (tx, rx) = channel::<i32>();
+        let mut metalog = MetaLog::open(&dir, None).unwrap();
+
+        std::thread::spawn({
+            let mut metalog = metalog.checkout(metalog.orig_root_id).unwrap();
+            move || {
+                metalog = metalog.wait_for_change(&[]).unwrap();
+                tx.send(101).unwrap();
+                metalog = metalog.wait_for_change(&["key1"]).unwrap();
+                tx.send(102).unwrap();
+                metalog = metalog.wait_for_change(&["key1"]).unwrap();
+                tx.send(103).unwrap();
+                let _ = metalog;
+            }
+        });
+
+        // We should not receive 101 at this point.
+        std::thread::sleep(Duration::from_millis(110));
+        assert!(rx.try_recv().is_err());
+
+        // The other thread should detect and send 101.
+        metalog.set("a", b"1").unwrap();
+        metalog.commit(commit_opt("set a", 0)).unwrap();
+
+        assert_eq!(rx.recv().unwrap(), 101);
+
+        // The other thread should detect but ignore (key mismatch), should not send 102.
+        metalog.set("b", b"1").unwrap();
+        metalog.commit(commit_opt("set b", 0)).unwrap();
+
+        // We should not receive 102 at this point.
+        std::thread::sleep(Duration::from_millis(110));
+        assert!(rx.try_recv().is_err());
+
+        // The other thread should detect change and send 102.
+        metalog.set("key1", b"1").unwrap();
+        metalog.commit(commit_opt("change key1", 0)).unwrap();
+
+        assert_eq!(rx.recv().unwrap(), 102);
+
+        // The other thread should detect change and ignore (key1 not changed).
+        metalog.set("key1", b"1").unwrap();
+        metalog.set("b", b"2").unwrap();
+        metalog.commit(commit_opt("touch key1", 1)).unwrap();
+
+        // We should not receive 103 at this point.
+        std::thread::sleep(Duration::from_millis(110));
+        assert!(rx.try_recv().is_err());
+
+        // The other thread should detect change and send 103.
+        metalog.set("key1", b"2").unwrap();
+        metalog.commit(commit_opt("change key1", 1)).unwrap();
+
+        assert_eq!(rx.recv().unwrap(), 103);
     }
 
     quickcheck! {

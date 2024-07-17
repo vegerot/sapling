@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
   $ eagerepo
   $ configure dummyssh modernclient
   $ newclientrepo repo
@@ -44,7 +46,7 @@ Order relative to --config
 
 Attribution works
   $ hg config --configfile $TESTTMP/simple.rc mysection --debug
-  $TESTTMP/simple.rc:2:--configfile: mysection.myname=myvalue
+  $TESTTMP/simple.rc:2: mysection.myname=myvalue
 
 Cloning adds --configfile values to .hg/hgrc
   $ cd ..

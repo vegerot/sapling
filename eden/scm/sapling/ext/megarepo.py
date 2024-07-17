@@ -14,6 +14,8 @@ local repo which corresponds to commit "deadbeef" in a mirror repo.
 import re
 from typing import Optional
 
+import bindings
+
 from sapling import (
     autopull,
     commands,
@@ -26,6 +28,7 @@ from sapling import (
     util,
 )
 from sapling.autopull import deferredpullattempt, pullattempt
+from sapling.ext import fbcodereview
 from sapling.i18n import _
 from sapling.namespaces import namespace
 from sapling.node import bin, hex
@@ -50,8 +53,8 @@ def _megareponamespace(_repo) -> namespace:
 
     """
 
-    def cachedname(repo, commithash):
-        if localnode := getattr(repo, "_xrepo_lookup_cache", {}).get(commithash):
+    def cachedname(repo, commitid):
+        if localnode := getattr(repo, "_xrepo_lookup_cache", {}).get(commitid):
             return [localnode]
 
         return []
@@ -64,8 +67,8 @@ def _megareponamespace(_repo) -> namespace:
     )
 
 
-@autopullpredicate("megarepo", priority=100)
-def _xrepopull(repo, name) -> deferredpullattempt:
+@autopullpredicate("megarepo", priority=100, rewritepullrev=True)
+def _xrepopull(repo, name, rewritepullrev=False) -> Optional[pullattempt]:
     """Autopull a commit from another repo.
 
     First the xrepo commit is translated to the coresponding commit of
@@ -78,53 +81,142 @@ def _xrepopull(repo, name) -> deferredpullattempt:
     """
 
     def generateattempt() -> Optional[pullattempt]:
-        localnode = _xrepotranslate(repo, name)
+        if not may_need_xrepotranslate(repo, name):
+            return None
+
+        localnode = xrepotranslate(repo, name)
         if not localnode:
             return None
         return autopull.pullattempt(headnodes=[localnode])
 
-    return deferredpullattempt(generate=generateattempt)
+    if rewritepullrev:
+        if repo.ui.configbool("megarepo", "rewrite-pull-rev", True):
+            return generateattempt()
+    elif may_need_xrepotranslate(repo, name):
+        # deferredpullattempt disables "titles" namespace!
+        return deferredpullattempt(generate=generateattempt)
+
+    # Returning None allows "titles" namespace lookup.
+    return None
 
 
 _commithashre = re.compile(r"\A[0-9a-f]{6,40}\Z")
+_diffidre = re.compile(r"\AD\d+\Z")
 
 
-def _xrepotranslate(repo, commithash):
-    if not _commithashre.match(commithash):
+def may_need_xrepotranslate(repo, commitid) -> bool:
+    """Test if 'commitid' may trigger xrepo lookup without asking remote servers.
+    Returns True if the commitid might trigger xrepo lookup.
+    Returns False if the commitid will NOT trigger xrepo lookup.
+    This is a subset of `_xrepotranslate` but avoids remote lookups.
+    """
+    if (
+        not _diffidre.match(commitid)
+        and not _commithashre.match(commitid)
+        and "/" not in commitid
+    ):
+        return False
+    if not repo.nullableedenapi or commitid in repo:
+        return False
+    return True
+
+
+def _diff_to_commit(repo, commitid):
+    try:
+        # First try looking up the diff using our local repo name. This can work xrepo
+        # since Phabricator has knowledge of a commit landing to multiple different repos
+        # (one of which might be our repo).
+        if resolved := fbcodereview.diffidtonode(
+            repo,
+            commitid[1:],
+        ):
+            return hex(resolved)
+    except Exception as ex:
+        repo.ui.note_err(_("error resolving diff %s to commit: %s\n") % (commitid, ex))
+
+    for xrepo in repo.ui.configlist("megarepo", "transparent-lookup"):
+        if xrepo == repo.ui.config("remotefilelog", "reponame"):
+            continue
+
+        try:
+            # Now try using the other repo's name. If Phabricator hasn't noticed the
+            # commit appearing in our local repo yet, we need to resolve the diff number
+            # using the "native" repo.
+            if resolved := fbcodereview.diffidtonode(
+                repo,
+                commitid[1:],
+                localreponame=xrepo,
+            ):
+                return hex(resolved)
+        except Exception as ex:
+            repo.ui.note_err(
+                _("error resolving diff %s to commit in %s: %s\n")
+                % (commitid, xrepo, ex)
+            )
+
+    return None
+
+
+def xrepotranslate(repo, commitid):
+    commit_ids = {commitid}
+
+    if _diffidre.match(commitid):
+        # If it looks like a phabricator diff, first resolve the diff ID to a commit hash.
+        if resolved := _diff_to_commit(repo, commitid):
+            commitid = resolved
+            commit_ids.add(commitid)
+
+    if not _commithashre.match(commitid) and "/" not in commitid:
         return None
 
     if not repo.nullableedenapi:
-        return None
-
-    # Avoid xrepo query if commithash is now known to be of this repo.
-    # This would be the case if a previous autopull already found it.
-    if commithash in repo:
         return None
 
     cache = getattr(repo, "_xrepo_lookup_cache", None)
     if cache is None:
         return None
 
-    if commithash in cache:
-        return cache[commithash]
+    # Avoid xrepo query if commithash is now known to be of this repo.
+    # This would be the case if a previous autopull already found it.
+    if commitid in repo:
+        node = repo[commitid].node()
+        for id in commit_ids:
+            cache[id] = node
+        return node
 
-    commit_ids = {commithash}
+    if commitid in cache:
+        return cache[commitid]
 
     localnode = None
     for xrepo in repo.ui.configlist("megarepo", "transparent-lookup"):
         if xrepo == repo.ui.config("remotefilelog", "reponame"):
             continue
 
-        if len(commithash) == 40:
-            xnode = bin(commithash)
+        xnode = None
+
+        if "/" in commitid:
+            bm_name = commitid.removeprefix(xrepo + "/")
+            if bm_name != commitid:
+                repo.ui.note_err(
+                    _("looking up bookmark %s in repo %s\n") % (bm_name, xrepo)
+                )
+                xrepo_edenapi = bindings.edenapi.client(repo.ui._rcfg, reponame=xrepo)
+                if xrepo_hash := xrepo_edenapi.bookmarks([bm_name]).get(bm_name):
+                    commit_ids.add(xrepo_hash)
+                    xnode = bin(xrepo_hash)
+        elif len(commitid) == 40:
+            xnode = bin(commitid)
         else:
             try:
                 repo.ui.note_err(
-                    _("looking up prefix %s in repo %s\n") % (commithash, xrepo)
+                    _("looking up prefix %s in repo %s\n") % (commitid, xrepo)
                 )
-                xnode = next(repo._http_prefix_lookup([commithash], reponame=xrepo))
+                xnode = next(repo._http_prefix_lookup([commitid], reponame=xrepo))
             except error.RepoLookupError:
-                continue
+                pass
+
+        if xnode is None:
+            continue
 
         if xnode in cache:
             return cache[xnode]
@@ -180,7 +272,7 @@ def extsetup(ui) -> None:
     action = ui.config("megarepo", "lossy-commit-action")
     should_abort = action == "abort"
 
-    def _wrap_commit_ctx(orig, repo, ctx, **opts):
+    def _wrap_commit_ctx(orig, repo, ctx, *args, **opts):
         to_check = set()
 
         # Check mutation info. Some commands like "metaedit" only set this.
@@ -194,7 +286,7 @@ def extsetup(ui) -> None:
         for c in to_check:
             _check_for_lossy_commit_usage(repo, c, should_abort)
 
-        return orig(repo, ctx, **opts)
+        return orig(repo, ctx, *args, **opts)
 
     # Wrap backout separately since it doesn't set any commit extras.
     def _wrap_backout(orig, ui, repo, node=None, rev=None, **opts):

@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-strict
+
 import typing
 
 from eden.fs.cli.config import EdenInstance
@@ -36,7 +38,7 @@ class OperatingSystemsCheckTest(DoctorTestBase):
         for test_version, expected in test_versions:
             with self.subTest(test_version=test_version):
                 result = check_os._parse_os_kernel_version(test_version)
-                self.assertEquals(result, expected)
+                self.assertEqual(result, expected)
 
     def test_kernel_version_min(self) -> None:
         # Each of these are ((test_value, expected_result), ...)

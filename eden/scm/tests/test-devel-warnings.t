@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
   $ newext buggylocking <<EOF
@@ -205,7 +207,7 @@ Test warning on config option access and registration
   > EOF
 
   $ hg --config "extensions.buggyconfig=${TESTTMP}/buggyconfig.py" buggyconfig
-  devel-warn: extension 'buggyconfig' overwrite config item 'ui.interactive' at:*sapling/extensions.py:* (_loadextra) (glob)
-  devel-warn: extension 'buggyconfig' overwrite config item 'ui.quiet' at:*sapling/extensions.py:* (_loadextra) (glob)
+  devel-warn: extension 'buggyconfig' overwrite config item 'ui.interactive' at:* (_loadextra) (glob)
+  devel-warn: extension 'buggyconfig' overwrite config item 'ui.quiet' at:* (_loadextra) (glob)
 
   $ cd ..

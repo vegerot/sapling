@@ -3,135 +3,104 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+"""
+This script is for evaluating the performance of automerge (smart merge) algorithms.
+
+The script supports both git repsotiories and interal sapling repositories. Below
+are the steps to use this script for the `git/git` repository, since it has many merge
+commits and it's faster to run the script on a local git repository.
+
+1. Clone the `git/git` repository
+
+```
+$ sl clone https://github.com/git/git.git
+```
+
+2. Run following command to evaluate the performance of automerge algorithms
+
+```
+$ sl smerge_bench --algos=adjacent-changes,subset-changes,word-merge -q > ~/data/git_automerge_wordmerge.txt
+$ tail -2 ~/data/git_automerge_wordmerge.txt
+Summary: BenchStats(merger_name="Merge3Text(algos=('adjacent-changes', 'subset-changes', 'word-merge'))", changed_files=26177, unresolved_files=1538, unmatched_files=251)
+Execution time: 277.87 seconds
+
+# baseline
+$ sl smerge_bench -q > ~/data/git_no_automerge.txt
+$ tail -2 ~/data/git_no_automerge.txt
+Summary: BenchStats(merger_name='Merge3Text(algos=())', changed_files=26177, unresolved_files=2438, unmatched_files=102)
+Execution time: 273.72 seconds
+```
+
+3. Analyze the results
+
+Below is an example of a "bad" automerge result:
+
+```
+Unmatched_file: commit.h 2a2ad0c0007b 6bf4f1b4c9d7 a0b54e7b7341 267123b4299e
+--- a/commit.h
++++ b/commit.h
+@@ -80,7 +80,7 @@
+       const char *subject,
+       const char *after_subject,
+       const char *encoding,
+-      int plain_non_ascii);
++      int need_8bit_cte);
+ void pp_remainder(enum cmit_fmt fmt,
+      const char **msg_p,
+      struct strbuf *sb,
+```
+
+then we can run below command to see the conflict
+
+```
+$ sl sresolve commit.h 2a2ad0c0007b 6bf4f1b4c9d7 a0b54e7b7341
+writing to file: /tmp/sresolve.txt
+$ open the file /tmp/sresolve.txt and search conflict markers
+...
+<<<<<<< dest: 2a2ad0c0007b - Merge branch 'maint'
+        int non_ascii_present);
++void pp_user_info(const char *what, enum cmit_fmt fmt, struct strbuf *sb,
++      const char *line, enum date_mode dmode,
++      const char *encoding);
++void pp_title_line(enum cmit_fmt fmt,
++      const char **msg_p,
++      struct strbuf *sb,
++      const char *subject,
++      const char *after_subject,
++      const char *encoding,
++      int plain_non_ascii);
++void pp_remainder(enum cmit_fmt fmt,
++     const char **msg_p,
++     struct strbuf *sb,
++     int indent);
++
+======= base: a0b54e7b7341 - Make man page building quiet when DOCBOOK_XSL_172 is defined
+-       int non_ascii_present);
++       int need_8bit_cte);
+>>>>>>> source: 6bf4f1b4c9d7 - format-patch: generate MIME header as needed even when there is format.header
+```
+"""
+
 import csv
 import re
 import time
 from dataclasses import dataclass
-from typing import List, Optional
 
 from sapling import error, mdiff, registrar, scmutil
 from sapling.i18n import _
-from sapling.simplemerge import Merge3Text, render_minimized, wordmergemode
+from sapling.simplemerge import Merge3Text, render_mergediff2, render_minimized
 
 cmdtable = {}
 command = registrar.command(cmdtable)
 
 
-A, B, BASE = range(3)
 WHITE_SPACE_PATTERN = re.compile(b"\\s+")
 
 
-class SmartMerge3Text(Merge3Text):
-    """
-    SmergeMerge3Text uses vairable automerge algorithms to resolve conflicts.
-    """
-
-    def __init__(self, basetext, atext, btext, wordmerge=wordmergemode.disabled):
-        Merge3Text.__init__(self, basetext, atext, btext, wordmerge=wordmerge)
-        self.automerge_fns.extend(
-            [
-                merge_adjacent_changes,
-                merge_common_changes,
-            ]
-        )
-
-
-def merge_adjacent_changes(base_lines, a_lines, b_lines) -> Optional[List[bytes]]:
-    # require something to be changed
-    if not base_lines:
-        return None
-
-    ablocks = unmatching_blocks(base_lines, a_lines)
-    bblocks = unmatching_blocks(base_lines, b_lines)
-
-    k = 0
-    indexes = [0, 0]
-    merged_lines = []
-    while indexes[A] < len(ablocks) and indexes[B] < len(bblocks):
-        ablock, bblock = ablocks[indexes[A]], bblocks[indexes[B]]
-        if is_overlap(ablock[0], ablock[1], bblock[0], bblock[1]):
-            return None
-        elif is_non_unique_separator_for_insertion(
-            base_lines, a_lines, b_lines, ablock, bblock
-        ):
-            return None
-
-        i, block, lines = (
-            (A, ablock, a_lines) if ablock[0] < bblock[0] else (B, bblock, b_lines)
-        )
-        # add base lines before the block
-        while k < block[0]:
-            merged_lines.append(base_lines[k])
-            k += 1
-        # skip base lines being deleted
-        k += block[1] - block[0]
-        # add new lines from the block
-        merged_lines.extend(lines[block[2] : block[3]])
-
-        indexes[i] += 1
-
-    if indexes[A] < len(ablocks):
-        blocks, index, lines = ablocks, indexes[A], a_lines
-    else:
-        blocks, index, lines = bblocks, indexes[B], b_lines
-
-    while index < len(blocks):
-        block = blocks[index]
-        index += 1
-
-        while k < block[0]:
-            merged_lines.append(base_lines[k])
-            k += 1
-        k += block[1] - block[0]
-        merged_lines.extend(lines[block[2] : block[3]])
-
-    # add base lines at the end of block
-    merged_lines.extend(base_lines[k:])
-
-    return merged_lines
-
-
-def merge_common_changes(base_lines, a_lines, b_lines) -> Optional[List[bytes]]:
-    if base_lines:
-        return None
-    if len(a_lines) > len(b_lines):
-        return merge_common_changes(base_lines, b_lines, a_lines)
-    if is_sub_list(a_lines, b_lines):
-        return b_lines
-
-
-def is_non_unique_separator_for_insertion(
-    base_lines, a_lines, b_lines, ablock, bblock
-) -> bool:
-    # no insertion on both sides
-    if not (ablock[0] == bblock[0] or ablock[1] == bblock[1]):
-        return False
-
-    if ablock[1] <= bblock[0]:
-        base_start, base_end = ablock[1], bblock[0]
-    else:
-        base_start, base_end = bblock[1], ablock[0]
-
-    if base_start <= base_end:
-        # empty is a subset of any list
-        return True
-
-    base_list = base_lines[base_start:base_end]
-    a_list = a_lines[ablock[3] : ablock[4]]
-    b_list = b_lines[bblock[3] : bblock[4]]
-    return is_sub_list(base_list, a_list) or is_sub_list(base_list, b_list)
-
-
-def is_sub_list(list1, list2):
-    "check if list1 is a sublist of list2"
-    # PERF: might be able to use rolling hash to optimize the time complexity
-    len1, len2 = len(list1), len(list2)
-    if len1 > len2:
-        return False
-    for i in range(len2 - len1 + 1):
-        if list1 == list2[i : i + len1]:
-            return True
-    return False
+def gen_3way_merger(ui, basetext, atext, btext, filepath, algos=()):
+    ui.setconfig("automerge", "mode", "accept")
+    ui.setconfig("automerge", "merge-algos", ",".join(algos))
+    return Merge3Text(basetext, atext, btext, ui=ui, file_path=filepath)
 
 
 @dataclass
@@ -144,7 +113,14 @@ class BenchStats:
 
 @command(
     "debugsmerge",
-    [],
+    [
+        (
+            "",
+            "algos",
+            "",
+            _("automerge algorithms (e.g.: 'adjacent-changes,subset-changes')."),
+        )
+    ],
     _("[OPTION]... <DEST_FILE> <SRC_FILE> <BASE_FILE>"),
 )
 def debugsmerge(ui, repo, *args, **opts):
@@ -154,9 +130,10 @@ def debugsmerge(ui, repo, *args, **opts):
     if len(args) != 3:
         raise error.CommandError("debugsmerge", _("invalid arguments"))
 
+    algos = str_to_tuple(opts.get("algos"))
     desttext, srctext, basetext = [readfile(p) for p in args]
-    m3 = SmartMerge3Text(basetext, desttext, srctext)
-    lines = render_mergediff2(m3, b"dest", b"source")[0]
+    m3 = gen_3way_merger(ui, basetext, desttext, srctext, args[-1], algos)
+    lines = render_mergediff2(m3, b"dest", b"source", b"base")[0]
     mergedtext = b"".join(lines)
     ui.fout.write(mergedtext)
 
@@ -165,10 +142,10 @@ def debugsmerge(ui, repo, *args, **opts):
     "sresolve",
     [
         (
-            "s",
-            "smart",
-            None,
-            _("use the smart merge for resolving conflicts"),
+            "",
+            "algos",
+            "",
+            _("automerge algorithms (e.g.: 'adjacent-changes,subset-changes')."),
         ),
         (
             "o",
@@ -196,13 +173,21 @@ def sresolve(ui, repo, *args, **opts):
     desttext = repo[dest][filepath].data()
     srctext = repo[src][filepath].data()
     basetext = repo[base][filepath].data()
+    algos = str_to_tuple(opts.get("algos"))
 
-    if opts.get("smart"):
-        m3 = SmartMerge3Text(basetext, desttext, srctext)
-    else:
-        m3 = Merge3Text(basetext, desttext, srctext)
+    m3 = gen_3way_merger(ui, basetext, desttext, srctext, filepath, algos)
 
-    mergedtext = b"".join(render_mergediff2(m3, b"dest", b"source")[0])
+    def gen_label(prefix, ctx):
+        s = f"{prefix}: {ctx} - " + ctx.description().split("\n")[0]
+        return s.encode("utf-8")
+
+    label_dest = gen_label("dest", dest)
+    label_source = gen_label("source", src)
+    label_base = gen_label("base", base)
+
+    mergedtext = b"".join(
+        render_mergediff2(m3, label_dest, label_source, label_base)[0]
+    )
 
     if output := opts.get("output"):
         ui.write(f"writing to file: {output}\n")
@@ -214,7 +199,15 @@ def sresolve(ui, repo, *args, **opts):
 
 @command(
     "smerge_bench",
-    [("f", "file", "", _("a file that contains merge commits (csv file)."))],
+    [
+        ("f", "file", "", _("a file that contains merge commits (csv file).")),
+        (
+            "",
+            "algos",
+            "",
+            _("automerge algorithms (e.g.: 'adjacent-changes,subset-changes')."),
+        ),
+    ],
 )
 def smerge_bench(ui, repo, *args, **opts):
     path = opts.get("file")
@@ -222,30 +215,32 @@ def smerge_bench(ui, repo, *args, **opts):
         merge_ctxs = get_merge_ctxs_from_file(ui, repo, path)
     else:
         merge_ctxs = get_merge_ctxs_from_repo(ui, repo)
-    for m3merger in [SmartMerge3Text, Merge3Text]:
-        ui.write(f"\n============== {m3merger.__name__} ==============\n")
-        start = time.time()
-        bench_stats = BenchStats(m3merger.__name__)
 
-        for i, (p1ctx, p2ctx, basectx, mergectx) in enumerate(merge_ctxs, start=1):
-            for filepath in mergectx.files():
-                if all(filepath in ctx for ctx in [basectx, p1ctx, p2ctx, mergectx]):
-                    merge_file(
-                        repo,
-                        p1ctx,
-                        p2ctx,
-                        basectx,
-                        mergectx,
-                        filepath,
-                        m3merger,
-                        bench_stats,
-                    )
+    algos = str_to_tuple(opts.get("algos"))
+    m3merger_name = f"Merge3Text(algos={algos})"
+    ui.write(f"\n============== {m3merger_name} ==============\n")
+    start = time.time()
+    bench_stats = BenchStats(m3merger_name)
 
-            if i % 100 == 0:
-                ui.write(f"{i} {bench_stats}\n")
+    for i, (p1ctx, p2ctx, basectx, mergectx) in enumerate(merge_ctxs, start=1):
+        for filepath in mergectx.files():
+            if all(filepath in ctx for ctx in [basectx, p1ctx, p2ctx, mergectx]):
+                merge_file(
+                    repo,
+                    p1ctx,
+                    p2ctx,
+                    basectx,
+                    mergectx,
+                    filepath,
+                    algos,
+                    bench_stats,
+                )
 
-        ui.write(f"\nSummary: {bench_stats}\n")
-        ui.write(f"Execution time: {time.time() - start:.2f} seconds\n")
+        if i % 100 == 0:
+            ui.note(f"{i} {bench_stats}\n")
+
+    ui.write(f"\nSummary: {bench_stats}\n")
+    ui.write(f"Execution time: {time.time() - start:.2f} seconds\n")
 
 
 def get_merge_ctxs_from_repo(ui, repo):
@@ -348,9 +343,7 @@ def get_merge_ctxs_from_file(ui, repo, filepath):
     return ctxs
 
 
-def merge_file(
-    repo, dstctx, srcctx, basectx, mergectx, filepath, m3merger, bench_stats
-):
+def merge_file(repo, dstctx, srcctx, basectx, mergectx, filepath, algos, bench_stats):
     srctext = srcctx[filepath].data()
     dsttext = dstctx[filepath].data()
     basetext = basectx[filepath].data()
@@ -360,7 +353,7 @@ def merge_file(
 
     bench_stats.changed_files += 1
 
-    m3 = m3merger(basetext, dsttext, srctext)
+    m3 = gen_3way_merger(repo.ui, basetext, dsttext, srctext, filepath, algos)
     mergedlines, conflictscount = render_minimized(m3)
     mergedtext = b"".join(mergedlines)
 
@@ -372,7 +365,7 @@ def merge_file(
             bench_stats.unmatched_files += 1
             mergedtext_baseline = b""
 
-            if m3merger != Merge3Text:
+            if algos:
                 m3_baseline = Merge3Text(basetext, dsttext, srctext)
                 mergedtext_baseline = b"".join(render_minimized(m3_baseline)[0])
 
@@ -406,70 +399,17 @@ def unidiff(atext, btext, filepath="") -> bytes:
     return b"\n".join(result)
 
 
-def render_mergediff2(m3, name_a, name_b):
-    lines = []
-    conflicts = False
-    for what, group_lines in m3.merge_groups(automerge=True):
-        if what == "conflict":
-            base_lines, a_lines, b_lines = group_lines
-            basetext = b"".join(base_lines)
-            bblocks = list(
-                mdiff.allblocks(
-                    basetext,
-                    b"".join(b_lines),
-                    lines1=base_lines,
-                    lines2=b_lines,
-                )
-            )
-            ablocks = list(
-                mdiff.allblocks(
-                    basetext,
-                    b"".join(a_lines),
-                    lines1=base_lines,
-                    lines2=b_lines,
-                )
-            )
-
-            def difflines(blocks, lines1, lines2):
-                for block, kind in blocks:
-                    if kind == "=":
-                        for line in lines1[block[0] : block[1]]:
-                            yield b" " + line
-                    else:
-                        for line in lines1[block[0] : block[1]]:
-                            yield b"-" + line
-                        for line in lines2[block[2] : block[3]]:
-                            yield b"+" + line
-
-            lines.append(b"<<<<<<< %s\n" % name_a)
-            lines.extend(difflines(ablocks, base_lines, a_lines))
-            lines.append(b"=======\n")
-            lines.extend(difflines(bblocks, base_lines, b_lines))
-            lines.append(b">>>>>>> %s\n" % name_b)
-            conflicts = True
-        else:
-            lines.extend(group_lines)
-    return lines, conflicts
-
-
 def readfile(path):
     with open(path, "rb") as f:
         return f.read()
 
 
-def unmatching_blocks(lines1, lines2):
-    text1 = b"".join(lines1)
-    text2 = b"".join(lines2)
-    blocks = mdiff.allblocks(text1, text2, lines1=lines1, lines2=lines2)
-    return [b[0] for b in blocks if b[1] == "!"]
-
-
-def is_overlap(s1, e1, s2, e2):
-    return not (s1 >= e2 or s2 >= e1)
-
-
 def remove_white_space(text):
     return re.sub(WHITE_SPACE_PATTERN, b"", text)
+
+
+def str_to_tuple(csv, sep=","):
+    return tuple(csv.split(sep) if csv else ())
 
 
 if __name__ == "__main__":

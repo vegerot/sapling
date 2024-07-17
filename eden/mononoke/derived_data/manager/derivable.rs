@@ -9,66 +9,26 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
+use std::sync::Arc;
 
+use anyhow::anyhow;
 use anyhow::Result;
 use async_trait::async_trait;
 use context::CoreContext;
-use derived_data_service_if::types::DerivedData;
+use derived_data_service_if::DerivedData;
 use futures::future::try_join;
 use futures::stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
-use strum::AsRefStr;
-use strum::Display;
-use strum::EnumString;
+use mononoke_types::DerivableType;
 
 use crate::context::DerivationContext;
-
-/// Enum which consolidates all available derived data types
-/// It provides access to `const &'static str` representation to
-/// use as Name of the derived data type, which is used to
-/// identify or name data (for example lease keys) associated with this
-/// particular derived data type.
-/// It also provides `as_ref()` method for serialization.
-/// and implements FromStr trait for deserialization.
-#[derive(AsRefStr, EnumString, Display, Debug, Clone, PartialEq, Eq, Hash)]
-pub enum DerivableType {
-    BlameV2,
-    Bssm,
-    ChangesetInfo,
-    DeletedManifests,
-    Fastlog,
-    FileNodes,
-    Fsnodes,
-    HgChangesets,
-    GitTree,
-    GitCommit,
-    GitDeltaManifest,
-    SkeletonManifests,
-    Unodes,
-}
-
-impl DerivableType {
-    const fn name(&self) -> &'static str {
-        match self {
-            DerivableType::BlameV2 => "blame",
-            DerivableType::Bssm => "bssm",
-            DerivableType::ChangesetInfo => "changeset_info",
-            DerivableType::DeletedManifests => "deleted_manifest",
-            DerivableType::Fastlog => "fastlog",
-            DerivableType::FileNodes => "filenodes",
-            DerivableType::Fsnodes => "fsnodes",
-            DerivableType::HgChangesets => "hgchangesets",
-            DerivableType::GitTree => "git_trees",
-            DerivableType::GitCommit => "git_commits",
-            DerivableType::GitDeltaManifest => "git_delta_manifests",
-            DerivableType::SkeletonManifests => "skeleton_manifests",
-            DerivableType::Unodes => "unodes",
-        }
-    }
-}
+use crate::DerivedDataManager;
+use crate::Rederivation;
+use crate::SharedDerivationError;
+use crate::VisitedDerivableTypesMap;
 
 /// Defines how derivation occurs.  Each derived data type must implement
 /// `BonsaiDerivable` to describe how to derive a new value from its inputs
@@ -97,6 +57,18 @@ pub trait BonsaiDerivable: Sized + Send + Sync + Clone + Debug + 'static {
     ///
     /// Use the `dependencies!` macro to populate this type.
     type Dependencies: DerivationDependencies;
+
+    /// Types of derived data types which this derived data type
+    /// can use as predecessors for the "predecessors optimization".
+    ///
+    /// This is a technique where you can derive a type from a "predecessor"
+    /// type, which allows to parallelize backfilling of the latter type
+    /// by using the predecessor type to start deriving future commits before
+    /// we have backfilled the latter type.
+    /// Example: SkeletonManifest can be used as a predecessor for BSSM.
+    ///
+    /// Use the `dependencies!` macro to populate this type.
+    type PredecessorDependencies: DerivationDependencies;
 
     /// Derive data for a single changeset.
     ///
@@ -134,7 +106,6 @@ pub trait BonsaiDerivable: Sized + Send + Sync + Clone + Debug + 'static {
         ctx: &CoreContext,
         derivation_ctx: &DerivationContext,
         bonsais: Vec<BonsaiChangeset>,
-        _gap_size: Option<usize>,
     ) -> Result<HashMap<ChangesetId, Self>> {
         let mut res: HashMap<ChangesetId, Self> = HashMap::new();
         // The default implementation must derive sequentially with no
@@ -149,6 +120,24 @@ pub trait BonsaiDerivable: Sized + Send + Sync + Clone + Debug + 'static {
             res.insert(csid, derived);
         }
         Ok(res)
+    }
+
+    /// Derive data for a changeset using other derived data types without
+    /// requiring data to be derived for the parents of the changeset.
+    ///
+    /// Can be used to parallelize backfilling derived data by slicing the commits
+    /// of a repository, deriving data for the boundaries of the slices using
+    /// this method, and then deriving data for the rest of the commits for all
+    /// slices in parallel using the normal derivation path.
+    async fn derive_from_predecessor(
+        _ctx: &CoreContext,
+        _derivation_ctx: &DerivationContext,
+        _bonsai: BonsaiChangeset,
+    ) -> Result<Self> {
+        Err(anyhow!(
+            "derive_from_predecessor is not implemented for {}",
+            Self::NAME
+        ))
     }
 
     /// Store this derived data as the mapped value for a given changeset.
@@ -209,6 +198,8 @@ pub trait BonsaiDerivable: Sized + Send + Sync + Clone + Debug + 'static {
 
 #[async_trait]
 pub trait DerivationDependencies {
+    /// Returns an iterator over all dependencies.
+    fn iter() -> impl Iterator<Item = DerivableType>;
     /// Checks that all dependencies have been derived for this
     /// changeset.
     async fn check_dependencies(
@@ -217,16 +208,57 @@ pub trait DerivationDependencies {
         csid: ChangesetId,
         visited: &mut HashSet<TypeId>,
     ) -> Result<()>;
+    /// Derive all dependent data types for this batch of commits.
+    /// The same pre-conditions apply as in derive.rs
+    async fn derive_heads<'a>(
+        ddm: &'a DerivedDataManager,
+        ctx: &'a CoreContext,
+        heads: &'a [ChangesetId],
+        override_batch_size: Option<u64>,
+        rederivation: Option<Arc<dyn Rederivation>>,
+        _visited: VisitedDerivableTypesMap<'a, u64, SharedDerivationError>,
+    ) -> Result<(), SharedDerivationError>;
+    /// Derive all predecessor data types for this batch of commits.
+    /// The same pre-conditions apply as in derive.rs
+    async fn derive_predecessors(
+        ddm: &DerivedDataManager,
+        ctx: &CoreContext,
+        csid: ChangesetId,
+        rederivation: Option<Arc<dyn Rederivation>>,
+        visited: &mut HashSet<TypeId>,
+    ) -> Result<(), SharedDerivationError>;
 }
 
 #[async_trait]
 impl DerivationDependencies for () {
+    fn iter() -> impl Iterator<Item = DerivableType> {
+        std::iter::empty()
+    }
     async fn check_dependencies(
         _ctx: &CoreContext,
         _derivation: &DerivationContext,
         _csid: ChangesetId,
         _visited: &mut HashSet<TypeId>,
     ) -> Result<()> {
+        Ok(())
+    }
+    async fn derive_heads<'a>(
+        _ddm: &'a DerivedDataManager,
+        _ctx: &'a CoreContext,
+        _heads: &'a [ChangesetId],
+        _override_batch_size: Option<u64>,
+        _rederivation: Option<Arc<dyn Rederivation>>,
+        _visited: VisitedDerivableTypesMap<'a, u64, SharedDerivationError>,
+    ) -> Result<(), SharedDerivationError> {
+        Ok(())
+    }
+    async fn derive_predecessors(
+        _ddm: &DerivedDataManager,
+        _ctx: &CoreContext,
+        _csid: ChangesetId,
+        _rederivation: Option<Arc<dyn Rederivation>>,
+        _visited: &mut HashSet<TypeId>,
+    ) -> Result<(), SharedDerivationError> {
         Ok(())
     }
 }
@@ -237,6 +269,9 @@ where
     Derivable: BonsaiDerivable,
     Rest: DerivationDependencies + 'static,
 {
+    fn iter() -> impl Iterator<Item = DerivableType> {
+        std::iter::once(Derivable::VARIANT).chain(Rest::iter())
+    }
     async fn check_dependencies(
         ctx: &CoreContext,
         derivation_ctx: &DerivationContext,
@@ -253,6 +288,46 @@ where
             Ok(())
         } else {
             Rest::check_dependencies(ctx, derivation_ctx, csid, visited).await
+        }
+    }
+    async fn derive_heads<'a>(
+        ddm: &'a DerivedDataManager,
+        ctx: &'a CoreContext,
+        heads: &'a [ChangesetId],
+        override_batch_size: Option<u64>,
+        rederivation: Option<Arc<dyn Rederivation>>,
+        visited: VisitedDerivableTypesMap<'a, u64, SharedDerivationError>,
+    ) -> Result<(), SharedDerivationError> {
+        let _res = try_join(
+            ddm.derive_heads_with_visited::<Derivable>(
+                ctx,
+                heads,
+                override_batch_size,
+                rederivation.clone(),
+                visited.clone(),
+            ),
+            Rest::derive_heads(ddm, ctx, heads, override_batch_size, rederivation, visited),
+        )
+        .await?;
+        Ok(())
+    }
+    async fn derive_predecessors(
+        ddm: &DerivedDataManager,
+        ctx: &CoreContext,
+        csid: ChangesetId,
+        rederivation: Option<Arc<dyn Rederivation>>,
+        visited: &mut HashSet<TypeId>,
+    ) -> Result<(), SharedDerivationError> {
+        let type_id = TypeId::of::<Derivable>();
+        if visited.insert(type_id) {
+            try_join(
+                ddm.derive::<Derivable>(ctx, csid, rederivation.clone()),
+                Rest::derive_predecessors(ddm, ctx, csid, rederivation, visited),
+            )
+            .await?;
+            Ok(())
+        } else {
+            Rest::derive_predecessors(ddm, ctx, csid, rederivation, visited).await
         }
     }
 }

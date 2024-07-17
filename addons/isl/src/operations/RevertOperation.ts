@@ -9,22 +9,31 @@ import type {
   ApplyUncommittedChangesPreviewsFuncType,
   UncommittedChangesPreviewContext,
 } from '../previews';
-import type {CommandArg, RepoRelativePath, Revset, UncommittedChanges} from '../types';
+import type {
+  CommandArg,
+  ExactRevset,
+  OptimisticRevset,
+  RepoRelativePath,
+  SucceedableRevset,
+  UncommittedChanges,
+} from '../types';
 
-import {SucceedableRevset} from '../types';
 import {Operation} from './Operation';
 
 export class RevertOperation extends Operation {
   static opName = 'Revert';
 
-  constructor(private files: Array<RepoRelativePath>, private revset?: Revset) {
+  constructor(
+    private files: Array<RepoRelativePath>,
+    private revset?: SucceedableRevset | ExactRevset | OptimisticRevset,
+  ) {
     super('RevertOperation');
   }
 
   getArgs() {
     const args: Array<CommandArg> = ['revert'];
     if (this.revset != null) {
-      args.push('--rev', SucceedableRevset(this.revset));
+      args.push('--rev', this.revset);
     }
     args.push(
       ...this.files.map(file =>

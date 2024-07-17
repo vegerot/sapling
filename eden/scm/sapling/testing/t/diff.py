@@ -19,6 +19,7 @@ class ExpectLine:
     (glob) - The line contains glob patterns (ex. '*')
     (re) - The line is a regular expression
     """
+
     # raw line content, including the hints, without ending "\n"
     rawline: str
 
@@ -35,7 +36,9 @@ class ExpectLine:
     body: str = ""
 
     def __init__(
-        self, rawline: str, hasfeature: Optional[Callable[[str], bool]] = None
+        self,
+        rawline: str,
+        hasfeature: Optional[Callable[[str], bool]] = None,
     ):
         optional = False
         excluded = False
@@ -85,6 +88,20 @@ class ExpectLine:
         # normalize path separator on windows
         if os.name == "nt":
             line = line.replace("\\", "/")
+            # Output might sometimes use different line endings "\r\n", "\n".
+            # Normalize to "\n" on Windows to avoid verbose "#if win"s.
+            # Note: some tests (ex. test-import-eol.t) intentionally test "\r\n"
+            # on POSIX and Windows, so if the expected output (self.body) is
+            # "\r\n (esc)" explicitly, it should also be accepted.
+            if (
+                not self.isre
+                and line != self.body
+                # splitlines() turns "\r" to r"\r (esc)"
+                # which is replaced to r"/r (esc)" by the above line.
+                and line.endswith("/r (esc)")
+                and line[:-8] == self.body
+            ):
+                return True
         if self.isre:
             # pyre-fixme[7]: Expected `bool` but got `Optional[Match[str]]`.
             return re.match(self.body + r"\Z", line)
@@ -184,13 +201,27 @@ class MultiLineMatcher:
         >>> m.normalize('a\ne\n')[0]
         'a\n...\ne\n'
 
+    "fallback_match" provides alternative fallback match function:
+
+        >>> m = MultiLineMatcher('aBc\n')
+        >>> m.match('AbC\n')
+        False
+
+        >>> m = MultiLineMatcher('aBc\n', fallback_match=lambda a, b: a.lower() == b.lower())
+        >>> m.match('AbC\n')
+        True
+
     """
 
     def __init__(
-        self, expected: str, hasfeature: Optional[Callable[[str], bool]] = None
+        self,
+        expected: str,
+        hasfeature: Optional[Callable[[str], bool]] = None,
+        fallback_match: Optional[Callable[[str, str], bool]] = None,
     ):
         self.blines = blines = splitlines(expected.rstrip("\n"))
         self.elines: List[ExpectLine] = [ExpectLine(l, hasfeature) for l in blines]
+        self.fallback_match = fallback_match
         self._cache = {}
 
     def match(self, actual: str) -> bool:
@@ -198,7 +229,7 @@ class MultiLineMatcher:
         return self._matchandnormalizecached(actual)[0]
 
     def normalize(self, actual: str) -> Tuple[str, str]:
-        """Normalzie (actual, expected) for plain text diff.
+        """Normalize (actual, expected) for plain text diff.
 
         Return (actual, expected) pair, which is more friendly for a plain
         text diff algorithm.
@@ -206,6 +237,12 @@ class MultiLineMatcher:
         # pyre-fixme[7]: Expected `Tuple[str, str]` but got `Tuple[Union[bool, str],
         #  ...]`.
         return self._matchandnormalizecached(actual)[1:]
+
+    def _match_line(self, lhs: ExpectLine, rhs: str) -> bool:
+        result = lhs.match(rhs)
+        if not result and self.fallback_match is not None:
+            result = self.fallback_match(lhs.rawline, rhs)
+        return result
 
     def _matchandnormalizecached(self, actual: str) -> Tuple[bool, str, str]:
         result = self._cache.get(actual)
@@ -224,7 +261,7 @@ class MultiLineMatcher:
 
         matched = True
 
-        for (tag, i1, i2, j1, j2) in difflib.SequenceMatcher(
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
             a=alines, b=blines
         ).get_opcodes():
             if tag == "equal":
@@ -245,11 +282,13 @@ class MultiLineMatcher:
                         glines.append(blines[j])
                         j += 1
                     while (
-                        j < j2 and not elines[j].match(alines[i]) and elines[j].optional
+                        j < j2
+                        and not self._match_line(elines[j], alines[i])
+                        and elines[j].optional
                     ):
                         glines.append(blines[j])
                         j += 1
-                    if j < j2 and elines[j].match(alines[i]):
+                    if j < j2 and self._match_line(elines[j], alines[i]):
                         glines.append(blines[j])
                     else:
                         glines.append(alines[i])

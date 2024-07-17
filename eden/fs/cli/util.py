@@ -4,7 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
+
 
 import abc
 import binascii
@@ -15,12 +16,12 @@ import os
 import random
 import re
 import shlex
-import socket
 import stat
 import subprocess
 import sys
 import time
 import typing
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING, TypeVar
 
@@ -44,6 +45,8 @@ PID_FILE = "pid"
 NFS_MOUNT_PROTOCOL_STRING = "nfs"
 FUSE_MOUNT_PROTOCOL_STRING = "fuse"
 PRJFS_MOUNT_PROTOCOL_STRING = "prjfs"
+
+INODE_CATALOG_TYPE_IN_MEMORY_STRING = "inmemory"
 
 
 class EdenStartError(Exception):
@@ -220,6 +223,7 @@ def check_health(
 
 
 def wait_for_daemon_healthy(
+    # pyre-fixme[24]: Generic type `subprocess.Popen` expects 1 type parameter.
     proc: subprocess.Popen,
     config_dir: Path,
     get_client: Callable[..., EdenClient],
@@ -263,6 +267,7 @@ def wait_for_instance_healthy(instance: "EdenInstance", timeout: float) -> Healt
 
     proc_utils = proc_utils_mod.new()
 
+    # pyre-fixme[53]: Captured variable `proc_utils` is not annotated.
     def check_daemon_health() -> Optional[HealthStatus]:
         # Check the thrift status
         health_info = instance.check_health()
@@ -342,10 +347,18 @@ class Repo(abc.ABC):
 class HgRepo(Repo):
     HEAD = "."
 
-    def __init__(self, source: str, working_dir: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        source: str,
+        working_dir: Optional[str] = None,
+        backing_type: Optional[str] = None,
+    ) -> None:
         super(HgRepo, self).__init__(
-            "hg", source, source if working_dir is None else working_dir
+            backing_type if backing_type is not None else "hg",
+            source,
+            source if working_dir is None else working_dir,
         )
+        # pyre-fixme[4]: Attribute must be annotated.
         self._env = os.environ.copy()
         self._env["HGPLAIN"] = "1"
 
@@ -358,11 +371,13 @@ class HgRepo(Repo):
         # The EDEN_HG_BINARY environment variable is normally set when running
         # Eden's integration tests.  Just find 'hg' from the path when it is
         # not set.
+        # pyre-fixme[4]: Attribute must be annotated.
         self._hg_binary = os.environ.get("EDEN_HG_BINARY", "hg")
 
     def __repr__(self) -> str:
         return f"HgRepo(source={self.source!r}, " f"working_dir={self.working_dir!r})"
 
+    # pyre-fixme[2]: Parameter must be annotated.
     def _run_hg(self, args: List[str], stderr_output=None) -> bytes:
         cmd = [self._hg_binary] + args
         out_bytes = subprocess.check_output(
@@ -372,6 +387,7 @@ class HgRepo(Repo):
         out = typing.cast(bytes, out_bytes)
         return out
 
+    # pyre-fixme[2]: Parameter must be annotated.
     def get_commit_hash(self, commit: str, stderr_output=None) -> str:
         out = self._run_hg(["log", "-r", commit, "-T{node}"], stderr_output)
         return out.strip().decode("utf-8")
@@ -460,7 +476,7 @@ def _get_git_repo(path: str) -> Optional[GitRepo]:
     return None
 
 
-def get_hg_repo(path: str) -> Optional[HgRepo]:
+def get_hg_repo(path: str, backing_type: Optional[str] = None) -> Optional[HgRepo]:
     """
     If path points to a mercurial repository, return a HgRepo object.
     Otherwise, if path is not a mercurial repository, return None.
@@ -487,7 +503,7 @@ def get_hg_repo(path: str) -> Optional[HgRepo]:
     if not os.path.isdir(os.path.join(hg_dir, "store")):
         return None
 
-    return HgRepo(repo_path, working_dir)
+    return HgRepo(repo_path, working_dir, backing_type)
 
 
 def get_recas_repo(path: str) -> Optional[ReCasRepo]:
@@ -524,7 +540,7 @@ def get_repo(path: str, backing_store_type: Optional[str] = None) -> Optional[Re
         return None
 
     while True:
-        hg_repo = get_hg_repo(path)
+        hg_repo = get_hg_repo(path, backing_store_type)
         if hg_repo is not None:
             return hg_repo
         git_repo = _get_git_repo(path)
@@ -745,9 +761,11 @@ class Spinner:
 
     def __init__(self, header: str) -> None:
         self._header = header
+        # pyre-fixme[4]: Attribute must be annotated.
         self._cursor = self.cursor()
 
     @staticmethod
+    # pyre-fixme[3]: Return type must be annotated.
     def cursor():
         while True:
             for cursor in "|/-\\":
@@ -762,12 +780,15 @@ class Spinner:
     def __enter__(self) -> "Spinner":
         return self
 
+    # pyre-fixme[2]: Parameter must be annotated.
     def __exit__(self, ex_type, ex_value, ex_traceback) -> bool:
         sys.stdout.write("\n")
         sys.stdout.flush()
         return False
 
 
+# pyre-fixme[3]: Return type must be annotated.
+# pyre-fixme[24]: Generic type `Callable` expects 2 type parameters.
 def hook_recursive_with_spinner(function: Callable, spinner: Spinner):
     """
     hook_recursive_with_spinner
@@ -778,6 +799,8 @@ def hook_recursive_with_spinner(function: Callable, spinner: Spinner):
     """
 
     @functools.wraps(function)
+    # pyre-fixme[3]: Return type must be annotated.
+    # pyre-fixme[2]: Parameter must be annotated.
     def run(*args, **kwargs):
         spinner.spin(args[0])
         return function(*args, **kwargs)
@@ -792,3 +815,70 @@ if sys.platform == "win32":
         if re.match(r"\\\\\?\\[A-Za-z]:\\", parts[0]):
             parts[0] = parts[0][-3:].upper()
         return Path(*parts)
+
+
+# pyre-fixme[3]: Return type must be annotated.
+def _varint_byte(b: int):
+    return bytes((b,))
+
+
+def encode_varint(number: int) -> bytes:
+    """Pack `number` into varint bytes"""
+    buf = b""
+    while True:
+        towrite = number & 0x7F
+        number >>= 7
+        if number:
+            buf += _varint_byte(towrite | 0x80)
+        else:
+            buf += _varint_byte(towrite)
+            break
+    return buf
+
+
+# Adapted from https://github.com/fmoo/python-varint and
+# https://fburl.com/p8xrmnch
+def decode_varint(buf: bytes) -> typing.Tuple[int, int]:
+    """Read a varint from from `buf` bytes and return the number of bytes read"""
+    stream = BytesIO(buf)
+    shift = 0
+    result = 0
+    bytes_read = 0
+
+    # pyre-fixme[3]: Return type must be annotated.
+    def read_one_byte(stream: BytesIO):
+        """Reads a byte from the file (as an integer)
+
+        raises EOFError if the stream ends while reading bytes.
+        """
+        c = stream.read(1)
+        if c == b"":
+            raise EOFError("Unexpected EOF while reading varint bytes")
+        return ord(c)
+
+    while True:
+        bytes_read += 1
+        i = read_one_byte(stream)
+        result |= (i & 0x7F) << shift
+        shift += 7
+        if not (i & 0x80):
+            break
+
+    return result, bytes_read
+
+
+def create_filtered_rootid(root_id: str, filter_path: Optional[str] = None) -> bytes:
+    """Create a FilteredRootId from a RootId and filter path pair.
+
+    The FilteredRootId is in the form:
+
+    <Varint><OriginalRootId><FilterId>
+
+    Where the Varint represents the length of the OriginalRootId and the
+    FilterId represents which filter should be applied to the checkout. If no
+    filter is provided, the "null" filter is used.
+    """
+    original_len = len(root_id)
+    filter_id = f"{filter_path}:{root_id}" if filter_path is not None else "null"
+    varint = encode_varint(original_len)
+    return varint + root_id.encode() + filter_id.encode()

@@ -23,7 +23,7 @@ pub fn list_modules() -> Vec<&'static str> {
 }
 
 #[derive(Copy, Clone)]
-pub struct ModuleInfo(&'static (&'static str, &'static [u8], bool, usize, usize));
+pub struct ModuleInfo(&'static (&'static str, &'static [u8], bool, usize, usize, bool));
 
 impl ModuleInfo {
     pub fn c_name(&self) -> &'static [u8] {
@@ -42,12 +42,24 @@ impl ModuleInfo {
         self.0.2
     }
 
-    pub fn source_code(&self) -> &'static str {
-        &UNCOMPRESS_SOURCE.as_str()[self.0.3..self.0.4]
+    pub fn is_stdlib(&self) -> bool {
+        self.0.5
+    }
+
+    pub fn source_code(&self) -> Option<&'static str> {
+        let source = &UNCOMPRESS_SOURCE.as_str()[self.0.3..self.0.4];
+        if source.is_empty() {
+            None
+        } else {
+            Some(source)
+        }
     }
 }
 
 static UNCOMPRESS_SOURCE: Lazy<String> = Lazy::new(|| {
     let bytes = zstdelta::apply(b"", compiled::COMPRESSED_SOURCE).unwrap();
-    String::from_utf8(bytes).unwrap()
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => panic!("uncompressed source code is not valid utf-8: {}", e),
+    }
 });

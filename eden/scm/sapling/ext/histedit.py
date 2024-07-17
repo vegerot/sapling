@@ -913,7 +913,7 @@ class base(histeditaction):
             with self.repo.wlock(), self.repo.lock(), self.repo.transaction(
                 "histedit-base"
             ):
-                mergemod.update(self.repo, self.node, force=True)
+                mergemod.goto(self.repo, self.node, force=True)
         return self.continueclean()
 
     def continuedirty(self):
@@ -1720,15 +1720,6 @@ def summaryhook(ui, repo):
 
 def extsetup(ui):
     cmdutil.summaryhooks.add("histedit", summaryhook)
-    cmdutil.unfinishedstates.append(
-        [
-            "histedit-state",
-            False,
-            True,
-            _("histedit in progress"),
-            _("use '@prog@ histedit --continue' or '@prog@ histedit --abort'"),
-        ]
-    )
     cmdutil.afterresolvedstates.append(
         ("histedit-state", _("@prog@ histedit --continue"))
     )

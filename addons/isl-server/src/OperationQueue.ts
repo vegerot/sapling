@@ -6,14 +6,17 @@
  */
 
 import type {ServerSideTracker} from './analytics/serverSideTracker';
-import type {Logger} from './logger';
+import type {RepositoryContext} from './serverTypes';
 import type {
   OperationCommandProgressReporter,
   OperationProgress,
   RunnableOperation,
 } from 'isl/src/types';
+import type {Deferred} from 'shared/utils';
 
+import {clearTrackedCache} from 'shared/LRU';
 import {newAbortController} from 'shared/compat';
+import {defer} from 'shared/utils';
 
 /**
  * Handle running & queueing all Operations so that only one Operation runs at once.
@@ -21,31 +24,41 @@ import {newAbortController} from 'shared/compat';
  */
 export class OperationQueue {
   constructor(
-    private logger: Logger,
     private runCallback: (
+      ctx: RepositoryContext,
       operation: RunnableOperation,
-      cwd: string,
       handleProgress: OperationCommandProgressReporter,
       signal: AbortSignal,
-    ) => Promise<void>,
+    ) => Promise<unknown>,
   ) {}
 
   private queuedOperations: Array<RunnableOperation & {tracker: ServerSideTracker}> = [];
   private runningOperation: RunnableOperation | undefined = undefined;
+  private runningOperationStartTime: Date | undefined = undefined;
   private abortController: AbortController | undefined = undefined;
+  private deferredOperations = new Map<string, Deferred<'ran' | 'skipped'>>();
 
+  /**
+   * Run an operation, or if one is already running, add it to the queue.
+   * Promise resolves with:
+   * - 'ran', when the operation exits (no matter success/failure), even if it was enqueued.
+   * - 'skipped', when the operation is never going to be run, since an earlier queued command errored.
+   */
   async runOrQueueOperation(
+    ctx: RepositoryContext,
     operation: RunnableOperation,
     onProgress: (progress: OperationProgress) => void,
-    tracker: ServerSideTracker,
-    cwd: string,
-  ): Promise<void> {
+  ): Promise<'ran' | 'skipped'> {
+    const {tracker, logger} = ctx;
     if (this.runningOperation != null) {
       this.queuedOperations.push({...operation, tracker});
+      const deferred = defer<'ran' | 'skipped'>();
+      this.deferredOperations.set(operation.id, deferred);
       onProgress({id: operation.id, kind: 'queue', queue: this.queuedOperations.map(o => o.id)});
-      return;
+      return deferred.promise;
     }
     this.runningOperation = operation;
+    this.runningOperationStartTime = new Date();
 
     const handleCommandProgress: OperationCommandProgressReporter = (...args) => {
       switch (args[0]) {
@@ -81,32 +94,64 @@ export class OperationQueue {
         operation.trackEventName,
         'RunOperationError',
         {extras: {args: operation.args, runner: operation.runner}, operationId: operation.id},
-        _p => this.runCallback(operation, cwd, handleCommandProgress, controller.signal),
+        _p => this.runCallback(ctx, operation, handleCommandProgress, controller.signal),
       );
-      this.runningOperation = undefined;
-
-      // now that we successfully ran this operation, dequeue the next
-      if (this.queuedOperations.length > 0) {
-        const op = this.queuedOperations.shift();
-        if (op != null) {
-          // don't await this, the caller should resolve when the original operation finishes.
-          this.runOrQueueOperation(
-            op,
-            // TODO: we're using the onProgress from the LAST `runOperation`... should we be keeping the newer onProgress in the queued operation?
-            onProgress,
-            op.tracker,
-            cwd,
-          );
-        }
-      }
     } catch (err) {
       const errString = (err as Error).toString();
-      this.logger.log('error running operation: ', operation.args[0], errString);
+      logger.log('error running operation: ', operation.args[0], errString);
       onProgress({id: operation.id, kind: 'error', error: errString});
-      // clear queue to run when we hit an error
+
+      // clear queue to run when we hit an error,
+      // which also requires resolving all their promises
+      for (const queued of this.queuedOperations) {
+        this.resolveDeferredPromise(queued.id, 'skipped');
+      }
       this.queuedOperations = [];
+    } finally {
+      this.runningOperationStartTime = undefined;
       this.runningOperation = undefined;
+
+      // resolve original enqueuer's promise
+      this.resolveDeferredPromise(operation.id, 'ran');
     }
+
+    // now that we successfully ran this operation, dequeue the next
+    if (this.queuedOperations.length > 0) {
+      const op = this.queuedOperations.shift();
+      if (op != null) {
+        // don't await this, the caller should resolve when the original operation finishes.
+        this.runOrQueueOperation(
+          ctx,
+          op,
+          // TODO: we're using the onProgress from the LAST `runOperation`... should we be keeping the newer onProgress in the queued operation?
+          onProgress,
+        );
+      }
+    } else {
+      // Attempt to free some memory.
+      clearTrackedCache();
+    }
+
+    return 'ran';
+  }
+
+  private resolveDeferredPromise(id: string, kind: 'ran' | 'skipped') {
+    const found = this.deferredOperations.get(id);
+    if (found != null) {
+      found.resolve(kind);
+      this.deferredOperations.delete(id);
+    }
+  }
+
+  /**
+   * Get the running operation start time.
+   * Returns `undefined` if there is no running operation.
+   */
+  getRunningOperationStartTime(): Date | undefined {
+    if (this.runningOperation == null) {
+      return undefined;
+    }
+    return this.runningOperationStartTime;
   }
 
   /**
@@ -118,5 +163,10 @@ export class OperationQueue {
     if (this.runningOperation?.id == operationId) {
       this.abortController?.abort();
     }
+  }
+
+  /** The currently running operation. */
+  getRunningOperation(): RunnableOperation | undefined {
+    return this.runningOperation;
   }
 }

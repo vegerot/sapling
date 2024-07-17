@@ -13,25 +13,29 @@ use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
-use blobrepo::BlobRepo;
+use blobstore_factory::MetadataSqlFactory;
 use bookmarks::BookmarkKey;
 use borrowed::borrowed;
+use cached_config::ConfigStore;
 use clap::ArgMatches;
+use clientinfo::ClientEntryPoint;
+use clientinfo::ClientInfo;
 use cmdlib::args;
 use cmdlib::args::MononokeMatches;
 use cmdlib::helpers;
 use cmdlib_x_repo::create_commit_syncer_from_matches;
+use cmdlib_x_repo::get_all_possible_small_repo_submodule_deps_from_matches;
 use context::CoreContext;
 use cross_repo_sync::create_commit_syncer_lease;
 use cross_repo_sync::find_toposorted_unsynced_ancestors;
-use cross_repo_sync::types::Source;
-use cross_repo_sync::types::Target;
-use cross_repo_sync::validation::verify_working_copy_with_version_fast_path;
+use cross_repo_sync::verify_working_copy_with_version;
 use cross_repo_sync::CandidateSelectionHint;
 use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncOutcome;
 use cross_repo_sync::CommitSyncer;
 use cross_repo_sync::ConcreteRepo as CrossRepo;
+use cross_repo_sync::Source;
+use cross_repo_sync::Target;
 use derived_data::BonsaiDerived;
 use fbinit::FacebookInit;
 use fsnodes::RootFsnodeId;
@@ -48,7 +52,6 @@ use manifest::ManifestOps;
 use manifest::PathOrPrefix;
 use metaconfig_types::CommitSyncConfigVersion;
 use metaconfig_types::MetadataDatabaseConfig;
-use mononoke_api_types::InnerRepo;
 use mononoke_types::path::MPath;
 use mononoke_types::ChangesetId;
 use mononoke_types::FileChange;
@@ -56,6 +59,7 @@ use mononoke_types::NonRootMPath;
 use mononoke_types::RepositoryId;
 use movers::get_small_to_large_mover;
 use movers::Mover;
+use pushredirect::SqlPushRedirectionConfigBuilder;
 use regex::Regex;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_identity::RepoIdentityRef;
@@ -83,6 +87,16 @@ mod manual_commit_sync;
 mod merging;
 mod sync_diamond_merge;
 
+use bonsai_git_mapping::BonsaiGitMapping;
+use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
+use bonsai_hg_mapping::BonsaiHgMapping;
+use bookmarks::BookmarkUpdateLog;
+use bookmarks::Bookmarks;
+use changeset_fetcher::ChangesetFetcher;
+use changesets::Changesets;
+use commit_graph::CommitGraph;
+use filenodes::Filenodes;
+use filestore::FilestoreConfig;
 use megarepolib::chunking::even_chunker_with_max_size;
 use megarepolib::chunking::parse_chunking_hint;
 use megarepolib::chunking::path_chunker_from_hint;
@@ -98,6 +112,15 @@ use megarepolib::perform_stack_move;
 use megarepolib::pre_merge_delete::create_pre_merge_delete;
 use megarepolib::pre_merge_delete::PreMergeDelete;
 use megarepolib::working_copy::get_working_copy_paths_by_prefixes;
+use metaconfig_types::RepoConfig;
+use mutable_counters::MutableCounters;
+use phases::Phases;
+use pushrebase_mutation_mapping::PushrebaseMutationMapping;
+use repo_blobstore::RepoBlobstore;
+use repo_bookmark_attrs::RepoBookmarkAttrs;
+use repo_cross_repo::RepoCrossRepo;
+use repo_derived_data::RepoDerivedData;
+use repo_identity::RepoIdentity;
 
 use crate::cli::cs_args_from_matches;
 use crate::cli::get_catchup_head_delete_commits_cs_args_factory;
@@ -158,11 +181,34 @@ use crate::cli::VERSION;
 use crate::cli::WAIT_SECS;
 use crate::merging::perform_merge;
 
+#[derive(Clone)]
+#[facet::container]
+pub struct Repo(
+    dyn BonsaiHgMapping,
+    dyn BonsaiGitMapping,
+    dyn BonsaiGlobalrevMapping,
+    dyn PushrebaseMutationMapping,
+    RepoCrossRepo,
+    RepoBookmarkAttrs,
+    dyn Bookmarks,
+    dyn Phases,
+    dyn BookmarkUpdateLog,
+    dyn Changesets,
+    dyn ChangesetFetcher,
+    FilestoreConfig,
+    dyn MutableCounters,
+    RepoBlobstore,
+    RepoConfig,
+    RepoDerivedData,
+    RepoIdentity,
+    CommitGraph,
+    dyn Filenodes,
+);
+
 async fn run_move<'a>(
     ctx: &CoreContext,
     matches: &MononokeMatches<'a>,
     sub_m: &ArgMatches<'a>,
-    live_commit_sync_config: CfgrLiveCommitSyncConfig,
 ) -> Result<(), Error> {
     let origin_repo =
         RepositoryId::new(args::get_i32_opt(sub_m, ORIGIN_REPO).expect("Origin repo is missing"));
@@ -174,6 +220,11 @@ async fn run_move<'a>(
         .ok_or_else(|| format_err!("mapping-version-name is not specified"))?;
     let mapping_version = CommitSyncConfigVersion(mapping_version_name.to_string());
 
+    let live_commit_sync_config =
+        get_live_commit_sync_config(ctx, ctx.fb, matches, matches.config_store(), origin_repo)
+            .await
+            .context("building live_commit_sync_config")?;
+
     let commit_sync_config = live_commit_sync_config
         .get_commit_sync_config_by_version(origin_repo, &mapping_version)
         .await?;
@@ -183,7 +234,7 @@ async fn run_move<'a>(
         args::get_and_parse_opt(sub_m, MAX_NUM_OF_MOVES_IN_COMMIT);
 
     let (repo, resulting_changeset_args) = try_join(
-        args::not_shardmanager_compatible::open_repo::<BlobRepo>(
+        args::not_shardmanager_compatible::open_repo::<Repo>(
             ctx.fb,
             &ctx.logger().clone(),
             matches,
@@ -230,7 +281,7 @@ async fn run_merge<'a>(
     let second_parent = sub_m.value_of(SECOND_PARENT).unwrap().to_owned();
     let resulting_changeset_args = cs_args_from_matches(sub_m);
     let (repo, resulting_changeset_args) = try_join(
-        args::not_shardmanager_compatible::open_repo::<BlobRepo>(
+        args::not_shardmanager_compatible::open_repo::<Repo>(
             ctx.fb,
             &ctx.logger().clone(),
             matches,
@@ -278,29 +329,45 @@ async fn run_sync_diamond_merge<'a>(
         ctx.fb,
         config_store,
         matches,
-    )?;
+    )
+    .await?;
 
     let merge_commit_hash = sub_m.value_of(COMMIT_HASH).unwrap().to_owned();
-    let (source_repo, target_repo): (InnerRepo, InnerRepo) =
-        try_join(source_repo, target_repo).await?;
+    let (source_repo, target_repo): (Repo, Repo) = try_join(source_repo, target_repo).await?;
 
-    let source_merge_cs_id =
-        helpers::csid_resolve(ctx, &source_repo.blob_repo, merge_commit_hash).await?;
+    let source_merge_cs_id = helpers::csid_resolve(ctx, &source_repo, merge_commit_hash).await?;
 
-    let config_store = matches.config_store();
-    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new(ctx.logger(), config_store)?;
+    let live_commit_sync_config = get_live_commit_sync_config(
+        ctx,
+        ctx.fb,
+        matches,
+        config_store,
+        source_repo.repo_identity().id(),
+    )
+    .await
+    .context("building live_commit_sync_config")?;
 
     let caching = matches.caching();
     let x_repo_syncer_lease = create_commit_syncer_lease(ctx.fb, caching)?;
 
+    let live_commit_sync_config = Arc::new(live_commit_sync_config);
+    let submodule_deps = get_all_possible_small_repo_submodule_deps_from_matches(
+        ctx,
+        matches,
+        &source_repo,
+        live_commit_sync_config.clone(),
+    )
+    .await?;
+
     sync_diamond_merge::do_sync_diamond_merge(
         ctx,
-        source_repo,
-        target_repo,
+        &source_repo,
+        &target_repo,
+        submodule_deps,
         source_merge_cs_id,
         mapping,
         bookmark,
-        Arc::new(live_commit_sync_config),
+        live_commit_sync_config,
         x_repo_syncer_lease,
     )
     .await
@@ -312,7 +379,7 @@ async fn run_pre_merge_delete<'a>(
     matches: &MononokeMatches<'a>,
     sub_m: &ArgMatches<'a>,
 ) -> Result<(), Error> {
-    let repo: BlobRepo =
+    let repo: Repo =
         args::not_shardmanager_compatible::open_repo(ctx.fb, &ctx.logger().clone(), matches)
             .await?;
 
@@ -382,7 +449,7 @@ async fn run_history_fixup_delete<'a>(
     matches: &MononokeMatches<'a>,
     sub_m: &ArgMatches<'a>,
 ) -> Result<(), Error> {
-    let repo: BlobRepo =
+    let repo: Repo =
         args::not_shardmanager_compatible::open_repo(ctx.fb, &ctx.logger().clone(), matches)
             .await?;
 
@@ -460,7 +527,7 @@ async fn run_gradual_delete<'a>(
     matches: &MononokeMatches<'a>,
     sub_m: &ArgMatches<'a>,
 ) -> Result<(), Error> {
-    let repo: BlobRepo =
+    let repo: Repo =
         args::not_shardmanager_compatible::open_repo(ctx.fb, &ctx.logger().clone(), matches)
             .await?;
 
@@ -520,7 +587,7 @@ async fn run_bonsai_merge<'a>(
     matches: &MononokeMatches<'a>,
     sub_m: &ArgMatches<'a>,
 ) -> Result<(), Error> {
-    let repo: BlobRepo =
+    let repo: Repo =
         args::not_shardmanager_compatible::open_repo(ctx.fb, &ctx.logger().clone(), matches)
             .await?;
 
@@ -552,7 +619,7 @@ async fn run_gradual_merge<'a>(
     sub_m: &ArgMatches<'a>,
 ) -> Result<(), Error> {
     let config_store = matches.config_store();
-    let repo: InnerRepo =
+    let repo: Repo =
         args::not_shardmanager_compatible::open_repo(ctx.fb, ctx.logger(), matches).await?;
 
     let last_deletion_commit = sub_m
@@ -568,9 +635,9 @@ async fn run_gradual_merge<'a>(
 
     let limit = args::get_usize_opt(sub_m, LIMIT);
     let (_, repo_config) =
-        args::get_config_by_repoid(config_store, matches, repo.blob_repo.repo_identity().id())?;
-    let last_deletion_commit = helpers::csid_resolve(ctx, &repo.blob_repo, last_deletion_commit);
-    let pre_deletion_commit = helpers::csid_resolve(ctx, &repo.blob_repo, pre_deletion_commit);
+        args::get_config_by_repoid(config_store, matches, repo.repo_identity().id())?;
+    let last_deletion_commit = helpers::csid_resolve(ctx, &repo, last_deletion_commit);
+    let pre_deletion_commit = helpers::csid_resolve(ctx, &repo, pre_deletion_commit);
 
     let (last_deletion_commit, pre_deletion_commit) =
         try_join(last_deletion_commit, pre_deletion_commit).await?;
@@ -594,7 +661,7 @@ async fn run_gradual_merge_progress<'a>(
     matches: &MononokeMatches<'a>,
     sub_m: &ArgMatches<'a>,
 ) -> Result<(), Error> {
-    let repo: InnerRepo =
+    let repo: Repo =
         args::not_shardmanager_compatible::open_repo(ctx.fb, ctx.logger(), matches).await?;
 
     let last_deletion_commit = sub_m
@@ -607,8 +674,8 @@ async fn run_gradual_merge_progress<'a>(
         .value_of(COMMIT_BOOKMARK)
         .ok_or_else(|| format_err!("bookmark where to merge is not specified"))?;
 
-    let last_deletion_commit = helpers::csid_resolve(ctx, &repo.blob_repo, last_deletion_commit);
-    let pre_deletion_commit = helpers::csid_resolve(ctx, &repo.blob_repo, pre_deletion_commit);
+    let last_deletion_commit = helpers::csid_resolve(ctx, &repo, last_deletion_commit);
+    let pre_deletion_commit = helpers::csid_resolve(ctx, &repo, pre_deletion_commit);
 
     let (last_deletion_commit, pre_deletion_commit) =
         try_join(last_deletion_commit, pre_deletion_commit).await?;
@@ -632,7 +699,7 @@ async fn run_manual_commit_sync<'a>(
     matches: &MononokeMatches<'a>,
     sub_m: &ArgMatches<'a>,
 ) -> Result<(), Error> {
-    let commit_syncer = create_commit_syncer_from_matches::<InnerRepo>(ctx, matches, None).await?;
+    let commit_syncer = create_commit_syncer_from_matches::<Repo>(ctx, matches, None).await?;
 
     let target_repo = commit_syncer.get_target_repo();
     let target_repo_parents = if sub_m.is_present(SELECT_PARENTS_AUTOMATICALLY) {
@@ -730,8 +797,17 @@ async fn run_check_push_redirection_prereqs<'a>(
     );
 
     let config_store = matches.config_store();
-    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new(ctx.logger(), config_store)?;
-    verify_working_copy_with_version_fast_path(
+    let live_commit_sync_config = get_live_commit_sync_config(
+        ctx,
+        ctx.fb,
+        matches,
+        config_store,
+        source_repo.repo_identity().id(),
+    )
+    .await
+    .context("building live_commit_sync_config")?;
+
+    verify_working_copy_with_version(
         ctx,
         &commit_syncer,
         Source(source_cs_id),
@@ -747,7 +823,7 @@ async fn run_catchup_delete_head<'a>(
     matches: &MononokeMatches<'a>,
     sub_m: &ArgMatches<'a>,
 ) -> Result<(), Error> {
-    let repo: BlobRepo =
+    let repo: Repo =
         args::not_shardmanager_compatible::open_repo(ctx.fb, &ctx.logger().clone(), matches)
             .await?;
 
@@ -811,7 +887,7 @@ async fn run_catchup_validate<'a>(
     matches: &MononokeMatches<'a>,
     sub_m: &ArgMatches<'a>,
 ) -> Result<(), Error> {
-    let repo: BlobRepo =
+    let repo: Repo =
         args::not_shardmanager_compatible::open_repo(ctx.fb, &ctx.logger().clone(), matches)
             .await?;
 
@@ -1014,8 +1090,10 @@ async fn run_diff_mapping_versions<'a>(
         .values_of(MAPPING_VERSION_NAME)
         .ok_or_else(|| format_err!("{} is supposed to be set", MAPPING_VERSION_NAME))?;
 
-    let config_store = matches.config_store();
-    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new(ctx.logger(), config_store)?;
+    let live_commit_sync_config =
+        get_live_commit_sync_config(ctx, ctx.fb, matches, config_store, source_repo_id)
+            .await
+            .context("building live_commit_sync_config")?;
 
     let mut commit_sync_configs = vec![];
     for version in mapping_version_names {
@@ -1133,7 +1211,7 @@ async fn process_stream_and_wait_for_replication<'a, R: cross_repo_sync::Repo>(
     let storage_config = small_repo_config.storage_config;
 
     let db_address = match &storage_config.metadata {
-        MetadataDatabaseConfig::Local(_) => None,
+        MetadataDatabaseConfig::Local(_) | MetadataDatabaseConfig::OssRemote(_) => None,
         MetadataDatabaseConfig::Remote(remote_config) => {
             Some(remote_config.primary.db_address.clone())
         }
@@ -1192,7 +1270,7 @@ async fn run_sync_commit_and_ancestors<'a>(
         helpers::csid_resolve(ctx, commit_syncer.get_source_repo(), source_commit_hash).await?;
 
     let (unsynced_ancestors, _) =
-        find_toposorted_unsynced_ancestors(ctx, &commit_syncer, source_cs_id).await?;
+        find_toposorted_unsynced_ancestors(ctx, &commit_syncer, source_cs_id, None).await?;
 
     for ancestor in unsynced_ancestors {
         commit_syncer
@@ -1201,6 +1279,7 @@ async fn run_sync_commit_and_ancestors<'a>(
                 ancestor,
                 CandidateSelectionHint::Only,
                 CommitSyncContext::AdminChangeMapping,
+                None,
             )
             .await?;
     }
@@ -1312,13 +1391,44 @@ async fn find_mover_for_commit<R: cross_repo_sync::Repo>(
     Ok(mover)
 }
 
+async fn get_live_commit_sync_config(
+    ctx: &CoreContext,
+    fb: FacebookInit,
+    matches: &MononokeMatches<'_>,
+    config_store: &ConfigStore,
+    repo_id: RepositoryId,
+) -> Result<CfgrLiveCommitSyncConfig> {
+    let (_, repo_config) = args::get_config_by_repoid(config_store, matches, repo_id)?;
+
+    let sql_factory: MetadataSqlFactory = MetadataSqlFactory::new(
+        fb,
+        repo_config.storage_config.metadata.clone(),
+        matches.mysql_options().clone(),
+        *matches.readonly_storage(),
+    )
+    .await?;
+    let builder = sql_factory
+        .open::<SqlPushRedirectionConfigBuilder>()
+        .await?;
+    let push_redirection_config = builder.build();
+
+    CfgrLiveCommitSyncConfig::new_with_xdb(
+        ctx.logger(),
+        config_store,
+        Arc::new(push_redirection_config),
+    )
+}
+
 #[fbinit::main]
 fn main(fb: FacebookInit) -> Result<()> {
     let app = setup_app();
     let (matches, _runtime) = app.get_matches(fb)?;
     let logger = matches.logger();
-    let config_store = matches.config_store();
-    let ctx = CoreContext::new_with_logger(fb, logger.clone());
+    let ctx = CoreContext::new_with_logger_and_client_info(
+        fb,
+        logger.clone(),
+        ClientInfo::default_with_entry_point(ClientEntryPoint::MegarepoTool),
+    );
     let ctx = &ctx;
 
     let subcommand_future = async {
@@ -1338,11 +1448,7 @@ fn main(fb: FacebookInit) -> Result<()> {
                 run_mark_not_synced(ctx, &matches, sub_m).await
             }
             (MERGE, Some(sub_m)) => run_merge(ctx, &matches, sub_m).await,
-            (MOVE, Some(sub_m)) => {
-                let live_commit_sync_config =
-                    CfgrLiveCommitSyncConfig::new(ctx.logger(), config_store)?;
-                run_move(ctx, &matches, sub_m, live_commit_sync_config).await
-            }
+            (MOVE, Some(sub_m)) => run_move(ctx, &matches, sub_m).await,
             (RUN_MOVER, Some(sub_m)) => run_mover(ctx, &matches, sub_m).await,
             (SYNC_COMMIT_AND_ANCESTORS, Some(sub_m)) => {
                 run_sync_commit_and_ancestors(ctx, &matches, sub_m).await

@@ -1,5 +1,5 @@
 #chg-compatible
-#require bash
+#require bash no-eden
 
   $ eagerepo
 Initialize scm prompt

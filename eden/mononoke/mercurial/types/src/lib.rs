@@ -56,14 +56,16 @@ pub mod file;
 pub mod flags;
 pub mod fsencode;
 pub mod manifest;
-mod node;
 pub mod nodehash;
+pub mod preloaded_augmented_manifest;
 pub mod remotefilelog;
+pub mod sharded_augmented_manifest;
 pub mod sql_types;
 pub mod utils;
 
 // Re-exports from mononoke_types. Eventually these should go away and everything should depend
 // directly on mononoke_types;
+pub use mononoke_types::path::MPath;
 pub use mononoke_types::sha1_hash;
 pub use mononoke_types::FileType;
 pub use mononoke_types::Globalrev;
@@ -94,7 +96,7 @@ pub use crate::flags::RevFlags;
 pub use crate::fsencode::fncache_fsencode;
 pub use crate::fsencode::simple_fsencode;
 pub use crate::manifest::Type;
-pub use crate::node::Node;
+pub use crate::nodehash::HgAugmentedManifestId;
 pub use crate::nodehash::HgChangesetId;
 pub use crate::nodehash::HgChangesetIdPrefix;
 pub use crate::nodehash::HgChangesetIdsResolvedFromPrefix;
@@ -105,8 +107,13 @@ pub use crate::nodehash::HgNodeHash;
 pub use crate::nodehash::HgNodeKey;
 pub use crate::nodehash::NULL_CSID;
 pub use crate::nodehash::NULL_HASH;
+pub use crate::preloaded_augmented_manifest::HgPreloadedAugmentedManifest;
 pub use crate::remotefilelog::convert_parents_to_remotefilelog_format;
 pub use crate::remotefilelog::HgFileHistoryEntry;
+pub use crate::sharded_augmented_manifest::fetch_augmented_manifest_envelope_opt;
+pub use crate::sharded_augmented_manifest::HgAugmentedManifestEntry;
+pub use crate::sharded_augmented_manifest::HgAugmentedManifestEnvelope;
+pub use crate::sharded_augmented_manifest::ShardedHgAugmentedManifest;
 pub use crate::utils::percent_encode;
 
 #[cfg(test)]
@@ -114,5 +121,6 @@ mod test;
 
 mod thrift {
     pub use mercurial_thrift::*;
-    pub use mononoke_types_thrift::*;
+    #[cfg(test)]
+    pub use mononoke_types_serialization::id;
 }

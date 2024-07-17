@@ -23,11 +23,12 @@ use manifest::Manifest;
 use manifest_tree::testutil::TestStore;
 use manifest_tree::TreeManifest;
 use manifest_tree::TreeStore;
-use storemodel::futures::stream;
 use storemodel::futures::StreamExt;
-use storemodel::ReadFileContents;
+use storemodel::BoxIterator;
+use storemodel::FileStore;
+use storemodel::KeyStore;
 use storemodel::ReadRootTreeIds;
-use storemodel::TreeFormat;
+use storemodel::SerializationFormat;
 use tracing_test::traced_test;
 use types::HgId;
 use types::Key;
@@ -48,7 +49,7 @@ struct CopyTraceTestCaseInner {
     /// Commits that change trees.
     commit_to_tree: HashMap<Vertex, HgId>,
     /// In memory tree store
-    tree_store: Arc<dyn TreeStore + Send + Sync>,
+    tree_store: Arc<dyn TreeStore>,
     /// Dag algorithm
     dagalgo: Arc<dyn DagAlgorithm + Send + Sync>,
     /// Copies info: dest -> src mapping
@@ -75,7 +76,7 @@ impl CopyTraceTestCase {
 
         let mut commit_to_tree: HashMap<Vertex, HgId> = Default::default();
         let mut copies: HashMap<Key, Key> = Default::default();
-        let tree_store = Arc::new(TestStore::new().with_format(TreeFormat::Git));
+        let tree_store = Arc::new(TestStore::new().with_format(SerializationFormat::Git));
         let changes = Change::build_changes(changes);
         let config: BTreeMap<&'static str, &'static str> = Default::default();
 
@@ -108,20 +109,22 @@ impl CopyTraceTestCase {
     pub async fn copy_trace(&self) -> Arc<dyn CopyTrace + Send + Sync> {
         let file_reader = Arc::new(self.clone());
         let config = Arc::new(self.inner.config.clone());
-        let rename_finder = Arc::new(MetadataRenameFinder::new(file_reader, config).unwrap());
+        let rename_finder =
+            Arc::new(MetadataRenameFinder::new(file_reader, config.clone()).unwrap());
 
         let root_tree_reader = Arc::new(self.clone());
         let tree_store = self.inner.tree_store.clone();
         let dagalgo = self.inner.dagalgo.clone();
 
         let copy_trace =
-            DagCopyTrace::new(root_tree_reader, tree_store, rename_finder, dagalgo).unwrap();
+            DagCopyTrace::new(root_tree_reader, tree_store, rename_finder, dagalgo, config)
+                .unwrap();
         Arc::new(copy_trace)
     }
 
     async fn build_tree(
         dag: &MemDag,
-        tree_store: Arc<dyn TreeStore + Send + Sync>,
+        tree_store: Arc<dyn TreeStore>,
         commit_to_tree: &mut HashMap<Vertex, HgId>,
         copies: &mut HashMap<Key, Key>,
         commit: Vertex,
@@ -184,28 +187,18 @@ impl ReadRootTreeIds for CopyTraceTestCase {
 }
 
 #[async_trait]
-impl ReadFileContents for CopyTraceTestCase {
-    type Error = anyhow::Error;
+impl KeyStore for CopyTraceTestCase {}
 
-    #[allow(dead_code)]
-    async fn read_file_contents(
-        &self,
-        _keys: Vec<Key>,
-    ) -> stream::BoxStream<Result<(storemodel::minibytes::Bytes, Key), Self::Error>> {
-        // We will need this for computing content similarity score later.
-        todo!()
-    }
-
-    async fn read_rename_metadata(
+#[async_trait]
+impl FileStore for CopyTraceTestCase {
+    fn get_rename_iter(
         &self,
         keys: Vec<Key>,
-    ) -> stream::BoxStream<Result<(Key, Option<Key>), Self::Error>> {
-        let renames: Vec<_> = {
-            keys.iter()
-                .map(|k| Ok((k.clone(), self.inner.copies.get(k).cloned())))
-                .collect()
-        };
-        stream::iter(renames).boxed()
+    ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, Key)>>> {
+        let iter = keys
+            .into_iter()
+            .filter_map(|k| self.inner.copies.get(&k).cloned().map(|v| Ok((k, v))));
+        Ok(Box::new(iter))
     }
 }
 
@@ -290,7 +283,26 @@ macro_rules! assert_trace_rename {
     }};
 }
 
-#[tokio::test]
+macro_rules! assert_path_copies {
+    ($copy_trace:ident $src:tt $dst:tt, [$( $key:expr => $val:expr ),*]) => {{
+        let src = vertex_from_str(stringify!($src));
+        let dst = vertex_from_str(stringify!($dst));
+        let result = $copy_trace
+            .path_copies(src, dst, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<HashMap<_, _>>();
+
+        let mut expected = HashMap::new();
+        $( expected.insert($key.to_string(), $val.to_string()); )*
+
+        assert_eq!(result, expected);
+    }};
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_linear_single_rename() {
     let ascii = r#"
     C
@@ -316,7 +328,7 @@ async fn test_linear_single_rename() {
     assert_trace_rename!(c A C, d -> !);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[traced_test]
 async fn test_non_linear_single_rename() {
     let ascii = r#"
@@ -339,7 +351,7 @@ async fn test_non_linear_single_rename() {
     assert_trace_rename!(c B C, b -> a);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[traced_test]
 async fn test_linear_multiple_renames() {
     let ascii = r#"
@@ -368,7 +380,7 @@ async fn test_linear_multiple_renames() {
     assert_trace_rename!(c X A, d -> a);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_linear_multiple_renames_with_deletes() {
     let ascii = r#"
     Z
@@ -386,13 +398,13 @@ async fn test_linear_multiple_renames_with_deletes() {
     let c = t.copy_trace().await;
 
     assert_trace_rename!(c A X, a -> d);
-    assert_trace_rename!(c A Z, a -> !-Z d);
+    assert_trace_rename!(c A Z, a -> ! - Z d);
 
     assert_trace_rename!(c Z B, b2 -> b2);
-    assert_trace_rename!(c Z A, b2 -> !+B b2);
+    assert_trace_rename!(c Z A, b2 -> ! + B b2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_non_linear_multiple_renames() {
     let ascii = r#"
     1..10..1023
@@ -429,7 +441,7 @@ async fn test_non_linear_multiple_renames() {
     assert_trace_rename!(c 1023 Z, d -> a2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_non_linear_multiple_renames_with_deletes() {
     let ascii = r#"
     1..10..1023
@@ -449,11 +461,11 @@ async fn test_non_linear_multiple_renames_with_deletes() {
     let c = t.copy_trace().await;
 
     assert_trace_rename!(c Z 1000, a2 -> d);
-    assert_trace_rename!(c Z 1001, a2 -> !-1001 d);
-    assert_trace_rename!(c Z 1023, a2 -> !-1001 d);
+    assert_trace_rename!(c Z 1001, a2 -> ! - 1001 d);
+    assert_trace_rename!(c Z 1023, a2 -> ! - 1001 d);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_multiple_copies_ordering_default() {
     let ascii = r#"
     C
@@ -467,7 +479,7 @@ async fn test_multiple_copies_ordering_default() {
     assert_trace_rename!(c A C, a -> b);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_multiple_copies_ordering_same_basename_win() {
     let ascii = r#"
     C
@@ -484,7 +496,7 @@ async fn test_multiple_copies_ordering_same_basename_win() {
     assert_trace_rename!(c A C, a -> "z/a");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_multiple_copies_ordering_same_directory_win() {
     let ascii = r#"
     C
@@ -499,7 +511,7 @@ async fn test_multiple_copies_ordering_same_directory_win() {
     assert_trace_rename!(c A C, a -> b);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[traced_test]
 async fn test_linear_dir_move() {
     let ascii = r#"
@@ -531,4 +543,25 @@ async fn test_linear_dir_move() {
 
     assert_trace_rename!(c A B, "a/b/3.c" -> "b/b/3.c");
     assert_trace_rename!(c B A, "b/b/3.c" -> "a/b/3.c");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_basic_path_copies() {
+    let ascii = r#"
+    C
+    |
+    B
+    |
+    A
+    "#;
+    let changes = HashMap::from([
+        ("A", vec!["+ a/1.txt 1", "+ b/3.c 3"]),
+        ("B", vec!["-> a/1.txt b/1.txt", "-> b/3.c b/3.cpp"]),
+        ("C", vec!["M b/1.txt 4"]),
+    ]);
+    let t = CopyTraceTestCase::new(ascii, changes).await;
+    let c = t.copy_trace().await;
+
+    assert_path_copies!(c A B, ["b/1.txt" => "a/1.txt", "b/3.cpp" => "b/3.c"]);
+    assert_path_copies!(c B A, ["a/1.txt" => "b/1.txt", "b/3.c" => "b/3.cpp"]);
 }

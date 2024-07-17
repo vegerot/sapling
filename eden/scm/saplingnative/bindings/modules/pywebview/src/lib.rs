@@ -6,22 +6,24 @@
  */
 
 use cpython::*;
+use cpython_ext::convert::Serde;
 use cpython_ext::ResultPyErrExt;
 
 pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
     let name = [package, "webview"].join(".");
     let m = PyModule::new(py, &name)?;
-    m.add(py, "open", py_fn!(py, open(url: &str, width: i32 = 800, height: i32 = 600, browser: Option<String> = None)))?;
+    m.add(
+        py,
+        "open_isl",
+        py_fn!(py, open_isl(
+        options: Serde<webview_app::ISLSpawnOptions>
+                )),
+    )?;
     Ok(m)
 }
 
-fn open(
-    py: Python,
-    url: &str,
-    width: i32,
-    height: i32,
-    browser: Option<String>,
-) -> PyResult<PyNone> {
-    webview_app::open(url, width, height, browser).map_pyerr(py)?;
+fn open_isl(py: Python, options: Serde<webview_app::ISLSpawnOptions>) -> PyResult<PyNone> {
+    let opts: webview_app::ISLSpawnOptions = options.0;
+    webview_app::open_isl(opts).map_pyerr(py)?;
     Ok(PyNone)
 }

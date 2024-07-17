@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 hide outer repo
   $ hg init
@@ -143,7 +145,6 @@ Test "%unset"
   $ hg showconfig unsettest.both -Tjson
   [
   ]
-  [1]
   $ hg showconfig unsettest.both -Tjson --debug
   [
   {
@@ -152,6 +153,60 @@ Test "%unset"
     "value": null
   }
   ]
+
+Read multiple values with -Tjson
+
+  $ hg config --config=a.1=1 --config=a.2=2 --config=a.3=3 a.1 a.3 -Tjson
+  [
+  {
+    "name": "a.1",
+    "source": "--config",
+    "value": "1"
+  },
+  {
+    "name": "a.3",
+    "source": "--config",
+    "value": "3"
+  }
+  ]
+
+  $ hg config --config=a.1=1 --config=a.2=2 --config=a.3=3 --config=b.1=4 --config=b.2=5 a.3 b a.1 -Tjson
+  [
+  {
+    "name": "a.3",
+    "source": "--config",
+    "value": "3"
+  },
+  {
+    "name": "b.1",
+    "source": "--config",
+    "value": "4"
+  },
+  {
+    "name": "b.2",
+    "source": "--config",
+    "value": "5"
+  },
+  {
+    "name": "a.1",
+    "source": "--config",
+    "value": "1"
+  }
+  ]
+
+Config order is preserved:
+
+  $ cat <<EOF >> $HGRCPATH
+  > [ordertest]
+  > a = 1
+  > c = 3
+  > b = 2
+  > EOF
+
+  $ hg config ordertest
+  ordertest.a=1
+  ordertest.c=3
+  ordertest.b=2
 
 Test exit code when no config matches
 
@@ -246,11 +301,12 @@ config editing without an editor
 
  invalid pattern
   $ hg config --edit missing.value
-  abort: missing config value for 'missing.value'
+  abort: invalid config edit: 'missing.value'
+  (try section.name=value)
   [255]
 
   $ hg config --edit missing=name
-  abort: invalid argument: 'missing'
+  abort: invalid config edit: 'missing'
   (try section.name=value)
   [255]
 
@@ -388,3 +444,28 @@ Can see all sources w/ --debug and --verbose:
   $TESTTMP/sources/.hg/hgrc:*: foo.bar=2 (glob)
     $TESTTMP/sources/.hg/hgrc:*: foo.bar=1 (glob)
     $TESTTMP/sources.rc:*: foo.bar=3 (glob)
+
+Can delete in place:
+  $ newrepo delete
+  $ cat > .hg/hgrc << EOF
+  > [foo]
+  > bar = 1
+  > baz = 2
+  > EOF
+
+  $ hg config --delete foo.bar
+  abort: --delete requires one of --user, --local or --system
+  [255]
+
+  $ hg config --delete --local foo.bar=123
+  abort: invalid config deletion: 'foo.bar=123'
+  (try section.name)
+  [255]
+
+  $ hg config --delete --local foo.bar -v
+  deleting foo.bar from $TESTTMP/delete/.hg/hgrc
+  updated config in $TESTTMP/delete/.hg/hgrc
+
+  $ cat .hg/hgrc
+  [foo]
+  baz = 2

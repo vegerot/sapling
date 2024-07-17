@@ -176,6 +176,8 @@ impl<T: HgIdMutableHistoryStore> LocalStore for MultiplexHgIdHistoryStore<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use minibytes::Bytes;
     use tempfile::TempDir;
     use types::testutil::*;
@@ -201,10 +203,11 @@ mod tests {
             max_bytes: None,
         };
         let mut log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Ignore,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?;
         let mut multiplex = MultiplexDeltaStore::new();
         multiplex.add_store(Box::new(&mut log));
@@ -233,10 +236,11 @@ mod tests {
             max_bytes: None,
         };
         let mut log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Ignore,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?;
         let mut pack = MutableDataPack::new(&tempdir, DataPackVersion::One);
         let mut multiplex: MultiplexDeltaStore<Box<dyn HgIdMutableDeltaStore>> =

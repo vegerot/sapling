@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 #inprocess-hg-incompatible
 
   $ disable treemanifest
@@ -79,6 +81,7 @@ However, we can't prevent it from loading extensions and configs:
   [255]
 
   $ mkdir -p badrepo/.hg
+  $ touch badrepo/.hg/requires
   $ echo 'invalid-syntax' > badrepo/.hg/hgrc
   $ hg log -b -Rbadrepo default
   hg: parse errors: "$TESTTMP/a/badrepo/.hg/hgrc":

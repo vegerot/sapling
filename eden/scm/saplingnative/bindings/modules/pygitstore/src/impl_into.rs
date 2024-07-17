@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use cpython::*;
 use cpython_ext::convert::register_into;
-use storemodel::ReadFileContents;
+use storemodel::FileStore;
 use storemodel::TreeStore;
 
 use crate::gitstore;
@@ -22,15 +22,12 @@ pub(crate) fn register(py: Python) {
 }
 
 impl gitstore {
-    fn to_dyn_treestore(&self, py: Python) -> Arc<dyn TreeStore + Send + Sync> {
+    fn to_dyn_treestore(&self, py: Python) -> Arc<dyn TreeStore> {
         let store = self.inner(py);
         store.clone() as Arc<_>
     }
 
-    fn to_read_file_contents(
-        &self,
-        py: Python,
-    ) -> Arc<dyn ReadFileContents<Error = anyhow::Error> + Send + Sync> {
+    fn to_read_file_contents(&self, py: Python) -> Arc<dyn FileStore> {
         let store = self.inner(py).clone();
         store as Arc<_>
     }

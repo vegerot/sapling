@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 import configparser
 import datetime
 import json
@@ -31,12 +33,14 @@ class HgRepository(repobase.Repository):
     hg_environment: Dict[str, str]
     temp_mgr: TempFileManager
     staged_files: List[str]
+    filtered: bool = False
 
     def __init__(
         self,
         path: str,
         system_hgrc: Optional[str] = None,
         temp_mgr: Optional[TempFileManager] = None,
+        filtered: bool = False,
     ) -> None:
         """
         If hgrc is specified, it will be used as the value of the HGRCPATH
@@ -63,6 +67,7 @@ class HgRepository(repobase.Repository):
             self.hg_environment["HGRCPATH"] = ""
         self.hg_bin = FindExe.HG
         self.staged_files = []
+        self.filtered = filtered
 
     @classmethod
     def get_system_hgrc_contents(cls) -> str:
@@ -143,40 +148,85 @@ class HgRepository(repobase.Repository):
         cwd: Optional[str] = None,
         check: bool = True,
         traceback: bool = True,
+        env: Optional[Dict[str, str]] = None,
     ) -> subprocess.CompletedProcess:
-        env = self.hg_environment
+        env = self.hg_environment | (env or {})
         argslist = list(args)
         cmd = [self.hg_bin] + (["--traceback"] if traceback else []) + argslist
         print(f"Trying to run {cmd}")
         if hgeditor is not None:
-            env = dict(env)
             env["HGEDITOR"] = hgeditor
 
-        input_bytes = None
+        # Create a temporary file for the input as a more reliable way than the PIPE
+        # and Python threads.
+        input_file = None
+        stdin = subprocess.DEVNULL
         if input is not None:
             input_bytes = input.encode(encoding)
+            input_file = self.temp_mgr.make_temp_binary(prefix="hg_input.")
+            input_file.write(input_bytes)
+            input_file.seek(0)
+            stdin = input_file.fileno()
+
+        # Turn subprocess.PIPE to temporary files to avoid issues with selectors.
+        stdout_file = None
+        stderr_file = None
+        if stdout is subprocess.PIPE:
+            stdout = stdout_file = self.temp_mgr.make_temp_binary(prefix="hg_stdout.")
+        if stderr is subprocess.PIPE:
+            stderr = stderr_file = self.temp_mgr.make_temp_binary(prefix="hg_stdout.")
 
         if cwd is None:
             cwd = self.path
+
+        result = None
+        error = None
+        stdout_content = None
+        stderr_content = None
         try:
-            return subprocess.run(
+            result = subprocess.run(
                 cmd,
                 stdout=stdout,
                 stderr=stderr,
-                input=input_bytes,
+                stdin=stdin,
                 check=check,
                 cwd=cwd,
                 env=env,
             )
         except subprocess.CalledProcessError as ex:
+            error = ex
+        finally:
+            if input_file:
+                input_file.close()
+            if stdout_file is not None:
+                stdout_file.seek(0)
+                stdout_content = stdout_file.read()
+                stdout_file.close()
+            if stderr_file is not None:
+                stderr_file.seek(0)
+                stderr_content = stderr_file.read()
+                stderr_file.close()
+
+        if error is not None:
             print("----------- Mercurial Crash Report")
             print("cmd: ", " ".join(cmd))
-            if ex.stdout:
-                print("stdout: ", ex.stdout.decode())
-            if ex.stderr:
-                print("stderr: ", ex.stderr.decode())
+            if stdout_content is not None:
+                error.stdout = stdout_content
+                print("stdout: ", stdout_content.decode())
+            if stderr_content is not None:
+                error.stderr = stderr_content
+                print("stderr: ", stderr_content.decode())
             print("----------- Mercurial Crash Report End")
-            raise HgError(ex) from ex
+            raise HgError(error) from error
+        elif result is not None:
+            if stdout_content is not None:
+                result.stdout = stdout_content
+            if stderr_content is not None:
+                result.stderr = stderr_content
+            return result
+        else:
+            # practically unreachable, just to make pyre happy.
+            raise RuntimeError("either result or error should be set")
 
     def hg(
         self,
@@ -186,6 +236,7 @@ class HgRepository(repobase.Repository):
         hgeditor: Optional[str] = None,
         cwd: Optional[str] = None,
         check: bool = True,
+        env: Optional[Dict[str, str]] = None,
     ) -> str:
         if "--debug" in args:
             stderr = subprocess.STDOUT
@@ -199,6 +250,7 @@ class HgRepository(repobase.Repository):
             cwd=cwd,
             check=check,
             stderr=stderr,
+            env=env,
         )
         return typing.cast(
             str, completed_process.stdout.decode(encoding, errors="replace")
@@ -236,6 +288,15 @@ class HgRepository(repobase.Repository):
         hgrc["remotefilelog"]["server"] = "false"
         hgrc["remotefilelog"]["reponame"] = "test"
         hgrc["remotefilelog"]["cachepath"] = cachepath
+
+        # Use Rust status.
+        hgrc.setdefault("status", {})
+        hgrc["status"]["use-rust"] = "true"
+
+        # Use (native) Rust checkout whenever possible
+        hgrc.setdefault("checkout", {})
+        hgrc["checkout"]["use-rust"] = "true"
+
         self.write_hgrc(hgrc)
 
         storerequirespath = os.path.join(self.path, ".hg", "store", "requires")
@@ -261,7 +322,7 @@ class HgRepository(repobase.Repository):
             f.write("[hooks]\npost-pull.changelo-migrate=")
 
     def get_type(self) -> str:
-        return "hg"
+        return "filteredhg" if self.filtered else "hg"
 
     def get_head_hash(self) -> str:
         return self.hg("log", "-r.", "-T{node}")
@@ -332,7 +393,11 @@ class HgRepository(repobase.Repository):
 
             # Do not capture stdout or stderr when running "hg commit"
             # This allows its output to show up in the test logs.
-            self.run_hg(*args, stdout=None, stderr=None)
+            self.run_hg(
+                *args,
+                stdout=None,
+                stderr=None,
+            )
 
         # Get the commit ID and return it
         return self.hg("log", "-T{node}", "-r.")
@@ -358,7 +423,7 @@ class HgRepository(repobase.Repository):
         return typing.cast(List[Dict[str, Any]], json_data)
 
     def status(
-        self, include_ignored: bool = False, rev: Optional[str] = None
+        self, include_ignored: bool = False, rev: Optional[str] = None, **opts
     ) -> Dict[str, str]:
         """Returns the output of `hg status` as a dictionary of {path: status char}.
 
@@ -371,7 +436,7 @@ class HgRepository(repobase.Repository):
             args.append("--rev")
             args.append(rev)
 
-        output = self.hg(*args)
+        output = self.hg(*args, **opts)
         status = {}
         for entry in output.split("\0"):
             if not entry:
@@ -383,14 +448,14 @@ class HgRepository(repobase.Repository):
 
         return status
 
-    def update(self, rev: str, clean: bool = False, merge: bool = False) -> str:
+    def update(self, rev: str, clean: bool = False, merge: bool = False, **opts) -> str:
         args = ["update"]
         if clean:
             args.append("--clean")
         if merge:
             args.append("--merge")
         args.append(rev)
-        return self.hg(*args)
+        return self.hg(*args, **opts)
 
     def reset(self, rev: str, keep: bool = True) -> None:
         if keep:

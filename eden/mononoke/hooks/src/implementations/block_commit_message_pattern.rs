@@ -5,8 +5,6 @@
  * GNU General Public License version 2.
  */
 
-use anyhow::bail;
-use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
 use bookmarks::BookmarkKey;
@@ -29,12 +27,12 @@ pub struct BlockCommitMessagePatternConfig {
     /// Pattern to search for.  If found in any text file or the commit
     /// message, the commit is blocked.
     #[serde(with = "serde_regex")]
-    pub(crate) pattern: Regex,
+    pattern: Regex,
 
     /// Message to include in the hook rejection.  The string is expanded with
     /// the capture groups from the pattern, i.e. `${1}` is replaced with the
     /// first capture group, etc.
-    pub(crate) message: String,
+    message: String,
 }
 
 /// Hook to block commits based on matching a pattern in the commit message.
@@ -45,13 +43,7 @@ pub struct BlockCommitMessagePatternHook {
 
 impl BlockCommitMessagePatternHook {
     pub fn new(config: &HookConfig) -> Result<Self> {
-        match &config.options {
-            Some(options) => {
-                let config = serde_json::from_str(options).context("Invalid hook config")?;
-                Self::with_config(config)
-            }
-            None => bail!("Missing hook options"),
-        }
+        Self::with_config(config.parse_options()?)
     }
 
     pub fn with_config(config: BlockCommitMessagePatternConfig) -> Result<Self> {

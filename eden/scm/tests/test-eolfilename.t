@@ -1,8 +1,7 @@
-#debugruntest-compatible
 
-#require no-fsmonitor
+#require no-fsmonitor no-eden
 
-#require eol-in-paths
+#require eol-in-paths no-eden
 
   $ eagerepo
 

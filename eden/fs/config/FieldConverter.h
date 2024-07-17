@@ -21,8 +21,8 @@
 
 #include <folly/Expected.h>
 
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/utils/ChronoParse.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 namespace facebook::eden {
 
@@ -180,6 +180,22 @@ class FieldConverter<std::unordered_set<T>> {
           return FieldConverter<T>{}.toDebugString(element);
         });
     return fmt::to_string(fmt::join(serializedElements, ", "));
+  }
+};
+
+template <typename T>
+class FieldConverter<std::shared_ptr<T>> {
+ public:
+  folly::Expected<std::shared_ptr<T>, std::string> fromString(
+      std::string_view value,
+      const std::map<std::string, std::string>& convData) const {
+    return FieldConverter<T>{}.fromString(value, convData).then([](T val) {
+      return std::make_shared<T>(std::move(val));
+    });
+  }
+
+  std::string toDebugString(const std::shared_ptr<T>& value) const {
+    return FieldConverter<T>{}.toDebugString(*value);
   }
 };
 

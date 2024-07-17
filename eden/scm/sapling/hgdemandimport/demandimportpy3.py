@@ -32,8 +32,6 @@ This also has some limitations compared to the Python 2 implementation:
 from __future__ import absolute_import
 
 import contextlib
-import importlib.abc
-import importlib.machinery
 import importlib.util
 import sys
 
@@ -52,6 +50,9 @@ class _lazyloaderex(importlib.util.LazyLoader):
             self.loader.exec_module(module)
         else:
             super().exec_module(module)
+
+    def get_source(self, name):
+        return self.loader.get_source(name)
 
 
 class LazyFinder:

@@ -4,7 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
+
 
 import errno
 import typing
@@ -23,7 +24,7 @@ try:
     )
 
     def getFakeVSCodeExtensionsChecker() -> FakeVSCodeExtensionsChecker:
-        return FakeVSCodeExtensionsChecker()
+        return FakeVSCodeExtensionsChecker(None)
 
 except ImportError:
 

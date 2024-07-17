@@ -1,14 +1,14 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
   $ eagerepo
-  $ cat >> $HGRCPATH << 'EOF'
-  > [extensions]
-  > preventpremegarepoupdateshook=
-  > EOF
+  $ enable preventpremegarepoupdateshook
+  $ setconfig checkout.use-rust=false
 
   $ hg init repo
   $ cd repo

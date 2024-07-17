@@ -8,42 +8,39 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::BufRead;
-use std::io::BufReader;
 use std::io::Cursor;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::Result;
 use assert_matches::assert_matches;
-use async_compression::membuf::MemBuf;
-use async_compression::Bzip2Compression;
-use async_compression::CompressorType;
-use async_compression::FlateCompression;
 use context::CoreContext;
 use fbinit::FacebookInit;
-use futures::compat::Future01CompatExt;
+use futures::stream;
 use futures::stream::BoxStream;
+use futures::StreamExt;
 use futures::TryStreamExt;
-use futures_old::stream;
-use futures_old::stream::Stream;
-use futures_old::stream::Stream as OldStream;
 use mercurial_types::HgChangesetId;
 use mercurial_types::HgNodeHash;
 use mercurial_types::NonRootMPath;
 use mercurial_types::RepoPath;
 use mercurial_types::NULL_HASH;
-use partial_io::GenWouldBlock;
+use partial_io::quickcheck_types::GenWouldBlock;
+use partial_io::quickcheck_types::PartialWithErrors;
 use partial_io::PartialAsyncRead;
-use partial_io::PartialWithErrors;
 use phases::Phase;
 use quickcheck::Gen;
 use quickcheck::QuickCheck;
 use slog::o;
 use slog::Discard;
 use slog::Logger;
+use tokio::io::AsyncBufRead;
+use tokio::io::BufReader;
 use tokio::runtime::Runtime;
-use tokio_io::AsyncRead;
 
-use crate::bundle2::Bundle2Stream;
+use crate::bundle2::bundle2_stream;
+use crate::bundle2::Remainder;
 use crate::bundle2::StreamEvent;
 use crate::bundle2_encode::Bundle2EncodeBuilder;
 use crate::changegroup;
@@ -53,7 +50,6 @@ use crate::part_header::PartHeaderBuilder;
 use crate::part_header::PartHeaderType;
 use crate::parts::phases_part;
 use crate::types::StreamHeader;
-use crate::utils::get_compression_param;
 use crate::wirepack;
 use crate::Bundle2Item;
 
@@ -105,33 +101,22 @@ fn parse_uncompressed(read_ops: PartialWithErrors<GenWouldBlock>) {
 
 #[test]
 fn test_parse_unknown_compression() {
+    let app_errors = Arc::new(Mutex::new(Vec::new()));
+
     let runtime = Runtime::new().unwrap();
-    let bundle2_buf = BufReader::new(MemBuf::from(Vec::from(UNKNOWN_COMPRESSION_BUNDLE2)));
-    let outer_stream_err = parse_stream_start(&runtime, bundle2_buf, Some("IL")).unwrap_err();
+    let bundle2_buf = BufReader::new(Cursor::new(UNKNOWN_COMPRESSION_BUNDLE2));
+    let outer_stream_err = parse_stream_start(&runtime, bundle2_buf, Some("IL"), app_errors)
+        .err()
+        .unwrap();
     assert_matches!(outer_stream_err.downcast::<ErrorKind>().unwrap(),
                     ErrorKind::Bundle2Decode(ref msg) if msg == "unknown compression 'IL'");
 }
 
 #[test]
-fn test_empty_bundle_roundtrip_bzip() {
-    empty_bundle_roundtrip(Some(CompressorType::Bzip2(Bzip2Compression::Default)));
-}
-
-#[test]
-fn test_empty_bundle_roundtrip_gzip() {
-    empty_bundle_roundtrip(Some(CompressorType::Gzip(FlateCompression::best())));
-}
-
-#[test]
 fn test_empty_bundle_roundtrip_uncompressed() {
-    empty_bundle_roundtrip(None);
-}
-
-fn empty_bundle_roundtrip(ct: Option<CompressorType>) {
     // Encode an empty bundle.
     let cursor = Cursor::new(Vec::with_capacity(32 * 1024));
     let mut builder = Bundle2EncodeBuilder::new(cursor);
-    builder.set_compressor_type(ct);
     builder
         .add_stream_param("Foo".into(), "123".into())
         .unwrap();
@@ -141,18 +126,18 @@ fn empty_bundle_roundtrip(ct: Option<CompressorType>) {
     let encode_fut = builder.build();
 
     let runtime = Runtime::new().unwrap();
-    let mut buf = runtime.block_on(encode_fut.compat()).unwrap();
+    let mut buf = runtime.block_on(encode_fut).unwrap();
     buf.set_position(0);
 
     // Now decode it.
     let logger = Logger::root(Discard, o!());
-    let stream = Bundle2Stream::new(logger, buf);
-    let (item, stream) = runtime.block_on(stream.into_future().compat()).unwrap();
+    let stream = bundle2_stream(logger, buf, None);
+    let (item, stream) = runtime.next_stream(stream);
 
     let mut mparams = HashMap::new();
     let mut aparams = HashMap::new();
     mparams.insert("foo".into(), "123".into());
-    mparams.insert("compression".into(), get_compression_param(&ct).into());
+    mparams.insert("compression".into(), "UN".into());
     aparams.insert("bar".into(), "456".into());
     let expected_header = StreamHeader {
         m_stream_params: mparams,
@@ -164,16 +149,16 @@ fn empty_bundle_roundtrip(ct: Option<CompressorType>) {
         Some(StreamEvent::Next(Bundle2Item::Start(ref header))) if header == &expected_header
     );
 
-    let (item, stream) = runtime.block_on(stream.into_future().compat()).unwrap();
+    let (item, stream) = runtime.next_stream(stream);
     assert_matches!(item, Some(StreamEvent::Done(_)));
 
-    let (item, _stream) = runtime.block_on(stream.into_future().compat()).unwrap();
+    let (item, _stream) = runtime.next_stream(stream);
     assert!(item.is_none());
 }
 
 #[fbinit::test]
 fn test_phases_part_encording(fb: FacebookInit) {
-    let phases_entries = stream::iter_ok(vec![
+    let phases_entries = stream::iter(vec![
         (
             HgChangesetId::from_bytes(b"bbbbbbbbbbbbbbbbbbbb").unwrap(),
             Phase::Public,
@@ -186,20 +171,17 @@ fn test_phases_part_encording(fb: FacebookInit) {
             HgChangesetId::from_bytes(b"aaaaaaaaaaaaaaaaaaaa").unwrap(),
             Phase::Draft,
         ),
-    ]);
+    ])
+    .map(anyhow::Ok);
 
     let cursor = Cursor::new(Vec::new());
     let mut builder = Bundle2EncodeBuilder::new(cursor);
-    builder.set_compressor_type(None);
 
     let ctx = CoreContext::test_mock(fb);
     let part = phases_part(ctx, phases_entries).unwrap();
     builder.add_part(part);
 
-    let mut cursor = Runtime::new()
-        .unwrap()
-        .block_on(builder.build().compat())
-        .unwrap();
+    let mut cursor = Runtime::new().unwrap().block_on(builder.build()).unwrap();
     cursor.set_position(0);
     let buf = cursor.fill_buf().unwrap();
 
@@ -212,25 +194,9 @@ fn test_phases_part_encording(fb: FacebookInit) {
 }
 
 #[test]
-fn test_unknown_part_bzip() {
-    unknown_part(Some(CompressorType::Bzip2(Bzip2Compression::Default)));
-}
-
-#[test]
-fn test_unknown_part_gzip() {
-    unknown_part(Some(CompressorType::Gzip(FlateCompression::best())));
-}
-
-#[test]
 fn test_unknown_part_uncompressed() {
-    unknown_part(None);
-}
-
-fn unknown_part(ct: Option<CompressorType>) {
     let cursor = Cursor::new(Vec::with_capacity(32 * 1024));
     let mut builder = Bundle2EncodeBuilder::new(cursor);
-
-    builder.set_compressor_type(ct);
 
     let unknown_part = PartEncodeBuilder::mandatory(PartHeaderType::Listkeys).unwrap();
 
@@ -238,21 +204,21 @@ fn unknown_part(ct: Option<CompressorType>) {
     let encode_fut = builder.build();
 
     let runtime = Runtime::new().unwrap();
-    let mut buf = runtime.block_on(encode_fut.compat()).unwrap();
+    let mut buf = runtime.block_on(encode_fut).unwrap();
     buf.set_position(0);
 
-    let logger = Logger::root(Discard, o!());
-    let stream = Bundle2Stream::new(logger, buf);
-    let parts = Vec::new();
+    let app_errors = Arc::new(Mutex::new(Vec::new()));
 
-    let decode_fut = stream
-        .map_err(|e| panic!("unexpected error: {:?}", e))
-        .forward(parts);
-    let (stream, parts) = runtime.block_on(decode_fut.compat()).unwrap();
+    let logger = Logger::root(Discard, o!());
+    let stream = bundle2_stream(logger, buf, Some(app_errors.clone()));
+
+    let parts: Vec<_> = runtime
+        .block_on(async move { stream.try_collect().await })
+        .unwrap();
 
     // Only the stream header should have been returned.
     let mut m_stream_params = HashMap::new();
-    m_stream_params.insert("compression".into(), get_compression_param(&ct).into());
+    m_stream_params.insert("compression".into(), "UN".into());
     let expected = StreamHeader {
         m_stream_params,
         a_stream_params: HashMap::new(),
@@ -267,8 +233,7 @@ fn unknown_part(ct: Option<CompressorType>) {
     assert!(parts.next().is_none());
 
     // Make sure the error was accumulated.
-    let stream = stream.into_inner();
-    let app_errors = stream.app_errors();
+    let app_errors = app_errors.lock().unwrap();
     assert_eq!(app_errors.len(), 1);
     assert_matches!(&app_errors[0],
                     ErrorKind::BundleUnknownPart(header)
@@ -281,13 +246,15 @@ fn parse_bundle(
     read_ops: PartialWithErrors<GenWouldBlock>,
 ) {
     let runtime = Runtime::new().unwrap();
+    let app_errors = Arc::new(Mutex::new(Vec::new()));
 
-    let bundle2_buf = MemBuf::from(Vec::from(input));
+    let bundle2_buf = Cursor::new(Vec::from(input));
     let partial_read = BufReader::new(PartialAsyncRead::new(bundle2_buf, read_ops));
-    let stream = parse_stream_start(&runtime, partial_read, compression).unwrap();
+    let stream =
+        parse_stream_start(&runtime, partial_read, compression, app_errors.clone()).unwrap();
 
     let (stream, cg2s) = {
-        let (res, stream) = runtime.old_next_stream(stream);
+        let (res, stream) = runtime.next_stream(stream);
         let mut header = PartHeaderBuilder::new(PartHeaderType::Changegroup, true).unwrap();
         header.add_mparam("version", "02").unwrap();
         header.add_aparam("nbchanges", "2").unwrap();
@@ -304,17 +271,17 @@ fn parse_bundle(
 
     verify_cg2(&runtime, cg2s);
 
-    let (res, stream) = runtime.old_next_stream(stream);
+    let (res, stream) = runtime.next_stream(stream);
     assert_matches!(res, Some(StreamEvent::Done(_)));
 
-    let (res, stream) = runtime.old_next_stream(stream);
+    let (res, stream) = runtime.next_stream(stream);
     assert!(res.is_none());
 
     // Make sure the stream is fused.
-    let (res, stream) = runtime.old_next_stream(stream);
+    let (res, _stream) = runtime.next_stream(stream);
     assert!(res.is_none());
 
-    assert!(stream.app_errors().is_empty());
+    assert!(app_errors.lock().unwrap().is_empty());
 }
 
 fn verify_cg2(runtime: &Runtime, stream: BoxStream<'static, Result<changegroup::Part>>) {
@@ -463,18 +430,19 @@ fn test_parse_wirepack() {
 
 fn parse_wirepack(read_ops: PartialWithErrors<GenWouldBlock>) {
     let runtime = Runtime::new().unwrap();
+    let app_errors = Arc::new(Mutex::new(Vec::new()));
 
     let cursor = Cursor::new(WIREPACK_BUNDLE2);
     let partial_read = BufReader::new(PartialAsyncRead::new(cursor, read_ops));
 
-    let stream = parse_stream_start(&runtime, partial_read, None).unwrap();
+    let stream = parse_stream_start(&runtime, partial_read, None, app_errors.clone()).unwrap();
 
     let stream = {
-        let (res, stream) = runtime.old_next_stream(stream);
+        let (res, stream) = runtime.next_stream(stream);
         match res {
             Some(StreamEvent::Next(Bundle2Item::Changegroup(_, cg2s))) => {
                 runtime
-                    .block_on(cg2s.compat().for_each(|_| Ok(())).compat())
+                    .block_on(cg2s.try_for_each(|_| async move { anyhow::Ok(()) }))
                     .unwrap();
             }
             bad => panic!("Unexpected Bundle2Item: {:?}", bad),
@@ -483,7 +451,7 @@ fn parse_wirepack(read_ops: PartialWithErrors<GenWouldBlock>) {
     };
 
     let (stream, wirepacks) = {
-        let (res, stream) = runtime.old_next_stream(stream);
+        let (res, stream) = runtime.next_stream(stream);
         // Header
         let mut header = PartHeaderBuilder::new(PartHeaderType::B2xTreegroup2, true).unwrap();
         header.add_mparam("version", "1").unwrap();
@@ -592,20 +560,21 @@ fn parse_wirepack(read_ops: PartialWithErrors<GenWouldBlock>) {
         "after the End part this stream should be empty"
     );
 
-    let (res, stream) = runtime.old_next_stream(stream);
+    let (res, _stream) = runtime.next_stream(stream);
     assert_matches!(res, Some(StreamEvent::Done(_)));
-    assert!(stream.app_errors().is_empty());
+    assert!(app_errors.lock().unwrap().is_empty());
 }
 
 fn path(bytes: &[u8]) -> NonRootMPath {
     NonRootMPath::new(bytes).unwrap()
 }
 
-fn parse_stream_start<R: AsyncRead + BufRead + 'static + Send>(
+fn parse_stream_start<R: AsyncBufRead + Send + Unpin + 'static>(
     runtime: &Runtime,
     reader: R,
     compression: Option<&str>,
-) -> Result<Bundle2Stream<R>> {
+    app_errors: Arc<Mutex<Vec<ErrorKind>>>,
+) -> Result<BoxStream<'static, Result<StreamEvent<Bundle2Item<'static>, Remainder<R>>>>> {
     let mut m_stream_params = HashMap::new();
     let a_stream_params = HashMap::new();
     if let Some(compression) = compression {
@@ -617,15 +586,14 @@ fn parse_stream_start<R: AsyncRead + BufRead + 'static + Send>(
     };
 
     let logger = Logger::root(Discard, o!());
-    let stream = Bundle2Stream::new(logger, reader);
-    match runtime.block_on(stream.into_future().compat()) {
-        Ok((item, stream)) => {
-            let stream_start = item.unwrap();
-            assert_eq!(stream_start.into_next().unwrap().unwrap_start(), expected);
-            Ok(stream)
-        }
-        Err((e, _)) => Err(e),
-    }
+    let mut stream = bundle2_stream(logger, reader, Some(app_errors));
+    let (item, stream) = runtime.block_on(async move {
+        let item = stream.try_next().await?;
+        anyhow::Ok((item, stream))
+    })?;
+    let stream_start = item.unwrap();
+    assert_eq!(stream_start.into_next().unwrap().unwrap_start(), expected);
+    Ok(stream)
 }
 
 trait RuntimeExt {
@@ -635,37 +603,20 @@ trait RuntimeExt {
     ) -> (Option<T>, BoxStream<'static, Result<T>>)
     where
         T: Send + 'static;
-
-    fn old_next_stream<S>(&self, stream: S) -> (Option<S::Item>, S)
-    where
-        S: OldStream + Send + 'static,
-        <S as OldStream>::Item: Send,
-        <S as OldStream>::Error: Debug + Send;
 }
 
 impl RuntimeExt for Runtime {
     fn next_stream<T>(
         &self,
-        stream: BoxStream<'static, Result<T>>,
+        mut stream: BoxStream<'static, Result<T>>,
     ) -> (Option<T>, BoxStream<'static, Result<T>>)
     where
         T: Send + 'static,
     {
-        let (item, stream) = self.old_next_stream(stream.compat());
-        (item, stream.into_inner())
-    }
-
-    fn old_next_stream<S>(&self, stream: S) -> (Option<S::Item>, S)
-    where
-        S: OldStream + Send + 'static,
-        <S as OldStream>::Item: Send,
-        <S as OldStream>::Error: Debug + Send,
-    {
-        match self.block_on(stream.into_future().compat()) {
-            Ok((res, stream)) => (res, stream),
-            Err((e, _)) => {
-                panic!("stream failed to produce the next value! {:?}", e);
-            }
-        }
+        self.block_on(async move {
+            let item = stream.try_next().await?;
+            anyhow::Ok((item, stream))
+        })
+        .unwrap()
     }
 }

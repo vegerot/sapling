@@ -1,11 +1,9 @@
-#debugruntest-compatible
   $ setconfig experimental.allowfilepeer=True
 
-#require symlink
-
-#testcases legacyupdater rustupdater
+#require symlink no-eden
 
   $ configure modern
+  $ setconfig workingcopy.rust-checkout=true
 
   $ newserver server1
   $ clone server1 client

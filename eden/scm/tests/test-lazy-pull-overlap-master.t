@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 This test checks the pull works when:
 
@@ -59,7 +61,6 @@ Create commits in the client repo. Make them overlap with the server-side master
   > |       |
   > master  $B
   > EOS
-   INFO dag::cache: skip flushing 112478962961147124edd43549aedd1a335e44bf-1 to IdMap set by DAG_SKIP_FLUSH_VERTEXES
    INFO dag::cache: skip flushing 112478962961147124edd43549aedd1a335e44bf-1 to IdMap set by DAG_SKIP_FLUSH_VERTEXES
 
 Pull:

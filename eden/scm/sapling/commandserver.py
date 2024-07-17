@@ -16,6 +16,8 @@ import errno
 import gc
 import os
 import random
+
+import selectors
 import signal
 import socket
 import struct
@@ -27,12 +29,6 @@ import bindings
 
 from . import encoding, error, pycompat, util
 from .i18n import _
-
-
-if sys.version_info.major == 3:
-    import selectors as selectors2
-else:
-    from .thirdparty import selectors2
 
 
 logfile = None
@@ -189,11 +185,8 @@ class server:
             # the ui here is really the repo ui so take its baseui so we don't
             # end up with its local configuration
             self.ui = repo.baseui
-            self.repo = repo
-            self.repoui = repo.ui
         else:
             self.ui = ui
-            self.repo = self.repoui = None
 
         self.cerr = channeledoutput(fout, b"e")
         self.cout = channeledoutput(fout, b"o")
@@ -240,41 +233,19 @@ class server:
     def runcommand(self):
         """reads a list of \0 terminated arguments, executes
         and writes the return code to the result channel"""
-        from . import dispatch  # avoid cycle
 
         args = self._readlist()
         pycompat.sysargv[1:] = args
 
-        # copy the uis so changes (e.g. --config or --verbose) don't
-        # persist between requests
-        copiedui = self.ui.copy()
-        uis = [copiedui]
-        if self.repo:
-            self.repo.baseui = copiedui
-            repoui = self.repoui.copy()
-            uis.append(repoui)
-            self.repo.ui = self.repo.dirstate._ui = repoui
-            self.repo.invalidateall()
-
-        for ui in uis:
-            ui.resetstate()
-            # any kind of interaction must use server channels, but chg may
-            # replace channels by fully functional tty files. so nontty is
-            # enforced only if cin is a channel.
-            if not hasattr(self.cin, "fileno"):
-                ui.setconfig("ui", "nontty", "true", "commandserver")
-
-        req = dispatch.request(
-            args[:], copiedui, self.repo, self.cin, self.cout, self.cerr
+        ret = bindings.commands.run(
+            [pycompat.sysargv[0]] + args, self.cin, self.cout, self.cerr
         )
-
-        ret = (dispatch.dispatch(req) or 0) & 255  # might return None
 
         # restore old cwd
         if "--cwd" in args:
             os.chdir(self.cwd)
 
-        self.cresult.write(struct.pack(">i", int(ret)))
+        self.cresult.write(struct.pack(">i", int(ret & 255)))
 
     def getencoding(self) -> None:
         """writes the current encoding to the result channel"""
@@ -393,6 +364,7 @@ def _initworkerprocess() -> None:
     # change random state otherwise forked request handlers would have a
     # same state inherited from parent.
     random.seed()
+    bindings.threading.trigger_rng_reseed()
 
 
 def _serverequest(ui, repo, conn, createcmdserver):
@@ -528,8 +500,8 @@ class unixforkingservice:
     def _mainloop(self):
         exiting = False
         h = self._servicehandler
-        selector = selectors2.DefaultSelector()
-        selector.register(self._sock, selectors2.EVENT_READ)
+        selector = selectors.DefaultSelector()
+        selector.register(self._sock, selectors.EVENT_READ)
         while True:
             if not exiting and h.shouldexit():
                 # clients can no longer connect() to the domain socket, so

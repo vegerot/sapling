@@ -7,6 +7,13 @@
 
 use std::sync::Arc;
 
+use ::commits::DagCommits;
+use ::commits::GraphNode;
+use ::commits::HgCommit;
+use ::commits::HgCommits;
+use ::commits::HybridCommits;
+use ::commits::MemHgCommits;
+use ::commits::RevlogCommits;
 use anyhow::format_err;
 use async_runtime::try_block_unless_interrupted as block_on;
 use cpython::*;
@@ -27,15 +34,6 @@ use dag::Dag;
 use dag::DagAlgorithm;
 use dag::Vertex;
 use dag::VertexListWithOptions;
-use hgcommits::DagCommits;
-use hgcommits::DoubleWriteCommits;
-use hgcommits::GitSegmentedCommits;
-use hgcommits::GraphNode;
-use hgcommits::HgCommit;
-use hgcommits::HgCommits;
-use hgcommits::HybridCommits;
-use hgcommits::MemHgCommits;
-use hgcommits::RevlogCommits;
 use minibytes::Bytes;
 use parking_lot::RwLock;
 use pyedenapi::PyClient;
@@ -183,7 +181,7 @@ py_class!(pub class commits |py| {
         // This function takes a 'out' parameter so it can work with pager
         // and output progressively.
         let inner = self.inner(py).read();
-        let mut out = cpython_ext::wrap_pyio(out);
+        let mut out = pyio::wrap_pyio(py, out);
         inner.explain_internals(&mut out).map_pyerr(py)?;
         Ok(PyNone)
     }
@@ -289,20 +287,12 @@ py_class!(pub class commits |py| {
         Ok(PyNone)
     }
 
-    /// Construct "double write" `commits` from both revlog and segmented
-    /// changelog.
-    @staticmethod
-    def opendoublewrite(revlogdir: &PyPath, segmentsdir: &PyPath, commitsdir: &PyPath) -> PyResult<Self> {
-        let inner = DoubleWriteCommits::new(revlogdir.as_path(), segmentsdir.as_path(), commitsdir.as_path()).map_pyerr(py)?;
-        Self::from_commits(py, inner)
-    }
-
     /// Construct `commits` from a revlog + segmented changelog + hgcommits + edenapi hybrid.
     ///
     /// This is similar to doublewrite backend, except that commit text fallback is edenapi,
     /// not revlog, despite the revlog might have the data.
     ///
-    /// If lazyhash is True, enable lazy commit hashes or EdenAPI.
+    /// If lazyhash is True, enable lazy commit hashes or SaplingRemoteAPI.
     ///
     /// If lazyhashdir is set, enable lazy commit hashes backed by the given segments dir
     /// (for testing).
@@ -323,16 +313,6 @@ py_class!(pub class commits |py| {
         } else if lazyhash {
             inner.enable_lazy_commit_hashes();
         }
-        Self::from_commits(py, inner)
-    }
-
-    /// Construct "git segmented" `commits` from a git repo and segmented
-    /// changelog.
-    @staticmethod
-    def opengitsegments(gitdir: &PyPath, segmentsdir: &PyPath, metalog: PyMetaLog) -> PyResult<Self> {
-        let inner = py.allow_threads(|| GitSegmentedCommits::new(gitdir.as_path(), segmentsdir.as_path())).map_pyerr(py)?;
-        let meta = metalog.metalog_rwlock(py);
-        inner.git_references_to_metalog(&mut meta.write()).map_pyerr(py)?;
         Self::from_commits(py, inner)
     }
 

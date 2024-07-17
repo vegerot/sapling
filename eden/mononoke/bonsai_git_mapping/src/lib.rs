@@ -13,12 +13,15 @@ use context::CoreContext;
 use mononoke_types::hash::GitSha1;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
+use mononoke_types::RepositoryId;
 use slog::warn;
 
+mod caching;
 mod errors;
 mod nodehash;
 mod sql;
 
+pub use crate::caching::CachingBonsaiGitMapping;
 pub use crate::errors::AddGitMappingErrorKind;
 pub use crate::nodehash::GitSha1Prefix;
 pub use crate::nodehash::GitSha1sResolvedFromPrefix;
@@ -43,10 +46,24 @@ pub enum BonsaisOrGitShas {
 }
 
 impl BonsaisOrGitShas {
+    pub fn from_object_ids(oids: impl Iterator<Item = impl AsRef<gix_hash::oid>>) -> Result<Self> {
+        let shas = oids
+            .map(|oid| GitSha1::from_object_id(oid.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(BonsaisOrGitShas::GitSha1(shas))
+    }
+
     pub fn is_empty(&self) -> bool {
         match self {
             BonsaisOrGitShas::Bonsai(v) => v.is_empty(),
             BonsaisOrGitShas::GitSha1(v) => v.is_empty(),
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        match self {
+            BonsaisOrGitShas::Bonsai(v) => v.len(),
+            BonsaisOrGitShas::GitSha1(v) => v.len(),
         }
     }
 }
@@ -78,6 +95,8 @@ impl From<Vec<GitSha1>> for BonsaisOrGitShas {
 #[facet::facet]
 #[async_trait]
 pub trait BonsaiGitMapping: Send + Sync {
+    fn repo_id(&self) -> RepositoryId;
+
     async fn add(
         &self,
         ctx: &CoreContext,
@@ -202,7 +221,7 @@ where
         }
     }
 
-    if hggit_source_extra == Some(b"git") {
+    if hggit_source_extra == Some("git".as_bytes()) {
         if let Some(convert_revision_extra) = convert_revision_extra {
             let git_sha1 = AsciiStr::from_ascii(convert_revision_extra)?;
             let git_sha1 = GitSha1::from_ascii_str(git_sha1)?;

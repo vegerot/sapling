@@ -70,7 +70,7 @@ describe('WatchForChanges', () => {
     expect(onChange).not.toHaveBeenCalled();
     jest.advanceTimersByTime(5.5 * ONE_MINUTE_MS);
     expect(onChange).toHaveBeenCalledTimes(1);
-    expect(onChange).toHaveBeenCalledWith('everything');
+    expect(onChange).toHaveBeenCalledWith('everything', undefined);
   });
 
   it('polls more often when the page is visible', () => {
@@ -209,6 +209,7 @@ describe('WatchForChanges', () => {
       unwatch: jest.fn(),
     } as unknown as Watchman;
     watch = new WatchForChanges(mockInfo, mockLogger, focusTracker, onChange, mockWatchman);
+    watch.setupWatchmanSubscriptions();
     expect(onChange).toHaveBeenCalledTimes(1);
     onChange.mockClear();
 
@@ -225,6 +226,8 @@ describe('WatchForChanges', () => {
     expect(onChange).toHaveBeenCalledTimes(1);
     jest.advanceTimersByTime(2.0 * ONE_MINUTE_MS); // 5 minutes after watchman change, a new poll occurred
     expect(onChange).toHaveBeenCalledTimes(2);
-    expect(onChange).toHaveBeenCalledWith('everything');
+    expect(onChange).toHaveBeenCalledWith('everything', undefined);
+
+    watch.dispose();
   });
 });

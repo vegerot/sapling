@@ -5,17 +5,25 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashMap;
+
 use anyhow::anyhow;
 use anyhow::Result;
 use borrowed::borrowed;
 use commit_graph_types::edges::ChangesetNode;
 use commit_graph_types::frontier::ChangesetFrontier;
+use commit_graph_types::frontier::ChangesetFrontierWithinDistance;
 use commit_graph_types::storage::Prefetch;
+use commit_graph_types::storage::PrefetchTarget;
 use context::CoreContext;
 use futures::future;
+use futures::stream;
 use futures::Future;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use mononoke_types::ChangesetId;
 use mononoke_types::Generation;
+use mononoke_types::FIRST_GENERATION;
 
 use crate::CommitGraph;
 
@@ -58,6 +66,44 @@ impl CommitGraph {
             .collect::<Result<_>>()
     }
 
+    /// Obtain a frontier of changesets from a list of changeset ids. This frontier
+    /// enforces that at any point all changesets inside of it will be reachable
+    /// from the original list of changesets by traversing no more than `distance`
+    /// edges.
+    pub(crate) async fn frontier_within_distance(
+        &self,
+        ctx: &CoreContext,
+        cs_ids: Vec<ChangesetId>,
+        distance: u64,
+    ) -> Result<ChangesetFrontierWithinDistance> {
+        let all_edges = self
+            .storage
+            .fetch_many_edges(
+                ctx,
+                &cs_ids,
+                Prefetch::Hint(PrefetchTarget::LinearAncestors {
+                    generation: FIRST_GENERATION,
+                    steps: distance + 1,
+                }),
+            )
+            .await?;
+
+        cs_ids
+            .into_iter()
+            .map(|cs_id| {
+                Ok((
+                    cs_id,
+                    all_edges
+                        .get(&cs_id)
+                        .ok_or_else(|| anyhow!("Missing changeset in commit graph: {}", cs_id))?
+                        .node
+                        .generation,
+                    distance,
+                ))
+            })
+            .collect::<Result<_>>()
+    }
+
     /// Pops the highest generation changesets of a frontier, returning any that
     /// satisify a property and lowering the rest of them to either their immediate
     /// parents or their lowest skip tree edge that doesn't satisfy the property.
@@ -85,19 +131,33 @@ impl CommitGraph {
                     .fetch_many_edges(ctx, &cs_ids, prefetch)
                     .await?;
 
+                let property_map = stream::iter(frontier_edges.clone())
+                    .map(|(cs_id, edges)| {
+                        borrowed!(property);
+                        async move { anyhow::Ok((cs_id, property(edges.node).await?)) }
+                    })
+                    .buffered(100)
+                    .try_collect::<HashMap<_, _>>()
+                    .await?;
+
                 let mut property_frontier: Vec<_> = Default::default();
 
-                for (_, edges) in frontier_edges {
-                    if property(edges.node).await? {
+                for (cs_id, edges) in frontier_edges {
+                    if *property_map.get(&cs_id).ok_or_else(|| {
+                        anyhow!(
+                            "Missing changeset id {} from property_map (in ancestors_frontier)",
+                            cs_id
+                        )
+                    })? {
                         property_frontier.push(edges.node.cs_id);
                     } else {
-                        match edges
+                        let lowest_ancestor = edges
                             .lowest_skip_tree_edge_with(|node| {
                                 borrowed!(property);
                                 async move { Ok(!property(node).await?) }
                             })
-                            .await?
-                        {
+                            .await?;
+                        match lowest_ancestor {
                             Some(ancestor) => {
                                 frontier
                                     .entry(ancestor.generation)
@@ -105,7 +165,7 @@ impl CommitGraph {
                                     .insert(ancestor.cs_id);
                             }
                             None => {
-                                for parent in edges.parents {
+                                for parent in &edges.parents {
                                     frontier
                                         .entry(parent.generation)
                                         .or_default()
@@ -143,7 +203,15 @@ impl CommitGraph {
                 ctx,
                 frontier,
                 move |node| future::ready(Ok(node.generation < target_generation)),
-                Prefetch::for_skip_tree_traversal(target_generation),
+                if justknobs::eval(
+                    "scm/mononoke:commit_graph_use_skip_tree_exact_prefetching",
+                    None,
+                    None,
+                )? {
+                    Prefetch::for_exact_skip_tree_traversal(target_generation)
+                } else {
+                    Prefetch::for_skip_tree_traversal(target_generation)
+                },
             )
             .await?;
         }
@@ -177,5 +245,39 @@ impl CommitGraph {
             }
         }
         Ok(())
+    }
+
+    /// Minimize a frontier by removing all changesets that are ancestors of other changesets
+    /// in the frontier.
+    pub async fn minimize_frontier(
+        &self,
+        ctx: &CoreContext,
+        frontier: Vec<ChangesetId>,
+    ) -> Result<Vec<ChangesetId>> {
+        // Process the frontier generation by generation starting from the highest,
+        // removing changesets that are ancestors of a higher generation changeset.
+
+        let mut processed_frontier = ChangesetFrontier::new();
+        let mut remaining_frontier = self.frontier(ctx, frontier).await?;
+        let mut minimal_frontier = vec![];
+
+        while let Some((generation, cs_ids)) = remaining_frontier.pop_last() {
+            // Lower the frontier of the previously processed generations to the current
+            // generation. Any changeset that's contained in this frontier is an ancestor
+            // of a higher generation changeset and should be removed.
+            self.lower_frontier(ctx, &mut processed_frontier, generation)
+                .await?;
+
+            let new_cs_ids = cs_ids
+                .iter()
+                .copied()
+                .filter(|cs_id| !processed_frontier.highest_generation_contains(*cs_id, generation))
+                .collect::<Vec<_>>();
+
+            minimal_frontier.extend(new_cs_ids.clone());
+            processed_frontier.extend(new_cs_ids.into_iter().map(|cs_id| (cs_id, generation)))
+        }
+
+        Ok(minimal_frontier)
     }
 }

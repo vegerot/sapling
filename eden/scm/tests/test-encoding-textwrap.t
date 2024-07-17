@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
   $ eagerepo
 Test text wrapping for multibyte characters
 

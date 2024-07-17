@@ -1,5 +1,4 @@
-#require symlink
-#debugruntest-compatible
+#require symlink no-eden
 
   $ eagerepo
   $ hg init repo

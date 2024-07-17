@@ -1,6 +1,5 @@
-#debugruntest-compatible
 
-#require serve tar unzip
+#require serve tar unzip no-eden
 
   $ setconfig devel.segmented-changelog-rev-compat=true
   $ enable share

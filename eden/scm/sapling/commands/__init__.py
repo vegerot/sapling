@@ -176,6 +176,7 @@ globalopts = cmdutil._typedflags(
             _("when to paginate (boolean, always, auto, or never)"),
             _("TYPE"),
         ),
+        ("", "reason", [], _("why this runs, usually set by automation (ADVANCED)")),
     ]
 )
 
@@ -493,6 +494,7 @@ def annotate(ui, repo, *pats, **opts):
     for abs in ctx.walk(m):
         fctx = ctx[abs]
         rootfm.startitem()
+        rootfm.context(ctx=ctx)
         rootfm.data(abspath=abs, path=m.rel(abs))
         if not opts.get("text") and fctx.isbinary():
             rootfm.plain(_("%s: binary file\n") % ((pats and m.rel(abs)) or abs))
@@ -784,13 +786,11 @@ def _dobackout(ui, repo, node=None, rev=None, **opts):
         dsguard = dirstateguard.dirstateguard(repo, "backout")
         try:
             ui.setconfig("ui", "forcemerge", opts.get("tool", ""), "backout")
-            stats = mergemod.update(
-                repo, parent, branchmerge=True, force=True, ancestor=node
-            )
+            stats = mergemod.merge(repo, parent, force=True, ancestor=node)
             repo.setparents(op1, op2)
 
             # Ensure reverse-renames are preserved during the backout. In theory
-            # merge.update() should handle this, but it's extremely complex, so
+            # merge.merge() should handle this, but it's extremely complex, so
             # let's just double check it here.
             _replayrenames(repo, node)
 
@@ -807,7 +807,7 @@ def _dobackout(ui, repo, node=None, rev=None, **opts):
     else:
         hg.clean(repo, node, show_stats=False)
         repo.dirstate.setbranch(branch)
-        cmdutil.revert(ui, repo, rctx, repo.dirstate.parents(), forcecopytracing=True)
+        cmdutil.revert(ui, repo, rctx, repo.dirstate.parents())
         # Ensure reverse-renames are preserved during the backout. In theory
         # cmdutil.revert() should handle this, but it's extremely complex, so
         # let's just double check it here.
@@ -1211,7 +1211,7 @@ def _update_state(repo, state, rev, good, bad, skip):
 
 
 @command(
-    "bookmark|bo|book",
+    "bookmark|bo|book|bookmarks",
     [
         ("f", "force", False, _("force")),
         ("r", "rev", "", _("revision for bookmark action"), _("REV")),
@@ -1222,7 +1222,7 @@ def _update_state(repo, state, rev, good, bad, skip):
     ]
     + formatteropts,
     _("[OPTION]... [NAME]..."),
-    legacyaliases=["bookmarks", "boo", "bookm", "bookma", "bookmar"],
+    legacyaliases=["boo", "bookm", "bookma", "bookmar"],
 )
 def bookmark(ui, repo, *names, **opts):
     """create a new bookmark or list existing bookmarks
@@ -1731,7 +1731,7 @@ def _docommit(ui, repo, *pats, **opts):
         # commit(), 1 if nothing changed or None on success.
         return 1 if ret == 0 else ret
 
-    cmdutil.checkunfinished(repo, commit=True)
+    cmdutil.checkunfinished(repo, op="commit")
 
     branch = repo[None].branch()
 
@@ -1821,6 +1821,12 @@ def _docommit(ui, repo, *pats, **opts):
             False,
             _("edit system config, opening in editor if no args given (DEPRECATED)"),
         ),
+        (
+            "d",
+            "delete",
+            False,
+            _("delete specified config items"),
+        ),
     ]
     + formatteropts,
     optionalrepo=True,
@@ -1831,6 +1837,9 @@ def config(ui, repo, *values, **opts):
     if any(opts.get(flag) for flag in {"edit", "user", "local", "system", "global"}):
         editconfig(ui, repo, *values, **opts)
         return
+
+    if opts.get("delete"):
+        raise error.Abort(_("--delete requires one of --user, --local or --system"))
 
     ui.pager("config")
     fm = ui.formatter("config", opts)
@@ -1923,35 +1932,59 @@ def editconfig(ui, repo, *values, **opts):
         return
 
     section_name = value = None
+    invalid_arg = None
     to_edit = []
+    is_delete = opts.get("delete")
 
     for arg in values:
         if section_name is None:
             if "=" in arg:
+                if is_delete:
+                    invalid_arg = arg
+                    break
+
                 section_name, value = arg.split("=", 1)
             else:
                 section_name = arg
         else:
             value = arg
-        if value is None:
+
+        # For whitespace separated pairs like "sl config --local foo.bar baz",
+        # we skip to the next iteration to get config value "baz".
+        if value is None and not is_delete:
             continue
+
         try:
             section, name = section_name.split(".", 1)
         except ValueError:
             # ex. not enough values to unpack
-            raise error.Abort(
-                _("invalid argument: %r") % section_name,
-                hint=("try section.name=value"),
-            )
+            break
+
         to_edit.append((section, name, value))
         section_name = value = None
 
-    if section_name is not None:
-        raise error.Abort(
-            _("missing config value for %r") % section_name,
-        )
+    if invalid_arg is None:
+        # If we are left with a live section_name, user failed to specify final
+        # (whitespace separated) value.
+        invalid_arg = section_name
+
+    if invalid_arg is not None:
+        if is_delete:
+            raise error.Abort(
+                _("invalid config deletion: %r") % invalid_arg,
+                hint=("try section.name"),
+            )
+        else:
+            raise error.Abort(
+                _("invalid config edit: %r") % invalid_arg,
+                hint=("try section.name=value"),
+            )
 
     for section, name, value in to_edit:
+        if value is None:
+            ui.note(_("deleting %s.%s from %s\n") % (section, name, targetpath))
+        else:
+            ui.note(_("setting %s.%s=%s in %s\n") % (section, name, value, targetpath))
         rcutil.editconfig(ui, targetpath, section, name, value)
 
     ui.status(_("updated config in %s\n") % targetpath)
@@ -1987,7 +2020,9 @@ def continuecmd(ui, repo):
 @command(
     "copy|cp",
     [
-        ("A", "after", None, _("record a copy that has already occurred")),
+        ("", "mark", None, _("mark as a copy without actual copying")),
+        ("", "amend", None, _("amend the current commit to mark a copy")),
+        ("A", "after", None, _("alias to --mark (DEPRECATED)")),
         ("f", "force", None, _("forcibly copy over an existing managed file")),
     ]
     + walkopts
@@ -2003,7 +2038,7 @@ def copy(ui, repo, *pats, **opts):
     the source must be a single file.
 
     By default, this command copies the contents of files as they
-    exist in the working directory. If invoked with ``-A/--after``, the
+    exist in the working directory. If invoked with ``--mark``, the
     operation is recorded, but no copying is performed.
 
     This command takes effect with the next commit. To undo a copy
@@ -2354,7 +2389,10 @@ def files(ui, repo, *pats, **opts):
     fmt = "%s" + end
 
     m = scmutil.match(ctx, pats, opts)
-    if isinstance(ctx, context.workingctx) and hasattr(repo, "sparsematch"):
+    shouldsparsematch = hasattr(repo, "sparsematch") and (
+        "eden" not in repo.requirements or "edensparse" in repo.requirements
+    )
+    if isinstance(ctx, context.workingctx) and shouldsparsematch:
         m = matchmod.intersectmatchers(m, repo.sparsematch())
 
     ui.pager("files")
@@ -2535,6 +2573,7 @@ def _dograft(ui, repo, *revs, **opts):
         if opts.get("continue"):
             cont = True
         if opts.get("abort"):
+            repo.localvfs.tryunlink("graftstate")
             return update(ui, repo, node=".", clean=True)
     else:
         cmdutil.checkunfinished(repo)
@@ -4353,6 +4392,20 @@ def merge(ui, repo, node=None, **opts):
     if not node:
         node = repo[destutil.destmerge(repo)].node()
 
+    max_distance = ui.configint("merge", "max-distance")
+    if max_distance:
+        # merge distance is computed as the number of commit between the common ancestors and the merge
+        distance = repo.dageval(
+            lambda: len(
+                range(children(gcaall(dot() + lookup(node))), dot() + lookup(node))
+            )
+        )
+        if distance > max_distance:
+            raise error.Abort(
+                _("merging distant ancestors is not supported for this repository"),
+                hint=_("use rebase instead"),
+            )
+
     if opts.get("preview"):
         # find nodes that are ancestors of p2 but not of p1
         p1 = repo.lookup(".")
@@ -4625,7 +4678,7 @@ def postincoming(ui, repo, modheads, optupdate, checkout, brev):
     """
     if optupdate:
         try:
-            return hg.updatetotally(ui, repo, checkout, brev)
+            return hg.updatetotally(ui, repo, checkout or repo["tip"].node(), brev)
         except error.UpdateAbort as inst:
             msg = _("not updating: %s") % str(inst)
             hint = inst.hint
@@ -4684,11 +4737,6 @@ def pull(ui, repo, source="default", **opts):
     """
     if ui.configbool("pull", "automigrate"):
         repo.automigratestart()
-
-    if ui.configbool("commands", "update.requiredest") and opts.get("update"):
-        msg = _("update destination required by configuration")
-        hint = _("use @prog@ pull followed by @prog@ goto DEST")
-        raise error.Abort(msg, hint=hint)
 
     # Allows us to announce larger changes affecting all the users by displaying
     # config-driven hint on pull.
@@ -5133,7 +5181,8 @@ def recover(ui, repo):
 @command(
     "remove|rm",
     [
-        ("A", "after", None, _("record delete for missing files")),
+        ("", "mark", None, _("mark as a deletion for already missing files")),
+        ("A", "after", None, _("alias to --mark (DEPRECATED)")),
         ("f", "force", None, _("forget added files, delete modified files")),
     ]
     + walkopts,
@@ -5153,7 +5202,7 @@ def remove(ui, repo, *pats, **opts):
 
     .. container:: verbose
 
-      ``-A/--after`` can be used to remove only files that have already
+      ``--mark`` can be used to remove only files that have already
       been deleted, ``-f/--force`` can be used to force deletion, and ``-Af``
       can be used to remove files from the next revision without
       deleting them from the working directory.
@@ -5182,18 +5231,21 @@ def remove(ui, repo, *pats, **opts):
     Returns 0 on success, 1 if any warnings encountered.
     """
 
-    after, force = opts.get("after"), opts.get("force")
-    if not pats and not after:
+    mark = opts.get("mark") or opts.get("after")
+    force = opts.get("force")
+    if not pats and not mark:
         raise error.Abort(_("no files specified"))
 
     m = scmutil.match(repo[None], pats, opts)
-    return cmdutil.remove(ui, repo, m, "", after, force)
+    return cmdutil.remove(ui, repo, m, "", mark, force)
 
 
 @command(
     "rename|move|mv",
     [
-        ("A", "after", None, _("record a rename that has already occurred")),
+        ("", "mark", None, _("mark a rename that has already occurred")),
+        ("", "amend", None, _("amend the current commit to mark a rename")),
+        ("A", "after", None, _("alias to --mark (DEPRECATED)")),
         ("f", "force", None, _("forcibly copy over an existing managed file")),
     ]
     + walkopts
@@ -5209,7 +5261,7 @@ def rename(ui, repo, *pats, **opts):
     file, there can only be one source.
 
     By default, this command copies the contents of files as they
-    exist in the working directory. If invoked with -A/--after, the
+    exist in the working directory. If invoked with --mark, the
     operation is recorded, but no copying is performed.
 
     This command takes effect at the next commit. To undo a rename
@@ -6298,7 +6350,7 @@ def _ensurebaserev(ui, repo, fname):
 
 
 @command(
-    "goto|go",
+    "goto|go||up|update|co|checkout",
     [
         ("C", "clean", None, _("discard uncommitted changes (no backup)")),
         ("c", "check", None, _("require clean working copy")),
@@ -6310,13 +6362,9 @@ def _ensurebaserev(ui, repo, fname):
     ]
     + mergetoolopts,
     legacyaliases=[
-        "update",
-        "up",
         "upd",
         "upda",
         "updat",
-        "checkout",
-        "co",
         "che",
         "chec",
         "check",
@@ -6338,19 +6386,26 @@ def update(
     inactive=None,
     **opts,
 ):
+
+    ui.log("checkout_info", checkout_mode="python")
+
+    def abort_on_unresolved_conflicts():
+        if repo.localvfs.exists("updatemergestate"):
+            ms = mergemod.mergestate.read(repo)
+            if list(ms.unresolved()):
+                raise error.Abort(
+                    _("outstanding merge conflicts"),
+                    hint=_(
+                        "use '@prog@ resolve --list' to list, '@prog@ resolve --mark FILE' to mark resolved"
+                    ),
+                )
+            repo.localvfs.tryunlink("updatemergestate")
+            ms.reset()
+
     if opts.get("continue"):
         with repo.wlock():
             if repo.localvfs.exists("updatemergestate"):
-                ms = mergemod.mergestate.read(repo)
-                if list(ms.unresolved()):
-                    raise error.Abort(
-                        _("outstanding merge conflicts"),
-                        hint=_(
-                            "use '@prog@ resolve --list' to list, '@prog@ resolve --mark FILE' to mark resolved"
-                        ),
-                    )
-                repo.localvfs.unlink("updatemergestate")
-                ms.reset()
+                abort_on_unresolved_conflicts()
                 return 0
             elif repo.localvfs.exists("updatestate") and (
                 repo.ui.configbool("experimental", "nativecheckout")
@@ -6364,17 +6419,13 @@ def update(
                 rev = repo.localvfs.readutf8("updatestate")
                 repo.ui.warn(_("continuing checkout to '%s'\n") % rev)
             else:
-                raise error.Abort(_("not in an interrupted update --merge state"))
+                raise error.Abort(_("not in an interrupted update state"))
+    else:
+        # proactively clean this up if we aren't continuing
+        repo.localvfs.tryunlink("updatestate")
 
     if rev is not None and rev != "" and node is not None:
         raise error.Abort(_("please specify just one revision"))
-
-    if ui.configbool("commands", "update.requiredest"):
-        if not node and not rev and not date:
-            raise error.Abort(
-                _("you must specify a destination"),
-                hint=_('for example: @prog@ goto ".::"'),
-            )
 
     if rev is None or rev == "":
         rev = node
@@ -6387,21 +6438,17 @@ def update(
             _("can only specify one of -C/--clean, -c/--check, " "or -m/--merge")
         )
 
-    # If nothing was passed, the default behavior (moving to branch tip)
-    # can be disabled and replaced with an error.
-    # internal config: ui.disallowemptyupdate
-    if ui.configbool("ui", "disallowemptyupdate"):
-        if node is None and rev is None and not date:
-            raise error.Abort(
-                _(
-                    "You must specify a destination to update to,"
-                    + ' for example "@prog@ goto main".'
-                ),
-                hint=_(
-                    "If you're trying to move a bookmark forward, try "
-                    + '"@prog@ rebase -d <destination>".'
-                ),
-            )
+    if node is None and rev is None and not date:
+        raise error.Abort(
+            _(
+                "You must specify a destination to update to,"
+                + ' for example "@prog@ goto main".'
+            ),
+            hint=_(
+                "If you're trying to move a bookmark forward, try "
+                + '"@prog@ rebase -d <destination>".'
+            ),
+        )
 
     # Suggest `hg prev` as an alternative to 'hg update .^'.
     # internal config: ui.suggesthgprev
@@ -6415,7 +6462,17 @@ def update(
         updatecheck = "none"
 
     with repo.wlock():
-        cmdutil.clearunfinished(repo)
+        # Don't delete the "updatemergestate" marker if we have conflicts.
+        if clean:
+            repo.localvfs.tryunlink("updatemergestate")
+        else:
+            abort_on_unresolved_conflicts()
+
+        # Either we consumed this with "--continue" or we ignoring it with a
+        # different destination.
+        repo.localvfs.tryunlink("updatestate")
+
+        cmdutil.checkunfinished(repo, op="goto_clean" if clean else None)
 
         if date:
             rev = hex(cmdutil.finddate(ui, repo, date))

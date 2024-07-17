@@ -19,6 +19,7 @@
 mod macros;
 
 pub mod base16;
+mod change_detect;
 pub mod config;
 mod errors;
 pub mod index;
@@ -29,6 +30,9 @@ mod page_out;
 mod repair;
 pub mod rotate;
 pub mod utils;
+
+#[cfg(all(unix, feature = "sigbus-handler"))]
+mod sigbus;
 
 pub use errors::Error;
 pub use errors::Result;

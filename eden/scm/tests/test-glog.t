@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Copyright (c) Mercurial Contributors.
 #
@@ -115,7 +117,7 @@
   > EOF
 
   $ echo '[extensions]' >> $HGRCPATH
-  $ echo "printrevset=$TESTTMP/printrevset.py" >> $HGRCPATH
+  $ printf "%s\n" "printrevset=$TESTTMP/printrevset.py" >> $HGRCPATH
 
   $ hg init repo
   $ cd repo

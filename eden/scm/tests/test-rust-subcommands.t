@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This software may be used and distributed according to the terms of the
@@ -11,16 +13,12 @@
   ["a", "b"]
   $ hg --cwd . debug args a b
   ["a", "b"]
-  $ hg --cwd . debug --args a b
-  ["a", "b"]
 
 # Aliases
 
   $ hg --config 'alias.foo-bar=debug-args alias-foo-bar' foo bar 1 2
   ["alias-foo-bar", "1", "2"]
   $ hg --config 'alias.foo-bar=debug-args alias-foo-bar' foo-bar 1 2
-  ["alias-foo-bar", "1", "2"]
-  $ hg --config 'alias.foo-bar=debug-args alias-foo-bar' foo --bar 1 2
   ["alias-foo-bar", "1", "2"]
 
 # If both "foo-bar" and "foo" are defined, then "foo bar" does not resolve to
@@ -32,7 +30,5 @@
 
   $ hg --config 'alias.foo-bar=debug-args alias-foo-bar' --config 'alias.foo=debug-args alias-foo' foo bar
   ["alias-foo", "bar"]
-  $ hg --config 'alias.foo-bar=debug-args alias-foo-bar' --config 'alias.foo=debug-args alias-foo' foo --bar
-  ["alias-foo-bar"]
   $ hg --config 'alias.foo-bar=debug-args alias-foo-bar' --config 'alias.foo=debug-args alias-foo' foo-bar
   ["alias-foo-bar"]

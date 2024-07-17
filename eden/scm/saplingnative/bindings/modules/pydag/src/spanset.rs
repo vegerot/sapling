@@ -11,6 +11,7 @@ use cpython::*;
 use dag::Id;
 use dag::IdSet;
 use dag::IdSetIter;
+use types::hgid::WDIR_REV;
 
 /// A wrapper around [`IdSet`] with Python integration.
 ///
@@ -161,8 +162,12 @@ impl<'a> FromPyObject<'a> for Spans {
                 // Skip "None" (wdir?) automatically.
                 Ok(None) => None,
                 Ok(Some(i)) => {
-                    // Skip "nullrev" automatically.
-                    if i >= 0 { Some(Ok(Id(i as u64))) } else { None }
+                    // Skip "nullrev" and "wdirrev" automatically.
+                    if i >= 0 && i != WDIR_REV {
+                        Some(Ok(Id(i as u64)))
+                    } else {
+                        None
+                    }
                 }
                 Err(e) => Some(Err(e)),
             })

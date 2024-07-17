@@ -21,6 +21,8 @@ use bulkops::ChangesetBulkFetcher;
 use bulkops::Direction;
 use bulkops::MAX_FETCH_STEP;
 use changesets::ChangesetsArc;
+use clientinfo::ClientEntryPoint;
+use clientinfo::ClientInfo;
 use cloned::cloned;
 use context::CoreContext;
 use derived_data_manager::BonsaiDerivable as NewBonsaiDerivable;
@@ -83,9 +85,6 @@ fn roots_for_chunk(
                 NodeType::DeletedManifestV2Mapping => Node::DeletedManifestV2Mapping(id),
                 NodeType::FsnodeMapping => Node::FsnodeMapping(id),
                 NodeType::SkeletonManifestMapping => Node::SkeletonManifestMapping(id),
-                NodeType::BasenameSuffixSkeletonManifestMapping => {
-                    Node::BasenameSuffixSkeletonManifestMapping(id)
-                }
                 NodeType::UnodeMapping => Node::UnodeMapping(id),
                 _ => bail!("Unsupported root type for chunking {:?}", r),
             };
@@ -226,8 +225,8 @@ where
     let mut state_start = Timestamp::now();
 
     let with_hg = repo_params.include_node_types.iter().any(|n| {
-        let n = n.derived_data_name();
-        n == Some(MappedHgChangesetId::NAME) || n == Some(FilenodesOnlyPublic::NAME)
+        let n = n.derived_data_type();
+        n == Some(MappedHgChangesetId::VARIANT) || n == Some(FilenodesOnlyPublic::VARIANT)
     });
 
     // At every iteration, check if cancellation is requested by the caller.
@@ -235,7 +234,11 @@ where
         cloned!(job_params, tail_params, type_params, make_run);
         let tail_secs = tail_params.tail_secs;
         // Each loop get new ctx and thus session id so we can distinguish runs
-        let ctx = CoreContext::new_with_logger(fb, repo_params.logger.clone());
+        let ctx = CoreContext::new_with_logger_and_client_info(
+            fb,
+            repo_params.logger.clone(),
+            ClientInfo::default_with_entry_point(ClientEntryPoint::Walker),
+        );
         let session_text = ctx.session().metadata().session_id().to_string();
         if !job_params.quiet {
             info!(

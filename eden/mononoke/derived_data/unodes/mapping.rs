@@ -24,7 +24,7 @@ use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
 use derived_data_manager::DerivationContext;
-use derived_data_service_if::types as thrift;
+use derived_data_service_if as thrift;
 use futures::future::try_join_all;
 use futures::TryFutureExt;
 use metaconfig_types::UnodeVersion;
@@ -90,6 +90,7 @@ impl BonsaiDerivable for RootUnodeManifestId {
     const VARIANT: DerivableType = DerivableType::Unodes;
 
     type Dependencies = dependencies![];
+    type PredecessorDependencies = dependencies![];
 
     async fn derive_single(
         ctx: &CoreContext,
@@ -116,7 +117,6 @@ impl BonsaiDerivable for RootUnodeManifestId {
         ctx: &CoreContext,
         derivation_ctx: &DerivationContext,
         bonsais: Vec<BonsaiChangeset>,
-        _gap_size: Option<usize>,
     ) -> Result<HashMap<ChangesetId, Self>> {
         if bonsais.is_empty() {
             return Ok(HashMap::new());
@@ -168,7 +168,7 @@ impl BonsaiDerivable for RootUnodeManifestId {
                         .map(|item| (item.cs_id, item.per_commit_file_changes))
                         .collect(),
                     derived_parents
-                        .get(0)
+                        .first()
                         .map(|mf_id| *mf_id.manifest_unode_id()),
                 )
                 .await
@@ -247,8 +247,8 @@ mod test {
     use bookmarks::BookmarkKey;
     use borrowed::borrowed;
     use cloned::cloned;
+    use commit_graph::CommitGraphRef;
     use derived_data::BonsaiDerived;
-    use derived_data_manager::BatchDeriveOptions;
     use derived_data_test_utils::iterate_all_manifest_entries;
     use fbinit::FacebookInit;
     use fixtures::BranchEven;
@@ -262,9 +262,7 @@ mod test {
     use fixtures::TestRepoFixture;
     use fixtures::UnsharedMergeEven;
     use fixtures::UnsharedMergeUneven;
-    use futures::compat::Stream01CompatExt;
     use futures::Future;
-    use futures::Stream;
     use futures::TryStreamExt;
     use manifest::Entry;
     use mercurial_derivation::DeriveHgChangeset;
@@ -272,7 +270,6 @@ mod test {
     use mercurial_types::HgManifestId;
     use mononoke_types::ChangesetId;
     use repo_derived_data::RepoDerivedDataRef;
-    use revset::AncestorsNodeStream;
     use tests_utils::CreateCommitContext;
 
     use super::*;
@@ -282,7 +279,7 @@ mod test {
         ctx: &CoreContext,
         repo: &TestRepo,
         hg_cs_id: HgChangesetId,
-    ) -> Result<HgManifestId, Error> {
+    ) -> Result<HgManifestId> {
         Ok(hg_cs_id.load(ctx, &repo.repo_blobstore).await?.manifestid())
     }
 
@@ -291,7 +288,7 @@ mod test {
         repo: &TestRepo,
         bcs_id: ChangesetId,
         hg_cs_id: HgChangesetId,
-    ) -> Result<RootUnodeManifestId, Error> {
+    ) -> Result<RootUnodeManifestId> {
         let (unode_entries, mf_unode_id) = async move {
             let mf_unode_id = RootUnodeManifestId::derive(ctx, repo, bcs_id)
                 .await?
@@ -302,7 +299,7 @@ mod test {
                 .try_collect::<Vec<_>>()
                 .await?;
             paths.sort();
-            Result::<_, Error>::Ok((paths, RootUnodeManifestId(mf_unode_id)))
+            anyhow::Ok((paths, RootUnodeManifestId(mf_unode_id)))
         }
         .await?;
 
@@ -313,7 +310,7 @@ mod test {
                 .try_collect::<Vec<_>>()
                 .await?;
             paths.sort();
-            Result::<_, Error>::Ok(paths)
+            anyhow::Ok(paths)
         };
 
         let filenode_entries = filenode_entries.await?;
@@ -322,26 +319,30 @@ mod test {
         Ok(mf_unode_id)
     }
 
-    fn all_commits_descendants_to_ancestors(
+    async fn all_commits_descendants_to_ancestors(
         ctx: CoreContext,
         repo: TestRepo,
-    ) -> impl Stream<Item = Result<(ChangesetId, HgChangesetId), Error>> {
+    ) -> Result<Vec<(ChangesetId, HgChangesetId, RootUnodeManifestId)>> {
         let master_book = BookmarkKey::new("master").unwrap();
-        repo.bookmarks
+        let bcs_id = repo
+            .bookmarks
             .get(ctx.clone(), &master_book)
-            .map_ok(move |maybe_bcs_id| {
-                let bcs_id = maybe_bcs_id.unwrap();
-                AncestorsNodeStream::new(ctx.clone(), &repo.changeset_fetcher, bcs_id.clone())
-                    .compat()
-                    .and_then(move |new_bcs_id| {
-                        cloned!(ctx, repo);
-                        async move {
-                            let hg_cs_id = repo.derive_hg_changeset(&ctx, new_bcs_id).await?;
-                            Result::<_, Error>::Ok((new_bcs_id, hg_cs_id))
-                        }
-                    })
+            .await?
+            .unwrap();
+
+        repo.commit_graph()
+            .ancestors_difference_stream(&ctx, vec![bcs_id], vec![])
+            .await?
+            .and_then(move |new_bcs_id| {
+                cloned!(ctx, repo);
+                async move {
+                    let hg_cs_id = repo.derive_hg_changeset(&ctx, new_bcs_id).await?;
+                    let unode_id = verify_unode(&ctx, &repo, new_bcs_id, hg_cs_id).await?;
+                    Ok((new_bcs_id, hg_cs_id, unode_id))
+                }
             })
-            .try_flatten_stream()
+            .try_collect()
+            .await
     }
 
     async fn verify_repo<F, Fut>(fb: FacebookInit, repo_func: F)
@@ -355,17 +356,11 @@ mod test {
         borrowed!(ctx, repo);
 
         let commits_desc_to_anc = all_commits_descendants_to_ancestors(ctx.clone(), repo.clone())
-            .and_then(move |(bcs_id, hg_cs_id)| async move {
-                let unode_id = verify_unode(ctx, repo, bcs_id, hg_cs_id).await?;
-                Ok((bcs_id, hg_cs_id, unode_id))
-            })
-            .try_collect::<Vec<_>>()
             .await
             .unwrap();
 
         // Recreate repo from scratch and derive everything again
         let repo = repo_func().await;
-        let options = BatchDeriveOptions::Parallel { gap_size: None };
         let csids = commits_desc_to_anc
             .clone()
             .into_iter()
@@ -375,7 +370,7 @@ mod test {
         let manager = repo.repo_derived_data().manager();
 
         manager
-            .derive_exactly_batch::<RootUnodeManifestId>(ctx, csids.clone(), options, None)
+            .derive_exactly_batch::<RootUnodeManifestId>(ctx, csids.clone(), None)
             .await
             .unwrap();
         let batch_derived = manager

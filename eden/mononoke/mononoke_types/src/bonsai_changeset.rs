@@ -73,7 +73,7 @@ impl Default for BonsaiChangesetMut {
 
 impl BonsaiChangesetMut {
     /// Create from a thrift `BonsaiChangeset`.
-    fn from_thrift(tc: thrift::BonsaiChangeset) -> Result<Self> {
+    fn from_thrift(tc: thrift::bonsai::BonsaiChangeset) -> Result<Self> {
         Ok(BonsaiChangesetMut {
             parents: tc
                 .parents
@@ -116,8 +116,8 @@ impl BonsaiChangesetMut {
     }
 
     /// Convert into a thrift `BonsaiChangeset`.
-    fn into_thrift(self) -> thrift::BonsaiChangeset {
-        thrift::BonsaiChangeset {
+    fn into_thrift(self) -> thrift::bonsai::BonsaiChangeset {
+        thrift::bonsai::BonsaiChangeset {
             parents: self
                 .parents
                 .into_iter()
@@ -132,7 +132,7 @@ impl BonsaiChangesetMut {
             git_extra_headers: self.git_extra_headers.map(|extra| {
                 extra
                     .into_iter()
-                    .map(|(k, v)| (thrift::small_binary(k), v))
+                    .map(|(k, v)| (thrift::data::SmallBinary(k), v))
                     .collect()
             }),
             file_changes: self
@@ -140,7 +140,7 @@ impl BonsaiChangesetMut {
                 .into_iter()
                 .map(|(f, c)| (f.into_thrift(), c.into_thrift()))
                 .collect(),
-            snapshot_state: self.is_snapshot.then_some(thrift::SnapshotState {}),
+            snapshot_state: self.is_snapshot.then_some(thrift::bonsai::SnapshotState {}),
             git_tree_hash: self.git_tree_hash.map(|hash| hash.into_thrift()),
             git_annotated_tag: self.git_annotated_tag.map(BonsaiAnnotatedTag::into_thrift),
         }
@@ -168,6 +168,21 @@ impl BonsaiChangesetMut {
     /// that's external to this changeset. For example, a changeset that deletes a file that
     /// doesn't exist in its parent is invalid. Instead, it only checks for internal consistency.
     pub fn verify(&self) -> Result<()> {
+        // Check that the author and committer do not contain newline
+        // characters.
+        if let Some(offset) = self.author.find('\n') {
+            bail!(MononokeTypeError::InvalidBonsaiChangeset(format!(
+                "commit author contains a newline at offset {}",
+                offset
+            )));
+        }
+        if let Some(offset) = self.committer.as_ref().and_then(|c| c.find('\n')) {
+            bail!(MononokeTypeError::InvalidBonsaiChangeset(format!(
+                "committer contains a newline at offset {}",
+                offset
+            )));
+        }
+
         // Check that the copy info ID refers to a parent in the parent set.
         for (path, fc) in &self.file_changes {
             if let Some((copy_from_path, copy_from_id)) = fc.copy_from() {
@@ -257,7 +272,7 @@ impl BonsaiChangeset {
         Ok(bcs)
     }
 
-    fn from_thrift_with_id(tc: thrift::BonsaiChangeset, id: ChangesetId) -> Result<Self> {
+    fn from_thrift_with_id(tc: thrift::bonsai::BonsaiChangeset, id: ChangesetId) -> Result<Self> {
         let catch_block = || -> Result<_> {
             let inner = BonsaiChangesetMut::from_thrift(tc)?;
             inner.verify()?;
@@ -415,12 +430,14 @@ impl Arbitrary for BonsaiChangeset {
             // This is rare but is definitely possible. Retry in this case.
             Self::arbitrary(g)
         } else {
+            // Author and committer cannot contain newline, so remove any that
+            // are generated.
             BonsaiChangesetMut {
                 parents,
                 file_changes: file_changes.into(),
-                author: String::arbitrary(g),
+                author: String::arbitrary(g).replace('\n', ""),
                 author_date: DateTime::arbitrary(g),
-                committer: Option::<String>::arbitrary(g),
+                committer: Option::<String>::arbitrary(g).map(|s| s.replace('\n', "")),
                 committer_date: Option::<DateTime>::arbitrary(g),
                 message: String::arbitrary(g),
                 hg_extra: SortedVectorMap::arbitrary(g),
@@ -488,15 +505,15 @@ pub enum BonsaiAnnotatedTagTarget {
 
 impl BonsaiAnnotatedTagTarget {
     /// Create from a thrift `BonsaiAnnotatedTagTarget`.
-    fn from_thrift(thrift_tag: thrift::BonsaiAnnotatedTagTarget) -> Result<Self> {
+    fn from_thrift(thrift_tag: thrift::bonsai::BonsaiAnnotatedTagTarget) -> Result<Self> {
         match thrift_tag {
-            thrift::BonsaiAnnotatedTagTarget::Changeset(id) => Ok(
+            thrift::bonsai::BonsaiAnnotatedTagTarget::Changeset(id) => Ok(
                 BonsaiAnnotatedTagTarget::Changeset(ChangesetId::from_thrift(id)?),
             ),
-            thrift::BonsaiAnnotatedTagTarget::Content(id) => Ok(BonsaiAnnotatedTagTarget::Content(
-                ContentId::from_thrift(id)?,
-            )),
-            thrift::BonsaiAnnotatedTagTarget::UnknownField(x) => {
+            thrift::bonsai::BonsaiAnnotatedTagTarget::Content(id) => Ok(
+                BonsaiAnnotatedTagTarget::Content(ContentId::from_thrift(id)?),
+            ),
+            thrift::bonsai::BonsaiAnnotatedTagTarget::UnknownField(x) => {
                 bail!(MononokeTypeError::InvalidThrift(
                     "BonsaiAnnotatedTagTarget".into(),
                     format!("unknown bonsai annotated tag target field: {}", x)
@@ -506,13 +523,13 @@ impl BonsaiAnnotatedTagTarget {
     }
 
     /// Convert into a thrift `BonsaiAnnotatedTagTarget`.
-    fn into_thrift(self) -> thrift::BonsaiAnnotatedTagTarget {
+    fn into_thrift(self) -> thrift::bonsai::BonsaiAnnotatedTagTarget {
         match self {
             BonsaiAnnotatedTagTarget::Changeset(id) => {
-                thrift::BonsaiAnnotatedTagTarget::Changeset(id.into_thrift())
+                thrift::bonsai::BonsaiAnnotatedTagTarget::Changeset(id.into_thrift())
             }
             BonsaiAnnotatedTagTarget::Content(id) => {
-                thrift::BonsaiAnnotatedTagTarget::Content(id.into_thrift())
+                thrift::bonsai::BonsaiAnnotatedTagTarget::Content(id.into_thrift())
             }
         }
     }
@@ -538,7 +555,7 @@ pub struct BonsaiAnnotatedTag {
 
 impl BonsaiAnnotatedTag {
     /// Create from a thrift `BonsaiAnnotatedTag`.
-    fn from_thrift(thrift_tag: thrift::BonsaiAnnotatedTag) -> Result<Self> {
+    fn from_thrift(thrift_tag: thrift::bonsai::BonsaiAnnotatedTag) -> Result<Self> {
         Ok(Self {
             target: BonsaiAnnotatedTagTarget::from_thrift(thrift_tag.target)?,
             pgp_signature: thrift_tag.pgp_signature,
@@ -546,8 +563,8 @@ impl BonsaiAnnotatedTag {
     }
 
     /// Convert into a thrift `BonsaiAnnotatedTag`.
-    fn into_thrift(self) -> thrift::BonsaiAnnotatedTag {
-        thrift::BonsaiAnnotatedTag {
+    fn into_thrift(self) -> thrift::bonsai::BonsaiAnnotatedTag {
+        thrift::bonsai::BonsaiAnnotatedTag {
             target: self.target.into_thrift(),
             pgp_signature: self.pgp_signature,
         }
@@ -572,6 +589,7 @@ mod test {
 
     use super::*;
     use crate::file_change::FileType;
+    use crate::file_change::GitLfs;
     use crate::hash::Blake2;
     use crate::typed_hash::ContentId;
 
@@ -609,6 +627,7 @@ mod test {
                     FileType::Regular,
                     42,
                     None,
+                    GitLfs::FullContent,
                 ),
                 NonRootMPath::new("c/d").unwrap() => FileChange::tracked(
                     ContentId::from_byte_array([2; 32]),
@@ -618,6 +637,7 @@ mod test {
                         NonRootMPath::new("e/f").unwrap(),
                         ChangesetId::from_byte_array([3; 32]),
                     )),
+                    GitLfs::FullContent,
                 ),
                 NonRootMPath::new("g/h").unwrap() => FileChange::Deletion,
                 NonRootMPath::new("i/j").unwrap() => FileChange::Deletion,
@@ -639,6 +659,43 @@ mod test {
     }
 
     #[test]
+    fn invalid_author_committer() {
+        let invalid_author = BonsaiChangesetMut {
+            parents: vec![],
+            author: "test\nuser".into(),
+            author_date: DateTime::from_timestamp(1, 2).unwrap(),
+            committer: None,
+            committer_date: None,
+            message: "a".into(),
+            hg_extra: SortedVectorMap::new(),
+            git_extra_headers: None,
+            git_tree_hash: None,
+            file_changes: sorted_vector_map![],
+            is_snapshot: false,
+            git_annotated_tag: None,
+        };
+
+        assert!(invalid_author.freeze().is_err());
+
+        let invalid_committer = BonsaiChangesetMut {
+            parents: vec![],
+            author: "test user".into(),
+            author_date: DateTime::from_timestamp(1, 2).unwrap(),
+            committer: Some("test\nuser".into()),
+            committer_date: Some(DateTime::from_timestamp(1, 2).unwrap()),
+            message: "a".into(),
+            hg_extra: SortedVectorMap::new(),
+            git_extra_headers: None,
+            git_tree_hash: None,
+            file_changes: sorted_vector_map![],
+            is_snapshot: false,
+            git_annotated_tag: None,
+        };
+
+        assert!(invalid_committer.freeze().is_err());
+    }
+
+    #[test]
     fn bonsai_snapshots() {
         fn create(untracked: bool, missing: bool, is_snapshot: bool) -> Result<BonsaiChangeset> {
             let mut file_changes = sorted_vector_map! [
@@ -647,6 +704,7 @@ mod test {
                     FileType::Regular,
                     42,
                     None,
+                    GitLfs::GitLfsPointer,
                 ),
                 NonRootMPath::new("b").unwrap() => FileChange::Deletion,
             ];
@@ -729,6 +787,7 @@ mod test {
                     FileType::Regular,
                     42,
                     None,
+                    GitLfs::FullContent,
                 ),
                 NonRootMPath::new("b").unwrap() => FileChange::Deletion,
             ],
@@ -787,6 +846,7 @@ mod test {
                     FileType::Regular,
                     42,
                     None,
+                    GitLfs::GitLfsPointer,
                 ),
                 NonRootMPath::new("b").unwrap() => FileChange::Deletion,
             ],
@@ -839,6 +899,7 @@ mod test {
                     FileType::Regular,
                     42,
                     None,
+                    GitLfs::FullContent,
                 ),
                 NonRootMPath::new("b").unwrap() => FileChange::Deletion,
             ],

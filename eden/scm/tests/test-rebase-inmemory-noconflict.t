@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ configure mutation-norecord
 Tests the --noconflict rebase flag
@@ -24,7 +26,7 @@ Tests the --noconflict rebase flag
   $ hg amend -q
   $ hg up c
   2 files updated, 0 files merged, 1 files removed, 0 files unresolved
-  (activating bookmark c)
+  (changing active bookmark from g to c)
   $ echo "local change" > b
 
 

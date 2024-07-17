@@ -23,6 +23,7 @@ use manifest_tree::FileType;
 use manifest_tree::Flag;
 use manifest_tree::TreeEntry;
 use manifest_tree::TreeStore;
+use types::fetch_mode::FetchMode;
 use types::HgId;
 use types::Key;
 use types::PathComponentBuf;
@@ -61,6 +62,7 @@ struct State<'a> {
 }
 
 /// An item of a tree. It optionally contains a resolved `TreeEntry`.
+#[derive(Debug)]
 struct TreeItem<'a> {
     id: HgId,
     flag: Flag,
@@ -111,7 +113,7 @@ impl<'a> State<'a> {
 
     /// Convert to output.
     fn into_output(self) -> Vec<Option<(HgId, Flag)>> {
-        if let Some(Some(item)) = self.items.get(0) {
+        if let Some(Some(item)) = self.items.first() {
             tracing::trace!("   root tree {} => {:?}", item.id, &self.output);
         }
         self.output
@@ -183,7 +185,7 @@ impl<'a> State<'a> {
             Some(Some(item)) => item,
         };
         if item.loaded.is_none() {
-            let entry = tree_store.get(item.path, item.id)?;
+            let entry = tree_store.get_content(item.path, item.id, FetchMode::AllowRemote)?;
             let format = tree_store.format();
             item.loaded = Some(TreeEntry(entry, format));
         }
@@ -305,7 +307,7 @@ impl CompiledPaths {
     pub async fn execute(
         &mut self,
         root_tree_ids: Vec<HgId>,
-        tree_store: Arc<dyn TreeStore + Send + Sync>,
+        tree_store: Arc<dyn TreeStore>,
     ) -> Result<Vec<ContentId>> {
         let mut states: Vec<State> = root_tree_ids
             .iter()
@@ -329,7 +331,9 @@ impl CompiledPaths {
             }
             // Execute the operation.
             for state in states.iter_mut() {
-                state.execute(op, &*tree_store, &mut self.lookup_cache)?;
+                async_runtime::block_in_place(|| {
+                    state.execute(op, &*tree_store, &mut self.lookup_cache)
+                })?;
             }
         }
 

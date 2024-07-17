@@ -47,25 +47,27 @@ use bookmarks::BookmarksArc;
 use bookmarks::BookmarksRef;
 pub use bookmarks::Freshness as BookmarkFreshness;
 use bookmarks::Freshness;
+use bookmarks_cache::BookmarksCache;
+use bulk_derivation::BulkDerivation;
 use bytes::Bytes;
 use cacheblob::InProcessLease;
 use cacheblob::LeaseOps;
-use changeset_fetcher::ChangesetFetcher;
-use changeset_fetcher::ChangesetFetcherArc;
-use changeset_fetcher::ChangesetFetcherRef;
 use changeset_info::ChangesetInfo;
 use changesets::Changesets;
 use changesets::ChangesetsArc;
 use changesets::ChangesetsRef;
+use commit_cloud::CommitCloud;
 use commit_graph::CommitGraph;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
-use cross_repo_sync::types::Target;
+use cross_repo_sync::get_all_possible_repo_submodule_deps;
+use cross_repo_sync::get_small_and_large_repos;
 use cross_repo_sync::CandidateSelectionHint;
 use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncRepos;
 use cross_repo_sync::CommitSyncer;
-use derived_data_manager::manager::derive::BatchDeriveOptions;
+use cross_repo_sync::SubmoduleDeps;
+use cross_repo_sync::Target;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
 use ephemeral_blobstore::ArcRepoEphemeralStore;
@@ -76,19 +78,20 @@ use ephemeral_blobstore::RepoEphemeralStoreArc;
 use ephemeral_blobstore::RepoEphemeralStoreRef;
 use ephemeral_blobstore::StorageLocation;
 use fbinit::FacebookInit;
+use filenodes::Filenodes;
 use filestore::Alias;
 use filestore::FetchKey;
 use filestore::FilestoreConfig;
 use filestore::FilestoreConfigRef;
 pub use filestore::StoreRequest;
-use fsnodes::RootFsnodeId;
-use futures::compat::Stream01CompatExt;
 use futures::stream;
 use futures::stream::Stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures::try_join;
 use futures::Future;
+use git_symbolic_refs::GitSymbolicRefs;
+use git_types::MappedGitCommitId;
 use hook_manager::manager::HookManager;
 use hook_manager::manager::HookManagerArc;
 use itertools::Itertools;
@@ -140,13 +143,12 @@ use repo_permission_checker::RepoPermissionChecker;
 use repo_sparse_profiles::ArcRepoSparseProfiles;
 use repo_sparse_profiles::RepoSparseProfiles;
 use repo_sparse_profiles::RepoSparseProfilesArc;
-use revset::AncestorsNodeStream;
+use repo_stats_logger::RepoStatsLogger;
 use segmented_changelog::CloneData;
 use segmented_changelog::DisabledSegmentedChangelog;
 use segmented_changelog::Location;
 use segmented_changelog::SegmentedChangelog;
 use segmented_changelog::SegmentedChangelogRef;
-use skeleton_manifest::RootSkeletonManifestId;
 use slog::debug;
 use slog::error;
 use sql_construct::SqlConstruct;
@@ -157,10 +159,8 @@ use streaming_clone::StreamingCloneBuilder;
 use synced_commit_mapping::ArcSyncedCommitMapping;
 use synced_commit_mapping::SqlSyncedCommitMapping;
 use test_repo_factory::TestRepoFactory;
-use tunables::tunables;
 use unbundle::PushRedirector;
 use unbundle::PushRedirectorArgs;
-use warm_bookmarks_cache::BookmarksCache;
 use warm_bookmarks_cache::WarmBookmarksCacheBuilder;
 use wireproto_handler::PushRedirectorBase;
 use wireproto_handler::RepoHandlerBase;
@@ -186,7 +186,7 @@ pub mod git;
 pub mod land_stack;
 pub mod move_bookmark;
 
-pub use git::upload_git_object;
+pub use git::upload_non_blob_git_object;
 
 define_stats! {
     prefix = "mononoke.api";
@@ -219,7 +219,6 @@ pub struct Repo {
         dyn BonsaiHgMapping,
         dyn BookmarkUpdateLog,
         dyn Bookmarks,
-        dyn ChangesetFetcher,
         dyn Changesets,
         dyn Phases,
         dyn PushrebaseMutationMapping,
@@ -236,6 +235,9 @@ pub struct Repo {
         RepoSparseProfiles,
         StreamingClone,
         CommitGraph,
+        dyn GitSymbolicRefs,
+        dyn Filenodes,
+        CommitCloud
     )]
     pub inner: InnerRepo,
 
@@ -253,6 +255,9 @@ pub struct Repo {
 
     #[facet]
     pub filestore_config: FilestoreConfig,
+
+    #[facet]
+    pub repo_stats_logger: RepoStatsLogger,
 }
 
 impl AsBlobRepo for Repo {
@@ -267,6 +272,7 @@ pub struct RepoContext {
     authz: Arc<AuthorizationContext>,
     repo: Arc<Repo>,
     push_redirector: Option<Arc<PushRedirector<Repo>>>,
+    repos: Arc<MononokeRepos<Repo>>,
 }
 
 impl fmt::Debug for RepoContext {
@@ -281,6 +287,7 @@ pub struct RepoContextBuilder {
     repo: Arc<Repo>,
     push_redirector: Option<Arc<PushRedirector<Repo>>>,
     bubble_id: Option<BubbleId>,
+    repos: Arc<MononokeRepos<Repo>>,
 }
 
 async fn maybe_push_redirector(
@@ -288,15 +295,14 @@ async fn maybe_push_redirector(
     repo: &Arc<Repo>,
     repos: &MononokeRepos<Repo>,
 ) -> Result<Option<PushRedirector<Repo>>, MononokeError> {
-    if tunables().disable_scs_pushredirect().unwrap_or_default() {
-        return Ok(None);
-    }
     let base = match repo.repo_handler_base().maybe_push_redirector_base.as_ref() {
         None => return Ok(None),
         Some(base) => base,
     };
     let live_commit_sync_config = repo.live_commit_sync_config();
-    let enabled = live_commit_sync_config.push_redirector_enabled_for_public(repo.repoid());
+    let enabled = live_commit_sync_config
+        .push_redirector_enabled_for_public(ctx, repo.repoid())
+        .await?;
     if enabled {
         let large_repo_id = base.common_commit_sync_config.large_repo_id;
         let large_repo = repos.get_by_id(large_repo_id.id()).ok_or_else(|| {
@@ -322,20 +328,22 @@ async fn maybe_push_redirector(
 }
 
 impl RepoContextBuilder {
-    pub(crate) async fn new(
+    pub async fn new(
         ctx: CoreContext,
         repo: Arc<Repo>,
-        repos: &MononokeRepos<Repo>,
+        repos: Arc<MononokeRepos<Repo>>,
     ) -> Result<Self, MononokeError> {
-        let push_redirector = maybe_push_redirector(&ctx, &repo, repos)
+        let push_redirector = maybe_push_redirector(&ctx, &repo, repos.as_ref())
             .await?
             .map(Arc::new);
+
         Ok(RepoContextBuilder {
             ctx,
             authz: None,
             repo,
             push_redirector,
             bubble_id: None,
+            repos,
         })
     }
 
@@ -356,6 +364,7 @@ impl RepoContextBuilder {
     pub async fn build(self) -> Result<RepoContext, MononokeError> {
         let authz = Arc::new(
             self.authz
+                .clone()
                 .unwrap_or_else(|| AuthorizationContext::new(&self.ctx)),
         );
         RepoContext::new(
@@ -364,6 +373,7 @@ impl RepoContextBuilder {
             self.repo,
             self.bubble_id,
             self.push_redirector,
+            self.repos,
         )
         .await
     }
@@ -388,6 +398,24 @@ pub async fn open_synced_commit_mapping(
     ))
 }
 
+/// Defines behavuiour of xrepo_commit_lookup when there's no mapping for queries commit just yet.
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
+pub enum XRepoLookupSyncBehaviour {
+    // Initiates sync and returns the sync result
+    SyncIfAbsent,
+    // Returns None
+    NeverSync,
+}
+
+/// Defines behavuiour of xrepo_commit_lookup when there's no exact mapping but only working copy equivalence
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
+pub enum XRepoLookupExactBehaviour {
+    // Returns result only when there's exact mapping
+    OnlyExactMapping,
+    // Returns result also when there's working copy equivalent match
+    WorkingCopyEquivalence,
+}
+
 impl Repo {
     /// Construct a new Repo based on an existing one with a bubble opened.
     pub fn with_bubble(&self, bubble: Bubble) -> Self {
@@ -403,6 +431,7 @@ impl Repo {
             hook_manager: self.hook_manager.clone(),
             repo_handler_base: self.repo_handler_base.clone(),
             filestore_config: self.filestore_config.clone(),
+            repo_stats_logger: self.repo_stats_logger.clone(),
         }
     }
 
@@ -491,6 +520,8 @@ impl Repo {
         let warm_bookmarks_cache = warm_bookmarks_cache_builder.build().await?;
         let filestore_config = Arc::new(FilestoreConfig::no_chunking_filestore());
 
+        let repo_stats_logger = Arc::new(RepoStatsLogger::noop());
+
         Ok(Self {
             name: name.clone(),
             inner,
@@ -498,6 +529,7 @@ impl Repo {
             hook_manager,
             repo_handler_base,
             filestore_config,
+            repo_stats_logger,
         })
     }
 
@@ -698,12 +730,10 @@ impl Repo {
         // This is a generation number beyond which we don't need to traverse
         let min_gen_num = self.fetch_gen_num(ctx, &ancestor).await?;
 
-        let mut ancestors = AncestorsNodeStream::new(
-            ctx.clone(),
-            &self.blob_repo().changeset_fetcher_arc(),
-            descendant,
-        )
-        .compat();
+        let mut ancestors = self
+            .commit_graph()
+            .ancestors_difference_stream(ctx, vec![descendant], vec![])
+            .await?;
 
         let mut traversed = 0;
         while let Some(cs_id) = ancestors.next().await {
@@ -713,11 +743,7 @@ impl Repo {
             }
 
             let cs_id = cs_id?;
-            let parents = self
-                .blob_repo()
-                .changeset_fetcher()
-                .get_parents(ctx, cs_id)
-                .await?;
+            let parents = self.commit_graph().changeset_parents(ctx, cs_id).await?;
 
             if parents.contains(&ancestor) {
                 return Ok(Some(cs_id));
@@ -737,10 +763,7 @@ impl Repo {
         ctx: &CoreContext,
         cs_id: &ChangesetId,
     ) -> Result<Generation, Error> {
-        self.blob_repo()
-            .changeset_fetcher()
-            .get_generation_number(ctx, *cs_id)
-            .await
+        self.commit_graph().changeset_generation(ctx, *cs_id).await
     }
 }
 
@@ -765,6 +788,7 @@ impl RepoContext {
         repo: Arc<Repo>,
         bubble_id: Option<BubbleId>,
         push_redirector: Option<Arc<PushRedirector<Repo>>>,
+        repos: Arc<MononokeRepos<Repo>>,
     ) -> Result<Self, MononokeError> {
         let ctx = ctx.with_mutated_scuba(|mut scuba| {
             scuba.add("permissions_model", format!("{:?}", authz));
@@ -776,7 +800,10 @@ impl RepoContext {
 
         // Open the bubble if necessary.
         let repo = if let Some(bubble_id) = bubble_id {
-            let bubble = repo.repo_ephemeral_store().open_bubble(bubble_id).await?;
+            let bubble = repo
+                .repo_ephemeral_store()
+                .open_bubble(&ctx, bubble_id)
+                .await?;
             Arc::new(repo.with_bubble(bubble))
         } else {
             repo
@@ -787,12 +814,13 @@ impl RepoContext {
             authz,
             repo,
             push_redirector,
+            repos,
         })
     }
 
     pub async fn new_test(ctx: CoreContext, repo: Arc<Repo>) -> Result<Self, MononokeError> {
         let authz = Arc::new(AuthorizationContext::new_bypass_access_control());
-        RepoContext::new(ctx, authz, repo, None, None).await
+        RepoContext::new(ctx, authz, repo, None, None, Arc::new(MononokeRepos::new())).await
     }
 
     /// The context for this query.
@@ -890,14 +918,21 @@ impl RepoContext {
         self.blob_repo()
             .repo_derived_data()
             .config()
-            .is_enabled(ChangesetInfo::NAME)
+            .is_enabled(ChangesetInfo::VARIANT)
+    }
+
+    pub fn derive_gitcommit_enabled(&self) -> bool {
+        self.blob_repo()
+            .repo_derived_data()
+            .config()
+            .is_enabled(MappedGitCommitId::VARIANT)
     }
 
     pub fn derive_hgchangesets_enabled(&self) -> bool {
         self.blob_repo()
             .repo_derived_data()
             .config()
-            .is_enabled(MappedHgChangesetId::NAME)
+            .is_enabled(MappedHgChangesetId::VARIANT)
     }
 
     /// Load bubble from id
@@ -905,7 +940,7 @@ impl RepoContext {
         Ok(self
             .repo
             .repo_ephemeral_store()
-            .open_bubble(bubble_id)
+            .open_bubble(self.ctx(), bubble_id)
             .await?)
     }
 
@@ -915,7 +950,11 @@ impl RepoContext {
         bubble_id: Option<BubbleId>,
     ) -> Result<Arc<dyn Changesets>, MononokeError> {
         Ok(match bubble_id {
-            Some(id) => Arc::new(self.open_bubble(id).await?.changesets(self.blob_repo())),
+            Some(id) => Arc::new(
+                self.open_bubble(id)
+                    .await?
+                    .repo_changesets(self.blob_repo()),
+            ),
             None => self.blob_repo().changesets_arc(),
         })
     }
@@ -933,7 +972,7 @@ impl RepoContext {
             UnknownBubble => match self
                 .repo
                 .repo_ephemeral_store()
-                .bubble_from_changeset(&changeset_id)
+                .bubble_from_changeset(&self.ctx, &changeset_id)
                 .await?
             {
                 Some(id) => Some(id),
@@ -945,6 +984,10 @@ impl RepoContext {
             .await?
             .exists(&self.ctx, changeset_id)
             .await?)
+    }
+
+    pub fn commit_graph(&self) -> &CommitGraph {
+        self.repo.commit_graph()
     }
 
     /// Look up a changeset specifier to find the canonical bonsai changeset
@@ -1066,6 +1109,11 @@ impl RepoContext {
         Ok(changeset)
     }
 
+    /// Create changeset context from known existing changeset id.
+    pub fn changeset_from_existing_id(&self, cs_id: ChangesetId) -> ChangesetContext {
+        ChangesetContext::new(self.clone(), cs_id)
+    }
+
     pub async fn difference_of_unions_of_ancestors<'a>(
         &'a self,
         includes: Vec<ChangesetId>,
@@ -1075,7 +1123,6 @@ impl RepoContext {
         let repo = self.clone();
 
         Ok(self
-            .repo()
             .commit_graph()
             .ancestors_difference_stream(&self.ctx, includes, excludes)
             .await?
@@ -1332,7 +1379,7 @@ impl RepoContext {
                     BookmarkCategory::ALL,
                     BookmarkKind::ALL,
                     &pagination,
-                    limit.unwrap_or(std::u64::MAX),
+                    limit.unwrap_or(u64::MAX),
                 )
                 .try_filter_map(move |(bookmark, cs_id)| async move {
                     if bookmark.kind() == &BookmarkKind::Scratch {
@@ -1516,21 +1563,21 @@ impl RepoContext {
 
         use CandidateSelectionHintArgs::*;
         match args {
-            OnlyOrAncestorOfBookmark(bookmark) => {
+            AncestorOfBookmark(bookmark) => {
                 let repo = other_repo_context.target_repo();
-                Ok(CandidateSelectionHint::OnlyOrAncestorOfBookmark(
+                Ok(CandidateSelectionHint::AncestorOfBookmark(
                     Target(bookmark),
                     repo,
                 ))
             }
-            OnlyOrDescendantOfBookmark(bookmark) => {
+            DescendantOfBookmark(bookmark) => {
                 let repo = other_repo_context.target_repo();
-                Ok(CandidateSelectionHint::OnlyOrDescendantOfBookmark(
+                Ok(CandidateSelectionHint::DescendantOfBookmark(
                     Target(bookmark),
                     repo,
                 ))
             }
-            OnlyOrAncestorOfCommit(specifier) => {
+            AncestorOfCommit(specifier) => {
                 let repo = other_repo_context.target_repo();
                 let cs_id = other_repo_context
                     .resolve_specifier(specifier)
@@ -1541,12 +1588,12 @@ impl RepoContext {
                             specifier
                         ))
                     })?;
-                Ok(CandidateSelectionHint::OnlyOrAncestorOfCommit(
+                Ok(CandidateSelectionHint::AncestorOfCommit(
                     Target(cs_id),
                     repo,
                 ))
             }
-            OnlyOrDescendantOfCommit(specifier) => {
+            DescendantOfCommit(specifier) => {
                 let repo = other_repo_context.target_repo();
                 let cs_id = other_repo_context
                     .resolve_specifier(specifier)
@@ -1557,7 +1604,7 @@ impl RepoContext {
                             specifier
                         ))
                     })?;
-                Ok(CandidateSelectionHint::OnlyOrDescendantOfCommit(
+                Ok(CandidateSelectionHint::DescendantOfCommit(
                     Target(cs_id),
                     repo,
                 ))
@@ -1577,12 +1624,19 @@ impl RepoContext {
         }
     }
 
-    /// Get the equivalent changeset from another repo - it will sync it if needed
-    pub async fn xrepo_commit_lookup(
-        &self,
-        other: &Self,
+    /// Get the equivalent changeset from another repo - it may sync it if needed (depending on
+    /// `sync_behaviour` arg).
+    ///
+    /// Setting exact to true will return result only if there's exact match for the requested
+    /// commit - rather than commit with equivalent working copy (which happens in case the source
+    /// commit rewrites to nothing in target repo).
+    pub async fn xrepo_commit_lookup<'a, 'b>(
+        &'a self,
+        other: &'a Self,
         specifier: impl Into<ChangesetSpecifier>,
         maybe_candidate_selection_hint_args: Option<CandidateSelectionHintArgs>,
+        sync_behaviour: XRepoLookupSyncBehaviour,
+        exact: XRepoLookupExactBehaviour,
     ) -> Result<Option<ChangesetContext>, MononokeError> {
         let common_config = self
             .live_commit_sync_config()
@@ -1598,8 +1652,17 @@ impl RepoContext {
             .build_candidate_selection_hint(maybe_candidate_selection_hint_args, other)
             .await?;
 
-        let commit_sync_repos =
-            CommitSyncRepos::new(self.repo().clone(), other.repo().clone(), &common_config)?;
+        let (_small_repo, _large_repo) =
+            get_small_and_large_repos(self.repo.as_ref(), other.repo.as_ref(), &common_config)?;
+
+        let submodule_deps = self.get_final_submodule_deps(other).await?;
+
+        let commit_sync_repos = CommitSyncRepos::new(
+            self.repo().clone(),
+            other.repo().clone(),
+            submodule_deps,
+            &common_config,
+        )?;
 
         let specifier = specifier.into();
         let changeset = self.resolve_specifier(specifier).await?.ok_or_else(|| {
@@ -1614,16 +1677,70 @@ impl RepoContext {
             self.repo.x_repo_sync_lease().clone(),
         );
 
+        if sync_behaviour == XRepoLookupSyncBehaviour::SyncIfAbsent {
+            let _ = commit_syncer
+                .sync_commit(
+                    &self.ctx,
+                    changeset,
+                    candidate_selection_hint,
+                    CommitSyncContext::ScsXrepoLookup,
+                    false,
+                )
+                .await?;
+        }
+        use cross_repo_sync::CommitSyncOutcome::*;
         let maybe_cs_id = commit_syncer
-            .sync_commit(
-                &self.ctx,
-                changeset,
-                candidate_selection_hint,
-                CommitSyncContext::ScsXrepoLookup,
-                false,
-            )
-            .await?;
+            .get_commit_sync_outcome(&self.ctx, changeset)
+            .await?
+            .and_then(|outcome| match outcome {
+                NotSyncCandidate(_) => None,
+                EquivalentWorkingCopyAncestor(_cs_id, _)
+                    if exact == XRepoLookupExactBehaviour::OnlyExactMapping =>
+                {
+                    None
+                }
+                EquivalentWorkingCopyAncestor(cs_id, _) | RewrittenAs(cs_id, _) => Some(cs_id),
+            });
         Ok(maybe_cs_id.map(|cs_id| ChangesetContext::new(other.clone(), cs_id)))
+    }
+
+    /// Only the small repo should have submodule dependencies in the commit sync
+    /// config, but when `xrepo_commit_lookup`, we don't know if the small repo
+    /// is the source (forward sync) or target (backsync).
+    /// So just get the submodule dependencies from both repos
+    async fn get_final_submodule_deps<'a>(
+        &'a self,
+        target_repo_ctx: &'a Self,
+    ) -> Result<SubmoduleDeps<Repo>, MononokeError> {
+        let live_commit_sync_config = self.repo.live_commit_sync_config();
+        let source_submodule_deps = get_all_possible_repo_submodule_deps(
+            &self.ctx,
+            self.repo.clone(),
+            self.repos.clone(),
+            live_commit_sync_config.clone(),
+        )
+        .await?;
+        let target_submodule_deps = get_all_possible_repo_submodule_deps(
+            &self.ctx,
+            target_repo_ctx.repo.clone(),
+            self.repos.clone(),
+            live_commit_sync_config,
+        )
+        .await?;
+
+        match (
+            source_submodule_deps.dep_map(),
+            target_submodule_deps.dep_map(),
+        ) {
+            (Some(dep_map), None) => Ok(SubmoduleDeps::ForSync(dep_map.clone())),
+            (None, Some(dep_map)) => Ok(SubmoduleDeps::ForSync(dep_map.clone())),
+            (Some(source_deps_map), Some(target_deps_map)) => {
+                let mut deps_map = source_deps_map.clone();
+                deps_map.extend(target_deps_map.clone());
+                Ok(SubmoduleDeps::ForSync(deps_map))
+            }
+            (None, None) => Ok(SubmoduleDeps::NotAvailable),
+        }
     }
 
     /// Start a write to the repo.
@@ -1673,12 +1790,34 @@ impl RepoContext {
         location: Location<ChangesetId>,
         count: u64,
     ) -> Result<Vec<ChangesetId>, MononokeError> {
-        let segmented_changelog = self.repo.segmented_changelog();
-        let ancestor = segmented_changelog
-            .location_to_many_changeset_ids(&self.ctx, location, count)
-            .await
-            .map_err(MononokeError::from)?;
-        Ok(ancestor)
+        let use_commit_graph = justknobs::eval(
+            "scm/mononoke:commit_graph_location_to_hash",
+            None,
+            Some(self.name()),
+        )
+        .unwrap_or_default();
+
+        let ancestors = match use_commit_graph {
+            true => {
+                self.commit_graph()
+                    .locations_to_changeset_ids(
+                        self.ctx(),
+                        location.descendant,
+                        location.distance,
+                        count,
+                    )
+                    .await?
+            }
+            false => {
+                let segmented_changelog = self.repo.segmented_changelog();
+                segmented_changelog
+                    .location_to_many_changeset_ids(&self.ctx, location, count)
+                    .await
+                    .map_err(MononokeError::from)?
+            }
+        };
+
+        Ok(ancestors)
     }
 
     /// A Segmented Changelog client needs to know how to translate between a commit hash,
@@ -1690,17 +1829,44 @@ impl RepoContext {
         cs_ids: Vec<ChangesetId>,
     ) -> Result<HashMap<ChangesetId, Result<Location<ChangesetId>, MononokeError>>, MononokeError>
     {
-        let segmented_changelog = self.repo.segmented_changelog();
-        let result = segmented_changelog
-            .many_changeset_ids_to_locations(&self.ctx, master_heads, cs_ids)
-            .await
-            .map(|ok| {
-                ok.into_iter()
-                    .map(|(k, v)| (k, v.map_err(Into::into)))
-                    .collect::<HashMap<ChangesetId, Result<_, MononokeError>>>()
-            })
-            .map_err(MononokeError::from)?;
-        Ok(result)
+        let use_commit_graph = justknobs::eval(
+            "scm/mononoke:commit_graph_hash_to_location",
+            None,
+            Some(self.name()),
+        )
+        .unwrap_or_default();
+
+        match use_commit_graph {
+            true => Ok(self
+                .commit_graph()
+                .changeset_ids_to_locations(self.ctx(), master_heads, cs_ids)
+                .await
+                .map(|ok| {
+                    ok.into_iter()
+                        .map(|(k, v)| {
+                            (
+                                k,
+                                Ok(Location {
+                                    descendant: v.cs_id,
+                                    distance: v.distance,
+                                }),
+                            )
+                        })
+                        .collect::<HashMap<ChangesetId, Result<_, MononokeError>>>()
+                })
+                .map_err(MononokeError::from)?),
+            false => Ok(self
+                .repo()
+                .segmented_changelog()
+                .many_changeset_ids_to_locations(&self.ctx, master_heads, cs_ids)
+                .await
+                .map(|ok| {
+                    ok.into_iter()
+                        .map(|(k, v)| (k, v.map_err(Into::into)))
+                        .collect::<HashMap<ChangesetId, Result<_, MononokeError>>>()
+                })
+                .map_err(MononokeError::from)?),
+        }
     }
 
     pub async fn segmented_changelog_clone_data(
@@ -1736,46 +1902,60 @@ impl RepoContext {
         Ok(pull_data)
     }
 
-    pub async fn prepare_derived_data(
+    pub async fn derive_bulk(
         &self,
-        derivable_type: DerivableType,
+        ctx: &CoreContext,
         csids: Vec<ChangesetId>,
+        derivable_types: &[DerivableType],
+        override_batch_size: Option<u64>,
     ) -> Result<(), MononokeError> {
-        // Simple initial implementation: does not support types with
-        // dependencies, and only supports a single type at a time.
-        match derivable_type {
-            DerivableType::Fsnodes => {
-                self.repo
-                    .repo_derived_data()
-                    .manager()
-                    .derive_exactly_batch::<RootFsnodeId>(
-                        self.ctx(),
-                        csids,
-                        BatchDeriveOptions::Parallel { gap_size: None },
-                        None,
-                    )
-                    .await?;
-            }
-            DerivableType::SkeletonManifests => {
-                self.repo
-                    .repo_derived_data()
-                    .manager()
-                    .derive_exactly_batch::<RootSkeletonManifestId>(
-                        self.ctx(),
-                        csids,
-                        BatchDeriveOptions::Parallel { gap_size: None },
-                        None,
-                    )
-                    .await?;
-            }
-            _ => {
-                return Err(MononokeError::InvalidRequest(format!(
-                    "Unsupported derived data type for preparation: {}",
-                    derivable_type
-                )));
-            }
-        }
-        Ok(())
+        // We don't need to expose rederivation to users of the repo api
+        // That's a lower level concept that clients like the derived data backfiller
+        // can get straight from the derived data manager
+        let rederivation = None;
+        Ok(self
+            .repo
+            .repo_derived_data()
+            .manager()
+            .derive_bulk(
+                ctx,
+                &csids,
+                rederivation,
+                derivable_types,
+                override_batch_size,
+            )
+            .await?)
+    }
+
+    pub async fn is_derived(
+        &self,
+        ctx: &CoreContext,
+        csid: ChangesetId,
+        derivable_type: DerivableType,
+    ) -> Result<bool, MononokeError> {
+        // We don't need to expose rederivation to users of the repo api
+        // That's a lower level concept that clients like the derived data backfiller
+        // can get straight from the derived data manager
+        let rederivation = None;
+        Ok(self
+            .repo
+            .repo_derived_data()
+            .manager()
+            .is_derived(ctx, csid, rederivation, derivable_type)
+            .await?)
+    }
+}
+
+impl PartialEq for RepoContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.repoid() == other.repoid()
+    }
+}
+impl Eq for RepoContext {}
+
+impl Hash for RepoContext {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.repoid().hash(state);
     }
 }
 
@@ -1832,18 +2012,5 @@ mod tests {
         let child = maybe_child.ok_or_else(|| anyhow!("didn't find child"))?;
         assert_eq!(child, descendant);
         Ok(())
-    }
-}
-
-impl PartialEq for RepoContext {
-    fn eq(&self, other: &Self) -> bool {
-        self.repoid() == other.repoid()
-    }
-}
-impl Eq for RepoContext {}
-
-impl Hash for RepoContext {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.repoid().hash(state);
     }
 }

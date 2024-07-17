@@ -9,15 +9,27 @@ import socket
 
 from sapling import error
 
-from . import httpsservice, localservice
+from . import httpsservice, localservice, saplingremoteapiservice
 
 
-def get(ui):
+def get(ui, repo=None):
     servicetype = ui.config("commitcloud", "servicetype")
     if servicetype == "local":
         return localservice.LocalService(ui)
     elif servicetype == "remote":
         return httpsservice.HttpsCommitCloudService(ui)
+    elif servicetype == "saplingremoteapi" or servicetype == "edenapi":
+        fallbackcfg = ui.config("commitcloud", "fallback")
+        fallback = (
+            localservice.LocalService(ui)
+            if fallbackcfg == "local"
+            else httpsservice.HttpsCommitCloudService(ui)
+        )
+        return saplingremoteapiservice.SaplingRemoteAPIService(
+            ui,
+            repo,
+            fallback,
+        )
     else:
         msg = "Unrecognized commitcloud.servicetype: %s" % servicetype
         raise error.Abort(msg)

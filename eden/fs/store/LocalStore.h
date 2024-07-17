@@ -11,19 +11,15 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+
+#include "eden/common/utils/ImmediateFuture.h"
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/RefPtr.h"
 #include "eden/fs/model/BlobFwd.h"
 #include "eden/fs/model/BlobMetadataFwd.h"
 #include "eden/fs/model/ObjectId.h"
 #include "eden/fs/model/TreeFwd.h"
 #include "eden/fs/store/KeySpace.h"
-#include "eden/fs/utils/ImmediateFuture.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/RefPtr.h"
-
-namespace folly {
-template <typename T>
-class Future;
-} // namespace folly
 
 namespace facebook::eden {
 
@@ -123,7 +119,7 @@ class LocalStore : public std::enable_shared_from_this<LocalStore> {
       KeySpace keySpace,
       const ObjectId& id) const;
 
-  FOLLY_NODISCARD virtual folly::Future<std::vector<StoreResult>> getBatch(
+  FOLLY_NODISCARD virtual ImmediateFuture<std::vector<StoreResult>> getBatch(
       KeySpace keySpace,
       const std::vector<folly::ByteRange>& keys) const;
 

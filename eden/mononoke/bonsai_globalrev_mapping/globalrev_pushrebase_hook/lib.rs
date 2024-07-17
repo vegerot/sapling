@@ -26,9 +26,7 @@ use pushrebase_hook::PushrebaseCommitHook;
 use pushrebase_hook::PushrebaseHook;
 use pushrebase_hook::PushrebaseTransactionHook;
 use pushrebase_hook::RebasedChangesets;
-use rand::Rng;
 use sql::Transaction;
-use tunables::tunables;
 
 #[cfg(test)]
 mod test;
@@ -60,18 +58,13 @@ impl GlobalrevPushrebaseHook {
 
 #[async_trait]
 impl PushrebaseHook for GlobalrevPushrebaseHook {
-    async fn in_critical_section(&self) -> Result<Box<dyn PushrebaseCommitHook>, Error> {
+    async fn in_critical_section(
+        &self,
+        _ctx: &CoreContext,
+        _old_bookmark_value: Option<ChangesetId>,
+    ) -> Result<Box<dyn PushrebaseCommitHook>, Error> {
         let max = self.mapping.get_max(&self.ctx).await?;
-
-        let increment: u64 = if tunables()
-            .global_rev_increment_with_gaps()
-            .unwrap_or_default()
-        {
-            let mut rng = rand::thread_rng();
-            rng.gen_range(1..5)
-        } else {
-            1
-        };
+        let increment = 1;
 
         let next_rev = match (max, self.small_repo_id) {
             (Some(max), _) => Globalrev::new(max.id() + increment),
@@ -171,10 +164,10 @@ struct GlobalrevTransactionHook {
 impl PushrebaseTransactionHook for GlobalrevTransactionHook {
     async fn populate_transaction(
         &self,
-        _ctx: &CoreContext,
+        ctx: &CoreContext,
         txn: Transaction,
     ) -> Result<Transaction, BookmarkTransactionError> {
-        let txn = add_globalrevs(txn, self.repo_id, &self.entries[..])
+        let txn = add_globalrevs(ctx, txn, self.repo_id, &self.entries[..])
             .await
             .map_err(|e| match e {
                 AddGlobalrevsErrorKind::Conflict => BookmarkTransactionError::LogicError,

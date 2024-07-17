@@ -32,7 +32,6 @@ use itertools::Itertools;
 use mercurial_types::HgChangesetId;
 use mercurial_types::HgFileNodeId;
 use mercurial_types::HgManifestId;
-use mononoke_types::BasenameSuffixSkeletonManifestId;
 use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::DeletedManifestV2Id;
@@ -48,7 +47,7 @@ use slog::Logger;
 use strum::EnumCount;
 use strum::EnumIter;
 use strum::EnumString;
-use strum::EnumVariantNames;
+use strum::VariantNames;
 
 use crate::detail::graph::EdgeType;
 use crate::detail::graph::Node;
@@ -104,13 +103,16 @@ struct InternedId<K> {
 }
 
 // Can't auto-derive as dont want to make K Copy
+// Implementing it by hand allows us to omit this bound on the type parameter. See [the Rust
+// documentation](https://doc.rust-lang.org/core/marker/trait.Copy.html#how-can-i-implement-copy)
 impl<K> Copy for InternedId<K> {}
+
+// Can't auto-derive as dont want to make K Clone
+// Implementing it by hand allows us to omit this bound on the type parameter. See [the Rust
+// documentation](https://doc.rust-lang.org/core/clone/trait.Clone.html#how-can-i-implement-clone)
 impl<K> Clone for InternedId<K> {
     fn clone(&self) -> Self {
-        Self {
-            id: self.id,
-            _phantom: PhantomData,
-        }
+        *self
     }
 }
 
@@ -194,6 +196,7 @@ pub struct WalkState {
     include_node_types: HashSet<NodeType>,
     include_edge_types: HashSet<EdgeType>,
     always_emit_edge_types: HashSet<EdgeType>,
+    exclude_nodes: HashSet<Node>,
     enable_derive: bool,
     chunk_direction: Option<Direction>,
     // Interning
@@ -234,8 +237,6 @@ pub struct WalkState {
     visited_fsnode_mapping: StateMap<InternedId<ChangesetId>>,
     visited_skeleton_manifest: StateMap<SkeletonManifestId>,
     visited_skeleton_manifest_mapping: StateMap<InternedId<ChangesetId>>,
-    visited_basename_suffix_skeleton_manifest: StateMap<BasenameSuffixSkeletonManifestId>,
-    visited_basename_suffix_skeleton_manifest_mapping: StateMap<InternedId<ChangesetId>>,
     visited_unode_file: StateMap<UnodeInterned<FileUnodeId>>,
     visited_unode_manifest: StateMap<UnodeInterned<ManifestUnodeId>>,
     visited_unode_mapping: StateMap<InternedId<ChangesetId>>,
@@ -248,6 +249,7 @@ impl WalkState {
         include_node_types: HashSet<NodeType>,
         include_edge_types: HashSet<EdgeType>,
         always_emit_edge_types: HashSet<EdgeType>,
+        exclude_nodes: HashSet<Node>,
         enable_derive: bool,
         chunk_direction: Option<Direction>,
     ) -> Self {
@@ -256,6 +258,7 @@ impl WalkState {
             // Params
             include_node_types,
             include_edge_types,
+            exclude_nodes,
             always_emit_edge_types,
             enable_derive,
             chunk_direction,
@@ -297,8 +300,6 @@ impl WalkState {
             visited_fsnode_mapping: StateMap::with_hasher(fac.clone()),
             visited_skeleton_manifest: StateMap::with_hasher(fac.clone()),
             visited_skeleton_manifest_mapping: StateMap::with_hasher(fac.clone()),
-            visited_basename_suffix_skeleton_manifest: StateMap::with_hasher(fac.clone()),
-            visited_basename_suffix_skeleton_manifest_mapping: StateMap::with_hasher(fac.clone()),
             visited_unode_file: StateMap::with_hasher(fac.clone()),
             visited_unode_manifest: StateMap::with_hasher(fac.clone()),
             visited_unode_mapping: StateMap::with_hasher(fac),
@@ -388,12 +389,6 @@ impl WalkState {
                     &self.bcs_ids.interned(bcs_id),
                 );
             }
-            (Node::BasenameSuffixSkeletonManifestMapping(bcs_id), Some(_)) => {
-                self.record(
-                    &self.visited_basename_suffix_skeleton_manifest_mapping,
-                    &self.bcs_ids.interned(bcs_id),
-                );
-            }
             (Node::UnodeMapping(bcs_id), Some(_)) => {
                 self.record(&self.visited_unode_mapping, &self.bcs_ids.interned(bcs_id));
             }
@@ -402,12 +397,10 @@ impl WalkState {
     }
 
     fn retain_edge(&self, outgoing_edge: &OutgoingEdge) -> bool {
-        // Retain if a root, or if selected
-        outgoing_edge.label.incoming_type().is_none()
-            || (self
-                .include_node_types
-                .contains(&outgoing_edge.target.get_type())
-                && self.include_edge_types.contains(&outgoing_edge.label))
+        // Retain if selected
+        self.include_node_types
+            .contains(&outgoing_edge.target.get_type())
+            && self.include_edge_types.contains(&outgoing_edge.label)
     }
 
     fn get_visit_count(&self, t: &NodeType) -> usize {
@@ -501,12 +494,6 @@ impl WalkState {
             NodeType::FsnodeMapping => self.visited_fsnode_mapping.clear(),
             NodeType::SkeletonManifest => self.visited_skeleton_manifest.clear(),
             NodeType::SkeletonManifestMapping => self.visited_skeleton_manifest_mapping.clear(),
-            NodeType::BasenameSuffixSkeletonManifest => {
-                self.visited_basename_suffix_skeleton_manifest.clear()
-            }
-            NodeType::BasenameSuffixSkeletonManifestMapping => self
-                .visited_basename_suffix_skeleton_manifest_mapping
-                .clear(),
             NodeType::UnodeFile => self.visited_unode_file.clear(),
             NodeType::UnodeManifest => self.visited_unode_manifest.clear(),
             NodeType::UnodeMapping => self.visited_unode_mapping.clear(),
@@ -515,6 +502,10 @@ impl WalkState {
 
     fn needs_visit_impl(&self, outgoing: &OutgoingEdge, executing_step: bool) -> bool {
         let target_node: &Node = &outgoing.target;
+        // Short circuit for nodes that should be never visited.
+        if self.exclude_nodes.contains(target_node) {
+            return false;
+        }
         let k = target_node.get_type();
         if !executing_step {
             self.visit_count[k as usize].fetch_add(1, Ordering::Release);
@@ -666,19 +657,6 @@ impl WalkState {
                     true
                 }
             }
-            (Node::BasenameSuffixSkeletonManifest(_), true) => true,
-            (Node::BasenameSuffixSkeletonManifest(id), false) => {
-                self.record(&self.visited_basename_suffix_skeleton_manifest, id)
-            }
-            (Node::BasenameSuffixSkeletonManifestMapping(bcs_id), _) => {
-                if let Some(id) = self.bcs_ids.get(bcs_id) {
-                    !self
-                        .visited_basename_suffix_skeleton_manifest_mapping
-                        .contains_key(&id) // Does not insert, see record_resolved_visit
-                } else {
-                    true
-                }
-            }
             (Node::UnodeFile(_), true) => true,
             (Node::UnodeFile(k), false) => self.record(
                 &self.visited_unode_file,
@@ -715,7 +693,7 @@ impl WalkState {
     Hash,
     EnumIter,
     EnumString,
-    EnumVariantNames
+    VariantNames
 )]
 pub enum InternedType {
     // No ChangesetId as that is not flushable as it is used to maintain deferred_bcs
@@ -935,12 +913,10 @@ impl WalkVisitor<(Node, Option<NodeData>, Option<StepStats>), EmptyRoute> for Wa
     fn start_step(
         &self,
         ctx: CoreContext,
-        route: Option<&EmptyRoute>,
+        _route: Option<&EmptyRoute>,
         step: &OutgoingEdge,
     ) -> Option<CoreContext> {
-        if route.is_none() // is it a root
-            || step.label.incoming_type().is_none() // is it from a root?
-            || self.always_emit_edge_types.contains(&step.label) // always emit?
+        if self.always_emit_edge_types.contains(&step.label) // always emit?
             || self.needs_visit_impl(step, true)
         {
             Some(ctx)
@@ -966,12 +942,13 @@ impl WalkVisitor<(Node, Option<NodeData>, Option<StepStats>), EmptyRoute> for Wa
         } else {
             0
         };
+        // This conditional is purely to avoid to allocating the vector again if we don't need to.
+        // It's a perf optimization, code should work the same without it.
         if route.is_none() || !self.always_emit_edge_types.is_empty() {
             outgoing.retain(|e| {
                 if e.label.incoming_type().is_none() {
                     // Make sure stats are updated for root nodes
-                    self.needs_visit(e);
-                    true
+                    self.needs_visit(e)
                 } else {
                     // Check the always emit edges, outer visitor has now processed them.
                     self.retain_edge(e)

@@ -14,6 +14,7 @@ use changeset_info::ChangesetInfo;
 use context::CoreContext;
 use derived_data::BonsaiDerived;
 use metaconfig_types::CommitSyncConfigVersion;
+use mononoke_types::BonsaiChangesetMut;
 use mononoke_types::ChangesetId;
 use repo_derived_data::RepoDerivedDataRef;
 use slog::info;
@@ -125,6 +126,26 @@ fn get_version_impl<'a>(
     }
 }
 
+pub fn get_mapping_change_version_from_hg_extra<'a>(
+    mut hg_extra: impl Iterator<Item = (&'a str, &'a [u8])>,
+) -> Result<Option<CommitSyncConfigVersion>, Error> {
+    if justknobs::eval("scm/mononoke:ignore_change_xrepo_mapping_extra", None, None)
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    let maybe_mapping = hg_extra.find(|(name, _)| name == &CHANGE_XREPO_MAPPING_EXTRA);
+    if let Some((_, version)) = maybe_mapping {
+        let version = String::from_utf8(version.to_vec())
+            .with_context(|| "non-utf8 version change".to_string())?;
+
+        let version = CommitSyncConfigVersion(version);
+        Ok(Some(version))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Get a mapping change version from changeset extras, if present
 /// Some changesets are used as "boundaries" to change CommmitSyncConfigVersion
 /// used in syncing. This is determined by the `CHANGE_XREPO_MAPPING_EXTRA`'s
@@ -132,23 +153,31 @@ fn get_version_impl<'a>(
 pub fn get_mapping_change_version(
     cs_info: &ChangesetInfo,
 ) -> Result<Option<CommitSyncConfigVersion>, Error> {
-    if tunables::tunables()
-        .allow_change_xrepo_mapping_extra()
-        .unwrap_or(false)
-    {
-        let maybe_mapping = cs_info
-            .hg_extra()
-            .find(|(name, _)| name == &CHANGE_XREPO_MAPPING_EXTRA);
-        if let Some((_, version)) = maybe_mapping {
-            let version = String::from_utf8(version.to_vec()).with_context(|| {
-                format!("non-utf8 version is set in {}", cs_info.changeset_id())
-            })?;
+    get_mapping_change_version_from_hg_extra(cs_info.hg_extra())
+}
 
-            let version = CommitSyncConfigVersion(version);
-            return Ok(Some(version));
-        }
+/// Set mapping change version into changeset extras
+/// Some changesets are used as "boundaries" to change CommmitSyncConfigVersion
+/// used in syncing. This is determined by the `CHANGE_XREPO_MAPPING_EXTRA`'s
+/// value.
+pub fn set_mapping_change_version(
+    bcs: &mut BonsaiChangesetMut,
+    mapping_version: CommitSyncConfigVersion,
+) -> Result<(), Error> {
+    if bcs
+        .hg_extra
+        .contains_key(&CHANGE_XREPO_MAPPING_EXTRA.to_string())
+    {
+        return Err(format_err!(
+            "changeset already contains the {}",
+            CHANGE_XREPO_MAPPING_EXTRA
+        ));
     }
-    Ok(None)
+    bcs.hg_extra.insert(
+        CHANGE_XREPO_MAPPING_EXTRA.to_string(),
+        mapping_version.0.clone().into_bytes(),
+    );
+    Ok(())
 }
 
 #[cfg(test)]

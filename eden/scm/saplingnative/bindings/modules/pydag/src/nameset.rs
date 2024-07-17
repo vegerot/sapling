@@ -7,6 +7,8 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use async_runtime::try_block_unless_interrupted as block_on;
 use cpython::*;
@@ -18,10 +20,12 @@ use dag::nameset::BoxVertexStream;
 use dag::Set;
 use dag::Vertex;
 use futures::stream::StreamExt;
+use types::hgid::NULL_ID;
 
 use crate::dagalgo::dagalgo;
-use crate::idmap::NULL_NODE;
 use crate::parents::parents;
+
+pub(crate) static USE_LEGACY_UNION_ORDER: AtomicBool = AtomicBool::new(false);
 
 /// A wrapper around [`Set`] with Python integration added.
 ///
@@ -45,19 +49,26 @@ py_class!(pub class nameset |py| {
     }
 
     def __len__(&self) -> PyResult<usize> {
-        block_on(self.inner(py).count()).map_pyerr(py)
+        block_on(self.inner(py).count()).and_then(|v| usize::try_from(v).map_err(Into::into)).map_pyerr(py)
     }
 
     def __repr__(&self) -> PyResult<String> {
         Ok(format!("{:?}", self.inner(py)))
     }
 
+    // Unlike "|", "+" preserves order, unless USE_LEGACY_UNION_ORDER is true.
     def __add__(lhs, rhs) -> PyResult<Names> {
         let lhs = Names::extract(py, lhs)?;
         let rhs = Names::extract(py, rhs)?;
-        Ok(Names(lhs.0.union(&rhs.0)))
+        let set = if USE_LEGACY_UNION_ORDER.load(Ordering::Acquire) {
+            lhs.0.union(&rhs.0)
+        } else {
+            lhs.0.union_preserving_order(&rhs.0)
+        };
+        Ok(Names(set))
     }
 
+    // Unlike "+", "|" does not preserve order.
     def __or__(lhs, rhs) -> PyResult<Names> {
         let lhs = Names::extract(py, lhs)?;
         let rhs = Names::extract(py, rhs)?;
@@ -150,6 +161,26 @@ py_class!(pub class nameset |py| {
         Ok(Names(set))
     }
 
+    /// Reverse the iteration order.
+    /// Returns the reversed set. The current set is not affected.
+    def reverse(&self) -> PyResult<Names> {
+        let inner = self.inner(py);
+        let set = inner.reverse();
+        Ok(Names(set))
+    }
+
+    /// Union two sets with the "zip" order.
+    def union_zip(&self, rhs: Names) -> PyResult<Names> {
+        let lhs = self.inner(py);
+        Ok(Names(lhs.union_zip(&rhs.0)))
+    }
+
+    /// Get the size hint: (min_size_or_0, max_size_or_None).
+    def size_hint(&self) -> PyResult<(u64, Option<u64>)> {
+        let inner = self.inner(py);
+        Ok(async_runtime::block_on(inner.size_hint()))
+    }
+
     def hints(&self) -> PyResult<HashMap<&'static str, PyObject>> {
         let mut result = HashMap::new();
         let hints = self.inner(py).hints();
@@ -221,7 +252,7 @@ impl<'a> FromPyObject<'a> for Names {
             let set = Set::from_static_names(pylist.into_iter().filter_map(|name| {
                 let data = name.data(py);
                 // Skip "nullid" automatically.
-                if data == &NULL_NODE[..] {
+                if data == NULL_ID.as_ref() {
                     None
                 } else {
                     Some(Vertex::copy_from(data))
@@ -273,7 +304,7 @@ impl Iterator for PyNameIter {
                 Some(Ok(value)) => {
                     let value = value.extract::<PyBytes>(py)?;
                     let data = value.data(py);
-                    if data == &NULL_NODE[..] {
+                    if data == NULL_ID.as_ref() {
                         // Skip "nullid" automatically.
                         self.next().transpose().map_pyerr(py)
                     } else {

@@ -145,7 +145,7 @@ class treestatemap:
         self.setparents(node.nullid, node.nullid)
 
         # use a new file
-        self._rootid = self._tree.reset(self._vfs.join("treestate"))
+        self._rootid = self._tree.reset()
 
     def iteritems(self):
         return ((k, self[k]) for k in self.keys())
@@ -279,9 +279,7 @@ class treestatemap:
                 self._tree.insert(f, state, mode, size, mtime, copied)
                 return True
 
-    def clearambiguoustimes(self, _files, now):
-        # TODO(quark): could _files be different from those with mtime = -1
-        # ones?
+    def clearambiguoustimes(self, now):
         self._tree.invalidatemtime(now)
 
     def nonnormalentries(self):

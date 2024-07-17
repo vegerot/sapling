@@ -27,10 +27,6 @@ from .i18n import _
 
 stringio = util.stringio
 
-# This is required for ncurses to display non-ASCII characters in default user
-# locale encoding correctly.  --immerrr
-locale.setlocale(locale.LC_ALL, "")
-
 # patch comments based on the git one
 diffhelptext: str = _(
     """# To remove '-' lines, make them ' ' lines (context).
@@ -57,21 +53,7 @@ patchhelptext: str = _(
 """
 )
 
-try:
-    import curses
-
-    curses.error
-except ImportError:
-    # I have no idea if wcurses works with crecord...
-    try:
-        # pyre-fixme[21]: Could not find `wcurses`.
-        import wcurses as curses
-
-        curses.error
-    except ImportError:
-        # wcurses is not shipped on Windows by default, or python is not
-        # compiled with curses
-        curses = False
+curses = util.import_curses()
 
 
 def checkcurses(ui):
@@ -1113,6 +1095,7 @@ class curseschunkselector:
     def updatescreen(self):
         self.statuswin.erase()
         self.chunkpad.erase()
+        self.chunkpad.clear()
 
         printstring = self.printstring
 

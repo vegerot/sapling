@@ -9,21 +9,27 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use anyhow::anyhow;
+use anyhow::Context;
 use anyhow::Result;
 use ascii::AsciiString;
 use bookmarks_types::BookmarkKey;
-use commitsync::types::CommonCommitSyncConfig as RawCommonCommitSyncConfig;
+use commitsync::CommonCommitSyncConfig as RawCommonCommitSyncConfig;
 use itertools::Itertools;
 use metaconfig_types::CommitSyncConfig;
 use metaconfig_types::CommitSyncConfigVersion;
 use metaconfig_types::CommonCommitSyncConfig;
 use metaconfig_types::DefaultSmallToLargeCommitSyncPathAction;
+use metaconfig_types::GitSubmodulesChangesAction;
 use metaconfig_types::SmallRepoCommitSyncConfig;
+use metaconfig_types::SmallRepoGitSubmoduleConfig;
 use metaconfig_types::SmallRepoPermanentConfig;
+use metaconfig_types::DEFAULT_GIT_SUBMODULE_METADATA_FILE_PREFIX;
+use mononoke_types::hash::GitSha1;
 use mononoke_types::NonRootMPath;
 use mononoke_types::RepositoryId;
 use repos::RawCommitSyncConfig;
 use repos::RawCommitSyncSmallRepoConfig;
+use repos::RawGitSubmodulesChangesAction;
 
 use crate::convert::Convert;
 
@@ -154,6 +160,25 @@ impl Convert for RawCommitSyncConfig {
     }
 }
 
+impl Convert for RawGitSubmodulesChangesAction {
+    type Output = GitSubmodulesChangesAction;
+    fn convert(self) -> Result<Self::Output> {
+        let converted = match self {
+            RawGitSubmodulesChangesAction::KEEP => GitSubmodulesChangesAction::Keep,
+            RawGitSubmodulesChangesAction::STRIP => GitSubmodulesChangesAction::Strip,
+            RawGitSubmodulesChangesAction::EXPAND => GitSubmodulesChangesAction::Expand,
+            RawGitSubmodulesChangesAction::UNKNOWN => GitSubmodulesChangesAction::default(),
+            v => {
+                return Err(anyhow!(
+                    "Invalid value {} for enum GitSubmodulesChangesAction",
+                    v
+                ));
+            }
+        };
+        Ok(converted)
+    }
+}
+
 impl Convert for RawCommitSyncSmallRepoConfig {
     type Output = SmallRepoCommitSyncConfig;
 
@@ -163,8 +188,15 @@ impl Convert for RawCommitSyncSmallRepoConfig {
             default_action,
             default_prefix,
             mapping,
+            git_submodules_action,
+            submodule_dependencies,
+            submodule_metadata_file_prefix,
+            dangling_submodule_pointers,
             ..
         } = self;
+
+        let submodule_metadata_file_prefix = submodule_metadata_file_prefix
+            .unwrap_or(DEFAULT_GIT_SUBMODULE_METADATA_FILE_PREFIX.to_string());
 
         let default_action = match default_action.as_str() {
             "preserve" => DefaultSmallToLargeCommitSyncPathAction::Preserve,
@@ -181,15 +213,37 @@ impl Convert for RawCommitSyncSmallRepoConfig {
             },
             other => return Err(anyhow!("unknown default_action: {:?}", other)),
         };
+        let submodule_dependencies = submodule_dependencies
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(path, id)| Ok((NonRootMPath::new(path)?, RepositoryId::new(id))))
+            .collect::<Result<HashMap<_, _>>>()
+            .context("Failed to get small repo dependencies from config")?;
 
         let map = mapping
             .into_iter()
             .map(|(k, v)| Ok((NonRootMPath::new(k)?, NonRootMPath::new(v)?)))
             .collect::<Result<HashMap<_, _>>>()?;
 
+        let git_submodules_action = match git_submodules_action {
+            Some(git_submodules_action) => git_submodules_action.convert()?,
+            None => GitSubmodulesChangesAction::default(),
+        };
+        let dangling_submodule_pointers = dangling_submodule_pointers
+            .unwrap_or(Vec::new())
+            .into_iter()
+            .map(|git_commit_str| GitSha1::from_str(&git_commit_str))
+            .collect::<Result<Vec<_>>>()?;
+
         Ok(SmallRepoCommitSyncConfig {
             default_action,
             map,
+            submodule_config: SmallRepoGitSubmoduleConfig {
+                git_submodules_action,
+                submodule_dependencies,
+                submodule_metadata_file_prefix,
+                dangling_submodule_pointers,
+            },
         })
     }
 }
@@ -217,8 +271,17 @@ impl Convert for RawCommonCommitSyncConfig {
                             small_repo_config.bookmark_prefix
                         )
                     })?;
+                let common_pushrebase_bookmarks_map = small_repo_config
+                    .common_pushrebase_bookmarks_map
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(k, v)| Ok((BookmarkKey::from_str(&k)?, BookmarkKey::from_str(&v)?)))
+                    .collect::<Result<_>>()?;
 
-                let config = SmallRepoPermanentConfig { bookmark_prefix };
+                let config = SmallRepoPermanentConfig {
+                    bookmark_prefix,
+                    common_pushrebase_bookmarks_map,
+                };
                 Ok((repo_id, config))
             })
             .collect::<Result<_>>()?;

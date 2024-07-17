@@ -1,8 +1,9 @@
-#debugruntest-compatible
+
+#require no-eden
+
 #inprocess-hg-incompatible
 
   $ eagerepo
-  $ enable tweakdefaults
 
 Setup repo
 

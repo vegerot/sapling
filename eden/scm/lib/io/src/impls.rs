@@ -14,6 +14,12 @@ use std::sync::Weak;
 
 use crate::IsTty;
 
+impl IsTty for std::io::Empty {
+    fn is_tty(&self) -> bool {
+        false
+    }
+}
+
 impl IsTty for std::io::Stdin {
     fn is_tty(&self) -> bool {
         stdin().is_terminal()
@@ -152,13 +158,13 @@ impl IsTty for crate::IOError {
     }
 }
 
-pub(crate) struct PipeWriterWithTty {
-    inner: pipe::PipeWriter,
+pub(crate) struct WriterWithTty {
+    inner: Box<dyn std::io::Write + Sync + Send>,
     pretend_tty: bool,
     pub(crate) pretend_stdout: bool,
 }
 
-impl std::io::Write for PipeWriterWithTty {
+impl std::io::Write for WriterWithTty {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.inner.write(buf)
     }
@@ -168,7 +174,7 @@ impl std::io::Write for PipeWriterWithTty {
     }
 }
 
-impl IsTty for PipeWriterWithTty {
+impl IsTty for WriterWithTty {
     fn is_tty(&self) -> bool {
         self.pretend_tty
     }
@@ -180,8 +186,8 @@ impl IsTty for PipeWriterWithTty {
     }
 }
 
-impl PipeWriterWithTty {
-    pub fn new(inner: pipe::PipeWriter, pretend_tty: bool) -> Self {
+impl WriterWithTty {
+    pub fn new(inner: Box<dyn std::io::Write + Sync + Send>, pretend_tty: bool) -> Self {
         Self {
             inner,
             pretend_tty,

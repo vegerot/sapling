@@ -127,10 +127,6 @@ class httppasswordmgrdbproxy:
         return tuple(v for v in self._get_mgr().find_user_password(realm, uri))
 
 
-def _catchterm(*args):
-    raise error.SignalInterrupt
-
-
 # unique object used to detect no default value has been provided when
 # retrieving configuration value.
 _unset: object = uiconfig._unset
@@ -153,7 +149,7 @@ class deprecationlevel(IntEnum):
 
 
 class ui:
-    def __init__(self, src=None, rcfg=None):
+    def __init__(self, src=None, rctx=None):
         """Create a fresh new ui object if no src given
 
         Use uimod.ui.load() to create a ui which knows global and user configs.
@@ -179,8 +175,6 @@ class ui:
         self._styles = {}
         # Whether the output stream is known to be a terminal.
         self._terminaloutput = None
-        # The current command name being executed.
-        self.cmdname = None
 
         # CLI config overrides to allow easier reloading of config.
         self.cliconfigs = []
@@ -193,6 +187,7 @@ class ui:
             self.fout = src.fout
             self.ferr = src.ferr
             self.fin = src.fin
+            self.io = src.io
             self.pageractive = src.pageractive
             self._disablepager = src._disablepager
             self._tweaked = src._tweaked
@@ -211,6 +206,7 @@ class ui:
 
             self.metrics = src.metrics
             self.cmdname = src.cmdname
+            self.cmdtype = src.cmdtype
 
             self.cliconfigs = src.cliconfigs.copy()
             self.cliconfigfiles = src.cliconfigfiles.copy()
@@ -218,11 +214,13 @@ class ui:
 
             self.identity = src.identity
         else:
-            self._uiconfig = uiconfig.uiconfig(rcfg=rcfg)
+            self._uiconfig = uiconfig.uiconfig(rctx=rctx)
 
-            self.fout = util.refcell(util.get_main_io().output())
-            self.ferr = util.refcell(util.get_main_io().error())
-            self.fin = util.refcell(util.stdin)
+            io = util.get_main_io()
+            self.fout = util.refcell(io.output())
+            self.ferr = util.refcell(io.error())
+            self.fin = util.refcell(io.input())
+            self.io = io
             self.pageractive = False
             self._disablepager = False
             self._tweaked = False
@@ -234,6 +232,9 @@ class ui:
             self._measuredtimes = collections.defaultdict(int)
 
             self.metrics = metrics.metrics(self)
+            # The current command name being executed.
+            self.cmdname = None
+            self.cmdtype = None
 
             self.identity = identity.default()
 
@@ -283,18 +284,6 @@ class ui:
 
     def copy(self):
         return self.__class__(self)
-
-    def copywithoutrepo(self):
-        """Create a copy sans repo-specific config."""
-
-        # This copies the config as well, but uiconfig.load below
-        # completely replaces the _uiconfig object.
-        repoless = self.copy()
-        uiconfig.uiconfig.load(repoless, None)
-
-        repoless.setclioverrides(self.cliconfigs, self.cliconfigfiles)
-        repoless.deriveconfigfromclioptions(self.clioptions)
-        return repoless
 
     def resetstate(self):
         """Clear internal state that shouldn't persist across commands"""
@@ -548,8 +537,6 @@ class ui:
             user = self.config("ui", "username")
             if user is not None:
                 user = os.path.expandvars(user)
-        if user is None:
-            user = encoding.environ.get("EMAIL")
         if user is None and acceptempty:
             return user
         if user is None and not self.plain("username"):
@@ -626,10 +613,11 @@ class ui:
         self._bufferstates.append((error, subproc, labeled))
         self._bufferapplylabels = labeled
 
-    def popbuffer(self) -> str:
+    def popbuffer(self, errors="strict") -> str:
         """pop the last buffer and return the buffered output
 
-        Throws if any element of the buffer is not str.
+        Content written by `ui.writebytes` gets utf-8 decoded based on the
+        `errors` handler. See `str.decode` for valid values of `errors`.
         """
         self._bufferstates.pop()
         if self._bufferstates:
@@ -638,14 +626,14 @@ class ui:
             self._bufferapplylabels = None
 
         buf = self._buffers.pop()
-        if any(not isinstance(s, str) for s in buf):
-            raise error.ProgrammingError("popbuffer cannot be used on bytes buffer")
-        return "".join(buf)
+        return "".join(
+            (b if isinstance(b, str) else b.decode(errors=errors)) for b in buf
+        )
 
     def popbufferbytes(self) -> bytes:
         """pop the last buffer and return the buffered output
 
-        Throws if any element of the buffer is not bytes.
+        Content written by `ui.write` gets utf-8 encoded.
         """
         self._bufferstates.pop()
         if self._bufferstates:
@@ -654,9 +642,7 @@ class ui:
             self._bufferapplylabels = None
 
         buf = self._buffers.pop()
-        if any(not isinstance(s, bytes) for s in buf):
-            raise error.ProgrammingError("popbufferbytes cannot be used on str buffer")
-        return b"".join(buf)
+        return b"".join((b if isinstance(b, bytes) else b.encode()) for b in buf)
 
     def popbufferlist(self) -> "List[Union[str, bytes]]":
         """pop the last buffer and return the buffered output as a list
@@ -730,20 +716,10 @@ class ui:
             self._write(*msgs)
 
     def _write(self, *msgs: str) -> None:
-        starttime = util.timer()
         try:
             self.fout.write(encodeutf8("".join(msgs)))
         except IOError as err:
             raise error.StdioError(err)
-        finally:
-            # Assuming the only way to be blocked on stdout is the pager.
-            seconds = util.timer() - starttime
-            # Using util.traced is in theory correct, but will generate too
-            # many (noisy) tracing events. Only log blocking events that
-            # takes some time (ex. 0.1s).
-            if seconds >= 0.1:
-                util.info("stdio", cat="blocked-after", millis=int(seconds * 1000))
-            self._measuredtimes["stdio_blocked"] += (seconds) * 1000
 
     def writebytes(self, *args, **opts):
         """Like `write` but taking bytes instead of str as arguments.
@@ -765,17 +741,10 @@ class ui:
             self._writebytes(*msgs, **opts)
 
     def _writebytes(self, *msgs, **opts):
-        starttime = util.timer()
         try:
             self.fout.write(b"".join(msgs))
         except IOError as err:
             raise error.StdioError(err)
-        finally:
-            # Assuming the only way to be blocked on stdout is the pager.
-            millis = int((util.timer() - starttime) * 1000)
-            if millis >= 20:
-                util.info("stdio", cat="blocked-after", millis=millis)
-            self._measuredtimes["stdio_blocked"] += millis
 
     def write_err(self, *args, **opts):
         if self._outputui is not None or (
@@ -787,7 +756,6 @@ class ui:
             self._write_err(*msgs, **opts)
 
     def _write_err(self, *msgs, **opts):
-        starttime = util.timer()
         try:
             if not getattr(self.fout, "closed", False):
                 self.fout.flush()
@@ -801,12 +769,6 @@ class ui:
         except IOError as inst:
             if inst.errno not in (errno.EPIPE, errno.EIO, errno.EBADF):
                 raise error.StdioError(inst)
-        finally:
-            # Assuming the only way to be blocked on stdout is the pager.
-            millis = int((util.timer() - starttime) * 1000)
-            if millis >= 20:
-                util.info("stdio", cat="blocked-after", millis=millis)
-            self._measuredtimes["stdio_blocked"] += millis
 
     def flush(self):
         try:
@@ -844,6 +806,7 @@ class ui:
           command: The full, non-aliased name of the command. That is, "log"
                    not "history, "summary" not "summ", etc.
         """
+
         if self._disablepager or self.pageractive:
             # how pager should do is already determined
             return
@@ -884,8 +847,11 @@ class ui:
 
         wasformatted = self.formatted
         wasterminaloutput = self.terminaloutput()
-        if hasattr(signal, "SIGPIPE"):
-            util.signal(signal.SIGPIPE, _catchterm)
+
+        if self.configbool("experimental", "rust-custom-pager", True):
+            self._runrustpager(pagercmd)
+            return
+
         if pagercmd == "internal:streampager":
             self._runinternalstreampager()
         elif self._runpager(pagercmd, pagerenv):
@@ -906,6 +872,27 @@ class ui:
             # given, don't try again when the command runs, to avoid a duplicate
             # warning about a missing pager command.
             self.disablepager()
+
+    def _runrustpager(self, pagercmd):
+        """Delegate both streampager and custom pagers to rust"""
+        self.debug("starting rust pager command: %r\n" % pagercmd)
+
+        origencoding = encoding.outputencoding
+
+        self.flush()
+        util.get_main_io().start_pager(self._rcfg)
+
+        # The Rust streampager wants utf-8 unconditionally.
+        if pagercmd == "internal:streampager":
+            encoding.outputencoding = "utf-8"
+
+        @self.atexit
+        def waitpager():
+            util.get_main_io().wait_pager()
+            encoding.outputencoding = origencoding
+
+        self.pageractive = True
+        return True
 
     def _runinternalstreampager(self):
         """Start the builtin streampager"""
@@ -931,6 +918,7 @@ class ui:
         This is separate in part so that extensions (like chg) can
         override how a pager is invoked.
         """
+
         if command == "cat":
             # Save ourselves some work.
             return False
@@ -979,6 +967,18 @@ class ui:
         os.dup2(pager.stdin.fileno(), util.stdout.fileno())
         if self._isatty(util.stderr) and self.configbool("pager", "stderr"):
             os.dup2(pager.stdin.fileno(), util.stderr.fileno())
+
+        if os.name == "nt":
+            # Note:
+            # - `terminate_pid_tree_on_exit` is only available on Windows.
+            # - Cannot use atexit or ctrlc handler, since TerminateProcess does
+            #   not give them a chance to run.
+            # - Need process tree killing. The "pager" process might be
+            #   "cmd.exe". "less.exe" is a child. Killing "cmd.exe" does
+            #   not affect "less.exe".
+            # - Important when running with commandserver, where Ctrl+C does
+            #   not affect the server-spawned "less.exe" directly.
+            bindings.process.terminate_pid_tree_on_exit(pager.pid)
 
         @self.atexit
         def killpager():
@@ -1348,7 +1348,7 @@ class ui:
         if action == "diff":
             suffix = ".diff"
         elif action:
-            suffix = ".%s.hg.txt" % action
+            suffix = ".%s.%s.txt" % (action, self.identity.cliname())
         else:
             suffix = extra["suffix"]
 
@@ -1359,7 +1359,9 @@ class ui:
             rdir = os.path.join(rdir, "edit-tmp")
             util.makedirs(rdir)
         (fd, name) = tempfile.mkstemp(
-            prefix="hg-" + extra["prefix"] + "-", suffix=suffix, dir=rdir
+            prefix=self.identity.cliname() + "-" + extra["prefix"] + "-",
+            suffix=suffix,
+            dir=rdir,
         )
         try:
             f = util.fdopen(fd, r"wb")
@@ -1580,6 +1582,14 @@ class ui:
 
         self._logsample(service, *origmsg, **opts)
 
+    def log_exception(self, *msg, **opts):
+        """A wrapper around log() that automatically adds common fields for exceptions metrics"""
+        common_fields = {
+            "client_correlator": bindings.clientinfo.get_client_correlator().decode(),
+        }
+        opts.update(common_fields)
+        self.log("exceptions", *msg, **opts)
+
     def deprecate(
         self, name, message, maxlevel=deprecationlevel.Log, startstr=None, endstr=None
     ):
@@ -1692,6 +1702,10 @@ class ui:
           env_vars = PATH,SHELL
         """
 
+        if event == "metrics":
+            # This is sampled in Rust.
+            return
+
         category = bindings.hgmetrics.samplingcategory(event)
         if category is None:
             return
@@ -1706,9 +1720,7 @@ class ui:
             }
 
         opts["metrics_type"] = event
-        if msg and event != "metrics":
-            # do not keep message for "metrics", which only wants
-            # to log key/value dict.
+        if msg:
             if len(msg) == 1:
                 # don't try to format if there is only one item.
                 opts["msg"] = msg[0]
@@ -1808,6 +1820,9 @@ class ui:
     @property
     def _rcfg(self):
         return self._uiconfig._rcfg
+
+    def rustcontext(self) -> bindings.context.context:
+        return self._uiconfig._rctx.withconfig(self._rcfg)
 
     @property
     def quiet(self):

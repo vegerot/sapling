@@ -1,12 +1,14 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2 or any later version.
 
-  $ configure modernclient
   $ setconfig devel.segmented-changelog-rev-compat=true
+  $ setconfig checkout.use-rust=true
 
   $ cat >> $HGRCPATH << 'EOF'
   > [extensions]
@@ -313,8 +315,9 @@
   U a/a
 
   $ hg shelve
-  abort: unshelve already in progress
-  (use 'hg unshelve --continue' or 'hg unshelve --abort')
+  abort: unshelve in progress
+  (use 'hg unshelve --continue' to continue or
+       'hg unshelve --abort' to abort)
   [255]
 
 # Abort the unshelve and be happy
@@ -364,8 +367,9 @@
   (no more unresolved files)
   continue: hg unshelve --continue
   $ hg commit -m 'commit while unshelve in progress'
-  abort: unshelve already in progress
-  (use 'hg unshelve --continue' or 'hg unshelve --abort')
+  abort: unshelve in progress
+  (use 'hg unshelve --continue' to continue or
+       'hg unshelve --abort' to abort)
   [255]
   $ hg graft --continue
   abort: no graft in progress
@@ -955,7 +959,7 @@
   $ echo '' > root
   $ hg shelve -q
   $ echo contADDent > root
-  $ hg unshelve -q --config 'ui.origbackuppath=.hg/origbackups'
+  $ hg unshelve -q --config 'ui.origbackuppath=@DOTDIR@/origbackups'
   warning: 1 conflicts while merging root! (edit, then use 'hg resolve --mark')
   unresolved conflicts (see 'hg resolve', then 'hg unshelve --continue')
   [1]
@@ -991,11 +995,11 @@
   [1]
 
   $ sed 's/ae8c668541e8/123456789012/' .hg/shelvedstate > ../corrupt-shelvedstate
-  $ mv ../corrupt-shelvedstate .hg/histedit-state
+  $ mv ../corrupt-shelvedstate .hg/shelvedstate
 
   $ hg unshelve --abort
-  rebase aborted
-  unshelve of * aborted (glob)
+  could not read shelved state file, your working copy may be in an unexpected state
+  please update to some commit
   $ hg up -C .
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ cd ..
@@ -1302,3 +1306,23 @@
   unshelving change 'default'
   $ cat file2
   2
+
+# Test unshelve new added files in a sub-directory (non-reporoot)
+
+  $ newclientrepo
+  $ mkdir foo && cd foo
+  $ touch a
+  $ hg ci -Aqm a
+  $ touch b
+  $ hg add b
+  $ hg shelve
+  shelved as default
+  0 files updated, 0 files merged, 1 files removed, 0 files unresolved
+  $ touch b
+  $ hg st
+  ? b
+  $ hg unshelve
+  unshelving change 'default'
+  $ hg st
+  A b
+  ? b.orig

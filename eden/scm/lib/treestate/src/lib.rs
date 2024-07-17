@@ -17,8 +17,8 @@ pub mod errors;
 mod filereadwrite;
 pub mod filestate;
 pub mod filestore;
-mod legacy_eden_dirstate;
 pub mod metadata;
+pub mod overlay_dirstate;
 pub mod root;
 pub mod serialization;
 pub mod store;
@@ -26,5 +26,8 @@ pub mod tree;
 pub mod treestate;
 pub mod vecmap;
 pub mod vecstack;
+mod wait;
+
+pub use wait::Wait;
 
 pub use crate::errors::*;

@@ -13,8 +13,8 @@ use anyhow::Error;
 use anyhow::Result;
 use byteorder::BigEndian;
 use byteorder::ByteOrder;
-use bytes_old::BytesMut;
-use tokio_io::codec::Decoder;
+use bytes::BytesMut;
+use tokio_util::codec::Decoder;
 
 use crate::errors::ErrorKind;
 use crate::types::StreamHeader;

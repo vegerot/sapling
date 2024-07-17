@@ -17,13 +17,14 @@ use byteorder::BigEndian;
 use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
 use configmodel::convert::ByteCount;
+use configmodel::Config;
 use edenapi_types::FileEntry;
 use edenapi_types::TreeEntry;
 use indexedlog::log::IndexOutput;
 use lz4_pyframe::compress;
 use lz4_pyframe::decompress;
 use minibytes::Bytes;
-use parking_lot::RwLock;
+use once_cell::sync::OnceCell;
 use tracing::warn;
 use types::hgid::ReadHgIdExt;
 use types::HgId;
@@ -52,7 +53,7 @@ pub struct IndexedLogHgIdDataStoreConfig {
 }
 
 pub struct IndexedLogHgIdDataStore {
-    store: RwLock<Store>,
+    store: Store,
     extstored_policy: ExtStoredPolicy,
     missing: MissingInjection,
 }
@@ -62,7 +63,7 @@ pub struct Entry {
     key: Key,
     metadata: Metadata,
 
-    content: Option<Bytes>,
+    content: OnceCell<Bytes>,
     compressed_content: Option<Bytes>,
 }
 
@@ -70,7 +71,7 @@ impl std::cmp::PartialEq for Entry {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
             && self.metadata == other.metadata
-            && match (self.content_inner(), other.content_inner()) {
+            && match (self.calculate_content(), other.calculate_content()) {
                 (Ok(c1), Ok(c2)) if c1 == c2 => true,
                 _ => false,
             }
@@ -81,7 +82,7 @@ impl Entry {
     pub fn new(key: Key, content: Bytes, metadata: Metadata) -> Self {
         Entry {
             key,
-            content: Some(content),
+            content: OnceCell::with_value(content),
             metadata,
             compressed_content: None,
         }
@@ -123,16 +124,16 @@ impl Entry {
 
         Ok(Entry {
             key,
-            content: None,
+            content: OnceCell::new(),
             compressed_content: Some(bytes),
             metadata,
         })
     }
 
     /// Read an entry from the IndexedLog and deserialize it.
-    pub fn from_log(key: &Key, log: &RwLock<Store>) -> Result<Option<Self>> {
+    pub(crate) fn from_log(id: &[u8], log: &Store) -> Result<Option<Self>> {
         let locked_log = log.read();
-        let mut log_entry = locked_log.lookup(0, key.hgid.as_ref())?;
+        let mut log_entry = locked_log.lookup(0, id)?;
         let buf = match log_entry.next() {
             None => return Ok(None),
             Some(buf) => buf?,
@@ -144,7 +145,7 @@ impl Entry {
     }
 
     /// Write an entry to the IndexedLog. See [`from_log`] for the detail about the on-disk format.
-    pub fn write_to_log(self, log: &RwLock<Store>) -> Result<()> {
+    pub fn write_to_log(self, log: &Store) -> Result<()> {
         let mut buf = Vec::new();
         buf.write_all(self.key.hgid.as_ref())?;
         let path_slice = self.key.path.as_byte_slice();
@@ -154,8 +155,8 @@ impl Entry {
 
         let compressed = if let Some(compressed) = self.compressed_content {
             compressed
-        } else if let Some(raw) = self.content {
-            compress(&raw)?.into()
+        } else if let Some(raw) = self.content.get() {
+            compress(raw)?.into()
         } else {
             bail!("No content");
         };
@@ -166,23 +167,20 @@ impl Entry {
         log.write().append(buf)
     }
 
-    fn content_inner(&self) -> Result<Bytes> {
-        if let Some(content) = self.content.as_ref() {
-            return Ok(content.clone());
-        }
-
-        if let Some(compressed) = self.compressed_content.as_ref() {
-            let raw = Bytes::from(decompress(compressed)?);
-            Ok(raw)
-        } else {
-            bail!("No content");
-        }
+    pub(crate) fn calculate_content(&self) -> Result<Bytes> {
+        let content = self.content.get_or_try_init(|| {
+            if let Some(compressed) = self.compressed_content.as_ref() {
+                let raw = Bytes::from(decompress(compressed)?);
+                Ok(raw)
+            } else {
+                bail!("No content");
+            }
+        })?;
+        Ok(content.clone())
     }
 
-    pub fn content(&mut self) -> Result<Bytes> {
-        self.content = Some(self.content_inner()?);
-        // this unwrap is safe because we assign the field in the line above
-        Ok(self.content.as_ref().unwrap().clone())
+    pub fn content(&self) -> Result<Bytes> {
+        self.calculate_content()
     }
 
     pub fn metadata(&self) -> &Metadata {
@@ -207,31 +205,35 @@ impl Entry {
 impl IndexedLogHgIdDataStore {
     /// Create or open an `IndexedLogHgIdDataStore`.
     pub fn new(
+        config: &dyn Config,
         path: impl AsRef<Path>,
         extstored_policy: ExtStoredPolicy,
-        config: &IndexedLogHgIdDataStoreConfig,
+        log_config: &IndexedLogHgIdDataStoreConfig,
         store_type: StoreType,
     ) -> Result<Self> {
-        let open_options = IndexedLogHgIdDataStore::open_options(config);
+        let open_options = IndexedLogHgIdDataStore::open_options(config, log_config);
 
         let log = match store_type {
-            StoreType::Local => open_options.local(&path),
-            StoreType::Shared => open_options.shared(&path),
+            StoreType::Permanent => open_options.permanent(&path),
+            StoreType::Rotated => open_options.rotated(&path),
         }?;
 
         Ok(IndexedLogHgIdDataStore {
-            store: RwLock::new(log),
+            store: log,
             extstored_policy,
             missing: MissingInjection::new_from_env("MISSING_FILES"),
         })
     }
 
-    fn open_options(config: &IndexedLogHgIdDataStoreConfig) -> StoreOpenOptions {
+    fn open_options(
+        config: &dyn Config,
+        log_config: &IndexedLogHgIdDataStoreConfig,
+    ) -> StoreOpenOptions {
         // If you update defaults/logic here, please update the "cache" help topic
         // calculations in help.py.
 
         // Default configuration: 4 x 2.5GB.
-        let mut open_options = StoreOpenOptions::new()
+        let mut open_options = StoreOpenOptions::new(config)
             .max_log_count(4)
             .max_bytes_per_log(2500 * 1000 * 1000)
             .auto_sync_threshold(50 * 1024 * 1024)
@@ -240,38 +242,63 @@ impl IndexedLogHgIdDataStore {
                 vec![IndexOutput::Reference(0..HgId::len() as u64)]
             });
 
-        if let Some(max_log_count) = config.max_log_count {
+        if let Some(max_log_count) = log_config.max_log_count {
             open_options = open_options.max_log_count(max_log_count);
         }
-        if let Some(max_bytes_per_log) = config.max_bytes_per_log {
+        if let Some(max_bytes_per_log) = log_config.max_bytes_per_log {
             open_options = open_options.max_bytes_per_log(max_bytes_per_log.value());
-        } else if let Some(max_bytes) = config.max_bytes {
+        } else if let Some(max_bytes) = log_config.max_bytes {
             let log_count: u64 = open_options.max_log_count.unwrap_or(1).max(1).into();
             open_options = open_options.max_bytes_per_log((max_bytes.value() / log_count).max(1));
         }
+
         open_options
     }
 
     pub fn repair(
+        config: &dyn Config,
         path: PathBuf,
-        config: &IndexedLogHgIdDataStoreConfig,
+        log_config: &IndexedLogHgIdDataStoreConfig,
         store_type: StoreType,
     ) -> Result<String> {
         match store_type {
-            StoreType::Local => IndexedLogHgIdDataStore::open_options(config).repair_local(path),
-            StoreType::Shared => IndexedLogHgIdDataStore::open_options(config).repair_shared(path),
+            StoreType::Permanent => {
+                IndexedLogHgIdDataStore::open_options(config, log_config).repair_permanent(path)
+            }
+            StoreType::Rotated => {
+                IndexedLogHgIdDataStore::open_options(config, log_config).repair_rotated(path)
+            }
         }
     }
 
     /// Attempt to read an Entry from IndexedLog, replacing the stored path with the one from the provided Key
-    pub fn get_entry(&self, key: Key) -> Result<Option<Entry>> {
-        Ok(self.get_raw_entry(&key)?.map(|e| e.with_key(key)))
+    pub(crate) fn get_entry(&self, key: Key) -> Result<Option<Entry>> {
+        Ok(self.get_raw_entry(&key.hgid)?.map(|e| e.with_key(key)))
     }
 
-    // TODO(meyer): Make IndexedLogHgIdDataStore "directly" lockable so we can lock and do a batch of operations (RwLock Guard pattern)
     /// Attempt to read an Entry from IndexedLog, without overwriting the Key (return Key path may not match the request Key path)
-    pub(crate) fn get_raw_entry(&self, key: &Key) -> Result<Option<Entry>> {
-        Entry::from_log(key, &self.store)
+    pub(crate) fn get_raw_entry(&self, id: &HgId) -> Result<Option<Entry>> {
+        Entry::from_log(id.as_ref(), &self.store)
+    }
+
+    /// Return whether the store contains the given id.
+    pub(crate) fn contains(&self, id: &HgId) -> Result<bool> {
+        self.store.read().contains(0, id.as_ref())
+    }
+
+    /// Directly get the local content. Do not ask remote servers.
+    pub(crate) fn get_local_content_direct(&self, id: &HgId) -> Result<Option<Bytes>> {
+        let entry = match self.get_raw_entry(id)? {
+            None => return Ok(None),
+            Some(v) => v,
+        };
+        if entry.metadata().is_lfs() {
+            // Does not handle the LFS complexity here.
+            // It seems this is not actually used in modern setup.
+            return Ok(None);
+        }
+        let data = hgstore::strip_hg_file_metadata(&entry.calculate_content()?)?.0;
+        Ok(Some(data))
     }
 
     /// Write an entry to the IndexedLog
@@ -335,10 +362,8 @@ impl LocalStore for IndexedLogHgIdDataStore {
                         warn!("Force missing: {}", k.path);
                         return true;
                     }
-                    match Entry::from_log(k, &self.store) {
-                        Ok(None) | Err(_) => true,
-                        Ok(Some(_)) => false,
-                    }
+
+                    !self.contains(&k.hgid).unwrap_or(false)
                 }
                 StoreKey::Content(_, _) => true,
             })
@@ -355,7 +380,7 @@ impl HgIdDataStore for IndexedLogHgIdDataStore {
             content => return Ok(StoreResult::NotFound(content)),
         };
 
-        let mut entry = match self.get_raw_entry(&key)? {
+        let entry = match self.get_raw_entry(&key.hgid)? {
             None => return Ok(StoreResult::NotFound(StoreKey::HgId(key))),
             Some(entry) => entry,
         };
@@ -374,7 +399,7 @@ impl HgIdDataStore for IndexedLogHgIdDataStore {
             content => return Ok(StoreResult::NotFound(content)),
         };
 
-        let entry = match self.get_raw_entry(&key)? {
+        let entry = match self.get_raw_entry(&key.hgid)? {
             None => return Ok(StoreResult::NotFound(StoreKey::HgId(key))),
             Some(entry) => entry,
         };
@@ -394,7 +419,7 @@ impl HgIdDataStore for IndexedLogHgIdDataStore {
 
 impl ToKeys for IndexedLogHgIdDataStore {
     fn to_keys(&self) -> Vec<Result<Key>> {
-        let log = &self.store.read();
+        let log = self.store.read();
         log.iter()
             .map(|entry| {
                 let bytes = log.slice_to_bytes(entry?);
@@ -407,15 +432,16 @@ impl ToKeys for IndexedLogHgIdDataStore {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::remove_file;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    use fs_err::remove_file;
     use minibytes::Bytes;
     use tempfile::TempDir;
+    use types::fetch_mode::FetchMode;
     use types::testutil::*;
 
     use super::*;
-    use crate::scmstore::FetchMode;
     use crate::scmstore::FileAttributes;
     use crate::scmstore::FileStore;
     use crate::testutil::*;
@@ -429,10 +455,11 @@ mod tests {
             max_bytes: None,
         };
         let log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Use,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )
         .unwrap();
         log.flush().unwrap();
@@ -447,10 +474,11 @@ mod tests {
             max_bytes: None,
         };
         let log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Use,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )
         .unwrap();
 
@@ -474,10 +502,11 @@ mod tests {
             max_bytes: None,
         };
         let log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Use,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )
         .unwrap();
 
@@ -497,10 +526,11 @@ mod tests {
             max_bytes: None,
         };
         let log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Use,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )
         .unwrap();
         let read_data = log.get(StoreKey::hgid(delta.key)).unwrap();
@@ -516,10 +546,11 @@ mod tests {
             max_bytes: None,
         };
         let log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Use,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )
         .unwrap();
 
@@ -536,10 +567,11 @@ mod tests {
             max_bytes: None,
         };
         let log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Use,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?;
 
         let delta = Delta {
@@ -562,10 +594,11 @@ mod tests {
             max_bytes: None,
         };
         let log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Use,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?;
 
         let k = key("a", "2");
@@ -590,10 +623,11 @@ mod tests {
             max_bytes: None,
         };
         let log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Use,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?;
 
         let k = key("a", "2");
@@ -620,10 +654,11 @@ mod tests {
             max_bytes: None,
         };
         let log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Use,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?;
         let k = key("a", "3");
         let delta = Delta {
@@ -649,10 +684,11 @@ mod tests {
             max_bytes: None,
         };
         let log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Ignore,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?;
 
         let delta = Delta {
@@ -684,10 +720,11 @@ mod tests {
             max_bytes: None,
         };
         let log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Use,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?;
 
         let delta = Delta {
@@ -727,10 +764,11 @@ mod tests {
             max_bytes: None,
         };
         let local = Arc::new(IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tmp,
             ExtStoredPolicy::Ignore,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?);
 
         local.add(&d, &meta).unwrap();
@@ -768,10 +806,11 @@ mod tests {
             max_bytes: None,
         };
         let local = Arc::new(IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tmp,
             ExtStoredPolicy::Ignore,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?);
 
         // Set up local-only FileStore
@@ -804,10 +843,11 @@ mod tests {
             max_bytes: None,
         };
         let log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Use,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?;
 
         let lfs_key = key("a", "1");
@@ -835,7 +875,7 @@ mod tests {
         store.lfs_threshold_bytes = Some(123);
 
         let fetched = store.fetch(
-            vec![lfs_key.clone(), nonlfs_key.clone()].into_iter(),
+            vec![lfs_key.clone(), nonlfs_key.clone()],
             FileAttributes::CONTENT,
             FetchMode::AllowRemote,
         );
@@ -852,7 +892,7 @@ mod tests {
         // Note: We don't fully respect ExtStoredPolicy in scmstore. We try to resolve the pointer,
         // and if we can't we no longer return the serialized pointer. Thus, this fails with
         // "unknown metadata" trying to deserialize a malformed LFS pointer.
-        assert!(format!("{:#?}", missing[&lfs_key][0]).contains("unknown metadata"));
+        assert!(format!("{:#?}", missing[&lfs_key]).contains("unknown metadata"));
         Ok(())
     }
 
@@ -865,10 +905,11 @@ mod tests {
             max_bytes: None,
         };
         let log = IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tempdir,
             ExtStoredPolicy::Ignore,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?;
 
         let lfs_key = key("a", "1");
@@ -896,7 +937,7 @@ mod tests {
         store.lfs_threshold_bytes = Some(123);
 
         let fetched = store.fetch(
-            vec![lfs_key.clone(), nonlfs_key.clone()].into_iter(),
+            vec![lfs_key.clone(), nonlfs_key.clone()],
             FileAttributes::CONTENT,
             FetchMode::AllowRemote,
         );
@@ -910,7 +951,7 @@ mod tests {
             content
         );
 
-        assert_eq!(missing[&lfs_key].len(), 1);
+        assert!(missing.contains_key(&lfs_key));
         Ok(())
     }
 }

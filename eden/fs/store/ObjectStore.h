@@ -13,26 +13,29 @@
 #include <unordered_map>
 
 #include <folly/logging/xlog.h>
+#include <gtest/gtest_prod.h>
+
+#include "eden/common/utils/CaseSensitivity.h"
+#include "eden/common/utils/RefPtr.h"
 #include "eden/fs/model/BlobMetadata.h"
 #include "eden/fs/model/Hash.h"
 #include "eden/fs/model/RootId.h"
 #include "eden/fs/model/TreeEntry.h"
 #include "eden/fs/model/TreeFwd.h"
+#include "eden/fs/store/BackingStore.h"
 #include "eden/fs/store/IObjectStore.h"
 #include "eden/fs/store/ImportPriority.h"
 #include "eden/fs/store/ObjectFetchContext.h"
-#include "eden/fs/utils/CaseSensitivity.h"
-#include "eden/fs/utils/RefPtr.h"
 
 namespace facebook::eden {
 
-class BackingStore;
 class Blob;
 class EdenConfig;
 class EdenStats;
 class ProcessInfoCache;
 class StructuredLogger;
 class TreeCache;
+class LocalStore;
 enum class ObjectComparison : uint8_t;
 
 using EdenStatsPtr = RefPtr<EdenStats>;
@@ -80,6 +83,7 @@ class ObjectStore : public IObjectStore,
  public:
   static std::shared_ptr<ObjectStore> create(
       std::shared_ptr<BackingStore> backingStore,
+      std::shared_ptr<LocalStore> localStore,
       std::shared_ptr<TreeCache> treeCache,
       EdenStatsPtr stats,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
@@ -174,6 +178,8 @@ class ObjectStore : public IObjectStore,
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const override;
 
+  // TODO(T192128228): Add GetTreeMetadata method for caching purposes
+
   /**
    * Prefetch all the blobs represented by the HashRange.
    *
@@ -251,10 +257,25 @@ class ObjectStore : public IObjectStore,
       const ObjectFetchContextPtr& context) const;
 
   /**
+   * Get file paths matching the given globs
+   */
+  ImmediateFuture<BackingStore::GetGlobFilesResult> getGlobFiles(
+      const RootId& id,
+      const std::vector<std::string>& globs,
+      const ObjectFetchContextPtr& context) const;
+
+  /**
    * Get the BackingStore used by this ObjectStore
    */
   const std::shared_ptr<BackingStore>& getBackingStore() const {
     return backingStore_;
+  }
+
+  /**
+   * Get the TreeCache used by this ObjectStore
+   */
+  const std::shared_ptr<TreeCache>& getTreeCache() const {
+    return treeCache_;
   }
 
   /**
@@ -290,9 +311,16 @@ class ObjectStore : public IObjectStore,
   }
 
  private:
+  FRIEND_TEST(ObjectStoreTest, caching_policies_anything);
+  FRIEND_TEST(ObjectStoreTest, caching_policies_no_caching);
+  FRIEND_TEST(ObjectStoreTest, caching_policies_blob);
+  FRIEND_TEST(ObjectStoreTest, caching_policies_trees);
+  FRIEND_TEST(ObjectStoreTest, caching_policies_blob_metadata);
+  FRIEND_TEST(ObjectStoreTest, caching_policies_trees_and_blob_metadata);
   // Forbidden constructor. Use create().
   ObjectStore(
       std::shared_ptr<BackingStore> backingStore,
+      std::shared_ptr<LocalStore> localStore,
       std::shared_ptr<TreeCache> treeCache,
       EdenStatsPtr stats,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
@@ -306,18 +334,48 @@ class ObjectStore : public IObjectStore,
 
   Hash32 computeBlake3(const Blob& blob) const;
 
-  static constexpr size_t kCacheSize = 1000000;
+  /**
+   * Check if the object should be cached in the LocalStore. If
+   * localStoreCachingPolicy_ is set to NoCaching, this will always return
+   * false.
+   */
+  bool shouldCacheOnDisk(BackingStore::LocalStoreCachingPolicy object) const;
+
+  /*
+   * This method should only be used for testing purposes.
+   */
+  void setLocalStoreCachingPolicy(
+      BackingStore::LocalStoreCachingPolicy policy) {
+    localStoreCachingPolicy_ = policy;
+  }
+
+  folly::SemiFuture<BackingStore::GetTreeResult> getTreeImpl(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) const;
+
+  folly::SemiFuture<BackingStore::GetBlobResult> getBlobImpl(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) const;
+
+  folly::SemiFuture<BackingStore::GetBlobMetaResult> getBlobMetadataImpl(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) const;
+
+  ImmediateFuture<BackingStore::GetGlobFilesResult> getGlobFilesImpl(
+      const RootId& id,
+      const std::vector<std::string>& globs,
+      const ObjectFetchContextPtr& context) const;
 
   /**
    * During status and checkout, it's common to look up the SHA-1 for a given
    * blob ID. To avoid needing to hit RocksDB, keep a bounded in-memory cache of
    * the sizes and SHA-1s of blobs we've seen. Each node is somewhere around 50
-   * bytes (20+28 + LRU overhead) and we store kMetadataCacheSize entries, which
-   * EvictingCacheMap divides in two for some reason. At the time of this
-   * comment, EvictingCacheMap does not store its nodes densely, so there may
-   * also be some jemalloc tracking overhead and some internal fragmentation
-   * depending on whether the node fits cleanly into one of jemalloc's size
-   * classes.
+   * bytes (20+28 + LRU overhead) and we store metadataCacheSize entries (as
+   * defined in EdenConfig.h), which EvictingCacheMap divides in two for some
+   * reason. At the time of this comment, EvictingCacheMap does not store its
+   * nodes densely, so there may also be some jemalloc tracking overhead and
+   * some internal fragmentation depending on whether the node fits cleanly
+   * into one of jemalloc's size classes.
    *
    * TODO: It never makes sense to rlock an LRU cache, since cache hits mutate
    * the data structure. Thus, should we use a more appropriate type of lock?
@@ -344,6 +402,21 @@ class ObjectStore : public IObjectStore,
    * Multiple ObjectStores may share the same BackingStore.
    */
   std::shared_ptr<BackingStore> backingStore_;
+
+  /*
+   * The on-disk cache which is used with most of the BackingStore
+   */
+  std::shared_ptr<LocalStore> localStore_;
+
+  /*
+   * BackingStore can turn off on-disk cache by setting this to
+   * LocalStoreCachingPolicy::NoCaching
+   *
+   * TODO: This might be better suited to either live in the BackingStore, or
+   * be determined by querying the BackingStore, as opposed to being a
+   * constructor argument, since this is strongly tied to that class.
+   */
+  BackingStore::LocalStoreCachingPolicy localStoreCachingPolicy_;
 
   EdenStatsPtr const stats_;
 

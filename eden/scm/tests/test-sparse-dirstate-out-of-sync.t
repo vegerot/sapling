@@ -1,13 +1,7 @@
-#debugruntest-compatible
 
-#testcases pythonstatus ruststatus
-#if pythonstatus
-  $ setconfig status.use-rust=false workingcopy.rust-status=false
-#else
-  $ setconfig status.use-rust=true workingcopy.rust-status=true
-#endif
+#require no-eden
 
-  $ configure modernclient
+
 
   $ enable sparse
   $ newclientrepo myrepo

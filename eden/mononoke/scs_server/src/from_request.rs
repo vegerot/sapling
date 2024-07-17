@@ -39,10 +39,10 @@ use mononoke_api::FileId;
 use mononoke_api::FileType;
 use mononoke_api::HgChangesetId;
 use mononoke_api::HgChangesetIdPrefix;
-use mononoke_api::MononokePath;
 use mononoke_api::TreeId;
 use mononoke_types::hash::Sha1;
 use mononoke_types::hash::Sha256;
+use mononoke_types::path::MPath;
 use source_control as thrift;
 
 use crate::commit_id::CommitIdExt;
@@ -102,25 +102,21 @@ impl FromRequest<thrift::CandidateSelectionHint> for CandidateSelectionHintArgs 
         match hint {
             thrift::CandidateSelectionHint::bookmark_ancestor(bookmark) => {
                 let bookmark = BookmarkKey::from_request(bookmark)?;
-                Ok(CandidateSelectionHintArgs::OnlyOrAncestorOfBookmark(
-                    bookmark,
-                ))
+                Ok(CandidateSelectionHintArgs::AncestorOfBookmark(bookmark))
             }
             thrift::CandidateSelectionHint::bookmark_descendant(bookmark) => {
                 let bookmark = BookmarkKey::from_request(bookmark)?;
-                Ok(CandidateSelectionHintArgs::OnlyOrDescendantOfBookmark(
-                    bookmark,
-                ))
+                Ok(CandidateSelectionHintArgs::DescendantOfBookmark(bookmark))
             }
             thrift::CandidateSelectionHint::commit_ancestor(commit) => {
                 let changeset_specifier = ChangesetSpecifier::from_request(commit)?;
-                Ok(CandidateSelectionHintArgs::OnlyOrAncestorOfCommit(
+                Ok(CandidateSelectionHintArgs::AncestorOfCommit(
                     changeset_specifier,
                 ))
             }
             thrift::CandidateSelectionHint::commit_descendant(commit) => {
                 let changeset_specifier = ChangesetSpecifier::from_request(commit)?;
-                Ok(CandidateSelectionHintArgs::OnlyOrDescendantOfCommit(
+                Ok(CandidateSelectionHintArgs::DescendantOfCommit(
                     changeset_specifier,
                 ))
             }
@@ -318,7 +314,7 @@ impl FromRequest<thrift::RepoCreateCommitParamsFileCopyInfo> for CreateCopyInfo 
     fn from_request(
         copy_info: &thrift::RepoCreateCommitParamsFileCopyInfo,
     ) -> Result<Self, thrift::RequestError> {
-        let path = MononokePath::try_from(&copy_info.path).map_err(|e| {
+        let path = MPath::try_from(&copy_info.path).map_err(|e| {
             errors::invalid_request(format!(
                 "invalid copy-from path '{}': {}",
                 copy_info.path, e
@@ -384,16 +380,7 @@ impl FromRequest<thrift::DateTime> for DateTime<FixedOffset> {
 
 impl FromRequest<thrift::DerivedDataType> for DerivableType {
     fn from_request(data_type: &thrift::DerivedDataType) -> Result<Self, thrift::RequestError> {
-        match *data_type {
-            thrift::DerivedDataType::FSNODE | thrift::DerivedDataType::FSNODE_OLD => {
-                Ok(DerivableType::Fsnodes)
-            }
-            thrift::DerivedDataType::SKELETON_MANIFEST => Ok(DerivableType::SkeletonManifests),
-            val => Err(errors::invalid_request(format!(
-                "unsupported derived data type ({})",
-                val
-            ))),
-        }
+        DerivableType::from_thrift(*data_type).map_err(errors::invalid_request)
     }
 }
 

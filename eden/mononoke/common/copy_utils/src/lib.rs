@@ -6,6 +6,7 @@
  */
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::num::NonZeroU64;
 
 use anyhow::anyhow;
@@ -26,6 +27,7 @@ use mononoke_types::BonsaiChangesetMut;
 use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
 use mononoke_types::FileChange;
+use mononoke_types::GitLfs;
 use mononoke_types::NonRootMPath;
 use regex::Regex;
 use repo_blobstore::RepoBlobstoreRef;
@@ -65,7 +67,7 @@ pub async fn copy(
     // These are the file changes that have to be copied
     let mut file_changes = BTreeMap::new();
     let mut total_file_size = 0;
-    let mut contents_to_upload = vec![];
+    let mut contents_to_upload = HashSet::new();
     let same_repo = source_repo.repo_identity().id() == target_repo.repo_identity().id();
 
     for (from_dir, to_dir) in from_to_dirs {
@@ -113,7 +115,7 @@ pub async fn copy(
             file_changes.insert(to_path, Some((from_path, fsnode_file)));
 
             if !same_repo {
-                contents_to_upload.push(fsnode_file.content_id().clone());
+                contents_to_upload.insert(fsnode_file.content_id().clone());
             }
 
             if let Some(lfs_threshold) = limits.lfs_threshold {
@@ -195,6 +197,7 @@ async fn create_changesets(
                         *fsnode_file.file_type(),
                         fsnode_file.size(),
                         copy_from,
+                        GitLfs::FullContent,
                     )
                 }
                 None => FileChange::Deletion,
@@ -291,7 +294,7 @@ async fn list_directory(
         .try_collect::<Vec<_>>()
         .await?;
 
-    let entry = entries.get(0);
+    let entry = entries.first();
 
     let fsnode_id = match entry {
         Some((_, Entry::Tree(fsnode_id))) => fsnode_id,
@@ -789,7 +792,7 @@ mod test {
         .await?;
 
         assert_eq!(
-            list_working_copy_utf8(&ctx, &repo, *cs_ids.get(0).unwrap()).await?,
+            list_working_copy_utf8(&ctx, &repo, *cs_ids.first().unwrap()).await?,
             hashmap! {
                 NonRootMPath::new("dir_from/a")? => "aa".to_string(),
                 NonRootMPath::new("dir_from/b")? => "b".to_string(),
@@ -993,7 +996,7 @@ mod test {
         .await?;
 
         assert_eq!(
-            list_working_copy_utf8(&ctx, &target_repo, *cs_ids.get(0).unwrap()).await?,
+            list_working_copy_utf8(&ctx, &target_repo, *cs_ids.first().unwrap()).await?,
             hashmap! {
                 NonRootMPath::new("target_random_file")? => "tr".to_string(),
             }
@@ -1011,7 +1014,7 @@ mod test {
         assert_eq!(
             target_repo
                 .changeset_fetcher()
-                .get_parents(&ctx, *cs_ids.get(0).unwrap())
+                .get_parents(&ctx, *cs_ids.first().unwrap())
                 .await?,
             vec![target_cs_id],
         );

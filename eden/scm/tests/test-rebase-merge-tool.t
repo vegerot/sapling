@@ -1,8 +1,9 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ enable rebase
   $ setconfig rebase.experimental.inmemory=True
-  $ configure modernclient
 
 Prepare repo
 

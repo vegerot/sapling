@@ -1,14 +1,10 @@
-#require git no-windows
-#debugruntest-compatible
+#require git no-windows no-eden
+#modern-config-incompatible
 
   $ . $TESTDIR/git.sh
   $ setconfig diff.git=true ui.allowemptycommit=true
   $ enable rebase
   $ export HGIDENTITY=sl
-
-Avoid local clone error "fatal: transport 'file' not allowed" in new Git versions (see CVE-2022-39253).
-  $ export XDG_CONFIG_HOME=$TESTTMP
-  $ git config --global protocol.file.allow always
 
 Prepare smaller submodules
 
@@ -62,14 +58,19 @@ Clone the git repo with submodules
 
 Checking out commits triggers submodule updates
 
-  $ hg checkout '.^'
+  $ hg checkout '.^' --config experimental.submodule-pull-quiet=False
   pulling submodule mod/1
+  From * (glob)
+     73c8ee0..0de3093  0de30934572f96ff6d3cbfc70aa8b46ef95dbb42 -> parent/mod_1
   pulling submodule mod/2
+  From * (glob)
+     f4140cb..f02e91c  f02e91cd72c210709673488ad9224fdc72e49018 -> parent/mod_2
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ echo mod/*/*
   mod/1/A mod/1/B mod/2/C mod/2/D
 
-  $ hg checkout main
+  $ LOG=ext::sigtrace=debug hg checkout main --config extensions.sigtrace= --config sigtrace.interval=60
+  DEBUG ext::sigtrace: starting sigtrace thread
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ echo mod/*/*
   mod/1/A mod/2/C

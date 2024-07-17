@@ -86,6 +86,15 @@ pub fn configure(config: &dyn configmodel::Config) -> configmodel::Result<()> {
         let use_symlink_atomic_write: bool =
             config.get_or_default("format", "use-symlink-atomic-write")?;
         SYMLINK_ATOMIC_WRITE.store(use_symlink_atomic_write, atomic::Ordering::Release);
+
+        #[cfg(all(unix, feature = "sigbus-handler"))]
+        {
+            let use_sigbus_handler: bool =
+                config.get_or_default("unsafe", "indexedlog-zerofill-mmap-sigbus")?;
+            if use_sigbus_handler {
+                crate::sigbus::register_sigbus_handler();
+            }
+        }
     }
 
     if let Some(max_chain_len) =

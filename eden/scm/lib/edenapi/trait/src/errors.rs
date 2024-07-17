@@ -5,8 +5,10 @@
  * GNU General Public License version 2.
  */
 
+use std::time::Duration;
+
 use edenapi_types::wire::WireToApiConversionError;
-use edenapi_types::EdenApiServerError;
+use edenapi_types::SaplingRemoteApiServerError;
 use http::header::HeaderMap;
 use http::status::StatusCode;
 use http_client::HttpClientError;
@@ -16,7 +18,7 @@ use thiserror::Error;
 use types::errors::NetworkError;
 
 #[derive(Debug, Error)]
-pub enum EdenApiError {
+pub enum SaplingRemoteApiError {
     #[error("failed to serialize request: {0}")]
     RequestSerializationFailed(#[source] serde_cbor::Error),
     #[error("failed to parse response: {0}")]
@@ -37,7 +39,7 @@ pub enum EdenApiError {
     #[error(transparent)]
     WireToApiConversionFailed(#[from] WireToApiConversionError),
     #[error(transparent)]
-    ServerError(#[from] EdenApiServerError),
+    ServerError(#[from] SaplingRemoteApiServerError),
     #[error("expected response, but none returned by the server")]
     NoResponse,
     #[error(transparent)]
@@ -56,9 +58,9 @@ pub enum ConfigError {
     Invalid(String, #[source] anyhow::Error),
 }
 
-impl EdenApiError {
+impl SaplingRemoteApiError {
     pub fn is_rate_limiting(&self) -> bool {
-        use EdenApiError::*;
+        use SaplingRemoteApiError::*;
         match self {
             HttpError { status, .. } => {
                 if status.is_client_error() {
@@ -76,7 +78,7 @@ impl EdenApiError {
 
     pub fn is_retryable(&self) -> bool {
         use http_client::HttpClientError::*;
-        use EdenApiError::*;
+        use SaplingRemoteApiError::*;
         match self {
             Http(client_error) => match client_error {
                 Tls(TlsError { kind, .. }) => kind == &TlsErrorKind::RecvError,
@@ -94,19 +96,37 @@ impl EdenApiError {
                         _ => false,
                     }
                 // 500-599
-                } else if status.is_server_error() {
-                    true
                 } else {
-                    false
+                    // request could be too heavy
+                    if *status == StatusCode::GATEWAY_TIMEOUT {
+                        return false;
+                    }
+                    status.is_server_error()
                 }
             }
             _ => false,
         }
     }
 
+    pub fn retry_after(&self, attempt: usize, max: usize) -> Option<Duration> {
+        if self.is_retryable() && attempt < max {
+            // Retrying for a longer period of time is simply a
+            // way to wait until whatever surge of traffic is happening ends.
+            if self.is_rate_limiting() {
+                Some(Duration::from_secs(
+                    u32::pow(2, std::cmp::min(3, attempt as u32 + 1)) as u64,
+                ))
+            } else {
+                Some(Duration::from_secs(attempt as u64 + 1))
+            }
+        } else {
+            None
+        }
+    }
+
     // Report whether this error may be a network error. Err on the side of saying "yes".
     pub fn maybe_network_error(&self) -> bool {
-        use EdenApiError::*;
+        use SaplingRemoteApiError::*;
 
         match self {
             Http(_) | HttpError { .. } | ServerError(_) | NoResponse | Other(_) => true,

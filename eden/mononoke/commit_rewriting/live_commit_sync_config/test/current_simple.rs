@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use anyhow::Result;
 use fbinit::FacebookInit;
 use live_commit_sync_config::LiveCommitSyncConfig;
 use mononoke_types::RepositoryId;
@@ -14,10 +15,20 @@ use crate::EMPTY_PUSHREDIRECTOR;
 use crate::EMTPY_COMMIT_SYNC_ALL;
 
 #[fbinit::test]
-async fn test_empty_configs(fb: FacebookInit) {
-    let (_ctx, _test_source, _store, live_commit_sync_config) =
+async fn test_empty_configs(fb: FacebookInit) -> Result<()> {
+    let (ctx, _test_source, _store, live_commit_sync_config) =
         get_ctx_source_store_and_live_config(fb, EMPTY_PUSHREDIRECTOR, EMTPY_COMMIT_SYNC_ALL);
     let repo_1 = RepositoryId::new(1);
-    assert!(!live_commit_sync_config.push_redirector_enabled_for_draft(repo_1));
-    assert!(!live_commit_sync_config.push_redirector_enabled_for_public(repo_1));
+    assert!(
+        !live_commit_sync_config
+            .push_redirector_enabled_for_draft(&ctx, repo_1)
+            .await?
+    );
+    assert!(
+        !live_commit_sync_config
+            .push_redirector_enabled_for_public(&ctx, repo_1)
+            .await?
+    );
+
+    Ok(())
 }

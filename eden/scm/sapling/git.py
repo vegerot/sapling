@@ -8,15 +8,15 @@ utilities for git support
 """
 
 import errno
+import functools
 import hashlib
 import os
 import re
-import shutil
 import subprocess
 import textwrap
 import weakref
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import bindings
 from sapling import tracing
@@ -36,6 +36,9 @@ GIT_STORE_REQUIREMENT = "git-store"
 # Whether the repo should use git format when creating new objects.
 # Should be set if git-store is set.
 GIT_FORMAT_REQUIREMENT = "git"
+
+# Whether to be compatibile with `.git/`.
+DOTGIT_REQUIREMENT = "dotgit"
 
 
 class GitCommandError(error.Abort):
@@ -81,17 +84,41 @@ def isgitpeer(repo):
     return isgitstore(repo)
 
 
-def createrepo(ui, url, destpath):
-    from . import hg
+def createrepo(ui, url, destpath, submodule=None):
 
-    repo_config = "%include builtin:git.rc\n"
+    repo_config = ""
     if url:
         repo_config += "\n[paths]\ndefault = %s\n" % url
 
-    return hg.repository(ui, destpath, create=True, initial_config=repo_config).local()
+    return setup_repository(
+        ui, destpath, create=True, initial_config=repo_config, submodule=submodule
+    ).local()
 
 
-def clone(ui, url, destpath=None, update=True, pullnames=None):
+def setup_repository(ui, path, create=False, initial_config=None, submodule=None):
+    """similar to hg.repository, but optionally sets `submodule`"""
+    from . import hg
+
+    presetupfuncs = []
+
+    if submodule is not None:
+        weak_submodule = weakref.proxy(submodule)
+
+        def setup_submodule(ui, repo):
+            repo.submodule = weak_submodule
+
+        presetupfuncs.append(setup_submodule)
+
+    return hg.repository(
+        ui,
+        path,
+        create=create,
+        initial_config=initial_config,
+        presetupfuncs=presetupfuncs,
+    )
+
+
+def clone(ui, url, destpath=None, update=True, pullnames=None, submodule=None):
     """Clone a git repo, then create a repo at dest backed by the git repo.
     update can be False, or True, or a node to update to.
     - False: do not update, leave an empty working copy.
@@ -101,8 +128,12 @@ def clone(ui, url, destpath=None, update=True, pullnames=None):
     - None: use default refspecs set by configs.
     - []: do not fetch anything.
     If url is empty, create the repo but do not add a remote.
+    If submodule is set, it will be passed to `setup_repository`.
     """
     from . import hg
+
+    if url.endswith("/"):
+        url = url[:-1]
 
     if destpath is None:
         # use basename as fallback, but strip ".git" or "/.git".
@@ -126,11 +157,11 @@ def clone(ui, url, destpath=None, update=True, pullnames=None):
 
     with bindings.atexit.AtExit.rmtree(destpath):
         try:
-            repo = createrepo(ui, url, destpath)
+            repo = createrepo(ui, url, destpath, submodule=submodule)
             ret = initgitbare(ui, repo.svfs.join("git"))
             if ret != 0:
                 raise error.Abort(_("git clone was not successful"))
-            initgit(repo, "git", url)
+            repo = initgit(repo, "git", url)
             if url:
                 if pullnames is None:
                     ls_remote_args = ["ls-remote", "--symref", url, "HEAD"]
@@ -255,8 +286,12 @@ def initgit(repo, gitdir, giturl=None):
         repo.storerequirements.add(GIT_FORMAT_REQUIREMENT)
         repo.storerequirements.add(GIT_STORE_REQUIREMENT)
         repo._writestorerequirements()
-        repo.invalidatechangelog()
-        visibility.add(repo, repo.changelog.dageval(lambda: heads(all())))
+    # recreate the repo to pick up key changes
+    from . import hg
+
+    repo = setup_repository(repo.baseui, repo.root).local()
+    visibility.add(repo, repo.changelog.dageval(lambda: heads(all())))
+    return repo
 
 
 def maybegiturl(url):
@@ -320,7 +355,9 @@ def initgitbare(ui, destpath):
 @cached
 def readgitdir(repo):
     """Return the path of the GIT_DIR, if the repo is backed by git"""
-    if isgitstore(repo):
+    if DOTGIT_REQUIREMENT in repo.requirements:
+        return repo.wvfs.join(".git")
+    elif isgitstore(repo):
         path = repo.svfs.readutf8(GIT_DIR_FILE)
         if os.path.isabs(path):
             return path
@@ -334,7 +371,9 @@ def openstore(repo):
     """Obtain a gitstore object to access git odb"""
     gitdir = readgitdir(repo)
     if gitdir:
-        return bindings.gitstore.gitstore(gitdir)
+        if DOTGIT_REQUIREMENT not in repo.storerequirements:
+            write_maintained_git_config(repo)
+        return bindings.gitstore.gitstore(gitdir, repo.ui._rcfg)
 
 
 @cached
@@ -352,6 +391,89 @@ def readconfig(repo):
         section, name = sectionname.split(".", 1)
         config.set(section, name, value, "git")
     return config
+
+
+# By default, `git maintenance run --auto` (run by `git fetch`) triggers GC,
+# which runs repack. The gc/repack can cause compatibility issues with
+# shallow/not-shallow mix, such as some blob or tree cannot be read. `repack
+# --filter=tree:0` might work but it can be slow.
+#
+# `git maintenance run --task incremental-repack` and
+# `git maintenance run --task loose-objects` seem to work.
+#
+# `repack.writeBitmaps` is incompatible with `repack --filter...` and
+# might cause issues. Therefore disable it.
+MAINTAINED_GIT_CONFIG = """
+[maintenance "gc"]
+  enabled = false
+[maintenance "loose-objects"]
+  enabled = true
+[maintenance "incremental-repack"]
+  enabled = true
+[repack]
+  writeBitmaps = false
+"""
+
+
+@cached
+def write_maintained_git_config(repo):
+    """Update the git repo config file so it contains the maintained config."""
+    # For performance we are going to modify the git/config directly.
+    gitdir = readgitdir(repo)
+    config_path = os.path.join(gitdir, "config")
+    try:
+        old_config = util.readfileutf8(config_path)
+    except FileNotFoundError:
+        old_config = ""
+    new_config = calculate_new_config(old_config, MAINTAINED_GIT_CONFIG)
+    if new_config != old_config:
+        util.replacefile(config_path, new_config.encode())
+
+
+def calculate_new_config(old_config: str, maintained_config: str):
+    r"""
+    Examples:
+
+    Empty config:
+        >>> print(calculate_new_config('user config', ''))
+        user config
+
+    Add a maintained config section:
+        >>> c = calculate_new_config('user config', 'maintained config') + 'user config2'
+        >>> print(c)
+        user config
+        #### Begin maintained by Sapling ####
+        maintained config
+        #### End maintained by Sapling ####
+        user config2
+
+    No-op change to the maintained config section:
+        >>> print(calculate_new_config(c, 'maintained config'))
+        user config
+        #### Begin maintained by Sapling ####
+        maintained config
+        #### End maintained by Sapling ####
+        user config2
+
+    Change the maintained config section:
+        >>> print(calculate_new_config(c, 'maintained config - changed'))
+        user config
+        #### Begin maintained by Sapling ####
+        maintained config - changed
+        #### End maintained by Sapling ####
+        user config2
+    """
+    begin_split = "\n#### Begin maintained by Sapling ####\n"
+    end_split = "\n#### End maintained by Sapling ####\n"
+    if begin_split in old_config and end_split in old_config:
+        head, rest = old_config.split(begin_split, 1)
+        old_maintained, tail = rest.split(end_split, 1)
+    else:
+        head = old_config
+        tail = old_maintained = ""
+    if old_maintained == maintained_config:
+        return old_config
+    return "".join([head, begin_split, maintained_config, end_split, tail])
 
 
 def update_and_persist_config(repo, section, name, value):
@@ -537,7 +659,7 @@ def _writerefs(repo, refnodes):
     Only 'refs/heads/<name>' references are written (as local bookmarks).
     Other references will be normalized to `refs/visibleheads/<hex>`.
     """
-    for (ref, node) in refnodes:
+    for ref, node in refnodes:
         ref = str(ref)
         if not ref.startswith("refs/heads/"):
             # ref might be non-standard like "BUNDLE_HEAD".
@@ -585,6 +707,10 @@ def pullrefspecs(repo, url, refspecs):
         # Nothing to pull
         return 0
     args = ["fetch", "--no-tags", "--prune"]
+    if repo.ui.configbool("git", "shallow"):
+        filter_config = repo.ui.config("git", "filter")
+        if filter_config:
+            args.append(f"--filter={filter_config}")
     if _supportwritefetchhead(repo):
         args.append("--no-write-fetch-head")
     args += [url] + refspecs
@@ -653,12 +779,35 @@ def parsesubmodules(ctx):
 
     data = ctx[".gitmodules"].data()
     submodules = []
-    for (name, url, path) in bindings.workingcopy.parsegitsubmodules(data):
+    for name, url, path in bindings.workingcopy.parsegitsubmodules(data):
         submodules.append(
             Submodule(name, url, path, weakref.proxy(repo)),
         )
 
     return submodules
+
+
+def maybe_cleanup_submodule_in_treestate(repo):
+    """Remove treestate submodule entries, based on '.gitmodules' in the working copy.
+
+    By the current design, treestate should not track submodules. However,
+    those entries sometimes (mistakenly?) got in the treestate. This function
+    cleans them up.
+    """
+    if (
+        "treestate" not in repo.requirements
+        or GIT_FORMAT_REQUIREMENT not in repo.storerequirements
+    ):
+        # No need to cleanup if treestate is not used (ex. dotgit), or if Git format is not used.
+        return
+
+    data = repo.wvfs.tryread(".gitmodules")
+    if not data:
+        return
+
+    remove = repo.dirstate._map._tree.remove
+    for _name, _url, path in bindings.workingcopy.parsegitsubmodules(data):
+        remove(path)
 
 
 def submodulecheckout(ctx, match=None, force=False, mctx=None):
@@ -770,9 +919,7 @@ class Submodule:
         repopath = self.gitmodulesvfs.join("gitmodules", urldigest)
         ident = identity.sniffdir(repopath)
         if ident:
-            from . import hg
-
-            repo = hg.repository(self.parentrepo.baseui, repopath)
+            repo = setup_repository(self.parentrepo.baseui, repopath, submodule=self)
         else:
             # create the repo but do not fetch anything
             repo = clone(
@@ -781,8 +928,9 @@ class Submodule:
                 destpath=repopath,
                 update=False,
                 pullnames=[],
+                submodule=self,
             )
-        repo.submodule = weakref.proxy(self)
+        self._inherit_git_config(repo)
         return repo
 
     @util.propertycache
@@ -803,7 +951,7 @@ class Submodule:
         ident = identity.sniffdir(repopath)
         if ident:
             ui.debug(" initializing submodule workingcopy at %s\n" % repopath)
-            repo = hg.repository(self.parentrepo.baseui, repopath)
+            repo = setup_repository(self.parentrepo.baseui, repopath, submodule=self)
         else:
             if self.parentrepo.wvfs.isfile(self.path):
                 ui.debug(" unlinking conflicted submodule file at %s\n" % self.path)
@@ -815,10 +963,21 @@ class Submodule:
                 % (repopath, backingrepo.root)
             )
             repo = hg.share(
-                backingrepo.ui, backingrepo.root, repopath, update=False, relative=True
+                backingrepo.ui,
+                backingrepo.root,
+                repopath,
+                update=False,
+                relative=True,
+                repository=functools.partial(setup_repository, submodule=self),
             )
-        repo.submodule = weakref.proxy(self)
+        self._inherit_git_config(repo)
         return repo
+
+    def _inherit_git_config(self, subrepo):
+        """Inherit [git] configs from parentrepo to subrepo"""
+        for name, value in self.parentrepo.ui.configitems("git"):
+            if subrepo.ui.config("git", name) is None:
+                subrepo.ui.setconfig("git", name, value, "parent")
 
     @util.propertycache
     def gitmodulesvfs(self):
@@ -849,18 +1008,25 @@ class Submodule:
     def pullnode(self, repo, node):
         """fetch a commit on demand, prepare for checkout"""
         if node not in repo:
-            repo.ui.status(_("pulling submodule %s\n") % self.nestedpath)
-            # Write a remote bookmark to mark node public
-            with repo.ui.configoverride({("ui", "quiet"): "true"}):
-                refspec = "+%s:refs/remotes/parent/%s" % (
-                    hex(node),
-                    # Avoids conflicts like gflags/ and gflags/doc sharing a
-                    # same backing repo. (Git does not allow one reference
-                    # "gflags" to be a prefix of another reference
-                    # "gflags/doc").
-                    self.nestedpath.replace("_", "__").replace("/", "_"),
-                )
-                pullrefspecs(repo, self.url, [refspec])
+            self._pullraw(repo, hex(node))
+
+    def pullhead(self, repo):
+        self._pullraw(repo, "HEAD")
+
+    def _pullraw(self, repo, refspec_lhs):
+        repo.ui.status(_("pulling submodule %s\n") % self.nestedpath)
+        # Write a remote bookmark to mark node public
+        quiet = repo.ui.configbool("experimental", "submodule-pull-quiet", True)
+        with repo.ui.configoverride({("ui", "quiet"): str(quiet)}):
+            refspec = "+%s:refs/remotes/parent/%s" % (
+                refspec_lhs,
+                # Avoids conflicts like gflags/ and gflags/doc sharing a
+                # same backing repo. (Git does not allow one reference
+                # "gflags" to be a prefix of another reference
+                # "gflags/doc").
+                self.nestedpath.replace("_", "__").replace("/", "_"),
+            )
+            pullrefspecs(repo, self.url, [refspec])
 
     def checkout(self, node, force=False):
         """checkout a commit in working copy"""
@@ -870,13 +1036,25 @@ class Submodule:
         if not force and self.workingparentnode() == node:
             return
 
-        repo = self.backingrepo
+        repo = self.workingcopyrepo
+
         self.pullnode(repo, node)
         # Skip if the commit is already checked out, unless force is set.
         if not force and repo["."].node() == node:
             return
 
-        repo = self.workingcopyrepo
+        if node not in repo:
+            # `node` does not exist after pull. Try to pull "HEAD" as a mitigation.
+            # NOTE: See `man gitmodules`. If "branch" is specified, then this
+            # should probably pull the specified branch instead.
+            self.pullhead(repo)
+            # Track whether pullhead fixed the issue.
+            fixed = node in repo
+            repo.ui.log(
+                "features",
+                feature="submodule-pullhead",
+                message=f"fixed: {fixed} node: {hex(node)} submod: {repr(self)}",
+            )
 
         # Run checkout
         from . import hg
@@ -891,10 +1069,20 @@ class Submodule:
             return repo.dirstate.p1()
 
         repopath = self.parentrepo.wvfs.join(self.path)
+        dotgit_path = os.path.join(repopath, ".git")
 
-        from . import dirstate
+        if DOTGIT_REQUIREMENT in self.parentrepo.requirements and os.path.exists(
+            dotgit_path
+        ):
+            # dotgit repo, .git/sl not yet initialized.
+            # read git HEAD directly.
+            git = bindings.gitcompat.RunGit(self.parentrepo.ui._rcfg, dotgit_path)
 
-        return dirstate.fastreadp1(repopath)
+            return git.resolve_head()
+        else:
+            from . import dirstate
+
+            return dirstate.fastreadp1(repopath)
 
 
 def callgit(repo, args, checkreturncode=True):
@@ -974,7 +1162,7 @@ class gitfilelog:
     """filelog-like interface for git"""
 
     def __init__(self, repo):
-        self.store = repo.fileslog.contentstore
+        self.store = repo.fileslog.filestore
 
     def lookup(self, node):
         assert len(node) == 20
@@ -1032,6 +1220,46 @@ def submodule_node_from_ctx_path(ctx, path) -> Optional[bytes]:
         return None
     fctx = ctx[path]
     return submodule_node_from_fctx(fctx)
+
+
+def author_date_from_extras(extra) -> Optional[Tuple[int, int]]:
+    """Extract the author date from commit extras.
+
+    This is encoded using the 'author_date' extra.
+    """
+    d = extra.get("author_date")
+    if d:
+        try:
+            sec_str, tz_str = d.split(" ", 1)
+            return int(sec_str), int(tz_str)
+        except ValueError:
+            pass
+    return None
+
+
+def committer_and_date_from_extras(extra) -> Optional[Tuple[str, int, int]]:
+    """Extract the committer and committer date from commit extras.
+
+    There are two ways that this may have been encoded:
+
+      * Separate 'committer' and 'committer_date' extras.  This is used by
+        Sapling.
+      * A single 'committer' extra, where the two fields are stored separated
+        by a space.  This is used by hg-git and Mononoke.
+    """
+    if "committer" in extra and "committer_date" in extra:
+        try:
+            sec_str, tz_str = extra["committer_date"].split(" ", 1)
+            return extra["committer"], int(sec_str), int(tz_str)
+        except ValueError:
+            pass
+    elif "committer" in extra:
+        try:
+            committer, sec_str, tz_str = extra["committer"].rsplit(" ", 2)
+            return committer, int(sec_str), int(tz_str)
+        except ValueError:
+            pass
+    return None
 
 
 def update_extra_with_git_committer(ui, ctx, extra):

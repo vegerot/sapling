@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +21,7 @@ use cpython_ext::PyCell;
 use cpython_ext::PyPathBuf;
 use cpython_ext::ResultPyErrExt;
 use edenapi::Builder;
-use edenapi::EdenApi;
+use edenapi::SaplingRemoteApi;
 use edenapi_ext::check_files;
 use edenapi_ext::download_files;
 use edenapi_ext::upload_snapshot;
@@ -44,37 +45,43 @@ use edenapi_types::FetchSnapshotResponse;
 use edenapi_types::FileResponse;
 use edenapi_types::FileSpec;
 use edenapi_types::FileType;
+use edenapi_types::GetReferencesParams;
 use edenapi_types::HgChangesetContent;
 use edenapi_types::HgMutationEntryContent;
 use edenapi_types::HistoryEntry;
 use edenapi_types::Key;
 use edenapi_types::LandStackResponse;
+use edenapi_types::ReferencesDataResponse;
+use edenapi_types::SetBookmarkResponse;
 use edenapi_types::SnapshotRawData;
+use edenapi_types::SuffixQueryResponse;
 use edenapi_types::TreeAttributes;
 use edenapi_types::TreeEntry;
+use edenapi_types::UpdateReferencesParams;
 use edenapi_types::UploadSnapshotResponse;
 use edenapi_types::UploadToken;
+use edenapi_types::WorkspaceDataResponse;
 use futures::TryStreamExt;
 use minibytes::Bytes;
 use pyconfigloader::config;
 use pyrevisionstore::edenapifilestore;
 use pyrevisionstore::edenapitreestore;
-use revisionstore::EdenApiFileStore;
-use revisionstore::EdenApiTreeStore;
+use revisionstore::SaplingRemoteApiFileStore;
+use revisionstore::SaplingRemoteApiTreeStore;
 use types::HgId;
 use types::RepoPathBuf;
 
-use crate::pyext::EdenApiPyExt;
+use crate::pyext::SaplingRemoteApiPyExt;
 use crate::stats::stats;
 use crate::util::to_path;
 
-// Python wrapper around an EdenAPI client.
+// Python wrapper around an SaplingRemoteAPI client.
 //
 // This is basically just FFI boilerplate. The actual functionality
 // is implemented as the default implementations of the methods in
-// the `EdenApiPyExt` trait.
+// the `SaplingRemoteApiPyExt` trait.
 py_class!(pub class client |py| {
-    data inner: Arc<dyn EdenApi>;
+    data inner: Arc<dyn SaplingRemoteApi>;
 
     def __new__(
         _cls,
@@ -186,8 +193,9 @@ py_class!(pub class client |py| {
         bookmark: String,
         to: Serde<Option<HgId>>,
         from: Serde<Option<HgId>>,
-        pushvars: Vec<(String, String)> = Vec::new(),
-    ) -> PyResult<bool> {
+        pushvars: Serde<Option<HashMap<String, String>>> = Serde(None),
+    ) -> PyResult<Serde<SetBookmarkResponse>> {
+        let pushvars = pushvars.0.unwrap_or_else(HashMap::new);
         self.inner(py).as_ref().set_bookmark_py(py, bookmark, to.0, from.0, pushvars)
     }
 
@@ -199,8 +207,9 @@ py_class!(pub class client |py| {
         bookmark: String,
         head: Serde<HgId>,
         base: Serde<HgId>,
-        pushvars: Vec<(String, String)> = Vec::new(),
+        pushvars: Serde<Option<HashMap<String, String>>> = Serde(None),
     ) -> PyResult<Serde<LandStackResponse>> {
+        let pushvars = pushvars.0.unwrap_or_else(HashMap::new);
         self.inner(py).as_ref().land_stack_py(py, bookmark, head.0, base.0, pushvars)
     }
 
@@ -219,7 +228,7 @@ py_class!(pub class client |py| {
         &self
     ) -> PyResult<edenapifilestore> {
         let edenapi = self.extract_inner(py);
-        let store = EdenApiFileStore::new(edenapi);
+        let store = SaplingRemoteApiFileStore::new(edenapi);
 
         edenapifilestore::new(py, store)
     }
@@ -228,7 +237,7 @@ py_class!(pub class client |py| {
         &self
     ) -> PyResult<edenapitreestore> {
         let edenapi = self.extract_inner(py);
-        let store = EdenApiTreeStore::new(edenapi);
+        let store = SaplingRemoteApiTreeStore::new(edenapi);
 
         edenapitreestore::new(py, store)
     }
@@ -336,18 +345,6 @@ py_class!(pub class client |py| {
         self.inner(py).as_ref().lookup_filenodes_and_trees(py, filenodes.0, trees.0)
     }
 
-    /// Upload file contents only
-    def uploadfileblobs(
-        &self,
-        store: PyObject,
-        keys: Vec<(
-            PyPathBuf,   /* path */
-            Serde<HgId>, /* hgid */
-        )>,
-    ) -> PyResult<(TStream<anyhow::Result<Serde<UploadToken>>>, PyFuture)> {
-        self.inner(py).as_ref().uploadfileblobs_py(py, store, keys)
-    }
-
     /// Upload file contents and hg filenodes
     def uploadfiles(
         &self,
@@ -358,8 +355,9 @@ py_class!(pub class client |py| {
             Serde<HgId>,   /* p1 */
             Serde<HgId>,   /* p2 */
         )>,
+        use_sha1: bool,
     ) -> PyResult<(TStream<anyhow::Result<Serde<UploadToken>>>, PyFuture)> {
-        self.inner(py).as_ref().uploadfiles_py(py, store, keys)
+        self.inner(py).as_ref().uploadfiles_py(py, store, keys, use_sha1)
     }
 
     /// Upload trees
@@ -473,15 +471,14 @@ py_class!(pub class client |py| {
     }
 
     def ephemeralprepare(&self, custom_duration: Option<u64>, labels: Option<Vec<String>>)
-        -> PyResult<TStream<anyhow::Result<Serde<EphemeralPrepareResponse>>>>
+        -> PyResult<Serde<EphemeralPrepareResponse>>
     {
         let api = self.inner(py).as_ref();
-        let entries = py
+        py
             .allow_threads(|| block_unless_interrupted(api.ephemeral_prepare(custom_duration.map(Duration::from_secs), labels)))
             .map_pyerr(py)?
-            .map_pyerr(py)?
-            .entries;
-        Ok(entries.map_ok(Serde).map_err(Into::into).into())
+            .map_pyerr(py)
+            .map(Serde)
     }
 
     /// uploadfilecontents(data: [(AnyFileContentId, Bytes)], bubbleid: int | None)
@@ -537,10 +534,45 @@ py_class!(pub class client |py| {
             .entries;
         Ok(blames.map_ok(Serde).map_err(Into::into).into())
     }
+
+    def cloudworkspace(&self, workspace: String, reponame : String)
+        -> PyResult<Serde<WorkspaceDataResponse>>
+    {
+        self.inner(py).as_ref().cloud_workspace_py(workspace,reponame, py)
+    }
+
+    def suffix_query(
+        &self,
+        commit: Serde<CommitId>,
+        suffixes: Serde<Vec<String>>,
+        prefixes: Serde<Option<Vec<String>>>,
+    ) -> PyResult<TStream<anyhow::Result<Serde<SuffixQueryResponse>>>> {
+        let api = self.inner(py).as_ref();
+        let suffix_query_response = py.allow_threads(|| block_unless_interrupted(api.suffix_query(
+            commit.0,
+            suffixes.0,
+            prefixes.0)))
+            .map_pyerr(py)?
+            .map_pyerr(py)?
+            .entries;
+        Ok(suffix_query_response.map_ok(Serde).map_err(Into::into).into())
+    }
+
+    def cloudreferences(&self, data: Serde<GetReferencesParams>)
+        -> PyResult<Serde<ReferencesDataResponse>>
+    {
+        self.inner(py).as_ref().cloud_references_py(data, py)
+    }
+
+    def cloudupdatereferences(&self, data: Serde<UpdateReferencesParams>)
+        -> PyResult<Serde<ReferencesDataResponse>>
+    {
+        self.inner(py).as_ref().cloud_update_references_py(data, py)
+    }
 });
 
 impl ExtractInnerRef for client {
-    type Inner = Arc<dyn EdenApi>;
+    type Inner = Arc<dyn SaplingRemoteApi>;
 
     fn extract_inner_ref<'a>(&'a self, py: Python<'a>) -> &'a Self::Inner {
         self.inner(py)
@@ -548,7 +580,7 @@ impl ExtractInnerRef for client {
 }
 
 impl client {
-    pub fn from_edenapi(py: Python, client: Arc<dyn EdenApi>) -> PyResult<Self> {
+    pub fn from_edenapi(py: Python, client: Arc<dyn SaplingRemoteApi>) -> PyResult<Self> {
         Self::create_instance(py, client)
     }
 }

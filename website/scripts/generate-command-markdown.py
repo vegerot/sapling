@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
+import html
 import json
 import os
 import shutil
@@ -95,6 +96,7 @@ def get_sapling() -> str:
 
 
 subprocess_cwd = os.path.dirname(__file__)
+
 
 # Extract command documentation from Sapling.
 def generate_commands_json(command_list: List[str]) -> Dict:
@@ -336,7 +338,7 @@ def create_arg_table(args) -> str:
                 cells[2] = f"`{default}`"
 
         if description:
-            cells[3] = description
+            cells[3] = html.escape(description)
 
         arg_table += "".join([f"| {cell}" for cell in cells]) + "|\n"
     return arg_table.rstrip("\n")
@@ -365,7 +367,7 @@ def regenerate_pages(command_list, commands_json, output_dir: Path):
     command_markdown = generate_pages(command_list, commands_json)
 
     markdown_files = []
-    for (command, info) in command_markdown.items():
+    for command, info in command_markdown.items():
         remove_command_doc(commands_json[command]["aliases"], output_dir)
 
         command_file_path = output_dir / f"{command}.md"

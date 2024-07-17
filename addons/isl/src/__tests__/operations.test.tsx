@@ -6,6 +6,7 @@
  */
 
 import App from '../App';
+import {tracker} from '../analytics';
 import {mostRecentSubscriptionIds} from '../serverAPIState';
 import {CommitTreeListTestUtils} from '../testQueries';
 import {
@@ -18,12 +19,10 @@ import {
   simulateRepoConnected,
   dragAndDropCommits,
   COMMIT,
+  expectYouAreHerePointAt,
 } from '../testUtils';
-import {fireEvent, render, screen, within} from '@testing-library/react';
-import {act} from 'react-dom/test-utils';
+import {fireEvent, render, screen, within, act} from '@testing-library/react';
 import * as utils from 'shared/utils';
-
-jest.mock('../MessageBus');
 
 const {clickGoto} = CommitTreeListTestUtils;
 
@@ -64,18 +63,18 @@ describe('operations', () => {
     jest.spyOn(utils, 'randomId').mockRestore();
   });
 
-  it('shows running operation', () => {
+  it('shows running operation', async () => {
     mockNextOperationId('1');
-    clickGoto('c');
+    await clickGoto('c');
 
     expect(
       within(screen.getByTestId('progress-container')).getByText('sl goto --rev c'),
     ).toBeInTheDocument();
   });
 
-  it('shows stdout from running command', () => {
+  it('shows stdout from running command', async () => {
     mockNextOperationId('1');
-    clickGoto('c');
+    await clickGoto('c');
 
     act(() => {
       simulateMessageFromServer({
@@ -104,12 +103,12 @@ describe('operations', () => {
       });
     });
 
-    expect(screen.queryByText('another message')).toBeInTheDocument();
+    expect(screen.queryByText('another message', {exact: false})).toBeInTheDocument();
   });
 
-  it('shows stderr from running command', () => {
+  it('shows stderr from running command', async () => {
     mockNextOperationId('1');
-    clickGoto('c');
+    await clickGoto('c');
 
     act(() => {
       simulateMessageFromServer({
@@ -127,7 +126,7 @@ describe('operations', () => {
       });
     });
 
-    expect(screen.queryByText('some progress...')).toBeInTheDocument();
+    expect(screen.queryByText('some progress...', {exact: false})).toBeInTheDocument();
 
     act(() => {
       simulateMessageFromServer({
@@ -138,12 +137,12 @@ describe('operations', () => {
       });
     });
 
-    expect(screen.queryByText('another message')).toBeInTheDocument();
+    expect(screen.queryByText('another message', {exact: false})).toBeInTheDocument();
   });
 
-  it('shows abort on long-running commands', () => {
+  it('shows abort on long-running commands', async () => {
     mockNextOperationId('1');
-    clickGoto('c');
+    await clickGoto('c');
     expect(abortButton()).toBeNull();
 
     act(() => {
@@ -152,9 +151,9 @@ describe('operations', () => {
     expect(abortButton()).toBeInTheDocument();
   });
 
-  it('shows successful exit status', () => {
+  it('shows successful exit status', async () => {
     mockNextOperationId('1');
-    clickGoto('c');
+    await clickGoto('c');
 
     act(() => {
       simulateMessageFromServer({
@@ -179,9 +178,9 @@ describe('operations', () => {
     ).toBeInTheDocument();
   });
 
-  it('shows unsuccessful exit status', () => {
+  it('shows unsuccessful exit status', async () => {
     mockNextOperationId('1');
-    clickGoto('c');
+    await clickGoto('c');
 
     act(() => {
       simulateMessageFromServer({
@@ -206,9 +205,9 @@ describe('operations', () => {
     ).toBeInTheDocument();
   });
 
-  it('reacts to abort', () => {
+  it('reacts to abort', async () => {
     mockNextOperationId('1');
-    clickGoto('c');
+    await clickGoto('c');
     act(() => {
       jest.advanceTimersByTime(600000);
     });
@@ -234,9 +233,9 @@ describe('operations', () => {
   });
 
   describe('queued commands', () => {
-    it('optimistically shows queued commands', () => {
+    it('optimistically shows queued commands', async () => {
       mockNextOperationId('1');
-      clickGoto('c');
+      await clickGoto('c');
 
       act(() => {
         simulateMessageFromServer({
@@ -248,9 +247,9 @@ describe('operations', () => {
       });
 
       mockNextOperationId('2');
-      clickGoto('a');
+      await clickGoto('a');
       mockNextOperationId('3');
-      clickGoto('b');
+      await clickGoto('b');
 
       expect(
         within(screen.getByTestId('queued-commands')).getByText('sl goto --rev a'),
@@ -260,9 +259,9 @@ describe('operations', () => {
       ).toBeInTheDocument();
     });
 
-    it('dequeues when the server starts the next command', () => {
+    it('dequeues when the server starts the next command', async () => {
       mockNextOperationId('1');
-      clickGoto('c');
+      await clickGoto('c');
 
       act(() => {
         simulateMessageFromServer({
@@ -274,7 +273,7 @@ describe('operations', () => {
       });
 
       mockNextOperationId('2');
-      clickGoto('a');
+      await clickGoto('a');
       expect(
         within(screen.getByTestId('queued-commands')).getByText('sl goto --rev a'),
       ).toBeInTheDocument();
@@ -291,9 +290,9 @@ describe('operations', () => {
       expect(screen.queryByTestId('queued-commands')).not.toBeInTheDocument();
     });
 
-    it('takes queued command info from server', () => {
+    it('takes queued command info from server', async () => {
       mockNextOperationId('1');
-      clickGoto('c');
+      await clickGoto('c');
 
       act(() => {
         simulateMessageFromServer({
@@ -305,9 +304,9 @@ describe('operations', () => {
       });
 
       mockNextOperationId('2');
-      clickGoto('a');
+      await clickGoto('a');
       mockNextOperationId('3');
-      clickGoto('b');
+      await clickGoto('b');
 
       act(() => {
         simulateMessageFromServer({
@@ -333,9 +332,9 @@ describe('operations', () => {
       ).not.toBeInTheDocument();
     });
 
-    it('error running command cancels queued commands', () => {
+    it('error running command cancels queued commands', async () => {
       mockNextOperationId('1');
-      clickGoto('c');
+      await clickGoto('c');
 
       act(() => {
         simulateMessageFromServer({
@@ -347,9 +346,9 @@ describe('operations', () => {
       });
 
       mockNextOperationId('2');
-      clickGoto('a');
+      await clickGoto('a');
       mockNextOperationId('3');
-      clickGoto('b');
+      await clickGoto('b');
 
       expect(screen.queryByTestId('queued-commands')).toBeInTheDocument();
       act(() => {
@@ -365,10 +364,11 @@ describe('operations', () => {
       expect(screen.queryByTestId('queued-commands')).not.toBeInTheDocument();
     });
 
-    it('force clears optimistic state after fetching after an operation has finished', () => {
+    it('force clears optimistic state after fetching after an operation has finished', async () => {
+      jest.spyOn(tracker, 'track').mockImplementation(() => null);
       const commitsBeforeOperations = {
         value: [
-          COMMIT('e', 'Commit E', 'd', {isHead: true}),
+          COMMIT('e', 'Commit E', 'd', {isDot: true}),
           COMMIT('d', 'Commit D', 'c'),
           COMMIT('c', 'Commit C', 'b'),
           COMMIT('b', 'Commit B', 'a'),
@@ -376,10 +376,10 @@ describe('operations', () => {
           COMMIT('1', 'public', '0', {phase: 'public'}),
         ],
       };
-      const commitsAfterOptions = {
+      const commitsAfterOperations = {
         value: [
           COMMIT('e2', 'Commit E', 'd2'),
-          COMMIT('d2', 'Commit D', 'c2', {isHead: true}), // goto
+          COMMIT('d2', 'Commit D', 'c2', {isDot: true}), // goto
           COMMIT('c2', 'Commit C', 'a'), // rebased
           COMMIT('b', 'Commit B', 'a'),
           COMMIT('a', 'Commit A', '1'),
@@ -407,13 +407,13 @@ describe('operations', () => {
       //                                 <----fetch1--->  (no effect)
       //                                            <---fetch2-->   (clears optimistic state)
 
-      // t=100 simulate spawn rebase
-      // t=200 simulate queue goto
-      // t=300 simulate exit rebase
-      //       expect optimistic "You were here..."
+      // t=100 simulate spawn rebase [c-d-e(YouAreHere)] -> a
+      // t=200 simulate queue goto 'd' (successor: 'd2')
+      // t=300 simulate exit rebase (success)
       // t=400 simulate spawn goto
-      // t=500 simulate exit goto
-      //       expect optimistic "You were here..."
+      // t=500 simulate exit goto (success)
+      // no "commitsAfterOperations" state received
+      //       expect optimistic "You are here" to be on the old 'e'
       // t=600 simulate new commits fetch started @ t=450, with new head
       //       no effect
       // t=700 simulate new commits fetch started @ t=550, with new head
@@ -422,7 +422,7 @@ describe('operations', () => {
 
       dragAndDropCommits('c', 'a');
       fireEvent.click(screen.getByText('Run Rebase'));
-      clickGoto('d'); // checkout d, which is now optimistic from the rebase, since it'll actually become d2.
+      await clickGoto('d'); // checkout d, which is now optimistic from the rebase, since it'll actually become d2.
 
       act(() =>
         simulateMessageFromServer({
@@ -482,7 +482,7 @@ describe('operations', () => {
           kind: 'smartlogCommits',
           subscriptionID: mostRecentSubscriptionIds.smartlogCommits,
           data: {
-            commits: commitsAfterOptions,
+            commits: commitsBeforeOperations, // not observed the new head
             fetchStartTimestamp: 400, // before goto finished
             fetchCompletedTimestamp: 450,
           },
@@ -490,8 +490,8 @@ describe('operations', () => {
       );
 
       // this latest fetch started before the goto finished, so we don't know that it has all the information
-      // included. So the optimistic state remains.
-      expect(screen.getByText('You were here...')).toBeInTheDocument();
+      // included. So the optimistic state remains (goto 'd').
+      expectYouAreHerePointAt('d');
 
       act(() =>
         simulateMessageFromServer({
@@ -499,7 +499,25 @@ describe('operations', () => {
           kind: 'smartlogCommits',
           subscriptionID: mostRecentSubscriptionIds.smartlogCommits,
           data: {
-            commits: commitsAfterOptions,
+            commits: commitsAfterOperations, // observed the new head
+            fetchStartTimestamp: 400, // before goto finished
+            fetchCompletedTimestamp: 450,
+          },
+        }),
+      );
+
+      // However, even if the latest fetch started before the goto finished,
+      // if "goto" saw that head = the new commit, the optimistic state is a
+      // no-op (does not update 'd2' from the smartlog head back to 'd').
+      expectYouAreHerePointAt('d2');
+
+      act(() =>
+        simulateMessageFromServer({
+          type: 'subscriptionResult',
+          kind: 'smartlogCommits',
+          subscriptionID: mostRecentSubscriptionIds.smartlogCommits,
+          data: {
+            commits: commitsBeforeOperations, // intentionally "incorrect" to test the force clear out
             fetchStartTimestamp: 550, // after goto finished
             fetchCompletedTimestamp: 600,
           },
@@ -510,14 +528,15 @@ describe('operations', () => {
       // it accounts for that operation.
       // So the optimistic state should be cleared out, even though we didn't
       // detect that the optimistic state should have resolved according to the applier.
-      expect(screen.queryByText('You were here...')).not.toBeInTheDocument();
+      // (does not update 'e' from the smartlog head to 'd')
+      expectYouAreHerePointAt('e');
     });
   });
 
   describe('progress messages', () => {
-    it('shows progress messages', () => {
+    it('shows progress messages', async () => {
       mockNextOperationId('1');
-      clickGoto('c');
+      await clickGoto('c');
 
       act(() => {
         simulateMessageFromServer({
@@ -540,9 +559,9 @@ describe('operations', () => {
       ).toBeInTheDocument();
     });
 
-    it('hide progress on new stdout', () => {
+    it('hide progress on new stdout', async () => {
       mockNextOperationId('1');
-      clickGoto('c');
+      await clickGoto('c');
 
       act(() => {
         simulateMessageFromServer({
@@ -583,9 +602,9 @@ describe('operations', () => {
   });
 
   describe('inline progress', () => {
-    it('shows progress messages next to commits', () => {
+    it('shows progress messages next to commits', async () => {
       mockNextOperationId('1');
-      clickGoto('c');
+      await clickGoto('c');
 
       act(() => {
         simulateMessageFromServer({

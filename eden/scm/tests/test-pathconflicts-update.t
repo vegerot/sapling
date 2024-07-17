@@ -1,8 +1,11 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 Path conflict checking is currently disabled by default because of issue5716.
 Turn it on for this test.
 
+  $ setconfig checkout.use-rust=true
   $ setconfig experimental.merge.checkpathconflicts=True
 
   $ hg init repo
@@ -44,16 +47,13 @@ Update - local file conflicts with remote directory:
   $ mkdir a
   $ echo 9 > a/b
   $ hg up dir
-  a/b: untracked file conflicts with directory
-  abort: untracked files in working directory differ from files in requested revision
+  abort: 1 conflicting file changes:
+   a/b
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
-  $ hg up dir --config merge.checkunknown=warn
-  a/b: replacing untracked file
+  $ hg up dir --config experimental.checkout.rust-path-conflicts=false
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   (activating bookmark dir)
-  $ cat a/b.orig
-  9
-  $ rm a/b.orig
 
 Update - local symlink conflicts with remote directory:
 
@@ -65,18 +65,13 @@ Update - local symlink conflicts with remote directory:
   $ touch a/b
 #endif
   $ hg up dir
-  a/b: untracked file conflicts with directory
-  abort: untracked files in working directory differ from files in requested revision
+  abort: 1 conflicting file changes:
+   a/b
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
-  $ hg up dir --config merge.checkunknown=warn
-  a/b: replacing untracked file
+  $ hg up dir --config experimental.checkout.rust-path-conflicts=false
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   (activating bookmark dir)
-#if symlink
-  $ f a/b.orig
-  a/b.orig -> x
-#endif
-  $ rm a/b.orig
 
 Update - local directory conflicts with remote file
 
@@ -84,17 +79,15 @@ Update - local directory conflicts with remote file
   $ mkdir -p a/b/c
   $ echo 9 > a/b/c/d
   $ hg up file
-  a/b: untracked directory conflicts with file
-  abort: untracked files in working directory differ from files in requested revision
+  abort: 1 conflicting file changes:
+   a/b/c/d
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
-  $ hg up file --config merge.checkunknown=warn
-  a/b: replacing untracked files in directory
+  $ hg up file --config experimental.checkout.rust-path-conflicts=false
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   (activating bookmark file)
   $ cat a/b
   1
-  $ test -d a/b.orig
-  $ rm -rf a/b.orig
 
 Update - local directory conflicts with remote symlink
 
@@ -102,19 +95,17 @@ Update - local directory conflicts with remote symlink
   $ mkdir -p a/b/c
   $ echo 9 > a/b/c/d
   $ hg up link
-  a/b: untracked directory conflicts with file
-  abort: untracked files in working directory differ from files in requested revision
+  abort: 1 conflicting file changes:
+   a/b/c/d
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
-  $ hg up link --config merge.checkunknown=warn
-  a/b: replacing untracked files in directory
+  $ hg up link --config experimental.checkout.rust-path-conflicts=false
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   (activating bookmark link)
 #if symlink
   $ f a/b
   a/b -> c
 #endif
-  $ test -d a/b.orig
-  $ rm -rf a/b.orig
 
 Update - local renamed file conflicts with remote directory
 
@@ -127,7 +118,7 @@ Update - local renamed file conflicts with remote directory
   $ hg up --check dir
   abort: uncommitted changes
   [255]
-  $ hg up dir
+  $ hg up dir --merge
   a: path conflict - a file or link has the same name as a directory
   the local file has been renamed to a~d20a80d4def3
   resolve manually then use 'hg resolve --mark a'
@@ -149,9 +140,9 @@ Update clean - local directory conflicts with changed remote file
   $ rm a/b
   $ mkdir a/b
   $ echo 9 > a/b/c
-  $ hg up file2 --check --config merge.checkunknown=warn
+  $ hg up file2 --check --config experimental.checkout.rust-path-conflicts=false
   abort: uncommitted changes
   [255]
   $ hg up file2 --clean
-  1 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  (activating bookmark file2)
+  1 files updated, 0 files merged, 1 files removed, 0 files unresolved
+  (changing active bookmark from file to file2)

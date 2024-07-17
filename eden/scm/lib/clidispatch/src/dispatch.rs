@@ -5,8 +5,10 @@
  * GNU General Public License version 2.
  */
 
+use std::borrow::Cow;
 use std::env;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Error;
 use cliparser::alias::expand_aliases;
@@ -15,7 +17,9 @@ use cliparser::parser::ParseError;
 use cliparser::parser::ParseOptions;
 use cliparser::parser::ParseOutput;
 use cliparser::parser::StructFlags;
+use cliparser::parser::Value;
 use configloader::config::ConfigSet;
+use configloader::hg::set_pinned;
 use configmodel::Config;
 use configmodel::ConfigExt;
 use repo::repo::Repo;
@@ -26,9 +30,9 @@ use crate::command::CommandFunc;
 use crate::command::CommandTable;
 use crate::errors;
 use crate::errors::UnknownCommand;
-use crate::fallback;
 use crate::global_flags::HgGlobalOpts;
 use crate::io::IO;
+use crate::util::pinned_configs;
 use crate::OptionalRepo;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -43,62 +47,9 @@ pub fn args() -> Result<Vec<String>> {
         .collect()
 }
 
-fn add_global_flag_derived_configs(repo: &mut OptionalRepo, global_opts: HgGlobalOpts) {
-    if let OptionalRepo::Some(_) = repo {
-        if global_opts.hidden {
-            let config = repo.config_mut();
-            config.set("visibility", "all-heads", Some("true"), &"--hidden".into());
-        }
-    }
-
-    let config = repo.config_mut();
-    if global_opts.trace || global_opts.traceback {
-        config.set("ui", "traceback", Some("on"), &"--traceback".into());
-    }
-    if global_opts.profile {
-        config.set("profiling", "enabled", Some("true"), &"--profile".into());
-    }
-    if !global_opts.color.is_empty() {
-        config.set(
-            "ui",
-            "color",
-            Some(global_opts.color.as_str()),
-            &"--color".into(),
-        );
-    }
-    if global_opts.verbose || global_opts.debug || global_opts.quiet {
-        config.set(
-            "ui",
-            "verbose",
-            Some(global_opts.verbose.to_string().as_str()),
-            &"--verbose".into(),
-        );
-        config.set(
-            "ui",
-            "debug",
-            Some(global_opts.debug.to_string().as_str()),
-            &"--debug".into(),
-        );
-        config.set(
-            "ui",
-            "quiet",
-            Some(global_opts.quiet.to_string().as_str()),
-            &"--quiet".into(),
-        );
-    }
-    if global_opts.noninteractive {
-        config.set("ui", "interactive", Some("off"), &"-y".into());
-    }
-}
-
 fn last_chance_to_abort(early: &HgGlobalOpts, full: &HgGlobalOpts) -> Result<()> {
-    abort_if!(
-        full.profile,
-        "--profile does not support Rust commands (yet)"
-    );
-
     if full.help {
-        fallback!("--help option requested");
+        return Err(errors::UnknownCommand("--help".to_string()).into());
     }
 
     // These are security sensitive options, so perform extra checks.
@@ -151,7 +102,7 @@ fn parse(definition: &CommandDefinition, args: &Vec<String>) -> Result<ParseOutp
     let flags = definition
         .flags()
         .into_iter()
-        .chain(HgGlobalOpts::flags().into_iter())
+        .chain(HgGlobalOpts::flags())
         .collect();
     ParseOptions::new()
         .error_on_unknown_opts(true)
@@ -181,7 +132,7 @@ fn initialize_blackbox(optional_repo: &OptionalRepo) -> Result<()> {
     Ok(())
 }
 
-fn initialize_indexedlog(config: &ConfigSet) -> Result<()> {
+fn initialize_indexedlog(config: &dyn Config) -> Result<()> {
     indexedlog::config::configure(config)?;
     Ok(())
 }
@@ -192,9 +143,10 @@ pub fn parse_global_opts(args: &[String]) -> Result<HgGlobalOpts> {
 }
 
 pub struct Dispatcher {
+    orig_args: Vec<String>,
     args: Vec<String>,
     early_result: ParseOutput,
-    global_opts: HgGlobalOpts,
+    early_global_opts: HgGlobalOpts,
     optional_repo: OptionalRepo,
 }
 
@@ -205,14 +157,22 @@ fn version_args(binary_path: &str) -> Vec<String> {
 impl Dispatcher {
     /// Load configs. Prepare to run a command.
     pub fn from_args(mut args: Vec<String>) -> Result<Self> {
+        let orig_args = args.clone();
+
         if args.get(1).map(|s| s.as_ref()) == Some("--version") {
-            args = version_args(&args[0]);
+            args[1] = "version".to_string();
         }
 
         let mut early_result = early_parse(&args[1..])?;
         let global_opts: HgGlobalOpts = early_result.clone().try_into()?;
         if global_opts.version {
             args = version_args(&args[0]);
+            if global_opts.quiet {
+                args.push("--quiet".to_string());
+            }
+            if global_opts.verbose {
+                args.push("--verbose".to_string());
+            }
             early_result = early_parse(&args[1..])?;
         }
 
@@ -226,17 +186,16 @@ impl Dispatcher {
         // Load repo and configuration.
         match OptionalRepo::from_global_opts(&global_opts, cwd) {
             Ok(optional_repo) => Ok(Self {
+                orig_args,
                 args,
                 early_result,
-                global_opts,
+                early_global_opts: global_opts,
                 optional_repo,
             }),
             Err(err) => {
                 // If we failed to load the repo, make one last ditch effort to load a repo-less config.
                 // This might allow us to run the network doctor even if this repo's dynamic config is not loadable.
-                if let Ok(config) =
-                    configloader::hg::load(None, &global_opts.config, &global_opts.configfile)
-                {
+                if let Ok(config) = configloader::hg::load(None, &pinned_configs(&global_opts)) {
                     Err(errors::triage_error(&config, err, None))
                 } else {
                     Err(err)
@@ -245,18 +204,22 @@ impl Dispatcher {
         }
     }
 
+    pub fn orig_args(&self) -> &[String] {
+        &self.orig_args
+    }
+
     pub fn args(&self) -> &[String] {
         &self.args
     }
 
     /// Get a reference to the parsed config.
-    pub fn config(&self) -> &ConfigSet {
+    pub fn config(&self) -> &Arc<dyn Config> {
         self.optional_repo.config()
     }
 
     /// Get a reference to the global options.
     pub fn global_opts(&self) -> &HgGlobalOpts {
-        &self.global_opts
+        &self.early_global_opts
     }
 
     pub fn repo(&self) -> Option<&Repo> {
@@ -270,20 +233,20 @@ impl Dispatcher {
     /// where config is not influenced by the current repo.
     pub fn convert_to_repoless_config(&mut self) -> Result<()> {
         if matches!(self.optional_repo, OptionalRepo::Some(_)) {
-            self.optional_repo = OptionalRepo::None(self.load_repoless_config()?)
+            self.optional_repo = OptionalRepo::None(Arc::new(self.load_repoless_config()?));
         }
 
         Ok(())
     }
 
     fn load_repoless_config(&self) -> Result<ConfigSet> {
-        configloader::hg::load(None, &self.global_opts.config, &self.global_opts.configfile)
+        configloader::hg::load(None, &pinned_configs(&self.early_global_opts))
     }
 
     fn default_command(&self) -> Result<String, UnknownCommand> {
         // Passing in --verbose also disables this behavior,
         // but that option is handled somewhere else
-        if self.global_opts.help || hgplain::is_plain(None) {
+        if self.early_global_opts.help || hgplain::is_plain(None) {
             return Err(errors::UnknownCommand(String::new()));
         }
         Ok(if let OptionalRepo::Some(repo) = &self.optional_repo {
@@ -304,8 +267,8 @@ impl Dispatcher {
     ) -> Result<(&'a CommandDefinition, ParseOutput)> {
         let config = self.optional_repo.config();
 
-        if !self.global_opts.cwd.is_empty() {
-            env::set_current_dir(&self.global_opts.cwd)?;
+        if !self.early_global_opts.cwd.is_empty() {
+            env::set_current_dir(&self.early_global_opts.cwd)?;
         }
 
         initialize_indexedlog(config)?;
@@ -331,7 +294,7 @@ impl Dispatcher {
             }
         };
 
-        let first_arg = if let Some(first_arg) = self.early_result.args.get(0) {
+        let first_arg = if let Some(first_arg) = self.early_result.args.first() {
             first_arg.clone()
         } else {
             let default_command = self.default_command()?;
@@ -355,7 +318,7 @@ impl Dispatcher {
         // - args are unchanged arguments provided by the user, unless only global options are provided.
         //   args can have global flags before command name.
         //   for example, ["--traceback", "log", "-Gvr", "master"]
-        //                                      ^^^^^ first_arg_index, "log" is "command_name"
+        //                                ^^^^^ first_arg_index, "log" is "command_name"
         // - expanded: includes alias expansion result
         //   no global flags before command name.
         //   for example, with alias "log = log -f", ["log", "-Gvr", "master"]
@@ -394,7 +357,17 @@ impl Dispatcher {
         let parsed = parse(def, &new_args)?;
 
         let global_opts: HgGlobalOpts = parsed.clone().try_into()?;
-        last_chance_to_abort(&self.global_opts, &global_opts)?;
+        last_chance_to_abort(&self.early_global_opts, &global_opts)?;
+
+        // Update pinned config values using the "true" global opts. The early global are
+        // parsed conservatively (i.e. incompletely) because they can't read aliases from
+        // the config yet, and in general don't know which command is being run yet.
+        let pinned_configs = pinned_configs(&global_opts);
+        if !pinned_configs.is_empty() {
+            let mut config = ConfigSet::wrap(self.config().clone()).named("root:pin");
+            set_pinned(&mut config, &pinned_configs)?;
+            self.set_config(Arc::new(config));
+        }
 
         initialize_blackbox(&self.optional_repo)?;
 
@@ -416,31 +389,55 @@ impl Dispatcher {
             Err(e) => return (None, Err(e)),
         };
 
-        sampling::append_sample("command_info", "positional_args", parsed.args());
+        // Logged directly to sampling since `tracing` doesn't support structured data.
+        {
+            sampling::append_sample("command_info", "positional_args", parsed.args());
 
-        let opt_names = parsed.specified_opts();
-        sampling::append_sample("command_info", "option_names", opt_names);
+            let opt_names = parsed.specified_opts();
+            sampling::append_sample("command_info", "option_names", opt_names);
 
-        let opt_values: Vec<_> = opt_names.iter().map(|n| parsed.opts().get(n)).collect();
-        sampling::append_sample("command_info", "option_values", &opt_values);
+            let opt_values: Vec<_> = opt_names
+                .iter()
+                .map(|n| opt_value_to_str(parsed.opts().get(n)))
+                .collect();
+            sampling::append_sample("command_info", "option_values", &opt_values);
+        }
+
+        tracing::debug!(target: "command_info", command=handler.legacy_alias().unwrap_or_else(|| handler.main_alias()));
 
         let res = || -> Result<u8> {
-            add_global_flag_derived_configs(&mut self.optional_repo, parsed.clone().try_into()?);
+            // This may trigger Python fallback if there are Python hooks.
+            let hooks = crate::hooks::Hooks::new(self.config(), io, handler)?;
+
             tracing::debug!("command handled by a Rust function");
-            match handler.func() {
+
+            // Convert to repoless before running the "pre" hook. For repoless commands,
+            // we don't want to run hooks from root of incidentally containing repo.
+            if matches!(handler.func(), CommandFunc::NoRepo(_)) {
+                self.convert_to_repoless_config()?;
+            }
+
+            hooks.run_pre(self.repo().map(|r| r.path()), &self.args[1..])?;
+
+            let res = match handler.func() {
                 CommandFunc::Repo(f) => f(parsed, io, self.repo_mut()?),
                 CommandFunc::OptionalRepo(f) => f(parsed, io, &mut self.optional_repo),
-                CommandFunc::NoRepo(f) => {
-                    self.convert_to_repoless_config()?;
-                    f(parsed, io, self.optional_repo.config_mut())
-                }
+                CommandFunc::NoRepo(f) => f(parsed, io, self.optional_repo.config()),
                 CommandFunc::WorkingCopy(f) => {
                     let repo = self.repo_mut()?;
-                    let path = repo.path().to_owned();
-                    let mut wc = repo.working_copy(&path)?;
+                    let mut wc = repo.working_copy()?;
                     f(parsed, io, repo, &mut wc)
                 }
+            };
+
+            match &res {
+                Ok(result_code) => {
+                    hooks.run_post(self.repo().map(|r| r.path()), &self.args[1..], *result_code)?
+                }
+                Err(_) => hooks.run_fail(self.repo().map(|r| r.path()), &self.args[1..])?,
             }
+
+            res
         }();
 
         (Some(handler), res)
@@ -461,4 +458,26 @@ impl Dispatcher {
             }
         }
     }
+
+    fn set_config(&mut self, new: Arc<dyn Config>) {
+        match &mut self.optional_repo {
+            OptionalRepo::Some(repo) => repo.set_config(new),
+            OptionalRepo::None(old) => *old = new,
+        }
+    }
+}
+
+fn opt_value_to_str(value: Option<&Value>) -> Cow<str> {
+    let opt_str: Option<Cow<str>> = value.and_then(|v| match v {
+        Value::Bool(b) => b.map(|b| Cow::Borrowed(if b { "true" } else { "false" })),
+        Value::Str(s) => s.as_ref().map(|s| Cow::Borrowed(s.as_ref())),
+        Value::Int(i) => i.map(|i| Cow::Owned(i.to_string())),
+        Value::List(l) => match l.len() {
+            0 => None,
+            1 => Some(Cow::Borrowed(&l[0])),
+            _ => Some(Cow::Owned(l.join(","))),
+        },
+    });
+
+    opt_str.unwrap_or(Cow::Borrowed("<unset>"))
 }

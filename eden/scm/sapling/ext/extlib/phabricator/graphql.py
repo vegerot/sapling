@@ -10,7 +10,6 @@
 
 from __future__ import absolute_import
 
-import operator
 import os
 
 from typing import Optional
@@ -43,9 +42,10 @@ class Client:
             if repodir is None:
                 repodir = repo.root
             ui = ui or repo.ui
-        else:
-            if ui is None:
-                raise error.ProgrammingError("either repo or ui needs to be provided")
+
+        if ui is None:
+            raise error.ProgrammingError("either repo or ui needs to be provided")
+
         if not repodir:
             repodir = pycompat.getcwd()
         self._mock = "HG_ARC_CONDUIT_MOCK" in encoding.environ
@@ -79,7 +79,7 @@ class Client:
 
             self._client = phabricator_graphql_client.PhabricatorGraphQLClient(
                 phabricator_graphql_client_urllib.PhabricatorGraphQLClientRequests(
-                    unix_socket_proxy=unix_socket_path,
+                    unix_socket_proxy=unix_socket_path, ui=ui
                 ),
                 app_id if unix_socket_path else None,
                 self._oauth,
@@ -177,13 +177,22 @@ class Client:
         params = {"diffid": diffid}
         ret = self._client.query(timeout, query, params)
 
-        latest: Optional[dict] = ret["data"]["phabricator_diff_query"][0]["results"][
-            "nodes"
-        ][0]["latest_associated_phabricator_version_regardless_of_viewer"]
+        try:
+            latest: Optional[dict] = ret["data"]["phabricator_diff_query"][0][
+                "results"
+            ]["nodes"][0]["latest_associated_phabricator_version_regardless_of_viewer"]
 
-        if latest is None:
+            if latest is None:
+                raise ClientError(
+                    None, _("D%s does not have any commits associated with it") % diffid
+                )
+        except (KeyError, IndexError):
             raise ClientError(
-                None, f"D{diffid} does not have any commits associated with it"
+                None,
+                _(
+                    "Failed to get commit hash via Phabricator for D%s. GraphQL response:\n  %s"
+                )
+                % (diffid, json.dumps(ret)),
             )
 
         # Massage commits into {repo_name => commit_hash}
@@ -282,7 +291,7 @@ class Client:
             difftonode[diffidentifiers.pop(hex(hashident))] = hashident
 
         difftoglobalrev = {}
-        for (identifier, diffid) in diffidentifiers.items():
+        for identifier, diffid in diffidentifiers.items():
             # commit_identifier could be svn revision numbers, ignore
             # them.
             if identifier.isdigit():
@@ -339,6 +348,11 @@ class Client:
             ret = self._client.query(timeout, self._getquery(signalstatus), params)
         return self._processrevisioninfo(ret)
 
+    def graphqlquery(self, query, variables, timeout=60_000):
+        if self._mock:
+            return self._mocked_responses.pop()
+        return self._client.query(timeout, query, variables)
+
     def _getquery(self, signalstatus):
         signalquery = ""
 
@@ -369,6 +383,22 @@ class Client:
                 is_landing
                 land_job_status
                 needs_final_review_status
+                unpublished_phabricator_versions {
+                  phabricator_version_migration {
+                    ordinal_label {
+                      abbreviated
+                    }
+                    commit_hash_best_effort
+                  }
+                }
+                phabricator_versions {
+                  nodes {
+                    ordinal_label {
+                      abbreviated
+                    }
+                    commit_hash_best_effort
+                  }
+                }
                 %s
               }
             }
@@ -391,11 +421,13 @@ class Client:
             pass
 
         infos = {}
+        diff_number_str = None  # for error message
         try:
             nodes = ret["data"]["query"][0]["results"]["nodes"]
             for node in nodes:
                 info = {}
-                infos[str(node["number"])] = info
+                diff_number_str = str(node["number"])
+                infos[diff_number_str] = info
 
                 status = node["diff_status_name"]
                 # GraphQL uses "Closed" but Conduit used "Committed" so let's
@@ -422,17 +454,34 @@ class Client:
                         .replace("_", " ")
                     )
 
+                alldiffversions = {}
+                phabversions = node.get("phabricator_versions", {}).get("nodes", [])
+                phabdraftversions = node.get("unpublished_phabricator_versions", [])
+                for version in phabversions + phabdraftversions:
+                    if "phabricator_version_migration" in version:
+                        version = version["phabricator_version_migration"]
+                    name = version.get("ordinal_label", {}).get("abbreviated")
+                    vhash = version.get("commit_hash_best_effort")
+                    if name and vhash:
+                        alldiffversions[vhash] = name
+                info["diff_versions"] = alldiffversions
+
                 active_version = node.get(
                     "latest_publishable_draft_phabricator_version"
                 )
                 if active_version is None:
                     active_version = node.get("latest_active_phabricator_version", {})
-                commit_hash = active_version.get("commit_hash_best_effort")
-                if commit_hash is not None:
-                    info["hash"] = commit_hash
+                if active_version is not None:
+                    commit_hash = active_version.get("commit_hash_best_effort")
+                    if commit_hash is not None:
+                        info["hash"] = commit_hash
 
         except (AttributeError, KeyError, TypeError):
-            raise ClientError(None, "Unexpected graphql response format")
+            if diff_number_str is not None:
+                msg = _("Unexpected graphql response format for D%s") % diff_number_str
+            else:
+                msg = _("Unexpected graphql response format")
+            raise ClientError(None, msg)
 
         return infos
 

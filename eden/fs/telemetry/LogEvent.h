@@ -8,55 +8,14 @@
 #pragma once
 
 #include <folly/portability/SysTypes.h>
+#include <cstdint>
 #include <optional>
 #include <string>
-#include <unordered_map>
 
 #include "eden/common/os/ProcessId.h"
+#include "eden/common/telemetry/DynamicEvent.h"
 
 namespace facebook::eden {
-
-class DynamicEvent {
- public:
-  using IntMap = std::unordered_map<std::string, int64_t>;
-  using StringMap = std::unordered_map<std::string, std::string>;
-  using DoubleMap = std::unordered_map<std::string, double>;
-
-  DynamicEvent() = default;
-  DynamicEvent(const DynamicEvent&) = default;
-  DynamicEvent(DynamicEvent&&) = default;
-  DynamicEvent& operator=(const DynamicEvent&) = default;
-  DynamicEvent& operator=(DynamicEvent&&) = default;
-
-  void addInt(std::string name, int64_t value);
-  void addString(std::string name, std::string value);
-  void addDouble(std::string name, double value);
-
-  /**
-   * Convenience function that adds boolean values as integer 0 or 1.
-   */
-  void addBool(std::string name, bool value) {
-    addInt(std::move(name), value);
-  }
-
-  const IntMap& getIntMap() const {
-    return ints_;
-  }
-  const StringMap& getStringMap() const {
-    return strings_;
-  }
-  const DoubleMap& getDoubleMap() const {
-    return doubles_;
-  }
-
- private:
-  // Due to limitations in the underlying log database, limit the field types to
-  // int64_t, double, string, and vector<string>
-  // TODO: add vector<string> support if needed.
-  IntMap ints_;
-  StringMap strings_;
-  DoubleMap doubles_;
-};
 
 struct Fsck {
   static constexpr const char* type = "fsck";
@@ -81,6 +40,38 @@ struct StarGlob {
   void populate(DynamicEvent& event) const {
     event.addString("glob_request", glob_request);
     event.addString("client_cmdline", client_cmdline);
+  }
+};
+
+struct SuffixGlob {
+  static constexpr const char* type = "suffix_glob";
+
+  double duration = 0.0;
+  std::string glob_request;
+  std::string client_cmdline;
+  bool is_local;
+
+  void populate(DynamicEvent& event) const {
+    event.addDouble("duration", duration);
+    event.addString("glob_request", glob_request);
+    event.addString("client_scope", client_cmdline);
+    event.addBool("is_local", is_local);
+  }
+};
+
+struct ExpensiveGlob {
+  static constexpr const char* type = "expensive_glob";
+
+  double duration = 0.0;
+  std::string glob_request;
+  std::string client_cmdline;
+  bool is_local;
+
+  void populate(DynamicEvent& event) const {
+    event.addDouble("duration", duration);
+    event.addString("glob_request", glob_request);
+    event.addString("client_scope", client_cmdline);
+    event.addBool("is_local", is_local);
   }
 };
 
@@ -175,6 +166,7 @@ struct FinishedCheckout {
 struct FinishedMount {
   static constexpr const char* type = "mount";
 
+  std::string backing_store_type;
   std::string repo_type;
   std::string repo_source;
   std::string fs_channel_type;
@@ -268,29 +260,6 @@ struct ServerDataFetch {
   }
 };
 
-struct EdenApiMiss {
-  enum MissType : bool {
-    Blob = 0,
-    Tree = 1,
-  };
-
-  static constexpr const char* type = "edenapi_miss";
-
-  std::string repo_name;
-  MissType miss_type;
-  std::string reason;
-
-  void populate(DynamicEvent& event) const {
-    event.addString("repo_source", repo_name);
-    if (miss_type == Blob) {
-      event.addString("edenapi_miss_type", "blob");
-    } else {
-      event.addString("edenapi_miss_type", "tree");
-    }
-    event.addString("edenapi_miss_reason", reason);
-  }
-};
-
 struct NfsParsingError {
   std::string proc;
   std::string reason;
@@ -365,6 +334,16 @@ struct PrjFSFileNotificationFailure {
   }
 };
 
+struct PrjFSCheckoutReadRace {
+  static constexpr const char* type = "prjfs_checkout_read_race";
+
+  std::string client_cmdline;
+
+  void populate(DynamicEvent& event) const {
+    event.addString("client_cmdline", client_cmdline);
+  }
+};
+
 struct WorkingCopyGc {
   static constexpr const char* type = "working_copy_gc";
 
@@ -400,7 +379,7 @@ struct NfsCrawlDetected {
   int64_t readDirThreshold = 0;
   // root->leaf formatted as:
   //   "[simple_name (pid): full_name] -> [simple_name (pid): full_name] -> ..."
-  std::string processHierarchy = "";
+  std::string processHierarchy;
 
   void populate(DynamicEvent& event) const {
     event.addInt("read_count", readCount);
@@ -408,6 +387,61 @@ struct NfsCrawlDetected {
     event.addInt("readdir_count", readDirCount);
     event.addInt("readdir_threshold", readDirThreshold);
     event.addString("process_hierarchy", processHierarchy);
+  }
+};
+
+struct FetchMiss {
+  enum MissType : uint8_t { Tree = 0, Blob = 1, BlobMetadata = 2 };
+
+  static constexpr const char* type = "fetch_miss";
+
+  std::string_view repo_source;
+  MissType miss_type;
+  std::string reason;
+  bool retry;
+
+  void populate(DynamicEvent& event) const {
+    event.addString("repo_source", std::string(repo_source));
+    if (miss_type == Tree) {
+      event.addString("miss_type", "tree");
+    } else if (miss_type == Blob) {
+      event.addString("miss_type", "blob");
+    } else {
+      event.addString("miss_type", "aux");
+    }
+    event.addString("reason", reason);
+    event.addBool("retry", retry);
+  }
+};
+
+/**
+ * So that we know how many hosts have EdenFS handling high numbers of fuse
+ * requests at once as we rollout rate limiting.
+ *
+ * This honestly could be an ODS counter, but we don't have ODS on some
+ * platforms (CI), so logging it to scuba so that we have this available to
+ * monitor on all platforms.
+ */
+struct ManyLiveFsChannelRequests {
+  static constexpr const char* type = "high_fschannel_requests";
+
+  void populate(DynamicEvent& /*event*/) const {}
+};
+
+/**
+ * Used to log sapling blob download events from Sapling Backing Store
+ */
+struct SaplingBlobDownloadEvent {
+  static constexpr const char* type = "sl_blob_download_events";
+
+  size_t sizeInBytes;
+  long timeToDownloadInMs;
+  std::string fetchMode;
+
+  void populate(DynamicEvent& event) const {
+    event.addInt("size_in_bytes", sizeInBytes);
+    event.addInt("time_to_download_in_ms", timeToDownloadInMs);
+    event.addString("fetch_mode", fetchMode);
   }
 };
 

@@ -22,8 +22,10 @@ use context::CoreContext;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivationError;
 use derived_data_manager::DerivedDataManager;
+use derived_data_manager::SharedDerivationError;
 use derived_data_remote::DerivationClient;
 use filenodes::Filenodes;
+use filestore::FilestoreConfig;
 use metaconfig_types::DerivedDataConfig;
 use metaconfig_types::DerivedDataTypesConfig;
 use mononoke_types::ChangesetId;
@@ -52,6 +54,7 @@ impl RepoDerivedData {
         bonsai_git_mapping: Arc<dyn BonsaiGitMapping>,
         filenodes: Arc<dyn Filenodes>,
         repo_blobstore: RepoBlobstore,
+        filestore_config: FilestoreConfig,
         lease: Arc<dyn LeaseOps>,
         scuba: MononokeScubaSampleBuilder,
         config: DerivedDataConfig,
@@ -67,6 +70,7 @@ impl RepoDerivedData {
             bonsai_git_mapping,
             filenodes,
             repo_blobstore,
+            filestore_config,
             lease,
             scuba,
             config_name.clone(),
@@ -105,6 +109,14 @@ impl RepoDerivedData {
         Self {
             config: self.config.clone(),
             manager: self.manager.with_replaced_changesets(changesets),
+        }
+    }
+
+    // For dangerous-override: allow replacement of commit_graph
+    pub fn with_replaced_commit_graph(&self, commit_graph: Arc<CommitGraph>) -> Self {
+        Self {
+            config: self.config.clone(),
+            manager: self.manager.with_replaced_commit_graph(commit_graph),
         }
     }
 
@@ -176,7 +188,7 @@ impl RepoDerivedData {
         &self,
         ctx: &CoreContext,
         csid: ChangesetId,
-    ) -> Result<Derivable, DerivationError>
+    ) -> Result<Derivable, SharedDerivationError>
     where
         Derivable: BonsaiDerivable,
     {

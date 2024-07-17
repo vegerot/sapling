@@ -21,10 +21,10 @@ use mercurial_types::HgNodeHash;
 use mononoke_api_hg::HgRepoContext;
 use types::Key;
 
-use super::handler::EdenApiContext;
-use super::EdenApiHandler;
-use super::EdenApiMethod;
+use super::handler::SaplingRemoteApiContext;
 use super::HandlerResult;
+use super::SaplingRemoteApiHandler;
+use super::SaplingRemoteApiMethod;
 use crate::errors::ErrorKind;
 use crate::utils::to_mpath;
 
@@ -36,16 +36,16 @@ const MAX_CONCURRENT_FETCHES_PER_REQUEST: usize = 10;
 pub struct HistoryHandler;
 
 #[async_trait]
-impl EdenApiHandler for HistoryHandler {
+impl SaplingRemoteApiHandler for HistoryHandler {
     type Request = HistoryRequest;
     type Response = HistoryResponseChunk;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::History;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::History;
     const ENDPOINT: &'static str = "/history";
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
@@ -77,7 +77,9 @@ async fn fetch_history_for_key(
     length: Option<u32>,
 ) -> Result<HistoryStream, Error> {
     let filenode_id = HgFileNodeId::new(HgNodeHash::from(key.hgid));
-    let mpath = to_mpath(&key.path)?.context(ErrorKind::UnexpectedEmptyPath)?;
+    let mpath = to_mpath(&key.path)?
+        .into_optional_non_root_path()
+        .context(ErrorKind::UnexpectedEmptyPath)?;
 
     let file = repo
         .file(filenode_id)

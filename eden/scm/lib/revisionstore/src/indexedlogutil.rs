@@ -8,8 +8,12 @@
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic;
+use std::sync::atomic::AtomicU64;
 
 use anyhow::Result;
+use configmodel::Config;
+use configmodel::ConfigExt;
 use indexedlog::log;
 use indexedlog::log::IndexDef;
 use indexedlog::log::IndexOutput;
@@ -21,26 +25,92 @@ use indexedlog::rotate::RotateLogLookupIter;
 use indexedlog::OpenWithRepair;
 use indexedlog::Result as IndexedlogResult;
 use minibytes::Bytes;
+use parking_lot::RwLock;
+use parking_lot::RwLockReadGuard;
+use parking_lot::RwLockUpgradableReadGuard;
+use parking_lot::RwLockWriteGuard;
 use tracing::debug;
 
 /// Simple wrapper around either an `IndexedLog` or a `RotateLog`. This abstracts whether a store
-/// is local (`IndexedLog`) or shared (`RotateLog`) so that higher level stores don't have to deal
+/// is permanent (`IndexedLog`) or rotated (`RotateLog`) so that higher level stores don't have to deal
 /// with the subtle differences.
-pub enum Store {
-    Local(Log),
-    Shared(RotateLog),
+pub struct Store {
+    inner: RwLock<Inner>,
+    auto_sync_count: AtomicU64,
+    // Configured by scmstore.sync-logs-if-changed-on-disk (defaults to disabled if not configured).
+    sync_if_changed_on_disk: bool,
+}
+
+pub enum Inner {
+    Permanent(Log),
+    Rotated(RotateLog),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoreType {
-    Local,
-    Shared,
+    Permanent,
+    Rotated,
 }
 
 impl Store {
-    pub fn is_local(&self) -> bool {
+    pub fn read(&self) -> RwLockReadGuard<'_, Inner> {
+        self.sync_if_changed_on_disk()
+    }
+
+    pub fn write(&self) -> RwLockWriteGuard<'_, Inner> {
+        self.inner.write()
+    }
+
+    pub fn is_permanent(&self) -> bool {
+        self.read().is_permanent()
+    }
+
+    /// Add the buffer to the store.
+    pub fn append(&self, buf: impl AsRef<[u8]>) -> Result<()> {
+        self.write().append(buf)
+    }
+
+    /// Attempt to make slice backed by the mmap buffer to avoid heap allocation.
+    pub fn slice_to_bytes(&self, slice: &[u8]) -> Bytes {
+        self.read().slice_to_bytes(slice)
+    }
+
+    pub fn flush(&self) -> Result<()> {
+        self.write().flush()
+    }
+
+    fn sync_if_changed_on_disk(&self) -> RwLockReadGuard<'_, Inner> {
+        let log = self.inner.read();
+
+        if !self.sync_if_changed_on_disk {
+            return log;
+        }
+
+        if log.is_changed_on_disk() {
+            drop(log);
+
+            let mut log = self.inner.upgradable_read();
+            if log.is_changed_on_disk() {
+                tracing::debug!("auto-syncing indexedlog because it changed on disk");
+                self.auto_sync_count.fetch_add(1, atomic::Ordering::Relaxed);
+                log.with_upgraded(|log| {
+                    if let Err(err) = log.flush() {
+                        tracing::warn!(?err, "error auto-syncing indexedlog store");
+                    }
+                })
+            }
+
+            RwLockUpgradableReadGuard::downgrade(log)
+        } else {
+            log
+        }
+    }
+}
+
+impl Inner {
+    pub fn is_permanent(&self) -> bool {
         match self {
-            Store::Local(_) => true,
+            Self::Permanent(_) => true,
             _ => false,
         }
     }
@@ -50,49 +120,54 @@ impl Store {
     pub fn lookup(&self, index_id: usize, key: impl AsRef<[u8]>) -> Result<LookupIter> {
         let key = key.as_ref();
         match self {
-            Store::Local(log) => Ok(LookupIter::Local(log.lookup(index_id, key)?)),
-            Store::Shared(log) => Ok(LookupIter::Shared(
+            Self::Permanent(log) => Ok(LookupIter::Permanent(log.lookup(index_id, key)?)),
+            Self::Rotated(log) => Ok(LookupIter::Rotated(
                 log.lookup(index_id, Bytes::copy_from_slice(key))?,
             )),
         }
     }
 
+    /// Return whether `key` exists in specified index, without reading log data.
+    pub fn contains(&self, index_id: usize, key: impl AsRef<[u8]>) -> Result<bool> {
+        Ok(!self.lookup(index_id, key)?.is_empty()?)
+    }
+
     /// Add the buffer to the store.
     pub fn append(&mut self, buf: impl AsRef<[u8]>) -> Result<()> {
         match self {
-            Store::Local(log) => Ok(log.append(buf)?),
-            Store::Shared(log) => Ok(log.append(buf)?),
+            Self::Permanent(log) => Ok(log.append(buf)?),
+            Self::Rotated(log) => Ok(log.append(buf)?),
         }
     }
 
     pub fn iter(&self) -> Box<dyn Iterator<Item = IndexedlogResult<&[u8]>> + '_> {
         match self {
-            Store::Local(log) => Box::new(log.iter()),
-            Store::Shared(log) => Box::new(log.iter()),
+            Self::Permanent(log) => Box::new(log.iter()),
+            Self::Rotated(log) => Box::new(log.iter()),
         }
     }
 
     /// Attempt to make slice backed by the mmap buffer to avoid heap allocation.
     pub fn slice_to_bytes(&self, slice: &[u8]) -> Bytes {
         match self {
-            Store::Local(log) => log.slice_to_bytes(slice),
-            Store::Shared(log) => log.slice_to_bytes(slice),
+            Self::Permanent(log) => log.slice_to_bytes(slice),
+            Self::Rotated(log) => log.slice_to_bytes(slice),
         }
     }
 
     pub fn flush(&mut self) -> Result<()> {
         match self {
-            Store::Local(log) => {
-                log.flush()?;
+            Self::Permanent(log) => {
+                log.sync()?;
             }
-            Store::Shared(log) => {
-                if let Err(err) = log.flush() {
+            Self::Rotated(log) => {
+                if let Err(err) = log.sync() {
                     if !err.is_corruption() && err.io_error_kind() == ErrorKind::NotFound {
                         // File-not-found errors can happen when the hg cache
                         // was blown away during command execution. Ignore the
                         // error since failed cache writes won't cause incorrect
                         // behavior and do not have to abort the command.
-                        tracing::warn!(%err, "ignoring error flushing shared indexedlog");
+                        tracing::warn!(%err, "ignoring error flushing rotated indexedlog");
                     } else {
                         return Err(err.into());
                     }
@@ -101,12 +176,19 @@ impl Store {
         };
         Ok(())
     }
+
+    fn is_changed_on_disk(&self) -> bool {
+        match self {
+            Self::Permanent(log) => log.is_changed_on_disk(),
+            Self::Rotated(log) => log.is_changed_on_disk(),
+        }
+    }
 }
 
-/// Iterator returned from `Store::lookup`.
+/// Iterator returned from `Self::lookup`.
 pub enum LookupIter<'a> {
-    Local(LogLookupIter<'a>),
-    Shared(RotateLogLookupIter<'a>),
+    Permanent(LogLookupIter<'a>),
+    Rotated(RotateLogLookupIter<'a>),
 }
 
 impl<'a> Iterator for LookupIter<'a> {
@@ -114,14 +196,24 @@ impl<'a> Iterator for LookupIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            LookupIter::Local(iter) => iter.next().map(|res| res.map_err(Into::into)),
-            LookupIter::Shared(iter) => iter.next().map(|res| res.map_err(Into::into)),
+            LookupIter::Permanent(iter) => iter.next().map(|res| res.map_err(Into::into)),
+            LookupIter::Rotated(iter) => iter.next().map(|res| res.map_err(Into::into)),
+        }
+    }
+}
+
+impl<'a> LookupIter<'a> {
+    pub fn is_empty(self) -> Result<bool> {
+        match self {
+            LookupIter::Permanent(log) => Ok(log.is_empty()),
+            LookupIter::Rotated(log) => Ok(log.is_empty()?),
         }
     }
 }
 
 pub struct StoreOpenOptions {
     auto_sync_threshold: Option<u64>,
+    sync_if_changed_on_disk: bool,
     pub max_log_count: Option<u8>,
     pub max_bytes_per_log: Option<u64>,
     indexes: Vec<IndexDef>,
@@ -129,23 +221,26 @@ pub struct StoreOpenOptions {
 }
 
 impl StoreOpenOptions {
-    pub fn new() -> Self {
+    pub fn new(config: &dyn Config) -> Self {
         Self {
             auto_sync_threshold: None,
             max_log_count: None,
             max_bytes_per_log: None,
             indexes: Vec::new(),
             create: true,
+            sync_if_changed_on_disk: config
+                .must_get("scmstore", "sync-logs-if-changed-on-disk")
+                .unwrap_or_default(),
         }
     }
 
-    /// When the store is local, control how many logs will be kept in the `RotateLog`.
+    /// When the store is rotated, control how many logs will be kept in the `RotateLog`.
     pub fn max_log_count(mut self, count: u8) -> Self {
         self.max_log_count = Some(count);
         self
     }
 
-    /// When the store is local, control how big each of the individual logs in the `RotateLog`
+    /// When the store is rotated, control how big each of the individual logs in the `RotateLog`
     /// will be.
     pub fn max_bytes_per_log(mut self, bytes: u64) -> Self {
         self.max_bytes_per_log = Some(bytes);
@@ -169,28 +264,33 @@ impl StoreOpenOptions {
         self
     }
 
-    fn into_local_open_options(self) -> log::OpenOptions {
+    fn into_permanent_open_options(self) -> log::OpenOptions {
         log::OpenOptions::new()
             .create(self.create)
             .index_defs(self.indexes)
             .auto_sync_threshold(self.auto_sync_threshold)
     }
 
-    /// Create a local `Store`.
+    /// Create a permanent `Store`.
     ///
-    /// Data added to a local store will never be rotated out, and `fsync(2)` is used to guarantee
+    /// Data added to the store will never be rotated out, and `fsync(2)` is used to guarantee
     /// data consistency.
-    pub fn local(self, path: impl AsRef<Path>) -> Result<Store> {
-        Ok(Store::Local(
-            self.into_local_open_options()
-                .open_with_repair(path.as_ref())?,
-        ))
+    pub fn permanent(self, path: impl AsRef<Path>) -> Result<Store> {
+        let sync_if_changed_on_disk = self.sync_if_changed_on_disk;
+        Ok(Store {
+            inner: RwLock::new(Inner::Permanent(
+                self.into_permanent_open_options()
+                    .open_with_repair(path.as_ref())?,
+            )),
+            auto_sync_count: AtomicU64::new(0),
+            sync_if_changed_on_disk,
+        })
     }
 
     /// Convert a `StoreOpenOptions` to a `rotate::OpenOptions`.
     ///
     /// Should only be used to implement `indexedlog::DefaultOpenOptions`
-    pub fn into_shared_open_options(self) -> rotate::OpenOptions {
+    pub fn into_rotated_open_options(self) -> rotate::OpenOptions {
         let mut opts = rotate::OpenOptions::new()
             .create(self.create)
             .auto_sync_threshold(self.auto_sync_threshold)
@@ -207,12 +307,13 @@ impl StoreOpenOptions {
         opts
     }
 
-    /// Create a shared `Store`
+    /// Create a rotated `Store`
     ///
-    /// Data added to a shared store will be rotated out depending on the values of `max_log_count`
+    /// Data added to a rotated store will be rotated out depending on the values of `max_log_count`
     /// and `max_bytes_per_log`.
-    pub fn shared(self, path: impl AsRef<Path>) -> Result<Store> {
-        let opts = self.into_shared_open_options();
+    pub fn rotated(self, path: impl AsRef<Path>) -> Result<Store> {
+        let sync_if_changed_on_disk = self.sync_if_changed_on_disk;
+        let opts = self.into_rotated_open_options();
         let mut rotate_log = opts.open_with_repair(path.as_ref())?;
         // Attempt to clean up old logs that might be left around. On Windows, other
         // Mercurial processes that have the store opened might prevent their removal.
@@ -220,26 +321,30 @@ impl StoreOpenOptions {
         if let Err(err) = res {
             debug!("Unable to remove old indexedlogutil logs: {:?}", err);
         }
-        Ok(Store::Shared(rotate_log))
+        Ok(Store {
+            inner: RwLock::new(Inner::Rotated(rotate_log)),
+            auto_sync_count: AtomicU64::new(0),
+            sync_if_changed_on_disk,
+        })
     }
 
-    /// Attempts to repair corruption in a local indexedlog store.
+    /// Attempts to repair corruption in a permanent indexedlog store.
     ///
     /// Note, this may delete data, though it should only delete data that is unreadable.
     #[allow(dead_code)]
-    pub fn repair_local(self, path: PathBuf) -> Result<String> {
-        self.into_local_open_options()
+    pub fn repair_permanent(self, path: PathBuf) -> Result<String> {
+        self.into_permanent_open_options()
             .repair(path)
             .map_err(|e| e.into())
     }
 
-    /// Attempts to repair corruption in a shared rotatelog store.
+    /// Attempts to repair corruption in a rotated rotatelog store.
     ///
     /// Note, this may delete data, though that should be fine since a rotatelog is free to delete
     /// data already.
     #[allow(dead_code)]
-    pub fn repair_shared(self, path: PathBuf) -> Result<String> {
-        self.into_shared_open_options()
+    pub fn repair_rotated(self, path: PathBuf) -> Result<String> {
+        self.into_rotated_open_options()
             .repair(path)
             .map_err(|e| e.into())
     }
@@ -247,53 +352,55 @@ impl StoreOpenOptions {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use tempfile::TempDir;
 
     use super::*;
 
     #[test]
-    fn test_local() -> Result<()> {
+    fn test_permanent() -> Result<()> {
         let dir = TempDir::new()?;
 
-        let mut store = StoreOpenOptions::new()
+        let store = StoreOpenOptions::new(&BTreeMap::<&str, &str>::new())
             .index("hex", |_| vec![IndexOutput::Reference(0..2)])
-            .local(&dir)?;
+            .permanent(&dir)?;
 
         store.append(b"aabcd")?;
 
         assert_eq!(
-            store.lookup(0, b"aa")?.collect::<Result<Vec<_>>>()?,
+            store.read().lookup(0, b"aa")?.collect::<Result<Vec<_>>>()?,
             vec![b"aabcd"]
         );
         Ok(())
     }
 
     #[test]
-    fn test_shared() -> Result<()> {
+    fn test_rotated() -> Result<()> {
         let dir = TempDir::new()?;
 
-        let mut store = StoreOpenOptions::new()
+        let store = StoreOpenOptions::new(&BTreeMap::<&str, &str>::new())
             .index("hex", |_| vec![IndexOutput::Reference(0..2)])
-            .shared(&dir)?;
+            .rotated(&dir)?;
 
         store.append(b"aabcd")?;
 
         assert_eq!(
-            store.lookup(0, b"aa")?.collect::<Result<Vec<_>>>()?,
+            store.read().lookup(0, b"aa")?.collect::<Result<Vec<_>>>()?,
             vec![b"aabcd"]
         );
         Ok(())
     }
 
     #[test]
-    fn test_local_no_rotate() -> Result<()> {
+    fn test_permanent_no_rotate() -> Result<()> {
         let dir = TempDir::new()?;
 
-        let mut store = StoreOpenOptions::new()
+        let store = StoreOpenOptions::new(&BTreeMap::<&str, &str>::new())
             .index("hex", |_| vec![IndexOutput::Reference(0..2)])
             .max_log_count(1)
             .max_bytes_per_log(10)
-            .local(&dir)?;
+            .permanent(&dir)?;
 
         store.append(b"aabcd")?;
         store.append(b"abbcd")?;
@@ -302,19 +409,19 @@ mod tests {
         store.append(b"adbcd")?;
         store.flush()?;
 
-        assert_eq!(store.lookup(0, b"aa")?.count(), 1);
+        assert_eq!(store.read().lookup(0, b"aa")?.count(), 1);
         Ok(())
     }
 
     #[test]
-    fn test_shared_rotate() -> Result<()> {
+    fn test_rotated_rotate() -> Result<()> {
         let dir = TempDir::new()?;
 
-        let mut store = StoreOpenOptions::new()
+        let store = StoreOpenOptions::new(&BTreeMap::<&str, &str>::new())
             .index("hex", |_| vec![IndexOutput::Reference(0..2)])
             .max_log_count(1)
             .max_bytes_per_log(10)
-            .shared(&dir)?;
+            .rotated(&dir)?;
 
         store.append(b"aabcd")?;
         store.append(b"abbcd")?;
@@ -323,7 +430,76 @@ mod tests {
         store.append(b"adbcd")?;
         store.flush()?;
 
-        assert_eq!(store.lookup(0, b"aa")?.count(), 0);
+        assert_eq!(store.read().lookup(0, b"aa")?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_transparent_sync() -> Result<()> {
+        let dir = TempDir::new()?;
+
+        let mut config = BTreeMap::<&str, &str>::new();
+        config.insert("scmstore.sync-logs-if-changed-on-disk", "true");
+
+        let store1 = StoreOpenOptions::new(&config)
+            .index("hex", |_| vec![IndexOutput::Reference(0..2)])
+            .permanent(&dir)?;
+
+        let store2 = StoreOpenOptions::new(&config)
+            .index("hex", |_| vec![IndexOutput::Reference(0..2)])
+            .permanent(&dir)?;
+
+        store1.append(b"aabcd")?;
+        store1.flush()?;
+
+        // store2 sees the write immediately
+        assert_eq!(
+            store2
+                .read()
+                .lookup(0, b"aa")?
+                .collect::<Result<Vec<_>>>()?,
+            vec![b"aabcd"]
+        );
+
+        store2.append(b"abcd")?;
+        assert_eq!(
+            store2
+                .read()
+                .lookup(0, b"ab")?
+                .collect::<Result<Vec<_>>>()?,
+            vec![b"abcd"]
+        );
+
+        // Make sure we only synced once:
+        assert_eq!(store2.auto_sync_count.load(atomic::Ordering::Relaxed), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_transparent_sync_disabled() -> Result<()> {
+        let dir = TempDir::new()?;
+
+        let store1 = StoreOpenOptions::new(&BTreeMap::<&str, &str>::new())
+            .index("hex", |_| vec![IndexOutput::Reference(0..2)])
+            .permanent(&dir)?;
+
+        let store2 = StoreOpenOptions::new(&BTreeMap::<&str, &str>::new())
+            .index("hex", |_| vec![IndexOutput::Reference(0..2)])
+            .permanent(&dir)?;
+
+        store1.append(b"aabcd")?;
+        store1.flush()?;
+
+        // store2 doesn't see the write.
+        assert!(
+            store2
+                .read()
+                .lookup(0, b"aa")?
+                .collect::<Result<Vec<_>>>()?
+                .is_empty()
+        );
+
         Ok(())
     }
 }

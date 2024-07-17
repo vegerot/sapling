@@ -6,30 +6,31 @@
  */
 
 import type {CommitInfo} from './types';
-import type {MutableRefObject} from 'react';
 
 import {Commit} from './Commit';
 import {FlexSpacer} from './ComponentUtils';
-import {Tooltip} from './Tooltip';
-import {VSCodeCheckbox} from './VSCodeCheckbox';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {submitAsDraft, SubmitAsDraftCheckbox} from './codeReview/DraftCheckbox';
 import {t, T} from './i18n';
-import {persistAtomToConfigEffect} from './persistAtomToConfigEffect';
+import {configBackedAtom, readAtom} from './jotaiUtils';
 import {CommitPreview} from './previews';
 import {useModal} from './useModal';
-import {VSCodeDivider, VSCodeButton, VSCodeTextField} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {Checkbox} from 'isl-components/Checkbox';
+import {Divider} from 'isl-components/Divider';
+import {TextField} from 'isl-components/TextField';
+import {Tooltip} from 'isl-components/Tooltip';
+import {useAtom, useAtomValue} from 'jotai';
 import {useState} from 'react';
-import {atom, useRecoilCallback, useRecoilState, useRecoilValue} from 'recoil';
 import {useAutofocusRef} from 'shared/hooks';
+import {nullthrows} from 'shared/utils';
 
 import './ConfirmSubmitStack.css';
 
-export const confirmShouldSubmitEnabledAtom = atom<boolean>({
-  key: 'confirmShouldSubmitEnabledAtom',
-  default: true,
-  effects: [persistAtomToConfigEffect('isl.show-stack-submit-confirmation', true as boolean)],
-});
+export const confirmShouldSubmitEnabledAtom = configBackedAtom<boolean>(
+  'isl.show-stack-submit-confirmation',
+  true,
+);
 
 export type SubmitConfirmationReponse =
   | {submitAsDraft: boolean; updateMessage?: string}
@@ -37,10 +38,20 @@ export type SubmitConfirmationReponse =
 
 type SubmitType = 'submit' | 'submit-all' | 'resubmit';
 
+export function shouldShowSubmitStackConfirmation(): boolean {
+  const provider = readAtom(codeReviewProvider);
+  const shouldShowConfirmation = readAtom(confirmShouldSubmitEnabledAtom);
+  return (
+    shouldShowConfirmation === true &&
+    // if you can't submit as draft, no need to show the interstitial
+    provider?.supportSubmittingAsDraft != null
+  );
+}
+
 /**
  * Show a modal to confirm if you want to bulk submit a given stack of commits.
  * Allows you to set if you want to submit as a draft or not,
- * and provide an update message (TODO).
+ * and provide an update message.
  *
  * If your code review provider does not support submitting as draft,
  * this function returns true immediately.
@@ -48,28 +59,24 @@ type SubmitType = 'submit' | 'submit-all' | 'resubmit';
 export function useShowConfirmSubmitStack() {
   const showModal = useModal();
 
-  useRecoilValue(confirmShouldSubmitEnabledAtom); // ensure this config is loaded ahead of clicking this
-
-  return useRecoilCallback(({snapshot}) => async (mode: SubmitType, stack: Array<CommitInfo>) => {
-    const provider = snapshot.getLoadable(codeReviewProvider).valueMaybe();
-    const shouldShowConfirmation = snapshot
-      .getLoadable(confirmShouldSubmitEnabledAtom)
-      .valueMaybe();
-    if (
-      !shouldShowConfirmation ||
-      provider?.supportSubmittingAsDraft == null // if you can't submit as draft, no need to show the interstitial
-    ) {
-      const draft = snapshot.getLoadable(submitAsDraft).valueMaybe();
+  return async (mode: SubmitType, stack: Array<CommitInfo>) => {
+    if (!shouldShowSubmitStackConfirmation()) {
+      const draft = readAtom(submitAsDraft);
       return {submitAsDraft: draft ?? false};
     }
 
-    const replace = {$numCommits: String(stack.length)};
+    const provider = readAtom(codeReviewProvider);
+
+    const replace = {
+      $numCommits: String(stack.length),
+      $cmd: nullthrows(provider).submitCommandName(),
+    };
     const title =
       mode === 'submit'
-        ? t('Submit $numCommits commits for review?', {replace})
+        ? t('Submitting $numCommits commits for review with $cmd', {replace})
         : mode === 'resubmit'
-        ? t('Resubmit $numCommits commits that already have diffs for review?', {replace})
-        : t('Submit all $numCommits commits in this stack for review?', {replace});
+        ? t('Submitting new versions of $numCommits commits for review with $cmd', {replace})
+        : t('Submitting all $numCommits commits in this stack for review with $cmd', {replace});
     const response = await showModal<SubmitConfirmationReponse>({
       type: 'custom',
       title,
@@ -78,7 +85,7 @@ export function useShowConfirmSubmitStack() {
       ),
     });
     return response;
-  });
+  };
 }
 
 function ConfirmModalContent({
@@ -88,16 +95,16 @@ function ConfirmModalContent({
   stack: Array<CommitInfo>;
   returnResultAndDismiss: (value: SubmitConfirmationReponse) => unknown;
 }) {
-  const [showSubmitConfirmation, setShowSubmitConfirmation] = useRecoilState(
+  const [showSubmitConfirmation, setShowSubmitConfirmation] = useAtom(
     confirmShouldSubmitEnabledAtom,
   );
-  const shouldSubmitAsDraft = useRecoilValue(submitAsDraft);
+  const shouldSubmitAsDraft = useAtomValue(submitAsDraft);
   const [updateMessage, setUpdateMessage] = useState('');
   const commitsWithDiffs = stack.filter(commit => commit.diffId != null);
 
-  const submitRef = useAutofocusRef();
+  const submitRef = useAutofocusRef<HTMLButtonElement>();
 
-  const provider = useRecoilValue(codeReviewProvider);
+  const provider = useAtomValue(codeReviewProvider);
   return (
     <div className="confirm-submit-stack" data-testid="confirm-submit-stack">
       <div className="confirm-submit-stack-content">
@@ -112,16 +119,16 @@ function ConfirmModalContent({
           ))}
         </div>
         {provider?.supportsUpdateMessage !== true || commitsWithDiffs.length === 0 ? null : (
-          <VSCodeTextField
+          <TextField
             value={updateMessage}
             data-testid="submit-update-message-input"
-            onChange={e => setUpdateMessage((e.target as HTMLInputElement).value)}>
+            onChange={e => setUpdateMessage(e.currentTarget.value)}>
             Update Message
-          </VSCodeTextField>
+          </TextField>
         )}
         <SubmitAsDraftCheckbox commitsToBeSubmit={stack} />
       </div>
-      <VSCodeDivider />
+      <Divider />
       <div className="use-modal-buttons">
         <Tooltip
           placement="bottom"
@@ -130,19 +137,19 @@ function ConfirmModalContent({
               'Your last setting will control if it is submitted as a draft. ' +
               'You can change this from settings.',
           )}>
-          <VSCodeCheckbox
+          <Checkbox
             checked={!showSubmitConfirmation}
-            onChange={e => setShowSubmitConfirmation(!(e.target as HTMLInputElement).checked)}>
+            onChange={checked => setShowSubmitConfirmation(!checked)}>
             <T>Don't show again</T>
-          </VSCodeCheckbox>
+          </Checkbox>
         </Tooltip>
         <FlexSpacer />
-        <VSCodeButton appearance="secondary" onClick={() => returnResultAndDismiss(undefined)}>
+        <Button onClick={() => returnResultAndDismiss(undefined)}>
           <T>Cancel</T>
-        </VSCodeButton>
-        <VSCodeButton
-          ref={submitRef as MutableRefObject<null>}
-          appearance="primary"
+        </Button>
+        <Button
+          ref={submitRef}
+          primary
           onClick={() =>
             returnResultAndDismiss({
               submitAsDraft: shouldSubmitAsDraft,
@@ -150,7 +157,7 @@ function ConfirmModalContent({
             })
           }>
           <T>Submit</T>
-        </VSCodeButton>
+        </Button>
       </div>
     </div>
   );

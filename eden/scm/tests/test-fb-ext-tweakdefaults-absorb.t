@@ -1,7 +1,8 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
-  $ enable tweakdefaults
   $ enable absorb
 
 Commit date defaults to "now" based on tweakdefaults

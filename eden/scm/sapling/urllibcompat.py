@@ -11,8 +11,6 @@
 # GNU General Public License version 2 or any later version.
 from __future__ import absolute_import
 
-import sys
-
 from . import pycompat
 
 
@@ -103,6 +101,7 @@ httpserver._registeraliases(
 # quote() and unquote() both operate on and return strings (not bytes)
 quote = urllib.parse.quote
 unquote = urllib.parse.unquote
+
 
 # urllib.parse.urlencode() returns str. We use this function to make
 # sure we return bytes.

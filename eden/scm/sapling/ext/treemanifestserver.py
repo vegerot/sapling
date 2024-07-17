@@ -172,7 +172,6 @@ from sapling import (
     wireproto,
 )
 from sapling.commands import debug as debugcommands
-from sapling.ext import clienttelemetry
 from sapling.ext.remotefilelog import (
     cmdtable as remotefilelogcmdtable,
     mutablestores,
@@ -1429,7 +1428,7 @@ def backfillmanifestrevlog(ui, repo, *args, **opts):
             for i, r in enumerate(publicheads)
             if knownheads[i] and cl.changelogrevision(r).manifest in mfrevlog.nodemap
         ]
-        with repo.wlock(), repo.lock(), (repo.transaction("backfillmanifest")) as tr:
+        with repo.wlock(), repo.lock(), repo.transaction("backfillmanifest") as tr:
             bundlecaps = exchange.caps20to10(repo)
             cg = remote.getbundle(
                 "pull", bundlecaps=bundlecaps, common=common, heads=heads
@@ -2208,8 +2207,7 @@ def pull(orig, ui, repo, *pats, **opts):
         except Exception as ex:
             # Errors are not fatal.
             ui.warn(_("failed to prefetch trees after pull: %s\n") % ex)
-            ui.log(
-                "exceptions",
+            ui.log_exception(
                 exception_type=type(ex).__name__,
                 exception_msg=str(ex),
                 fatal="false",
@@ -2596,9 +2594,6 @@ class generatingdatastore(pycompat.ABC):
 
     def getmissing(self, keys):
         return keys
-
-    def getmetrics(self):
-        return {}
 
     def getnodeinfo(self, name, node):
         with self._generating(name, node):

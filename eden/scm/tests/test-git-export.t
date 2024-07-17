@@ -1,4 +1,6 @@
-#chg-compatible
+
+#require no-eden
+
 
   $ setconfig devel.segmented-changelog-rev-compat=true
   $ hg init repo

@@ -189,18 +189,14 @@ async fn add_mutable_rename(
 
     let rename_entry = MutableRenameEntry::new(
         dst.changeset().id(),
-        dst.path().as_mpath().cloned().into(),
+        dst.path().clone(),
         src.changeset().id(),
-        src.path().as_mpath().cloned().into(),
+        src.path().clone(),
         src_unode,
     )?;
 
     mutable_renames
-        .add_or_overwrite_renames(
-            repo.ctx(),
-            repo.changesets(None).await?.as_ref(),
-            vec![rename_entry],
-        )
+        .add_or_overwrite_renames(repo.ctx(), repo.commit_graph(), vec![rename_entry])
         .await
 }
 

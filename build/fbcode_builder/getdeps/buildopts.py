@@ -3,6 +3,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-unsafe
+
 import errno
 import glob
 import ntpath
@@ -51,6 +53,8 @@ class BuildOptions(object):
         lfs_path=None,
         shared_libs: bool = False,
         facebook_internal=None,
+        free_up_disk: bool = False,
+        build_type: Optional[str] = None,
     ) -> None:
         """fbcode_builder_dir - the path to either the in-fbsource fbcode_builder dir,
                              or for shipit-transformed repos, the build dir that
@@ -65,6 +69,8 @@ class BuildOptions(object):
         use_shipit - use real shipit instead of the simple shipit transformer
         vcvars_path - Path to external VS toolchain's vsvarsall.bat
         shared_libs - whether to build shared libraries
+        free_up_disk - take extra actions to save runner disk space
+        build_type - CMAKE_BUILD_TYPE, used by cmake and cargo builders
         """
 
         if not install_dir:
@@ -103,6 +109,12 @@ class BuildOptions(object):
         self.allow_system_packages = allow_system_packages
         self.lfs_path = lfs_path
         self.shared_libs = shared_libs
+        self.free_up_disk = free_up_disk
+
+        if build_type is None:
+            build_type = "RelWithDebInfo"
+
+        self.build_type = build_type
 
         lib_path = None
         if self.is_darwin():
@@ -209,7 +221,7 @@ class BuildOptions(object):
         )
 
     def compute_env_for_install_dirs(
-        self, install_dirs, env=None, manifest=None
+        self, loader, dep_manifests, ctx, env=None, manifest=None
     ):  # noqa: C901
         if env is not None:
             env = env.copy()
@@ -288,8 +300,16 @@ class BuildOptions(object):
             env["FBSOURCE_DATE"] = hash_data.date
 
         # reverse as we are prepending to the PATHs
-        for d in reversed(install_dirs):
-            self.add_prefix_to_env(d, env, append=False)
+        for m in reversed(dep_manifests):
+            is_direct_dep = (
+                manifest is not None and m.name in manifest.get_dependencies(ctx)
+            )
+            self.add_prefix_to_env(
+                loader.get_project_install_dir(m),
+                env,
+                append=False,
+                is_direct_dep=is_direct_dep,
+            )
 
         # Linux is always system openssl
         system_openssl = self.is_linux()
@@ -324,18 +344,26 @@ class BuildOptions(object):
         return False
 
     def add_prefix_to_env(
-        self, d, env, append: bool = True, add_library_path: bool = False
+        self,
+        d,
+        env,
+        append: bool = True,
+        add_library_path: bool = False,
+        is_direct_dep: bool = False,
     ) -> bool:  # noqa: C901
         bindir = os.path.join(d, "bin")
         found = False
+        has_pkgconfig = False
         pkgconfig = os.path.join(d, "lib", "pkgconfig")
         if os.path.exists(pkgconfig):
             found = True
+            has_pkgconfig = True
             add_path_entry(env, "PKG_CONFIG_PATH", pkgconfig, append=append)
 
         pkgconfig = os.path.join(d, "lib64", "pkgconfig")
         if os.path.exists(pkgconfig):
             found = True
+            has_pkgconfig = True
             add_path_entry(env, "PKG_CONFIG_PATH", pkgconfig, append=append)
 
         add_path_entry(env, "CMAKE_PREFIX_PATH", d, append=append)
@@ -357,6 +385,20 @@ class BuildOptions(object):
                 add_flag(env, "CPPFLAGS", f"-I{ncursesincludedir}", append=append)
             elif "/bz2-" in d:
                 add_flag(env, "CPPFLAGS", f"-I{includedir}", append=append)
+            # For non-pkgconfig projects Cabal has no way to find the includes or
+            # libraries, so we provide a set of extra Cabal flags in the env
+            if not has_pkgconfig and is_direct_dep:
+                add_flag(
+                    env,
+                    "GETDEPS_CABAL_FLAGS",
+                    f"--extra-include-dirs={includedir}",
+                    append=append,
+                )
+
+            # The thrift compiler's built-in includes are installed directly to the include dir
+            includethriftdir = os.path.join(d, "include", "thrift")
+            if os.path.exists(includethriftdir):
+                add_path_entry(env, "THRIFT_INCLUDE_PATH", includedir, append=append)
 
         # Map from FB python manifests to PYTHONPATH
         pydir = os.path.join(d, "lib", "fb-py-libs")
@@ -390,6 +432,13 @@ class BuildOptions(object):
                         add_flag(env, "LDFLAGS", f"-L{libdir}", append=append)
                     if add_library_path:
                         add_path_entry(env, "LIBRARY_PATH", libdir, append=append)
+                    if not has_pkgconfig and is_direct_dep:
+                        add_flag(
+                            env,
+                            "GETDEPS_CABAL_FLAGS",
+                            f"--extra-lib-dirs={libdir}",
+                            append=append,
+                        )
 
         # Allow resolving binaries (eg: cmake, ninja) and dlls
         # built by earlier steps
@@ -602,6 +651,8 @@ def setup_build_options(args, host_type=None) -> BuildOptions:
             "allow_system_packages",
             "lfs_path",
             "shared_libs",
+            "free_up_disk",
+            "build_type",
         }
     }
 

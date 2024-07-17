@@ -1,3 +1,6 @@
+
+#require no-eden
+
 #chg-compatible
 
   $ . "$TESTDIR/hgsql/library.sh"
@@ -23,7 +26,7 @@ Basic functionality.
   $ hg init basic
   $ cd basic
   $ echo {} > .arcconfig
-  $ enable fbscmquery
+  $ enable fbcodereview
   $ cat >> .hg/hgrc <<EOF
   > [fbscmquery]
   > reponame = basic
@@ -69,7 +72,7 @@ Test with one backing repos specified.
   $ echo {} > .arcconfig
   $ cd single_backingrepo
   $ echo "[extensions]" >> .hg/hgrc
-  $ echo "fbscmquery=" >> .hg/hgrc
+  $ echo "fbcodereview=" >> .hg/hgrc
   $ echo "[fbscmquery]" >> .hg/hgrc
   $ echo "reponame = single" >> .hg/hgrc
   $ echo "backingrepos = single_src" >> .hg/hgrc
@@ -103,7 +106,7 @@ Test with multiple backing repos specified.
   $ echo {} > .arcconfig
   $ cd backingrepos
   $ echo "[extensions]" >> .hg/hgrc
-  $ echo "fbscmquery=" >> .hg/hgrc
+  $ echo "fbcodereview=" >> .hg/hgrc
   $ echo "[fbscmquery]" >> .hg/hgrc
   $ echo "reponame = multiple" >> .hg/hgrc
   $ echo "backingrepos = src_a src_b src_c" >> .hg/hgrc
@@ -171,7 +174,7 @@ Test with a bad server port, where we get connection refused errors.
   $ echo {} > .arcconfig
   $ cd errortest
   $ echo "[extensions]" >> .hg/hgrc
-  $ echo "fbscmquery=" >> .hg/hgrc
+  $ echo "fbcodereview=" >> .hg/hgrc
   $ echo "[fbscmquery]" >> .hg/hgrc
   $ echo "reponame = errortest" >> .hg/hgrc
   $ echo "host = localhost:9" >> .hg/hgrc
@@ -204,7 +207,7 @@ Make sure that globalrevs work
   $ cd ..
   $ initserver mockwwwrepo mockwwwrepo
   $ cd mockwwwrepo
-  $ enable fbscmquery globalrevs pushrebase
+  $ enable fbcodereview globalrevs pushrebase
   $ setconfig \
   > hgsql.enabled=True \
   > fbscmquery.reponame=basic \

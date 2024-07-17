@@ -4,7 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
+
 
 import argparse
 import io
@@ -59,6 +60,7 @@ def do_stats_general(instance: EdenInstance, options: StatsGeneralOptions) -> No
         print_stats(stat_info, out)
 
 
+# pyre-fixme[2]: Parameter must be annotated.
 def print_stats(stat_info, out: io.TextIOWrapper) -> None:
     private_bytes = (
         stats_print.format_size(stat_info.privateBytes)
@@ -289,33 +291,6 @@ def get_fuse_latency(counters: DiagInfoCounters, all_flg: bool) -> Table2D:
     return table
 
 
-@stats_cmd(
-    "hgimporter",
-    "Show the number of requests to hg-debugedenimporthelper",
-    aliases=[
-        "debugedenimporthelper",
-        "hg-debugedenimporthelper",
-        "hg",
-        "hg-import",
-        "hg-importer",
-        "hgimport",
-    ],
-)
-class HgImporterCmd(Subcmd):
-    def run(self, args: argparse.Namespace) -> int:
-        TITLE = "Counts of HgImporter requests performed in EdenFS"
-        stats_print.write_heading(TITLE, sys.stdout)
-
-        instance = cmd_util.get_eden_instance(args)
-        with instance.get_thrift_client_legacy() as client:
-            counters = client.getCounters()
-
-        table = get_counter_table(counters, ["hg_importer"], ["count"])
-        stats_print.write_table(table, "HgImporter Request", sys.stdout)
-
-        return 0
-
-
 @stats_cmd("thrift", "Show the number of received thrift calls")
 class ThriftCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
@@ -367,7 +342,7 @@ def get_thrift_latency(counters: DiagInfoCounters) -> Table2D:
 
 
 @stats_cmd("hg-latency", "Show the latency of hg backing store")
-class HgBackingStoreLatencyCmd(Subcmd):
+class SaplingBackingStoreLatencyCmd(Subcmd):
     def run(self, args: argparse.Namespace) -> int:
         return backing_store_latency("hg", args)
 
@@ -484,6 +459,8 @@ class ObjectStoreCommand(Subcmd):
         return 0
 
 
+# pyre-fixme[24]: Generic type `list` expects 1 type parameter, use
+#  `typing.List[<element type>]` to avoid runtime subscripting errors.
 def get_counter_table(counters: DiagInfoCounters, prefix: List, suffix: List) -> Table:
     table: Table = {}
 

@@ -15,6 +15,8 @@
 #include <thrift/lib/cpp/concurrency/ThreadManager.h>
 
 #include "common/rust/shed/hostcaps/hostcaps.h"
+
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/config/ConfigSetting.h"
 #include "eden/fs/config/ConfigSource.h"
 #include "eden/fs/config/ConfigVariables.h"
@@ -24,7 +26,6 @@
 #include "eden/fs/config/MountProtocol.h"
 #include "eden/fs/config/ReaddirPrefetch.h"
 #include "eden/fs/eden-config.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 namespace re2 {
 class RE2;
@@ -226,6 +227,15 @@ class EdenConfig : private ConfigSettingManager {
   // [config]
 
   /**
+   * If EdenFS should auto migrate non inmemory inode catalogs to inmemory on
+   * Windows.
+   */
+  ConfigSetting<bool> migrateToInMemoryCatalog{
+      "core:migrate_existing_to_in_memory_catalog",
+      true,
+      this};
+
+  /**
    * How often the on-disk config information should be checked for changes.
    */
   ConfigSetting<std::chrono::nanoseconds> configReloadInterval{
@@ -250,6 +260,19 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * If Eden is using custom permission checking, the list of methods that any
+   * user can call.
+   */
+  ConfigSetting<std::vector<std::string>> thriftFunctionsAllowlist{
+      "thrift:functions-allowlist",
+      std::vector<std::string>{
+          "BaseService.getCounter",
+          "BaseService.getCounters",
+          "BaseService.getRegexCounters",
+          "BaseService.getSelectedCounters"},
+      this};
+
+  /**
    * The number of Thrift worker threads.
    */
   ConfigSetting<size_t> thriftNumWorkers{
@@ -271,6 +294,14 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<std::chrono::nanoseconds> thriftQueueTimeout{
       "thrift:queue-timeout",
       std::chrono::seconds(30),
+      this};
+
+  /**
+   * Use a SmallSerialExecutor for serial Thrift requests.
+   */
+  ConfigSetting<bool> thriftUseSmallSerialExecutor{
+      "thrift:use-small-serial-executor",
+      true,
       this};
 
   // [ssl]
@@ -411,18 +442,38 @@ class EdenConfig : private ConfigSettingManager {
       5,
       this};
 
+  /**
+   * The maximum number blob SHA-1s and sizes to keep in memory per mount. See
+   * the comment on `ObjectStore::metadataCache_` for more details.
+   */
+  ConfigSetting<uint64_t> metadataCacheSize{
+      "store:metadata-cache-size",
+      1'000'000,
+      this};
+
   // [fuse]
 
   /**
-   * The maximum number of concurrent FUSE requests we allow the kernel to send
-   * us.
+   * The maximum number of concurrent background FUSE requests we allow the
+   * kernel to send us. background should mean things like readahead prefetches
+   * and direct I/O, but may include things that seem like more traditionally
+   * foreground I/O. What counts as "background" seems to be up to the
+   * discretion of the kernel.
    *
    * Linux FUSE defaults to 12, but EdenFS can handle a great deal of
    * concurrency.
    */
-  ConfigSetting<int32_t> fuseMaximumRequests{
+  ConfigSetting<int32_t> fuseMaximumBackgroundRequests{
       "fuse:max-concurrent-requests",
       1000,
+      this};
+
+  /**
+   * The number of FUSE dispatcher threads to spawn.
+   */
+  ConfigSetting<int32_t> fuseNumDispatcherThreads{
+      "fuse:num-dispatcher-threads",
+      16,
       this};
 
   /**
@@ -454,6 +505,12 @@ class EdenConfig : private ConfigSettingManager {
    * to 12 (FUSE_DEFAULT_MAX_BACKGROUND) unless this is set high.
    */
   ConfigSetting<uint32_t> maximumFuseRequests{"fuse:max-requests", 1000, this};
+
+  /**
+   * The string we use in the vfs type when mounting the fuse mount. Others will
+   * see this in the mount table on the system.
+   */
+  ConfigSetting<std::string> fuseVfsType{"fuse:vfs-type", "fuse", this};
 
   // [nfs]
 
@@ -490,20 +547,6 @@ class EdenConfig : private ConfigSettingManager {
    * Controls whether Mountd will register itself against rpcbind.
    */
   ConfigSetting<bool> registerMountd{"nfs:register-mountd", false, this};
-
-  /**
-   * Number of threads that will service the NFS requests.
-   */
-  ConfigSetting<uint64_t> numNfsThreads{"nfs:num-servicing-threads", 8, this};
-
-  /**
-   * Maximum number of pending NFS requests. If more requests are inflight, the
-   * NFS code will block.
-   */
-  ConfigSetting<uint64_t> maxNfsInflightRequests{
-      "nfs:max-inflight-requests",
-      1000,
-      this};
 
   /**
    * Buffer size for read and writes requests. Default to 16 KiB.
@@ -637,6 +680,50 @@ class EdenConfig : private ConfigSettingManager {
       true,
       this};
 
+  /**
+   * Controls how frequently we log to the EdenFS log file and scuba tables
+   * about torn reads - i.e. when Prjfs attempts to read a file that was
+   * modified in the middle of an operation.
+   */
+  ConfigSetting<std::chrono::nanoseconds> prjfsTornReadLogInterval{
+      "prjfs:torn-read-log-interval",
+      std::chrono::seconds{10},
+      this};
+
+  ConfigSetting<std::chrono::nanoseconds> tornReadCleanupDelay{
+      "prjfs:torn-read-cleanup-delay",
+      std::chrono::seconds{1},
+      this};
+
+  // [fschannel]
+
+  /**
+   * Number of threads that will service the background FS channel requests.
+   */
+  ConfigSetting<uint64_t> numFsChannelThreads{
+      "fschannel:num-servicing-threads",
+      std::thread::hardware_concurrency(),
+      this};
+
+  /**
+   * Maximum number of pending FS channel requests. If more requests are
+   * inflight, the FS channel code will block.
+   */
+  ConfigSetting<uint64_t> maxFsChannelInflightRequests{
+      "fschannel:max-inflight-requests",
+      1000,
+      this};
+
+  ConfigSetting<bool> unboundedFsChannel{
+      "fschannel:unbounded-task-queue",
+      true,
+      this};
+
+  ConfigSetting<std::chrono::nanoseconds> highFsRequestsLogInterval{
+      "fschannel:high-fs-requests-log-interval",
+      std::chrono::minutes{30},
+      this};
+
   // [hg]
 
   /**
@@ -660,7 +747,7 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<bool> fetchHgAuxMetadata{"hg:fetch-aux-metadata", true, this};
 
   /**
-   * Which object ID format should the HgBackingStore use?
+   * Which object ID format should the SaplingBackingStore use?
    */
   ConfigSetting<HgObjectIdFormat> hgObjectIdFormat{
       "hg:object-id-format",
@@ -682,12 +769,12 @@ class EdenConfig : private ConfigSettingManager {
 
   /**
    * Controls the number of blob or prefetch import requests we batch in
-   * HgBackingStore
+   * SaplingBackingStore
    */
   ConfigSetting<uint32_t> importBatchSize{"hg:import-batch-size", 1, this};
 
   /**
-   * Controls the number of tree import requests we batch in HgBackingStore
+   * Controls the number of tree import requests we batch in SaplingBackingStore
    */
   ConfigSetting<uint32_t> importBatchSizeTree{
       "hg:import-batch-size-tree",
@@ -696,7 +783,7 @@ class EdenConfig : private ConfigSettingManager {
 
   /**
    * Controls the max number of blob metadata import requests we batch in
-   * HgBackingStore
+   * SaplingBackingStore
    */
   ConfigSetting<uint32_t> importBatchSizeBlobMeta{
       "hg:import-batch-size-blobmeta",
@@ -704,20 +791,10 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Whether fetching trees should fall back on an external hg importer process.
+   * Whether fetching objects should fall back to hg importer process.
    */
-  ConfigSetting<bool> hgTreeFetchFallback{"hg:tree-fetch-fallback", true, this};
-
-  /**
-   * Whether fetching blobs should fall back on an external hg importer process.
-   */
-  ConfigSetting<bool> hgBlobFetchFallback{"hg:blob-fetch-fallback", true, this};
-
-  /**
-   * Whether fetching blob metadata should fall back to fetching blobs.
-   */
-  ConfigSetting<bool> hgBlobMetaFetchFallback{
-      "hg:blobmeta-fetch-fallback",
+  ConfigSetting<bool> hgImporterFetchFallback{
+      "hg:importer-fetch-fallback",
       true,
       this};
 
@@ -740,9 +817,45 @@ class EdenConfig : private ConfigSettingManager {
    *
    * DO NOT USE UNLESS YOU HAVE THE OK FROM THE EDENFS TEAM.
    */
-  ConfigSetting<std::unordered_set<RelativePath>> hgFilteredPaths{
-      "hg:filtered-paths",
-      std::unordered_set<RelativePath>{},
+  ConfigSetting<std::shared_ptr<std::unordered_set<RelativePath>>>
+      hgFilteredPaths{
+          "hg:filtered-paths",
+          std::make_shared<std::unordered_set<RelativePath>>(),
+          this};
+
+  /**
+   * Should we use the cached `sl status` results or not
+   */
+  ConfigSetting<bool> hgEnableCachedResultForStatusRequest{
+      "hg:enable-scm-status-cache",
+      false,
+      this};
+
+  /**
+   *  The maximum size of SCM status cache in bytes:
+   *  1. Generally, a file path is about 50 chars long.
+   *  2. We only cache status when the number of diff files is less than 10k.
+   *  3. And we allow at most 5 such "huge" status
+   */
+  ConfigSetting<size_t> scmStatusCacheMaxSize{
+      "hg:scm-status-cache-max-size",
+      50 * 10 * 1024 * 5, // 2.5 MB
+      this};
+
+  /**
+   *  The minimum number of items to keep in SCM status cache
+   */
+  ConfigSetting<size_t> scmStatusCacheMininumItems{
+      "hg:scm-status-cache-min-items",
+      3,
+      this};
+
+  /**
+   *  The maximum number of entries we want to cache within a single status
+   */
+  ConfigSetting<size_t> scmStatusCacheMaxEntriesPerItem{
+      "hg:scm-status-cache-max-entires-per-item",
+      10000,
       this};
 
   // [backingstore]
@@ -968,6 +1081,15 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   *  The interval for backgroung periodic unloading of inodes from inodeMap.
+   * The value is in minutes.
+   */
+  ConfigSetting<uint32_t> periodicUnloadIntervalMinutes{
+      "experimental:periodic-inode-map-unload-interval",
+      0,
+      this};
+
+  /**
    * Controls whether EdenFS eagerly invalidates directories during checkout or
    * whether it only does when children were modified.
    *
@@ -978,7 +1100,60 @@ class EdenConfig : private ConfigSettingManager {
       folly::kIsWindows,
       this};
 
+  /**
+   * Controls whether EdenFS symlinks are enabled on Windows.
+   *
+   * Currently this is disabled because of a Windows bug. Directories with
+   * long symlinks become un-list-able.
+   * https://fb.workplace.com/groups/edenfswindows/permalink/1427359391513268/
+   */
+  ConfigSetting<bool> windowsSymlinksEnabled{
+      "experimental:windows-symlinks",
+      false,
+      this};
+
+  /**
+   * Controls if EdenFS runs a checkout operation on EdenServer's
+   * EdenCPUThreadPool or using the Thrift CPU workers.
+   *
+   * This is a temporary option to help us mitigate and understand S399431.
+   */
+  ConfigSetting<bool> runCheckoutOnEdenCPUThreadpool{
+      "experimental:run-checkout-on-eden-threadpool",
+      false,
+      this};
+
+  /**
+   * Controls if EdenFS runs a prefetch operation serially or not.
+   *
+   * This is a temporary option to help us mitigate and understand S399431.
+   */
+  ConfigSetting<bool> runSerialPrefetch{
+      "experimental:run-serial-prefetch",
+      false,
+      this};
+
+  /**
+   * Controls if batches are sent to Sapling with FetchMode::AllowRemote
+   * or batches are sent to Sapling with FetchMode::LocalOnly and then the
+   * failed requests are sent to Sapling again with FetchMode::RemoteOnly.
+   *
+   * This is a temporary option to test metrics on this new way of batching
+   */
+  ConfigSetting<bool> allowRemoteGetBatch{
+      "experimental:allow-remote-get-batch",
+      true,
+      this};
+
   // [blobcache]
+
+  /**
+   * Controls whether if EdenFS caches blobs in memory.
+   */
+  ConfigSetting<bool> enableInMemoryBlobCaching{
+      "blobcache:enable-in-memory-blob-caching",
+      true,
+      this};
 
   /**
    * How many bytes worth of blobs to keep in memory, at most.
@@ -1000,7 +1175,7 @@ class EdenConfig : private ConfigSettingManager {
   // [treecache]
 
   /**
-   * Controls whether if EdenFS caches tree in memory.
+   * Controls whether if EdenFS caches trees in memory.
    */
   ConfigSetting<bool> enableInMemoryTreeCaching{
       "treecache:enable-in-memory-tree-caching",
@@ -1050,7 +1225,7 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> enableEdenMenu{
       "notifications:enable-eden-menu",
-      false,
+      true,
       this};
 
   /**
@@ -1058,7 +1233,7 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> enableNotifications{
       "notifications:enable-notifications",
-      false,
+      true,
       this};
 
   /**
@@ -1066,7 +1241,7 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> enableEdenDebugMenu{
       "notifications:enable-debug",
-      false,
+      true,
       this};
 
   // [log]
@@ -1113,6 +1288,8 @@ class EdenConfig : private ConfigSettingManager {
       "prefetch-profiles:file-access-logging-sampling-denominator",
       0,
       this};
+
+  // [predictive-prefetch-profiles]
 
   /**
    * The number of globs to use for a predictive prefetch profile,
@@ -1234,6 +1411,14 @@ class EdenConfig : private ConfigSettingManager {
       true,
       this};
 
+  /**
+   * Controls whether EdenFS uses EdenAPI to make suffix queries
+   */
+  ConfigSetting<bool> enableEdenAPISuffixQuery{
+      "glob:use-edenapi-suffix-query",
+      false,
+      this};
+
   // [doctor]
 
   /**
@@ -1244,6 +1429,83 @@ class EdenConfig : private ConfigSettingManager {
       "doctor:ignored-problem-class-names",
       {},
       this};
+
+  /**
+   * Whether edenfsctl doctor should check for Kerberos certificate issues.
+   */
+  ConfigSetting<bool> doctorEnableKerberosCheck{
+      "doctor:enable-kerberos-check",
+      false,
+      this};
+
+  /**
+   * The minimum kernel version required for EdenFS to work correctly.
+   */
+  ConfigSetting<std::string> doctorMinimumKernelVersion{
+      "doctor:minimum-kernel-version",
+      "4.11.3-67",
+      this};
+
+  /**
+   * Known bad kernel versions for which we should print a warning in `edenfsctl
+   * doctor`.
+   */
+  ConfigSetting<std::string> doctorKnownBadKernelVersions{
+      "doctor:known-bad-kernel-versions",
+      "TODO,TEST",
+      this};
+
+  /**
+   * Known bad edenfs versions for which we should print a warning in `edenfsctl
+   * doctor`. Currently not used in Daemon.
+   * Format:
+   * [<bad_version_1>|<sev_1(optional):reason_1>,<bad_version_2>|<sev_2(optional):reason_2>]
+   */
+  ConfigSetting<std::vector<std::string>> doctorKnownBadEdenFsVersions{
+      "doctor:known-bad-edenfs-versions",
+      {},
+      this};
+
+  /**
+   * Extensions that may do bad things that we want to warn about in
+   * doctor.
+   */
+  ConfigSetting<std::vector<std::string>> doctorExtensionWarnList{
+      "doctor:vscode-extensions-warn-list",
+      {},
+      this};
+
+  /**
+   * Extensions that will do bad things that we definitely want to advise
+   * against using.
+   */
+  ConfigSetting<std::vector<std::string>> doctorExtensionBlockList{
+      "doctor:vscode-extensions-block-list",
+      {},
+      this};
+
+  /**
+   * Extensions that we know are fine and should not be warned against.
+   */
+  ConfigSetting<std::vector<std::string>> doctorExtensionAllowList{
+      "doctor:vscode-extensions-allow-list",
+      {},
+      this};
+
+  /**
+   * Extensions authors that are known and we should not warn about.
+   */
+  ConfigSetting<std::vector<std::string>> doctorExtensionAuthorAllowList{
+      "doctor:vscode-extensions-author-allow-list",
+      {},
+      this};
+
+  // [rage]
+  /**
+   * The tool that will be used to upload eden rages. Only currently used in the
+   * CLI.
+   */
+  ConfigSetting<std::string> rageReporter{"rage:reporter", "", this};
 
   // [hash]
   /**

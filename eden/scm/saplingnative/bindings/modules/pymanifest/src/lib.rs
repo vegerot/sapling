@@ -50,7 +50,7 @@ pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
         py_fn!(
             py,
             subdir_diff(
-                store: ImplInto<Arc<dyn TreeStore + Send + Sync>>,
+                store: ImplInto<Arc<dyn TreeStore>>,
                 path: PyPathBuf,
                 binnode: &PyBytes,
                 other_binnodes: &PyList,
@@ -64,7 +64,7 @@ pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
         py_fn!(
             py,
             prefetch(
-                store: ImplInto<Arc<dyn TreeStore + Send + Sync>>,
+                store: ImplInto<Arc<dyn TreeStore>>,
                 node: Vec<PyBytes>,
                 paths: Option<Vec<PyPathBuf>> = None,
             )
@@ -79,7 +79,7 @@ py_class!(pub class treemanifest |py| {
 
     def __new__(
         _cls,
-        store: ImplInto<Arc<dyn TreeStore + Send + Sync>>,
+        store: ImplInto<Arc<dyn TreeStore>>,
         node: Option<&PyBytes> = None
     ) -> PyResult<treemanifest> {
         let manifest_store = store.into();
@@ -158,7 +158,7 @@ py_class!(pub class treemanifest |py| {
     def walk(&self, pymatcher: PyObject) -> PyResult<Vec<PyPathBuf>> {
         let mut result = Vec::new();
         let tree = self.underlying(py);
-        let matcher = extract_matcher(py, pymatcher)?;
+        let matcher = extract_matcher(py, pymatcher)?.0;
         let files = py.allow_threads(move || -> Vec<_> {
             let tree = tree.read();
             tree.files(matcher).collect()
@@ -170,11 +170,38 @@ py_class!(pub class treemanifest |py| {
         Ok(result)
     }
 
+    /// Like walk(), but includes file node as well.
+    def walkfiles(&self, pymatcher: PyObject) -> PyResult<Vec<(PyPathBuf, PyBytes)>> {
+        let tree = self.underlying(py);
+
+        let (matcher, is_rust_matcher) = extract_matcher(py, pymatcher)?;
+
+        if is_rust_matcher {
+            tree.read().files(matcher)
+                .map(|file| {
+                    let file = file?;
+                    Ok((file.path.into(), PyBytes::new(py, file.meta.hgid.as_ref())))
+                })
+                .collect::<Result<Vec<_>>>().map_pyerr(py)
+        } else {
+            let files = py.allow_threads(move || -> Vec<_> {
+                let tree = tree.read();
+                tree.files(matcher).collect()
+            });
+            let mut result = Vec::new();
+            for entry in files.into_iter() {
+                let file = entry.map_pyerr(py)?;
+                result.push((file.path.into(), PyBytes::new(py, file.meta.hgid.as_ref())));
+            }
+            Ok(result)
+        }
+    }
+
     /// Returns [(path, id)] for directories.
     def walkdirs(&self, pymatcher: PyObject) -> PyResult<Vec<(PyPathBuf, Option<PyBytes>)>> {
         let mut result = Vec::new();
         let tree = self.underlying(py);
-        let matcher = extract_matcher(py, pymatcher)?;
+        let matcher = extract_matcher(py, pymatcher)?.0;
         let dirs = py.allow_threads(move || -> Vec<_> {
             let tree = tree.read();
             tree.dirs(matcher).collect()
@@ -527,7 +554,7 @@ impl treemanifest {
 
 pub fn subdir_diff(
     py: Python,
-    store: ImplInto<Arc<dyn TreeStore + Send + Sync>>,
+    store: ImplInto<Arc<dyn TreeStore>>,
     path: PyPathBuf,
     binnode: &PyBytes,
     other_binnodes: &PyList,
@@ -568,7 +595,7 @@ pub fn subdir_diff(
 
 pub fn prefetch(
     py: Python,
-    store: ImplInto<Arc<dyn TreeStore + Send + Sync>>,
+    store: ImplInto<Arc<dyn TreeStore>>,
     nodes: Vec<PyBytes>,
     paths: Option<Vec<PyPathBuf>>,
 ) -> PyResult<PyNone> {

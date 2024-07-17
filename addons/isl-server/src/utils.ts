@@ -9,7 +9,7 @@ import type execa from 'execa';
 import type {ExecaChildProcess, ExecaError} from 'execa';
 import type {CommitInfo, SmartlogCommits} from 'isl/src/types';
 
-import os from 'os';
+import os from 'node:os';
 import {truncate} from 'shared/utils';
 
 export function sleep(timeMs: number): Promise<void> {
@@ -165,6 +165,23 @@ export function parseExecJson<T>(
     });
 }
 
-export function isExecaError(s: unknown): s is ExecaError {
-  return s != null && typeof s === 'object' && 'stderr' in s;
+export function isExecaError(s: unknown): s is ExecaError & {code?: string} {
+  return s != null && typeof s === 'object' && 'exitCode' in s;
+}
+
+export function fromEntries<V>(entries: Array<[string, V]>): {
+  [key: string]: V;
+} {
+  // Object.fromEntries() is available in Node v12 and later.
+  if (typeof Object.fromEntries === 'function') {
+    return Object.fromEntries(entries);
+  }
+
+  const obj: {
+    [key: string]: V;
+  } = {};
+  for (const [key, value] of entries) {
+    obj[key] = value;
+  }
+  return obj;
 }

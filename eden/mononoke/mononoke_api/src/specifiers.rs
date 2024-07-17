@@ -9,6 +9,8 @@ use std::fmt;
 
 use anyhow::Context;
 use anyhow::Result;
+use context::CoreContext;
+use edenapi_types::CommitId;
 use edenapi_types::HgId;
 use ephemeral_blobstore::BubbleId;
 use ephemeral_blobstore::RepoEphemeralStore;
@@ -78,6 +80,17 @@ impl From<GitSha1> for ChangesetSpecifier {
     }
 }
 
+impl From<CommitId> for ChangesetSpecifier {
+    fn from(id: CommitId) -> Self {
+        match id {
+            CommitId::Hg(id) => Self::Hg(HgChangesetId::from(id)),
+            CommitId::Bonsai(id) => Self::Bonsai(id.into()),
+            CommitId::Globalrev(id) => Self::Globalrev(Globalrev::new(id)),
+            CommitId::GitSha1(id) => Self::GitSha1(id.into()),
+        }
+    }
+}
+
 impl ChangesetSpecifier {
     pub fn in_bubble(&self) -> bool {
         use ChangesetSpecifier::*;
@@ -89,6 +102,7 @@ impl ChangesetSpecifier {
 
     pub async fn bubble_id(
         &self,
+        ctx: &CoreContext,
         ephemeral_blobstore: RepoEphemeralStore,
     ) -> Result<Option<BubbleId>> {
         use ChangesetSpecifier::*;
@@ -96,7 +110,7 @@ impl ChangesetSpecifier {
             EphemeralBonsai(cs_id, bubble_id) => Some(match bubble_id {
                 Some(id) => id.clone(),
                 None => ephemeral_blobstore
-                    .bubble_from_changeset(cs_id)
+                    .bubble_from_changeset(ctx, cs_id)
                     .await?
                     .with_context(|| format!("changeset {} does not belong to bubble", cs_id))?,
             }),

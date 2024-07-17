@@ -12,19 +12,20 @@ import type {StackEditOpDescription, UseStackEditState} from './stackEditState';
 
 import {AnimatedReorderGroup} from '../../AnimatedReorderGroup';
 import {CommitTitle as StandaloneCommitTitle} from '../../CommitTitle';
-import {FlexRow} from '../../ComponentUtils';
+import {Row} from '../../ComponentUtils';
 import {DragHandle} from '../../DragHandle';
-import {Tooltip} from '../../Tooltip';
+import {DraggingOverlay} from '../../DraggingOverlay';
 import {t, T} from '../../i18n';
+import {SplitCommitIcon} from '../../icons/SplitCommitIcon';
 import {reorderedRevs} from '../commitStackState';
 import {ReorderState} from '../reorderState';
-import {SplitCommitIcon} from './SplitCommitIcon';
 import {bumpStackEditMetric, useStackEditState} from './stackEditState';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
 import {is} from 'immutable';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useRef, useState} from 'react';
-import {Icon} from 'shared/Icon';
-import {unwrap} from 'shared/utils';
+import {nullthrows} from 'shared/utils';
 
 import './StackEditSubTree.css';
 
@@ -37,7 +38,7 @@ export function StackEditSubTree(props: ActivateSplitProps): React.ReactElement 
   const stackEdit = useStackEditState();
   const [reorderState, setReorderState] = useState<ReorderState>(() => new ReorderState());
 
-  const draggingDivRef = useRef<HTMLDivElement | null>(null);
+  const onDragRef = useRef<DragHandler | null>(null);
   const commitListDivRef = useRef<HTMLDivElement | null>(null);
 
   const commitStack = stackEdit.commitStack;
@@ -63,17 +64,7 @@ export function StackEditSubTree(props: ActivateSplitProps): React.ReactElement 
 
     return (x, y, isDragging) => {
       // Visual update.
-      const draggingDiv = draggingDivRef.current;
-      if (draggingDiv != null) {
-        if (isDragging) {
-          Object.assign(draggingDiv.style, {
-            transform: `translate(${x}px, calc(-50% + ${y}px))`,
-            opacity: '1',
-          });
-        } else {
-          draggingDiv.style.opacity = '0';
-        }
-      }
+      onDragRef.current?.(x, y, isDragging);
       // State update.
       if (isDragging) {
         if (currentReorderState.isDragging()) {
@@ -99,7 +90,7 @@ export function StackEditSubTree(props: ActivateSplitProps): React.ReactElement 
             name: 'move',
             offset: currentReorderState.offset,
             depCount: currentReorderState.draggingRevs.size - 1,
-            commit: unwrap(commitStack.stack.get(currentReorderState.draggingRev)),
+            commit: nullthrows(commitStack.stack.get(currentReorderState.draggingRev)),
           });
           bumpStackEditMetric('moveDnD');
         }
@@ -128,21 +119,14 @@ export function StackEditSubTree(props: ActivateSplitProps): React.ReactElement 
         </AnimatedReorderGroup>
       </div>
       {reorderState.isDragging() && (
-        <div className="stack-edit-dragging" ref={draggingDivRef}>
-          <div className="stack-edit-dragging-commit-list">
-            {reorderState.draggingRevs
-              .toArray()
-              .reverse()
-              .map(rev => (
-                <StackEditCommit key={rev} rev={rev} stackEdit={stackEdit} />
-              ))}
-          </div>
-          {draggingHintText && (
-            <div className="stack-edit-dragging-hint-container">
-              <span className="stack-edit-dragging-hint-text tooltip">{draggingHintText}</span>
-            </div>
-          )}
-        </div>
+        <DraggingOverlay onDragRef={onDragRef} hint={draggingHintText}>
+          {reorderState.draggingRevs
+            .toArray()
+            .reverse()
+            .map(rev => (
+              <StackEditCommit key={rev} rev={rev} stackEdit={stackEdit} />
+            ))}
+        </DraggingOverlay>
       )}
     </>
   );
@@ -165,7 +149,7 @@ export function StackEditCommit({
   const canDrop = state.canDrop(rev);
   const canMoveDown = state.canMoveDown(rev);
   const canMoveUp = state.canMoveUp(rev);
-  const commit = unwrap(state.stack.get(rev));
+  const commit = nullthrows(state.stack.get(rev));
   const titleText = commit.text.split('\n', 1).at(0) ?? '';
 
   const handleMoveUp = () => {
@@ -212,9 +196,9 @@ export function StackEditCommit({
                 'Cannot move up if this commit is at the top, or if the next commit depends on this commit',
               )
         }>
-        <VSCodeButton disabled={!canMoveUp} onClick={handleMoveUp} appearance="icon">
+        <Button disabled={!canMoveUp} onClick={handleMoveUp} icon>
           <Icon icon="chevron-up" />
-        </VSCodeButton>
+        </Button>
       </Tooltip>
       <Tooltip
         title={
@@ -224,9 +208,9 @@ export function StackEditCommit({
                 'Cannot move up if this commit is at the bottom, or if this commit depends on its parent',
               )
         }>
-        <VSCodeButton disabled={!canMoveDown} onClick={handleMoveDown} appearance="icon">
+        <Button disabled={!canMoveDown} onClick={handleMoveDown} icon>
           <Icon icon="chevron-down" />
-        </VSCodeButton>
+        </Button>
       </Tooltip>
       <Tooltip
         title={
@@ -234,9 +218,9 @@ export function StackEditCommit({
             ? t('Fold the commit with its parent')
             : t('Can not fold with parent if this commit is at the bottom')
         }>
-        <VSCodeButton disabled={!canFold} onClick={handleFoldDown} appearance="icon">
+        <Button disabled={!canFold} onClick={handleFoldDown} icon>
           <Icon icon="fold-down" />
-        </VSCodeButton>
+        </Button>
       </Tooltip>
       <Tooltip
         title={
@@ -244,9 +228,9 @@ export function StackEditCommit({
             ? t('Drop the commit in the stack')
             : t('Cannot drop this commit because it has dependencies')
         }>
-        <VSCodeButton disabled={!canDrop} onClick={handleDrop} appearance="icon">
+        <Button disabled={!canDrop} onClick={handleDrop} icon>
           <Icon icon="close" />
-        </VSCodeButton>
+        </Button>
       </Tooltip>
     </div>
   );
@@ -254,16 +238,16 @@ export function StackEditCommit({
   const rightSideButtons = (
     <div className="stack-edit-right-side-buttons">
       <Tooltip title={t('Start interactive split for this commit')}>
-        <VSCodeButton onClick={handleSplit} appearance="icon">
+        <Button onClick={handleSplit} icon>
           <SplitCommitIcon slot="start" />
           <T>Split</T>
-        </VSCodeButton>
+        </Button>
       </Tooltip>
     </div>
   );
 
   return (
-    <FlexRow
+    <Row
       data-reorder-id={onDrag ? commit.key : ''}
       data-rev={rev}
       className={`commit${isReorderPreview ? ' commit-reorder-preview' : ''}`}>
@@ -273,7 +257,7 @@ export function StackEditCommit({
       {buttons}
       {title}
       {rightSideButtons}
-    </FlexRow>
+    </Row>
   );
 }
 
@@ -296,7 +280,7 @@ function calculateReorderOffset(
   invisibleRevCount = 1,
 ): number {
   let belowCount = 0;
-  const parentY: number = unwrap(container).getBoundingClientRect().y;
+  const parentY: number = nullthrows(container).getBoundingClientRect().y;
   container.querySelectorAll('.commit').forEach(element => {
     const commitDiv = element as HTMLDivElement;
     // commitDiv.getBoundingClientRect() will consider the animation transform.

@@ -59,8 +59,8 @@ const DERIVED_PREFIX: &str = "derived_";
 static DERIVED_DATA_NODE_TYPES: Lazy<HashMap<String, Vec<NodeType>>> = Lazy::new(|| {
     let mut m: HashMap<String, Vec<NodeType>> = HashMap::new();
     for t in NodeType::iter() {
-        if let Some(name) = t.derived_data_name() {
-            m.entry(format!("{}{}", DERIVED_PREFIX, name))
+        if let Some(derived_data_type) = t.derived_data_type() {
+            m.entry(format!("{}{}", DERIVED_PREFIX, derived_data_type.name()))
                 .or_default()
                 .push(t);
         }
@@ -119,7 +119,6 @@ const DEEP_INCLUDE_EDGE_TYPES: &[EdgeType] = &[
     EdgeType::ChangesetToDeletedManifestV2Mapping,
     EdgeType::ChangesetToFsnodeMapping,
     EdgeType::ChangesetToSkeletonManifestMapping,
-    EdgeType::ChangesetToBasenameSuffixSkeletonManifestMapping,
     EdgeType::ChangesetToUnodeMapping,
     // Hg
     EdgeType::HgBonsaiMappingToChangeset,
@@ -164,8 +163,6 @@ const DEEP_INCLUDE_EDGE_TYPES: &[EdgeType] = &[
     EdgeType::FsnodeToFileContent,
     EdgeType::SkeletonManifestMappingToRootSkeletonManifest,
     EdgeType::SkeletonManifestToSkeletonManifestChild,
-    EdgeType::BasenameSuffixSkeletonManifestMappingToRootBasenameSuffixSkeletonManifest,
-    EdgeType::BasenameSuffixSkeletonManifestToBasenameSuffixSkeletonManifestChild,
     EdgeType::UnodeFileToBlame,
     EdgeType::UnodeFileToFastlogFile,
     EdgeType::UnodeFileToFileContent,
@@ -192,7 +189,6 @@ const SHALLOW_INCLUDE_EDGE_TYPES: &[EdgeType] = &[
     EdgeType::ChangesetToDeletedManifestV2Mapping,
     EdgeType::ChangesetToFsnodeMapping,
     EdgeType::ChangesetToSkeletonManifestMapping,
-    EdgeType::ChangesetToBasenameSuffixSkeletonManifestMapping,
     EdgeType::ChangesetToUnodeMapping,
     // Hg
     EdgeType::HgBonsaiMappingToChangeset,
@@ -223,8 +219,6 @@ const SHALLOW_INCLUDE_EDGE_TYPES: &[EdgeType] = &[
     EdgeType::FsnodeMappingToRootFsnode,
     EdgeType::SkeletonManifestMappingToRootSkeletonManifest,
     EdgeType::SkeletonManifestToSkeletonManifestChild,
-    EdgeType::BasenameSuffixSkeletonManifestMappingToRootBasenameSuffixSkeletonManifest,
-    EdgeType::BasenameSuffixSkeletonManifestToBasenameSuffixSkeletonManifestChild,
     EdgeType::UnodeFileToBlame,
     EdgeType::UnodeFileToFastlogFile,
     EdgeType::UnodeFileToFileContent,

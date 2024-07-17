@@ -40,6 +40,7 @@ from sapling import (
     hg,
     localrepo,
     mutation,
+    push as pushmod,
     pycompat,
     rcutil,
     registrar,
@@ -47,7 +48,6 @@ from sapling import (
     scmutil,
     smartset,
     tracing,
-    util,
     vfs as vfsmod,
     visibility,
 )
@@ -59,6 +59,7 @@ from sapling.bookmarks import (
     selectivepullbookmarknames,
     splitremotename,
 )
+from sapling.ext.commitcloud import util as ccutil
 from sapling.i18n import _
 from sapling.node import bin, hex, short
 
@@ -373,10 +374,6 @@ def _tracking(ui):
     return ui.configbool("remotenames", "tracking")
 
 
-def _branchesenabled(ui):
-    return False
-
-
 def exrebasecmd(orig, ui, repo, *pats, **opts):
     dest = opts["dest"]
     source = opts["source"]
@@ -390,7 +387,7 @@ def exrebasecmd(orig, ui, repo, *pats, **opts):
     if not (cont or abort or dest or source or revs or base) and current:
         tracking = _readtracking(repo)
         if current in tracking:
-            opts["dest"] = tracking[current]
+            opts["dest"] = [tracking[current]]
 
     ret = orig(ui, repo, *pats, **opts)
     precachedistance(repo)
@@ -551,7 +548,7 @@ def extsetup(ui):
             ),
         ),
         (pushcmd, ("t", "to", "", "push commits to this bookmark", "BOOKMARK")),
-        (pushcmd, ("d", "delete", "", "delete remote bookmark", "BOOKMARK")),
+        (pushcmd, ("", "delete", "", "delete remote bookmark", "BOOKMARK")),
         (pushcmd, ("", "create", None, "create a new remote bookmark")),
         (
             pushcmd,
@@ -716,7 +713,10 @@ def expullcmd(orig, ui, repo, source="default", **opts):
     if not opts.get("rebase"):
         return orig(ui, repo, source, **opts)
 
-    rebasemodule = extensions.find("rebase")
+    try:
+        rebasemodule = extensions.find("rebase")
+    except KeyError:
+        rebasemodule = None
 
     if not rebasemodule:
         return orig(ui, repo, source, **opts)
@@ -892,20 +892,6 @@ def expushcmd(orig, ui, repo, dest=None, **opts):
         or (opts.get("force") and forcecompat),
     }
 
-    if opargs["delete"]:
-        flag = None
-        for f in ("to", "bookmark", "branch", "rev"):
-            if opts.get(f):
-                flag = f
-                break
-        if flag:
-            msg = _("do not specify --delete and " "--%s at the same time") % flag
-            raise error.Abort(msg)
-        # we want to skip pushing any changesets while deleting a remote
-        # bookmark, so we send the null revision
-        opts["rev"] = ["null"]
-        return orig(ui, repo, dest, opargs=opargs, **opts)
-
     revs = opts.get("rev")
 
     paths = dict((path, url) for path, url in ui.configitems("paths"))
@@ -920,6 +906,7 @@ def expushcmd(orig, ui, repo, dest=None, **opts):
     if (
         (not dest or dest == defaultpush)
         and not opargs["to"]
+        and not opargs["delete"]
         and not revs
         and _tracking(ui)
     ):
@@ -934,6 +921,34 @@ def expushcmd(orig, ui, repo, dest=None, **opts):
             if book and path in paths:
                 dest = path
                 opargs["to"] = book
+
+    edenapi = pushmod.get_edenapi_for_dest(repo, dest)
+
+    if extensions.isenabled(ui, "commitcloud"):
+        bookname = opargs["to"] or opargs["delete"]
+        scratchmatcher = ccutil.scratchbranchmatcher(ui)
+        # infinitepush "scratch" branches don't work over the regular
+        # wire protocol, so require edenapi for them.
+        if bookname is not None and scratchmatcher.match(bookname):
+            edenapi = repo.edenapi
+
+    if opargs["delete"]:
+        flag = None
+        for f in ("to", "bookmark", "branch", "rev"):
+            if opts.get(f):
+                flag = f
+                break
+        if flag:
+            msg = _("do not specify --delete and " "--%s at the same time") % flag
+            raise error.Abort(msg)
+        # we want to skip pushing any changesets while deleting a remote
+        # bookmark, so we send the null revision
+        opts["rev"] = ["null"]
+        if edenapi:
+            return pushmod.delete_remote_bookmark(
+                repo, edenapi, opargs["delete"], opts.get("force"), opts.get("pushvars")
+            )
+        return orig(ui, repo, dest, opargs=opargs, **opts)
 
     # un-rename passed path
     dest = revrenames.get(dest, dest)
@@ -1006,11 +1021,6 @@ def expushcmd(orig, ui, repo, dest=None, **opts):
 
     # all checks pass, go for it!
     node = repo.lookup(rev)
-    ui.status_err(
-        _("pushing rev %s to destination %s bookmark %s\n")
-        % (short(node), dest, opargs["to"])
-    )
-
     force = opts.get("force")
     bookmark = opargs["to"]
     pattern = ui.config("remotenames", "disallowedto")
@@ -1028,6 +1038,26 @@ def expushcmd(orig, ui, repo, dest=None, **opts):
         opargs["forcedmissing"] = list(
             repo.nodes("draft() & only(%n, %s)", node, fullonto)
         )
+
+    if edenapi:
+        try:
+            return pushmod.push(
+                repo,
+                dest,
+                node,
+                remote_bookmark=opargs["to"],
+                force=force,
+                opargs=opargs,
+                edenapi=edenapi,
+            )
+        except error.UnsupportedEdenApiPush as e:
+            ui.status_err(_("fallback reason: %s\n") % e)
+            # fallback to old push
+
+    ui.status_err(
+        _("pushing rev %s to destination %s bookmark %s\n")
+        % (short(node), dest, opargs["to"])
+    )
 
     # NB: despite the name, 'revs' doesn't work if it's a numeric rev
     pushop = exchange.push(
@@ -1400,8 +1430,8 @@ def calculatedistance(repo, fromrev, torev):
     if not repo.ui.configbool("remotenames", "calculatedistance"):
         return (None, None)
 
-    ahead = len(repo.revs("only(%d, %d)" % (fromrev, torev)))
-    behind = len(repo.revs("only(%d, %d)" % (torev, fromrev)))
+    ahead = len(repo.revs("only(%d, %d)", fromrev, torev))
+    behind = len(repo.revs("only(%d, %d)", torev, fromrev))
 
     return (ahead, behind)
 

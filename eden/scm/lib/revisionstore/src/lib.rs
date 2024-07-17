@@ -98,8 +98,8 @@
 //!
 //! Main interface to read data out of a store. For copied file data, the returned
 //! data will contain a copy-from header which may need to be stripped with
-//! `strip_metadata` to obtain the plain blob. Must implement the `LocalStore`
-//! trait. Metadata can be also separated with separate_metadata that returns raw metadata blob.
+//! `strip_hg_file_metadata` to obtain the plain blob. Must implement the `LocalStore`
+//! trait. Metadata can be also separated with split_hg_file_metadata that returns raw metadata blob.
 //!
 //! ## `ContentDataStore`
 //!
@@ -120,7 +120,6 @@
 //! implemented by both the ssh and the edenapi remote store.
 //!
 //! The produced stores must implement the `HgIdDataStore` trait.
-//!
 
 mod contentstore;
 mod dataindex;
@@ -147,6 +146,7 @@ pub mod historypack;
 pub mod historystore;
 pub mod indexedlogauxstore;
 pub mod indexedlogdatastore;
+pub mod indexedlogtreeauxstore;
 pub mod localstore;
 pub mod multiplexstore;
 pub mod mutabledatapack;
@@ -175,9 +175,9 @@ pub use crate::datastore::HgIdMutableDeltaStore;
 pub use crate::datastore::LegacyStore;
 pub use crate::datastore::RemoteDataStore;
 pub use crate::datastore::StoreResult;
-pub use crate::edenapi::EdenApiFileStore;
-pub use crate::edenapi::EdenApiRemoteStore;
-pub use crate::edenapi::EdenApiTreeStore;
+pub use crate::edenapi::SaplingRemoteApiFileStore;
+pub use crate::edenapi::SaplingRemoteApiRemoteStore;
+pub use crate::edenapi::SaplingRemoteApiTreeStore;
 pub use crate::historypack::HistoryEntry;
 pub use crate::historypack::HistoryPack;
 pub use crate::historypack::HistoryPackVersion;
@@ -217,6 +217,9 @@ pub use crate::uniondatastore::UnionHgIdDataStore;
 pub mod testutil;
 
 #[cfg(test)]
+pub(crate) use env_lock::env_lock;
+
+#[cfg(test)]
 mod env_lock {
     use parking_lot::Mutex;
 
@@ -236,6 +239,3 @@ mod env_lock {
         lock
     }
 }
-
-#[cfg(test)]
-pub(crate) use env_lock::env_lock;

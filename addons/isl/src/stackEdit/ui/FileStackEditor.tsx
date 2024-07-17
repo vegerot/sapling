@@ -12,15 +12,15 @@ import type {Block, LineIdx} from 'shared/diff';
 
 import {CommitTitle} from '../../CommitTitle';
 import {Row, ScrollX, ScrollY} from '../../ComponentUtils';
-import {VSCodeCheckbox} from '../../VSCodeCheckbox';
 import {FlattenLine} from '../../linelog';
 import {computeLinesForFileStackEditor} from './FileStackEditorLines';
 import {TextEditable} from './TextEditable';
 import deepEqual from 'fast-deep-equal';
 import {Set as ImSet, Range, List} from 'immutable';
+import {Checkbox} from 'isl-components/Checkbox';
 import React, {useState, useRef, useEffect, useLayoutEffect} from 'react';
 import {mergeBlocks, collapseContextBlocks, diffBlocks, splitLines} from 'shared/diff';
-import {unwrap} from 'shared/utils';
+import {nullthrows} from 'shared/utils';
 
 import './FileStackEditor.css';
 
@@ -89,7 +89,7 @@ export function FileStackEditor(props: EditorProps) {
       for (const div of divs) {
         const child = div.lastChild;
         if (child && selection.containsNode(child, true)) {
-          selIds.push(unwrap(div.dataset.selId));
+          selIds.push(nullthrows(div.dataset.selId));
         }
       }
       setSelectedLineIds(ImSet(selIds));
@@ -372,14 +372,14 @@ function FileStackEditorUnifiedStack(props: EditorRowProps) {
       );
 
       if (textEdit) {
-        const len = Range(b1, b2).reduce((acc, i) => acc + unwrap(lines.get(i)).data.length, 0);
+        const len = Range(b1, b2).reduce((acc, i) => acc + nullthrows(lines.get(i)).data.length, 0);
         nextRangeId(len);
       }
 
       return;
     }
     for (let i = b1; i < b2; ++i) {
-      const line = unwrap(lines.get(i));
+      const line = nullthrows(lines.get(i));
       const checkboxes = revs.map(rev => {
         const checked = line.revs.contains(rev);
         let className = 'checkbox' + (rev > 0 ? ' mutable' : ' immutable');
@@ -394,7 +394,7 @@ function FileStackEditorUnifiedStack(props: EditorRowProps) {
             onPointerMove={e => handlePointerMove(i, rev, e)}
             onPointerUp={e => handlePointerUp(i, rev, e)}
             onDragStart={e => e.preventDefault()}>
-            <VSCodeCheckbox
+            <Checkbox
               tabIndex={-1}
               disabled={rev === 0}
               checked={checked}
@@ -478,7 +478,7 @@ function FileStackEditorUnifiedStack(props: EditorRowProps) {
     );
   }
 
-  return <ScrollY maxSize="calc(100vh - 300px)">{editor}</ScrollY>;
+  return <ScrollY maxSize="calc((100vh / var(--zoom)) - 300px)">{editor}</ScrollY>;
 }
 
 export function FileStackEditorRow(props: EditorRowProps) {

@@ -20,11 +20,11 @@ use scuba_ext::ScubaValue;
 use strum::AsRefStr;
 use strum::Display;
 use strum::EnumString;
-use strum::EnumVariantNames;
+use strum::VariantNames;
 use time_ext::DurationExt;
-use tunables::tunables;
 
 const SLOW_REQUEST_THRESHOLD: Duration = Duration::from_secs(5);
+const BLOBSTORE_READ_SIZE_LOGGING_THRESHOLD: usize = 1000000;
 
 pub const BLOBSTORE_ID: &str = "blobstore_id";
 pub const BLOBSTORE_TYPE: &str = "blobstore_type";
@@ -51,7 +51,7 @@ const OVERWRITE_STATUS: &str = "overwrite_status";
     Display,
     AsRefStr,
     EnumString,
-    EnumVariantNames,
+    VariantNames,
     ValueEnum
 )]
 #[strum(serialize_all = "kebab_case")]
@@ -131,10 +131,7 @@ pub fn record_get_stats(
     match result {
         Ok(Some(data)) => {
             let size = data.as_bytes().len();
-            let size_logging_threshold = tunables()
-                .blobstore_read_size_logging_threshold()
-                .unwrap_or_default();
-            if size_logging_threshold > 0 && size > size_logging_threshold as usize {
+            if size > BLOBSTORE_READ_SIZE_LOGGING_THRESHOLD {
                 scuba.unsampled();
             }
             scuba.add(SIZE, size);

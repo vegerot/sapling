@@ -5,46 +5,54 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {RefObject} from 'react';
+
 import clientToServerAPI from './ClientToServerAPI';
-import {getInnerTextareaForVSCodeTextArea} from './CommitInfoView/utils';
-import {InlineErrorBadge} from './ErrorNotice';
-import {Tooltip} from './Tooltip';
 import {T, t} from './i18n';
+import {atomFamilyWeak, readAtom, writeAtom} from './jotaiUtils';
+import platform from './platform';
 import {replaceInTextArea, insertAtCursor} from './textareaUtils';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {type MutableRefObject, useState, type ReactNode, useId} from 'react';
-import {atom, selector, useRecoilCallback, useRecoilValue} from 'recoil';
-import {Icon} from 'shared/Icon';
+import {Button} from 'isl-components/Button';
+import {InlineErrorBadge} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
+import {atom, useAtomValue} from 'jotai';
+import {useState, type ReactNode, useId} from 'react';
 import {randomId} from 'shared/utils';
 
-export type ImageUploadStatus = {id: number} & (
+export type ImageUploadStatus = {id: number; field: string} & (
   | {status: 'pending'}
   | {status: 'complete'}
   | {status: 'error'; error: Error; resolved: boolean}
   | {status: 'canceled'}
 );
 export const imageUploadState = atom<{next: number; states: Record<number, ImageUploadStatus>}>({
-  key: 'imageUploadState',
-  default: {next: 1, states: {}},
+  next: 1,
+  states: {},
 });
-export const numPendingImageUploads = selector({
-  key: 'numPendingImageUploads',
-  get: ({get}): number => {
+
+/**
+ * Number of currently ongoing image uploads for a given field name.
+ * If undefined is givens as the field name, all pending uploads across all fields are counted. */
+export const numPendingImageUploads = atomFamilyWeak((fieldName: string | undefined) =>
+  atom((get): number => {
     const state = get(imageUploadState);
-    return Object.values(state.states).filter(state => state.status === 'pending').length;
-  },
-});
+    return Object.values(state.states).filter(
+      state => (fieldName == null || state.field === fieldName) && state.status === 'pending',
+    ).length;
+  }),
+);
+
 type UnresolvedErrorImageUploadStatus = ImageUploadStatus & {status: 'error'; resolved: false};
-export const unresolvedErroredImagedUploads = selector({
-  key: 'unresolvedErroredImagedUploads',
-  get: ({get}): Array<UnresolvedErrorImageUploadStatus> => {
+export const unresolvedErroredImagedUploads = atomFamilyWeak((fieldName: string) =>
+  atom(get => {
     const state = get(imageUploadState);
     return Object.values(state.states).filter(
       (state): state is UnresolvedErrorImageUploadStatus =>
-        state.status === 'error' && !state.resolved,
+        state.field == fieldName && state.status === 'error' && !state.resolved,
     );
-  },
-});
+  }),
+);
 
 function placeholderForImageUpload(id: number): string {
   // TODO: it might be better to use a `contenteditable: true` div rather than
@@ -79,34 +87,37 @@ export async function uploadFile(file: File): Promise<string> {
 /**
  * Summary of ongoing image uploads. Click to cancel all ongoing uploads.
  */
-export function PendingImageUploads({textAreaRef}: {textAreaRef: MutableRefObject<unknown>}) {
-  const numPending = useRecoilValue(numPendingImageUploads);
-  const unresolvedErrors = useRecoilValue(unresolvedErroredImagedUploads);
+export function PendingImageUploads({
+  fieldName,
+  textAreaRef,
+}: {
+  fieldName: string;
+  textAreaRef: RefObject<HTMLTextAreaElement>;
+}) {
+  const numPending = useAtomValue(numPendingImageUploads(fieldName));
+  const unresolvedErrors = useAtomValue(unresolvedErroredImagedUploads(fieldName));
   const [isHovering, setIsHovering] = useState(false);
-  const onCancel = useRecoilCallback(({set}) => () => {
+  const onCancel = () => {
     setIsHovering(false);
     // Canceling ongoing uploads doesn't actualy interrupt the async work for the uploads,
     // it just deletes the tracking state, by replacing 'pending' uploads as 'cancelled'.
-    set(imageUploadState, current => {
+    writeAtom(imageUploadState, current => {
       const canceledIds: Array<number> = [];
-      // TODO: This cancels ALL ongoing uploads, even from other text areas, if any exist.
-      // imageUploadStates should contain a unique id per text area,
-      // so we can cancel just this text area's uploads
       const newState = {
         ...current,
         states: Object.fromEntries(
           Object.entries(current.states).map(([idStr, state]) => {
             const id = Number(idStr);
-            if (state.status === 'pending') {
+            if (state.field === fieldName && state.status === 'pending') {
               canceledIds.push(id);
-              return [id, {state: 'cancelled', id}];
+              return [id, {state: 'cancelled', id, fieldName}];
             }
             return [id, state];
           }),
         ) as Record<number, ImageUploadStatus>,
       };
 
-      const textArea = getInnerTextareaForVSCodeTextArea(textAreaRef.current as HTMLElement | null);
+      const textArea = textAreaRef.current;
       if (textArea) {
         for (const id of canceledIds) {
           const placeholder = placeholderForImageUpload(id);
@@ -115,19 +126,21 @@ export function PendingImageUploads({textAreaRef}: {textAreaRef: MutableRefObjec
       }
       return newState;
     });
-  });
+  };
 
-  const onDismissErrors = useRecoilCallback(({set}) => () => {
-    set(imageUploadState, value => ({
+  const onDismissErrors = () => {
+    writeAtom(imageUploadState, value => ({
       ...value,
       states: Object.fromEntries(
         Object.entries(value.states).map(([id, state]) => [
           id,
-          state.status === 'error' ? {...state, resolved: true} : state,
+          state.field === fieldName && state.status === 'error'
+            ? {...state, resolved: true}
+            : state,
         ]),
       ),
     }));
-  });
+  };
 
   if (unresolvedErrors.length === 0 && numPending === 0) {
     return null;
@@ -138,12 +151,9 @@ export function PendingImageUploads({textAreaRef}: {textAreaRef: MutableRefObjec
     content = (
       <span className="upload-status-error">
         <Tooltip title={t('Click to dismiss error')}>
-          <VSCodeButton
-            appearance="icon"
-            onClick={onDismissErrors}
-            data-testid="dismiss-upload-errors">
+          <Button icon onClick={onDismissErrors} data-testid="dismiss-upload-errors">
             <Icon icon="close" />
-          </VSCodeButton>
+          </Button>
         </Tooltip>
         <InlineErrorBadge error={unresolvedErrors[0].error} title={<T>Image upload failed</T>}>
           <T count={unresolvedErrors.length}>imageUploadFailed</T>
@@ -153,17 +163,17 @@ export function PendingImageUploads({textAreaRef}: {textAreaRef: MutableRefObjec
   } else if (numPending > 0) {
     if (isHovering) {
       content = (
-        <VSCodeButton appearance="icon">
+        <Button icon>
           <Icon icon="stop-circle" slot="start" />
           <T>Click to cancel</T>
-        </VSCodeButton>
+        </Button>
       );
     } else {
       content = (
-        <VSCodeButton appearance="icon">
+        <Button icon>
           <Icon icon="loading" slot="start" />
           <T count={numPending}>numImagesUploading</T>
-        </VSCodeButton>
+        </Button>
       );
     }
   }
@@ -202,9 +212,22 @@ export function FilePicker({uploadFiles}: {uploadFiles: (files: Array<File>) => 
           title={t(
             'Choose image or video files to upload. Drag & Drop and Pasting images or videos is also supported.',
           )}>
-          <VSCodeButton appearance="icon" data-testid="attach-file-button">
+          <Button
+            icon
+            data-testid="attach-file-button"
+            onClick={e => {
+              if (platform.chooseFile != null) {
+                e.preventDefault();
+                e.stopPropagation();
+                platform.chooseFile('Choose file to upload', /* multi */ true).then(chosen => {
+                  if (chosen.length > 0) {
+                    uploadFiles(chosen);
+                  }
+                });
+              }
+            }}>
             <PaperclipIcon />
-          </VSCodeButton>
+          </Button>
         </Tooltip>
       </label>
     </span>
@@ -212,22 +235,23 @@ export function FilePicker({uploadFiles}: {uploadFiles: (files: Array<File>) => 
 }
 
 export function useUploadFilesCallback(
-  ref: MutableRefObject<unknown>,
-  onInput: (event: {target: HTMLInputElement}) => unknown,
+  fieldName: string,
+  ref: RefObject<HTMLTextAreaElement>,
+  onInput: (e: {currentTarget: HTMLTextAreaElement}) => unknown,
 ) {
-  return useRecoilCallback(({snapshot, set}) => async (files: Array<File>) => {
+  return async (files: Array<File>) => {
     // capture snapshot of next before doing async work
     // we need to account for all files in this batch
-    let {next} = snapshot.getLoadable(imageUploadState).valueOrThrow();
+    let {next} = readAtom(imageUploadState);
 
-    const textArea = getInnerTextareaForVSCodeTextArea(ref.current as HTMLElement);
+    const textArea = ref.current;
     if (textArea != null) {
       // manipulating the text area directly does not emit change events,
       // we need to simulate those ourselves so that controlled text areas
       // update their underlying store
       const emitChangeEvent = () => {
         onInput({
-          target: textArea as unknown as HTMLInputElement,
+          currentTarget: textArea,
         });
       };
 
@@ -235,8 +259,8 @@ export function useUploadFilesCallback(
         files.map(async file => {
           const id = next;
           next += 1;
-          const state = {status: 'pending' as const, id};
-          set(imageUploadState, v => ({next, states: {...v.states, [id]: state}}));
+          const state: ImageUploadStatus = {status: 'pending' as const, id, field: fieldName};
+          writeAtom(imageUploadState, v => ({next, states: {...v.states, [id]: state}}));
           // insert pending text
           const placeholder = placeholderForImageUpload(state.id);
           insertAtCursor(textArea, placeholder);
@@ -245,18 +269,24 @@ export function useUploadFilesCallback(
           // start the file upload
           try {
             const uploadedFileText = await uploadFile(file);
-            set(imageUploadState, v => ({
+            writeAtom(imageUploadState, v => ({
               next,
-              states: {...v.states, [id]: {status: 'complete' as const, id}},
+              states: {...v.states, [id]: {status: 'complete' as const, id, field: fieldName}},
             }));
             replaceInTextArea(textArea, placeholder, uploadedFileText);
             emitChangeEvent();
           } catch (error) {
-            set(imageUploadState, v => ({
+            writeAtom(imageUploadState, v => ({
               next,
               states: {
                 ...v.states,
-                [id]: {status: 'error' as const, id, error: error as Error, resolved: false},
+                [id]: {
+                  status: 'error' as const,
+                  id,
+                  field: fieldName,
+                  error: error as Error,
+                  resolved: false,
+                },
               },
             }));
             replaceInTextArea(textArea, placeholder, ''); // delete placeholder
@@ -265,7 +295,7 @@ export function useUploadFilesCallback(
         }),
       );
     }
-  });
+  };
 }
 
 /**

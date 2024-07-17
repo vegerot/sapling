@@ -38,6 +38,7 @@ pub use log::ArcBookmarkUpdateLog;
 pub use log::BookmarkUpdateLog;
 pub use log::BookmarkUpdateLogArc;
 pub use log::BookmarkUpdateLogEntry;
+pub use log::BookmarkUpdateLogId;
 pub use log::BookmarkUpdateLogRef;
 pub use log::BookmarkUpdateReason;
 pub use subscription::BookmarksSubscription;
@@ -121,7 +122,7 @@ where
             BookmarkCategory::ALL,
             BookmarkKind::ALL_PUBLISHING,
             &BookmarkPagination::FromStart,
-            std::u64::MAX,
+            u64::MAX,
         )
         .map_ok(|(_, cs_id)| cs_id)
         .boxed()
@@ -138,7 +139,7 @@ where
             BookmarkCategory::ALL,
             BookmarkKind::ALL_PUBLISHING,
             &BookmarkPagination::FromStart,
-            std::u64::MAX,
+            u64::MAX,
         )
     }
 }
@@ -158,7 +159,7 @@ pub fn bookmark_heads_fetcher(
                     BookmarkCategory::ALL,
                     BookmarkKind::ALL_PUBLISHING,
                     &BookmarkPagination::FromStart,
-                    std::u64::MAX,
+                    u64::MAX,
                 )
                 .map_ok(|(_, cs_id)| cs_id)
                 .try_collect()

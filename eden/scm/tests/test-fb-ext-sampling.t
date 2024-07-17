@@ -1,5 +1,6 @@
 #chg-compatible
-#require no-fsmonitor
+#require no-fsmonitor no-eden
+#debugruntest-incompatible
 
 Setup. SCM_SAMPLING_FILEPATH needs to be cleared as some environments may
 have it set.
@@ -75,17 +76,17 @@ Do a couple of commits.  We expect to log two messages per call to repo.commit.
   ...         assert len(parsedrecord["data"]) == 4
   ...     elif parsedrecord['category'] == 'measuredtimes':
   ...         print('atexit_measured: ', ", ".join(sorted(parsedrecord['data'])))
-  atexit_measured:  atexit_measured, metrics_type, stdio_blocked
+  atexit_measured:  atexit_measured, metrics_type
   atexit_measured:  command_duration
   match filter commit_table
   message string commit_table
-  atexit_measured:  atexit_measured, metrics_type, stdio_blocked
+  atexit_measured:  atexit_measured, metrics_type
   atexit_measured:  command_duration
-  atexit_measured:  atexit_measured, metrics_type, stdio_blocked
+  atexit_measured:  atexit_measured, metrics_type
   atexit_measured:  command_duration
   match filter commit_table
   message string commit_table
-  atexit_measured:  atexit_measured, metrics_type, stdio_blocked
+  atexit_measured:  atexit_measured, metrics_type
   atexit_measured:  command_duration
 
 Test topdir logging:
@@ -166,11 +167,11 @@ Test command_duration is logged when ctrl-c'd:
 Test ui.metrics.gauge API
   $ cat > $TESTTMP/a.py << EOF
   > def reposetup(ui, repo):
-  >     ui.metrics.gauge("foo_a", 1)
-  >     ui.metrics.gauge("foo_b", 2)
-  >     ui.metrics.gauge("foo_b", len(repo))
-  >     ui.metrics.gauge("bar")
-  >     ui.metrics.gauge("bar")
+  >     ui.metrics.gauge("test_foo_a", 1)
+  >     ui.metrics.gauge("test_foo_b", 2)
+  >     ui.metrics.gauge("test_foo_b", len(repo))
+  >     ui.metrics.gauge("test_bar")
+  >     ui.metrics.gauge("test_bar")
   > EOF
   $ SCM_SAMPLING_FILEPATH=$TESTTMP/a.txt hg log -r null -T '.\n' --config extensions.gauge=$TESTTMP/a.py --config sampling.key.metrics=aaa
   .
@@ -185,18 +186,30 @@ Test ui.metrics.gauge API
   ...             data = obj["data"]
   ...             print("category: %s" % category)
   ...             for k, v in sorted(data.items()):
-  ...                 print("  %s=%s" % (k, v))
+  ...                 if "test" in k:
+  ...                     print("  %s=%s" % (k, v))
   category: aaa
-    bar=2
-    foo_a=1
-    foo_b=5
-    metrics_type=metrics
+    test_bar=2
+    test_foo_a=1
+    test_foo_b=5
+
+Counters get logged for native commands:
+  $ SCM_SAMPLING_FILEPATH=$TESTTMP/native.txt hg debugmetrics --config sampling.key.metrics=aaa
+  >>> import os, json
+  >>> with open(os.path.join(os.environ["TESTTMP"], "native.txt"), "r") as f:
+  ...     lines = filter(None, f.read().split("\0"))
+  ...     for line in lines:
+  ...         obj = json.loads(line)
+  ...         if obj["category"] == "aaa":
+  ...             for k, v in sorted(obj["data"].items()):
+  ...                 print("  %s=%s" % (k, v))
+    test_counter=1
 
 Metrics can be printed if devel.print-metrics is set:
-  $ hg log -r null -T '.\n' --config extensions.gauge=$TESTTMP/a.py --config devel.print-metrics=1 --config devel.skip-metrics=watchman
+  $ hg log -r null -T '.\n' --config extensions.gauge=$TESTTMP/a.py --config devel.print-metrics= --config devel.skip-metrics=scmstore,watchman
   .
   atexit handler executed
-  { metrics : { bar : 2,  foo : { a : 1,  b : 5}}}
+  { metrics : { test : { bar : 2,  foo : { a : 1,  b : 5}}}}
 
 Metrics is logged to blackbox:
 
@@ -204,15 +217,11 @@ Metrics is logged to blackbox:
   $ hg log -r null -T '.\n' --config extensions.gauge=$TESTTMP/a.py
   .
   atexit handler executed
-  $ hg blackbox --no-timestamp --no-sid --pattern '{"legacy_log":{"service":"metrics"}}'
-  [legacy][metrics] {'metrics': {'watchmanfilecount': 3, 'watchmanfreshinstances': 0}} (?)
-  [legacy][metrics] {'metrics': {'scmstore': {'file': {'api': {'hg': {'add': {'calls': 3}, 'prefetch': {'calls': 3}}}, 'write': {'nonlfs': {'items': 3, 'ok': 3}}}}}}
-  [legacy][metrics] {'metrics': {'scmstore': {'file': {'api': {'hg': {'add': {'calls': 3}, 'prefetch': {'calls': 3}}}, 'write': {'nonlfs': {'items': 3, 'ok': 3}}}}}}
-  *metrics* (glob)
-  [legacy][metrics] {'metrics': {'bar': 2, 'foo': {'a': 1, 'b': 5}}}
-  [legacy][metrics] {'metrics': {'bar': 2, 'foo': {'a': 1, 'b': 5}}}
-  [legacy][metrics] {'metrics': {'bar': 2, 'foo': {'a': 1, 'b': 5}}}
+  $ hg blackbox --no-timestamp --no-sid --pattern '{"legacy_log":{"service":"metrics"}}' | grep foo
   atexit handler executed
+  [legacy][metrics] {'metrics':*'test': {'bar': 2, 'foo': {'a': 1, 'b': 5}}}} (glob)
+  [legacy][metrics] {'metrics':*'test': {'bar': 2, 'foo': {'a': 1, 'b': 5}}}} (glob)
+  [legacy][metrics] {'metrics':*'test': {'bar': 2, 'foo': {'a': 1, 'b': 5}}}} (glob)
 
 Invalid format strings don't crash Mercurial
 
@@ -237,3 +246,21 @@ Invalid format strings don't crash Mercurial
   category: invalid
     metrics_type=invalid
     msg=invalid format %s %s single
+
+Test command name:
+  $ newclientrepo
+  $ enable sparse
+Both Rust and Python use canonical "update" name:
+  $ SL_LOG=command_info=debug hg go --config checkout.use-rust=false . 2>&1 | grep command=
+  DEBUG command_info: command="update"
+  DEBUG command_info: command="update"
+
+  $ SL_IDENTITY=sl SL_LOG=command_info=debug hg go --config checkout.use-rust=false . 2>&1 | grep command=
+  DEBUG command_info: command="update"
+  DEBUG command_info: command="update"
+
+Sub commands work:
+  $ SL_LOG=command_info=debug hg sparse 2>&1 | grep command=
+  DEBUG command_info: command="sparse"
+  $ SL_LOG=command_info=debug hg sparse refresh 2>&1 | grep command=
+  DEBUG command_info: command="sparse refresh"

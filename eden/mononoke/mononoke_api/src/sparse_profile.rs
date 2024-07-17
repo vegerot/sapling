@@ -24,6 +24,7 @@ use futures::TryStreamExt;
 use maplit::btreeset;
 use metaconfig_types::SparseProfilesConfig;
 use mononoke_types::fsnode::FsnodeEntry;
+use mononoke_types::path::MPath;
 use mononoke_types::NonRootMPath;
 use pathmatcher::DirectoryMatch;
 use pathmatcher::Matcher;
@@ -38,7 +39,6 @@ use crate::ChangesetDiffItem;
 use crate::ChangesetFileOrdering;
 use crate::ChangesetPathContentContext;
 use crate::ChangesetPathDiffContext;
-use crate::MononokePath;
 use crate::PathEntry;
 
 // This struct contains matchers which will be consulted in various scenarious
@@ -131,8 +131,8 @@ impl SparseProfileMonitoring {
     ) -> Result<Vec<NonRootMPath>, MononokeError> {
         match &self.monitoring_profiles {
             MonitoringProfiles::All => {
-                let prefixes = vec![MononokePath::try_from(
-                    &self.sparse_config.sparse_profiles_location,
+                let prefixes = vec![MPath::try_from(
+                    self.sparse_config.sparse_profiles_location.as_bytes(),
                 )?];
                 let files = changeset
                     .find_files(Some(prefixes), None, None, ChangesetFileOrdering::Unordered)
@@ -143,11 +143,11 @@ impl SparseProfileMonitoring {
                             .monitoring_profiles_only_matcher
                             .as_ref()
                             .map_or_else(|| &self.profiles_location_with_excludes_matcher, |m| m);
-                        Ok(match matcher.matches(path.to_string()) {
-                            // Since None in MononokePath is a root repo directory
+                        Ok(match matcher.matches(path.to_string().as_str()) {
+                            // Since None in MPath is a root repo directory
                             // and we are returning list of profiles
                             // we can safely filter that out.
-                            true => path.into_mpath(),
+                            true => path.into_optional_non_root_path(),
                             false => None,
                         })
                     })
@@ -157,14 +157,15 @@ impl SparseProfileMonitoring {
             MonitoringProfiles::Exact { profiles } => {
                 let prefixes = profiles
                     .iter()
-                    .map(MononokePath::try_from)
-                    .collect::<Result<Vec<_>, MononokeError>>()?;
+                    .map(|s| MPath::try_from(s.as_bytes()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| MononokeError::InvalidRequest(error.to_string()))?;
                 changeset
                     .find_files(Some(prefixes), None, None, ChangesetFileOrdering::Unordered)
                     .await?
                     .map(|p| {
                         p.and_then(|path| {
-                            path.into_mpath().ok_or_else(|| {
+                            path.into_optional_non_root_path().ok_or_else(|| {
                                 MononokeError::from(anyhow!(
                                     "Provided root diretory as monitored profile."
                                 ))
@@ -177,12 +178,12 @@ impl SparseProfileMonitoring {
         }
     }
 
-    fn is_profile_config_change(&self, path: &MononokePath) -> bool {
+    fn is_profile_config_change(&self, path: &MPath) -> bool {
         let matcher = match self.monitoring_profiles {
             MonitoringProfiles::Exact { .. } => &self.exact_profiles_matcher,
             MonitoringProfiles::All => &self.profiles_location_with_excludes_matcher,
         };
-        matcher.matches(path.to_string())
+        matcher.matches(path.to_string().as_str())
     }
 
     pub async fn get_profile_size(
@@ -278,7 +279,7 @@ async fn calculate_size<'a>(
     matchers: HashMap<String, Arc<dyn Matcher + Send + Sync>>,
 ) -> Result<Out, MononokeError> {
     let root_fsnode_id = changeset.root_fsnode_id().await?;
-    let root: Option<NonRootMPath> = None;
+    let root = MPath::ROOT;
     bounded_traversal::bounded_traversal(
         256,
         (root, *root_fsnode_id.fsnode_id(), matchers),
@@ -290,7 +291,7 @@ async fn calculate_size<'a>(
                 let mut next: HashMap<_, HashMap<_, _>> = HashMap::new();
                 let fsnode = fsnode_id.load(&ctx, blobstore).await?;
                 for (base_name, entry) in fsnode.list() {
-                    let path = NonRootMPath::join_opt_element(path.as_ref(), base_name);
+                    let path = path.join_element(Some(base_name));
                     let path_vec = path.to_vec();
                     let repo_path = RepoPath::from_utf8(&path_vec)?;
                     match entry {
@@ -309,7 +310,7 @@ async fn calculate_size<'a>(
                                             tree.summary().descendant_files_total_size;
                                     }
                                     DirectoryMatch::ShouldTraverse => {
-                                        next.entry((Some(path.clone()), *tree.id()))
+                                        next.entry((path.clone(), *tree.id()))
                                             .or_default()
                                             .insert(source.clone(), matcher.clone());
                                     }
@@ -428,10 +429,9 @@ async fn get_bonsai_size_change(
     Ok(res.into_iter().flatten().collect())
 }
 
-fn match_path(matcher: &dyn Matcher, path: &MononokePath) -> Result<bool> {
+fn match_path(matcher: &dyn Matcher, path: &MPath) -> Result<bool> {
     // None here means repo root which is empty RepoPath
-    let maybe_path_vec = path.as_mpath().map(|path| path.to_vec());
-    let path_vec = maybe_path_vec.unwrap_or_default();
+    let path_vec = path.to_vec();
     matcher.matches_file(RepoPath::from_utf8(&path_vec)?)
 }
 
@@ -509,7 +509,7 @@ async fn calculate_profile_config_change<'a>(
                 path,
                 size_change: _,
             } => {
-                if let Some(path) = path.into_mpath() {
+                if let Some(path) = path.into_optional_non_root_path() {
                     raw_increase.push(path);
                 }
             }
@@ -517,7 +517,7 @@ async fn calculate_profile_config_change<'a>(
                 path,
                 size_change: _,
             } => {
-                if let Some(path) = path.into_mpath() {
+                if let Some(path) = path.into_optional_non_root_path() {
                     raw_decrease.push(path);
                 }
             }
@@ -525,7 +525,7 @@ async fn calculate_profile_config_change<'a>(
                 path,
                 size_change: _,
             } => {
-                if let Some(path) = path.into_mpath() {
+                if let Some(path) = path.into_optional_non_root_path() {
                     changed.push(path);
                 }
             }
@@ -593,22 +593,13 @@ async fn calculate_profile_config_change<'a>(
 
 #[derive(Debug)]
 enum BonsaiSizeChange {
-    Added {
-        path: MononokePath,
-        size_change: u64,
-    },
-    Removed {
-        path: MononokePath,
-        size_change: u64,
-    },
-    Changed {
-        path: MononokePath,
-        size_change: i64,
-    },
+    Added { path: MPath, size_change: u64 },
+    Removed { path: MPath, size_change: u64 },
+    Changed { path: MPath, size_change: i64 },
 }
 
 impl BonsaiSizeChange {
-    fn path(&self) -> &MononokePath {
+    fn path(&self) -> &MPath {
         match self {
             BonsaiSizeChange::Added {
                 path,

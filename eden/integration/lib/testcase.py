@@ -4,24 +4,27 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 import configparser
 import errno
-import hashlib
 import inspect
+import json
 import logging
 import os
 import pathlib
-import stat
 import sys
 import time
 import typing
 import unittest
+from contextlib import contextmanager
 
 from pathlib import Path
 from typing import (
     Any,
     Callable,
     Dict,
+    Generator,
     Iterable,
     List,
     Optional,
@@ -33,10 +36,16 @@ from typing import (
 )
 
 import eden.config
+from eden.fs.cli import util
 from eden.test_support.testcase import EdenTestCaseBase
 from eden.thrift import legacy
 
-from facebook.eden.ttypes import SourceControlType
+from facebook.eden.ttypes import (
+    FaultDefinition,
+    GetBlockedFaultsRequest,
+    RemoveFaultArg,
+    UnblockFaultArg,
+)
 
 from . import edenclient, gitrepo, hgrepo, repobase, skip
 from .find_executables import FindExe
@@ -135,17 +144,12 @@ class EdenTestCase(EdenTestCaseBase):
 
         extra_config = self.edenfs_extra_config()
         if extra_config:
-            with open(self.eden.system_rc_path, "w") as edenfsrc:
-                for key, values in extra_config.items():
-                    edenfsrc.write(f"[{key}]\n")
-                    for setting in values:
-                        edenfsrc.write(f"{setting}\n")
+            self.write_configs(extra_config, self.eden.system_rc_path)
 
         # Default to using the Rust version of commands when running
         # integration tests. An empty edenfsctl_rollout file means that all
         # subcommands should use the Rust implementation if available.
-        with open(self.eden.system_rollout_path, "w") as edenfsctl_rollout:
-            edenfsctl_rollout.write("{}")
+        self.set_rust_rollout_config({})
 
         self.eden.start()
         # Store a lambda in case self.eden is replaced during the test.
@@ -172,6 +176,15 @@ class EdenTestCase(EdenTestCaseBase):
             extra_args=extra_args,
             storage_engine=storage_engine,
         )
+
+    def write_configs(
+        self, config_dict: Dict[str, List[str]], config_file_path
+    ) -> None:
+        with open(config_file_path, "w") as edenfs_config_file:
+            for section_name, lines in config_dict.items():
+                edenfs_config_file.write(f"[{section_name}]\n")
+                for setting in lines:
+                    edenfs_config_file.write(f"{setting}\n")
 
     @property
     def eden_dir(self) -> str:
@@ -210,7 +223,9 @@ class EdenTestCase(EdenTestCaseBase):
     def get_backing_dir(self, reponame: str, repo_type: str) -> Path:
         backing_dir_location = Path(self.repos_dir) / reponame
         return (
-            backing_dir_location if repo_type == "hg" else backing_dir_location / ".git"
+            backing_dir_location
+            if repo_type in ["hg", "filteredhg"]
+            else backing_dir_location / ".git"
         )
 
     def edenfs_logging_settings(self) -> Optional[Dict[str, str]]:
@@ -241,7 +256,9 @@ class EdenTestCase(EdenTestCaseBase):
         The format is the following:
         {"namespace": ["key1=value1", "key2=value2"}
         """
-        configs = {"experimental": ["enable-nfs-server = true"]}
+        configs = {
+            "experimental": ["enable-nfs-server = true\nwindows-symlinks = false"]
+        }
         if self.use_nfs():
             configs["clone"] = ['default-mount-protocol = "NFS"']
         # The number of concurrent APFS volumes we can create on macOS
@@ -259,6 +276,7 @@ class EdenTestCase(EdenTestCaseBase):
         name: str,
         hgrc: Optional[configparser.ConfigParser] = None,
         init_configs: Optional[List[str]] = None,
+        filtered: bool = False,
     ) -> hgrepo.HgRepository:
         """Create an hg repo.
 
@@ -284,7 +302,10 @@ class EdenTestCase(EdenTestCaseBase):
             self.system_hgrc = system_hgrc_path
 
         repo = hgrepo.HgRepository(
-            repo_path, system_hgrc=self.system_hgrc, temp_mgr=self.temp_mgr
+            repo_path,
+            system_hgrc=self.system_hgrc,
+            temp_mgr=self.temp_mgr,
+            filtered=filtered,
         )
         repo.init(hgrc=hgrc, init_configs=init_configs)
 
@@ -370,6 +391,11 @@ class EdenTestCase(EdenTestCaseBase):
         """
         return "memory"
 
+    def set_rust_rollout_config(self, config: Dict[str, bool]) -> None:
+        """Set the Rust rollout config for this test."""
+        with open(self.eden.system_rollout_path, "w") as edenfsctl_rollout:
+            edenfsctl_rollout.write(json.dumps(config))
+
     @staticmethod
     def unix_only(fn):
         """
@@ -391,6 +417,104 @@ class EdenTestCase(EdenTestCaseBase):
         from running with NFS via skip lists in eden/integration/lib/skip.py.
         """
         return sys.platform == "darwin"
+
+    def remove_fault(
+        self,
+        keyClass: str,
+        keyValueRegex: str = ".*",
+    ) -> None:
+        with self.eden.get_thrift_client_legacy() as client:
+            client.removeFault(
+                RemoveFaultArg(
+                    keyClass=keyClass,
+                    keyValueRegex=keyValueRegex,
+                )
+            )
+
+    def unblock_fault(
+        self,
+        keyClass: str,
+        keyValueRegex: str = ".*",
+    ) -> None:
+        with self.eden.get_thrift_client_legacy() as client:
+            client.unblockFault(
+                UnblockFaultArg(
+                    keyClass=keyClass,
+                    keyValueRegex=keyValueRegex,
+                )
+            )
+
+    def wait_on_fault_unblock(
+        self,
+        keyClass: str,
+        keyValueRegex: str = ".*",
+        numToUnblock: int = 1,
+    ) -> None:
+        def unblock() -> Optional[bool]:
+            with self.eden.get_thrift_client_legacy() as client:
+                unblocked = client.unblockFault(
+                    UnblockFaultArg(
+                        keyClass=keyClass,
+                        keyValueRegex=keyValueRegex,
+                    )
+                )
+            if unblocked == 1:
+                return True
+            return None
+
+        for _ in range(numToUnblock):
+            util.poll_until(unblock, timeout=30)
+
+    def wait_on_fault_hit(self, key_class: str, num_to_hit=1) -> None:
+        """
+        This waits until we have 'num_to_hit' faults currently blocking.
+        """
+
+        def faults_hit() -> Optional[bool]:
+            with self.eden.get_thrift_client_legacy() as client:
+                blocked_faults = client.getBlockedFaults(
+                    GetBlockedFaultsRequest(keyclass=key_class)
+                ).keyValues
+            return True if len(blocked_faults) == num_to_hit else None
+
+        try:
+            util.poll_until(faults_hit, timeout=30)
+        except TimeoutError as e:
+            with self.eden.get_thrift_client_legacy() as client:
+                # this unblock all faults to avoid tests hang
+                client.unblockFault(UnblockFaultArg())
+            raise e
+
+    @contextmanager
+    def run_with_blocking_fault(
+        self,
+        keyClass: str,
+        keyValueRegex: str = ".*",
+    ) -> Generator[None, None, None]:
+        with self.eden.get_thrift_client_legacy() as client:
+            client.injectFault(
+                FaultDefinition(
+                    keyClass=keyClass,
+                    keyValueRegex=keyValueRegex,
+                    block=True,
+                )
+            )
+
+            try:
+                yield
+            finally:
+                client.removeFault(
+                    RemoveFaultArg(
+                        keyClass=keyClass,
+                        keyValueRegex=keyValueRegex,
+                    )
+                )
+                client.unblockFault(
+                    UnblockFaultArg(
+                        keyClass=keyClass,
+                        keyValueRegex=keyValueRegex,
+                    )
+                )
 
 
 # pyre-ignore[13]: T62487924
@@ -428,6 +552,8 @@ class EdenRepoTest(EdenTestCase):
 
     enable_windows_symlinks: bool = False
 
+    backing_store_type: Optional[str] = None
+
     def setup_eden_test(self) -> None:
         super().setup_eden_test()
 
@@ -442,6 +568,7 @@ class EdenRepoTest(EdenTestCase):
             self.mount,
             case_sensitive=self.is_case_sensitive,
             enable_windows_symlinks=self.enable_windows_symlinks,
+            backing_store=self.backing_store_type,
         )
         self.report_time("eden clone done")
         actual_case_sensitive = self.eden.is_case_sensitive(self.mount)
@@ -483,7 +610,7 @@ class EdenRepoTest(EdenTestCase):
         """
         checkout_root = pathlib.Path(path if path is not None else self.mount)
         real_scm_type = scm_type if scm_type is not None else self.repo.get_type()
-        if real_scm_type == "hg":
+        if real_scm_type in ["hg", "filteredhg"]:
             expected_entries = expected_entries | {".hg"}
         actual_entries = set(os.listdir(checkout_root))
         self.assertEqual(
@@ -614,9 +741,11 @@ def _replicate_eden_repo_test(
         nfs_variants.append(("NFS", [NFSTestMixin]))
 
     scm_variants: MixinList = [("Hg", [HgRepoTestMixin])]
-    # Only run the git tests if EdenFS was built with git support.
+    # Gate some tests on whether EdenFS was built to support them.
     if eden.config.HAVE_GIT:
         scm_variants.append(("Git", [GitRepoTestMixin]))
+    if eden.config.HAVE_FILTEREDHG:
+        scm_variants.append(("FilteredHg", [FilteredHgTestMixin]))
 
     case_variants: MixinList = [("", [])]
     if case_sensitivity_dependent:
@@ -657,7 +786,7 @@ eden_repo_test = test_replicator(_replicate_eden_repo_test)
 class HgRepoTestMixin:
     repo_type: str = "hg"
 
-    def create_repo(self, name: str) -> repobase.Repository:
+    def create_repo(self, name: str, filtered: bool = False) -> repobase.Repository:
         # HgRepoTestMixin is always used in classes that derive from EdenRepoTest,
         # but it is difficult to make the type checkers aware of that.  We can't
         # add an abstract create_hg_repo() method to this class since the MRO would find
@@ -665,8 +794,15 @@ class HgRepoTestMixin:
         # breaking resolution of create_repo().
         # pyre-fixme[16]: `HgRepoTestMixin` has no attribute `create_hg_repo`.
         return self.create_hg_repo(
-            name, init_configs=["experimental.windows-symlinks=True"]
+            name, init_configs=["experimental.windows-symlinks=True"], filtered=filtered
         )
+
+
+class FilteredHgTestMixin(HgRepoTestMixin):
+    backing_store_type: Optional[str] = "filteredhg"
+
+    def create_repo(self, name: str, filtered: bool = True) -> repobase.Repository:
+        return super().create_repo(name, filtered=filtered)
 
 
 class GitRepoTestMixin:

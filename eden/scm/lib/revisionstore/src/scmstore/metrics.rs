@@ -7,8 +7,6 @@
 
 use std::ops::AddAssign;
 
-use crate::indexedlogutil::StoreType;
-
 #[derive(Clone, Debug, Default)]
 pub struct FetchMetrics {
     /// Number of requests / batches
@@ -28,6 +26,9 @@ pub struct FetchMetrics {
 
     // Total time spent completing the fetch
     time: usize,
+
+    // Number of times data was computed/derved (i.e. aux data based on content).
+    computed: usize,
 }
 
 impl AddAssign for FetchMetrics {
@@ -38,6 +39,7 @@ impl AddAssign for FetchMetrics {
         self.misses += rhs.misses;
         self.errors += rhs.errors;
         self.time += rhs.time;
+        self.computed += rhs.computed;
     }
 }
 
@@ -57,6 +59,10 @@ impl FetchMetrics {
 
     pub(crate) fn err(&mut self, keys: usize) {
         self.errors += keys;
+    }
+
+    pub(crate) fn computed(&mut self, keys: usize) {
+        self.computed += keys;
     }
 
     // Provide the time as microseconds
@@ -85,6 +91,7 @@ impl FetchMetrics {
             ("misses", self.misses),
             ("errors", self.errors),
             ("time", self.time),
+            ("computed", self.computed),
         ]
         .into_iter()
         .filter(|&(_, v)| v != 0)
@@ -109,11 +116,17 @@ pub struct LocalAndCacheFetchMetrics {
     cache: FetchMetrics,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreLocation {
+    Local,
+    Cache,
+}
+
 impl LocalAndCacheFetchMetrics {
-    pub(crate) fn store(&mut self, typ: StoreType) -> &mut FetchMetrics {
-        match typ {
-            StoreType::Local => &mut self.local,
-            StoreType::Shared => &mut self.cache,
+    pub(crate) fn store(&mut self, loc: StoreLocation) -> &mut FetchMetrics {
+        match loc {
+            StoreLocation::Local => &mut self.local,
+            StoreLocation::Cache => &mut self.cache,
         }
     }
 

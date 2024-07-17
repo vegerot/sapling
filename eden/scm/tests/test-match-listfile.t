@@ -1,12 +1,6 @@
-#debugruntest-compatible
 
-#testcases rust python
+#require no-eden
 
-#if rust
-  $ setconfig experimental.rustmatcher=true
-#else
-  $ setconfig experimental.rustmatcher=false
-#endif
 
   $ configure modern
 

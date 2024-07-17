@@ -4,7 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
+
 
 import abc
 import errno
@@ -30,6 +31,7 @@ MountInfo = NamedTuple(
 MTStat = NamedTuple("MTStat", [("st_uid", int), ("st_dev", int), ("st_mode", int)])
 
 kMountStaleSecondsTimeout = 10
+
 
 # Note this function needs to be a global function, otherwise it will cause
 # errors to spawn a process with this function as the entry point.
@@ -168,6 +170,7 @@ not seem to have finished.
         raise Exception(f"Unknown mount type {mount_type}")
 
     @abc.abstractmethod
+    # pyre-fixme[2]: Parameter must be annotated.
     def create_bind_mount(self, source_path, dest_path) -> bool:
         "Creates a bind mount from source_path to dest_path."
 
@@ -204,6 +207,7 @@ class LinuxMountTable(MountTable):
         # MNT_FORCE
         return 0 == subprocess.call(["sudo", "umount", "-f", mount_point])
 
+    # pyre-fixme[2]: Parameter must be annotated.
     def create_bind_mount(self, source_path, dest_path) -> bool:
         return 0 == subprocess.check_call(
             ["sudo", "mount", "-o", "bind", source_path, dest_path]
@@ -234,6 +238,7 @@ class MacOSMountTable(MountTable):
     def unmount_force(self, mount_point: bytes) -> bool:
         return 0 == subprocess.call(["sudo", "umount", "-f", mount_point])
 
+    # pyre-fixme[2]: Parameter must be annotated.
     def create_bind_mount(self, source_path, dest_path) -> bool:
         return False
 
@@ -248,6 +253,7 @@ class NopMountTable(MountTable):
     def unmount_force(self, mount_point: bytes) -> bool:
         return False
 
+    # pyre-fixme[2]: Parameter must be annotated.
     def create_bind_mount(self, source_path, dest_path) -> bool:
         return False
 

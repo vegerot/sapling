@@ -19,7 +19,6 @@ use configmodel::Config;
 use configmodel::ConfigExt;
 use indexedlog::log::IndexOutput;
 use minibytes::Bytes;
-use parking_lot::RwLock;
 use sha1::Digest;
 use sha1::Sha1;
 use types::hgid::ReadHgIdExt;
@@ -41,7 +40,7 @@ use crate::sliceext::SliceExt;
 use crate::types::StoreKey;
 
 pub struct IndexedLogHgIdHistoryStore {
-    log: RwLock<Store>,
+    log: Store,
 }
 
 struct Entry {
@@ -140,7 +139,7 @@ impl Entry {
     }
 
     /// Read an entry from the `IndexedLog` and deserialize it.
-    pub fn from_log(key: &Key, log: &RwLock<Store>) -> Result<Option<Self>> {
+    pub fn from_log(key: &Key, log: &Store) -> Result<Option<Self>> {
         let index_key = Self::key_to_index_key(key);
 
         let log = log.read();
@@ -156,7 +155,7 @@ impl Entry {
 
     /// Write an entry to the `IndexedLog`. See [`from_slice`] for the detail about the on-disk
     /// format.
-    pub fn write_to_log(self, log: &RwLock<Store>) -> Result<()> {
+    pub fn write_to_log(self, log: &Store) -> Result<()> {
         let mut buf = Vec::new();
         buf.write_all(Self::key_to_index_key(&self.key).as_ref())?;
         let path_slice = self.key.path.as_byte_slice();
@@ -172,7 +171,7 @@ impl Entry {
             buf.write_all(copy_from_slice)?;
         }
 
-        log.write().append(buf)
+        log.append(buf)
     }
 
     pub fn node_info(&self) -> NodeInfo {
@@ -197,16 +196,14 @@ impl IndexedLogHgIdHistoryStore {
     pub fn new(path: impl AsRef<Path>, config: &dyn Config, store_type: StoreType) -> Result<Self> {
         let open_options = Self::open_options(config)?;
         let log = match store_type {
-            StoreType::Local => open_options.local(&path),
-            StoreType::Shared => open_options.shared(&path),
+            StoreType::Permanent => open_options.permanent(&path),
+            StoreType::Rotated => open_options.rotated(&path),
         }?;
-        Ok(IndexedLogHgIdHistoryStore {
-            log: RwLock::new(log),
-        })
+        Ok(IndexedLogHgIdHistoryStore { log })
     }
 
     fn open_options(config: &dyn Config) -> Result<StoreOpenOptions> {
-        let mut open_options = StoreOpenOptions::new()
+        let mut open_options = StoreOpenOptions::new(config)
             .max_log_count(4)
             .max_bytes_per_log(500 * 1000 * 1000)
             .auto_sync_threshold(10 * 1024 * 1024)
@@ -228,13 +225,20 @@ impl IndexedLogHgIdHistoryStore {
 
     pub fn repair(path: PathBuf, config: &dyn Config, store_type: StoreType) -> Result<String> {
         match store_type {
-            StoreType::Local => {
-                IndexedLogHgIdHistoryStore::open_options(config)?.repair_local(path)
+            StoreType::Permanent => {
+                IndexedLogHgIdHistoryStore::open_options(config)?.repair_permanent(path)
             }
-            StoreType::Shared => {
-                IndexedLogHgIdHistoryStore::open_options(config)?.repair_shared(path)
+            StoreType::Rotated => {
+                IndexedLogHgIdHistoryStore::open_options(config)?.repair_rotated(path)
             }
         }
+    }
+
+    /// Check whether index contains `key`.
+    pub fn contains(&self, key: &Key) -> Result<bool> {
+        let index_key = Entry::key_to_index_key(key);
+        let log = self.log.read();
+        log.contains(0, index_key)
     }
 }
 
@@ -243,9 +247,9 @@ impl LocalStore for IndexedLogHgIdHistoryStore {
         Ok(keys
             .iter()
             .filter(|k| match k {
-                StoreKey::HgId(k) => match Entry::from_log(k, &self.log) {
-                    Ok(None) | Err(_) => true,
-                    Ok(Some(_)) => false,
+                StoreKey::HgId(k) => match self.contains(k) {
+                    Ok(contains) => !contains,
+                    Err(_) => true,
                 },
                 StoreKey::Content(_, _) => true,
             })
@@ -275,14 +279,14 @@ impl HgIdMutableHistoryStore for IndexedLogHgIdHistoryStore {
     }
 
     fn flush(&self) -> Result<Option<Vec<PathBuf>>> {
-        self.log.write().flush()?;
+        self.log.flush()?;
         Ok(None)
     }
 }
 
 impl ToKeys for IndexedLogHgIdHistoryStore {
     fn to_keys(&self) -> Vec<Result<Key>> {
-        let log = &self.log.read();
+        let log = self.log.read();
         log.iter()
             .map(|entry| {
                 let bytes = log.slice_to_bytes(entry?);
@@ -295,8 +299,7 @@ impl ToKeys for IndexedLogHgIdHistoryStore {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::remove_file;
-
+    use fs_err::remove_file;
     use rand::SeedableRng;
     use rand_chacha::ChaChaRng;
     use tempfile::TempDir;
@@ -309,7 +312,7 @@ mod tests {
     #[test]
     fn test_empty() -> Result<()> {
         let tempdir = TempDir::new()?;
-        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         log.flush()?;
         Ok(())
     }
@@ -317,7 +320,7 @@ mod tests {
     #[test]
     fn test_add() -> Result<()> {
         let tempdir = TempDir::new()?;
-        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         let k = key("a", "1");
         let nodeinfo = NodeInfo {
             parents: [key("a", "2"), null_key("a")],
@@ -332,7 +335,7 @@ mod tests {
     #[test]
     fn test_add_get_node_info() -> Result<()> {
         let tempdir = TempDir::new()?;
-        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         let k = key("a", "1");
         let nodeinfo = NodeInfo {
             parents: [key("a", "2"), null_key("a")],
@@ -341,7 +344,7 @@ mod tests {
         log.add(&k, &nodeinfo)?;
         log.flush()?;
 
-        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         let read_nodeinfo = log.get_node_info(&k)?;
         assert_eq!(Some(nodeinfo), read_nodeinfo);
         Ok(())
@@ -350,7 +353,7 @@ mod tests {
     #[test]
     fn test_corrupted() -> Result<()> {
         let tempdir = TempDir::new()?;
-        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         let mut rng = ChaChaRng::from_seed([0u8; 32]);
 
         let nodes = get_nodes(&mut rng);
@@ -366,7 +369,7 @@ mod tests {
         rotate_log_path.push("log");
         remove_file(rotate_log_path)?;
 
-        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         for (key, info) in nodes.iter() {
             log.add(key, info)?;
         }
@@ -379,7 +382,7 @@ mod tests {
     #[test]
     fn test_iter() -> Result<()> {
         let tempdir = TempDir::new()?;
-        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         let k = key("a", "1");
         let nodeinfo = NodeInfo {
             parents: [key("a", "2"), null_key("a")],

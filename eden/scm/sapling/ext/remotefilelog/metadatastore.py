@@ -5,8 +5,6 @@
 
 from __future__ import absolute_import
 
-from sapling import util
-
 from . import shallowutil
 
 
@@ -32,10 +30,6 @@ class unionmetadatastore:
             if missing:
                 missing = store.getmissing(missing)
         return missing
-
-    def getmetrics(self):
-        metrics = [s.getmetrics() for s in self.stores]
-        return shallowutil.sumdicts(*metrics)
 
     def markforrefresh(self):
         for store in self.stores:

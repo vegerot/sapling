@@ -13,6 +13,7 @@ use std::str;
 use anyhow::Error;
 use anyhow::Result;
 use configmodel::Config;
+use configmodel::ConfigExt;
 use configmodel::Text;
 use indexmap::IndexMap;
 use thiserror::Error;
@@ -227,7 +228,16 @@ impl<'a> AuthSection<'a> {
         }
 
         if let Some(best) = best {
-            Ok(Some(best.clone()))
+            tracing::debug!(%url, ?best, "best_auth_group");
+
+            let mut best = best.clone();
+            if best.cacerts.is_none() {
+                if let Ok(cacerts) = self.config.must_get("web", "cacerts") {
+                    tracing::debug!(%url, ?cacerts, "using web.cacerts bundle");
+                    best.cacerts = Some(cacerts);
+                }
+            }
+            Ok(Some(best))
         } else if !missing.is_empty() {
             let msg = self.config.get("help", "tlsauthhelp").unwrap_or_default();
             Err(MissingCerts {

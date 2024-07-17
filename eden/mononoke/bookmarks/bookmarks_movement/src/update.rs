@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use bookmarks::BookmarkUpdateLogId;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks_types::BookmarkKey;
 use bookmarks_types::BookmarkKind;
@@ -102,6 +103,7 @@ impl<'op> UpdateBookmarkOp<'op> {
         targets: BookmarkUpdateTargets,
         update_policy: BookmarkUpdatePolicy,
         reason: BookmarkUpdateReason,
+        affected_changesets_limit: Option<usize>,
     ) -> UpdateBookmarkOp<'op> {
         UpdateBookmarkOp {
             bookmark,
@@ -110,7 +112,7 @@ impl<'op> UpdateBookmarkOp<'op> {
             reason,
             kind_restrictions: BookmarkKindRestrictions::AnyKind,
             cross_repo_push_source: CrossRepoPushSource::NativeToThisRepo,
-            affected_changesets: AffectedChangesets::new(),
+            affected_changesets: AffectedChangesets::with_limit(affected_changesets_limit),
             pushvars: None,
             log_new_public_commits_to_scribe: false,
             only_log_acl_checks: false,
@@ -163,7 +165,7 @@ impl<'op> UpdateBookmarkOp<'op> {
         authz: &'op AuthorizationContext,
         repo: &'op impl Repo,
         hook_manager: &'op HookManager,
-    ) -> Result<(), BookmarkMovementError> {
+    ) -> Result<BookmarkUpdateLogId, BookmarkMovementError> {
         let kind = self.kind_restrictions.check_kind(repo, self.bookmark)?;
 
         if self.only_log_acl_checks {
@@ -185,7 +187,7 @@ impl<'op> UpdateBookmarkOp<'op> {
             .require_bookmark_modify(ctx, repo, self.bookmark)
             .await?;
 
-        check_bookmark_sync_config(repo, self.bookmark, kind)?;
+        check_bookmark_sync_config(ctx, repo, self.bookmark, kind).await?;
 
         self.update_policy
             .check_update_permitted(ctx, repo, self.bookmark, &self.targets)
@@ -209,7 +211,14 @@ impl<'op> UpdateBookmarkOp<'op> {
             )
             .await?;
 
-        check_repo_lock(repo, kind, self.pushvars, ctx.metadata().identities()).await?;
+        check_repo_lock(
+            repo,
+            kind,
+            self.pushvars,
+            ctx.metadata().identities(),
+            authz,
+        )
+        .await?;
 
         let mut txn = repo.bookmarks().create_transaction(ctx.clone());
         let txn_hook;
@@ -278,25 +287,26 @@ impl<'op> UpdateBookmarkOp<'op> {
             }
         };
 
-        let ok = match txn_hook {
+        let maybe_log_id = match txn_hook {
             Some(txn_hook) => txn.commit_with_hook(txn_hook).await?,
             None => txn.commit().await?,
         };
-        if !ok {
-            return Err(BookmarkMovementError::TransactionFailed);
-        }
+        if let Some(log_id) = maybe_log_id {
+            if self.log_new_public_commits_to_scribe {
+                log_new_bonsai_changesets(ctx, repo, self.bookmark, kind, commits_to_log.clone())
+                    .await;
+            }
+            let info = BookmarkInfo {
+                bookmark_name: self.bookmark.clone(),
+                bookmark_kind: kind,
+                operation: BookmarkOperation::Update(self.targets.old, self.targets.new),
+                reason: self.reason,
+            };
+            log_bookmark_operation(ctx, repo, &info).await;
 
-        if self.log_new_public_commits_to_scribe {
-            log_new_bonsai_changesets(ctx, repo, self.bookmark, kind, commits_to_log.clone()).await;
+            Ok(log_id.into())
+        } else {
+            Err(BookmarkMovementError::TransactionFailed)
         }
-        let info = BookmarkInfo {
-            bookmark_name: self.bookmark.clone(),
-            bookmark_kind: kind,
-            operation: BookmarkOperation::Update(self.targets.old, self.targets.new),
-            reason: self.reason,
-        };
-        log_bookmark_operation(ctx, repo, &info).await;
-
-        Ok(())
     }
 }

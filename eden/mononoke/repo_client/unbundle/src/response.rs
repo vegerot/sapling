@@ -15,15 +15,13 @@ use bookmarks::BookmarkKey;
 use bytes::Bytes;
 use bytes::BytesMut;
 use context::CoreContext;
-use futures::compat::Future01CompatExt;
-use futures::compat::Stream01CompatExt;
 use futures::future::try_join;
 use futures::TryStreamExt;
 use futures_stats::TimedTryFutureExt;
 use getbundle_response::create_getbundle_response;
 use getbundle_response::PhasesPart;
 use getbundle_response::SessionLfsParams;
-use mercurial_bundles::create_bundle_stream;
+use mercurial_bundles::create_bundle_stream_new;
 use mercurial_bundles::parts;
 use mercurial_bundles::Bundle2EncodeBuilder;
 use mercurial_bundles::PartId;
@@ -67,13 +65,7 @@ pub enum UnbundleResponse {
 
 impl UnbundleResponse {
     fn get_bundle_builder() -> Bundle2EncodeBuilder<Cursor<Vec<u8>>> {
-        let writer = Cursor::new(Vec::new());
-        let mut bundle = Bundle2EncodeBuilder::new(writer);
-        // Mercurial currently hangs while trying to read compressed bundles over the wire:
-        // https://bz.mercurial-scm.org/show_bug.cgi?id=5646
-        // TODO: possibly enable compression support once this is fixed.
-        bundle.set_compressor_type(None);
-        bundle
+        Bundle2EncodeBuilder::new(Cursor::new(Vec::new()))
     }
 
     async fn generate_push_or_infinitepush_response(
@@ -90,7 +82,7 @@ impl UnbundleResponse {
         for part_id in bookmark_ids {
             bundle.add_part(parts::replypushkey_part(true, part_id)?);
         }
-        let cursor = bundle.build().compat().await?;
+        let cursor = bundle.build().await?;
         Ok(Bytes::from(cursor.into_inner()))
     }
 
@@ -170,9 +162,7 @@ impl UnbundleResponse {
 
             cg_part_builder.extend(bookmark_reply_part.into_iter());
             cg_part_builder.extend(obsmarkers_part.into_iter());
-            let compression = None;
-            let chunks = create_bundle_stream(cg_part_builder, compression)
-                .compat()
+            let chunks = create_bundle_stream_new(cg_part_builder)
                 .try_collect::<Vec<_>>()
                 .await?;
 
@@ -181,7 +171,6 @@ impl UnbundleResponse {
                 total_capacity += c.len();
             }
 
-            // TODO(stash): make push and pushrebase response streamable - T34090105
             let mut res = BytesMut::with_capacity(total_capacity);
             for c in chunks {
                 res.extend_from_slice(&c);
@@ -210,7 +199,6 @@ impl UnbundleResponse {
         bundle.add_part(parts::replypushkey_part(true, bookmark_push_part_id)?);
         let cursor = bundle
             .build()
-            .compat()
             .await
             .context("While preparing bookmark-only pushrebase response")?;
 
@@ -228,7 +216,7 @@ impl UnbundleResponse {
     ) -> Result<Bytes> {
         if let Some(true) = respondlightly {
             let bundle = Self::get_bundle_builder();
-            let cursor = bundle.build().compat().await?;
+            let cursor = bundle.build().await?;
             return Ok(Bytes::from(cursor.into_inner()));
         }
         match self {

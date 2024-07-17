@@ -21,6 +21,11 @@ use metaconfig_types::SmallRepoCommitSyncConfig;
 use mononoke_types::RepositoryId;
 use thiserror::Error;
 
+// NOTE: Occurrences of Option<NonRootMPath> in this file have not been replaced with MPath since such a
+// replacement is only possible in cases where Option<NonRootMPath> is used to represent a path that can also
+// be root. However, in this case the Some(_) and None variant of Option<NonRootMPath> are used to represent
+// conditional logic, i.e. the code either does something or skips it based on None or Some.
+
 #[derive(Debug, Error)]
 pub enum ErrorKind {
     #[error("Cannot remove prefix, equal to the whole path")]
@@ -37,9 +42,11 @@ pub enum ErrorKind {
 /// Here are the meanings of the return values:
 /// - `Ok(Some(newpath))` - the path should be
 ///   replaced with `newpath` during sync
-/// - `Ok(None)` - the path shoould not be synced
+/// - `Ok(None)` - the path should not be synced
 /// - `Err(e)` - the sync should fail, as this function
 ///   could not figure out how to rewrite path
+/// Fine to have Option<NonRootMPath> in this case since the optional part is not for representing root paths
+/// but instead to handle control flow differently
 pub type Mover = Arc<dyn Fn(&NonRootMPath) -> Result<Option<NonRootMPath>> + Send + Sync + 'static>;
 
 /// A struct to contain forward and reverse `Mover`
@@ -377,7 +384,7 @@ mod test {
 
     #[test]
     fn test_get_path_action() {
-        let foo_el = vec![mpe(b"foo")];
+        let foo_el = [mpe(b"foo")];
         assert_eq!(
             get_path_action(foo_el.iter(), &PrefixAction::DoNotSync).unwrap(),
             PathAction::DoNotSync
@@ -477,6 +484,7 @@ mod test {
             map: hashmap! {
                 mp("preserved2") => mp("repo1-rest/preserved2"),
             },
+            submodule_config: Default::default(),
         }
     }
 
@@ -488,6 +496,7 @@ mod test {
                 mp("sub1") => mp("repo2-rest/sub1"),
                 mp("sub2") => mp("repo2-rest/sub2"),
             },
+            submodule_config: Default::default(),
         }
     }
 
@@ -644,6 +653,7 @@ mod test {
                     map: hashmap! {
                         mp("preserved2") => mp("preserved2"),
                     },
+                    submodule_config: Default::default(),
                 },
                 RepositoryId::new(2) => SmallRepoCommitSyncConfig {
                     default_action: DefaultSmallToLargeCommitSyncPathAction::PrependPrefix(mp("shifted2")),
@@ -652,6 +662,7 @@ mod test {
                         mp("sub1") => mp("repo2-rest/sub1"),
                         mp("sub2") => mp("repo2-rest/sub2"),
                     },
+                    submodule_config: Default::default(),
                 },
             },
             version_name: CommitSyncConfigVersion("TEST_VERSION_NAME".to_string()),
@@ -736,6 +747,7 @@ mod test {
                 mp("sub1") => mp("repo2-rest/sub1"),
                 mp("sub1/preserved") => mp("sub1/preserved"),
             },
+            submodule_config: Default::default(),
         }
     }
 
@@ -785,6 +797,7 @@ mod test {
                 mp("preserved") => mp("preserved"),
                 mp("preserved/excluded") => mp("shifted/preserved/excluded"),
             },
+            submodule_config: Default::default(),
         }
     }
 

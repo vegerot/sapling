@@ -21,12 +21,11 @@ use edenfs_error::Result;
 use edenfs_error::ResultExt;
 use glob::glob;
 use sysinfo::Pid;
-use sysinfo::ProcessExt;
-use sysinfo::SystemExt;
 use tracing::trace;
 
 pub mod humantime;
 pub mod metadata;
+pub mod varint;
 
 #[cfg(windows)]
 pub mod winargv;
@@ -141,7 +140,7 @@ pub fn get_executable(pid: sysinfo::Pid) -> Option<PathBuf> {
             #[cfg(unix)]
             {
                 // We may get a path ends with (deleted) if the executable is deleted on UNIX.
-                let path = executable
+                let path = executable?
                     .to_str()
                     .unwrap_or("")
                     .trim_end_matches(" (deleted)");
@@ -149,7 +148,7 @@ pub fn get_executable(pid: sysinfo::Pid) -> Option<PathBuf> {
             }
             #[cfg(not(unix))]
             {
-                return Some(executable.into());
+                return Some(executable?.into());
             }
         } else {
             trace!(%pid, "unable to find process");
@@ -280,4 +279,38 @@ pub fn remove_symlink(path: &Path) -> Result<()> {
 /// on other platforms, we don't know how to handle removing symlinks. Panic instead of guessing
 pub fn remove_symlink(path: &Path) -> Result<()> {
     panic!("failed to remove symlink, unsupported platform");
+}
+
+#[cfg(windows)]
+const PYTHON_CANDIDATES: &[&str] = &[
+    r"c:\tools\fb-python\fb-python312",
+    r"c:\tools\fb-python\fb-python310",
+    r"c:\Python310",
+];
+
+#[cfg(windows)]
+pub fn find_python() -> Option<PathBuf> {
+    for candidate in PYTHON_CANDIDATES.iter() {
+        let candidate = Path::new(candidate);
+        let python = candidate.join("python.exe");
+
+        if candidate.exists() && python.exists() {
+            tracing::debug!("Found Python runtime at {}", python.display());
+            return Some(python);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+pub fn execute_par(par: PathBuf) -> anyhow::Result<Command> {
+    let python = find_python().ok_or_else(|| {
+        anyhow!(
+            "Unable to find Python runtime. Paths tried:\n\n - {}",
+            PYTHON_CANDIDATES.join("\n - ")
+        )
+    })?;
+    let mut python = Command::new(python);
+    python.arg(par);
+    Ok(python)
 }

@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt::Write;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -23,8 +24,9 @@ use commit_graph_types::edges::ChangesetNode;
 use commit_graph_types::edges::ChangesetNodeParents;
 use commit_graph_types::edges::ChangesetParents;
 use commit_graph_types::storage::CommitGraphStorage;
+use commit_graph_types::storage::FetchedChangesetEdges;
 use commit_graph_types::storage::Prefetch;
-use commit_graph_types::storage::PrefetchEdge;
+use commit_graph_types::storage::PrefetchTarget;
 use context::CoreContext;
 use context::PerfCounterType;
 use mononoke_types::ChangesetId;
@@ -32,16 +34,15 @@ use mononoke_types::ChangesetIdPrefix;
 use mononoke_types::ChangesetIdsResolvedFromPrefix;
 use mononoke_types::Generation;
 use mononoke_types::RepositoryId;
+use rendezvous::ConfigurableRendezVousController;
 use rendezvous::RendezVous;
 use rendezvous::RendezVousOptions;
 use rendezvous::RendezVousStats;
-use rendezvous::TunablesRendezVousController;
 use sql::Connection;
 use sql::SqlConnections;
 use sql_construct::SqlConstruct;
 use sql_construct::SqlConstructFromMetadataDatabaseConfig;
 use sql_ext::mononoke_queries;
-use tunables::tunables;
 use vec1::vec1;
 use vec1::Vec1;
 
@@ -51,7 +52,7 @@ mod tests;
 /// Maximum number of recursive steps to take when prefetching commits.
 ///
 /// The configured maximum number of recursive steps in MySQL is 1000.
-const DEFAULT_PREFETCH_STEP_LIMIT: i64 = 1000;
+const DEFAULT_PREFETCH_STEP_LIMIT: u64 = 1000;
 
 pub struct SqlCommitGraphStorageBuilder {
     connections: SqlConnections,
@@ -90,7 +91,7 @@ impl SqlCommitGraphStorageBuilder {
 
 #[derive(Clone)]
 struct RendezVousConnection {
-    fetch_single: RendezVous<ChangesetId, ChangesetEdges>,
+    fetch_single: RendezVous<ChangesetId, FetchedChangesetEdges>,
     conn: Connection,
 }
 
@@ -99,7 +100,7 @@ impl RendezVousConnection {
         Self {
             conn,
             fetch_single: RendezVous::new(
-                TunablesRendezVousController::new(opts),
+                ConfigurableRendezVousController::new(opts),
                 Arc::new(RendezVousStats::new(format!(
                     "commit_graph.fetch_single.{}",
                     name
@@ -231,6 +232,7 @@ mononoke_queries! {
 
     read SelectManyChangesets(repo_id: RepositoryId, >list cs_ids: ChangesetId) -> (
         ChangesetId, // cs_id
+        Option<ChangesetId>, // origin_cs_id
         Option<u64>, // gen
         Option<u64>, // skip_tree_depth
         Option<u64>, // p1_linear_depth
@@ -260,6 +262,7 @@ mononoke_queries! {
         "
         SELECT
             cs0.cs_id AS cs_id,
+            NULL AS origin_cs_id,
             NULL AS gen,
             NULL AS skip_tree_depth,
             NULL AS p1_linear_depth,
@@ -294,6 +297,7 @@ mononoke_queries! {
 
         SELECT
             cs0.cs_id AS cs_id,
+            NULL AS origin_cs_id,
             cs0.gen AS gen,
             cs0.skip_tree_depth AS skip_tree_depth,
             cs0.p1_linear_depth AS p1_linear_depth,
@@ -333,6 +337,7 @@ mononoke_queries! {
 
     read SelectManyChangesetsWithFirstParentPrefetch(repo_id: RepositoryId, step_limit: u64, prefetch_gen: u64, >list cs_ids: ChangesetId) -> (
         ChangesetId, // cs_id
+        Option<ChangesetId>, // origin_cs_id
         Option<u64>, // gen
         Option<u64>, // skip_tree_depth
         Option<u64>, // p1_linear_depth
@@ -362,12 +367,12 @@ mononoke_queries! {
         "
         WITH RECURSIVE csp AS (
             SELECT
-                cs.id, 1 AS step, cs.p1_parent AS next
+                cs.id, cs.cs_id AS origin_cs_id, 1 AS step, cs.p1_parent AS next
             FROM commit_graph_edges cs
             WHERE cs.repo_id = {repo_id} AND cs.cs_id IN {cs_ids}
             UNION ALL
             SELECT
-                cs.id, csp.step + 1, cs.p1_parent AS next
+                cs.id, csp.origin_cs_id AS origin_cs_id, csp.step + 1, cs.p1_parent AS next
             FROM csp
             INNER JOIN commit_graph_edges cs ON cs.id = csp.next
             WHERE csp.step < {step_limit} AND cs.gen >= {prefetch_gen}
@@ -375,6 +380,7 @@ mononoke_queries! {
 
         SELECT
             cs0.cs_id AS cs_id,
+            csp.origin_cs_id AS origin_cs_id,
             NULL AS gen,
             NULL AS skip_tree_depth,
             NULL AS p1_linear_depth,
@@ -410,6 +416,7 @@ mononoke_queries! {
 
         SELECT
             cs0.cs_id AS cs_id,
+            csp.origin_cs_id AS origin_cs_id,
             cs0.gen AS gen,
             cs0.skip_tree_depth AS skip_tree_depth,
             cs0.p1_linear_depth AS p1_linear_depth,
@@ -448,6 +455,7 @@ mononoke_queries! {
 
     read SelectManyChangesetsWithSkipTreeSkewAncestorPrefetch(repo_id: RepositoryId, step_limit: u64, prefetch_gen: u64, >list cs_ids: ChangesetId) -> (
         ChangesetId, // cs_id
+        Option<ChangesetId>, // origin_cs_id
         Option<u64>, // gen
         Option<u64>, // skip_tree_depth
         Option<u64>, // p1_linear_depth
@@ -477,12 +485,12 @@ mononoke_queries! {
         "
         WITH RECURSIVE csp AS (
             SELECT
-                cs.id, 1 AS step, COALESCE(cs.skip_tree_skew_ancestor, cs.p1_parent) AS next
+                cs.id, cs.cs_id as origin_cs_id, 1 AS step, COALESCE(cs.skip_tree_skew_ancestor, cs.p1_parent) AS next
             FROM commit_graph_edges cs
             WHERE cs.repo_id = {repo_id} AND cs.cs_id IN {cs_ids}
             UNION ALL
             SELECT
-                cs.id, csp.step + 1, COALESCE(cs.skip_tree_skew_ancestor, cs.p1_parent) AS next
+                cs.id, csp.origin_cs_id, csp.step + 1, COALESCE(cs.skip_tree_skew_ancestor, cs.p1_parent) AS next
             FROM csp
             INNER JOIN commit_graph_edges cs ON cs.id = csp.next
             WHERE csp.step < {step_limit} AND cs.gen >= {prefetch_gen}
@@ -490,6 +498,7 @@ mononoke_queries! {
 
         SELECT
             cs0.cs_id AS cs_id,
+            csp.origin_cs_id AS origin_cs_id,
             NULL AS gen,
             NULL AS skip_tree_depth,
             NULL AS p1_linear_depth,
@@ -525,6 +534,136 @@ mononoke_queries! {
 
         SELECT
             cs0.cs_id AS cs_id,
+            csp.origin_cs_id AS origin_cs_id,
+            cs0.gen AS gen,
+            cs0.skip_tree_depth AS skip_tree_depth,
+            cs0.p1_linear_depth AS p1_linear_depth,
+            cs0.parent_count AS parent_count,
+            cs_merge_ancestor.cs_id AS merge_ancestor,
+            cs_merge_ancestor.gen AS merge_ancestor_gen,
+            cs_merge_ancestor.skip_tree_depth AS merge_ancestor_skip_tree_depth,
+            cs_merge_ancestor.p1_linear_depth AS merge_ancestor_p1_linear_depth,
+            cs_skip_tree_parent.cs_id AS skip_tree_parent,
+            cs_skip_tree_parent.gen AS skip_tree_parent_gen,
+            cs_skip_tree_parent.skip_tree_depth AS skip_tree_parent_skip_tree_depth,
+            cs_skip_tree_parent.p1_linear_depth AS skip_tree_parent_p1_linear_depth,
+            cs_skip_tree_skew_ancestor.cs_id AS skip_tree_skew_ancestor,
+            cs_skip_tree_skew_ancestor.gen AS skip_tree_skew_ancestor_gen,
+            cs_skip_tree_skew_ancestor.skip_tree_depth AS skip_tree_skew_ancestor_skip_tree_depth,
+            cs_skip_tree_skew_ancestor.p1_linear_depth AS skip_tree_skew_ancestor_p1_linear_depth,
+            cs_p1_linear_skew_ancestor.cs_id AS p1_linear_skew_ancestor,
+            cs_p1_linear_skew_ancestor.gen AS p1_linear_skew_ancestor_gen,
+            cs_p1_linear_skew_ancestor.skip_tree_depth AS p1_linear_skew_ancestor_skip_tree_depth,
+            cs_p1_linear_skew_ancestor.p1_linear_depth AS p1_linear_skew_ancestor_p1_linear_depth,
+            0 AS parent_num,
+            cs_p1_parent.cs_id AS parent,
+            cs_p1_parent.gen AS parent_gen,
+            cs_p1_parent.skip_tree_depth AS parent_skip_tree_depth,
+            cs_p1_parent.p1_linear_depth AS parent_p1_linear_depth
+        FROM csp
+        INNER JOIN commit_graph_edges cs0 ON csp.id = cs0.id
+        LEFT JOIN commit_graph_edges cs_p1_parent ON cs_p1_parent.id = cs0.p1_parent
+        LEFT JOIN commit_graph_edges cs_merge_ancestor ON cs_merge_ancestor.id = cs0.merge_ancestor
+        LEFT JOIN commit_graph_edges cs_skip_tree_parent ON cs_skip_tree_parent.id = cs0.skip_tree_parent
+        LEFT JOIN commit_graph_edges cs_skip_tree_skew_ancestor ON cs_skip_tree_skew_ancestor.id = cs0.skip_tree_skew_ancestor
+        LEFT JOIN commit_graph_edges cs_p1_linear_skew_ancestor ON cs_p1_linear_skew_ancestor.id = cs0.p1_linear_skew_ancestor
+        ORDER BY parent_num ASC
+        "
+    }
+
+    read SelectManyChangesetsWithExactSkipTreeAncestorPrefetch(repo_id: RepositoryId, prefetch_gen: u64, >list cs_ids: ChangesetId) -> (
+        ChangesetId, // cs_id
+        Option<ChangesetId>, // origin_cs_id
+        Option<u64>, // gen
+        Option<u64>, // skip_tree_depth
+        Option<u64>, // p1_linear_depth
+        Option<usize>, // parent_count
+        Option<ChangesetId>, // merge_ancestor
+        Option<u64>, // merge_ancestor_gen
+        Option<u64>, // merge_ancestor_skip_tree_depth
+        Option<u64>, // merge_ancestor_p1_linear_depth
+        Option<ChangesetId>, // skip_tree_parent
+        Option<u64>, // skip_tree_parent_gen
+        Option<u64>, // skip_tree_parent_skip_tree_depth
+        Option<u64>, // skip_tree_parent_p1_linear_depth
+        Option<ChangesetId>, // skip_tree_skew_ancestor
+        Option<u64>, // skip_tree_skew_ancestor_gen
+        Option<u64>, // skip_tree_skew_ancestor_skip_tree_depth
+        Option<u64>, // skip_tree_skew_ancestor_p1_linear_depth
+        Option<ChangesetId>, // p1_linear_skew_ancestor
+        Option<u64>, // p1_linear_skew_ancestor_gen
+        Option<u64>, // p1_linear_skew_ancestor_skip_tree_depth
+        Option<u64>, // p1_linear_skew_ancestor_p1_linear_depth
+        usize, // parent_num
+        Option<ChangesetId>, // parent
+        Option<u64>, // parent_gen
+        Option<u64>, // parent_skip_tree_depth
+        Option<u64>, // parent_p1_linear_depth
+    ) {
+        "
+        WITH RECURSIVE csp AS (
+            SELECT
+                cs.cs_id as origin_cs_id, cs.id, cs.skip_tree_parent, cs.skip_tree_skew_ancestor
+            FROM commit_graph_edges cs
+            WHERE cs.repo_id = {repo_id} AND cs.cs_id IN {cs_ids}
+
+            UNION ALL
+            
+            SELECT
+                csp.origin_cs_id, skip_tree_parent.id, skip_tree_parent.skip_tree_parent, skip_tree_parent.skip_tree_skew_ancestor
+            FROM csp
+            INNER JOIN commit_graph_edges skip_tree_parent ON skip_tree_parent.id = csp.skip_tree_parent
+            INNER JOIN commit_graph_edges skip_tree_skew_ancestor ON skip_tree_skew_ancestor.id = csp.skip_tree_skew_ancestor
+            WHERE skip_tree_parent.gen >= {prefetch_gen} and skip_tree_skew_ancestor.gen < {prefetch_gen}
+
+            UNION ALL
+
+            SELECT
+                csp.origin_cs_id, skip_tree_skew_ancestor.id, skip_tree_skew_ancestor.skip_tree_parent, skip_tree_skew_ancestor.skip_tree_skew_ancestor
+            FROM csp
+            INNER JOIN commit_graph_edges skip_tree_skew_ancestor ON skip_tree_skew_ancestor.id = csp.skip_tree_skew_ancestor
+            WHERE skip_tree_skew_ancestor.gen >= {prefetch_gen}
+        )
+
+        SELECT
+            cs0.cs_id AS cs_id,
+            csp.origin_cs_id AS origin_cs_id,
+            NULL AS gen,
+            NULL AS skip_tree_depth,
+            NULL AS p1_linear_depth,
+            NULL AS parent_count,
+            NULL AS merge_ancestor,
+            NULL AS merge_ancestor_gen,
+            NULL AS merge_ancestor_skip_tree_depth,
+            NULL AS merge_ancestor_p1_linear_depth,
+            NULL AS skip_tree_parent,
+            NULL AS skip_tree_parent_gen,
+            NULL AS skip_tree_parent_skip_tree_depth,
+            NULL AS skip_tree_parent_p1_linear_depth,
+            NULL AS skip_tree_skew_ancestor,
+            NULL AS skip_tree_skew_ancestor_gen,
+            NULL AS skip_tree_skew_ancestor_skip_tree_depth,
+            NULL AS skip_tree_skew_ancestor_p1_linear_depth,
+            NULL AS p1_linear_skew_ancestor,
+            NULL AS p1_linear_skew_ancestor_gen,
+            NULL AS p1_linear_skew_ancestor_skip_tree_depth,
+            NULL AS p1_linear_skew_ancestor_p1_linear_depth,
+            cgmp.parent_num AS parent_num,
+            cs1.cs_id AS parent,
+            cs1.gen AS parent_gen,
+            cs1.skip_tree_depth AS parent_skip_tree_depth,
+            cs1.p1_linear_depth AS parent_p1_linear_depth
+        FROM csp
+        INNER JOIN commit_graph_merge_parents cgmp ON csp.id = cgmp.id
+        INNER JOIN commit_graph_edges cs0 ON cs0.id = cgmp.id
+        INNER JOIN commit_graph_edges cs1 ON cs1.id = cgmp.parent
+        WHERE cs0.parent_count >= 2
+
+        UNION
+
+        SELECT
+            cs0.cs_id AS cs_id,
+            csp.origin_cs_id AS origin_cs_id,
             cs0.gen AS gen,
             cs0.skip_tree_depth AS skip_tree_depth,
             cs0.p1_linear_depth AS p1_linear_depth,
@@ -564,6 +703,7 @@ mononoke_queries! {
     // The only difference between mysql and sqlite is the FORCE INDEX
     read SelectManyChangesetsInIdRange(repo_id: RepositoryId, start_id: u64, end_id: u64, limit: u64) -> (
         ChangesetId, // cs_id
+        Option<ChangesetId>, // origin_cs_id
         Option<u64>, // gen
         Option<u64>, // skip_tree_depth
         Option<u64>, // p1_linear_depth
@@ -600,6 +740,7 @@ mononoke_queries! {
 
         SELECT
             cs0.cs_id AS cs_id,
+            NULL AS origin_cs_id,
             NULL AS gen,
             NULL AS skip_tree_depth,
             NULL AS p1_linear_depth,
@@ -635,6 +776,7 @@ mononoke_queries! {
 
         SELECT
             cs0.cs_id AS cs_id,
+            NULL AS origin_cs_id,
             cs0.gen AS gen,
             cs0.skip_tree_depth AS skip_tree_depth,
             cs0.p1_linear_depth AS p1_linear_depth,
@@ -678,6 +820,7 @@ mononoke_queries! {
 
         SELECT
             cs0.cs_id AS cs_id,
+            NULL AS origin_cs_id,
             NULL AS gen,
             NULL AS skip_tree_depth,
             NULL AS p1_linear_depth,
@@ -713,6 +856,7 @@ mononoke_queries! {
 
         SELECT
             cs0.cs_id AS cs_id,
+            NULL AS origin_cs_id,
             cs0.gen AS gen,
             cs0.skip_tree_depth AS skip_tree_depth,
             cs0.p1_linear_depth AS p1_linear_depth,
@@ -832,6 +976,7 @@ impl SqlCommitGraphStorage {
     fn collect_changeset_edges(
         fetched_edges: &[(
             ChangesetId,         // cs_id
+            Option<ChangesetId>, // origin_cs_id
             Option<u64>,         // gen
             Option<u64>,         // skip_tree_depth
             Option<u64>,         // p1_linear_depth
@@ -858,7 +1003,7 @@ impl SqlCommitGraphStorage {
             Option<u64>,         // parent_skip_tree_depth
             Option<u64>,         // parent_p1_linear_depth
         )],
-    ) -> HashMap<ChangesetId, ChangesetEdges> {
+    ) -> HashMap<ChangesetId, FetchedChangesetEdges> {
         let option_fields_to_option_node =
             |cs_id, generation, skip_tree_depth, p1_linear_depth| match (
                 cs_id,
@@ -881,6 +1026,7 @@ impl SqlCommitGraphStorage {
             match *row {
                 (
                     cs_id,
+                    origin_cs_id,
                     Some(gen),
                     Some(skip_tree_depth),
                     Some(p1_linear_depth),
@@ -903,41 +1049,44 @@ impl SqlCommitGraphStorage {
                     p1_linear_skew_ancestor_p1_linear_depth,
                     ..,
                 ) => {
-                    cs_id_to_cs_edges
-                        .entry(cs_id)
-                        .or_insert_with(|| ChangesetEdges {
-                            node: ChangesetNode {
-                                cs_id,
-                                generation: Generation::new(gen),
-                                skip_tree_depth,
-                                p1_linear_depth,
+                    cs_id_to_cs_edges.entry(cs_id).or_insert_with(|| {
+                        FetchedChangesetEdges::new(
+                            origin_cs_id,
+                            ChangesetEdges {
+                                node: ChangesetNode {
+                                    cs_id,
+                                    generation: Generation::new(gen),
+                                    skip_tree_depth,
+                                    p1_linear_depth,
+                                },
+                                parents: ChangesetNodeParents::new(),
+                                merge_ancestor: option_fields_to_option_node(
+                                    merge_ancestor,
+                                    merge_ancestor_gen,
+                                    merge_ancestor_skip_tree_depth,
+                                    merge_ancestor_p1_linear_depth,
+                                ),
+                                skip_tree_parent: option_fields_to_option_node(
+                                    skip_tree_parent,
+                                    skip_tree_parent_gen,
+                                    skip_tree_parent_skip_tree_depth,
+                                    skip_tree_parent_p1_linear_depth,
+                                ),
+                                skip_tree_skew_ancestor: option_fields_to_option_node(
+                                    skip_tree_skew_ancestor,
+                                    skip_tree_skew_ancestor_gen,
+                                    skip_tree_skew_ancestor_skip_tree_depth,
+                                    skip_tree_skew_ancestor_p1_linear_depth,
+                                ),
+                                p1_linear_skew_ancestor: option_fields_to_option_node(
+                                    p1_linear_skew_ancestor,
+                                    p1_linear_skew_ancestor_gen,
+                                    p1_linear_skew_ancestor_skip_tree_depth,
+                                    p1_linear_skew_ancestor_p1_linear_depth,
+                                ),
                             },
-                            parents: ChangesetNodeParents::new(),
-                            merge_ancestor: option_fields_to_option_node(
-                                merge_ancestor,
-                                merge_ancestor_gen,
-                                merge_ancestor_skip_tree_depth,
-                                merge_ancestor_p1_linear_depth,
-                            ),
-                            skip_tree_parent: option_fields_to_option_node(
-                                skip_tree_parent,
-                                skip_tree_parent_gen,
-                                skip_tree_parent_skip_tree_depth,
-                                skip_tree_parent_p1_linear_depth,
-                            ),
-                            skip_tree_skew_ancestor: option_fields_to_option_node(
-                                skip_tree_skew_ancestor,
-                                skip_tree_skew_ancestor_gen,
-                                skip_tree_skew_ancestor_skip_tree_depth,
-                                skip_tree_skew_ancestor_p1_linear_depth,
-                            ),
-                            p1_linear_skew_ancestor: option_fields_to_option_node(
-                                p1_linear_skew_ancestor,
-                                p1_linear_skew_ancestor_gen,
-                                p1_linear_skew_ancestor_skip_tree_depth,
-                                p1_linear_skew_ancestor_p1_linear_depth,
-                            ),
-                        });
+                        )
+                    });
                 }
                 _ => continue,
             }
@@ -979,7 +1128,7 @@ impl SqlCommitGraphStorage {
         cs_ids: &[ChangesetId],
         prefetch: Prefetch,
         rendezvous: &RendezVousConnection,
-    ) -> Result<HashMap<ChangesetId, ChangesetEdges>> {
+    ) -> Result<HashMap<ChangesetId, FetchedChangesetEdges>> {
         if cs_ids.is_empty() {
             // This is actually NECESSARY, because SQL doesn't deal well with
             // querying empty arrays
@@ -987,29 +1136,39 @@ impl SqlCommitGraphStorage {
         }
 
         if let Some(target) = prefetch.target() {
-            let steps = std::cmp::min(
-                target.steps,
-                tunables()
-                    .commit_graph_prefetch_step_limit()
-                    .unwrap_or(DEFAULT_PREFETCH_STEP_LIMIT) as u64,
-            );
-            let fetched_edges = match target.edge {
-                PrefetchEdge::FirstParent => {
-                    SelectManyChangesetsWithFirstParentPrefetch::query(
+            let steps_limit =
+                justknobs::get_as::<u64>("scm/mononoke:commit_graph_prefetch_step_limit", None)
+                    .unwrap_or(DEFAULT_PREFETCH_STEP_LIMIT);
+
+            let fetched_edges = match target {
+                PrefetchTarget::LinearAncestors { steps, generation } => {
+                    SelectManyChangesetsWithFirstParentPrefetch::maybe_traced_query(
                         &self.read_connection.conn,
+                        ctx.client_request_info(),
                         &self.repo_id,
-                        &steps,
-                        &target.generation.value(),
+                        &std::cmp::min(steps, steps_limit),
+                        &generation.value(),
                         cs_ids,
                     )
                     .await?
                 }
-                PrefetchEdge::SkipTreeSkewAncestor => {
-                    SelectManyChangesetsWithSkipTreeSkewAncestorPrefetch::query(
+                PrefetchTarget::SkipTreeSkewAncestors { steps, generation } => {
+                    SelectManyChangesetsWithSkipTreeSkewAncestorPrefetch::maybe_traced_query(
                         &self.read_connection.conn,
+                        ctx.client_request_info(),
                         &self.repo_id,
-                        &steps,
-                        &target.generation.value(),
+                        &std::cmp::min(steps, steps_limit),
+                        &generation.value(),
+                        cs_ids,
+                    )
+                    .await?
+                }
+                PrefetchTarget::ExactSkipTreeAncestors { generation } => {
+                    SelectManyChangesetsWithExactSkipTreeAncestorPrefetch::maybe_traced_query(
+                        &self.read_connection.conn,
+                        ctx.client_request_info(),
+                        &self.repo_id,
+                        &generation.value(),
                         cs_ids,
                     )
                     .await?
@@ -1022,12 +1181,17 @@ impl SqlCommitGraphStorage {
                 .dispatch(ctx.fb.clone(), cs_ids.iter().copied().collect(), || {
                     let conn = rendezvous.conn.clone();
                     let repo_id = self.repo_id.clone();
+                    let cri = ctx.client_request_info().cloned();
 
                     move |cs_ids| async move {
                         let cs_ids = cs_ids.into_iter().collect::<Vec<_>>();
-
-                        let fetched_edges =
-                            SelectManyChangesets::query(&conn, &repo_id, cs_ids.as_slice()).await?;
+                        let fetched_edges = SelectManyChangesets::maybe_traced_query(
+                            &conn,
+                            cri.as_ref(),
+                            &repo_id,
+                            cs_ids.as_slice(),
+                        )
+                        .await?;
                         Ok(Self::collect_changeset_edges(&fetched_edges))
                     }
                 })
@@ -1059,15 +1223,19 @@ impl SqlCommitGraphStorage {
         read_from_master: bool,
     ) -> Result<HashMap<ChangesetId, ChangesetEdges>> {
         Ok(Self::collect_changeset_edges(
-            &SelectManyChangesetsInIdRange::query(
+            &SelectManyChangesetsInIdRange::maybe_traced_query(
                 self.read_conn(read_from_master),
+                ctx.client_request_info(),
                 &self.repo_id,
                 &start_id,
                 &end_id,
                 &limit,
             )
             .await?,
-        ))
+        )
+        .into_iter()
+        .map(|(k, v)| (k, v.into()))
+        .collect())
     }
 
     /// Fetch a maximum of `limit` changeset ids for changesets having
@@ -1080,8 +1248,9 @@ impl SqlCommitGraphStorage {
         limit: u64,
         read_from_master: bool,
     ) -> Result<Vec<ChangesetId>> {
-        Ok(SelectManyChangesetsIdsInIdRange::query(
+        Ok(SelectManyChangesetsIdsInIdRange::maybe_traced_query(
             self.read_conn(read_from_master),
+            ctx.client_request_info(),
             &self.repo_id,
             &start_id,
             &end_id,
@@ -1096,12 +1265,14 @@ impl SqlCommitGraphStorage {
     /// Returns the maximum auto-increment id for any changeset in the repo,
     /// or `None` if there are no changesets.
     pub async fn max_id(&self, ctx: &CoreContext, read_from_master: bool) -> Result<Option<u64>> {
-        Ok(
-            SelectMaxId::query(self.read_conn(read_from_master), &self.repo_id)
-                .await?
-                .first()
-                .map(|(id,)| *id),
+        Ok(SelectMaxId::maybe_traced_query(
+            self.read_conn(read_from_master),
+            ctx.client_request_info(),
+            &self.repo_id,
         )
+        .await?
+        .first()
+        .map(|(id,)| *id))
     }
 
     /// Returns the maximum auto-increment id of changesets having auto-increment
@@ -1114,8 +1285,9 @@ impl SqlCommitGraphStorage {
         limit: u64,
         read_from_master: bool,
     ) -> Result<Option<u64>> {
-        Ok(SelectMaxIdInRange::query(
+        Ok(SelectMaxIdInRange::maybe_traced_query(
             self.read_conn(read_from_master),
+            ctx.client_request_info(),
             &self.repo_id,
             &start_id,
             &end_id,
@@ -1134,9 +1306,15 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
     }
 
     async fn add_many(&self, ctx: &CoreContext, many_edges: Vec1<ChangesetEdges>) -> Result<usize> {
+        // If we're inserting a single changeset, use the faster single insertion method.
+        if many_edges.len() == 1 {
+            return Ok(self.add(ctx, many_edges.split_off_first().0).await? as usize);
+        }
+
         // We need to be careful because there might be dependencies among the edges
         // Part 1 - Add all nodes without any edges, so we generate ids for them
         let transaction = self.write_connection.start_transaction().await?;
+        let cri = ctx.client_request_info();
         let cs_no_edges = many_edges
             .iter()
             .map(|e| {
@@ -1150,16 +1328,19 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
                 )
             })
             .collect::<Vec<_>>();
-        let (transaction, result) = InsertChangesetsNoEdges::query_with_transaction(
+        let (transaction, result) = InsertChangesetsNoEdges::maybe_traced_query_with_transaction(
             transaction,
+            cri,
+            // This pattern is used to convert a ref to tuple into a tuple of refs.
+            #[allow(clippy::map_identity)]
             cs_no_edges
                 .iter()
-                // This does &(TypeA, TypeB, ...) -> (&TypeA, &TypeB, ...)
                 .map(|(a, b, c, d, e, f)| (a, b, c, d, e, f))
                 .collect::<Vec<_>>()
                 .as_slice(),
         )
         .await?;
+
         let modified = result.affected_rows();
         if modified == 0 {
             // Early return, everything is already stored
@@ -1184,8 +1365,9 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
         }
         let (transaction, cs_to_ids) = if !need_ids.is_empty() {
             // Use the same transaction to make sure we see the new values
-            let (transaction, result) = SelectManyIds::query_with_transaction(
+            let (transaction, result) = SelectManyIds::maybe_traced_query_with_transaction(
                 transaction,
+                cri,
                 &self.repo_id,
                 need_ids.into_iter().collect::<Vec<_>>().as_slice(),
             )
@@ -1228,8 +1410,11 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
             }
         };
 
-        let (transaction, _) = FixEdges::query_with_transaction(
+        let (transaction, _) = FixEdges::maybe_traced_query_with_transaction(
             transaction,
+            cri,
+            // This pattern is used to convert a ref to tuple into a tuple of refs.
+            #[allow(clippy::map_identity)]
             rows.iter()
                 .map(|(a, b, c, d, e, f, g, h, i, j, k)| (a, b, c, d, e, f, g, h, i, j, k))
                 .collect::<Vec<_>>()
@@ -1249,8 +1434,11 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let (transaction, result) = InsertMergeParents::query_with_transaction(
+        let (transaction, result) = InsertMergeParents::maybe_traced_query_with_transaction(
             transaction,
+            cri,
+            // This pattern is used to convert a ref to tuple into a tuple of refs.
+            #[allow(clippy::map_identity)]
             merge_parent_rows
                 .iter()
                 .map(|(a, b, c)| (a, b, c))
@@ -1268,11 +1456,13 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
     }
 
     async fn add(&self, ctx: &CoreContext, edges: ChangesetEdges) -> Result<bool> {
+        let cri = ctx.client_request_info();
         let merge_parent_cs_id_to_id: HashMap<ChangesetId, u64> = if edges.parents.len() >= 2 {
             ctx.perf_counters()
                 .increment_counter(PerfCounterType::SqlReadsReplica);
-            SelectManyIds::query(
+            SelectManyIds::maybe_traced_query(
                 &self.read_connection.conn,
+                cri,
                 &self.repo_id,
                 &edges
                     .parents
@@ -1289,15 +1479,16 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
 
         let transaction = self.write_connection.start_transaction().await?;
 
-        let (transaction, result) = InsertChangeset::query_with_transaction(
+        let (transaction, result) = InsertChangeset::maybe_traced_query_with_transaction(
             transaction,
+            cri,
             &self.repo_id,
             &edges.node.cs_id,
             &edges.node.generation.value(),
             &edges.node.skip_tree_depth,
             &edges.node.p1_linear_depth,
             &edges.parents.len(),
-            &edges.parents.get(0).map(|node| node.cs_id),
+            &edges.parents.first().map(|node| node.cs_id),
             &edges.merge_ancestor.map(|node| node.cs_id),
             &edges.skip_tree_parent.map(|node| node.cs_id),
             &edges.skip_tree_skew_ancestor.map(|node| node.cs_id),
@@ -1323,15 +1514,19 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                let (transaction, result) = InsertMergeParents::query_with_transaction(
-                    transaction,
-                    merge_parent_rows
-                        .iter()
-                        .map(|(a, b, c)| (a, b, c))
-                        .collect::<Vec<_>>()
-                        .as_slice(),
-                )
-                .await?;
+                let (transaction, result) =
+                    InsertMergeParents::maybe_traced_query_with_transaction(
+                        transaction,
+                        cri,
+                        // This pattern is used to convert a ref to tuple into a tuple of refs.
+                        #[allow(clippy::map_identity)]
+                        merge_parent_rows
+                            .iter()
+                            .map(|(a, b, c)| (a, b, c))
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                    )
+                    .await?;
 
                 transaction.commit().await?;
                 ctx.perf_counters()
@@ -1350,6 +1545,7 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
         self.fetch_many_edges(ctx, &[cs_id], Prefetch::None)
             .await?
             .remove(&cs_id)
+            .map(|edges| edges.into())
             .ok_or_else(|| anyhow!("Missing changeset from sql commit graph storage: {}", cs_id))
     }
 
@@ -1361,7 +1557,8 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
         Ok(self
             .maybe_fetch_many_edges(ctx, &[cs_id], Prefetch::None)
             .await?
-            .remove(&cs_id))
+            .remove(&cs_id)
+            .map(|edges| edges.into()))
     }
 
     async fn fetch_many_edges(
@@ -1369,7 +1566,7 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
         ctx: &CoreContext,
         cs_ids: &[ChangesetId],
         prefetch: Prefetch,
-    ) -> Result<HashMap<ChangesetId, ChangesetEdges>> {
+    ) -> Result<HashMap<ChangesetId, FetchedChangesetEdges>> {
         let mut edges = self.maybe_fetch_many_edges(ctx, cs_ids, prefetch).await?;
         let unfetched_ids: Vec<ChangesetId> = cs_ids
             .iter()
@@ -1381,8 +1578,10 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
                 "Missing changesets from sql commit graph storage: {}",
                 unfetched_ids
                     .into_iter()
-                    .map(|id| format!("{}, ", id))
-                    .collect::<String>()
+                    .fold(String::new(), |mut acc, cs_id| {
+                        let _ = write!(acc, "{}, ", cs_id);
+                        acc
+                    })
             );
         }
         Ok(edges)
@@ -1393,7 +1592,7 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
         ctx: &CoreContext,
         cs_ids: &[ChangesetId],
         prefetch: Prefetch,
-    ) -> Result<HashMap<ChangesetId, ChangesetEdges>> {
+    ) -> Result<HashMap<ChangesetId, FetchedChangesetEdges>> {
         ctx.perf_counters()
             .increment_counter(PerfCounterType::SqlReadsReplica);
         let mut edges = self
@@ -1424,8 +1623,9 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
     ) -> Result<ChangesetIdsResolvedFromPrefix> {
         ctx.perf_counters()
             .increment_counter(PerfCounterType::SqlReadsReplica);
-        let mut fetched_ids = SelectChangesetsInRange::query(
+        let fetched_ids = SelectChangesetsInRange::maybe_traced_query(
             &self.read_connection.conn,
+            ctx.client_request_info(),
             &self.repo_id,
             &cs_prefix.min_bound(),
             &cs_prefix.max_bound(),
@@ -1447,12 +1647,15 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
         ctx: &CoreContext,
         cs_id: ChangesetId,
     ) -> Result<Vec<ChangesetId>> {
-        Ok(
-            SelectChildren::query(&self.read_master_connection.conn, &self.repo_id, &cs_id)
-                .await?
-                .into_iter()
-                .map(|(cs_id,)| cs_id)
-                .collect(),
+        Ok(SelectChildren::maybe_traced_query(
+            &self.read_master_connection.conn,
+            ctx.client_request_info(),
+            &self.repo_id,
+            &cs_id,
         )
+        .await?
+        .into_iter()
+        .map(|(cs_id,)| cs_id)
+        .collect())
     }
 }

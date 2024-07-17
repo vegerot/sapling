@@ -11,6 +11,7 @@
 #include <folly/Synchronized.h>
 #include <folly/container/EvictingCacheMap.h>
 #include <memory>
+#include <optional>
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/inodes/InodePtr.h"
 #include "eden/fs/inodes/OverlayFile.h"
@@ -143,7 +144,7 @@ class OverlayFileAccess {
         std::optional<size_t> s,
         const std::optional<Hash20>& sha1,
         const std::optional<Hash32>& blake3 = std::nullopt)
-        : file{std::move(f)}, info{folly::in_place, s, sha1, blake3} {}
+        : file{std::move(f)}, info{std::in_place, s, sha1, blake3} {}
 
     struct Info {
       Info(

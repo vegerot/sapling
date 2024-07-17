@@ -25,8 +25,8 @@ use cmdlib::helpers;
 use cmdlib_x_repo::create_commit_syncers_from_matches;
 use context::CoreContext;
 use context::SessionContainer;
-use cross_repo_sync::validation;
-use cross_repo_sync::validation::BookmarkDiff;
+use cross_repo_sync::find_bookmark_diff;
+use cross_repo_sync::BookmarkDiff;
 use cross_repo_sync::CommitSyncOutcome;
 use cross_repo_sync::CommitSyncer;
 use cross_repo_sync::Repo as CrossRepo;
@@ -39,7 +39,7 @@ use futures::future;
 use futures::TryStreamExt;
 use live_commit_sync_config::CONFIGERATOR_PUSHREDIRECT_ENABLE;
 use mononoke_types::ChangesetId;
-use pushredirect_enable::types::MononokePushRedirectEnable;
+use pushredirect_enable::MononokePushRedirectEnable;
 use scuba_ext::MononokeScubaSampleBuilder;
 use sharding_ext::RepoShard;
 use slog::error;
@@ -355,7 +355,11 @@ async fn loop_forever<M: SyncedCommitMapping + Clone + 'static, R: CrossRepo>(
                 (large_repo_name.to_string(), small_repo_name.to_string()),
             );
         }
-        tokio::time::sleep(Duration::new(1, 0)).await;
+        tokio::time::sleep(Duration::from_millis(justknobs::get_as::<u64>(
+            "scm/mononoke:bookmarks_validator_sleep_ms",
+            None,
+        )?))
+        .await;
     }
 }
 
@@ -377,7 +381,7 @@ async fn validate<M: SyncedCommitMapping + Clone + 'static, R: CrossRepo>(
     small_repo_name: &str,
 ) -> Result<(), ValidationError> {
     let commit_syncer = &syncers.small_to_large;
-    let diffs = validation::find_bookmark_diff(ctx.clone(), commit_syncer).await?;
+    let diffs = find_bookmark_diff(ctx.clone(), commit_syncer).await?;
 
     info!(ctx.logger(), "got {} bookmark diffs", diffs.len());
     for diff in diffs {
@@ -405,7 +409,8 @@ async fn validate<M: SyncedCommitMapping + Clone + 'static, R: CrossRepo>(
 
         // Check that large_bookmark actually pointed to a commit equivalent to small_cs_id
         // not so long ago.
-        let max_log_records: u32 = 100;
+        let max_log_records =
+            justknobs::get_as::<u32>("scm/mononoke:bookmarks_validator_max_log_records", None)?;
         let max_delay_secs: u32 = 300;
         let in_history = check_large_bookmark_history(
             ctx,
@@ -458,58 +463,57 @@ async fn check_large_bookmark_history<M: SyncedCommitMapping + Clone + 'static, 
         .try_collect()
         .await?;
 
-    // check_large_bookmark_history is called after current value of large bookmark (i.e.
-    // maybe_large_cs_id) was fetched. That means that log_entries might contain newer bookmark
-    // update log entries, so let's remove all the bookmark update log entries that are newer than
-    // maybe_large_cs_id.
-    let log_entries = log_entries
+    let maybe_large_bookmark_log_entry = log_entries
+        .iter()
+        .find(|(_, book_val, _, _)| book_val == maybe_large_cs_id);
+
+    let large_bookmark_timestamp = match maybe_large_bookmark_log_entry {
+        Some((_, _, _, timestamp)) => timestamp,
+        // We can't find the large bookmark in bookmark update log.
+        None => return Ok(false),
+    };
+
+    // Remap large repo commits into small repo commits
+    // Note that in theory it's possible to map a small repo commit into a large repo and compare
+    // only this remapped commit with the log of the large bookmark. However it doesn't work well
+    // in practice - if two small repos are tailed into a large repo and one small repo is has
+    // much more commits than the other, then latest max_log_records in the large repo might be
+    // from the more active source repo. Hence check_large_bookmark_history might return 'false'
+    // for the less active repo.
+    let remapped_log_entries = log_entries
+        .iter()
+        .map(|(_, book_val, _, timestamp)| async move {
+            let res: Result<_, Error> =
+                match book_val {
+                    Some(large_cs_id) => {
+                        let maybe_remapped_cs_id = remap(ctx, large_to_small, large_cs_id).await?;
+                        Ok(maybe_remapped_cs_id
+                            .map(|remapped_cs_id| (Some(remapped_cs_id), timestamp)))
+                    }
+                    None => Ok(Some((None, timestamp))),
+                };
+            res
+        });
+
+    let remapped_log_entries = future::try_join_all(remapped_log_entries).await?;
+
+    let maybe_log_entry = remapped_log_entries
         .into_iter()
-        .skip_while(|(_, book_val, _, _)| book_val != maybe_large_cs_id)
-        .collect::<Vec<_>>();
-    if log_entries.is_empty() {
-        // We can't find the value of large bookmark in bookmark update log.
-        return Ok(false);
+        .filter_map(std::convert::identity)
+        .find(|(maybe_remapped_cs_id, timestamp)| {
+            // Delay is measured from the large bookmark entry in the large repo bookmark update log.
+            // This log entry could be more recent than the entry pointing to large_bookmark, in which
+            // case the delay would be negative and the condition would evaluate to true. This is fine
+            // as we only want to exclude entries that are too old.
+            let delay =
+                large_bookmark_timestamp.timestamp_seconds() - timestamp.timestamp_seconds();
+            (maybe_remapped_cs_id == maybe_small_cs_id) && (delay < max_delay_secs as i64)
+        });
+
+    if maybe_log_entry.is_some() {
+        return Ok(true);
     }
 
-    if let Some((_, _, _, latest_timestamp)) = log_entries.get(0) {
-        // Remap large repo commits into small repo commits
-        // Note that in theory it's possible to map a small repo commit into a large repo and compare
-        // only this remapped commit with the log of the large bookmark. However it doesn't work well
-        // in practice - if two small repos are tailed into a large repo and one small repo is has
-        // much more commits than the other, then latest max_log_records in the large repo might be
-        // from the more active source repo. Hence check_large_bookmark_history might return 'false'
-        // for the less active repo.
-        let remapped_log_entries =
-            log_entries
-                .iter()
-                .map(|(_, book_val, _, timestamp)| async move {
-                    let res: Result<_, Error> = match book_val {
-                        Some(large_cs_id) => {
-                            let maybe_remapped_cs_id =
-                                remap(ctx, large_to_small, large_cs_id).await?;
-                            Ok(maybe_remapped_cs_id
-                                .map(|remapped_cs_id| (Some(remapped_cs_id), timestamp)))
-                        }
-                        None => Ok(Some((None, timestamp))),
-                    };
-                    res
-                });
-
-        let remapped_log_entries = future::try_join_all(remapped_log_entries).await?;
-
-        let maybe_log_entry = remapped_log_entries
-            .into_iter()
-            .filter_map(std::convert::identity)
-            .find(|(maybe_remapped_cs_id, timestamp)| {
-                // Delay is measured from the latest entry in the large repo bookmark update log
-                let delay = latest_timestamp.timestamp_seconds() - timestamp.timestamp_seconds();
-                (maybe_remapped_cs_id == maybe_small_cs_id) && (delay < max_delay_secs as i64)
-            });
-
-        if maybe_log_entry.is_some() {
-            return Ok(true);
-        }
-    }
     // We haven't found an entry with the same id - check that bookmark might have
     // been created recently
     let was_created = log_entries.len() < (max_log_records as usize);

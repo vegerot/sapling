@@ -1,6 +1,5 @@
-#debugruntest-compatible
 
-#require no-icasefs
+#require no-icasefs no-eden
 
   $ eagerepo
 test file addition with colliding case

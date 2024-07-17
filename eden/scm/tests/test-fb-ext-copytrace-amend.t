@@ -1,18 +1,12 @@
+#debugruntest-incompatible
 (debugruntest fails under buck for some reason)
 #chg-compatible
 
   $ configure mutation-norecord
-  $ enable amend copytrace rebase shelve
-  $ setconfig experimental.copytrace=off
-
-  $ initclient() {
-  >   setconfig copytrace.remote=false copytrace.enablefilldb=true
-  >   setconfig experimental.copytrace=off
-  > }
+  $ enable amend rebase shelve
 
 Test amend copytrace
   $ hg init repo
-  $ initclient repo
   $ cd repo
   $ echo x > x
   $ hg add x
@@ -44,7 +38,6 @@ Test amend copytrace
 
 Test amend copytrace with multiple stacked commits
   $ hg init repo
-  $ initclient repo
   $ cd repo
   $ echo x > x
   $ hg add x
@@ -88,7 +81,6 @@ Test amend copytrace with multiple stacked commits
 
 Test amend copytrace with multiple renames of the same file
   $ hg init repo
-  $ initclient repo
   $ cd repo
   $ echo x > x
   $ hg add x
@@ -117,7 +109,6 @@ Test amend copytrace with multiple renames of the same file
 
 Test amend copytrace with copies
   $ hg init repo
-  $ initclient repo
   $ cd repo
   $ echo x > x
   $ hg add x
@@ -142,22 +133,24 @@ Test amend copytrace with copies
   $ hg amend
   $ hg rebase --restack
   rebasing 6938f0d82b23 "mod a"
+  merging b and a to b
+  merging c and a to c
   rebasing df8dfcb1d237 "mod i" (test-top)
+  merging j and i to j
   $ hg up test-top
-  2 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  5 files updated, 0 files merged, 0 files removed, 0 files unresolved
   (activating bookmark test-top)
   $ cat a b c i j
   b
-  a
-  a
+  b
+  b
   j
-  i
+  j
   $ cd ..
   $ rm -rf repo
 
 Test rebase after amend deletion of copy
   $ hg init repo
-  $ initclient repo
   $ cd repo
   $ echo x > x
   $ hg add x
@@ -181,7 +174,6 @@ Test rebase after amend deletion of copy
 
 Test failure to rebase deletion after rename
   $ hg init repo
-  $ initclient repo
   $ cd repo
   $ echo x > x
   $ hg add x
@@ -203,8 +195,6 @@ Test failure to rebase deletion after rename
   merging b and a to b
   rebasing ba0395f0e180 "delete a"
   local [dest] changed b which other [source] deleted (as a)
-  hint: if this message is due to a moved file, you can ask mercurial to attempt to automatically resolve this change by re-running with the --config=experimental.copytrace=on flag, but this will significantly slow down the operation, so you will need to be patient.
-  Source control team is working on fixing this problem.
   use (c)hanged version, (d)elete, or leave (u)nresolved? u
   unresolved conflicts (see hg resolve, then hg rebase --continue)
   [1]
@@ -219,7 +209,6 @@ Test amend copytrace can be disabled
   > enableamendcopytrace=false
   > EOF
   $ hg init repo
-  $ initclient repo
   $ cd repo
   $ echo x > x
   $ hg add x

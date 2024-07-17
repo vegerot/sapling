@@ -5,12 +5,14 @@
  * GNU General Public License version 2.
  */
 
-use std::cmp::min;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::iter::zip;
 use std::sync::Arc;
 
 use anyhow::Result;
+use async_runtime::block_in_place;
+use async_runtime::spawn_blocking;
 use async_trait::async_trait;
 use configmodel::Config;
 use configmodel::ConfigExt;
@@ -18,32 +20,27 @@ use dag::Vertex;
 use hg_metrics::increment_counter;
 use lru_cache::LruCache;
 use manifest::DiffType;
+use manifest::FileType;
 use manifest::Manifest;
 use manifest_tree::Diff;
 use manifest_tree::TreeManifest;
 use parking_lot::Mutex;
 use pathmatcher::AlwaysMatcher;
-use storemodel::futures::StreamExt;
-use storemodel::ReadFileContents;
+use pathmatcher::Matcher;
+use storemodel::FileStore;
+use types::fetch_mode::FetchMode;
 use types::Key;
 use types::RepoPath;
 use types::RepoPathBuf;
-use xdiff::edit_cost;
 
 use crate::error::CopyTraceError;
+use crate::utils::compute_missing_files;
 use crate::utils::file_path_similarity;
+use crate::utils::is_content_similar;
 use crate::SearchDirection;
 
 /// Maximum rename candidate files to check
-const DEFAULT_MAX_RENAME_CANDIDATES: usize = 10;
-/// Content similarity threhold for rename detection. The definition of "similarity"
-/// between file a and file b is: (len(a.lines()) - edit_cost(a, b)) / len(a.lines())
-///   * 1.0 means exact match
-///   * 0.0 means not match at all
-/// The default value is 0.8.
-const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.8;
-/// Maximum rename edit cost determines whether we treat two files as a rename
-const DEFAULT_MAX_EDIT_COST: u64 = 1000;
+const DEFAULT_MAX_RENAME_CANDIDATES: usize = 1000;
 /// Control if MetadataRenameFinder fallbacks to content similarity finder
 const DEFAULT_FALLBACK_TO_CONTENT_SIMILARITY: bool = false;
 /// Default Rename cache size
@@ -70,6 +67,14 @@ pub trait RenameFinder {
         new_path: &RepoPath,
         new_vertex: &Vertex,
     ) -> Result<Option<RepoPathBuf>>;
+
+    /// Find {x@new_tree: y@old_tree} rename mapping for directed compare
+    async fn find_renames(
+        &self,
+        old_tree: &TreeManifest,
+        new_tree: &TreeManifest,
+        matcher: Option<Arc<dyn Matcher + Send + Sync>>,
+    ) -> Result<HashMap<RepoPathBuf, RepoPathBuf>>;
 }
 
 /// Rename finder based on the copy information in the file header metadata
@@ -86,7 +91,7 @@ pub struct ContentSimilarityRenameFinder {
 /// It is introduced for code reuse between those two file based rename finders.
 struct RenameFinderInner {
     // Read content and rename metadata of a file
-    file_reader: Arc<dyn ReadFileContents<Error = anyhow::Error> + Send + Sync>,
+    file_reader: Arc<dyn FileStore>,
     // Read configs
     config: Arc<dyn Config + Send + Sync>,
     // Dir move caused rename candidates
@@ -97,7 +102,7 @@ type CacheKey = (Vertex, RepoPathBuf);
 
 impl MetadataRenameFinder {
     pub fn new(
-        file_reader: Arc<dyn ReadFileContents<Error = anyhow::Error> + Send + Sync>,
+        file_reader: Arc<dyn FileStore>,
         config: Arc<dyn Config + Send + Sync>,
     ) -> Result<Self> {
         let cache_size = get_rename_cache_size(&config)?;
@@ -137,7 +142,11 @@ impl RenameFinder for MetadataRenameFinder {
         }
 
         // fallback to content similarity
-        let old_path_key = self.inner.get_key_from_path(old_tree, old_path)?;
+        let old_path_key = match self.inner.get_key_from_path(old_tree, old_path)? {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
         let found = self
             .inner
             .find_similar_file(candidates, old_path_key)
@@ -153,7 +162,10 @@ impl RenameFinder for MetadataRenameFinder {
         new_path: &RepoPath,
         new_vertex: &Vertex,
     ) -> Result<Option<RepoPathBuf>> {
-        let new_key = self.inner.get_key_from_path(new_tree, new_path)?;
+        let new_key = match self.inner.get_key_from_path(new_tree, new_path)? {
+            Some(k) => k,
+            None => return Ok(None),
+        };
         let found = self
             .inner
             .read_renamed_metadata_backward(new_key.clone())
@@ -175,11 +187,38 @@ impl RenameFinder for MetadataRenameFinder {
         emit_content_similarity_fallback_metric(found.is_some());
         Ok(found)
     }
+
+    async fn find_renames(
+        &self,
+        old_tree: &TreeManifest,
+        new_tree: &TreeManifest,
+        matcher: Option<Arc<dyn Matcher + Send + Sync>>,
+    ) -> Result<HashMap<RepoPathBuf, RepoPathBuf>> {
+        let missing = compute_missing_files(old_tree, new_tree, matcher, None)?;
+        tracing::trace!(missing_len = missing.len(), " find_renames");
+        let keys: Vec<_> = missing
+            .into_iter()
+            .filter_map(|p| match self.inner.get_key_from_path(new_tree, &p) {
+                Ok(Some(k)) => Some(k),
+                _ => None,
+            })
+            .collect();
+        tracing::trace!(keys_len = keys.len(), " find_renames");
+        block_in_place(move || {
+            let renames = self.inner.file_reader.get_rename_iter(keys)?;
+            let renames = renames
+                .filter_map(|x| x.ok())
+                .filter(|(_, v)| old_tree.contains_file(&v.path).unwrap_or(false))
+                .map(|(k, v)| (k.path, v.path))
+                .collect();
+            Ok(renames)
+        })
+    }
 }
 
 impl ContentSimilarityRenameFinder {
     pub fn new(
-        file_reader: Arc<dyn ReadFileContents<Error = anyhow::Error> + Send + Sync>,
+        file_reader: Arc<dyn FileStore>,
         config: Arc<dyn Config + Send + Sync>,
     ) -> Result<Self> {
         let cache_size = get_rename_cache_size(&config)?;
@@ -229,6 +268,42 @@ impl RenameFinder for ContentSimilarityRenameFinder {
             )
             .await
     }
+
+    async fn find_renames(
+        &self,
+        old_tree: &TreeManifest,
+        new_tree: &TreeManifest,
+        matcher: Option<Arc<dyn Matcher + Send + Sync>>,
+    ) -> Result<HashMap<RepoPathBuf, RepoPathBuf>> {
+        let (mut added, mut deleted) = self
+            .inner
+            .get_added_and_deleted_files(old_tree, new_tree, matcher)?;
+        tracing::trace!(
+            added_len = added.len(),
+            deleted_len = deleted.len(),
+            " find_renames"
+        );
+        let batch_mv_candidates = detect_batch_move(&mut added, &mut deleted);
+        let mut renames = HashMap::new();
+        if batch_mv_candidates.is_empty() {
+            for to in added {
+                let candidates =
+                    select_rename_candidates(deleted.clone(), &to.path, &self.inner.config)?;
+                let renamed_path = self.inner.find_similar_file(candidates, to.clone()).await;
+                if let Ok(Some(p)) = renamed_path {
+                    renames.insert(to.path, p);
+                }
+            }
+        } else {
+            for (to, from) in batch_mv_candidates {
+                let renamed_path = self.inner.find_similar_file(vec![from], to.clone()).await;
+                if let Ok(Some(p)) = renamed_path {
+                    renames.insert(to.path, p);
+                }
+            }
+        }
+        Ok(renames)
+    }
 }
 
 impl RenameFinderInner {
@@ -249,7 +324,7 @@ impl RenameFinderInner {
         }
 
         let (mut added_files, mut deleted_files) =
-            self.get_added_and_deleted_files(old_tree, new_tree)?;
+            self.get_added_and_deleted_files(old_tree, new_tree, None)?;
         let batch_mv_candidates = detect_batch_move(&mut added_files, &mut deleted_files);
 
         if batch_mv_candidates.is_empty() {
@@ -291,29 +366,44 @@ impl RenameFinderInner {
         &self,
         old_tree: &TreeManifest,
         new_tree: &TreeManifest,
+        matcher: Option<Arc<dyn Matcher + Send + Sync>>,
     ) -> Result<(Vec<Key>, Vec<Key>)> {
         let mut added_files = Vec::new();
         let mut deleted_files = Vec::new();
-        let matcher = AlwaysMatcher::new();
+        let matcher = matcher.unwrap_or_else(|| Arc::new(AlwaysMatcher::new()));
         let diff = Diff::new(old_tree, new_tree, &matcher)?;
         for entry in diff {
             let entry = entry?;
             match entry.diff_type {
                 DiffType::RightOnly(file_metadata) => {
-                    let path = entry.path;
-                    let key = Key {
-                        path,
-                        hgid: file_metadata.hgid,
-                    };
-                    added_files.push(key);
+                    tracing::trace!(
+                        path = ?entry.path,
+                        file_type = ?file_metadata.file_type,
+                        " get_added_and_deleted_files"
+                    );
+                    if is_file_type_supported(&file_metadata.file_type) {
+                        let path = entry.path;
+                        let key = Key {
+                            path,
+                            hgid: file_metadata.hgid,
+                        };
+                        added_files.push(key);
+                    }
                 }
                 DiffType::LeftOnly(file_metadata) => {
-                    let path = entry.path;
-                    let key = Key {
-                        path,
-                        hgid: file_metadata.hgid,
-                    };
-                    deleted_files.push(key);
+                    tracing::trace!(
+                        path = ?entry.path,
+                        file_type = ?file_metadata.file_type,
+                        " get_added_and_deleted_files"
+                    );
+                    if is_file_type_supported(&file_metadata.file_type) {
+                        let path = entry.path;
+                        let key = Key {
+                            path,
+                            hgid: file_metadata.hgid,
+                        };
+                        deleted_files.push(key);
+                    }
                 }
                 _ => {}
             }
@@ -327,25 +417,32 @@ impl RenameFinderInner {
         old_path: &RepoPath,
     ) -> Result<Option<RepoPathBuf>> {
         tracing::trace!(keys_len = keys.len(), " read_renamed_metadata_forward");
-        let mut renames = self.file_reader.read_rename_metadata(keys).await;
-        while let Some(rename) = renames.next().await {
-            let (key, rename_from_key) = rename?;
-            if let Some(rename_from_key) = rename_from_key {
-                if rename_from_key.path.as_repo_path() == old_path {
-                    return Ok(Some(key.path));
+        block_in_place(move || {
+            // the ordering of the result of `get_rename_iter()` can be different than `keys`
+            let renames = self.file_reader.get_rename_iter(keys.clone())?;
+            let rename_map: HashMap<_, _> = renames.filter_map(|x| x.ok()).collect();
+            for key in keys {
+                let rename_from_key = rename_map.get(&key);
+                if let Some(rename_from_key) = rename_from_key {
+                    if rename_from_key.path.as_repo_path() == old_path {
+                        return Ok(Some(key.path));
+                    }
                 }
             }
-        }
-        Ok(None)
+            Ok(None)
+        })
     }
 
     async fn read_renamed_metadata_backward(&self, key: Key) -> Result<Option<RepoPathBuf>> {
-        let mut renames = self.file_reader.read_rename_metadata(vec![key]).await;
-        if let Some(rename) = renames.next().await {
-            let (_, rename_from_key) = rename?;
-            return Ok(rename_from_key.map(|k| k.path));
-        }
-        Ok(None)
+        block_in_place(move || {
+            let mut renames = self.file_reader.get_rename_iter(vec![key])?;
+            if let Some(rename) = renames.next() {
+                let (_, rename_from_key) = rename?;
+                Ok(Some(rename_from_key.path))
+            } else {
+                Ok(None)
+            }
+        })
     }
 
     async fn find_rename_in_direction(
@@ -367,8 +464,10 @@ impl RenameFinderInner {
             SearchDirection::Forward => old_tree,
             SearchDirection::Backward => new_tree,
         };
-        let source = self.get_key_from_path(source_tree, source_path)?;
-
+        let source = match self.get_key_from_path(source_tree, source_path)? {
+            Some(source) => source,
+            None => return Ok(None),
+        };
         self.find_similar_file(candidates, source).await
     }
 
@@ -377,66 +476,48 @@ impl RenameFinderInner {
         keys: Vec<Key>,
         source_key: Key,
     ) -> Result<Option<RepoPathBuf>> {
-        let mut source = self
-            .file_reader
-            .read_file_contents(vec![source_key.clone()])
-            .await;
-        let source_content = match source.next().await {
-            None => return Err(CopyTraceError::FileNotFound(source_key.path).into()),
-            Some(content_and_key) => content_and_key?.0,
-        };
+        let source_content = spawn_blocking({
+            let path = source_key.path.clone();
+            let reader = self.file_reader.clone();
+            move || reader.get_content(&path, source_key.hgid, FetchMode::AllowRemote)
+        })
+        .await??;
 
-        let config_percentage = self.get_similarity_threshold()?;
-        let config_max_edit_cost = self.get_max_edit_cost()?;
-        let lines = source_content.iter().filter(|&&c| c == b'\n').count();
-        let max_edit_cost = min(
-            (lines as f32 * (1.0 - config_percentage)).round() as u64,
-            config_max_edit_cost,
-        );
-        tracing::trace!(
-            ?config_percentage,
-            ?config_max_edit_cost,
-            ?lines,
-            ?max_edit_cost,
-            " content similarity configs"
-        );
-
-        let mut candidates = self.file_reader.read_file_contents(keys).await;
-        while let Some(candidate) = candidates.next().await {
-            let (candidate_content, k) = candidate?;
-            if edit_cost(&source_content, &candidate_content, max_edit_cost + 1) <= max_edit_cost {
-                return Ok(Some(k.path));
+        block_in_place(move || {
+            let iter = self
+                .file_reader
+                .get_content_iter(keys, FetchMode::AllowRemote)?;
+            for entry in iter {
+                let (k, candidate_content) = entry?;
+                if is_content_similar(&source_content, &candidate_content, &self.config)? {
+                    return Ok(Some(k.path));
+                }
             }
-        }
-
-        Ok(None)
+            Ok(None)
+        })
     }
 
-    fn get_key_from_path(&self, tree: &TreeManifest, path: &RepoPath) -> Result<Key> {
+    fn get_key_from_path(&self, tree: &TreeManifest, path: &RepoPath) -> Result<Option<Key>> {
         let key = match tree.get_file(path)? {
             None => return Err(CopyTraceError::FileNotFound(path.to_owned()).into()),
-            Some(file_metadata) => Key {
-                path: path.to_owned(),
-                hgid: file_metadata.hgid,
-            },
+            Some(file_metadata) => {
+                tracing::trace!(
+                    ?path,
+                    file_type = ?file_metadata.file_type,
+                    " get_key_from_path"
+                );
+                if is_file_type_supported(&file_metadata.file_type) {
+                    let key = Key {
+                        path: path.to_owned(),
+                        hgid: file_metadata.hgid,
+                    };
+                    Some(key)
+                } else {
+                    None
+                }
+            }
         };
         Ok(key)
-    }
-
-    fn get_similarity_threshold(&self) -> Result<f32> {
-        let v = self
-            .config
-            .get_opt::<f32>("copytrace", "similarity-threshold")?
-            .unwrap_or(DEFAULT_SIMILARITY_THRESHOLD);
-        Ok(v)
-    }
-
-    fn get_max_edit_cost(&self) -> Result<u64> {
-        let v = self
-            .config
-            .get_opt::<u64>("copytrace", "max-edit-cost")?
-            .unwrap_or(DEFAULT_MAX_EDIT_COST);
-        Ok(v)
     }
 
     fn get_fallback_to_content_similarity(&self) -> Result<bool> {
@@ -460,7 +541,7 @@ fn select_rename_candidates(
     // is a copy of the old_path.
     candidates.sort_by_key(|k| {
         let path = k.path.as_repo_path();
-        let score = file_path_similarity(path, source_path);
+        let score = (file_path_similarity(path, source_path) * 1000.0) as i32;
         (-score, path.to_owned())
     });
     let max_rename_candidates = config
@@ -530,6 +611,15 @@ fn emit_content_similarity_fallback_metric(is_found: bool) {
         "copytrace_content_similarity_fallback_failure"
     };
     increment_counter(metric, 1);
+}
+
+fn is_file_type_supported(file_type: &FileType) -> bool {
+    match file_type {
+        FileType::Regular => true,
+        FileType::Symlink => true,
+        FileType::Executable => true,
+        FileType::GitSubmodule => false,
+    }
 }
 
 #[cfg(test)]

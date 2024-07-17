@@ -6,8 +6,10 @@
  */
 
 import {findParentWithClassName} from './utils';
+import {getZoomLevel} from './zoom';
+import {Icon} from 'isl-components/Icon';
+import {atom, useAtom, useSetAtom} from 'jotai';
 import {useEffect, useRef, useState} from 'react';
-import {atom, useRecoilState, useSetRecoilState} from 'recoil';
 
 import './ContextMenu.css';
 
@@ -27,9 +29,14 @@ import './ContextMenu.css';
 export function useContextMenu<T>(
   creator: () => Array<ContextMenuItem>,
 ): React.MouseEventHandler<T> {
-  const setState = useSetRecoilState(contextMenuState);
+  const setState = useSetAtom(contextMenuState);
   return e => {
-    setState({x: e.clientX, y: e.clientY, items: creator()});
+    const zoom = getZoomLevel();
+    const items = creator();
+    if (items.length === 0) {
+      return;
+    }
+    setState({x: e.clientX / zoom, y: e.clientY / zoom, items});
 
     e.preventDefault();
     e.stopPropagation();
@@ -39,18 +46,17 @@ export function useContextMenu<T>(
 type ContextMenuData = {x: number; y: number; items: Array<ContextMenuItem>};
 export type ContextMenuItem =
   | {type?: undefined; label: string | React.ReactNode; onClick?: () => void}
+  | {
+      type: 'submenu';
+      label: string | React.ReactNode;
+      children: Array<ContextMenuItem>;
+    }
   | {type: 'divider'};
 
-const contextMenuState = atom<null | ContextMenuData>({
-  key: 'contextMenuState',
-  default: null,
-});
+const contextMenuState = atom<null | ContextMenuData>(null);
 
 export function ContextMenus() {
-  const [state, setState] = useRecoilState(contextMenuState);
-
-  // after you click on an item, flash it as selected, then fade out tooltip
-  const [acceptedSuggestion, setAcceptedSuggestion] = useState<null | number>(null);
+  const [state, setState] = useAtom(contextMenuState);
 
   const ref = useRef<HTMLDivElement>(null);
 
@@ -87,8 +93,9 @@ export function ContextMenus() {
     return null;
   }
 
-  const topOrBottom = state.y > window.innerHeight / 2 ? 'bottom' : 'top';
-  const leftOrRight = state.x > window.innerWidth / 2 ? 'right' : 'left';
+  const zoom = getZoomLevel();
+  const topOrBottom = state.y > window.innerHeight / zoom / 2 ? 'bottom' : 'top';
+  const leftOrRight = state.x > window.innerWidth / zoom / 2 ? 'right' : 'left';
   const yOffset = 10;
   const xOffset = -10; // var(--pad)
   let position: React.CSSProperties;
@@ -96,29 +103,27 @@ export function ContextMenus() {
     if (leftOrRight === 'left') {
       position = {top: state.y + yOffset, left: state.x + xOffset};
     } else {
-      position = {top: state.y + yOffset, right: window.innerWidth - (state.x - xOffset)};
+      position = {top: state.y + yOffset, right: window.innerWidth / zoom - (state.x - xOffset)};
     }
   } else {
     if (leftOrRight === 'left') {
-      position = {bottom: window.innerHeight - (state.y - yOffset), left: state.x + xOffset};
+      position = {bottom: window.innerHeight / zoom - (state.y - yOffset), left: state.x + xOffset};
     } else {
       position = {
-        bottom: window.innerHeight - (state.y - yOffset),
-        right: window.innerWidth - (state.x + xOffset),
+        bottom: window.innerHeight / zoom - (state.y - yOffset),
+        right: window.innerWidth / zoom - (state.x + xOffset),
       };
     }
   }
   position.maxHeight =
-    window.innerHeight -
+    window.innerHeight / zoom -
     ((position.top as number | null) ?? 0) -
     ((position.bottom as number | null) ?? 0);
 
   return (
     <div
       ref={ref}
-      className={
-        'context-menu-container' + (acceptedSuggestion != null ? ' context-menu-fadeout' : '')
-      }
+      className={'context-menu-container'}
       data-testid="context-menu-container"
       style={position}>
       {topOrBottom === 'top' ? (
@@ -126,37 +131,19 @@ export function ContextMenus() {
           className={`context-menu-arrow context-menu-arrow-top context-menu-arrow-${leftOrRight}`}
         />
       ) : null}
-      <div className="context-menu">
-        {state.items.map((item, i) =>
-          item.type === 'divider' ? (
-            <div className="context-menu-divider" key={i} />
-          ) : (
-            <div
-              key={i}
-              onClick={
-                // don't allow double-clicking to run the action twice
-                acceptedSuggestion != null
-                  ? undefined
-                  : () => {
-                      item.onClick?.();
-                      setAcceptedSuggestion(i);
-                      setTimeout(() => {
-                        setState(null);
-                        setAcceptedSuggestion(null);
-                      }, 300);
-                    }
-              }
-              className={
-                'context-menu-item' +
-                (acceptedSuggestion != null && acceptedSuggestion === i
-                  ? ' context-menu-item-selected'
-                  : '')
-              }>
-              {item.label}
-            </div>
-          ),
-        )}
-      </div>
+      <ContextMenuList
+        items={state.items}
+        clickItem={item => {
+          if (item.type != null) {
+            return;
+          }
+          // don't allow double-clicking to run the action twice
+          if (state != null) {
+            item.onClick?.();
+            setState(null);
+          }
+        }}
+      />
 
       {topOrBottom === 'bottom' ? (
         <div
@@ -164,5 +151,72 @@ export function ContextMenus() {
         />
       ) : null}
     </div>
+  );
+}
+
+function ContextMenuList({
+  items,
+  clickItem,
+}: {
+  items: Array<ContextMenuItem>;
+  clickItem: (item: ContextMenuItem) => void;
+}) {
+  // Each ContextMenuList renders one additional layer of submenu
+  const [submenuNavigation, setSubmenuNavigation] = useState<
+    {x: number; y: number; children: Array<ContextMenuItem>} | undefined
+  >(undefined);
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  return (
+    <>
+      <div className="context-menu" ref={ref}>
+        {items.map((item, i) =>
+          item.type === 'divider' ? (
+            <div className="context-menu-divider" key={i} />
+          ) : item.type === 'submenu' ? (
+            <div
+              key={i}
+              className={'context-menu-item context-menu-submenu'}
+              onPointerEnter={e => {
+                const target = e.currentTarget as HTMLElement;
+                const parent = ref.current;
+                if (!parent) {
+                  return;
+                }
+                const parentRect = parent?.getBoundingClientRect();
+                const rect = target.getBoundingClientRect();
+                // attach to top right corner
+                const x = -1 * parentRect.left + rect.right;
+                const y = -1 * parentRect.top + rect.top;
+                setSubmenuNavigation({
+                  x,
+                  y,
+                  children: item.children,
+                });
+              }}>
+              <span>{item.label}</span>
+              <Icon icon="chevron-right" />
+            </div>
+          ) : (
+            <div
+              key={i}
+              onPointerEnter={() => setSubmenuNavigation(undefined)}
+              onClick={() => {
+                clickItem(item);
+              }}
+              className={'context-menu-item'}>
+              {item.label}
+            </div>
+          ),
+        )}
+      </div>
+      {submenuNavigation != null && (
+        <div
+          className="context-menu-submenu-navigation"
+          style={{position: 'absolute', top: submenuNavigation.y, left: submenuNavigation.x}}>
+          <ContextMenuList items={submenuNavigation.children} clickItem={clickItem} />
+        </div>
+      )}
+    </>
   );
 }

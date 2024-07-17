@@ -6,48 +6,46 @@
  */
 
 import type {Result} from '../types';
-import type {MutableRefObject} from 'react';
+import type {RefObject} from 'react';
 import type {Comparison} from 'shared/Comparison';
 
-import {ErrorNotice} from '../ErrorNotice';
 import {Internal} from '../Internal';
-import {Tooltip} from '../Tooltip';
 import {tracker} from '../analytics';
 import {useFeatureFlagSync} from '../featureFlags';
 import {T, t} from '../i18n';
+import {atomFamilyWeak, atomLoadableWithRefresh, readAtom} from '../jotaiUtils';
 import {uncommittedChangesWithPreviews} from '../previews';
 import {commitByHash} from '../serverAPIState';
-import {commitInfoViewCurrentCommits, commitMode, editedCommitMessages} from './CommitInfoState';
-import {getInnerTextareaForVSCodeTextArea} from './utils';
-import {VSCodeButton, VSCodeTextArea} from '@vscode/webview-ui-toolkit/react';
 import {
-  atomFamily,
-  selectorFamily,
-  useRecoilCallback,
-  useRecoilRefresher_UNSTABLE,
-  useRecoilValue,
-  useRecoilValueLoadable,
-  useSetRecoilState,
-} from 'recoil';
+  commitInfoViewCurrentCommits,
+  commitMode,
+  latestCommitMessageFieldsWithEdits,
+} from './CommitInfoState';
+import {Button} from 'isl-components/Button';
+import {ErrorNotice} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {TextArea} from 'isl-components/TextArea';
+import {Tooltip} from 'isl-components/Tooltip';
+import {atom, useAtom, useAtomValue, useSetAtom} from 'jotai';
+import {useCallback} from 'react';
 import {ComparisonType} from 'shared/Comparison';
-import {Icon} from 'shared/Icon';
 import {useThrottledEffect} from 'shared/hooks';
-import {randomId, unwrap} from 'shared/utils';
+import {randomId, nullthrows} from 'shared/utils';
 
 import './GenerateWithAI.css';
 
 /** Either a commit hash or "commit/aaaaa" when making a new commit on top of hash aaaaa  */
 type HashKey = `commit/${string}` | string;
 
-export function GenerateAICommitMesageButton({
+export function GenerateAICommitMessageButton({
   textAreaRef,
   appendToTextArea,
 }: {
-  textAreaRef: MutableRefObject<unknown>;
+  textAreaRef: RefObject<HTMLTextAreaElement>;
   appendToTextArea: (toAdd: string) => unknown;
 }) {
-  const currentCommit = useRecoilValue(commitInfoViewCurrentCommits)?.[0];
-  const mode = useRecoilValue(commitMode);
+  const currentCommit = useAtomValue(commitInfoViewCurrentCommits)?.[0];
+  const mode = useAtomValue(commitMode);
   const featureEnabled = useFeatureFlagSync(Internal.featureFlags?.GeneratedAICommitMessages);
 
   const hashKey: HashKey | undefined =
@@ -67,19 +65,15 @@ export function GenerateAICommitMesageButton({
     [hashKey, featureEnabled],
   );
 
-  const onDismiss = useRecoilCallback(
-    ({snapshot}) =>
-      () => {
-        if (hashKey != null) {
-          const hasAcceptedState = snapshot.getLoadable(hasAcceptedAIMessageSuggestion(hashKey));
-          if (hasAcceptedState.valueMaybe() === true) {
-            return;
-          }
-          FunnelTracker.get(hashKey)?.track(GeneratedMessageTrackEventName.Dismiss);
-        }
-      },
-    [hashKey],
-  );
+  const onDismiss = useCallback(() => {
+    if (hashKey != null) {
+      const hasAcceptedState = readAtom(hasAcceptedAIMessageSuggestion(hashKey));
+      if (hasAcceptedState === true) {
+        return;
+      }
+      FunnelTracker.get(hashKey)?.track(GeneratedMessageTrackEventName.Dismiss);
+    }
+  }, [hashKey]);
 
   if (hashKey == null || !featureEnabled) {
     return null;
@@ -93,15 +87,15 @@ export function GenerateAICommitMesageButton({
           <GenerateAICommitMessageModal
             dismiss={dismiss}
             hashKey={hashKey}
-            textArea={getInnerTextareaForVSCodeTextArea(textAreaRef.current as HTMLElement)}
+            textArea={textAreaRef.current}
             appendToTextArea={appendToTextArea}
           />
         )}
         onDismiss={onDismiss}
         title={t('Generate a commit message suggestion with AI')}>
-        <VSCodeButton appearance="icon" data-testid="generate-commit-message-button">
+        <Button icon data-testid="generate-commit-message-button">
           <Icon icon="sparkle" />
-        </VSCodeButton>
+        </Button>
       </Tooltip>
     </span>
   );
@@ -113,70 +107,63 @@ const cachedSuggestions = new Map<
 >();
 const ONE_HOUR = 60 * 60 * 1000;
 const MAX_SUGGESTION_CACHE_AGE = 24 * ONE_HOUR; // cache aggressively since we have an explicit button to invalidate
-const generatedCommitMessages = selectorFamily<Result<string>, HashKey>({
-  key: 'generatedCommitMessages',
-  get:
-    (hashKey: string | undefined) =>
-    ({get}) => {
-      if (hashKey == null || Internal.generateAICommitMessage == null) {
-        return Promise.resolve({value: ''});
-      }
+const generatedCommitMessages = atomFamilyWeak((hashKey: string | undefined) =>
+  atomLoadableWithRefresh((get): Promise<Result<string>> => {
+    if (hashKey == null || Internal.generateAICommitMessage == null) {
+      return Promise.resolve({value: ''});
+    }
 
-      const cached = cachedSuggestions.get(hashKey);
-      if (cached && Date.now() - cached.lastFetch < MAX_SUGGESTION_CACHE_AGE) {
-        return cached.messagePromise;
-      }
+    const cached = cachedSuggestions.get(hashKey);
+    if (cached && Date.now() - cached.lastFetch < MAX_SUGGESTION_CACHE_AGE) {
+      return cached.messagePromise;
+    }
 
-      const fileChanges = [];
-      if (hashKey === 'head') {
+    const fileChanges = [];
+    if (hashKey === 'head') {
+      const uncommittedChanges = get(uncommittedChangesWithPreviews);
+      fileChanges.push(...uncommittedChanges.slice(0, 10).map(change => change.path));
+    } else {
+      const commit = get(commitByHash(hashKey));
+      if (commit?.isDot) {
         const uncommittedChanges = get(uncommittedChangesWithPreviews);
         fileChanges.push(...uncommittedChanges.slice(0, 10).map(change => change.path));
-      } else {
-        const commit = get(commitByHash(hashKey));
-        if (commit?.isHead) {
-          const uncommittedChanges = get(uncommittedChangesWithPreviews);
-          fileChanges.push(...uncommittedChanges.slice(0, 10).map(change => change.path));
-        }
-        fileChanges.push(...(commit?.filesSample.slice(0, 10).map(change => change.path) ?? []));
       }
+      fileChanges.push(...(commit?.filesSample.slice(0, 10).map(change => change.path) ?? []));
+    }
 
-      const hashOrHead = hashKey.startsWith('commit/') ? 'head' : hashKey;
-      const editedFields = get(editedCommitMessages(hashOrHead));
-      const latestWrittenTitle =
-        editedFields.type === 'optimistic' ? '(none)' : (editedFields.fields.Title as string);
+    const hashOrHead = hashKey.startsWith('commit/') ? 'head' : hashKey;
+    const latestFields = readAtom(latestCommitMessageFieldsWithEdits(hashOrHead));
+    const latestWrittenTitle = latestFields.Title as string;
 
-      // Note: we don't use the FunnelTracker because this event is not needed for funnel analysis,
-      // only for our own duration / error rate tracking.
-      const resultPromise = tracker.operation(
-        'GenerateAICommitMessage',
-        'FetchError',
-        {},
-        async () => {
-          const comparison: Comparison = hashKey.startsWith('commit/')
-            ? {type: ComparisonType.UncommittedChanges}
-            : {type: ComparisonType.Committed, hash: hashKey};
-          const response = await unwrap(Internal.generateAICommitMessage)({
-            comparison,
-            title: latestWrittenTitle,
-          });
+    // Note: we don't use the FunnelTracker because this event is not needed for funnel analysis,
+    // only for our own duration / error rate tracking.
+    const resultPromise = tracker.operation(
+      'GenerateAICommitMessage',
+      'FetchError',
+      {},
+      async () => {
+        const comparison: Comparison = hashKey.startsWith('commit/')
+          ? {type: ComparisonType.UncommittedChanges}
+          : {type: ComparisonType.Committed, hash: hashKey};
+        const response = await nullthrows(Internal.generateAICommitMessage)({
+          comparison,
+          title: latestWrittenTitle,
+        });
 
-          return response;
-        },
-      );
+        return response;
+      },
+    );
 
-      cachedSuggestions.set(hashKey, {
-        lastFetch: Date.now(),
-        messagePromise: resultPromise,
-      });
+    cachedSuggestions.set(hashKey, {
+      lastFetch: Date.now(),
+      messagePromise: resultPromise,
+    });
 
-      return resultPromise;
-    },
-});
+    return resultPromise;
+  }),
+);
 
-const hasAcceptedAIMessageSuggestion = atomFamily<boolean, HashKey>({
-  key: 'hasAcceptedAIMessageSuggestion',
-  default: false,
-});
+const hasAcceptedAIMessageSuggestion = atomFamilyWeak((_key: HashKey) => atom<boolean>(false));
 
 function GenerateAICommitMessageModal({
   hashKey,
@@ -188,12 +175,16 @@ function GenerateAICommitMessageModal({
   dismiss: () => unknown;
   appendToTextArea: (toAdd: string) => unknown;
 }) {
-  const content = useRecoilValueLoadable(generatedCommitMessages(hashKey));
-  const refetch = useRecoilRefresher_UNSTABLE(generatedCommitMessages(hashKey));
+  const [content, refetch] = useAtom(generatedCommitMessages(hashKey));
 
-  const setHasAccepted = useSetRecoilState(hasAcceptedAIMessageSuggestion(hashKey));
+  const setHasAccepted = useSetAtom(hasAcceptedAIMessageSuggestion(hashKey));
 
-  const error = content.state === 'hasError' ? content.errorOrThrow() : content.valueMaybe()?.error;
+  const error =
+    content.state === 'hasError'
+      ? (content.error as Error)
+      : content.state === 'hasData'
+      ? (content.data.error as Error)
+      : undefined;
   const suggestionId = FunnelTracker.suggestionIdForHashKey(hashKey);
 
   useThrottledEffect(
@@ -206,7 +197,7 @@ function GenerateAICommitMessageModal({
 
   useThrottledEffect(
     () => {
-      if (content.state === 'hasValue' && content.valueMaybe()?.value != null) {
+      if (content.state === 'hasData' && content.data.value != null) {
         FunnelTracker.get(hashKey)?.track(GeneratedMessageTrackEventName.ResponseImpression);
       }
     },
@@ -216,22 +207,25 @@ function GenerateAICommitMessageModal({
 
   return (
     <div className="generated-ai-commit-message-modal">
-      <VSCodeButton appearance="icon" className="dismiss-modal" onClick={dismiss}>
+      <Button icon className="dismiss-modal" onClick={dismiss}>
         <Icon icon="x" />
-      </VSCodeButton>
+      </Button>
       <b>Generate Summary</b>
       {error ? (
         <ErrorNotice error={error} title={t('Unable to generate commit message')}></ErrorNotice>
       ) : (
         <div className="generated-message-textarea-container">
-          <VSCodeTextArea readOnly value={content.valueMaybe()?.value ?? ''} rows={14} />
+          <TextArea
+            readOnly
+            value={content.state === 'hasData' ? content.data.value ?? '' : ''}
+            rows={14}
+          />
           {content.state === 'loading' && <Icon icon="loading" />}
         </div>
       )}
       <div className="generated-message-button-bar">
-        <VSCodeButton
+        <Button
           disabled={content.state === 'loading' || error != null}
-          appearance="secondary"
           onClick={() => {
             FunnelTracker.get(hashKey)?.track(GeneratedMessageTrackEventName.RetryClick);
             cachedSuggestions.delete(hashKey); // make sure we don't re-use cached value
@@ -239,13 +233,14 @@ function GenerateAICommitMessageModal({
             FunnelTracker.restartFunnel(hashKey);
             refetch();
           }}>
-          <Icon icon="refresh" slot="start" />
+          <Icon icon="refresh" />
           <T>Try Again</T>
-        </VSCodeButton>
-        <VSCodeButton
+        </Button>
+        <Button
+          primary
           disabled={content.state === 'loading' || error != null}
           onClick={() => {
-            const value = content.state === 'hasValue' ? content.valueOrThrow().value : null;
+            const value = content.state === 'hasData' ? content.data.value : null;
             if (value) {
               appendToTextArea(value);
             }
@@ -253,9 +248,9 @@ function GenerateAICommitMessageModal({
             setHasAccepted(true);
             dismiss();
           }}>
-          <Icon icon="check" slot="start" />
+          <Icon icon="check" />
           <T>Insert into Summary</T>
-        </VSCodeButton>
+        </Button>
       </div>
     </div>
   );
@@ -301,7 +296,7 @@ class FunnelTracker {
   /** Get or create the funnel tracker for this hashKey */
   static get(hashKey: HashKey): FunnelTracker {
     if (this.trackersByHashKey.has(hashKey)) {
-      return unwrap(this.trackersByHashKey.get(hashKey));
+      return nullthrows(this.trackersByHashKey.get(hashKey));
     }
     const tracker = new FunnelTracker();
     this.trackersByHashKey.set(hashKey, tracker);

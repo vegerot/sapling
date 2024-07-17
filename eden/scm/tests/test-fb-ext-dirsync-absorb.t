@@ -1,6 +1,7 @@
-#debugruntest-compatible
 
-  $ configure modernclient
+#require no-eden
+
+
   $ enable dirsync absorb
 
 Prepare the repo

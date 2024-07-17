@@ -1,6 +1,5 @@
-#require fsmonitor
+#require fsmonitor no-eden
 
-  $ configure modernclient
   $ setconfig format.dirstate=2
   $ newclientrepo repo
   $ touch x

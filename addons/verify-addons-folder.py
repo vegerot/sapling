@@ -28,24 +28,20 @@ Requirements:
     )
     parser.add_argument(
         "--use-vendored-grammars",
-        help=(
-            "Skips the codegen step for TextMate grammars that "
-            + "fetches content from raw.githubusercontent.com. "
-            + "Assumes TextMate codegen is already available."
-        ),
+        help=("No-op. Provided for compatibility."),
         action="store_true",
     )
     args = parser.parse_args()
-    asyncio.run(verify(use_vendored_grammars=args.use_vendored_grammars))
+    asyncio.run(verify())
 
 
-async def verify(*, use_vendored_grammars=False):
+async def verify():
     await asyncio.gather(
         verify_prettier(),
         verify_shared(),
+        verify_components(),
         verify_textmate(),
         verify_isl(),
-        verify_reviewstack(use_vendored_grammars=use_vendored_grammars),
     )
 
 
@@ -60,6 +56,13 @@ async def verify_shared():
     shared = addons / "shared"
     await lint_and_test(shared)
     timer.report(ok("shared/"))
+
+
+async def verify_components():
+    timer = Timer("verifying components/")
+    components = addons / "components"
+    await lint_and_test(components)
+    timer.report(ok("components/"))
 
 
 async def verify_textmate():
@@ -93,48 +96,21 @@ async def verify_isl():
         lint_and_test(isl_server),
         lint_and_test(vscode),
     )
+    # run integration tests separately to reduce flakiness from CPU contention with normal unit tests
+    await run_isl_integration_tests()
     timer.report(ok("ISL"))
 
 
-async def verify_reviewstack(*, use_vendored_grammars=False):
-    timer = Timer("verifying reviewstack/")
-    cwd = addons / "reviewstack"
-    if use_vendored_grammars:
-        # Normally, the full codegen step takes care of copying onig.wasm.
-        src_onig_wasm = (
-            addons / "node_modules" / "vscode-oniguruma" / "release" / "onig.wasm"
-        )
-        dest_onig_wasm = (
-            addons
-            / "reviewstack.dev"
-            / "public"
-            / "generated"
-            / "textmate"
-            / "onig.wasm"
-        )
-        shutil.copyfile(src_onig_wasm, dest_onig_wasm)
-        await run(["yarn", "graphql"], cwd=cwd)
-    else:
-        await run(["yarn", "codegen"], cwd=cwd)
-    await asyncio.gather(lint_and_test(cwd), verify_reviewstack_dev())
-    timer.report(ok("reviewstack/"))
+async def run_isl_integration_tests():
+    await run(["yarn", "integration", "--watchAll=false"], cwd="isl")
 
 
 async def lint_and_test(cwd: Path):
     await asyncio.gather(
         run(["yarn", "run", "eslint"], cwd=cwd),
+        run(["yarn", "run", "tsc", "--noEmit"], cwd=cwd),
         run(["yarn", "test", "--watchAll=false"], cwd=cwd),
     )
-
-
-async def verify_reviewstack_dev():
-    """Requires codegen from reviewstack/ to have been built."""
-    timer = Timer("verifying reviewstack.dev/")
-    cwd = addons / "reviewstack.dev"
-    await run(["yarn", "build"], cwd=cwd)
-    await run(["yarn", "run", "eslint"], cwd=cwd)
-    await run(["yarn", "release"], cwd=cwd)
-    timer.report(ok("reviewstack.dev/"))
 
 
 async def run(args: List[str], cwd: str):

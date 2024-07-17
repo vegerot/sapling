@@ -15,10 +15,10 @@
 #include <folly/portability/GFlags.h>
 #include <memory>
 #include <optional>
+#include "eden/common/utils/FileDescriptor.h"
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/SpawnedProcess.h"
 #include "eden/fs/config/EdenConfig.h"
-#include "eden/fs/utils/FileDescriptor.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/SpawnedProcess.h"
 
 namespace facebook::eden {
 
@@ -252,11 +252,10 @@ class DaemonStartupLogger : public StartupLogger {
   // continue to print informational messages directly to the user during
   // startup even after normal log redirection.
   //
-  // If log redirection has not occurred these will simply be closed File
+  // If log redirection has not occurred this will simply be closed File
   // objects.  The normal logging mechanism is sufficient to show messages to
   // the user in this case.
   folly::File origStderr_;
-  std::string logPath_;
 
   // If we have daemonized, pipe_ is a pipe connected to the original foreground
   // process.  We use this to inform the original process when we have fully

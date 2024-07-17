@@ -24,14 +24,16 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use gix_hash::oid;
 use gix_hash::ObjectId;
+use gix_object::Kind;
 use mononoke_types::hash::Blake2;
+use mononoke_types::hash::GitSha1;
+use mononoke_types::hash::RichGitSha1;
 use mononoke_types::impl_typed_hash;
 use mononoke_types::impl_typed_hash_loadable;
 use mononoke_types::impl_typed_hash_no_context;
 use mononoke_types::path::MPath;
 use mononoke_types::sharded_map::MapValue;
 use mononoke_types::sharded_map::ShardedMapNode;
-use mononoke_types::thrift as mononoke_types_thrift;
 use mononoke_types::Blob;
 use mononoke_types::BlobstoreKey;
 use mononoke_types::BlobstoreValue;
@@ -49,7 +51,7 @@ pub struct ShardedMapNodeGitDeltaManifestId(Blake2);
 
 impl_typed_hash! {
     hash_type => ShardedMapNodeGitDeltaManifestId,
-    thrift_hash_type => mononoke_types_thrift::ShardedMapNodeId,
+    thrift_hash_type => mononoke_types_serialization::id::ShardedMapNodeId,
     value_type => ShardedMapNode<GitDeltaManifestEntry>,
     context_type => ShardedMapNodeGitDeltaManifestContext,
     context_key => "git_delta_manifest.mapnode",
@@ -118,7 +120,7 @@ impl GitDeltaManifest {
         Ok(())
     }
 
-    pub fn into_subentries<'a>(
+    pub fn into_entries<'a>(
         self,
         ctx: &'a CoreContext,
         blobstore: &'a impl Blobstore,
@@ -132,7 +134,7 @@ impl GitDeltaManifest {
             .boxed()
     }
 
-    pub fn into_filtered_subentries<'a>(
+    pub fn into_filtered_entries<'a>(
         self,
         ctx: &'a CoreContext,
         blobstore: &'a impl Blobstore,
@@ -151,7 +153,7 @@ impl GitDeltaManifest {
             .boxed()
     }
 
-    pub fn into_prefix_subentries<'a>(
+    pub fn into_prefix_entries<'a>(
         self,
         ctx: &'a CoreContext,
         blobstore: &'a impl Blobstore,
@@ -439,6 +441,17 @@ pub struct ObjectEntry {
     pub path: MPath,
 }
 
+impl ObjectEntry {
+    pub fn as_rich_git_sha1(&self) -> Result<RichGitSha1> {
+        let sha1 = GitSha1::from_bytes(self.oid.as_bytes())?;
+        let ty = match self.kind {
+            ObjectKind::Blob => "blob",
+            ObjectKind::Tree => "tree",
+        };
+        Ok(RichGitSha1::from_sha1(sha1, ty, self.size))
+    }
+}
+
 impl TryFrom<thrift::ObjectEntry> for ObjectEntry {
     type Error = Error;
 
@@ -458,7 +471,7 @@ impl TryFrom<thrift::ObjectEntry> for ObjectEntry {
 
 impl From<ObjectEntry> for thrift::ObjectEntry {
     fn from(value: ObjectEntry) -> Self {
-        let oid = mononoke_types_thrift::GitSha1(value.oid.as_bytes().into());
+        let oid = mononoke_types_serialization::id::GitSha1(value.oid.as_bytes().into());
         let size = value.size as i64;
         let kind = value.kind.into();
         let path = MPath::into_thrift(value.path);
@@ -503,10 +516,27 @@ impl Arbitrary for ObjectEntry {
 
 /// Enum representing the types of Git objects that can be present
 /// in a GitDeltaManifest
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum ObjectKind {
     Blob,
     Tree,
+}
+
+impl ObjectKind {
+    pub fn to_gix_kind(&self) -> Kind {
+        match self {
+            ObjectKind::Blob => Kind::Blob,
+            ObjectKind::Tree => Kind::Tree,
+        }
+    }
+
+    pub fn is_tree(&self) -> bool {
+        *self == ObjectKind::Tree
+    }
+
+    pub fn is_blob(&self) -> bool {
+        *self == ObjectKind::Blob
+    }
 }
 
 impl TryFrom<thrift::ObjectKind> for ObjectKind {

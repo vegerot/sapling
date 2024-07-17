@@ -19,7 +19,8 @@ class Object {
   }
 };
 
-using SimpleObjectCache = ObjectCache<Object, ObjectCacheFlavor::Simple>;
+using SimpleObjectCache =
+    ObjectCache<Object, ObjectCacheFlavor::Simple, FakeStats>;
 
 // 40 characters per line, 6 lines. 240 characters total.
 std::string longObjectBase =
@@ -35,14 +36,14 @@ std::string shortObjectBase = "f";
 
 void getSimple(benchmark::State& st, const std::string& objectBase) {
   size_t numObjects = 100000;
-  auto cache = SimpleObjectCache::create(40 * 1024 * 1024, 1);
+  auto cache =
+      SimpleObjectCache::create(40 * 1024 * 1024, 1, makeRefPtr<EdenStats>());
 
   std::vector<ObjectId> ids;
   ids.reserve(numObjects);
 
   for (size_t i = 0u; i < numObjects; ++i) {
-    ids.push_back(
-        ObjectId{ObjectId::sha1(fmt::to_string(i)).asString() + objectBase});
+    ids.emplace_back(ObjectId::sha1(fmt::to_string(i)).asString() + objectBase);
     auto object = std::make_shared<Object>();
     cache->insertSimple(ids[i], object);
   }
@@ -69,15 +70,15 @@ BENCHMARK(longGetSimple);
 
 void insertSimple(benchmark::State& st, const std::string& objectBase) {
   size_t numObjects = 100000;
-  auto cache = SimpleObjectCache::create(40 * 1024 * 1024, 1);
+  auto cache =
+      SimpleObjectCache::create(40 * 1024 * 1024, 1, makeRefPtr<EdenStats>());
   std::vector<ObjectId> ids;
   ids.reserve(numObjects);
   std::vector<std::shared_ptr<Object>> vec;
   vec.reserve(numObjects);
 
   for (size_t i = 0; i < numObjects; ++i) {
-    ids.push_back(
-        ObjectId{ObjectId::sha1(fmt::to_string(i)).asString() + objectBase});
+    ids.emplace_back(ObjectId::sha1(fmt::to_string(i)).asString() + objectBase);
     vec.push_back(std::make_shared<Object>());
   }
 

@@ -290,7 +290,6 @@ fn has_file_conflict(
 mod test {
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::Bookmarks;
-    use changeset_fetcher::ChangesetFetcher;
     use changesets::Changesets;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
@@ -299,6 +298,7 @@ mod test {
     use repo_blobstore::RepoBlobstore;
     use repo_blobstore::RepoBlobstoreRef;
     use repo_derived_data::RepoDerivedData;
+    use repo_identity::RepoIdentity;
     use tests_utils::CreateCommitContext;
 
     use super::*;
@@ -316,9 +316,9 @@ mod test {
         #[facet]
         filestore_config: FilestoreConfig,
         #[facet]
-        changeset_fetcher: dyn ChangesetFetcher,
-        #[facet]
         changesets: dyn Changesets,
+        #[facet]
+        repo_identity: RepoIdentity,
     }
 
     #[fbinit::test]

@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
   $ . "$TESTDIR/histedit-helpers.sh"
@@ -135,9 +137,9 @@ keep the non-commuting change, and thus the pending change will be dropped
 
 log after edit
   $ hg log --graph
-  @  commit:      1300355b1a54
+  @  commit:      3b98aba2599c
   │  user:        test
-  │  date:        Thu Jan 01 00:00:06 1970 +0000
+  │  date:        Thu Jan 01 00:00:00 1970 +0000
   │  summary:     f
   │
   o  commit:      e2ac33269083
@@ -164,7 +166,6 @@ log after edit
      user:        test
      date:        Thu Jan 01 00:00:00 1970 +0000
      summary:     Initial commit
-  
 
 contents of e
   $ hg cat e
@@ -273,9 +274,9 @@ just continue this time
 
 log after edit
   $ hg log --graph
-  @  commit:      b538bcb461be
+  @  commit:      908efed32642
   │  user:        test
-  │  date:        Thu Jan 01 00:00:06 1970 +0000
+  │  date:        Thu Jan 01 00:00:00 1970 +0000
   │  summary:     f
   │
   o  commit:      317e37cb6d66
@@ -302,7 +303,6 @@ log after edit
      user:        test
      date:        Thu Jan 01 00:00:00 1970 +0000
      summary:     Initial commit
-  
 
 contents of e
   $ hg cat e

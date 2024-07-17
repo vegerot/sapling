@@ -6,9 +6,9 @@
  */
 
 #include "eden/fs/store/BlobAccess.h"
-#include <folly/executors/QueuedImmediateExecutor.h>
 #include <folly/portability/GTest.h>
 #include <chrono>
+#include "eden/common/telemetry/NullStructuredLogger.h"
 #include "eden/common/utils/ProcessInfoCache.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/ReloadableConfig.h"
@@ -17,7 +17,6 @@
 #include "eden/fs/store/StoreResult.h"
 #include "eden/fs/store/TreeCache.h"
 #include "eden/fs/telemetry/EdenStats.h"
-#include "eden/fs/telemetry/NullStructuredLogger.h"
 #include "eden/fs/testharness/FakeBackingStore.h"
 #include "eden/fs/testharness/LoggingFetchContext.h"
 
@@ -82,8 +81,8 @@ class NullLocalStore final : public LocalStore {
 struct BlobAccessTest : ::testing::Test {
   BlobAccessTest()
       : localStore{std::make_shared<NullLocalStore>()},
-        backingStore{std::make_shared<FakeBackingStore>()},
-        blobCache{BlobCache::create(10, 0, makeRefPtr<EdenStats>())} {
+        backingStore{std::make_shared<FakeBackingStore>(
+            BackingStore::LocalStoreCachingPolicy::NoCaching)} {
     std::shared_ptr<EdenConfig> rawEdenConfig{
         EdenConfig::createTestEdenConfig()};
     rawEdenConfig->inMemoryTreeCacheSize.setValue(
@@ -92,11 +91,14 @@ struct BlobAccessTest : ::testing::Test {
         kTreeCacheMinimumEntries, ConfigSourceType::Default, true);
     auto edenConfig = std::make_shared<ReloadableConfig>(
         rawEdenConfig, ConfigReloadBehavior::NoReload);
-    auto treeCache = TreeCache::create(edenConfig);
+    auto blobCache =
+        BlobCache::create(10, 0, edenConfig, makeRefPtr<EdenStats>());
+    auto treeCache = TreeCache::create(edenConfig, makeRefPtr<EdenStats>());
 
     localStore->open();
     objectStore = ObjectStore::create(
         backingStore,
+        localStore,
         treeCache,
         makeRefPtr<EdenStats>(),
         std::make_shared<ProcessInfoCache>(),
@@ -123,7 +125,6 @@ struct BlobAccessTest : ::testing::Test {
   std::shared_ptr<LocalStore> localStore;
   std::shared_ptr<FakeBackingStore> backingStore;
   std::shared_ptr<ObjectStore> objectStore;
-  std::shared_ptr<BlobCache> blobCache;
   std::shared_ptr<BlobAccess> blobAccess;
 };
 
@@ -139,13 +140,13 @@ TEST_F(BlobAccessTest, remembers_blobs) {
 }
 
 TEST_F(BlobAccessTest, drops_blobs_when_size_is_exceeded) {
-  auto blob1 = getBlobBlocking(hash6);
-  auto blob2 = getBlobBlocking(hash5);
-  auto blob3 = getBlobBlocking(hash6);
+  auto blob0 = getBlobBlocking(hash6);
+  auto blob1 = getBlobBlocking(hash5);
+  auto blob2 = getBlobBlocking(hash6);
 
-  EXPECT_EQ(6, blob1->getSize());
-  EXPECT_EQ(5, blob2->getSize());
-  EXPECT_EQ(6, blob3->getSize());
+  EXPECT_EQ(6, blob0->getSize());
+  EXPECT_EQ(5, blob1->getSize());
+  EXPECT_EQ(6, blob2->getSize());
 
   EXPECT_EQ(1, backingStore->getAccessCount(hash5));
   EXPECT_EQ(2, backingStore->getAccessCount(hash6));

@@ -20,18 +20,19 @@ use filestore::FilestoreConfigRef;
 use fsnodes::RootFsnodeId;
 use manifest::Entry;
 use manifest::ManifestOps;
-pub use megarepo_configs::types::Source;
-pub use megarepo_configs::types::SourceMappingRules;
-pub use megarepo_configs::types::SourceRevision;
-pub use megarepo_configs::types::SyncConfigVersion;
-pub use megarepo_configs::types::SyncTargetConfig;
-pub use megarepo_configs::types::Target;
+pub use megarepo_configs::Source;
+pub use megarepo_configs::SourceMappingRules;
+pub use megarepo_configs::SourceRevision;
+pub use megarepo_configs::SyncConfigVersion;
+pub use megarepo_configs::SyncTargetConfig;
+pub use megarepo_configs::Target;
 use mononoke_types::path::MPath;
 use mononoke_types::BonsaiChangesetMut;
 use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::FileChange;
 use mononoke_types::FileType;
+use mononoke_types::GitLfs;
 use mononoke_types::NonRootMPath;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedDataRef;
@@ -127,16 +128,21 @@ pub struct CommitRemappingState {
     pub latest_synced_changesets: BTreeMap<SourceName, ChangesetId>,
     /// Config version that was used to create this commit
     sync_config_version: SyncConfigVersion,
+    /// AOSP manifest branch that this branch is based on
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bookmark: Option<String>,
 }
 
 impl CommitRemappingState {
     pub fn new(
         latest_synced_changesets: BTreeMap<SourceName, ChangesetId>,
         sync_config_version: SyncConfigVersion,
+        bookmark: Option<String>,
     ) -> Self {
         Self {
             latest_synced_changesets,
             sync_config_version,
+            bookmark,
         }
     }
 
@@ -193,7 +199,13 @@ impl CommitRemappingState {
         let (content_id, size) = self.save(ctx, repo).await?;
         let path = NonRootMPath::new(REMAPPING_STATE_FILE)?;
 
-        let fc = FileChange::tracked(content_id, FileType::Regular, size, None);
+        let fc = FileChange::tracked(
+            content_id,
+            FileType::Regular,
+            size,
+            None,
+            GitLfs::FullContent,
+        );
         if bcs.file_changes.insert(path, fc).is_some() {
             return Err(anyhow!(
                 "New bonsai changeset already has {} file",
@@ -202,6 +214,10 @@ impl CommitRemappingState {
         }
 
         Ok(())
+    }
+
+    pub fn set_bookmark(&mut self, bookmark: String) {
+        self.bookmark = Some(bookmark);
     }
 
     pub fn set_source_changeset(&mut self, source: SourceName, cs_id: ChangesetId) {
@@ -409,7 +425,7 @@ impl MegarepoMapping {
                     || &entry.sync_config_version != version
                 {
                     return Err(anyhow!(
-                        "trying to insert mapping whille one already exists and it's different!"
+                        "trying to insert mapping while one already exists and it's different!"
                     ));
                 }
             } else {
@@ -545,6 +561,7 @@ mod test {
                 SourceName::new("source_2") => TWOS_CSID,
             },
             "version_1".to_string(),
+            None,
         );
         let res = String::from_utf8(state.serialize()?)?;
         assert_eq!(
@@ -557,6 +574,26 @@ mod test {
   "sync_config_version": "version_1"
 }"#
         );
+
+        let state: CommitRemappingState = serde_json::from_str(&res)?;
+        assert_eq!(state.bookmark, None);
+
+        Ok(())
+    }
+
+    #[fbinit::test]
+    async fn test_deserialization_ignores_extra_fields(_fb: FacebookInit) -> Result<(), Error> {
+        let s = r#"{
+  "latest_synced_changesets": {
+    "source_1": "1111111111111111111111111111111111111111111111111111111111111111",
+    "source_2": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "sync_config_version": "version_1",
+  "foo": 423423423
+}"#;
+
+        let state: CommitRemappingState = serde_json::from_str(s)?;
+        assert_eq!(state.sync_config_version, "version_1");
 
         Ok(())
     }

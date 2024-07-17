@@ -6,6 +6,7 @@
  */
 
 import type {OneIndexedLineNumber} from './types';
+import type {ExclusiveOr} from 'shared/typeUtils';
 
 type Props = {
   beforeLineNumber: number | null;
@@ -14,6 +15,7 @@ type Props = {
   after: React.ReactFragment | null;
   rowType: SplitDiffRowType;
   path: string;
+  unified: boolean;
   openFileToLine?: (lineNumber: OneIndexedLineNumber) => unknown;
 };
 
@@ -26,8 +28,9 @@ export default function SplitDiffRow({
   after,
   rowType,
   path,
+  unified,
   openFileToLine,
-}: Props): React.ReactElement {
+}: Props): [JSX.Element, JSX.Element, JSX.Element, JSX.Element] {
   let beforeClass;
   let afterClass;
   switch (rowType) {
@@ -64,57 +67,75 @@ export default function SplitDiffRow({
   // doesn't work, so this seems to be some quirk in the underlying data model.
   const canComment = rowType !== 'expanded';
 
-  return (
-    <tr>
-      <SplitDiffRowSide
-        className={beforeClass}
-        content={before}
-        lineNumber={beforeLineNumber}
-        path={path}
-        side={'LEFT'}
-        canComment={canComment}
-      />
-      <SplitDiffRowSide
-        className={afterClass}
-        content={after}
-        lineNumber={afterLineNumber}
-        path={path}
-        side={'RIGHT'}
-        canComment={canComment}
-        openFileToLine={openFileToLine} // opening to a line number only makes sense on the "right" comparison side
-      />
-    </tr>
-  );
+  return [
+    LineNumber({
+      className: beforeClass,
+      lineNumber: beforeLineNumber,
+      path,
+      side: 'LEFT',
+      column: 0,
+      canComment,
+    }),
+    <td data-column={unified ? 2 : 1} className={beforeClass}>
+      {before}
+    </td>,
+    LineNumber({
+      className: afterClass,
+      lineNumber: afterLineNumber,
+      path,
+      side: 'RIGHT',
+      column: unified ? 1 : 2,
+      canComment,
+      openFileToLine, // opening to a line number only makes sense on the "right" comparison side
+    }),
+    <td data-column={unified ? 2 : 3} className={afterClass}>
+      {after}
+    </td>,
+  ];
 }
 
-type SideProps = {
+type LineNumberProps = {
   className?: string;
-  content: React.ReactFragment | null;
   lineNumber: number | null;
   path: string;
   side: 'LEFT' | 'RIGHT';
+  column: number;
   canComment: boolean;
   openFileToLine?: (lineNumber: OneIndexedLineNumber) => unknown;
 };
 
-function SplitDiffRowSide({className, content, lineNumber, path, side, openFileToLine}: SideProps) {
+function LineNumber({
+  className,
+  lineNumber,
+  path,
+  side,
+  column,
+  openFileToLine,
+}: LineNumberProps): JSX.Element {
   const clickableLineNumber = openFileToLine != null && lineNumber != null;
   const extraClassName =
     (className != null ? ` ${className}-number` : '') + (clickableLineNumber ? ' clickable' : '');
   return (
-    <>
-      <td
-        className={`lineNumber${extraClassName} lineNumber-${side}`}
-        data-line-number={lineNumber}
-        data-path={path}
-        data-side={side}
-        data-column={side === 'LEFT' ? '0' : '2'}
-        onClick={clickableLineNumber ? () => openFileToLine(lineNumber) : undefined}>
-        {lineNumber}
-      </td>
-      <td data-column={side === 'LEFT' ? '1' : '3'} className={className}>
-        {content}
-      </td>
-    </>
+    <td
+      className={`lineNumber${extraClassName} lineNumber-${side}`}
+      data-line-number={lineNumber}
+      data-path={path}
+      data-side={side}
+      data-column={column}
+      onClick={clickableLineNumber ? () => openFileToLine(lineNumber) : undefined}>
+      {lineNumber}
+    </td>
+  );
+}
+
+export function BlankLineNumber({before}: ExclusiveOr<{before: true}, {after: true}>) {
+  return (
+    <td
+      className={
+        before
+          ? 'patch-remove-line-number lineNumber lineNumber-LEFT'
+          : 'patch-add-line-number lineNumber lineNumber-RIGHT'
+      }
+    />
   );
 }

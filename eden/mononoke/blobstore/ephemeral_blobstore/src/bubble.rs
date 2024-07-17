@@ -24,7 +24,10 @@ use blobstore::BlobstoreIsPresent;
 use blobstore::BlobstoreKeyParam;
 use blobstore::BlobstoreKeySource;
 use blobstore::BlobstoreUnlinkOps;
+use changesets::ArcChangesets;
 use changesets::ChangesetsArc;
+use commit_graph::CommitGraph;
+use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use derivative::Derivative;
 use futures::future::try_join_all;
@@ -36,6 +39,7 @@ use metaconfig_types::RepoConfigArc;
 use mononoke_types::repo::EPH_ID_PREFIX;
 use mononoke_types::repo::EPH_ID_SUFFIX;
 use mononoke_types::DateTime;
+use mononoke_types::RepositoryId;
 use prefixblob::PrefixBlobstore;
 use repo_blobstore::RepoBlobstore;
 use repo_blobstore::RepoBlobstoreRef;
@@ -54,6 +58,7 @@ use sql::sql_common::mysql::ValueError;
 use sql_ext::SqlConnections;
 
 use crate::changesets::EphemeralChangesets;
+use crate::commit_graph::EphemeralCommitGraphStorage;
 use crate::error::EphemeralBlobstoreError;
 use crate::handle::EphemeralHandle;
 use crate::view::EphemeralRepoView;
@@ -101,6 +106,12 @@ impl From<BubbleId> for Value {
 impl From<BubbleId> for NonZeroU64 {
     fn from(bubble_id: BubbleId) -> Self {
         bubble_id.0
+    }
+}
+
+impl From<BubbleId> for i64 {
+    fn from(bubble_id: BubbleId) -> Self {
+        bubble_id.0.get() as i64
     }
 }
 
@@ -390,30 +401,82 @@ impl Bubble {
 
     fn changesets_with_blobstore(
         &self,
+        repo_id: RepositoryId,
         repo_blobstore: RepoBlobstore,
-        container: &(impl ChangesetsArc + RepoIdentityRef),
+        changesets: ArcChangesets,
     ) -> EphemeralChangesets {
         EphemeralChangesets::new(
-            container.repo_identity().id(),
+            repo_id,
             self.bubble_id(),
             repo_blobstore,
             self.connections.clone(),
-            container.changesets_arc(),
+            changesets,
         )
+    }
+
+    fn commit_graph_with_blobstore(
+        &self,
+        repo_id: RepositoryId,
+        repo_blobstore: RepoBlobstore,
+        commit_graph: &CommitGraph,
+    ) -> CommitGraph {
+        commit_graph.clone_with_replaced_storage(|storage| {
+            Arc::new(EphemeralCommitGraphStorage::new(
+                repo_id,
+                self.bubble_id(),
+                repo_blobstore,
+                self.connections.clone(),
+                storage,
+            ))
+        })
     }
 
     pub fn changesets(
         &self,
-        container: &(impl ChangesetsArc + RepoIdentityRef + RepoBlobstoreRef),
+        repo_id: RepositoryId,
+        repo_blobstore: RepoBlobstore,
+        changesets: ArcChangesets,
     ) -> EphemeralChangesets {
-        let repo_blobstore = self.wrap_repo_blobstore(container.repo_blobstore().clone());
-        self.changesets_with_blobstore(repo_blobstore, container)
+        let repo_blobstore = self.wrap_repo_blobstore(repo_blobstore);
+        self.changesets_with_blobstore(repo_id, repo_blobstore, changesets)
+    }
+
+    pub fn repo_changesets(
+        &self,
+        repo: &(impl ChangesetsArc + RepoIdentityRef + RepoBlobstoreRef),
+    ) -> EphemeralChangesets {
+        self.changesets(
+            repo.repo_identity().id(),
+            repo.repo_blobstore().clone(),
+            repo.changesets_arc(),
+        )
+    }
+
+    pub fn commit_graph(
+        &self,
+        repo_id: RepositoryId,
+        repo_blobstore: RepoBlobstore,
+        commit_graph: &CommitGraph,
+    ) -> CommitGraph {
+        let repo_blobstore = self.wrap_repo_blobstore(repo_blobstore);
+        self.commit_graph_with_blobstore(repo_id, repo_blobstore, commit_graph)
+    }
+
+    pub fn repo_commit_graph(
+        &self,
+        repo: &(impl CommitGraphRef + RepoIdentityRef + RepoBlobstoreRef),
+    ) -> CommitGraph {
+        self.commit_graph(
+            repo.repo_identity().id(),
+            repo.repo_blobstore().clone(),
+            repo.commit_graph(),
+        )
     }
 
     pub fn repo_view(
         &self,
         container: &(
-             impl RepoBlobstoreRef + RepoIdentityRef + RepoIdentityArc + ChangesetsArc + RepoConfigArc
+             impl RepoBlobstoreRef + RepoIdentityArc + ChangesetsArc + CommitGraphRef + RepoConfigArc
          ),
     ) -> EphemeralRepoView {
         let repo_blobstore = self.wrap_repo_blobstore(container.repo_blobstore().clone());
@@ -421,7 +484,16 @@ impl Bubble {
         let repo_config = container.repo_config_arc();
         EphemeralRepoView {
             repo_blobstore: Arc::new(repo_blobstore.clone()),
-            changesets: Arc::new(self.changesets_with_blobstore(repo_blobstore, container)),
+            changesets: Arc::new(self.changesets_with_blobstore(
+                repo_identity.id(),
+                repo_blobstore.clone(),
+                container.changesets_arc(),
+            )),
+            commit_graph: Arc::new(self.commit_graph_with_blobstore(
+                repo_identity.id(),
+                repo_blobstore,
+                container.commit_graph(),
+            )),
             repo_identity,
             repo_config,
         }

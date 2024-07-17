@@ -5,8 +5,6 @@
  * GNU General Public License version 2.
  */
 
-use std::cmp;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt;
@@ -24,24 +22,22 @@ use anyhow::Context as _;
 use anyhow::Error;
 use anyhow::Result;
 use ascii::AsciiString;
-use lazy_static::lazy_static;
 use quickcheck::Arbitrary;
 use quickcheck::Gen;
 use quickcheck_arbitrary_derive::Arbitrary;
-use regex::bytes::Regex as BytesRegex;
 use regex::Regex;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
-use smallvec::SmallVec;
 
+use self::mpath_element::MPathElement;
 use crate::bonsai_changeset::BonsaiChangeset;
 use crate::errors::MononokeTypeError;
 use crate::hash::Blake2;
 use crate::hash::Context;
 use crate::thrift;
-// Filesystems on Linux commonly limit path *elements* to 255 bytes. Enforce this on MPaths as well
-// as a repository that cannot be checked out isn't very useful.
-const MPATH_ELEMENT_MAX_LENGTH: usize = 255;
+use crate::ThriftConvert;
+
+pub mod mpath_element;
 
 /// A path or filename within Mononoke, with information about whether
 /// it's the root of the repo, a directory or a file.
@@ -154,28 +150,32 @@ impl RepoPath {
         Ok(bincode::serialize_into(writer, self)?)
     }
 
-    pub fn from_thrift(path: thrift::RepoPath) -> Result<Self> {
+    pub fn from_thrift(path: thrift::path::RepoPath) -> Result<Self> {
         let path = match path {
-            thrift::RepoPath::RootPath(_) => Self::root(),
-            thrift::RepoPath::DirectoryPath(path) => Self::dir(NonRootMPath::from_thrift(path)?)?,
-            thrift::RepoPath::FilePath(path) => Self::file(NonRootMPath::from_thrift(path)?)?,
-            thrift::RepoPath::UnknownField(unknown) => bail!(
-                "Unknown field encountered when parsing thrift::RepoPath: {}",
+            thrift::path::RepoPath::RootPath(_) => Self::root(),
+            thrift::path::RepoPath::DirectoryPath(path) => {
+                Self::dir(NonRootMPath::from_thrift(path)?)?
+            }
+            thrift::path::RepoPath::FilePath(path) => Self::file(NonRootMPath::from_thrift(path)?)?,
+            thrift::path::RepoPath::UnknownField(unknown) => bail!(
+                "Unknown field encountered when parsing thrift::path::RepoPath: {}",
                 unknown,
             ),
         };
         Ok(path)
     }
 
-    pub fn into_thrift(self) -> thrift::RepoPath {
+    pub fn into_thrift(self) -> thrift::path::RepoPath {
         match self {
             // dummy false here is required because thrift doesn't support mixing enums with and
             // without payload
-            RepoPath::RootPath => thrift::RepoPath::RootPath(false),
+            RepoPath::RootPath => thrift::path::RepoPath::RootPath(false),
             RepoPath::DirectoryPath(path) => {
-                thrift::RepoPath::DirectoryPath(NonRootMPath::into_thrift(path))
+                thrift::path::RepoPath::DirectoryPath(NonRootMPath::into_thrift(path))
             }
-            RepoPath::FilePath(path) => thrift::RepoPath::FilePath(NonRootMPath::into_thrift(path)),
+            RepoPath::FilePath(path) => {
+                thrift::path::RepoPath::FilePath(NonRootMPath::into_thrift(path))
+            }
         }
     }
 }
@@ -194,213 +194,6 @@ impl Display for RepoPath {
 impl<'a> From<&'a RepoPath> for RepoPath {
     fn from(path: &'a RepoPath) -> RepoPath {
         path.clone()
-    }
-}
-
-/// An element of a path or filename within Mercurial.
-///
-/// Mercurial treats pathnames as sequences of bytes, but the manifest format
-/// assumes they cannot contain zero bytes. The bytes are not necessarily utf-8
-/// and so cannot be converted into a string (or - strictly speaking - be displayed).
-///
-/// Internally using SmallVec as many path elements are directory names and thus
-/// quite short, avoiding need for heap alloc. Its stack storage size is set to 24
-/// as with the union feature the smallvec is 32 bytes on stack which is same as previous
-/// Bytes member stack sise (Bytes will usually have heap as well of course)
-#[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
-#[derive(Abomonation, Serialize, Deserialize)]
-pub struct MPathElement(SmallVec<[u8; 24]>);
-
-impl MPathElement {
-    #[inline]
-    pub fn new(element: Vec<u8>) -> Result<MPathElement> {
-        Self::verify(&element)?;
-        Ok(MPathElement(SmallVec::from(element)))
-    }
-
-    #[inline]
-    pub fn from_smallvec(element: SmallVec<[u8; 24]>) -> Result<MPathElement> {
-        Self::verify(&element)?;
-        Ok(MPathElement(element))
-    }
-
-    #[inline]
-    pub fn to_smallvec(self) -> SmallVec<[u8; 24]> {
-        self.0
-    }
-
-    #[inline]
-    pub fn new_from_slice(element: &[u8]) -> Result<MPathElement> {
-        Self::verify(element)?;
-        Ok(MPathElement(SmallVec::from(element)))
-    }
-
-    #[inline]
-    pub fn from_thrift(element: thrift::MPathElement) -> Result<MPathElement> {
-        Self::verify(&element.0).with_context(|| {
-            MononokeTypeError::InvalidThrift("MPathElement".into(), "invalid path element".into())
-        })?;
-        Ok(MPathElement(element.0))
-    }
-
-    fn verify(p: &[u8]) -> Result<()> {
-        if p.is_empty() {
-            bail!(MononokeTypeError::InvalidPath(
-                "".into(),
-                "path elements cannot be empty".into()
-            ));
-        }
-        if p.contains(&0) {
-            bail!(MononokeTypeError::InvalidPath(
-                String::from_utf8_lossy(p).into_owned(),
-                "path elements cannot contain '\\0'".into(),
-            ));
-        }
-        if p.contains(&1) {
-            // NonRootMPath can not contain '\x01', in particular if mpath ends with '\x01'
-            // and it is part of move metadata, because key-value pairs are separated
-            // by '\n', you will get '\x01\n' which is also metadata separator.
-            bail!(MononokeTypeError::InvalidPath(
-                String::from_utf8_lossy(p).into_owned(),
-                "path elements cannot contain '\\1'".into(),
-            ));
-        }
-        if p.contains(&b'/') {
-            bail!(MononokeTypeError::InvalidPath(
-                String::from_utf8_lossy(p).into_owned(),
-                "path elements cannot contain '/'".into(),
-            ));
-        }
-        if p.contains(&b'\n') {
-            bail!(MononokeTypeError::InvalidPath(
-                String::from_utf8_lossy(p).into_owned(),
-                "path elements cannot contain '\\n'".into(),
-            ));
-        }
-        if p == b"." || p == b".." {
-            bail!(MononokeTypeError::InvalidPath(
-                String::from_utf8_lossy(p).into_owned(),
-                "path elements cannot be . or .. to avoid traversal attacks".into(),
-            ));
-        }
-        Self::check_len(p)?;
-        Ok(())
-    }
-
-    fn check_len(p: &[u8]) -> Result<()> {
-        if p.len() > MPATH_ELEMENT_MAX_LENGTH {
-            bail!(MononokeTypeError::InvalidPath(
-                String::from_utf8_lossy(p).into_owned(),
-                format!(
-                    "path elements cannot exceed {} bytes",
-                    MPATH_ELEMENT_MAX_LENGTH
-                )
-            ));
-        }
-
-        Ok(())
-    }
-
-    #[allow(clippy::len_without_is_empty)]
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    #[inline]
-    pub fn into_thrift(self) -> thrift::MPathElement {
-        thrift::MPathElement(self.0)
-    }
-
-    /// Returns true if this path element is valid UTF-8.
-    pub fn is_utf8(&self) -> bool {
-        std::str::from_utf8(self.0.as_ref()).is_ok()
-    }
-
-    /// Returns the length of the path element in WCHARs, if the path element
-    /// is re-interpreted as a Windows filename.
-    ///
-    /// For UTF-8 path elements, this is the length of the UTF-16 encoding.
-    /// For other path elementss, it is assumed that a Windows 8-bit encoding
-    /// is in use and each byte corresponds to one WCHAR.
-    pub fn wchar_len(&self) -> usize {
-        match std::str::from_utf8(self.0.as_ref()) {
-            Ok(s) => s.encode_utf16().count(),
-            Err(_) => self.0.len(),
-        }
-    }
-
-    /// Returns the lowercased version of this NonRootMPath element if it is valid
-    /// UTF-8.
-    pub fn to_lowercase_utf8(&self) -> Option<String> {
-        let s = std::str::from_utf8(self.0.as_ref()).ok()?;
-        let s = s.to_lowercase();
-        Some(s)
-    }
-
-    /// Returns whether this path element is a valid filename on Windows.
-    /// ```text
-    ///
-    /// Invalid filenames on Windows are:
-    ///
-    /// * Any filename containing a control character in the range 0-31, or
-    ///   any character in the set `< > : " / \\ | ? *`.
-    /// * Any filename ending in a `.` or a space.
-    /// * Any filename that is `CON`, `PRN`, `AUX`, `NUL`, `COM1-9` or
-    ///   `LPT1-9`, with or without an extension.
-    /// ```
-    pub fn is_valid_windows_filename(&self) -> bool {
-        // File names containing any of <>:"/\|?* or control characters are invalid.
-        let is_invalid = |c: &u8| *c < b' ' || b"<>:\"/\\|?*".iter().any(|i| i == c);
-        if self.0.iter().any(is_invalid) {
-            return false;
-        }
-
-        // File names ending in . or space are invalid.
-        if let Some(b' ') | Some(b'.') = self.0.last() {
-            return false;
-        }
-
-        // CON, PRN, AUX, NUL, COM[1-9] and LPT[1-9] are invalid, with or
-        // without extension.
-        if INVALID_WINDOWS_FILENAME_REGEX.is_match(self.0.as_ref()) {
-            return false;
-        }
-
-        true
-    }
-
-    /// Returns whether potential_suffix is a suffix of this path element.
-    /// For example, if the element is "file.extension", "n", "tension",
-    /// "extension", ".extension", "file.extension" are suffixes of the
-    /// basename, but "file" is not.
-    #[inline]
-    pub fn has_suffix(&self, potential_suffix: &[u8]) -> bool {
-        self.0.ends_with(potential_suffix)
-    }
-
-    #[inline]
-    pub fn starts_with(&self, prefix: &[u8]) -> bool {
-        self.0.starts_with(prefix)
-    }
-
-    /// Reverse this path element inplace
-    pub fn reverse(&mut self) {
-        self.0.reverse()
-    }
-}
-
-// Regex for looking for invalid windows filenames
-lazy_static! {
-    static ref INVALID_WINDOWS_FILENAME_REGEX: BytesRegex =
-        BytesRegex::new("^((?i)CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])([.][^.]*|)$")
-            .expect("invalid windows filename regex should be valid");
-}
-
-impl AsRef<[u8]> for MPathElement {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_ref()
     }
 }
 
@@ -443,13 +236,6 @@ impl MPath {
         self.elements.is_empty()
     }
 
-    pub fn from_thrift(mpath: thrift::MPath) -> Result<Self> {
-        let elements: Result<Vec<_>> = mpath.0.into_iter().map(MPathElement::from_thrift).collect();
-        let elements = elements?;
-
-        Ok(Self { elements })
-    }
-
     pub fn join<'a, Elements: IntoIterator<Item = &'a MPathElement>>(
         &self,
         another: Elements,
@@ -464,6 +250,11 @@ impl MPath {
         Self {
             elements: newelements,
         }
+    }
+
+    /// Converts MPath into NonRootMath by adding one element to it
+    pub fn join_into_non_root_mpath(&self, another: &MPathElement) -> NonRootMPath {
+        NonRootMPath(self.join(another))
     }
 
     pub fn join_element(&self, element: Option<&MPathElement>) -> Self {
@@ -495,11 +286,17 @@ impl MPath {
             .count()
     }
 
+    /// Whether this path is related to the given path. A path P1 is related to path P2 iff
+    /// P1 is prefix of P2 or vice versa.
+    pub fn is_related_to(&self, other: &MPath) -> bool {
+        self.is_prefix_of(other.as_ref()) || other.is_prefix_of(self.as_ref())
+    }
+
     /// Whether this path is a path prefix of the given path.
     /// `foo` is a prefix of `foo/bar`, but not of `foo1`.
     #[inline]
     pub fn is_prefix_of<'a, E: IntoIterator<Item = &'a MPathElement>>(&self, other: E) -> bool {
-        let common_components = self.common_components(other.into_iter());
+        let common_components = self.common_components(other);
         let total_components = self.num_components();
         // If all the components of this path are present in the other path, then this path is
         // considered as a prefix of other path. However, if the current path is empty then the
@@ -584,15 +381,6 @@ impl MPath {
             .map(|(first, rest)| (first, Self::from_elements(rest.iter())))
     }
 
-    pub fn into_thrift(self) -> thrift::MPath {
-        thrift::MPath(
-            self.elements
-                .into_iter()
-                .map(|elem| elem.into_thrift())
-                .collect(),
-        )
-    }
-
     pub fn get_path_hash(&self) -> MPathHash {
         let mut context = MPathHashContext::new();
         let num_el = self.elements.len();
@@ -610,12 +398,10 @@ impl MPath {
         context.finish()
     }
 
-    /// Get an iterator over the parent directories of this `MPath`
-    /// Note: it contains the `self` as the first element
-    pub fn into_parent_dir_iter(self) -> ParentDirIterator {
-        ParentDirIterator {
-            current: self.into_optional_non_root_path(),
-        }
+    /// Returns an iterator of the path and each of its ancestor directories, up
+    /// to and including the root.
+    pub fn into_ancestors(self) -> MPathAncestors {
+        MPathAncestors { next: Some(self) }
     }
 
     pub fn into_optional_non_root_path(self) -> Option<NonRootMPath> {
@@ -656,6 +442,12 @@ impl MPath {
             .collect::<Result<Vec<_>>>()
             .with_context(|| format!("Error in creating Vec<MPathElement> from {:?}", path))?;
         Ok(MPath::from_elements(segments.iter()))
+    }
+
+    /// Returns the depth of this path. The root has a depth 0, and any non-root path has depth
+    /// equal to the number of elements in it.
+    pub fn depth(&self) -> u64 {
+        self.elements.len() as u64
     }
 }
 
@@ -760,6 +552,14 @@ impl<'a> TryFrom<&'a str> for MPath {
     }
 }
 
+impl<'a> TryFrom<&'a String> for MPath {
+    type Error = Error;
+
+    fn try_from(value: &String) -> Result<Self> {
+        MPath::new(value.as_bytes())
+    }
+}
+
 impl<'a> TryFrom<&'a OsStr> for MPath {
     type Error = Error;
 
@@ -842,10 +642,10 @@ impl NonRootMPath {
         }
     }
 
-    pub fn from_thrift(non_root_mpath: thrift::NonRootMPath) -> Result<NonRootMPath> {
+    pub fn from_thrift(non_root_mpath: thrift::path::NonRootMPath) -> Result<NonRootMPath> {
         let mpath = MPath::from_thrift(non_root_mpath.0)?;
         if mpath.is_root() {
-            bail!("Unexpected empty path in thrift::NonRootMPath")
+            bail!("Unexpected empty path in thrift::path::NonRootMPath")
         } else {
             Ok(NonRootMPath(mpath))
         }
@@ -1027,8 +827,8 @@ impl NonRootMPath {
         }
     }
 
-    pub fn into_thrift(self) -> thrift::NonRootMPath {
-        thrift::NonRootMPath(self.0.into_thrift())
+    pub fn into_thrift(self) -> thrift::path::NonRootMPath {
+        thrift::path::NonRootMPath(self.0.into_thrift())
     }
 
     pub fn display_opt<'a>(path_opt: Option<&'a NonRootMPath>) -> DisplayOpt<'a> {
@@ -1052,17 +852,40 @@ impl NonRootMPath {
         context.finish()
     }
 
-    /// Get an iterator over the parent directories of this `MPath`
-    /// Note: it contains the `self` as the first element
-    pub fn into_parent_dir_iter(self) -> ParentDirIterator {
-        ParentDirIterator {
-            current: Some(self),
-        }
+    /// Returns an iterator of the path and each of its ancestor directories, up
+    /// to but not includling the root.
+    pub fn into_non_root_ancestors(self) -> NonRootMPathAncestors {
+        NonRootMPathAncestors { next: Some(self) }
     }
 
     pub fn matches_regex(&self, re: &Regex) -> bool {
         let s: String = format!("{}", self);
         re.is_match(&s)
+    }
+}
+
+impl ThriftConvert for MPath {
+    const NAME: &'static str = "MPath";
+    type Thrift = thrift::path::MPath;
+
+    fn from_thrift(thrift: Self::Thrift) -> Result<Self> {
+        let elements: Result<Vec<_>> = thrift
+            .0
+            .into_iter()
+            .map(MPathElement::from_thrift)
+            .collect();
+        let elements = elements?;
+
+        Ok(Self { elements })
+    }
+
+    fn into_thrift(self) -> Self::Thrift {
+        thrift::path::MPath(
+            self.elements
+                .into_iter()
+                .map(|elem| elem.into_thrift())
+                .collect(),
+        )
     }
 }
 
@@ -1156,24 +979,35 @@ impl Arbitrary for NonRootMPath {
     }
 }
 
-/// Iterator over parent directories of a given `NonRootMPath`
-pub struct ParentDirIterator {
-    current: Option<NonRootMPath>,
+/// Iterator over the a path's ancestors.
+pub struct MPathAncestors {
+    next: Option<MPath>,
 }
 
-impl Iterator for ParentDirIterator {
+impl Iterator for MPathAncestors {
+    type Item = MPath;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let parent = self
+            .next
+            .as_ref()?
+            .split_dirname()
+            .map(|(parent, _)| parent);
+        std::mem::replace(&mut self.next, parent)
+    }
+}
+
+/// Iterator over the a path's non-root ancestors.
+pub struct NonRootMPathAncestors {
+    next: Option<NonRootMPath>,
+}
+
+impl Iterator for NonRootMPathAncestors {
     type Item = NonRootMPath;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let maybe_current = self.current.take();
-        match maybe_current {
-            None => None,
-            Some(current) => {
-                let (maybe_dirname, _) = current.split_dirname();
-                self.current = maybe_dirname;
-                Some(current)
-            }
-        }
+        let parent = self.next.as_ref()?.split_dirname().0;
+        std::mem::replace(&mut self.next, parent)
     }
 }
 
@@ -1182,18 +1016,18 @@ impl Iterator for ParentDirIterator {
 pub struct MPathHash(Blake2);
 
 impl MPathHash {
-    pub fn from_thrift(thrift_path: thrift::MPathHash) -> Result<MPathHash> {
+    pub fn from_thrift(thrift_path: thrift::id::MPathHash) -> Result<MPathHash> {
         match thrift_path.0 {
-            thrift::IdType::Blake2(blake2) => Ok(MPathHash(Blake2::from_thrift(blake2)?)),
-            thrift::IdType::UnknownField(x) => bail!(MononokeTypeError::InvalidThrift(
+            thrift::id::Id::Blake2(blake2) => Ok(MPathHash(Blake2::from_thrift(blake2)?)),
+            thrift::id::Id::UnknownField(x) => bail!(MononokeTypeError::InvalidThrift(
                 "MPathHash".into(),
                 format!("unknown id type field: {}", x)
             )),
         }
     }
 
-    pub fn into_thrift(self) -> thrift::MPathHash {
-        thrift::MPathHash(thrift::IdType::Blake2(self.0.into_thrift()))
+    pub fn into_thrift(self) -> thrift::id::MPathHash {
+        thrift::id::MPathHash(thrift::id::Id::Blake2(self.0.into_thrift()))
     }
 
     pub fn to_hex(&self) -> AsciiString {
@@ -1278,36 +1112,6 @@ impl<'a> IntoIterator for &'a MPathElement {
     }
 }
 
-lazy_static! {
-    static ref COMPONENT_CHARS: Vec<u8> = (2..b'\n')
-        .chain((b'\n' + 1)..b'/')
-        .chain((b'/' + 1)..255)
-        .collect();
-}
-
-impl Arbitrary for MPathElement {
-    fn arbitrary(g: &mut Gen) -> Self {
-        let size = cmp::max(g.size(), 1);
-        let size = cmp::min(size, MPATH_ELEMENT_MAX_LENGTH);
-        let mut element = SmallVec::with_capacity(size);
-        // Keep building possible MPathElements until we get a valid one
-        while MPathElement::verify(&element).is_err() {
-            element.clear();
-            for _ in 0..size {
-                let c = g.choose(&COMPONENT_CHARS[..]).unwrap();
-                element.push(*c);
-            }
-        }
-        MPathElement(element)
-    }
-}
-
-impl Display for MPathElement {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "{}", String::from_utf8_lossy(&self.0))
-    }
-}
-
 impl Display for NonRootMPath {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(fmt, "{}", String::from_utf8_lossy(&self.to_vec()))
@@ -1321,16 +1125,6 @@ impl Display for MPath {
 }
 
 // Implement our own Debug so that strings are displayed properly
-impl fmt::Debug for MPathElement {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            fmt,
-            "MPathElement(\"{}\")",
-            String::from_utf8_lossy(&self.0)
-        )
-    }
-}
-
 impl fmt::Debug for NonRootMPath {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(fmt, "NonRootMPath(\"{}\")", self)
@@ -1340,141 +1134,6 @@ impl fmt::Debug for NonRootMPath {
 impl fmt::Debug for MPath {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(fmt, "MPath(\"{}\")", self)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct TrieMap<V> {
-    pub value: Option<Box<V>>,
-    pub edges: BTreeMap<u8, Self>,
-}
-
-impl<V> Default for TrieMap<V> {
-    fn default() -> Self {
-        Self {
-            value: Default::default(),
-            edges: Default::default(),
-        }
-    }
-}
-
-impl<V: PartialEq> PartialEq for TrieMap<V> {
-    fn eq(&self, other: &Self) -> bool {
-        self.value == other.value && self.edges == other.edges
-    }
-}
-
-impl<V> TrieMap<V> {
-    pub fn get<K: AsRef<[u8]>>(&self, key: K) -> Option<&V> {
-        let mut node = self;
-        for next_byte in key.as_ref() {
-            match node.edges.get(next_byte) {
-                Some(child) => node = child,
-                None => return None,
-            }
-        }
-        node.value.as_ref().map(|value| value.as_ref())
-    }
-
-    pub fn insert<K: AsRef<[u8]>>(&mut self, key: K, value: V) -> Option<V> {
-        let node = key.as_ref().iter().fold(self, |node, next_byte| {
-            node.edges.entry(*next_byte).or_default()
-        });
-
-        node.value.replace(Box::new(value)).map(|v| *v)
-    }
-
-    pub fn expand(self) -> (Option<V>, Vec<(u8, Self)>) {
-        (self.value.map(|v| *v), self.edges.into_iter().collect())
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.value.is_none() && self.edges.is_empty()
-    }
-
-    pub fn clear(&mut self) {
-        self.value = None;
-        self.edges.clear();
-    }
-}
-
-impl<V> TrieMap<V>
-where
-    V: Default,
-{
-    pub fn get_or_insert_default<K: AsRef<[u8]>>(&mut self, key: K) -> &mut V {
-        let node = key.as_ref().iter().fold(self, |node, next_byte| {
-            node.edges
-                .entry(*next_byte)
-                .or_insert_with(Default::default)
-        });
-
-        node.value.get_or_insert_with(Default::default)
-    }
-}
-
-pub struct TrieMapIter<V> {
-    bytes: SmallVec<[u8; 24]>,
-    value: Option<Box<V>>,
-    stack: Vec<std::collections::btree_map::IntoIter<u8, TrieMap<V>>>,
-}
-
-impl<V> IntoIterator for TrieMap<V> {
-    type Item = (SmallVec<[u8; 24]>, V);
-    type IntoIter = TrieMapIter<V>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        TrieMapIter {
-            bytes: Default::default(),
-            value: self.value,
-            stack: vec![self.edges.into_iter()],
-        }
-    }
-}
-
-impl<V> Iterator for TrieMapIter<V> {
-    type Item = (SmallVec<[u8; 24]>, V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(value) = self.value.take() {
-                return Some((SmallVec::from_slice(self.bytes.as_ref()), *value));
-            }
-
-            match self.stack.last_mut() {
-                None => return None,
-                Some(iter) => match iter.next() {
-                    None => {
-                        self.bytes.pop();
-                        self.stack.pop();
-                    }
-                    Some((next_byte, child)) => {
-                        self.bytes.push(next_byte);
-                        self.value = child.value;
-                        self.stack.push(child.edges.into_iter());
-                    }
-                },
-            };
-        }
-    }
-}
-
-impl<K: AsRef<[u8]>, V> Extend<(K, V)> for TrieMap<V> {
-    fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
-        for (key, value) in iter {
-            self.insert(key, value);
-        }
-    }
-}
-
-impl<K: AsRef<[u8]>, V> FromIterator<(K, V)> for TrieMap<V> {
-    fn from_iter<I>(iter: I) -> Self
-    where
-        I: IntoIterator<Item = (K, V)>,
-    {
-        let mut trie_map: Self = Default::default();
-        trie_map.extend(iter);
-        trie_map
     }
 }
 
@@ -1906,19 +1565,43 @@ mod test {
     }
 
     #[test]
-    fn parent_dir_iterator() {
+    fn ancestors() {
+        fn path(p: &str) -> MPath {
+            MPath::new(p).unwrap()
+        }
+
+        fn collect_ancestors(p: &str) -> Vec<MPath> {
+            path(p).into_ancestors().collect()
+        }
+
+        assert_eq!(collect_ancestors("a"), vec![path("a"), MPath::ROOT]);
+        assert_eq!(
+            collect_ancestors("a/b"),
+            vec![path("a/b"), path("a"), MPath::ROOT]
+        );
+        assert_eq!(
+            collect_ancestors("a/b/c"),
+            vec![path("a/b/c"), path("a/b"), path("a"), MPath::ROOT]
+        );
+    }
+
+    #[test]
+    fn non_root_ancestors() {
         fn path(p: &str) -> NonRootMPath {
             NonRootMPath::new(p).unwrap()
         }
 
-        fn parent_vec(p: &str) -> Vec<NonRootMPath> {
-            path(p).into_parent_dir_iter().collect()
+        fn collect_non_root_ancestors(p: &str) -> Vec<NonRootMPath> {
+            path(p).into_non_root_ancestors().collect()
         }
 
-        assert_eq!(parent_vec("a"), vec![path("a")]);
-        assert_eq!(parent_vec("a/b"), vec![path("a/b"), path("a")]);
+        assert_eq!(collect_non_root_ancestors("a"), vec![path("a")]);
         assert_eq!(
-            parent_vec("a/b/c"),
+            collect_non_root_ancestors("a/b"),
+            vec![path("a/b"), path("a")]
+        );
+        assert_eq!(
+            collect_non_root_ancestors("a/b/c"),
             vec![path("a/b/c"), path("a/b"), path("a")]
         );
     }
@@ -1996,10 +1679,12 @@ mod test {
 
     #[test]
     fn bad_path_thrift() {
-        let bad_thrift = thrift::MPath(vec![thrift::MPathElement(b"abc\0".to_vec().into())]);
+        let bad_thrift =
+            thrift::path::MPath(vec![thrift::path::MPathElement(b"abc\0".to_vec().into())]);
         MPath::from_thrift(bad_thrift).expect_err("unexpected OK - embedded null");
 
-        let bad_thrift = thrift::MPath(vec![thrift::MPathElement(b"def/ghi".to_vec().into())]);
+        let bad_thrift =
+            thrift::path::MPath(vec![thrift::path::MPathElement(b"def/ghi".to_vec().into())]);
         MPath::from_thrift(bad_thrift).expect_err("unexpected OK - embedded slash");
     }
 
@@ -2037,68 +1722,6 @@ mod test {
             ("foo/bar\x30", true),
         ])
         .expect_err("unexpected OK - other paths and prefixes");
-    }
-
-    #[test]
-    fn trie_map() -> Result<()> {
-        let mut trie_map: TrieMap<i32> = Default::default();
-
-        assert_eq!(trie_map.insert("abcde", 1), None);
-        assert_eq!(trie_map.insert("abcdf", 2), None);
-        assert_eq!(trie_map.insert("bcdf", 3), None);
-        assert_eq!(trie_map.insert("abcde", 4), Some(1));
-
-        assert_eq!(
-            trie_map.clone().into_iter().collect::<Vec<_>>(),
-            vec![
-                (SmallVec::from_slice("abcde".as_bytes()), 4),
-                (SmallVec::from_slice("abcdf".as_bytes()), 2),
-                (SmallVec::from_slice("bcdf".as_bytes()), 3),
-            ]
-        );
-
-        assert_eq!(trie_map.get("abcde"), Some(&4));
-        assert_eq!(trie_map.get("abcdd"), None);
-        assert_eq!(trie_map.get("bcdf"), Some(&3));
-        assert_eq!(trie_map.get("zzzz"), None);
-
-        let value = trie_map.get_or_insert_default("abcde");
-        assert_eq!(value, &4);
-        *value = 5;
-        assert_eq!(trie_map.get("abcde"), Some(&5));
-
-        let value = trie_map.get_or_insert_default("zzzz");
-        assert_eq!(value, &0);
-        *value = 6;
-        assert_eq!(trie_map.get("zzzz"), Some(&6));
-
-        let (root_value, children) = trie_map.expand();
-
-        assert_eq!(root_value, None);
-        assert_eq!(children.len(), 3);
-        assert_eq!(children[0].0, b'a');
-        assert_eq!(children[1].0, b'b');
-        assert_eq!(children[2].0, b'z');
-
-        assert_eq!(
-            children[0].1.clone().into_iter().collect::<Vec<_>>(),
-            vec![
-                (SmallVec::from_slice("bcde".as_bytes()), 5),
-                (SmallVec::from_slice("bcdf".as_bytes()), 2),
-            ]
-        );
-
-        assert_eq!(
-            children[1].1.clone().into_iter().collect::<Vec<_>>(),
-            vec![(SmallVec::from_slice("cdf".as_bytes()), 3)]
-        );
-
-        assert_eq!(
-            children[2].1.clone().into_iter().collect::<Vec<_>>(),
-            vec![(SmallVec::from_slice("zzz".as_bytes()), 6)]
-        );
-
-        Ok(())
     }
 
     #[test]

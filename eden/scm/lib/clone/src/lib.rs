@@ -12,26 +12,18 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
-use async_runtime::block_unless_interrupted as block_on;
 use configmodel::Config;
 use configmodel::ConfigExt;
-use manifest_tree::Manifest;
-use manifest_tree::TreeManifest;
+use context::CoreContext;
 use repo::repo::Repo;
-use termlogger::TermLogger;
 use tracing::instrument;
-use treestate::treestate::TreeState;
 use types::HgId;
-use types::RepoPath;
 use util::errors::IOContext;
-use util::errors::IOError;
 use util::file::atomic_write;
 use util::path::absolute;
 use util::path::expand_path;
-use vfs::VFS;
 
 pub fn get_default_destination_directory(config: &dyn Config) -> Result<PathBuf> {
     Ok(absolute(
@@ -55,25 +47,13 @@ pub fn get_default_eden_backing_directory(config: &dyn Config) -> Result<Option<
     Ok(config.get("edenfs", "backing-repos-dir").map(expand_path))
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum WorkingCopyError {
-    #[error("No such checkout target '{0}'")]
-    NoSuchTarget(HgId),
-
-    #[error(transparent)]
-    Io(#[from] IOError),
-
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
-}
-
-#[instrument(skip(logger), err)]
+#[instrument(skip(ctx), err)]
 pub fn init_working_copy(
-    logger: &mut TermLogger,
+    ctx: &CoreContext,
     repo: &mut Repo,
     target: Option<HgId>,
     sparse_profiles: Vec<String>,
-) -> Result<(), WorkingCopyError> {
+) -> Result<()> {
     if !sparse_profiles.is_empty() {
         let mut sparse_contents: Vec<u8> = Vec::new();
         for profile in &sparse_profiles {
@@ -85,83 +65,32 @@ pub fn init_working_copy(
         })?;
     }
 
-    let target = match target {
-        Some(t) => t,
-        None => {
-            // Nothing to check out - init empty dirstate and bail.
-            let mut ts = create_treestate(repo.dot_hg_path())?;
-            checkout::clone::flush_dirstate(
-                repo.config(),
-                &mut ts,
-                repo.dot_hg_path(),
-                types::hgid::NULL_ID,
-            )?;
-            return Ok(());
-        }
-    };
+    let wc = repo.working_copy()?;
 
-    let roots = repo.dag_commits()?.read().to_dyn_read_root_tree_ids();
-    let tree_id = match block_on(roots.read_root_tree_ids(vec![target.clone()]))
-        .io_context("error blocking on read_root_tree_ids")??
-        .into_iter()
-        .next()
-    {
-        Some((_, tree_id)) => tree_id,
-        None => return Err(WorkingCopyError::NoSuchTarget(target)),
-    };
+    if let Some(target) = target {
+        let wc = wc.lock()?;
 
-    let tree_store = repo.tree_store()?;
-    let file_store = repo.file_store()?;
-
-    let source_mf = TreeManifest::ephemeral(tree_store.clone());
-    let target_mf = TreeManifest::durable(tree_store.clone(), tree_id.clone());
-
-    for profile in &sparse_profiles {
-        let path = RepoPath::from_str(profile).map_err(|e| anyhow!(e))?;
-        if matches!(target_mf.get(path)?, None) {
-            logger.warn(format!(
-                "The profile '{profile}' does not exist. Check out a commit where it exists, or remove it with '@prog@ sparse disableprofile'."
-            ));
-        }
-    }
-
-    let mut ts = create_treestate(repo.dot_hg_path())?;
-
-    match checkout::clone::checkout(
-        repo.config(),
-        repo.dot_hg_path(),
-        &source_mf,
-        &target_mf,
-        file_store.clone(),
-        &mut ts,
-        target,
-        repo.locker(),
-    ) {
-        Ok(stats) => {
-            logger.info(format!("{}", stats));
-
-            Ok(())
-        }
-        Err(err) => {
-            if err.resumable {
-                logger.info(format!(
+        if let Err(err) = checkout::checkout(
+            ctx,
+            repo,
+            &wc,
+            target,
+            checkout::BookmarkAction::None,
+            checkout::CheckoutMode::AbortIfConflicts,
+            checkout::ReportMode::Minimal,
+            true,
+        ) {
+            if ctx.config.get_or_default("checkout", "resumable")? {
+                ctx.logger.info(format!(
                     "Checkout failed. Resume with '{} checkout --continue'",
-                    logger.cli_name(),
+                    ctx.logger.cli_name(),
                 ));
             }
-
-            Err(err.source.into())
+            return Err(err);
         }
     }
-}
 
-fn create_treestate(dot_hg_path: &Path) -> Result<TreeState> {
-    let ts_dir = dot_hg_path.join("treestate");
-    Ok(TreeState::new(
-        &ts_dir,
-        VFS::new(dot_hg_path.to_path_buf())?.case_sensitive(),
-    )?
-    .0)
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -172,14 +101,42 @@ pub enum EdenCloneError {
     MissingCommandConfig(),
 }
 
+fn get_eden_clone_command(config: &dyn Config) -> Result<Command> {
+    let eden_command = config.get_opt::<String>("edenfs", "command")?;
+    match eden_command {
+        Some(cmd) => Ok(Command::new(cmd)),
+        None => Err(EdenCloneError::MissingCommandConfig().into()),
+    }
+}
+
+#[tracing::instrument]
+fn run_eden_clone_command(clone_command: &mut Command) -> Result<()> {
+    let output = clone_command
+        .output()
+        .with_context(|| format!("failed to execute {:?}", clone_command))?;
+
+    if !output.status.success() {
+        return Err(EdenCloneError::ExeuctionFailure(
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )
+        .into());
+    }
+
+    if String::from_utf8_lossy(&output.stdout)
+        .to_string()
+        .contains("edenfs daemon is not currently running")
+    {
+        tracing::debug!(target: "clone_info", edenfs_started_at_clone="true");
+    }
+    Ok(())
+}
+
 #[instrument(err)]
 pub fn eden_clone(backing_repo: &Repo, working_copy: &Path, target: Option<HgId>) -> Result<()> {
     let config = backing_repo.config();
-    let eden_command = config.get_opt::<String>("edenfs", "command")?;
-    let mut clone_command = match eden_command {
-        Some(cmd) => Command::new(cmd),
-        None => return Err(EdenCloneError::MissingCommandConfig().into()),
-    };
+
+    let mut clone_command = get_eden_clone_command(config)?;
 
     // allow tests to specify different configuration directories from prod defaults
     if let Some(base_dir) = config.get_opt::<PathBuf>("edenfs", "basepath")? {
@@ -218,28 +175,56 @@ pub fn eden_clone(backing_repo: &Repo, working_copy: &Path, target: Option<HgId>
         clone_command.arg("--allow-empty-repo");
     }
 
-    tracing::info!(?clone_command, "running edenfsctl clone");
+    // The old config value was a bool while the new config value is a String. We need to support
+    // both values until we can deprecate the old one.
+    let eden_sparse_filter = match config.must_get::<String>("clone", "eden-sparse-filter") {
+        // A non-empty string means we should activate this filter after cloning the repo.
+        // An empty string means the repo should be cloned without activating a filter.
+        Ok(val) => Some(val),
+        Err(_) => {
+            // If the old config value is true, we should use eden sparse but not activate a filter
+            if config.get_or_default::<bool>("clone", "use-eden-sparse")? {
+                Some("".to_owned())
+            } else {
+                // Otherwise we don't want to use eden sparse or activate any filters
+                None
+            }
+        }
+    };
 
-    let output = clone_command
-        .output()
-        .with_context(|| format!("failed to execute {:?}", clone_command))?;
+    // The current Eden installation may not yet support the --filter-path option. We will back-up
+    // the clone arguments and retry without --filter-path if our first clone attempt fails.
+    let args_without_filter = match eden_sparse_filter {
+        Some(filter) if !filter.is_empty() => {
+            clone_command.args(["--backing-store", "filteredhg"]);
+            let args_without_filter = clone_command
+                .get_args()
+                .map(|v| v.to_os_string())
+                .collect::<Vec<_>>();
+            clone_command.args(["--filter-path", &filter]);
+            Some(args_without_filter)
+        }
+        Some(_) => {
+            // The config didn't specify a filter, so we don't need to try to pass one.
+            clone_command.args(["--backing-store", "filteredhg"]);
+            None
+        }
+        // We aren't cloning with FilteredFS at all. No need to retry the clone if it fails.
+        None => None,
+    };
 
-    if !output.status.success() {
-        return Err(EdenCloneError::ExeuctionFailure(
-            String::from_utf8_lossy(&output.stdout).to_string(),
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        )
-        .into());
-    }
-
-    if String::from_utf8_lossy(&output.stdout)
-        .to_string()
-        .contains("edenfs daemon is not currently running")
-    {
-        tracing::debug!(target: "clone_info", edenfs_started_at_clone="true");
-    }
-
-    Ok(())
+    run_eden_clone_command(&mut clone_command).or_else(|e| {
+        // Retry the clone without the --filter-path argument
+        if let Some(args_without_filter) = args_without_filter {
+            let mut new_command = get_eden_clone_command(config)?;
+            new_command.args(args_without_filter);
+            tracing::debug!(target: "clone_info", empty_eden_filter=true);
+            run_eden_clone_command(&mut new_command)?;
+            Ok(())
+        } else {
+            Err(e)
+        }
+    })
 }
 
 #[cfg(test)]

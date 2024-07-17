@@ -1,8 +1,5 @@
-#debugruntest-compatible
 
-  $ eagerepo
-  $ hg init repo
-  $ cd repo
+  $ newclientrepo repo
   >>> with open("a", "wb") as f: f.write(b"a\n" * 213) and None
   $ hg add a
   $ cp a b

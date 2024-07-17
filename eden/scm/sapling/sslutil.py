@@ -387,6 +387,9 @@ def wrapsocket(sock, keyfile, certfile, ui, serverhostname=None):
     # choice.
     sslcontext = SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
+    if settings["verifymode"] == ssl.CERT_NONE:
+        sslcontext.check_hostname = False
+
     # This still works on our fake SSLContext.
     sslcontext.verify_mode = settings["verifymode"]
 
@@ -733,7 +736,7 @@ def _plainapplepython():
       for using system certificate store CAs in addition to the provided
       cacerts file
     """
-    if not pycompat.isdarwin or util.mainfrozen() or not pycompat.sysexecutable:
+    if not pycompat.isdarwin or not pycompat.sysexecutable:
         return False
     exe = os.path.realpath(pycompat.sysexecutable).lower()
     return exe.startswith("/usr/bin/python") or exe.startswith(

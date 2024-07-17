@@ -103,6 +103,11 @@ impl Span {
         (Id::MIN..=Id::MAX).into()
     }
 
+    /// Test if this span overlaps with another.
+    pub fn overlaps_with(&self, other: &Self) -> bool {
+        self.low <= other.high && other.low <= self.high
+    }
+
     pub(crate) fn try_from_bounds(bounds: impl RangeBounds<Id>) -> Option<Self> {
         use Bound::Excluded;
         use Bound::Included;
@@ -256,7 +261,7 @@ impl From<Id> for Span {
 
 impl<T: Into<Span>> From<T> for SpanSet {
     fn from(span: T) -> SpanSet {
-        SpanSet::from_sorted_spans(std::iter::once(span.into()))
+        SpanSet::from_single_span(span.into())
     }
 }
 
@@ -288,6 +293,12 @@ impl SpanSet {
         #[cfg(debug_assertions)]
         result.validate();
         result
+    }
+
+    /// Construct a [`SpanSet`] that contains a single span.
+    pub fn from_single_span(span: Span) -> Self {
+        let spans: VecDeque<_> = std::iter::once(span).collect();
+        Self { spans }
     }
 
     /// Construct a [`SpanSet`] containing given spans.
@@ -552,7 +563,7 @@ impl SpanSet {
 
     /// Get the maximum id in this set.
     pub fn max(&self) -> Option<Id> {
-        self.spans.get(0).map(|span| span.high)
+        self.spans.front().map(|span| span.high)
     }
 
     /// Get the minimal id in this set.
@@ -1008,7 +1019,10 @@ mod flat_id {
 #[cfg(test)]
 #[allow(clippy::redundant_clone)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
+    use crate::tests::dbg;
 
     impl From<RangeInclusive<u64>> for Span {
         fn from(range: RangeInclusive<u64>) -> Span {
@@ -1050,7 +1064,7 @@ mod tests {
     #[test]
     fn test_from_sorted_spans_merge() {
         let s = SpanSet::from_sorted_spans(vec![4..=4, 3..=3, 1..=2]);
-        assert_eq!(format!("{:?}", s), "1..=4");
+        assert_eq!(dbg(s), "1..=4");
     }
 
     #[test]
@@ -1065,7 +1079,7 @@ mod tests {
     #[test]
     fn test_skip() {
         let set = SpanSet::from_spans(vec![1..=10, 20..=20, 31..=40]);
-        let skip = |n| format!("{:?}", set.skip(n));
+        let skip = |n| dbg(set.skip(n));
         assert_eq!(skip(0), "1..=10 20 31..=40");
         assert_eq!(skip(1), "1..=10 20 31..=39");
         assert_eq!(skip(9), "1..=10 20 31");
@@ -1081,7 +1095,7 @@ mod tests {
     #[test]
     fn test_take() {
         let set = SpanSet::from_spans(vec![1..=10, 20..=20, 31..=40]);
-        let take = |n| format!("{:?}", set.take(n));
+        let take = |n| dbg(set.take(n));
         assert_eq!(take(0), "");
         assert_eq!(take(1), "40");
         assert_eq!(take(9), "32..=40");
@@ -1411,5 +1425,26 @@ mod tests {
         assert_eq!(format!("{:3?}", &set), "1..=10 20 31..=40");
         assert_eq!(format!("{:2?}", &set), "1..=10 20 and 1 span");
         assert_eq!(format!("{:1?}", &set), "1..=10 and 2 spans");
+    }
+
+    #[test]
+    fn test_span_overlaps_with() {
+        const N: u64 = 10;
+        for span1_low in 0..N {
+            for span1_high in span1_low..N {
+                for span2_low in 0..N {
+                    for span2_high in span2_low..N {
+                        let span1 = Span::new(Id(span1_low), Id(span1_high));
+                        let span2 = Span::new(Id(span2_low), Id(span2_high));
+                        let overlap_naive = (span1_low..=span1_high)
+                            .collect::<HashSet<_>>()
+                            .intersection(&(span2_low..=span2_high).collect::<HashSet<_>>())
+                            .count()
+                            > 0;
+                        assert_eq!(overlap_naive, span1.overlaps_with(&span2));
+                    }
+                }
+            }
+        }
     }
 }

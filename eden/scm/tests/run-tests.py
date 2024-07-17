@@ -46,7 +46,6 @@ from __future__ import absolute_import, print_function
 import argparse
 import collections
 import difflib
-import distutils.version as version
 import errno
 import hashlib
 import json
@@ -64,8 +63,8 @@ import tempfile
 import threading
 import time
 import unittest
-import uuid
 import xml.dom.minidom as minidom
+from pathlib import Path
 
 # If we're running in an embedded Python build, it won't add the test directory
 # to the path automatically, so let's add it manually.
@@ -89,10 +88,7 @@ except (ImportError, AttributeError):
 
     shellquote = pipes.quote
 
-try:
-    from bindings.threading import Condition as RLock
-except ImportError:
-    RLock = threading.RLock
+RLock = threading.RLock
 
 try:
     import libfb.py.pathutils as pathutils
@@ -109,6 +105,13 @@ except ImportError:
 
 from watchman import Watchman, WatchmanTimeout
 
+if os.environ.get("HGTEST_USE_EDEN", "0") == "1":
+    from edenfs import EdenFsManager
+
+    use_edenfs = True
+else:
+    use_edenfs = False
+
 if os.environ.get("RTUNICODEPEDANTRY", False):
     try:
         reload(sys)
@@ -117,7 +120,6 @@ if os.environ.get("RTUNICODEPEDANTRY", False):
         pass
 
 origenviron = os.environ.copy()
-processlock = threading.Lock()
 
 pygmentspresent = False
 # ANSI color is unsupported prior to Windows 10
@@ -197,6 +199,7 @@ else:
 # For Windows support
 wifexited = getattr(os, "WIFEXITED", lambda x: False)
 
+
 # Whether to use IPv6
 def checksocketfamily(name, port=20058):
     """return true if we can listen on localhost using family=name
@@ -263,19 +266,18 @@ else:
 
 def Popen4(cmd, wd, timeout, env=None):
     shell = not isinstance(cmd, list)
-    with processlock:
-        p = subprocess.Popen(
-            cmd,
-            shell=shell,
-            bufsize=-1,
-            cwd=wd,
-            env=env,
-            close_fds=closefds,
-            preexec_fn=preexec,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
+    p = subprocess.Popen(
+        cmd,
+        shell=shell,
+        bufsize=-1,
+        cwd=wd,
+        env=env,
+        close_fds=closefds,
+        preexec_fn=preexec,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
 
     p.fromchild = p.stdout
     p.tochild = p.stdin
@@ -288,12 +290,12 @@ def Popen4(cmd, wd, timeout, env=None):
         def t():
             start = time.time()
             while time.time() - start < timeout and p.returncode is None:
-                time.sleep(0.1)
+                time.sleep(5)
             p.timeout = True
             if p.returncode is None:
                 terminate(p)
 
-        threading.Thread(target=t).start()
+        threading.Thread(target=t, name=f"Timeout tracker {cmd=}", daemon=True).start()
 
     return p
 
@@ -374,7 +376,11 @@ def compatiblewithdebugruntest(path):
     """check whether a .t test is compatible with debugruntest"""
     try:
         with open(path, "r", encoding="utf8") as f:
-            return "#debugruntest-compatible" in f.read(1024)
+            contents = f.read(1024)
+            return "#debugruntest-compatible" in contents or (
+                os.environ.get("DEBUGRUNTEST_DEFAULT_DISABLED") != "1"
+                and "#debugruntest-incompatible" not in contents
+            )
     except IOError as ex:
         if ex.errno != errno.ENOENT:
             raise
@@ -581,12 +587,6 @@ def getparser():
         help="use IPv4 for network related tests",
     )
     hgconf.add_argument(
-        "-3",
-        "--py3k-warnings",
-        action="store_true",
-        help="enable Py3k warnings on Python 2.7+",
-    )
-    hgconf.add_argument(
         "--record",
         action="store_true",
         help="track $TESTTMP changes in git (implies --keep-tmpdir)",
@@ -598,13 +598,6 @@ def getparser():
     )
     hgconf.add_argument(
         "--with-watchman", metavar="WATCHMAN", help="test using specified watchman"
-    )
-    # This option should be deleted once test-check-py3-compat.t and other
-    # Python 3 tests run with Python 3.
-    hgconf.add_argument(
-        "--with-python3",
-        metavar="PYTHON3",
-        help="Python 3 interpreter (if running under Python 2) (TEMPORARY)",
     )
 
     reporting = parser.add_argument_group("Results Reporting")
@@ -730,9 +723,7 @@ def parseargs(args, parser):
         try:
             import coverage
 
-            covver = version.StrictVersion(coverage.__version__).version
-            if covver < (3, 3):
-                parser.error("coverage options require coverage 3.3 or later")
+            coverage.__version__
         except ImportError:
             parser.error("coverage options now require the coverage package")
 
@@ -746,6 +737,9 @@ def parseargs(args, parser):
     global verbose
     if options.verbose:
         verbose = ""
+
+    try_increase_open_file_limit()
+    setup_sigtrace()
 
     if options.tmpdir:
         options.tmpdir = canonpath(options.tmpdir)
@@ -770,31 +764,6 @@ def parseargs(args, parser):
             "ui.interactive=1",
             "ui.paginate=0",
         ]
-    if options.py3k_warnings:
-        if PYTHON3:
-            parser.error("--py3k-warnings can only be used on Python 2.7")
-    if options.with_python3:
-        if PYTHON3:
-            parser.error("--with-python3 cannot be used when executing with Python 3")
-
-        options.with_python3 = canonpath(options.with_python3)
-        # Verify Python3 executable is acceptable.
-        proc = subprocess.Popen(
-            [options.with_python3, "--version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        out, _err = proc.communicate()
-        ret = proc.wait()
-        if ret != 0:
-            parser.error("could not determine version of python 3")
-        if not out.startswith("Python "):
-            parser.error("unexpected output from python3 --version: %s" % out)
-        vers = version.LooseVersion(out[len("Python ") :])
-        if vers < version.LooseVersion("3.5.0"):
-            parser.error(
-                "--with-python3 version must be 3.5.0 or greater; got %s" % out
-            )
 
     if options.blacklist:
         options.blacklist = parselistfiles(options.blacklist, "blacklist")
@@ -811,6 +780,25 @@ def parseargs(args, parser):
         showprogress = False
 
     return options
+
+
+def try_increase_open_file_limit():
+    try:
+        import resource
+
+        old_soft, old_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if old_soft < 1_048_576:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (old_hard, old_hard))
+        new_soft, new_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        vlog(
+            "Maximum number of open file descriptors:"
+            f" old(soft_limit={old_soft}, hard_limit={old_hard}),"
+            f" new(soft_limit={new_soft}, hard_limit={new_hard}),"
+        )
+    except Exception:
+        # `resource` module only avaible on unix-like platforms (Linux, Mac)
+        # Windows does not have the open file descriptors limit issue.
+        pass
 
 
 def rename(src, dst):
@@ -851,6 +839,15 @@ def getdiff(expected, output, ref, err):
         ):
             servefail = True
 
+        # mactest may have too many open files issue due to system settings,
+        # let's skip them. It should be okay since we have tests on Linux.
+        if (
+            line.startswith(b"+")
+            and b"Too many open files" in line
+            and sys.platform == "darwin"
+        ):
+            raise unittest.SkipTest("Too many open files")
+
     return servefail, lines
 
 
@@ -863,6 +860,39 @@ def vlog(*msg):
         return
 
     return log(*msg)
+
+
+def setup_sigtrace():
+    if os.name == "nt":
+        return
+
+    import traceback
+
+    def printstacks(sig, currentframe) -> None:
+        path = os.path.join(
+            tempfile.gettempdir(), f"trace-{os.getpid()}-{int(time.time())}.log"
+        )
+        writesigtrace(path)
+
+    def writesigtrace(path) -> None:
+        content = ""
+        tid_name = {t.ident: t.name for t in threading.enumerate()}
+        for tid, frame in sys._current_frames().items():
+            tb = "".join(traceback.format_stack(frame))
+            content += f"Thread {tid_name.get(tid) or 'unnamed'} {tid}:\n{tb}\n"
+
+        with open(path, "w") as f:
+            f.write(content)
+
+        # Also print to stderr
+        sys.stderr.write(content)
+        sys.stderr.write("\nStacktrace written to %s\n" % path)
+        sys.stderr.flush()
+
+    sig = getattr(signal, "SIGUSR1")
+    if sig is not None:
+        signal.signal(sig, printstacks)
+        vlog("sigtrace: use 'kill -USR1 %d' to dump stacktrace\n" % os.getpid())
 
 
 # Bytes that break XML even in a CDATA block: control characters 0-31
@@ -1030,7 +1060,6 @@ class Test(unittest.TestCase):
         startport=None,
         extraconfigopts=None,
         extrarcpaths=None,
-        py3kwarnings=False,
         shell=None,
         hgcommand=None,
         slowtimeout=None,
@@ -1069,8 +1098,6 @@ class Test(unittest.TestCase):
         extrarcpaths is an iterable for extra hgrc paths (files or
         directories).
 
-        py3kwarnings enables Py3k warnings.
-
         shell is the shell to execute tests in.
         """
         if timeout is None:
@@ -1096,7 +1123,6 @@ class Test(unittest.TestCase):
         self._startport = startport
         self._extraconfigopts = extraconfigopts or []
         self._extrarcpaths = extrarcpaths or []
-        self._py3kwarnings = py3kwarnings
         self._shell = shell
         self._hgcommand = hgcommand or "hg"
         self._usechg = usechg
@@ -1179,12 +1205,17 @@ class Test(unittest.TestCase):
             shortname = hashlib.sha1(_bytespath("%s" % name)).hexdigest()[:6]
             self._watchmandir = os.path.join(self._threadtmp, "%s.watchman" % shortname)
             os.mkdir(self._watchmandir)
-            self._watchmanproc = Watchman(self._watchman, self._watchmandir)
+            self._watchmanproc = Watchman(self._watchman, Path(self._watchmandir))
             try:
                 self._watchmanproc.start()
             except WatchmanTimeout:
                 self.tearDown()
                 raise RuntimeError("timed out waiting for watchman")
+
+        if use_edenfs:
+            shortname = hashlib.sha1(_bytespath("%s" % name)).hexdigest()[:6]
+            self._edenfsdir = Path(self._threadtmp) / f"{shortname}.edenfs"
+            self._edenfsmanager = EdenFsManager(self._edenfsdir)
 
     def run(self, result):
         """Run this test and report results against a TestResult instance."""
@@ -1304,13 +1335,12 @@ class Test(unittest.TestCase):
                         f.write(line)
 
             # The result object handles diff calculation for us.
-            with firstlock:
-                if self._result.addOutputMismatch(self, ret, out, self._refout):
-                    # change was accepted, skip failing
-                    return
-                if self._first:
-                    global firsterror
-                    firsterror = True
+            if self._result.addOutputMismatch(self, ret, out, self._refout):
+                # change was accepted, skip failing
+                return
+            if self._first:
+                global firsterror
+                firsterror = True
 
             if ret:
                 msg = "output changed and " + describe(ret)
@@ -1350,6 +1380,17 @@ class Test(unittest.TestCase):
                     )
                 else:
                     shutil.rmtree(self._watchmandir, ignore_errors=True)
+            except Exception:
+                pass
+
+        if use_edenfs:
+            try:
+                self._edenfsmanager.eden.kill()
+                if self._keeptmpdir:
+                    log(f"Keeping edenfs dir: {self._edenfsmanager.test_dir}\n")
+                else:
+                    self._edenfsmanager.eden.cleanup()
+                    shutil.rmtree(self._edenfsmanager.test_dir, ignore_errors=True)
             except Exception:
                 pass
 
@@ -1407,6 +1448,11 @@ class Test(unittest.TestCase):
             ),
             # [ipv4]
             (rb"([^0-9])%s" % re.escape(_bytespath(self._localip())), rb"\1$LOCALIP"),
+            # localhost:port
+            (
+                rb"([^0-9])localhost:[0-9]+",
+                rb"\1localhost:$LOCAL_PORT",
+            ),
             (rb"\bHG_TXNID=TXN:[a-f0-9]{40}\b", rb"HG_TXNID=TXN:$ID$"),
         ]
         r.append((_bytespath(self._escapepath(self._testtmp)), b"$TESTTMP"))
@@ -1524,7 +1570,6 @@ class Test(unittest.TestCase):
         # the tests produce repeatable output.
         env["LANG"] = env["LC_ALL"] = env["LANGUAGE"] = self._options.locale
         env["TZ"] = "GMT"
-        env["EMAIL"] = "Foo Bar <foo.bar@example.com>"
         env["COLUMNS"] = "80"
 
         # Claim that 256 colors is not supported.
@@ -1539,7 +1584,7 @@ class Test(unittest.TestCase):
         keys_to_del = (
             "HG HGPROF CDPATH GREP_OPTIONS http_proxy no_proxy "
             + "HGPLAIN HGPLAINEXCEPT EDITOR VISUAL PAGER "
-            + "NO_PROXY CHGDEBUG HGDETECTRACE RUST_BACKTRACE RUST_LIB_BACKTRACE "
+            + "NO_PROXY CHGDEBUG RUST_BACKTRACE RUST_LIB_BACKTRACE "
             + " EDENSCM_TRACE_LEVEL EDENSCM_TRACE_OUTPUT"
             + " EDENSCM_TRACE_PY TRACING_DATA_FAKE_CLOCK"
             + " EDENSCM_LOG LOG FAILPOINTS"
@@ -1622,21 +1667,33 @@ class Test(unittest.TestCase):
             killdaemons(env["DAEMON_PIDS"])
             return ret
 
-        output = b""
         proc.tochild.close()
+        lines = []
 
         try:
             f = proc.fromchild
             while True:
-                line = f.readline()
+                # defend against very long line outputs
+                line = f.readline(5000)
                 # Make the test abort faster if other tests are Ctrl+C-ed.
                 # Code path: for test in runtests: test.abort()
                 if self._aborted:
                     raise KeyboardInterrupt()
+                if not line:
+                    break
                 if linecallback:
                     linecallback(line)
-                output += line
-                if not line:
+                lines.append(line)
+                if len(lines) > 50000:
+                    log(f"Test command '{cmd}' outputs too many lines")
+                    cleanup()
+                    break
+
+                # defend against very large outputs
+                # 10_000_000 = 50_000 * 200 (assuming each line has 200 bytes)
+                if sum(len(s) for s in lines) > 10_000_000:
+                    log(f"Test command '{cmd}' outputs too large")
+                    cleanup()
                     break
 
         except KeyboardInterrupt:
@@ -1646,6 +1703,8 @@ class Test(unittest.TestCase):
 
         finally:
             proc.fromchild.close()
+
+        output = b"".join(lines)
 
         ret = proc.wait()
         if wifexited(ret):
@@ -1835,7 +1894,8 @@ class TTest(Test):
 
     def _computehghave(self, reqs):
         # TODO do something smarter when all other uses of hghave are gone.
-        runtestdir = os.path.abspath(os.path.dirname(__file__))
+        if (runtestdir := os.environ.get("RUNTESTDIR", None)) is None:
+            runtestdir = os.path.abspath(os.path.dirname(__file__))
         tdir = runtestdir.replace("\\", "/")
         proc = Popen4(
             '%s debugpython -- "%s/hghave" %s'
@@ -2253,6 +2313,9 @@ class DebugRunTestTest(Test):
         return os.path.join(self._testdir, self.basename)
 
     def _run(self, env):
+        if use_edenfs:
+            self._edenfsmanager.start(env)
+
         cmdargs = [
             self._hgcommand,
             "debugpython",
@@ -2284,10 +2347,25 @@ class DebugRunTestTest(Test):
         return exitcode, out
 
 
-firstlock = RLock()
 firsterror = False
 
-_iolock = RLock()
+
+class NoopLock:
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        pass
+
+    def acquire(self):
+        pass
+
+    def release(self):
+        pass
+
+
+showprogress = sys.stderr.isatty()
+_iolock = showprogress and RLock() or NoopLock()
 
 
 class Progress:
@@ -2328,7 +2406,6 @@ class Progress:
 
 
 progress = Progress()
-showprogress = sys.stderr.isatty()
 
 if os.name == "nt":
     import ctypes
@@ -2387,16 +2464,19 @@ if showprogress and os.name == "nt":
 class IOLockWithProgress:
     def __enter__(self):
         _iolock.acquire()
-        progress.clear()
+        try:
+            progress.clear()
+        except:  # no re-raises
+            _iolock.release()
 
     def __exit__(self, exc_type, exc_value, traceback):
         _iolock.release()
 
 
-iolock = IOLockWithProgress()
+iolock = showprogress and IOLockWithProgress() or _iolock
 
 
-class TestResult(unittest._TextTestResult):
+class TestResult(unittest.TextTestResult):
     """Holds results when executing via unittest."""
 
     # Don't worry too much about accessing the non-public _TextTestResult.
@@ -2453,7 +2533,7 @@ class TestResult(unittest._TextTestResult):
 
     def addSuccess(self, test):
         if showprogress and not self.showAll:
-            super(unittest._TextTestResult, self).addSuccess(test)
+            super(unittest.TextTestResult, self).addSuccess(test)
         else:
             with iolock:
                 super(TestResult, self).addSuccess(test)
@@ -2461,7 +2541,7 @@ class TestResult(unittest._TextTestResult):
 
     def addError(self, test, err):
         if showprogress and not self.showAll:
-            super(unittest._TextTestResult, self).addError(test, err)
+            super(unittest.TextTestResult, self).addError(test, err)
         else:
             with iolock:
                 super(TestResult, self).addError(test, err)
@@ -2989,7 +3069,12 @@ class TextTestRunner(unittest.TextTestRunner):
                     self.stream.write("\n")
                     # Also write the file names to temporary files.  So it can be
                     # used in adhoc scripts like `hg revert $(cat .testfailed)`.
-                    with open(".test%s" % title.lower(), "a") as f:
+                    testsdir = os.path.abspath(os.path.dirname(__file__))
+                    if not os.path.exists(testsdir):
+                        # It's possible for the current directory to not exist if tests are run using Buck
+                        testsdir = ""
+                    filepath = os.path.join(testsdir, f".test{title.lower()}")
+                    with open(filepath, "a") as f:
                         for name in names:
                             f.write(name + "\n")
                         f.write("\n")
@@ -3461,11 +3546,13 @@ class TestRunner:
         os.environ["TMPBINDIR"] = self._tmpbindir
         os.environ["PYTHON"] = PYTHON
 
-        if self.options.with_python3:
-            os.environ["PYTHON3"] = self.options.with_python3
-
-        runtestdir = os.path.abspath(os.path.dirname(__file__))
-        os.environ["RUNTESTDIR"] = runtestdir
+        # One of our Buck targets sets this env var pointing to all the misc.
+        # files under tests/ including the .t tests themselves. run-tests.py
+        # directly tries to launch files like tinit.sh, so we need to help
+        # it to find these files.
+        if (runtestdir := os.environ.get("RUNTESTDIR", None)) is None:
+            runtestdir = os.path.abspath(os.path.dirname(__file__))
+            os.environ["RUNTESTDIR"] = runtestdir
         path = [self._bindir, runtestdir] + os.environ["PATH"].split(os.pathsep)
         if os.path.islink(__file__):
             # test helper will likely be at the end of the symlink
@@ -3518,6 +3605,8 @@ class TestRunner:
                 "extensions.logexceptions=%s" % logexceptions.decode("utf-8")
             )
 
+        vlog(f"# Show progress: {showprogress}")
+        vlog(f"# IO lock: {type(_iolock).__name__}")
         vlog("# Using TESTDIR", self._testdir)
         vlog("# Using RUNTESTDIR", os.environ["RUNTESTDIR"])
         vlog("# Using HGTMP", self._hgtmp)
@@ -3547,6 +3636,16 @@ class TestRunner:
         If you wish to inject custom tests into the test harness, this would
         be a good function to monkeypatch or override in a derived class.
         """
+
+        def transform_test_basename(path):
+            """transform test_revert_t to test-revert.t"""
+            dirname, basename = os.path.split(path)
+            if basename.startswith("test_") and basename.endswith("_t"):
+                basename = basename[:-2].replace("_", "-") + ".t"
+                return os.path.join(dirname, basename)
+            else:
+                return path
+
         if not args:
             if self.options.changed:
                 proc = Popen4(
@@ -3569,6 +3668,7 @@ class TestRunner:
 
         tests = []
         for t in args:
+            t = transform_test_basename(t)
             if not (
                 os.path.basename(t).startswith("test-")
                 and (t.endswith(".py") or t.endswith(".t"))
@@ -3748,7 +3848,6 @@ class TestRunner:
             startport=self._getport(count),
             extraconfigopts=self.options.extra_config_opt,
             extrarcpaths=self.options.extra_rcpath,
-            py3kwarnings=self.options.py3k_warnings,
             shell=self.options.shell,
             hgcommand=self._hgcommand,
             usechg=self.options.chg,
@@ -3901,15 +4000,6 @@ class TestRunner:
 
         self._usecorrectpython()
 
-        if self.options.py3k_warnings and not self.options.anycoverage:
-            vlog("# Updating hg command to enable Py3k Warnings switch")
-            with open(os.path.join(self._bindir, "hg"), "rb") as f:
-                lines = [line.rstrip() for line in f]
-                lines[0] += " -3"
-            with open(os.path.join(self._bindir, "hg"), "wb") as f:
-                for line in lines:
-                    f.write(line + "\n")
-
         hgbat = os.path.join(self._bindir, "hg.bat")
         if os.path.isfile(hgbat):
             # hg.bat expects to be put in bin/scripts while run-tests.py
@@ -4020,9 +4110,7 @@ class TestRunner:
             if found:
                 vlog("# Found prerequisite", p, "at", found)
             else:
-                print(
-                    "WARNING: Did not find prerequisite tool: %s " % p.decode("utf-8")
-                )
+                print("WARNING: Did not find prerequisite tool: %s " % p)
 
 
 def aggregateexceptions(path):
@@ -4052,10 +4140,41 @@ def ensureenv():
     """
     hgdir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     envpath = os.path.join(hgdir, "build", "env")
-    if not os.path.exists(envpath):
+    skipensureenv = "HGRUNTEST_SKIP_ENV" in os.environ
+    iswindows = os.name == "nt"
+    if (skipensureenv and not iswindows) or not os.path.exists(envpath):
         return
     with open(envpath, "r") as f:
         env = dict(l.split("=", 1) for l in f.read().splitlines() if "=" in l)
+
+    # A minority of our old non-debugruntest tests still rely on being able to
+    # run bash commands plus having commands like `less` available. On our CI
+    # this is not an issue, since those are already part of our path there.
+    # However, locally we usually don't have those on our path so let's try
+    # to get them from the list of env bars in ../build/env and relaunch this
+    # with that appended to our path. Note that in this case we cannot simply
+    # keep loading all the environment variables from `build/env`, since running
+    # run-tests.py as a Buck target generates a .par file. When this
+    # run-tests.py is built and run as a par, the par logic will modify PATH and
+    # other library and Python-related environment variables at startup.
+    # Changing the Python-related and library ones can prevent the .par from
+    # properly running in the first place, while the PATH one can make it loop.
+    # The modified PATH will trick ensureenv to relaunch with a different PATH,
+    # and enter an infinite loop of (par modifies PATH, ensureenv modifies PATH
+    # and relaunch). To avoid the loop we use a separate env var to tell
+    # ensureenv to skip.
+    if skipensureenv and iswindows:
+        esep = ";"
+        ppath = os.path.join("fbcode", "eden", "scm", "build", "bin")
+        k = "PATH"
+        origpath = os.environ[k]
+        newpath = esep.join([p for p in env[k].split(esep) if ppath in p])
+        if newpath and newpath not in origpath:
+            newpath += esep + origpath
+        else:
+            newpath = origpath
+        env = {k: newpath}
+
     if all(os.environ.get(k) == v for k, v in env.items()):
         # No restart needed
         return
@@ -4078,7 +4197,7 @@ def os_times():
     return times
 
 
-if __name__ == "__main__":
+def main() -> None:
     ensureenv()
     runner = TestRunner()
 
@@ -4092,3 +4211,7 @@ if __name__ == "__main__":
         pass
 
     sys.exit(runner.run(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    main()  # pragma: no cover

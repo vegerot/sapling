@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 Test applying context diffs
 

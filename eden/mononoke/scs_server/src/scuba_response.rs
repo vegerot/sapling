@@ -20,6 +20,8 @@ pub(crate) trait AddScubaResponse: Send + Sync {
 
 impl AddScubaResponse for bool {}
 
+impl AddScubaResponse for i64 {}
+
 impl AddScubaResponse for Vec<thrift::Repo> {}
 
 impl AddScubaResponse for thrift::RepoInfo {}
@@ -109,6 +111,8 @@ impl AddScubaResponse for thrift::CommitLookupResponse {}
 impl AddScubaResponse for thrift::CommitLookupPushrebaseHistoryResponse {}
 
 impl AddScubaResponse for thrift::CommitHistoryResponse {}
+
+impl AddScubaResponse for thrift::CommitLinearHistoryResponse {}
 
 impl AddScubaResponse for thrift::CommitListDescendantBookmarksResponse {}
 
@@ -236,6 +240,13 @@ impl AddScubaResponse for thrift::MegarepoSyncChangesetToken {
     }
 }
 
-impl AddScubaResponse for thrift::UploadGitObjectResponse {}
+impl AddScubaResponse for thrift::RepoUploadNonBlobGitObjectResponse {}
 impl AddScubaResponse for thrift::CreateGitTreeResponse {}
 impl AddScubaResponse for thrift::CreateGitTagResponse {}
+impl AddScubaResponse for thrift::RepoUploadPackfileBaseItemResponse {}
+
+impl AddScubaResponse for thrift::RepoStackGitBundleStoreResponse {
+    fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("bundle_handle", self.everstore_handle.as_ref());
+    }
+}

@@ -16,10 +16,8 @@ import {
   closeCommitInfoSidebar,
   simulateMessageFromServer,
 } from '../testUtils';
-import {fireEvent, render, screen} from '@testing-library/react';
-import {act} from 'react-dom/test-utils';
-
-jest.mock('../MessageBus');
+import {ConflictType} from '../types';
+import {fireEvent, render, screen, act} from '@testing-library/react';
 
 describe('CommitTreeList', () => {
   beforeEach(() => {
@@ -31,7 +29,7 @@ describe('CommitTreeList', () => {
         value: [
           COMMIT('1', 'some public base', '0', {phase: 'public'}),
           COMMIT('a', 'My Commit', '1'),
-          COMMIT('b', 'Another Commit', 'a', {isHead: true}),
+          COMMIT('b', 'Another Commit', 'a', {isDot: true}),
         ],
       });
       simulateUncommittedChangedFiles({
@@ -77,8 +75,8 @@ describe('CommitTreeList', () => {
             toContinue: 'rebase --continue',
             toAbort: 'rebase --abort',
             files: [
-              {path: 'src/file2.js', status: 'U'},
-              {path: 'src/file3.js', status: 'Resolved'},
+              {path: 'src/file2.js', status: 'U', conflictType: ConflictType.BothChanged},
+              {path: 'src/file3.js', status: 'Resolved', conflictType: ConflictType.BothChanged},
             ],
             fetchStartTimestamp: 1,
             fetchCompletedTimestamp: 2,
@@ -118,8 +116,8 @@ describe('CommitTreeList', () => {
             toContinue: 'rebase --continue',
             toAbort: 'rebase --abort',
             files: [
-              {path: 'src/file2.js', status: 'Resolved'},
-              {path: 'src/file3.js', status: 'Resolved'},
+              {path: 'src/file2.js', status: 'Resolved', conflictType: ConflictType.BothChanged},
+              {path: 'src/file3.js', status: 'Resolved', conflictType: ConflictType.BothChanged},
             ],
             fetchStartTimestamp: 1,
             fetchCompletedTimestamp: 2,

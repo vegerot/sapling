@@ -1,6 +1,7 @@
-#debugruntest-compatible
 
-  $ configure modernclient
+#require no-eden
+
+
   $ newclientrepo
 
   $ setconfig merge.followcopies=1
@@ -23,23 +24,9 @@
   $ hg ci -m "modify"
 
   $ hg merge -y --debug
-    searching for copies back to 85c198ef2f6c
-    unmatched files in local:
-     c2
-    unmatched files in other:
-     b
-     b2
-    all copies found (* = to merge, ! = divergent, % = renamed and deleted):
-     src: 'a' -> dst: 'b' *
-     src: 'a2' -> dst: 'b2' !
-     src: 'a2' -> dst: 'c2' !
-    checking for directory renames
   resolving manifests
    branchmerge: True, force: False
    ancestor: af1939970a1c, local: 044f8520aeeb+, remote: 85c198ef2f6c
-  note: possible conflict - a2 was renamed multiple times to:
-   c2
-   b2
    preserving a for resolve of b
   removing a
    b: remote moved from a -> m (premerge)
@@ -73,7 +60,7 @@ This used to trigger a "divergent renames" warning, despite no renames
   $ hg ci -A -m 'copy b twice'
   $ hg up eb92d88a9712
   0 files updated, 0 files merged, 2 files removed, 0 files unresolved
-  $ hg up
+  $ hg up tip
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ hg rm b3 b4
   $ hg ci -m 'clean up a bit of our mess'
@@ -85,7 +72,7 @@ We'd rather not warn on divergent renames done in the same changeset (issue2113)
   $ hg ci -A -m 'divergent renames in same changeset'
   $ hg up c761c6948de0
   1 files updated, 0 files merged, 2 files removed, 0 files unresolved
-  $ hg up
+  $ hg up tip
   2 files updated, 0 files merged, 1 files removed, 0 files unresolved
 
 Check for issue2642
@@ -159,17 +146,9 @@ Check for issue3074
   $ hg rm file
   $ hg commit -m "deleted file"
   $ hg merge --debug
-    searching for copies back to 5d32493049f0
-    unmatched files in other:
-     newfile
-    all copies found (* = to merge, ! = divergent, % = renamed and deleted):
-     src: 'file' -> dst: 'newfile' %
-    checking for directory renames
   resolving manifests
    branchmerge: True, force: False
    ancestor: 19d7f95df299, local: 0084274f6b67+, remote: 5d32493049f0
-  note: possible conflict - file was deleted and renamed to:
-   newfile
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   (branch merge, don't forget to commit)
   $ hg status

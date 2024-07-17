@@ -7,12 +7,17 @@
 
 import type {Hash} from '../../types';
 
-import {commitFieldsBeingEdited, editedCommitMessages} from '../../CommitInfoView/CommitInfoState';
-import {Tooltip, DOCUMENTATION_DELAY} from '../../Tooltip';
+import {
+  editedCommitMessages,
+  getDefaultEditedCommitMessage,
+} from '../../CommitInfoView/CommitInfoState';
 import {T, t} from '../../i18n';
+import {writeAtom} from '../../jotaiUtils';
 import {ImportStackOperation} from '../../operations/ImportStackOperation';
 import {RebaseOperation} from '../../operations/RebaseOperation';
-import {latestCommitTreeMap, latestHeadCommit, useRunOperation} from '../../serverAPIState';
+import {useRunOperation} from '../../operationsState';
+import {latestDag, latestHeadCommit} from '../../serverAPIState';
+import {exactRevset, succeedableRevset} from '../../types';
 import {UndoDescription} from './StackEditSubTree';
 import {
   bumpStackEditMetric,
@@ -20,14 +25,16 @@ import {
   sendStackEditMetrics,
   useStackEditState,
 } from './stackEditState';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilCallback, useRecoilState, useRecoilValue} from 'recoil';
-import {Icon} from 'shared/Icon';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip, DOCUMENTATION_DELAY} from 'isl-components/Tooltip';
+import {useAtom, useAtomValue} from 'jotai';
+import {useCallback} from 'react';
 
 export function StackEditConfirmButtons(): React.ReactElement {
-  const [[stackIntention], setStackIntentionHashes] = useRecoilState(editingStackIntentionHashes);
-  const originalHead = useRecoilValue(latestHeadCommit);
-  const latestTreeMap = useRecoilValue(latestCommitTreeMap);
+  const [[stackIntention], setStackIntentionHashes] = useAtom(editingStackIntentionHashes);
+  const originalHead = useAtomValue(latestHeadCommit);
+  const dag = useAtomValue(latestDag);
   const runOperation = useRunOperation();
   const stackEdit = useStackEditState();
 
@@ -53,16 +60,11 @@ export function StackEditConfirmButtons(): React.ReactElement {
    * but we actually need to delete them now that we're really
    * doing the split/edit stack.
    */
-  const invalidateUnsavedCommitMessages = useRecoilCallback(
-    ({reset}) =>
-      (commits: Array<Hash>) => {
-        for (const hash of commits) {
-          reset(editedCommitMessages(hash));
-        }
-        reset(commitFieldsBeingEdited);
-      },
-    [],
-  );
+  const invalidateUnsavedCommitMessages = useCallback((commits: Array<Hash>) => {
+    for (const hash of commits) {
+      writeAtom(editedCommitMessages(hash), getDefaultEditedCommitMessage());
+    }
+  }, []);
 
   const handleSaveChanges = () => {
     const originalHash = originalHead?.hash;
@@ -70,7 +72,7 @@ export function StackEditConfirmButtons(): React.ReactElement {
       goto: originalHash,
       rewriteDate: Date.now() / 1000,
     });
-    const op = new ImportStackOperation(importStack);
+    const op = new ImportStackOperation(importStack, stackEdit.commitStack.originalStack);
     runOperation(op);
     sendStackEditMetrics(true);
 
@@ -83,11 +85,11 @@ export function StackEditConfirmButtons(): React.ReactElement {
     // it handle pending changes just fine.
     const stackTop = stackEdit.commitStack.originalStack.at(-1)?.node;
     if (stackIntention === 'split' && stackTop != null) {
-      const children = latestTreeMap.get(stackTop)?.children?.map(c => c.info.hash);
-      if (children != null && children.length > 0) {
+      const children = dag.children(stackTop);
+      if (children.size > 0) {
         const rebaseOp = new RebaseOperation(
-          children.join('|'),
-          stackTop /* stack top of the new successor */,
+          exactRevset(children.toArray().join('|')),
+          succeedableRevset(stackTop) /* stack top of the new successor */,
         );
         runOperation(rebaseOp);
       }
@@ -115,9 +117,9 @@ export function StackEditConfirmButtons(): React.ReactElement {
           )
         }
         placement="bottom">
-        <VSCodeButton appearance="icon" disabled={!canUndo} onClick={handleUndo}>
+        <Button icon disabled={!canUndo} onClick={handleUndo}>
           <Icon icon="discard" />
-        </VSCodeButton>
+        </Button>
       </Tooltip>
       <Tooltip
         component={() =>
@@ -130,20 +132,17 @@ export function StackEditConfirmButtons(): React.ReactElement {
           )
         }
         placement="bottom">
-        <VSCodeButton appearance="icon" disabled={!canRedo} onClick={handleRedo}>
+        <Button icon disabled={!canRedo} onClick={handleRedo}>
           <Icon icon="redo" />
-        </VSCodeButton>
+        </Button>
       </Tooltip>
       <Tooltip
         title={stackIntention === 'split' ? t('Cancel split') : t('Discard stack editing changes')}
         delayMs={DOCUMENTATION_DELAY}
         placement="bottom">
-        <VSCodeButton
-          className="cancel-edit-stack-button"
-          appearance="secondary"
-          onClick={handleCancel}>
+        <Button className="cancel-edit-stack-button" onClick={handleCancel}>
           <T>Cancel</T>
-        </VSCodeButton>
+        </Button>
       </Tooltip>
       <Tooltip
         title={
@@ -151,12 +150,13 @@ export function StackEditConfirmButtons(): React.ReactElement {
         }
         delayMs={DOCUMENTATION_DELAY}
         placement="bottom">
-        <VSCodeButton
+        <Button
           className="confirm-edit-stack-button"
-          appearance="primary"
+          data-testid="confirm-edit-stack-button"
+          primary
           onClick={handleSaveChanges}>
           {stackIntention === 'split' ? <T>Split</T> : <T>Save changes</T>}
-        </VSCodeButton>
+        </Button>
       </Tooltip>
     </>
   );

@@ -5,18 +5,20 @@
  * GNU General Public License version 2.
  */
 
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use cached_config::ConfigStore;
+use blobstore_factory::ReadOnlyStorage;
 use context::CoreContext;
 use fbinit::FacebookInit;
-use megarepo_configs::types::SyncConfigVersion;
-use megarepo_configs::types::SyncTargetConfig;
-use megarepo_configs::types::Target;
+use megarepo_configs::SyncConfigVersion;
+use megarepo_configs::SyncTargetConfig;
+use megarepo_configs::Target;
 use megarepo_error::MegarepoError;
+use metaconfig_types::RepoConfig;
 use slog::warn;
 use slog::Logger;
+use sql_ext::facebook::MysqlOptions;
 
 use crate::MononokeMegarepoConfigs;
 
@@ -31,8 +33,8 @@ impl CfgrMononokeMegarepoConfigs {
     pub fn new(
         _fb: FacebookInit,
         logger: &Logger,
-        _config_store: ConfigStore,
-        _test_write_path: Option<PathBuf>,
+        _mysql_options: MysqlOptions,
+        _readonly_storage: ReadOnlyStorage,
     ) -> Result<Self, MegarepoError> {
         warn!(
             logger,
@@ -47,17 +49,10 @@ impl CfgrMononokeMegarepoConfigs {
 
 #[async_trait]
 impl MononokeMegarepoConfigs for CfgrMononokeMegarepoConfigs {
-    fn get_target_config_versions(
+    async fn get_config_by_version(
         &self,
         _ctx: CoreContext,
-        _target: Target,
-    ) -> Result<Vec<SyncConfigVersion>, MegarepoError> {
-        unimplemented!("OSS CfgrMononokeMegarepoConfigs::get_target_config_versions")
-    }
-
-    fn get_config_by_version(
-        &self,
-        _ctx: CoreContext,
+        _repo_config: Arc<RepoConfig>,
         _target: Target,
         _version: SyncConfigVersion,
     ) -> Result<SyncTargetConfig, MegarepoError> {
@@ -67,6 +62,7 @@ impl MononokeMegarepoConfigs for CfgrMononokeMegarepoConfigs {
     async fn add_config_version(
         &self,
         _ctx: CoreContext,
+        _repo_config: Arc<RepoConfig>,
         _config: SyncTargetConfig,
     ) -> Result<(), MegarepoError> {
         unimplemented!("OSS CfgrMononokeMegarepoConfigs::add_config_version")

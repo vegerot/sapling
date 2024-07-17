@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::format_err;
 use anyhow::Context;
@@ -28,6 +29,8 @@ use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
 use borrowed::borrowed;
+use cmdlib_cross_repo::get_all_possible_small_repo_submodule_deps;
+use cmdlib_cross_repo::repo_provider_from_mononoke_app;
 use context::CoreContext;
 use cross_repo_sync::create_commit_syncer_lease;
 use cross_repo_sync::create_commit_syncers;
@@ -37,7 +40,11 @@ use cross_repo_sync::CandidateSelectionHint;
 use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncOutcome;
 use cross_repo_sync::CommitSyncer;
+use cross_repo_sync::InMemoryRepo;
+use cross_repo_sync::Large;
 use cross_repo_sync::Repo as CrossRepo;
+use cross_repo_sync::SubmoduleDeps;
+use cross_repo_sync::SubmoduleExpansionData;
 use cross_repo_sync::Syncers;
 use derived_data_utils::derived_data_utils;
 use environment::MononokeEnvironment;
@@ -49,6 +56,7 @@ use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use import_tools::GitimportPreferences;
 use import_tools::GitimportTarget;
+use import_tools::ReuploadCommits;
 use itertools::Itertools;
 use live_commit_sync_config::CfgrLiveCommitSyncConfig;
 use live_commit_sync_config::LiveCommitSyncConfig;
@@ -59,9 +67,11 @@ use mercurial_types::HgChangesetId;
 use mercurial_types::NonRootMPath;
 use metaconfig_parser::RepoConfigs;
 use metaconfig_types::CommitSyncConfigVersion;
+use metaconfig_types::DefaultSmallToLargeCommitSyncPathAction;
 use metaconfig_types::MetadataDatabaseConfig;
 use metaconfig_types::RepoConfig;
 use metaconfig_types::SegmentedChangelogConfig;
+use metaconfig_types::DEFAULT_GIT_SUBMODULE_METADATA_FILE_PREFIX;
 use mononoke_app::args::RepoArgs;
 use mononoke_app::fb303::AliveService;
 use mononoke_app::fb303::Fb303AppExtension;
@@ -76,9 +86,7 @@ use mononoke_types::RepositoryId;
 use movers::DefaultAction;
 use movers::Mover;
 use pushrebase::do_pushrebase_bonsai;
-use question::Answer;
-use question::Question;
-use repo_derived_data::RepoDerivedDataArc;
+use pushredirect::PushRedirectionConfigArc;
 use segmented_changelog::seedheads_from_config;
 use segmented_changelog::SeedHead;
 use segmented_changelog::SegmentedChangelogTailer;
@@ -89,6 +97,7 @@ use sql_construct::SqlConstructFromMetadataDatabaseConfig;
 use sql_ext::facebook::MysqlOptions;
 use synced_commit_mapping::SqlSyncedCommitMapping;
 use synced_commit_mapping::SyncedCommitMapping;
+use synced_commit_mapping::SyncedCommitMappingRef;
 use tokio::fs;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncReadExt;
@@ -192,6 +201,7 @@ pub struct RecoveryFields {
     commit_author: String,
     commit_message: String,
     datetime: DateTime,
+    mark_not_synced_mapping: Option<String>,
     /// Head of the imported commits
     imported_cs_id: Option<ChangesetId>,
     /// ChangesetId of the merged commit we make to merge the imported commits into dest_bookmark
@@ -209,6 +219,7 @@ async fn rewrite_file_paths(
     mover: &Mover,
     gitimport_bcs_ids: &[ChangesetId],
     git_merge_bcs_id: &ChangesetId,
+    submodule_deps: SubmoduleDeps<Repo>,
 ) -> Result<(Vec<ChangesetId>, Option<ChangesetId>), Error> {
     let mut remapped_parents: HashMap<ChangesetId, ChangesetId> = HashMap::new();
     let mut bonsai_changesets = vec![];
@@ -226,6 +237,21 @@ async fn rewrite_file_paths(
 
     for (index, bcs) in gitimport_changesets.iter().enumerate() {
         let bcs_id = bcs.get_changeset_id();
+
+        let large_repo_id = Large(repo.repo_identity().id());
+        let fallback_repos = vec![];
+        let large_in_memory_repo = InMemoryRepo::from_repo(repo, fallback_repos)?;
+        let submodule_expansion_data = match submodule_deps {
+            SubmoduleDeps::ForSync(ref deps) => Some(SubmoduleExpansionData {
+                submodule_deps: deps,
+                x_repo_submodule_metadata_file_prefix: DEFAULT_GIT_SUBMODULE_METADATA_FILE_PREFIX,
+                large_repo_id,
+                large_repo: large_in_memory_repo,
+                dangling_submodule_pointers: vec![],
+            }),
+            SubmoduleDeps::NotNeeded | SubmoduleDeps::NotAvailable => None,
+        };
+
         let rewritten_bcs_opt = rewrite_commit(
             ctx,
             bcs.clone().into_mut(),
@@ -233,10 +259,12 @@ async fn rewrite_file_paths(
             mover.clone(),
             repo,
             Default::default(),
+            Default::default(),
+            submodule_expansion_data,
         )
         .await?;
 
-        if let Some(rewritten_bcs_mut) = rewritten_bcs_opt {
+        if let Some(rewritten_bcs_mut) = rewritten_bcs_opt.rewritten {
             let rewritten_bcs = rewritten_bcs_mut.freeze()?;
             let rewritten_bcs_id = rewritten_bcs.get_changeset_id();
             remapped_parents.insert(bcs_id.clone(), rewritten_bcs_id);
@@ -296,17 +324,18 @@ async fn back_sync_commits_to_small_repo(
     let mut synced_bcs_ids = vec![];
     for bcs_id in bcs_ids {
         let (unsynced_ancestors, _) =
-            find_toposorted_unsynced_ancestors(ctx, large_to_small_syncer, bcs_id.clone()).await?;
+            find_toposorted_unsynced_ancestors(ctx, large_to_small_syncer, bcs_id.clone(), None)
+                .await?;
         for ancestor in unsynced_ancestors {
             // It is always safe to use `CandidateSelectionHint::Only` in
             // the large-to-small direction
             let maybe_synced_cs_id = large_to_small_syncer
-                .unsafe_sync_commit_with_expected_version(
+                .unsafe_sync_commit(
                     ctx,
                     ancestor,
                     CandidateSelectionHint::Only,
-                    version.clone(),
                     CommitSyncContext::RepoImport,
+                    Some(version.clone()),
                 )
                 .await?;
 
@@ -382,7 +411,7 @@ async fn derive_bonsais_single_repo(
 
     let derived_utils: Vec<_> = derived_data_types
         .iter()
-        .map(|ty| derived_data_utils(ctx.fb, repo.as_blob_repo(), ty))
+        .map(|ty| derived_data_utils(ctx.fb, repo.as_blob_repo(), *ty))
         .collect::<Result<_, _>>()?;
 
     stream::iter(derived_utils)
@@ -435,7 +464,7 @@ async fn move_bookmark(
     let mut transaction = repo.bookmarks().create_transaction(ctx.clone());
     if maybe_old_csid.is_none() {
         transaction.create(bookmark, old_csid.clone(), BookmarkUpdateReason::ManualMove)?;
-        if !transaction.commit().await? {
+        if transaction.commit().await?.is_none() {
             return Err(format_err!("Logical failure while creating {:?}", bookmark));
         }
         info!(
@@ -467,7 +496,7 @@ async fn move_bookmark(
             BookmarkUpdateReason::ManualMove,
         )?;
 
-        if !transaction.commit().await? {
+        if transaction.commit().await?.is_none() {
             return Err(format_err!("Logical failure while setting {:?}", bookmark));
         }
         info!(
@@ -648,7 +677,9 @@ async fn push_merge_commit(
         repo,
         bookmark_to_merge_into,
         &repo_config.pushrebase,
-    )?;
+        None,
+    )
+    .await?;
 
     let pushrebase_res = do_pushrebase_bonsai(
         ctx,
@@ -806,12 +837,15 @@ fn get_importing_bookmark(bookmark_suffix: &str) -> Result<BookmarkKey, Error> {
 
 // Note: pushredirection only works from small repo to large repo.
 async fn get_large_repo_config_if_pushredirected<'a>(
+    ctx: &CoreContext,
     repo: &Repo,
     live_commit_sync_config: &CfgrLiveCommitSyncConfig,
     repos: &HashMap<String, RepoConfig>,
 ) -> Result<Option<RepoConfig>, Error> {
     let repo_id = repo.repo_id();
-    let enabled = live_commit_sync_config.push_redirector_enabled_for_public(repo_id);
+    let enabled = live_commit_sync_config
+        .push_redirector_enabled_for_public(ctx, repo_id)
+        .await?;
 
     if enabled {
         let common_commit_sync_config = match live_commit_sync_config.get_common_config(repo_id) {
@@ -903,7 +937,7 @@ fn get_config_by_repoid(
         .map(|(name, config)| (name.clone(), config.clone()))
 }
 
-fn open_sql<T>(
+async fn open_sql<T>(
     fb: FacebookInit,
     repo_id: RepositoryId,
     configs: &RepoConfigs,
@@ -919,6 +953,7 @@ where
         &env.mysql_options.clone(),
         env.readonly_storage.clone().0,
     )
+    .await
 }
 
 async fn get_pushredirected_vars(
@@ -954,13 +989,25 @@ async fn get_pushredirected_vars(
             large_repo.name()
         ));
     }
-    let mapping = open_sql::<SqlSyncedCommitMapping>(ctx.fb, repo.repo_id(), configs, env)?;
+
+    let live_commit_sync_config = Arc::new(live_commit_sync_config);
+
+    let repo_provider = repo_provider_from_mononoke_app(app);
+    let submodule_deps = get_all_possible_small_repo_submodule_deps(
+        repo.clone(),
+        live_commit_sync_config.clone(),
+        repo_provider,
+    )
+    .await?;
+
+    let mapping = open_sql::<SqlSyncedCommitMapping>(ctx.fb, repo.repo_id(), configs, env).await?;
     let syncers = create_commit_syncers(
         ctx,
         repo.clone(),
         large_repo.clone(),
+        submodule_deps,
         mapping.clone(),
-        Arc::new(live_commit_sync_config),
+        live_commit_sync_config,
         x_repo_syncer_lease,
     )?;
 
@@ -1042,11 +1089,33 @@ async fn repo_import(
         x_repo_check_disabled: recovery_fields.x_repo_check_disabled,
         hg_sync_check_disabled: recovery_fields.hg_sync_check_disabled,
     };
-    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new(ctx.logger(), &env.config_store)?;
 
-    let maybe_large_repo_config =
-        get_large_repo_config_if_pushredirected(&repo, &live_commit_sync_config, &configs.repos)
-            .await?;
+    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new_with_xdb(
+        ctx.logger(),
+        &env.config_store,
+        repo.push_redirection_config_arc(),
+    )?;
+
+    check_megarepo_large_repo_import_requirements(
+        &ctx,
+        &repo,
+        &live_commit_sync_config,
+        &repo_import_setting.dest_bookmark,
+        &dest_path_prefix,
+        recovery_fields.mark_not_synced_mapping.as_deref(),
+    )
+    .await?;
+
+    // Check if the import target is a small repo that is pushredirected to a
+    // large repo.  In that case we will import to the large repo and then
+    // backsync to the small repo.
+    let maybe_large_repo_config = get_large_repo_config_if_pushredirected(
+        &ctx,
+        &repo,
+        &live_commit_sync_config,
+        &configs.repos,
+    )
+    .await?;
     let mut maybe_small_repo_back_sync_vars = None;
     let mut movers = vec![movers::mover_factory(
         HashMap::new(),
@@ -1062,7 +1131,7 @@ async fn repo_import(
             &large_repo_config,
             configs,
             env,
-            live_commit_sync_config,
+            live_commit_sync_config.clone(),
         )
         .await?;
 
@@ -1133,11 +1202,10 @@ async fn repo_import(
         };
         let target = GitimportTarget::full();
         info!(ctx.logger(), "Started importing git commits to Mononoke");
-        let uploader = import_direct::DirectUploader::new(
-            repo.as_blob_repo().clone(),
-            import_direct::ReuploadCommits::Never,
-        );
-        let import_map = import_tools::gitimport(&ctx, path, &uploader, &target, &prefs).await?;
+        let uploader =
+            import_direct::DirectUploader::new(repo.as_blob_repo().clone(), ReuploadCommits::Never);
+        let import_map =
+            import_tools::gitimport(&ctx, path, Arc::new(uploader), &target, &prefs).await?;
         info!(ctx.logger(), "Added commits to Mononoke");
 
         let git_merge_oid = {
@@ -1184,12 +1252,21 @@ async fn repo_import(
             .git_merge_bcs_id
             .as_ref()
             .ok_or_else(|| format_err!("gitimported changeset ids are not found"))?;
+
+        let repo_provider = repo_provider_from_mononoke_app(app);
+        let submodule_deps = get_all_possible_small_repo_submodule_deps(
+            repo.clone(),
+            Arc::new(live_commit_sync_config),
+            repo_provider,
+        )
+        .await?;
         let (shifted_bcs_ids, git_merge_shifted_bcs_id) = rewrite_file_paths(
             &ctx,
             &repo,
             &combined_mover,
             gitimport_bcs_ids,
             git_merge_bcs_id,
+            submodule_deps,
         )
         .await?;
 
@@ -1244,8 +1321,33 @@ async fn repo_import(
             }
         };
 
+        let mark_not_synced_changesets = {
+            borrowed!(ctx, repo, shifted_bcs_ids: &[ChangesetId]);
+            let mark_not_synced_mapping = &recovery_fields.mark_not_synced_mapping;
+
+            async move {
+                if let Some(version) = mark_not_synced_mapping {
+                    let version = CommitSyncConfigVersion(version.to_string());
+                    let repo_id = repo.repo_identity().id();
+                    let mapping = repo.synced_commit_mapping();
+
+                    for cs_id in shifted_bcs_ids {
+                        mapping
+                            .insert_large_repo_commit_version(ctx, repo_id, *cs_id, &version)
+                            .await?;
+                    }
+                }
+                Ok(())
+            }
+        };
+
         info!(ctx.logger(), "Start deriving data types");
-        future::try_join(derive_changesets, backsync_and_derive_changesets).await?;
+        future::try_join3(
+            derive_changesets,
+            backsync_and_derive_changesets,
+            mark_not_synced_changesets,
+        )
+        .await?;
         info!(ctx.logger(), "Finished deriving data types");
 
         recovery_fields.import_stage = ImportStage::TailSegmentedChangelog;
@@ -1339,7 +1441,7 @@ async fn repo_import(
         BookmarkUpdateReason::ManualMove,
     )?;
 
-    if !transaction.commit().await? {
+    if transaction.commit().await?.is_none() {
         return Err(format_err!(
             "Logical failure while setting {:?} to the merge commit",
             &repo_import_setting.importing_bookmark,
@@ -1449,11 +1551,19 @@ async fn check_additional_setup_steps(
         ));
     }
 
-    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new(ctx.logger(), &env.config_store)?;
+    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new_with_xdb(
+        ctx.logger(),
+        &env.config_store,
+        repo.push_redirection_config_arc(),
+    )?;
 
-    let maybe_large_repo_config =
-        get_large_repo_config_if_pushredirected(&repo, &live_commit_sync_config, &configs.repos)
-            .await?;
+    let maybe_large_repo_config = get_large_repo_config_if_pushredirected(
+        &ctx,
+        &repo,
+        &live_commit_sync_config,
+        &configs.repos,
+    )
+    .await?;
     if let Some(large_repo_config) = maybe_large_repo_config {
         let (large_repo, large_repo_import_setting, _syncers) = get_pushredirected_vars(
             app,
@@ -1493,25 +1603,99 @@ async fn check_additional_setup_steps(
     Ok(())
 }
 
+/// Check if the import target is a large repo.  If so, the import destination must not be
+/// mapped to any small repos, and the caller needs to provide the name of the mapping to use
+/// for marking the commits as not-sync.
+///
+/// If the destination is mapped to a small repo, the repo should be imported to that repo
+/// instead.
+///
+/// It is not currently supported to import to a destination which maps to multiple repos,
+/// partially maps to a small repo, or otherwise crosses megarepo boundaries.
+async fn check_megarepo_large_repo_import_requirements(
+    ctx: &CoreContext,
+    repo: &Repo,
+    live_commit_sync_config: &dyn LiveCommitSyncConfig,
+    dest_bookmark: &BookmarkKey,
+    dest_path_prefix: &NonRootMPath,
+    mark_not_synced_mapping: Option<&str>,
+) -> Result<(), Error> {
+    let dest_cs_id = repo
+        .bookmarks()
+        .get(ctx.clone(), dest_bookmark)
+        .await?
+        .ok_or_else(|| anyhow!("Bookmark not found: {}", dest_bookmark))?;
+    if let Some(version) = repo
+        .synced_commit_mapping()
+        .get_large_repo_commit_version(ctx, repo.repo_identity().id(), dest_cs_id)
+        .await?
+    {
+        let commit_sync_config = live_commit_sync_config
+            .get_commit_sync_config_by_version_if_exists(repo.repo_identity().id(), &version)
+            .await?
+            .ok_or_else(|| anyhow!("Couldn't find commit sync config version {}", version))?;
+        for (small_repo_id, small_repo_config) in commit_sync_config.small_repos.iter() {
+            match &small_repo_config.default_action {
+                DefaultSmallToLargeCommitSyncPathAction::Preserve => {
+                    // This small repo is overlayed with the large repo
+                    // without a prefix.  We can't handle this case.
+                    return Err(anyhow!(
+                        "Not possible to import to a large repo with an unprefixed small repo"
+                    ));
+                }
+                DefaultSmallToLargeCommitSyncPathAction::PrependPrefix(prefix) => {
+                    if dest_path_prefix.is_prefix_of(prefix)
+                        || prefix.is_prefix_of(dest_path_prefix)
+                    {
+                        return Err(anyhow!(
+                            "Small repo {} default prefix {} overlaps with import destination {}",
+                            small_repo_id,
+                            prefix,
+                            dest_path_prefix
+                        ));
+                    }
+                }
+            }
+
+            for (small_repo_prefix, large_repo_prefix) in small_repo_config.map.iter() {
+                if dest_path_prefix.is_prefix_of(large_repo_prefix)
+                    || large_repo_prefix.is_prefix_of(dest_path_prefix)
+                {
+                    return Err(anyhow!(
+                        "Small repo {} mapped prefix {} -> {} overlaps with import destination {}",
+                        small_repo_id,
+                        small_repo_prefix,
+                        large_repo_prefix,
+                        dest_path_prefix
+                    ));
+                }
+            }
+        }
+
+        if mark_not_synced_mapping.is_none() {
+            // If we are importing into a large repo, we need to mark all the imported as
+            // "not-synced", which means we need the name of a mapping that contains only
+            // the large repo.
+            return Err(anyhow!(concat!(
+                "You are importing into a large repo without a large-only mapping.  ",
+                "Please specify one with '--mark-not-synced-mapping'.",
+            )));
+        }
+    } else if mark_not_synced_mapping.is_some() {
+        return Err(anyhow!(concat!(
+            "You specified '--mark-not-synced-mapping' but are not importing into a ",
+            "large repo.  This is invalid.",
+        )));
+    }
+
+    Ok(())
+}
+
 #[fbinit::main]
 fn main(fb: FacebookInit) -> Result<(), Error> {
     let app = MononokeAppBuilder::new(fb)
         .with_app_extension(Fb303AppExtension {})
         .build::<MononokeRepoImportArgs>()?;
-    let logger = app.logger();
-
-    let answer = Question::new("Does the git repo you're about to merge has multiple heads (unmerged branches)? It's unsafe to use this tool when it does.")
-        .show_defaults()
-        .confirm();
-    match answer {
-        Answer::NO => info!(logger, "Let's get this merged!"),
-        Answer::YES => bail!(
-            "Try cloning with 'git clone -b master --single-branch $clone_path` to clone only ancestors of master. Then you should be good to go!"
-        ),
-        _ => bail!(
-            "If not sure, you must examine the git repo for such branches / heads. If it has them, it's unsafe to use this tool."
-        ),
-    };
 
     app.run_with_monitoring_and_logging(async_main, "repo_import", AliveService)
 }

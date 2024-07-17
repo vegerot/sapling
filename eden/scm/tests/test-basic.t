@@ -1,8 +1,9 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 Create a repository:
 
-  $ configure modernclient
   $ newclientrepo t
 
 Prepare a changeset:

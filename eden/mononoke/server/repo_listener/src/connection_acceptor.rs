@@ -22,18 +22,18 @@ use anyhow::Result;
 use bytes::Bytes;
 use cached_config::ConfigStore;
 use connection_security_checker::ConnectionSecurityChecker;
-use edenapi_service::EdenApi;
+use edenapi_service::SaplingRemoteApi;
 use failure_ext::SlogKVError;
 use fbinit::FacebookInit;
+use futures::channel::mpsc;
 use futures::channel::oneshot;
 use futures::future::Future;
 use futures::select_biased;
-use futures_01_ext::BoxStream;
+use futures::sink::SinkExt;
+use futures::stream;
+use futures::stream::BoxStream;
+use futures::stream::Stream;
 use futures_ext::FbFutureExt;
-use futures_old::stream;
-use futures_old::sync::mpsc;
-use futures_old::Stream;
-use futures_util::compat::Stream01CompatExt;
 use futures_util::future::AbortHandle;
 use futures_util::future::FutureExt;
 use futures_util::stream::StreamExt;
@@ -45,6 +45,7 @@ use metaconfig_types::CommonConfig;
 use metadata::Metadata;
 use mononoke_api::Mononoke;
 use mononoke_app::fb303::ReadyFlagService;
+use mononoke_configs::MononokeConfigs;
 use openssl::ssl::Ssl;
 use openssl::ssl::SslAcceptor;
 use permission_checker::AclProvider;
@@ -110,6 +111,7 @@ pub async fn wait_for_connections_closed(logger: &Logger) {
 
 pub async fn connection_acceptor(
     fb: FacebookInit,
+    configs: Arc<MononokeConfigs>,
     common_config: CommonConfig,
     sockname: String,
     service: ReadyFlagService,
@@ -119,7 +121,7 @@ pub async fn connection_acceptor(
     terminate_process: oneshot::Receiver<()>,
     rate_limiter: Option<RateLimitEnvironment>,
     scribe: Scribe,
-    edenapi: EdenApi,
+    edenapi: SaplingRemoteApi,
     will_exit: Arc<AtomicBool>,
     config_store: &ConfigStore,
     cslb_config: Option<String>,
@@ -127,6 +129,7 @@ pub async fn connection_acceptor(
     bound_addr_path: Option<PathBuf>,
     acl_provider: &dyn AclProvider,
     readonly: bool,
+    mtls_disabled: bool,
 ) -> Result<()> {
     let enable_http_control_api = common_config.enable_http_control_api;
 
@@ -175,8 +178,10 @@ pub async fn connection_acceptor(
         config_store: config_store.clone(),
         qps,
         wireproto_scuba,
+        configs,
         common_config,
         readonly,
+        mtls_disabled,
     });
 
     loop {
@@ -208,15 +213,17 @@ pub struct Acceptor {
     pub rate_limiter: Option<RateLimitEnvironment>,
     pub scribe: Scribe,
     pub logger: Logger,
-    pub edenapi: EdenApi,
+    pub edenapi: SaplingRemoteApi,
     pub enable_http_control_api: bool,
     pub server_hostname: String,
     pub will_exit: Arc<AtomicBool>,
     pub config_store: ConfigStore,
     pub qps: Option<Arc<Qps>>,
     pub wireproto_scuba: MononokeScubaSampleBuilder,
+    pub configs: Arc<MononokeConfigs>,
     pub common_config: CommonConfig,
     pub readonly: bool,
+    pub mtls_disabled: bool,
 }
 
 /// Details for a socket we've just opened.
@@ -274,21 +281,29 @@ async fn handle_connection(conn: PendingConnection, sock: TcpStream) -> Result<(
         .await
         .context("Failed to perform tls handshake")?;
 
-    let identities = match ssl_socket.ssl().peer_certificate() {
-        Some(cert) => MononokeIdentity::try_from_x509(&cert),
-        None => Err(ErrorKind::ConnectionNoClientCertificate.into()),
-    }?;
+    let conn = match conn.acceptor.mtls_disabled {
+        true => AcceptedConnection {
+            pending: conn,
+            is_trusted: false,
+            identities: Arc::new(MononokeIdentitySet::new()),
+        },
+        false => {
+            let identities = match ssl_socket.ssl().peer_certificate() {
+                Some(cert) => MononokeIdentity::try_from_x509(&cert),
+                None => Err(ErrorKind::ConnectionNoClientCertificate.into()),
+            }?;
 
-    let is_trusted = conn
-        .acceptor
-        .security_checker
-        .check_if_trusted(&identities)
-        .await;
-
-    let conn = AcceptedConnection {
-        pending: conn,
-        is_trusted,
-        identities: Arc::new(identities),
+            let is_trusted = conn
+                .acceptor
+                .security_checker
+                .check_if_trusted(&identities)
+                .await;
+            AcceptedConnection {
+                pending: conn,
+                is_trusted,
+                identities: Arc::new(identities),
+            }
+        }
     };
 
     let ssl_socket = QuietShutdownStream::new(ssl_socket);
@@ -354,6 +369,7 @@ where
         conn.pending.acceptor.fb,
         reponame,
         Arc::clone(&conn.pending.acceptor.mononoke),
+        conn.pending.acceptor.configs.clone(),
         &conn.pending.acceptor.security_checker,
         stdio,
         conn.pending.acceptor.rate_limiter.clone(),
@@ -394,7 +410,7 @@ where
 }
 
 pub struct ChannelConn {
-    stdin: BoxStream<Bytes, io::Error>,
+    stdin: BoxStream<'static, Result<Bytes, io::Error>>,
     stdout: mpsc::Sender<Bytes>,
     stderr: mpsc::UnboundedSender<Bytes>,
     logger: Logger,
@@ -414,11 +430,11 @@ impl ChannelConn {
     {
         let FramedConn { rd, wr } = framed;
 
-        let stdin = Box::new(rd.compat().filter_map(|s| {
+        let stdin = Box::pin(rd.try_filter_map(|s| async move {
             if s.stream() == IoStream::Stdin {
-                Some(s.data())
+                Ok(Some(s.data()))
             } else {
-                None
+                Ok(None)
             }
         }));
 
@@ -430,12 +446,12 @@ impl ChannelConn {
             let orx = orx
                 .map(|blob| split_bytes_in_chunk(blob, CHUNK_SIZE))
                 .flatten()
-                .map(|v| SshMsg::new(IoStream::Stdout, v));
+                .map_ok(|v| SshMsg::new(IoStream::Stdout, v));
             let erx = erx
                 .map(|blob| split_bytes_in_chunk(blob, CHUNK_SIZE))
                 .flatten()
-                .map(|v| SshMsg::new(IoStream::Stderr, v));
-            let krx = krx.map(|v| SshMsg::new(IoStream::Stderr, v));
+                .map_ok(|v| SshMsg::new(IoStream::Stderr, v));
+            let krx = krx.map_ok(|v| SshMsg::new(IoStream::Stderr, v));
 
             // Glue them together
             let fwd = async move {
@@ -443,10 +459,7 @@ impl ChannelConn {
 
                 futures::pin_mut!(wr);
 
-                let res = orx
-                    .select(erx)
-                    .select(krx)
-                    .compat()
+                let res = stream::select(orx, stream::select(erx, krx))
                     .map_err(|()| io::Error::new(io::ErrorKind::Other, "huh?"))
                     .forward(wr.as_mut())
                     .await;
@@ -476,13 +489,15 @@ impl ChannelConn {
                     scuba.log_with_msg("Forwarding failed", format!("{:#}", e));
                 }
 
+                wr.flush().await?;
+                wr.close().await?;
                 Ok(())
             };
 
             let keep_alive_sender = async move {
                 loop {
                     tokio::time::sleep(KEEP_ALIVE_INTERVAL).await;
-                    if ktx.unbounded_send(Bytes::new()).is_err() {
+                    if ktx.unbounded_send(Ok(Bytes::new())).is_err() {
                         break;
                     }
                 }
@@ -524,16 +539,14 @@ impl ChannelConn {
     }
 }
 
-// TODO(stash): T33775046 we had to chunk responses because hgcli
-// can't cope with big chunks
-fn split_bytes_in_chunk<E>(blob: Bytes, chunksize: usize) -> impl Stream<Item = Bytes, Error = E> {
-    stream::unfold(blob, move |mut remain| {
+fn split_bytes_in_chunk<E>(blob: Bytes, chunksize: usize) -> impl Stream<Item = Result<Bytes, E>> {
+    stream::try_unfold(blob, move |mut remain| async move {
         let len = remain.len();
         if len > 0 {
             let ret = remain.split_to(::std::cmp::min(chunksize, len));
-            Some(Ok((ret, remain)))
+            Ok(Some((ret, remain)))
         } else {
-            None
+            Ok(None)
         }
     })
 }

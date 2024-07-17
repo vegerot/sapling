@@ -55,6 +55,7 @@ from sapling import (
     tracing,
     util,
 )
+from sapling.ext import shelve as shelvemod
 from sapling.i18n import _
 from sapling.node import bin
 from sapling.scmutil import status
@@ -71,15 +72,8 @@ _nodemirrored = {}  # {node: {path}}, for syncing from commit to wvfs
 def extsetup(ui) -> None:
     extensions.wrapfunction(localrepo.localrepository, "commitctx", _commitctx)
 
-    def wrapshelve(loaded=False):
-        try:
-            shelvemod = extensions.find("shelve")
-            extensions.wrapcommand(shelvemod.cmdtable, "shelve", _bypassdirsync)
-            extensions.wrapcommand(shelvemod.cmdtable, "unshelve", _bypassdirsync)
-        except KeyError:
-            pass
-
-    extensions.afterloaded("shelve", wrapshelve)
+    extensions.wrapcommand(shelvemod.cmdtable, "shelve", _bypassdirsync)
+    extensions.wrapcommand(shelvemod.cmdtable, "unshelve", _bypassdirsync)
 
     extensions.wrapfilecache(localrepo.localrepository, "dirstate", _wrapdirstate)
 
@@ -287,7 +281,7 @@ def _mctxstatus(ctx, matcher=None):
     # mutpred looks like:
     # hg/2dc0850429134cc0d21d84d6e5a3960faa9aadce,hg/ccfb9effa811b10fdc40e314524f9340c31085d7
     # The first one is the "top" of the stack that we care about.
-    mutpredhex = mutinfo and mutinfo["mutpred"].split(",", 1)[0].lstrip("hg/")
+    mutpredhex = mutinfo and mutinfo["mutpred"].split(",", 1)[0].removeprefix("hg/")
     mutpred = mutpredhex and bin(mutpredhex)
     predctx = mutpred and mutpred in repo and repo[mutpred] or None
 

@@ -7,10 +7,7 @@ from __future__ import absolute_import
 
 import doctest
 import os
-import re
 import sys
-
-from hghave import require
 
 
 # this is hack to make sure no escape characters are inserted into the output
@@ -72,17 +69,16 @@ testmod("sapling.smartset")
 testmod("sapling.store")
 testmod("sapling.templatefilters")
 testmod("sapling.templater")
+testmod("sapling.testing.ext.python")
+testmod("sapling.testing.sh")
+testmod("sapling.testing.t.diff")
+testmod("sapling.testing.t.runtime")
+testmod("sapling.testing.t.transform")
 testmod("sapling.ui")
 testmod("sapling.uiconfig")
 testmod("sapling.url")
 testmod("sapling.util")
 testmod("sapling.util", testtarget="platform")
 testmod("sapling.ext.commitcloud.sync")
+testmod("sapling.ext.fbcodereview")
 testmod("sapling.ext.remotenames")
-
-if sys.platform in {"linux", "win32"}:
-    testmod("sapling.testing.ext.python")
-    testmod("sapling.testing.sh")
-    testmod("sapling.testing.t.diff")
-    testmod("sapling.testing.t.runtime")
-    testmod("sapling.testing.t.transform")

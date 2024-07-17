@@ -6,12 +6,15 @@
  */
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Display;
 
 use mononoke_types::ChangesetId;
 use mononoke_types::Generation;
+use serde::Deserialize;
+use serde::Serialize;
 use smallvec::SmallVec;
 
 /// A representation of a segment of changesets.
@@ -84,3 +87,24 @@ impl Display for ChangesetSegmentLocation {
 pub struct ChangesetSegmentFrontier {
     pub segments: BTreeMap<Generation, HashMap<ChangesetId, HashSet<ChangesetId>>>,
 }
+
+/// A location of a changeset represented as the `distance`th ancestor
+/// of `cs_id` (i.e. `cs_id~distance`)
+#[derive(Debug)]
+pub struct Location {
+    pub cs_id: ChangesetId,
+    pub distance: u64,
+}
+
+#[derive(Serialize, Deserialize, Eq, PartialEq, Hash, Debug)]
+pub struct SegmentedSliceDescription {
+    pub segments: Vec<SegmentDescription>,
+}
+
+#[derive(Serialize, Deserialize, Eq, PartialEq, Hash, Debug)]
+pub struct SegmentDescription {
+    pub head: ChangesetId,
+    pub base: ChangesetId,
+}
+
+pub type BoundaryChangesets = BTreeSet<ChangesetId>;

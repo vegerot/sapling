@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 """Runner for Mononoke/Mercurial integration tests."""
 
 import json
@@ -82,14 +84,6 @@ class TestFlags(NamedTuple):
         return r
 
 
-def public_test_root(manifest_env: ManifestEnv) -> str:
-    return manifest_env["TEST_ROOT_PUBLIC"]
-
-
-def facebook_test_root(manifest_env: ManifestEnv) -> Optional[str]:
-    return manifest_env.get("TEST_ROOT_FACEBOOK")
-
-
 def maybe_use_local_test_paths(manifest_env: ManifestEnv) -> None:
     # If we are running outside of Buck, then update the test paths to use the
     # actual files. This makes --interactive work, and allows for adding new
@@ -97,29 +91,35 @@ def maybe_use_local_test_paths(manifest_env: ManifestEnv) -> None:
     if int(os.environ.get("NO_LOCAL_PATHS", 0)):
         return
 
-    is_oss_build = facebook_test_root(manifest_env) is None
+    # the test files in custom_test_root are symlink to real locations
+    test_root = custom_test_root(manifest_env)
+    # list files in test root
+    first_test_file = os.listdir(test_root)[0]
+    # resolve symlink
+    first_test_file_realpath = os.path.realpath(
+        os.path.join(test_root, first_test_file)
+    )
+    # parent directory
+    test_root = os.path.dirname(first_test_file_realpath)
 
     fbsource = subprocess.check_output(["hg", "root"], encoding="utf-8").strip()
     fbcode = os.path.join(fbsource, "fbcode")
-    tests = os.path.join(
-        fbcode,
-        manifest_env.get("VERBATIM_LOCAL_PATH", "eden/mononoke/tests/integration"),
-    )
     fixtures = os.path.join(fbcode, "eden/mononoke/tests/integration")
 
     updates_to_apply = {
-        "TEST_ROOT_PUBLIC": tests,
+        "TEST_ROOT": test_root,
         "TEST_FIXTURES": fixtures,
         "RUN_TESTS_LIBRARY": os.path.join(fbcode, "eden/scm/tests"),
     }
-
-    if is_oss_build:
-        updates_to_apply["TEST_CERTS"] = os.path.join(fixtures, "certs")
-    else:
-        updates_to_apply["TEST_CERTS"] = os.path.join(fixtures, "certs/facebook")
-        updates_to_apply["TEST_ROOT_FACEBOOK"] = os.path.join(tests, "facebook")
-
     manifest_env.update(updates_to_apply)
+
+
+def custom_test_root(manifest_env) -> str:
+    ctr = manifest_env.get("TEST_ROOT", None)
+    if ctr is not None:
+        return ctr
+    else:
+        raise click.BadParameter("TEST_ROOT missing in manifest")
 
 
 def _hg_runner(
@@ -172,6 +172,7 @@ def _hg_runner(
                 # non-utf8 data will result in "Illegal byte sequence" error.
                 # That is why we are forcing the "C" locale.
                 "HGTEST_LOCALE": "C",
+                "DEBUGRUNTEST_DEFAULT_DISABLED": "1",
                 "PYTHON_SYS_EXECUTABLE": manifest_env["BINARY_HGPYTHON"],
             }
         )
@@ -189,20 +190,6 @@ def _hg_runner(
             stdout=stderr,
             stderr=stderr,
         )
-
-
-def hg_runner_public(manifest_env: Env, *args, **kwargs) -> bool:
-    _hg_runner(public_test_root(manifest_env), manifest_env, *args, **kwargs)
-    return True
-
-
-def hg_runner_facebook(manifest_env: Env, *args, **kwargs) -> bool:
-    fb_root = facebook_test_root(manifest_env)
-    if fb_root is None:
-        return False
-    else:
-        _hg_runner(fb_root, manifest_env, *args, **kwargs)
-        return True
 
 
 def format_discovered_tests(
@@ -244,43 +231,35 @@ def run_tests(
     if xunit_output is not None and len(tests) > 1:
         raise click.BadParameter("Cannot run more than one test with --output", ctx)
 
-    public_tests = []
-    facebook_tests = []
+    existing_tests = []
     missing_tests = []
 
     for t in tests:
-        fb_root = facebook_test_root(manifest_env)
-        if os.path.isfile(os.path.join(public_test_root(manifest_env), t)):
-            public_tests.append(t)
-        elif fb_root is not None and os.path.isfile(os.path.join(fb_root, t)):
-            facebook_tests.append(t)
+        if os.path.isfile(os.path.join(custom_test_root(manifest_env), t)):
+            existing_tests.append(t)
         else:
             missing_tests.append(t)
 
     if missing_tests:
         raise click.BadParameter("Invalid tests: %s" % " ".join(missing_tests), ctx)
 
-    work = []
-    if public_tests:
-        work.append(("public", hg_runner_public, public_tests))
-    if facebook_tests:
-        work.append(("facebook", hg_runner_facebook, facebook_tests))
-
     success = True
+    prefix = "custom"
 
-    for (prefix, runner, tests) in work:
-        args = list(test_flags.runner_args())
+    args = list(test_flags.runner_args())
 
-        if xunit_output is not None:
-            xunit_file = os.path.join(xunit_output, ".".join([prefix, "xml"]))
-            args.extend(["--xunit", xunit_file])
-        args.extend(tests)
+    if xunit_output is not None:
+        xunit_file = os.path.join(xunit_output, ".".join([prefix, "xml"]))
+        args.extend(["--xunit", xunit_file])
+    args.extend(existing_tests)
 
-        try:
-            kwargs = test_flags.runner_kwargs(tests)
-            runner(manifest_env, args, test_env, **kwargs)
-        except subprocess.CalledProcessError:
-            success = False
+    try:
+        kwargs = test_flags.runner_kwargs(existing_tests)
+        _hg_runner(
+            custom_test_root(manifest_env), manifest_env, args, test_env, **kwargs
+        )
+    except subprocess.CalledProcessError:
+        success = False
 
     ctx.exit(0 if success else 1)
 
@@ -288,14 +267,19 @@ def run_tests(
 @click.command()
 @click.option("--dry-run", default=False, is_flag=True, help="list tests")
 @click.option(
-    "--interactive", default=False, is_flag=True, help="prompt to accept changed output"
+    "-i",
+    "--interactive",
+    default=False,
+    is_flag=True,
+    help="prompt to accept changed output",
 )
 @click.option(
-    "--update-output", default=False, is_flag=True, help="accept changed output"
+    "-u", "--update-output", default=False, is_flag=True, help="accept changed output"
 )
 @click.option("--output", default=None, help="output directory")
 @click.option("--verbose", default=False, is_flag=True, help="output verbose messages")
 @click.option(
+    "-d",
     "--debug",
     default=False,
     is_flag=True,

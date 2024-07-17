@@ -8,6 +8,7 @@
 use std::fmt::Display;
 
 use anyhow::Error;
+use edenapi_types::CommitId;
 use gotham_ext::error::HttpError;
 use mononoke_api::ChangesetId;
 use mononoke_api::MononokeError;
@@ -17,7 +18,7 @@ use types::Key;
 
 /// Enum to add context to server errors.
 ///
-/// Most of the functions in the EdenAPI server return `anyhow::Error`
+/// Most of the functions in the SaplingRemoteAPI server return `anyhow::Error`
 /// as their error type. The intention of `ErrorKind` is to be used
 /// in conjunction with `anyhow::Context` to annotate the error with
 /// the appropriate context. In that sense, this type should be used
@@ -53,6 +54,8 @@ pub enum ErrorKind {
     DeserializationFailed,
     #[error("Failed to fetch file for key: {0:?}")]
     FileFetchFailed(Key),
+    #[error("Failed to fetch file's aux data for key: {0:?}")]
+    FileAuxDataFetchFailed(Key),
     #[error("Failed to fetch tree for key: {0:?}")]
     TreeFetchFailed(Key),
     #[error("Failed to fetch history for key: {0:?}")]
@@ -71,6 +74,11 @@ pub enum ErrorKind {
         "Invalid file content upload token in 'upload/filenodes' request for filenode: {0}, reason: {1}"
     )]
     UploadHgFilenodeRequestInvalidToken(HgId, String),
+    #[error("CommitId not found: {0}")]
+    CommitIdNotFound(CommitId),
+    #[allow(dead_code)]
+    #[error("Invalid Request, reason: {0}")]
+    InvalidRequest(String),
 }
 
 /// Extension trait for converting `MononokeError`s into `HttpErrors`.

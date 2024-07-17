@@ -7,7 +7,6 @@
 
 use std::collections::BTreeSet;
 use std::collections::BinaryHeap;
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
 use std::fmt::Debug;
@@ -33,6 +32,7 @@ use crate::iddagstore::InProcessStore;
 #[cfg(any(test, feature = "indexedlog-backend"))]
 use crate::iddagstore::IndexedLogStore;
 use crate::ops::Persist;
+use crate::ops::StorageVersion;
 #[cfg(any(test, feature = "indexedlog-backend"))]
 use crate::ops::TryClone;
 use crate::segment::FlatSegment;
@@ -40,6 +40,7 @@ use crate::segment::PreparedFlatSegments;
 use crate::segment::Segment;
 use crate::segment::SegmentFlags;
 use crate::spanset;
+use crate::spanset::Span;
 use crate::types_ext::PreparedFlatSegmentsExt;
 use crate::Error::Programming;
 use crate::IdSegment;
@@ -160,13 +161,15 @@ impl<Store: IdDagStore> IdDag<Store> {
         high: Id,
         parents: &[Id],
     ) -> Result<()> {
-        self.version.bump();
+        if !low.is_virtual() {
+            self.version.bump();
+        }
         self.store.insert(flags, level, low, high, parents)
     }
 
     /// Returns whether the iddag contains segments for the given `id`.
     pub fn contains_id(&self, id: Id) -> Result<bool> {
-        Ok(self.all()?.contains(id))
+        Ok(self.all_with_virtual()?.contains(id))
     }
 
     pub(crate) fn version(&self) -> &VerLink {
@@ -314,6 +317,9 @@ impl<Store: IdDagStore> IdDag<Store> {
         level: Level,
         inserted_lower_level_id_set: &IdSet,
     ) -> Result<(usize, IdSet)> {
+        // Exclude VIRTUAL spans.
+        let inserted_lower_level_id_set = inserted_lower_level_id_set
+            .difference(&Span::new(Group::VIRTUAL.min_id(), Group::VIRTUAL.max_id()).into());
         let mut inserted_id_set = IdSet::empty();
         if level == 0 {
             // Do nothing. Level 0 is not considered high level.
@@ -580,9 +586,18 @@ impl<Store: IdDagStore> IdDag<Store> {
 
 // User-facing DAG-related algorithms.
 pub trait IdDagAlgorithm: IdDagStore {
-    /// Return a [`IdSet`] that covers all ids stored in this [`IdDag`].
-    fn all(&self) -> Result<IdSet> {
+    /// Return a [`IdSet`] that covers all ids stored in this [`IdDag`],
+    /// i.e. everything including the VIRTUAL group.
+    fn all_with_virtual(&self) -> Result<IdSet> {
+        // Intentionally skip the VIRTUAL group.
         self.all_ids_in_groups(&Group::ALL)
+    }
+
+    /// Return a [`IdSet`] that covers persistable ids stored in this [`IdDag`],
+    /// i.e. everything exluding the VIRTUAL group.
+    fn all(&self) -> Result<IdSet> {
+        // Intentionally skip the VIRTUAL group.
+        self.all_ids_in_groups(&[Group::MASTER, Group::NON_MASTER])
     }
 
     /// Return a [`IdSet`] that covers all ids stored in the master group.
@@ -647,7 +662,12 @@ pub trait IdDagAlgorithm: IdDagStore {
                     to_visit.push(parent);
                 }
             } else {
-                return bug("flat segments are expected to cover everything but they are not");
+                // The current design requires flat segments to cover all Ids.
+                // Potentially they can be made lazy. But that would be a large change.
+                return bug(format!(
+                    "flat segments should cover all Ids but {:?} is not covered",
+                    id
+                ));
             }
         }
 
@@ -676,7 +696,7 @@ pub trait IdDagAlgorithm: IdDagStore {
                 let span = seg.span()?;
                 result.push_span((span.low..=id).into());
                 trace(&|| format!(" push {:?}..={:?}", span.low, id));
-                if let Some(&p) = seg.parents()?.get(0) {
+                if let Some(&p) = seg.parents()?.first() {
                     to_visit.push(p);
                 }
             }
@@ -861,7 +881,7 @@ pub trait IdDagAlgorithm: IdDagStore {
             n -= step;
             if n > 0 {
                 // Follow the first parent.
-                id = match seg.parents()?.get(0) {
+                id = match seg.parents()?.first() {
                     None => return Ok(None),
                     Some(&id) => id,
                 };
@@ -993,7 +1013,7 @@ pub trait IdDagAlgorithm: IdDagStore {
 
                     // Fragmented linear segments. Convert id~n to next_id~next_n.
                     let child_parents = child_seg.parents()?;
-                    match child_parents.get(0) {
+                    match child_parents.first() {
                         None => {
                             return bug(format!(
                                 "segment {:?} should have parent {:?}",
@@ -1249,7 +1269,7 @@ pub trait IdDagAlgorithm: IdDagStore {
         };
 
         let max_level = self.max_level()?;
-        for span in self.all()?.as_spans() {
+        for span in self.all_with_virtual()?.as_spans() {
             visit_segments(&mut ctx, *span, max_level)?;
         }
 
@@ -1385,7 +1405,8 @@ pub trait IdDagAlgorithm: IdDagStore {
     fn descendants(&self, set: IdSet) -> Result<IdSet> {
         debug!(target: "dag::algo::descendants", "descendants({:?})", &set);
         let roots = set;
-        let result = self.descendants_intersection(&roots, &self.all()?)?;
+        let all = self.all_with_virtual()?;
+        let result = self.descendants_intersection(&roots, &all)?;
         trace!(target: "dag::algo::descendants", " result: {:?}", &result);
         Ok(result)
     }
@@ -1466,9 +1487,8 @@ pub trait IdDagAlgorithm: IdDagStore {
         // or interesting. For a typical query like `x::y`, it might just select
         // a few heads in the non-master group. It's a waste of time to iterate
         // through lots of invisible segments.
-        let non_master_spans = ancestors.intersection(
-            &IdSpan::from(Group::NON_MASTER.min_id()..=Group::NON_MASTER.max_id()).into(),
-        );
+        let non_master_spans = ancestors
+            .intersection(&IdSpan::from(Group::NON_MASTER.min_id()..=Group::MAX.max_id()).into());
         // Visit in ascending order.
         let mut span_iter = non_master_spans.as_spans().iter().rev().cloned();
         let mut next_optional_span = span_iter.next();
@@ -1663,6 +1683,94 @@ pub trait IdDagAlgorithm: IdDagStore {
         }
         Ok(result)
     }
+
+    /// Suggest the next `Id` to test, during a bisect.
+    ///
+    /// - `(low, high)` are explicitly marked ends, either `(good, bad)` or `(bad, good)`.
+    /// - `skip` is an explicitly skipped set.
+    ///
+    /// Return `(id_to_bisect_next, untested_set, roots(high::))`.
+    ///
+    /// If `id_to_bisect_next` is `None`, the bisect is completed. At this time,
+    /// `roots(high::)` is the "first good/bad" set. `untested_set` is usually
+    /// empty, or a subset of `skip`.
+    fn suggest_bisect(
+        &self,
+        low: &IdSet,
+        high: &IdSet,
+        skip: &IdSet,
+    ) -> Result<(Option<Id>, IdSet, IdSet)> {
+        debug!(target: "dag::algo::suggest_bisect", "suggest_bisect({:?}, {:?}, {:?})", low, high, skip);
+        // Handling the two ends is NOT symmetric. For example, assuming high = bad:
+        //
+        //     Y  high (bad)
+        //    / \
+        //  A10  B10
+        //   :    :
+        //  A01  B01
+        //    \ /
+        //     X  low (good)
+        //
+        // - If A05 is "good", then A01::A05 is implicit "good", B01::B10 remains unknown.
+        // - If A05 is "bad", then A05::Y is implicit "bad", B01::B10 can be skipped.
+        //
+        // The final bisect output is a single commit ("first bad"). The contract does not require us
+        // to figure out all "first bad"s in all branches. If X is good, A05 is bad, then we know one
+        // of the "first bad"s must exist in X::A05 and we can ignore other parts like B01::B10.
+
+        // low::low = implicit good.
+        let connected_low = self.range(low.clone(), low.clone())?;
+
+        // Ignore interesting parts - see above for why this is only for "high".
+        let high = self.roots(self.range(high.clone(), high.clone())?)?;
+
+        // The bisect range.
+        let untested = self
+            .range(low.clone(), high.clone())?
+            .difference(&connected_low)
+            .difference(&high);
+        trace!(target: "dag::algo::suggest_bisect", " untested = {:?}", untested);
+
+        let total = untested.count();
+        let ideal = (total + 1) / 2;
+
+        // Consider each linear ranges (flat segments).
+        let flat_segments =
+            self.id_set_to_id_segments_with_max_level(&untested.difference(skip), 0)?;
+        let mut best_score = 0;
+        let mut best_id = None;
+        for id_segment in flat_segments.into_iter().rev() {
+            // Pick "P", let "len(ancestors(P) & untested)" be "x".
+            // - If P is good, bisect total -= x.
+            // - If P is bad, bisect total -= (total + 1 - x).
+            // We want to make good progress even in the worst case, maximize "min(total + 1 - x, x)".
+            // The best happens when "total + 1 - x" is "x", when x = ideal.
+            //
+            // if good, remove "ancestors(P)" from "untested",
+            // if bad, remove "P + (untested - ancestors(P))" from "untested".
+
+            // "ancestors(high)" can be cheaper to calculate than "ancestor(low)", if it follows a
+            // high-level segment. Once we get "ancestors(high)", we can calculate the "count" for
+            // "ancestors(p for p in low..=high)" without calling (slower) "ancestors(p)", because
+            // the segment is "flat" (level 0), it cannot have merges except for "low".
+            let ancestors_high = self.ancestors(id_segment.high.into())?;
+            let high_count = ancestors_high.intersection(&untested).count();
+            let low_count = high_count.saturating_sub(id_segment.high.0 - id_segment.low.0);
+            let best_count = ideal.max(low_count).min(high_count);
+            let score = best_count.min(total + 1 - best_count);
+            if score > best_score {
+                let id = id_segment.low + (best_count - low_count);
+                trace!(target: "dag::algo::suggest_bisect", "  id={} score={}", id, score);
+                best_score = score;
+                best_id = Some(id);
+                if best_count == ideal {
+                    break;
+                }
+            }
+        }
+
+        Ok((best_id, untested, high))
+    }
 }
 
 impl<S: IdDagStore> IdDagAlgorithm for S {}
@@ -1740,24 +1848,6 @@ pub enum FirstAncestorConstraint {
 }
 
 impl<Store: IdDagStore> IdDag<Store> {
-    /// Export non-master DAG as parent_id_func on HashMap.
-    ///
-    /// This can be expensive if there are a lot of non-master ids.
-    /// It is currently only used to rebuild non-master groups after
-    /// id re-assignment.
-    pub fn non_master_parent_ids(&self) -> Result<HashMap<Id, Vec<Id>>> {
-        let mut parents = HashMap::new();
-        let start = Group::NON_MASTER.min_id();
-        for seg in self.next_segments(start, 0)? {
-            let span = seg.span()?;
-            parents.insert(span.low, seg.parents()?);
-            for i in (span.low + 1).to(span.high) {
-                parents.insert(i, vec![i - 1]);
-            }
-        }
-        Ok(parents)
-    }
-
     /// Remove `set` and their descendants. Return `descendents(set)`.
     ///
     /// The returned `descendants(set)` is usually used to remove
@@ -1849,7 +1939,17 @@ impl<Store: IdDagStore> IdDag<Store> {
         }
 
         // strip() is not an append-only change. Use an incompatible version.
-        self.version = VerLink::new();
+        // However, if it's just for the VIRTUAL group, then do not bump version.
+        let need_version_bump = match (
+            set.min().map(|id| id.group()),
+            set.max().map(|id| id.group()),
+        ) {
+            (Some(Group::VIRTUAL), Some(Group::VIRTUAL)) => false,
+            _ => true,
+        };
+        if need_version_bump {
+            self.version = VerLink::new();
+        }
 
         Ok(set)
     }
@@ -1949,6 +2049,12 @@ impl<P: Fn(Id) -> Result<bool>> LazyPredicate<P> {
     }
 }
 
+impl<S: StorageVersion> StorageVersion for IdDag<S> {
+    fn storage_version(&self) -> (u64, u64) {
+        self.store.storage_version()
+    }
+}
+
 fn default_seg_size() -> usize {
     DEFAULT_SEG_SIZE.load(Ordering::Acquire)
 }
@@ -1971,6 +2077,10 @@ mod tests {
 
     use super::*;
     use crate::iddagstore::tests::dump_store_state;
+    use crate::tests::dbg;
+    use crate::tests::dbg_iter;
+    use crate::tests::nid;
+    use crate::tests::vid;
 
     #[test]
     fn test_segment_basic_lookups() {
@@ -2029,7 +2139,7 @@ mod tests {
 
     fn get_parents(id: Id) -> Result<Vec<Id>> {
         match id.0 {
-            0 | 1 | 2 => Ok(Vec::new()),
+            0..=2 => Ok(Vec::new()),
             _ => Ok(vec![id - 1, Id(id.0 / 2)]),
         }
     }
@@ -2066,7 +2176,7 @@ mod tests {
         dag.build_segments(Id(1001), &get_parents).unwrap();
         let all = dag.all().unwrap();
         // Id 0 is not referred.
-        assert_eq!(format!("{:?}", &all), "1..=1001");
+        assert_eq!(dbg(&all), "1..=1001");
         assert_eq!(all.count(), 1001);
 
         // Insert discontinuous segments.
@@ -2088,7 +2198,7 @@ mod tests {
         })
         .unwrap();
         let all = dag.all().unwrap();
-        assert_eq!(format!("{:?}", &all), "3 4 5 10..=20 30..=40");
+        assert_eq!(dbg(&all), "3 4 5 10..=20 30..=40");
         assert_eq!(all.count(), 25);
     }
 
@@ -2192,10 +2302,10 @@ mod tests {
         assert_eq!(iddag.max_level().unwrap(), 2);
 
         let all = iddag.all().unwrap();
-        assert_eq!(format!("{:?}", &all), "0..=10 N0..=N19");
+        assert_eq!(dbg(&all), "0..=10 N0..=N19");
 
         let roots = iddag.roots(all).unwrap();
-        assert_eq!(format!("{:?}", roots), "0 N0 N5 N10 N15");
+        assert_eq!(dbg(roots), "0 N0 N5 N10 N15");
     }
 
     #[test]
@@ -2242,11 +2352,70 @@ mod tests {
             all_after_remove.union(&removed).as_spans(),
             all_before_remove.as_spans()
         );
-        assert_eq!(format!("{:?}", &removed), "70..=100 201..=300 N0..=N100");
+        assert_eq!(dbg(&removed), "70..=100 201..=300 N0..=N100");
         assert_eq!(
             dump_store_state(&iddag.store, &all_before_remove),
             "\nLv0: RH0-69[], 101-200[50], N101-N200[50]\nP->C: 50->101, 50->N101"
         );
+    }
+
+    #[test]
+    fn test_virtual() -> Result<()> {
+        let dir = tempdir()?;
+        let mut iddag = IdDag::open(dir.path())?;
+        let mut prepared = PreparedFlatSegments::default();
+        prepared.segments.insert(FlatSegment {
+            low: nid(0),
+            high: nid(5),
+            parents: Vec::new(),
+        });
+        prepared.segments.insert(FlatSegment {
+            low: vid(0),
+            high: vid(3),
+            parents: vec![nid(2)],
+        });
+        prepared.segments.insert(FlatSegment {
+            low: vid(5),
+            high: vid(8),
+            parents: vec![nid(3), vid(2)],
+        });
+        iddag.build_segments_from_prepared_flat_segments(&prepared)?;
+
+        // all() skips VIRTUAL.
+        assert_eq!(dbg(iddag.all()?), "N0..=N5");
+
+        // all_with_virtual() includes VIRTUAL.
+        assert_eq!(dbg(iddag.all_with_virtual()?), "N0..=N5 V0..=V3 V5..=V8");
+
+        // children() follows into VIRTUAL.
+        assert_eq!(dbg(iddag.children(nid(3).into())?), "N4 V5");
+        assert_eq!(dbg(iddag.children_id(nid(3))?), "N4 V5");
+        assert_eq!(dbg(iddag.children_set(nid(3).into())?), "N4 V5");
+        assert_eq!(dbg(iddag.children_id(vid(2))?), "V3 V5");
+        assert_eq!(dbg(iddag.children_set(vid(2).into())?), "V3 V5");
+
+        // descenants() follows into VIRTUAL.
+        assert_eq!(
+            dbg(iddag.descendants(nid(2).into())?),
+            "N2..=N5 V0..=V3 V5..=V8"
+        );
+        assert_eq!(dbg(iddag.descendants(vid(2).into())?), "V2 V3 V5..=V8");
+
+        // range() works with VIRTUAL.
+        assert_eq!(
+            dbg(iddag.range(nid(1).into(), vid(2).into())?),
+            "N1 N2 V0 V1 V2"
+        );
+
+        // Reloading drops VIRTUAL.
+        {
+            let lock = iddag.lock()?;
+            iddag.persist(&lock)?;
+            let iddag2 = IdDag::open(dir.path())?;
+            assert_eq!(dbg(iddag2.all_with_virtual()?), "N0..=N5");
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -2354,26 +2523,13 @@ mod tests {
             .back()
             .unwrap()
             .clone();
-        assert_eq!(format!("{:?}", &high_level_id_seg), "L2 0..=24 []R");
+        assert_eq!(dbg(&high_level_id_seg), "L2 0..=24 []R");
         let low_level_id_segs = iddag
             .id_segment_to_lower_level_id_segments(&high_level_id_seg)
             .unwrap();
         assert_eq!(
-            format!("{:?}", &low_level_id_segs),
+            dbg(&low_level_id_segs),
             "[L1 15..=24 [11, 14, 9], L1 0..=14 []R]"
         );
-    }
-
-    fn dbg_iter<'a, T: std::fmt::Debug>(iter: Box<dyn Iterator<Item = Result<T>> + 'a>) -> String {
-        let v = iter.map(|s| s.unwrap()).collect::<Vec<_>>();
-        dbg(v)
-    }
-
-    fn dbg<T: std::fmt::Debug>(t: T) -> String {
-        format!("{:?}", t)
-    }
-
-    fn nid(i: u64) -> Id {
-        Group::NON_MASTER.min_id() + i
     }
 }

@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Copyright (c) Mercurial Contributors.
 #
@@ -6,6 +8,7 @@
 # GNU General Public License version 2 or any later version.
 
   $ eagerepo
+  $ setconfig commands.update.check=none
   $ hg init repo
   $ cd repo
 
@@ -40,7 +43,7 @@
   $ hg id
   c3fa057dd86f
 
-  $ hg goto
+  $ hg goto tip
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ hg diff
   $ hg status
@@ -51,7 +54,7 @@
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ echo 'changed file1 different' >> file1
 
-  $ hg goto
+  $ hg goto tip
   merging file1
   warning: 1 conflicts while merging file1! (edit, then use 'hg resolve --mark')
   0 files updated, 0 files merged, 0 files removed, 1 files unresolved
@@ -92,7 +95,7 @@
   $ hg id
   dfab7f3c2efb
 
-  $ hg goto -C
+  $ hg goto -C .
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ hg diff
   $ hg status

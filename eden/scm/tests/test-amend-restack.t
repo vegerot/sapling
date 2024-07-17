@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
@@ -18,7 +20,7 @@
 
   $ enable amend rebase remotenames
   $ setconfig experimental.narrow-heads=True
-  $ setconfig visibility.enabled=true mutation.record=true mutation.enabled=true mutation.date='0 0' experimental.evolution= remotenames.rename.default=remote
+  $ setconfig visibility.enabled=true mutation.record=true mutation.enabled=true experimental.evolution= remotenames.rename.default=remote
   $ hg init restack
   $ cd restack
 
@@ -49,11 +51,14 @@
 
 # Test basic case of a single amend in a small stack.
 
+  $ mkcommit SRC
+  $ hg go -q null
+
   $ mkcommit a
   $ mkcommit b
   $ mkcommit c
   $ mkcommit d
-  $ hg up 1
+  $ hg up 'desc("add b")'
   0 files updated, 0 files merged, 2 files removed, 0 files unresolved
   $ echo b >> b
   $ hg amend
@@ -69,6 +74,8 @@
   │ x  7c3bad9141dc add b
   ├─╯
   o  1f0dee641bb7 add a
+  
+  o  b22283d0199d add SRC
   $ hg rebase --restack
   rebasing 4538525df7e2 "add c"
   rebasing 47d2a3944de8 "add d"
@@ -80,6 +87,8 @@
   @  743396f58c5c add b
   │
   o  1f0dee641bb7 add a
+  
+  o  b22283d0199d add SRC
 
 # Test multiple amends of same commit.
 
@@ -87,7 +96,7 @@
   $ mkcommit a
   $ mkcommit b
   $ mkcommit c
-  $ hg up 1
+  $ hg up 'desc("add b")'
   0 files updated, 0 files merged, 1 files removed, 0 files unresolved
   $ showgraph
   o  4538525df7e2 add c
@@ -127,7 +136,7 @@
   $ mkcommit c
   $ mkcommit d
   $ mkcommit e
-  $ hg up 1
+  $ hg up 'desc("add b")'
   0 files updated, 0 files merged, 3 files removed, 0 files unresolved
   $ echo conflict > d
   $ hg add d
@@ -155,7 +164,8 @@
   [1]
   $ hg rebase --restack
   abort: rebase in progress
-  (use 'hg rebase --continue' or 'hg rebase --abort')
+  (use 'hg rebase --continue' to continue or
+       'hg rebase --abort' to abort)
   [255]
   $ echo merged > d
   $ hg resolve --mark d
@@ -183,13 +193,13 @@
   $ mkcommit b
   $ mkcommit c
   $ mkcommit d
-  $ hg up 1
+  $ hg up 'desc("add b")'
   0 files updated, 0 files merged, 2 files removed, 0 files unresolved
   $ echo b >> b
   $ hg amend
   hint[amend-restack]: descendants of 7c3bad9141dc are left behind - use 'hg restack' to rebase them
   hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg up 3
+  $ hg up 'desc("add d")'
   3 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ showgraph
   o  743396f58c5c add b
@@ -220,7 +230,7 @@
   $ mkcommit b
   $ mkcommit c
   $ mkcommit d
-  $ hg up 1
+  $ hg up 'desc("add b")'
   0 files updated, 0 files merged, 2 files removed, 0 files unresolved
   $ echo b >> b
   $ hg amend
@@ -261,7 +271,7 @@
   $ mkcommit b
   $ mkcommit c
   $ mkcommit d
-  $ hg up 1
+  $ hg up 'desc("add b")'
   0 files updated, 0 files merged, 2 files removed, 0 files unresolved
   $ echo b >> b
   $ hg amend
@@ -275,7 +285,7 @@
   $ hg amend
   hint[amend-restack]: descendants of 743396f58c5c are left behind - use 'hg restack' to rebase them
   hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg up 5
+  $ hg up 'desc("add e")'
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ showgraph
   o  af408d76932d add b
@@ -315,19 +325,19 @@
   $ mkcommit b
   $ mkcommit c
   $ mkcommit d
-  $ hg up 1
+  $ hg up 'desc("add b")'
   0 files updated, 0 files merged, 2 files removed, 0 files unresolved
   $ echo b >> b
   $ hg amend
   hint[amend-restack]: descendants of 7c3bad9141dc are left behind - use 'hg restack' to rebase them
   hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg up 2
+  $ hg up 'desc("add c")'
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ echo c >> c
   $ hg amend
   hint[amend-restack]: descendants of 4538525df7e2 are left behind - use 'hg restack' to rebase them
   hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg up 3
+  $ hg up 'desc("add d")'
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ showgraph
   o  dd2a887139a3 add c
@@ -363,16 +373,16 @@
   $ mkcommit c
   $ mkcommit d
   $ mkcommit e
-  $ hg up 3
+  $ hg up 'desc("add d")'
   0 files updated, 0 files merged, 1 files removed, 0 files unresolved
   $ echo d >> d
   $ hg amend
   hint[amend-restack]: descendants of 47d2a3944de8 are left behind - use 'hg restack' to rebase them
   hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg up 0
+  $ hg up 'desc("add a")'
   0 files updated, 0 files merged, 3 files removed, 0 files unresolved
   $ mkcommit f
-  $ hg up 1
+  $ hg up 'desc("add b")'
   1 files updated, 0 files merged, 1 files removed, 0 files unresolved
   $ showgraph
   o  79bfbab36011 add f
@@ -453,19 +463,19 @@
   $ mkcommit b
   $ mkcommit c
   $ mkcommit d
-  $ hg up 1
+  $ hg up 'desc("add b")'
   0 files updated, 0 files merged, 2 files removed, 0 files unresolved
   $ echo b >> b
   $ hg amend
   hint[amend-restack]: descendants of 7c3bad9141dc are left behind - use 'hg restack' to rebase them
   hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg up 2
+  $ hg up 'desc("add c")'
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ echo c >> c
   $ hg amend
   hint[amend-restack]: descendants of 4538525df7e2 are left behind - use 'hg restack' to rebase them
   hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg up 1
+  $ hg up 7c3bad9141dc
   0 files updated, 0 files merged, 1 files removed, 0 files unresolved
   $ showgraph
   o  dd2a887139a3 add c
@@ -502,7 +512,7 @@
   $ mkcommit b
   $ mkcommit c
   $ mkcommit d
-  $ hg up 1
+  $ hg up 'desc("add b")'
   0 files updated, 0 files merged, 2 files removed, 0 files unresolved
   $ echo b >> b
   $ hg amend
@@ -517,7 +527,7 @@
   $ hg amend
   hint[amend-restack]: descendants of 58e16e5d23eb are left behind - use 'hg restack' to rebase them
   hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg up 2
+  $ hg up 'desc("add c")'
   2 files updated, 0 files merged, 1 files removed, 0 files unresolved
   $ echo c >> c
   $ hg amend
@@ -532,7 +542,7 @@
   $ hg amend
   hint[amend-restack]: descendants of a063c2736716 are left behind - use 'hg restack' to rebase them
   hint[hint-ack]: use 'hg hint --ack amend-restack' to silence these hints
-  $ hg up 1
+  $ hg up 7c3bad9141dc
   0 files updated, 0 files merged, 2 files removed, 0 files unresolved
   $ showgraph
   o  8282a17a7483 add g

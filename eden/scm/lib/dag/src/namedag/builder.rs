@@ -96,7 +96,11 @@ where
             overlay_map_id_set,
             overlay_map_paths: Default::default(),
             remote_protocol: Arc::new(()),
+            managed_virtual_group: None,
+
             missing_vertexes_confirmed_by_remote: Default::default(),
+
+            internal_stats: Default::default(),
         };
         Ok(dag)
     }

@@ -22,10 +22,10 @@
 #include <folly/logging/xlog.h>
 #include <thrift/lib/cpp2/protocol/Serializer.h>
 
+#include "eden/common/utils/FutureUnixSocket.h"
 #include "eden/fs/takeover/TakeoverData.h"
 #include "eden/fs/takeover/TakeoverHandler.h"
 #include "eden/fs/utils/EventBaseState.h"
-#include "eden/fs/utils/FutureUnixSocket.h"
 
 using apache::thrift::CompactSerializer;
 using folly::AsyncServerSocket;
@@ -309,7 +309,7 @@ TakeoverServer::TakeoverServer(
   start();
 }
 
-TakeoverServer::~TakeoverServer() {}
+TakeoverServer::~TakeoverServer() = default;
 
 void TakeoverServer::start() {
   // Build the address for the takeover socket.

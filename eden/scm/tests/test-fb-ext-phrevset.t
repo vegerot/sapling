@@ -1,4 +1,7 @@
-#debugruntest-compatible
+#modern-config-incompatible
+
+#require no-eden
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This software may be used and distributed according to the terms of the
@@ -7,7 +10,7 @@
   $ setconfig devel.segmented-changelog-rev-compat=true
   $ cat >> $HGRCPATH << 'EOF'
   > [extensions]
-  > phrevset=
+  > fbcodereview=
   > EOF
   $ hg init repo
   $ cd repo

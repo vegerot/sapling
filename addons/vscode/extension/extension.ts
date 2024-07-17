@@ -5,33 +5,59 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {EnabledSCMApiFeature} from './types';
 import type {Logger} from 'isl-server/src/logger';
+import type {RepositoryContext} from 'isl-server/src/serverTypes';
 
 import packageJson from '../package.json';
+import {DeletedFileContentProvider} from './DeletedFileContentProvider';
 import {registerSaplingDiffContentProvider} from './DiffContentProvider';
+import {Internal} from './Internal';
 import {VSCodeReposList} from './VSCodeRepo';
 import {InlineBlameProvider} from './blame/blame';
 import {registerCommands} from './commands';
+import {getCLICommand} from './config';
 import {ensureTranslationsLoaded} from './i18n';
 import {registerISLCommands} from './islWebviewPanel';
-import {VSCodePlatform} from './vscodePlatform';
+import {getVSCodePlatform} from './vscodePlatform';
 import {makeServerSideTracker} from 'isl-server/src/analytics/serverSideTracker';
-import * as util from 'util';
+import * as util from 'node:util';
 import * as vscode from 'vscode';
 
 export async function activate(context: vscode.ExtensionContext) {
   const start = Date.now();
   const [outputChannel, logger] = createOutputChannelLogger();
-  const extensionTracker = makeServerSideTracker(logger, VSCodePlatform, packageJson.version);
+  const platform = getVSCodePlatform(context);
+  const extensionTracker = makeServerSideTracker(logger, platform, packageJson.version);
   try {
-    await ensureTranslationsLoaded(context);
-    context.subscriptions.push(registerISLCommands(context, logger));
+    const [, enabledSCMApiFeatures] = await Promise.all([
+      ensureTranslationsLoaded(context),
+      Internal.getEnabledSCMApiFeatures?.() ??
+        new Set<EnabledSCMApiFeature>(['blame', 'sidebar', 'autoresolve']),
+    ]);
+    logger.info('enabled features: ', [...enabledSCMApiFeatures].join(', '));
+    const ctx: RepositoryContext = {
+      cmd: getCLICommand(),
+      cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),
+      logger,
+      tracker: extensionTracker,
+    };
+    Internal.maybeOverwriteIslEnabledSetting?.(ctx);
+    context.subscriptions.push(registerISLCommands(context, platform, logger));
     context.subscriptions.push(outputChannel);
-    const reposList = new VSCodeReposList(logger, extensionTracker);
+    const reposList = new VSCodeReposList(logger, extensionTracker, enabledSCMApiFeatures);
     context.subscriptions.push(reposList);
-    context.subscriptions.push(new InlineBlameProvider(reposList, logger, extensionTracker));
-    context.subscriptions.push(registerSaplingDiffContentProvider(logger));
-    context.subscriptions.push(...registerCommands(extensionTracker));
+    if (enabledSCMApiFeatures.has('blame')) {
+      context.subscriptions.push(new InlineBlameProvider(reposList, ctx));
+    }
+    context.subscriptions.push(registerSaplingDiffContentProvider(ctx));
+    context.subscriptions.push(new DeletedFileContentProvider());
+
+    context.subscriptions.push(...registerCommands(ctx));
+
+    Internal?.registerInternalBugLogsProvider != null &&
+      context.subscriptions.push(Internal.registerInternalBugLogsProvider(logger));
+
     extensionTracker.track('VSCodeExtensionActivated', {duration: Date.now() - start});
   } catch (error) {
     extensionTracker.error('VSCodeExtensionActivated', 'VSCodeActivationError', error as Error, {

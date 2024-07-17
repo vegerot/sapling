@@ -17,15 +17,14 @@ use bonsai_hg_mapping::BonsaiHgMapping;
 use cacheblob::MemWritesBlobstore;
 use context::CoreContext;
 use filenodes::Filenodes;
+use filestore::FilestoreConfig;
 use futures::future::try_join_all;
 use metaconfig_types::DerivedDataTypesConfig;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
-use mononoke_types::RepositoryId;
 
 use crate::derivable::BonsaiDerivable;
 use crate::manager::derive::Rederivation;
-use crate::manager::DerivedDataManager;
 
 /// Context for performing derivation.
 ///
@@ -34,9 +33,14 @@ use crate::manager::DerivedDataManager;
 /// derived data types.
 #[derive(Clone)]
 pub struct DerivationContext {
-    manager: DerivedDataManager,
-    rederivation: Option<Arc<dyn Rederivation>>,
-    blobstore: Arc<dyn Blobstore>,
+    pub(crate) bonsai_hg_mapping: Option<Arc<dyn BonsaiHgMapping>>,
+    bonsai_git_mapping: Option<Arc<dyn BonsaiGitMapping>>,
+    pub(crate) filenodes: Option<Arc<dyn Filenodes>>,
+    config_name: String,
+    config: DerivedDataTypesConfig,
+    pub(crate) rederivation: Option<Arc<dyn Rederivation>>,
+    pub(crate) blobstore: Arc<dyn Blobstore>,
+    filestore_config: FilestoreConfig,
 
     /// Write cache layered over the blobstore.  This is the same object
     /// with two views, so we can return a reference to the `Arc<dyn
@@ -49,15 +53,74 @@ pub struct DerivationContext {
 
 impl DerivationContext {
     pub(crate) fn new(
-        manager: DerivedDataManager,
-        rederivation: Option<Arc<dyn Rederivation>>,
+        bonsai_hg_mapping: Arc<dyn BonsaiHgMapping>,
+        bonsai_git_mapping: Arc<dyn BonsaiGitMapping>,
+        filenodes: Arc<dyn Filenodes>,
+        config_name: String,
+        config: DerivedDataTypesConfig,
         blobstore: Arc<dyn Blobstore>,
+        filestore_config: FilestoreConfig,
     ) -> Self {
+        // Start with None. Use with_rederivation later if needed
+        let rederivation = None;
         DerivationContext {
-            manager,
+            bonsai_hg_mapping: Some(bonsai_hg_mapping),
+            bonsai_git_mapping: Some(bonsai_git_mapping),
+            filenodes: Some(filenodes),
+            config_name,
+            config,
             rederivation,
             blobstore,
+            filestore_config,
             blobstore_write_cache: None,
+        }
+    }
+
+    pub(crate) fn with_replaced_rederivation(
+        &self,
+        rederivation: Option<Arc<dyn Rederivation>>,
+    ) -> Self {
+        Self {
+            rederivation,
+            ..self.clone()
+        }
+    }
+
+    // For dangerous-override: allow replacement of bonsai-hg-mapping
+    pub(crate) fn with_replaced_bonsai_hg_mapping(
+        &self,
+        bonsai_hg_mapping: Arc<dyn BonsaiHgMapping>,
+    ) -> Self {
+        Self {
+            bonsai_hg_mapping: Some(bonsai_hg_mapping),
+            ..self.clone()
+        }
+    }
+
+    // For dangerous-override: allow replacement of filenodes
+    pub(crate) fn with_replaced_filenodes(&self, filenodes: Arc<dyn Filenodes>) -> Self {
+        Self {
+            filenodes: Some(filenodes),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn with_replaced_config(
+        &self,
+        config_name: String,
+        config: DerivedDataTypesConfig,
+    ) -> Self {
+        Self {
+            config_name,
+            config,
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn with_replaced_blobstore(&self, blobstore: Arc<dyn Blobstore>) -> Self {
+        Self {
+            blobstore,
+            ..self.clone()
         }
     }
 
@@ -71,7 +134,7 @@ impl DerivationContext {
         Derivable: BonsaiDerivable,
     {
         if let Some(rederivation) = self.rederivation.as_ref() {
-            if rederivation.needs_rederive(Derivable::NAME, csid) == Some(true) {
+            if rederivation.needs_rederive(Derivable::VARIANT, csid) == Some(true) {
                 return Ok(None);
             }
         }
@@ -89,7 +152,9 @@ impl DerivationContext {
         Derivable: BonsaiDerivable,
     {
         if let Some(rederivation) = self.rederivation.as_ref() {
-            csids.retain(|csid| rederivation.needs_rederive(Derivable::NAME, *csid) != Some(true));
+            csids.retain(|csid| {
+                rederivation.needs_rederive(Derivable::VARIANT, *csid) != Some(true)
+            });
         }
         let derived = Derivable::fetch_batch(ctx, self, &csids).await?;
         Ok(derived)
@@ -167,35 +232,6 @@ impl DerivationContext {
         self.fetch_dependency(ctx, csid).await
     }
 
-    /// Cause derivation of a dependency, and fetch the result.
-    ///
-    /// In the future, this will be removed in favour of making the manager
-    /// arrange for dependent derived data to always be derived before
-    /// derivation starts.
-    pub async fn derive_dependency<Derivable>(
-        &self,
-        ctx: &CoreContext,
-        csid: ChangesetId,
-    ) -> Result<Derivable>
-    where
-        Derivable: BonsaiDerivable,
-    {
-        Ok(self
-            .manager
-            .derive::<Derivable>(ctx, csid, self.rederivation.clone())
-            .await?)
-    }
-
-    /// The repo id of the repo being derived.
-    pub fn repo_id(&self) -> RepositoryId {
-        self.manager.repo_id()
-    }
-
-    /// The repo name of the repo being derived.
-    pub fn repo_name(&self) -> &str {
-        self.manager.repo_name()
-    }
-
     /// The blobstore that should be used for storing and retrieving blobs.
     pub fn blobstore(&self) -> &Arc<dyn Blobstore> {
         match &self.blobstore_write_cache {
@@ -204,21 +240,33 @@ impl DerivationContext {
         }
     }
 
+    pub fn filestore_config(&self) -> FilestoreConfig {
+        self.filestore_config
+    }
+
     pub fn bonsai_hg_mapping(&self) -> Result<&dyn BonsaiHgMapping> {
-        self.manager.bonsai_hg_mapping()
+        self.bonsai_hg_mapping
+            .as_deref()
+            .context("Missing BonsaiHgMapping")
     }
 
     pub fn bonsai_git_mapping(&self) -> Result<&dyn BonsaiGitMapping> {
-        self.manager.bonsai_git_mapping()
+        self.bonsai_git_mapping
+            .as_deref()
+            .context("Missing BonsaiGitMapping")
     }
 
     pub fn filenodes(&self) -> Result<&dyn Filenodes> {
-        self.manager.filenodes()
+        self.filenodes.as_deref().context("Missing filenodes")
+    }
+
+    pub fn config_name(&self) -> String {
+        self.config_name.clone()
     }
 
     /// The config that should be used for derivation.
     pub fn config(&self) -> &DerivedDataTypesConfig {
-        self.manager.config()
+        &self.config
     }
 
     /// Mapping key prefix for a particular derived data type.
@@ -228,28 +276,20 @@ impl DerivationContext {
     {
         self.config()
             .mapping_key_prefixes
-            .get(Derivable::NAME)
+            .get(&Derivable::VARIANT)
             .map_or("", String::as_str)
     }
 
-    pub(crate) fn needs_rederive<Derivable>(&self, csid: ChangesetId) -> bool
+    /// Batch size for a particular derived data type.
+    pub fn batch_size<Derivable>(&self) -> u64
     where
         Derivable: BonsaiDerivable,
     {
-        if let Some(rederivation) = self.rederivation.as_ref() {
-            rederivation.needs_rederive(Derivable::NAME, csid) == Some(true)
-        } else {
-            false
-        }
-    }
-
-    pub(crate) fn mark_derived<Derivable>(&self, csid: ChangesetId)
-    where
-        Derivable: BonsaiDerivable,
-    {
-        if let Some(rederivation) = self.rederivation.as_ref() {
-            rederivation.mark_derived(Derivable::NAME, csid);
-        }
+        const DEFAULT_BATCH_SIZE: u64 = 20;
+        self.config()
+            .derivation_batch_sizes
+            .get(&Derivable::VARIANT)
+            .map_or(DEFAULT_BATCH_SIZE, |size| *size as u64)
     }
 
     /// Enable write batching for this derivation context.

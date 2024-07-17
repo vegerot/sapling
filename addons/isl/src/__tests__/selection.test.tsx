@@ -6,6 +6,8 @@
  */
 
 import App from '../App';
+import {readAtom} from '../jotaiUtils';
+import {individualToggleKey, selectedCommits} from '../selection';
 import {mostRecentSubscriptionIds} from '../serverAPIState';
 import {CommitTreeListTestUtils, CommitInfoTestUtils} from '../testQueries';
 import {
@@ -15,12 +17,11 @@ import {
   simulateRepoConnected,
   TEST_COMMIT_HISTORY,
   COMMIT,
+  closeCommitInfoSidebar,
+  commitInfoIsOpen,
 } from '../testUtils';
-import {fireEvent, render, screen} from '@testing-library/react';
+import {fireEvent, render, screen, act} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import {act} from 'react-dom/test-utils';
-
-jest.mock('../MessageBus');
 
 describe('selection', () => {
   beforeEach(() => {
@@ -37,11 +38,19 @@ describe('selection', () => {
     });
   });
 
-  const click = (name: string, opts?: {shiftKey?: boolean; metaKey?: boolean}) => {
+  const click = (
+    name: string,
+    opts?: {shiftKey?: boolean; metaKey?: boolean; ctrlKey?: boolean},
+  ) => {
     act(
       () => void fireEvent.click(CommitTreeListTestUtils.withinCommitTree().getByText(name), opts),
     );
   };
+
+  const expectNoRealSelection = () =>
+    expect(CommitInfoTestUtils.withinCommitInfo().queryAllByTestId('selected-commit')).toHaveLength(
+      0,
+    );
 
   const expectOnlyOneCommitSelected = () =>
     expect(
@@ -70,6 +79,10 @@ describe('selection', () => {
     );
   };
 
+  const rightArrow = () => {
+    act(() => userEvent.type(screen.getByTestId('commit-tree-root'), '{arrowright}'));
+  };
+
   it('allows selecting via click', () => {
     act(() => void fireEvent.click(screen.getByText('Commit A')));
 
@@ -95,9 +108,9 @@ describe('selection', () => {
   });
 
   it('allows multi-selecting via cmd-click', () => {
-    act(() => void fireEvent.click(screen.getByText('Commit A'), {metaKey: true}));
-    act(() => void fireEvent.click(screen.getByText('Commit B'), {metaKey: true}));
-    act(() => void fireEvent.click(screen.getByText('Commit C'), {metaKey: true}));
+    act(() => void fireEvent.click(screen.getByText('Commit A'), {[individualToggleKey]: true}));
+    act(() => void fireEvent.click(screen.getByText('Commit B'), {[individualToggleKey]: true}));
+    act(() => void fireEvent.click(screen.getByText('Commit C'), {[individualToggleKey]: true}));
 
     expect(CommitInfoTestUtils.withinCommitInfo().getByText('Commit A')).toBeInTheDocument();
     expect(CommitInfoTestUtils.withinCommitInfo().getByText('Commit B')).toBeInTheDocument();
@@ -108,8 +121,8 @@ describe('selection', () => {
   });
 
   it('single click after multi-select resets to single selection', () => {
-    act(() => void fireEvent.click(screen.getByText('Commit A'), {metaKey: true}));
-    act(() => void fireEvent.click(screen.getByText('Commit B'), {metaKey: true}));
+    act(() => void fireEvent.click(screen.getByText('Commit A'), {[individualToggleKey]: true}));
+    act(() => void fireEvent.click(screen.getByText('Commit B'), {[individualToggleKey]: true}));
 
     act(() => void fireEvent.click(screen.getByText('Commit C')));
 
@@ -133,11 +146,11 @@ describe('selection', () => {
 
   it('cmd-clicking on a commit a second time deselects it', () => {
     const commitA = screen.getByText('Commit A');
-    act(() => void fireEvent.click(commitA, {metaKey: true}));
-    act(() => void fireEvent.click(screen.getByText('Commit B'), {metaKey: true}));
-    act(() => void fireEvent.click(screen.getByText('Commit C'), {metaKey: true}));
+    act(() => void fireEvent.click(commitA, {[individualToggleKey]: true}));
+    act(() => void fireEvent.click(screen.getByText('Commit B'), {[individualToggleKey]: true}));
+    act(() => void fireEvent.click(screen.getByText('Commit C'), {[individualToggleKey]: true}));
 
-    act(() => void fireEvent.click(commitA, {metaKey: true}));
+    act(() => void fireEvent.click(commitA, {[individualToggleKey]: true}));
 
     expect(CommitInfoTestUtils.withinCommitInfo().queryByText('Commit A')).not.toBeInTheDocument();
     expect(CommitInfoTestUtils.withinCommitInfo().getByText('Commit B')).toBeInTheDocument();
@@ -149,9 +162,9 @@ describe('selection', () => {
 
   it('single click after multi-select resets to single selection, even on a previously selected commits', () => {
     const commitA = screen.getByText('Commit A');
-    act(() => void fireEvent.click(commitA, {metaKey: true}));
-    act(() => void fireEvent.click(screen.getByText('Commit B'), {metaKey: true}));
-    act(() => void fireEvent.click(screen.getByText('Commit C'), {metaKey: true}));
+    act(() => void fireEvent.click(commitA, {[individualToggleKey]: true}));
+    act(() => void fireEvent.click(screen.getByText('Commit B'), {[individualToggleKey]: true}));
+    act(() => void fireEvent.click(screen.getByText('Commit C'), {[individualToggleKey]: true}));
 
     act(() => void fireEvent.click(commitA));
 
@@ -182,8 +195,8 @@ describe('selection', () => {
   });
 
   it('does not show the submit button for multi selections in GitHub repos', () => {
-    act(() => void fireEvent.click(screen.getByText('Commit A'), {metaKey: true}));
-    act(() => void fireEvent.click(screen.getByText('Commit B'), {metaKey: true}));
+    act(() => void fireEvent.click(screen.getByText('Commit A'), {[individualToggleKey]: true}));
+    act(() => void fireEvent.click(screen.getByText('Commit B'), {[individualToggleKey]: true}));
     expect(
       CommitInfoTestUtils.withinCommitInfo().queryByText('Submit Selected Commits'),
     ).not.toBeInTheDocument();
@@ -193,13 +206,13 @@ describe('selection', () => {
     act(
       () =>
         void fireEvent.click(CommitTreeListTestUtils.withinCommitTree().getByText('Commit E'), {
-          metaKey: true,
+          [individualToggleKey]: true,
         }),
     );
     act(
       () =>
         void fireEvent.click(CommitTreeListTestUtils.withinCommitTree().getByText('Commit D'), {
-          metaKey: true,
+          [individualToggleKey]: true,
         }),
     );
     expect(CommitInfoTestUtils.withinCommitInfo().getByText('Commit E')).toBeInTheDocument();
@@ -237,8 +250,8 @@ describe('selection', () => {
     });
 
     it('adds to selection', () => {
-      click('Commit A', {metaKey: true});
-      click('Commit C', {metaKey: true});
+      click('Commit A', {[individualToggleKey]: true});
+      click('Commit C', {[individualToggleKey]: true});
       click('Commit E', {shiftKey: true});
       expect(CommitInfoTestUtils.withinCommitInfo().getByText('Commit A')).toBeInTheDocument();
       expect(CommitInfoTestUtils.withinCommitInfo().getByText('Commit C')).toBeInTheDocument();
@@ -249,10 +262,39 @@ describe('selection', () => {
       ).toBeInTheDocument();
     });
 
+    it('prefers dag range to flatten range', () => {
+      // a-b--c-d-e
+      //     \
+      //      f-g
+      act(() =>
+        simulateCommits({
+          value: [
+            COMMIT('f', 'Commit F', 'b'),
+            COMMIT('g', 'Commit G', 'f'),
+            ...TEST_COMMIT_HISTORY,
+          ],
+        }),
+      );
+
+      {
+        click('Commit A'); // select
+        click('Commit G', {shiftKey: true});
+        const selected = readAtom(selectedCommits);
+        expect([...selected].sort()).toEqual(['a', 'b', 'f', 'g']);
+      }
+
+      {
+        click('Commit D'); // select
+        click('Commit A', {shiftKey: true});
+        const selected = readAtom(selectedCommits);
+        expect([...selected].sort()).toEqual(['a', 'b', 'c', 'd']);
+      }
+    });
+
     it('deselecting clears last selected', () => {
       click('Commit A'); // select
       click('Commit A'); // deselect
-      click('Commit C', {metaKey: true});
+      click('Commit C', {[individualToggleKey]: true});
       expect(CommitInfoTestUtils.withinCommitInfo().getByText('Commit C')).toBeInTheDocument();
       // just one commit, C, selected
       expect(
@@ -270,12 +312,17 @@ describe('selection', () => {
   });
 
   describe('up/down arrows to select', () => {
-    it('noop if nothing selected', () => {
-      upArrow();
+    it('down arrow with no selection starts you at the top', () => {
+      expectNoRealSelection();
       downArrow();
-      upArrow(true);
-      downArrow(true);
       expectOnlyOneCommitSelected();
+      expect(CommitInfoTestUtils.withinCommitInfo().getByText('Commit Z')).toBeInTheDocument();
+    });
+
+    it('up arrow noop if nothing selected', () => {
+      upArrow();
+      upArrow(true);
+      expectNoRealSelection();
     });
 
     it('up arrow modifies selection', () => {
@@ -334,6 +381,16 @@ describe('selection', () => {
       expect(CommitInfoTestUtils.withinCommitInfo().getByText('Commit C')).toBeInTheDocument();
       expect(CommitInfoTestUtils.withinCommitInfo().getByText('Commit B')).toBeInTheDocument();
       expectNCommitsSelected(2);
+    });
+
+    it('right arrows opens sidebar', () => {
+      click('Commit A');
+      act(() => closeCommitInfoSidebar());
+
+      expect(commitInfoIsOpen()).toEqual(false);
+      rightArrow();
+      expect(CommitInfoTestUtils.withinCommitInfo().getByText('Commit A')).toBeInTheDocument();
+      expect(commitInfoIsOpen()).toEqual(true);
     });
   });
 });

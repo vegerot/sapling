@@ -123,6 +123,10 @@ impl<I, const N: usize> AbstractHashType<I, N> {
         self.0
     }
 
+    pub fn from_another<S>(another: AbstractHashType<S, N>) -> Self {
+        Self::from_byte_array(another.into())
+    }
+
     pub fn to_hex(&self) -> String {
         to_hex(self.0.as_ref())
     }
@@ -214,7 +218,7 @@ impl<I, const N: usize> Eq for AbstractHashType<I, N> {}
 
 impl<I, const N: usize> PartialOrd<Self> for AbstractHashType<I, N> {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 
@@ -232,7 +236,7 @@ impl<I, const N: usize> std::hash::Hash for AbstractHashType<I, N> {
 
 impl<I, const N: usize> Clone for AbstractHashType<I, N> {
     fn clone(&self) -> Self {
-        Self(self.0, PhantomData)
+        *self
     }
 }
 

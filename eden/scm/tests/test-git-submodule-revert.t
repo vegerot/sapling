@@ -1,5 +1,4 @@
-#require git no-windows
-#debugruntest-compatible
+#require git no-windows no-eden
 
 Test the 'revert' command with submodules:
 

@@ -23,8 +23,6 @@ import sys
 sys.path.append(os.path.dirname(os.path.realpath(__file__)))
 
 import contextlib
-import ctypes
-import ctypes.util
 import errno
 import glob
 import hashlib
@@ -34,17 +32,11 @@ import socket
 import stat
 import struct
 import subprocess
-import tarfile
 import tempfile
 import time
-import zipfile
 
-PY_VERSION = os.environ.get("PY_VERSION")
-if PY_VERSION is None:
-    if os.name == "nt":
-        PY_VERSION = "39"
-    else:
-        PY_VERSION = "38"
+from contrib.pick_python import load_build_env
+
 
 ossbuild = bool(os.environ.get("SAPLING_OSS_BUILD"))
 
@@ -59,10 +51,7 @@ def ensureenv():
     If build/env has specified a different set of environment variables,
     restart the current command. Otherwise do nothing.
     """
-    if not os.path.exists("build/env"):
-        return
-    with open("build/env", "r") as f:
-        env = dict(l.split("=", 1) for l in f.read().splitlines() if "=" in l)
+    env = load_build_env()
     if all(os.environ.get(k) == v for k, v in env.items()):
         # No restart needed
         return
@@ -77,6 +66,8 @@ def ensureenv():
 
 
 ensureenv()
+
+PY_VERSION = "%s%s" % sys.version_info[:2]
 
 # rust-cpython uses this to collect Python information
 os.environ["PYTHON_SYS_EXECUTABLE"] = sys.executable
@@ -93,21 +84,17 @@ import distutils
 from distutils import file_util, log
 from distutils.ccompiler import new_compiler
 from distutils.command.build import build
-from distutils.command.build_ext import build_ext
-from distutils.command.build_py import build_py
 from distutils.command.build_scripts import build_scripts
 from distutils.command.install import install
 from distutils.command.install_lib import install_lib
 from distutils.command.install_scripts import install_scripts
-from distutils.core import Command, Extension, setup
+from distutils.core import Command, setup
 from distutils.dir_util import copy_tree
-from distutils.dist import Distribution
-from distutils.errors import CCompilerError, DistutilsExecError
 from distutils.spawn import find_executable, spawn
 from distutils.sysconfig import get_config_var
 from distutils.version import StrictVersion
 
-from distutils_rust import BuildRustExt, InstallRustExt, RustBinary, RustExtension
+from distutils_rust import BuildRustExt, InstallRustExt, RustBinary
 
 havefb = not ossbuild and os.path.exists("fb")
 isgetdepsbuild = os.environ.get("GETDEPS_BUILD") == "1"
@@ -390,7 +377,6 @@ def hgtemplate(template, cast=None):
 
 
 def gitversion():
-    hgenv = localhgenv()
     format = "%cd-h%h"
     date_format = "format:%Y%m%d-%H%M%S"
     try:
@@ -409,7 +395,7 @@ def gitversion():
         if retcode or err:
             return None
         return out.decode("utf-8")
-    except EnvironmentError as e:
+    except EnvironmentError:
         return None
 
 
@@ -584,37 +570,6 @@ class hgbuildmo(build):
             self.make_file([pofile], mobuildfile, spawn, (cmd,))
 
 
-class hgdist(Distribution):
-    pure = False
-    cffi = ispypy
-
-    global_options = Distribution.global_options + [
-        ("pure", None, "use pure (slow) Python " "code instead of C extensions")
-    ]
-
-    def has_ext_modules(self):
-        # self.ext_modules is emptied in hgbuildpy.finalize_options which is
-        # too late for some cases
-        return not self.pure and Distribution.has_ext_modules(self)
-
-
-# This is ugly as a one-liner. So use a variable.
-buildextnegops = dict(getattr(build_ext, "negative_options", {}))
-
-
-class hgbuildext(build_ext):
-    def build_extensions(self):
-        return build_ext.build_extensions(self)
-
-    def build_extension(self, ext):
-        try:
-            build_ext.build_extension(self, ext)
-        except CCompilerError:
-            if not getattr(ext, "optional", False):
-                raise
-            log.warn("Failed to build optional extension '%s' (skipping)", ext.name)
-
-
 class hgbuildscripts(build_scripts):
     def run(self):
         if havefanotify:
@@ -651,21 +606,6 @@ class buildembedded(Command):
     def finalize_options(self):
         pass
 
-    def _zip_pyc_files(self, zipname, package):
-        """Modify a zip archive to include our .pyc files"""
-        sourcedir = pjoin(scriptdir, package)
-        with zipfile.PyZipFile(zipname, "a") as z:
-            # Write .py files for better traceback.
-            for root, _dirs, files in os.walk(sourcedir):
-                for basename in files:
-                    sourcepath = pjoin(root, basename)
-                    if sourcepath.endswith(".py"):
-                        # relative to scriptdir
-                        inzippath = sourcepath[len(scriptdir) + 1 :]
-                        z.write(sourcepath, inzippath)
-            # Compile and write .pyc files.
-            z.writepy(sourcedir)
-
     def _copy_py_lib(self, dirtocopy):
         """Copy main Python shared library"""
         pyroot = os.path.realpath(pjoin(sys.executable, ".."))
@@ -675,6 +615,8 @@ class buildembedded(Command):
         pylibpath = pjoin(pyroot, pylibext)
         if not os.path.exists(pylibpath):
             # a fallback option
+            import ctypes.util
+
             pylibpath = ctypes.util.find_library(pylib)
         log.debug("Python dynamic library is copied from: %s" % pylibpath)
         copy_to(pylibpath, pjoin(dirtocopy, os.path.basename(pylibpath)))
@@ -685,10 +627,29 @@ class buildembedded(Command):
             copy_to(pyzippath, pjoin(dirtocopy, pyzipname))
 
         # Copy native python modules
+
+        # Python adds these paths to sys.path:
+        # - Current EXE directory.
+        # - python310.dll directory + "\DLLs", "\lib", "\python310.zip".
+        # So if the main EXE is in a different directory, for example, in tests
+        # the main EXE might be copied to $TESTTMP/bin, and uses this
+        # python310.dll, it won't import stdlib native modules like
+        # unicodedata. Fix it by moving the native modules to DLLs/.
+        # Alternatively, the "embedded" windows python package should be built
+        # with `PYTHONPATH` C macro set to "." [1], but that's not what the
+        # official package provides.
+        # [1]: https://github.com/python/cpython/blob/3.10/PC/pyconfig.h#L71
+        dlls_dir = pjoin(dirtocopy, "DLLs")
+        ensureexists(dlls_dir)
         for pylibpath in glob.glob(os.path.join(pyroot, "*.pyd")):
-            copy_to(pylibpath, dirtocopy)
+            copy_to(pylibpath, dlls_dir)
         for pylibpath in glob.glob(os.path.join(pyroot, "*.dll")):
-            copy_to(pylibpath, dirtocopy)
+            name = os.path.basename(pylibpath)
+            if "python" in name or "vcruntime" in name:
+                dest = dirtocopy
+            else:
+                dest = dlls_dir
+            copy_to(pylibpath, dest)
 
     def _copy_hg_exe(self, dirtocopy):
         """Copy main mercurial executable which would load the embedded Python"""
@@ -730,70 +691,8 @@ class buildembedded(Command):
         # has the first priority in dynamic linker search path.
         self._copy_py_lib(embdir)
 
-        # Build everything into pythonXX.zip, which is in the default sys.path.
-        zippath = pjoin(embdir, f"python{PY_VERSION}.zip")
-        self._zip_pyc_files(zippath, "sapling")
-        self._zip_pyc_files(zippath, "ghstack")
         self._copy_hg_exe(embdir)
         self._copy_other(embdir)
-
-
-class hgbuildpy(build_py):
-    def finalize_options(self):
-        build_py.finalize_options(self)
-
-        if self.distribution.pure:
-            self.distribution.ext_modules = []
-        elif self.distribution.cffi:
-            from sapling.cffi import bdiffbuild, mpatchbuild
-
-            exts = [
-                mpatchbuild.ffi.distutils_extension(),
-                bdiffbuild.ffi.distutils_extension(),
-            ]
-            # cffi modules go here
-            if sys.platform == "darwin":
-                from sapling.cffi import osutilbuild
-
-                exts.append(osutilbuild.ffi.distutils_extension())
-            self.distribution.ext_modules = exts
-
-    def run(self):
-        basepath = os.path.join(self.build_lib, "sapling")
-        self.mkpath(basepath)
-
-        build_py.run(self)
-
-
-class buildextindex(Command):
-    description = "generate prebuilt index of ext (for frozen package)"
-    user_options = []
-    _indexfilename = "sapling/ext/__index__.py"
-
-    def initialize_options(self):
-        pass
-
-    def finalize_options(self):
-        pass
-
-    def run(self):
-        if os.path.exists(self._indexfilename):
-            with open(self._indexfilename, "w") as f:
-                f.write("# empty\n")
-
-        # here no extension enabled, disabled() lists up everything
-        code = (
-            "import pprint; from sapling import extensions; "
-            "pprint.pprint(extensions.disabled())"
-        )
-        returncode, out, err = runcmd([sys.executable, "-c", code], localhgenv())
-        if err or returncode != 0:
-            raise DistutilsExecError(err)
-
-        with open(self._indexfilename, "w") as f:
-            f.write("# this file is autogenerated by setup.py\n")
-            f.write("docs = ")
-            f.write(out)
 
 
 class BuildInteractiveSmartLog(build):
@@ -984,10 +883,7 @@ class hginstallscripts(install_scripts):
 cmdclass = {
     "build": hgbuild,
     "build_mo": hgbuildmo,
-    "build_ext": hgbuildext,
-    "build_py": hgbuildpy,
     "build_scripts": hgbuildscripts,
-    "build_extindex": buildextindex,
     "install": hginstall,
     "install_lib": hginstalllib,
     "install_scripts": hginstallscripts,
@@ -1035,7 +931,9 @@ def distutils_dir_name(dname):
     else:
         f = "{dirname}.{platform}-{version}"
     return f.format(
-        dirname=dname, platform=distutils.util.get_platform(), version=sys.version[:3]
+        dirname=dname,
+        platform=distutils.util.get_platform(),
+        version=("%s.%s" % sys.version_info[:2]),
     )
 
 
@@ -1199,17 +1097,6 @@ def ordinarypath(p):
     return p and p[0] != "." and p[-1] != "~"
 
 
-# distutils expects version to be str/unicode. Converting it to
-# unicode on Python 2 still works because it won't contain any
-# non-ascii bytes and will be implicitly converted back to bytes
-# when operated on.
-setupversion = sapling_version
-
-if os.name == "nt":
-    # Windows binary file versions for exe/dll files must have the
-    # form W.X.Y.Z, where W,X,Y,Z are numbers in the range 0..65535
-    setupversion = sapling_version.split("+", 1)[0]
-
 if sys.platform == "darwin" and os.path.exists("/usr/bin/xcodebuild"):
     xcode_version = runcmd(["/usr/bin/xcodebuild", "-version"], {})[1].splitlines()
     if xcode_version:
@@ -1249,7 +1136,7 @@ from distutils.errors import DistutilsSetupError
 
 
 def build_libraries(self, libraries):
-    for (lib_name, build_info) in libraries:
+    for lib_name, build_info in libraries:
         sources = build_info.get("sources")
         if sources is None or not isinstance(sources, (list, tuple)):
             raise DistutilsSetupError(
@@ -1304,7 +1191,7 @@ hgmainfeatures = (
                 "with_chg" if not iswindows else None,
                 "fb" if havefb else None,
                 "eden" if not ossbuild else None,
-                "sl_only" if ossbuild else None,
+                "sl_oss" if ossbuild else None,
             ],
         )
     ).strip()
@@ -1334,17 +1221,13 @@ if not ossbuild and not skip_other_binaries:
         RustBinary("scm_daemon", manifest="exec/scm_daemon/Cargo.toml"),
     ]
 
-if havefb and iswindows and not skip_other_binaries:
-    rustextbinaries += [RustBinary("fbclone", manifest="fb/fbclone/Cargo.toml")]
-
-
 if sys.platform == "cygwin":
     print("WARNING: CYGWIN BUILD NO LONGER OFFICIALLY SUPPORTED")
 
 
 setup(
     name="sapling",
-    version=setupversion,
+    version="0.0.1",  # dummy version to make setuptools happy
     author="Olivia Mackall and many others",
     url="https://sapling-scm.com/",
     description=(
@@ -1375,7 +1258,6 @@ setup(
     rust_ext_modules=rustextmodules,
     package_data=packagedata,
     cmdclass=cmdclass,
-    distclass=hgdist,
     options={
         "bdist_mpkg": {
             "zipdist": False,

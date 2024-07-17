@@ -1,4 +1,5 @@
 #chg-compatible
+#debugruntest-incompatible
   $ setconfig experimental.allowfilepeer=True
 
   $ eagerepo
@@ -29,8 +30,7 @@ Test hg pull --rebase degrades gracefully if rebase extension is not loaded
 Make sure to enable tracking
   $ hg book bmtrackingremote --track default/bookmarkonremote
   $ hg pull --rebase > /dev/null
-  hg pull: option --rebase not recognized
-  (use 'hg pull -h' to get help)
+  abort: missing rebase destination - supply --dest / -d
   [255]
 
 Tests 'hg pull --rebase' rebases from the active tracking bookmark onto the appropriate remote changes.
@@ -81,11 +81,10 @@ Tests 'hg pull --rebase' defaults to original (rebase->pullrebase) behaviour whe
   ├─╯
   o  root |  |
   
-  $ hg pull --rebase
+  $ hg pull --rebase -d .
   pulling from test:remoterepo
   searching for changes
-  updating to active bookmark bmnottracking
-  nothing to rebase
+  nothing to rebase - working directory parent is also destination
   $ hg rebase -d 'desc(untrackedremotecommit)'
   rebasing 6a7c7fb59c1e "localcommit" (bmnottracking)
   $ printdag

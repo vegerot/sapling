@@ -7,7 +7,6 @@
 
 use anyhow::anyhow;
 use anyhow::bail;
-use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
@@ -21,18 +20,25 @@ use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
 use derived_data_manager::DerivationContext;
-use derived_data_service_if::types as thrift;
+use derived_data_service_if as thrift;
+use filestore::FetchKey;
+use filestore::FilestoreConfig;
 use futures::future::ready;
 use futures::stream::FuturesUnordered;
 use futures::stream::TryStreamExt;
 use manifest::derive_manifest;
 use manifest::flatten_subentries;
+use mononoke_types::hash::RichGitSha1;
+use mononoke_types::hash::Sha256;
+use mononoke_types::BasicFileChange;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
+use mononoke_types::GitLfs;
 use mononoke_types::NonRootMPath;
 
 use crate::errors::MononokeGitError;
-use crate::upload_git_object;
+use crate::fetch_non_blob_git_object;
+use crate::upload_non_blob_git_object;
 use crate::BlobHandle;
 use crate::Tree;
 use crate::TreeBuilder;
@@ -46,9 +52,10 @@ fn format_key(derivation_ctx: &DerivationContext, changeset_id: ChangesetId) -> 
 
 #[async_trait]
 impl BonsaiDerivable for TreeHandle {
-    const VARIANT: DerivableType = DerivableType::GitTree;
+    const VARIANT: DerivableType = DerivableType::GitTrees;
 
     type Dependencies = dependencies![];
+    type PredecessorDependencies = dependencies![];
 
     async fn derive_single(
         ctx: &CoreContext,
@@ -60,8 +67,20 @@ impl BonsaiDerivable for TreeHandle {
             bail!("Can't derive TreeHandle for snapshot")
         }
         let blobstore = derivation_ctx.blobstore().clone();
-        let changes = get_file_changes(&blobstore, ctx, bonsai).await?;
-        derive_git_manifest(ctx, blobstore, parents, changes).await
+        let filestore_config = derivation_ctx.filestore_config();
+        let cs_id = bonsai.get_changeset_id();
+        let changes = get_file_changes(&blobstore, filestore_config, ctx, bonsai).await?;
+        // Check whether the git commit for this bonsai commit is already known.
+        // If so, then the raw git tree will also exist, as it would have been uploaded
+        // alongside the commit. If not, then the raw tree git may not already exist and
+        // we should derive it.
+        let derive_raw_tree = derivation_ctx
+            .bonsai_git_mapping()?
+            .get_git_sha1_from_bonsai(ctx, cs_id)
+            .await
+            .with_context(|| format!("Error in getting Git Sha1 for Bonsai Changeset {}", cs_id))?
+            .is_none();
+        derive_git_manifest(ctx, blobstore, parents, changes, derive_raw_tree).await
     }
 
     async fn store_mapping(
@@ -115,6 +134,7 @@ async fn derive_git_manifest<B: Blobstore + Clone + 'static>(
     blobstore: B,
     parents: Vec<TreeHandle>,
     changes: Vec<(NonRootMPath, Option<BlobHandle>)>,
+    derive_raw_tree: bool,
 ) -> Result<TreeHandle, Error> {
     let handle = derive_manifest(
         ctx.clone(),
@@ -133,19 +153,34 @@ async fn derive_git_manifest<B: Blobstore + Clone + 'static>(
 
                     let builder = TreeBuilder::new(members);
                     let (mut tree_bytes_without_header, tree) = builder.into_tree_with_bytes();
-                    // Store the raw git tree before storing the thrift version
                     let oid = tree.handle().oid();
-                    let git_hash =
-                        gix_hash::oid::try_from_bytes(oid.as_ref()).with_context(|| {
-                            format_err!(
-                                "Failure while converting Git hash {} into Git Object ID",
-                                oid
-                            )
-                        })?;
-                    // Need to prepend the object header before storing the Git tree
-                    let mut raw_tree_bytes = oid.prefix();
-                    raw_tree_bytes.append(&mut tree_bytes_without_header);
-                    upload_git_object(&ctx, &blobstore, git_hash, raw_tree_bytes).await?;
+                    let git_hash = oid.to_object_id()?;
+                    if derive_raw_tree {
+                        // Store the raw git tree before storing the thrift version
+                        // Need to prepend the object header before storing the Git tree
+                        let mut raw_tree_bytes = oid.prefix();
+                        raw_tree_bytes.append(&mut tree_bytes_without_header);
+                        upload_non_blob_git_object(
+                            &ctx,
+                            &blobstore,
+                            git_hash.as_ref(),
+                            raw_tree_bytes,
+                        )
+                        .await?;
+                    } else {
+                        // We don't need to store the raw git tree because it already exists. Validate that the existing tree
+                        // is present in the blobstore with the same hash as we computed. If not, then it means that we computed
+                        // a thirft Git tree that is different than the stored raw tree. This could be due to a bug so we need to
+                        // fail before storing the thrift tree
+                        fetch_non_blob_git_object(&ctx, &blobstore, git_hash.as_ref())
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Raw Git tree with hash {} should have been present already",
+                                    git_hash.to_hex()
+                                )
+                            })?;
+                    }
                     // Upload the thrift Git Tree
                     let handle = tree.store(&ctx, &blobstore).await?;
                     Ok(((), handle))
@@ -177,8 +212,44 @@ async fn derive_git_manifest<B: Blobstore + Clone + 'static>(
     }
 }
 
-pub async fn get_file_changes<B: Blobstore + Clone>(
+// in line with https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md
+fn format_lfs_pointer(sha256: Sha256, size: u64) -> String {
+    format!(
+        "version https://git-lfs.github.com/spec/v1\noid sha256:{sha256}\nsize {size}",
+        sha256 = sha256,
+        size = size
+    )
+}
+
+/// Given a file change generates a Git LFS pointer that points to acctual file contents
+/// and stores it in the blobstore. Returns oid of the LFS pointer.
+async fn generate_and_store_git_pointer<B: Blobstore + Clone + 'static>(
     blobstore: &B,
+    filestore_config: FilestoreConfig,
+    ctx: &CoreContext,
+    basic_file_change: &BasicFileChange,
+) -> Result<RichGitSha1> {
+    let metadata = filestore::get_metadata(
+        blobstore,
+        ctx,
+        &FetchKey::Canonical(basic_file_change.content_id()),
+    )
+    .await?
+    .ok_or_else(|| anyhow!("Missing metadata for {}", basic_file_change.content_id()))?;
+    let lfs_pointer = format_lfs_pointer(metadata.sha256, basic_file_change.size());
+    let ((content_id, _size), fut) =
+        filestore::store_bytes(blobstore, filestore_config, ctx, lfs_pointer.into());
+    fut.await?;
+    let oid = filestore::get_metadata(blobstore, ctx, &FetchKey::Canonical(content_id))
+        .await?
+        .ok_or_else(|| anyhow!("Missing metadata for {}", basic_file_change.content_id()))?
+        .git_sha1;
+    Ok(oid)
+}
+
+pub async fn get_file_changes<B: Blobstore + Clone + 'static>(
+    blobstore: &B,
+    filestore_config: FilestoreConfig,
     ctx: &CoreContext,
     bcs: BonsaiChangeset,
 ) -> Result<Vec<(NonRootMPath, Option<BlobHandle>)>, Error> {
@@ -187,10 +258,28 @@ pub async fn get_file_changes<B: Blobstore + Clone>(
         .into_iter()
         .map(|(mpath, file_change)| async move {
             match file_change.simplify() {
-                Some(basic_file_change) => Ok((
-                    mpath,
-                    Some(BlobHandle::new(ctx, blobstore, basic_file_change).await?),
-                )),
+                Some(basic_file_change) => match basic_file_change.git_lfs() {
+                    GitLfs::FullContent => Ok((
+                        mpath,
+                        Some(BlobHandle::new(ctx, blobstore, basic_file_change).await?),
+                    )),
+                    GitLfs::GitLfsPointer => {
+                        let oid = generate_and_store_git_pointer(
+                            blobstore,
+                            filestore_config,
+                            ctx,
+                            basic_file_change,
+                        )
+                        .await?;
+                        Ok((
+                            mpath,
+                            Some(BlobHandle::from_oid_and_file_type(
+                                oid,
+                                basic_file_change.file_type(),
+                            )),
+                        ))
+                    }
+                },
                 None => Ok((mpath, None)),
             }
         })
@@ -220,7 +309,7 @@ mod test {
     use manifest::ManifestOps;
     use repo_blobstore::RepoBlobstoreArc;
     use repo_derived_data::RepoDerivedDataRef;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -245,7 +334,7 @@ mod test {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let tmp_dir = TempDir::new("git_types_test")?;
+        let tmp_dir = TempDir::with_prefix("git_types_test.")?;
         let root_path = tmp_dir.path();
         let git = Repository::init(root_path)?;
         let mut index = git.index()?;

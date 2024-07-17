@@ -30,6 +30,8 @@ use bookmarks::BookmarkUpdateLogRef;
 use bookmarks::Freshness;
 use clap::Arg;
 use clap::SubCommand;
+use clientinfo::ClientEntryPoint;
+use clientinfo::ClientInfo;
 use cloned::cloned;
 use cmdlib::args;
 use cmdlib::args::MononokeMatches;
@@ -51,10 +53,10 @@ use futures::stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures::try_join;
-use live_commit_sync_config::CfgrLiveCommitSyncConfig;
 use live_commit_sync_config::LiveCommitSyncConfig;
 use mercurial_derivation::DeriveHgChangeset;
 use mercurial_types::HgChangesetId;
+use metadata::Metadata;
 use mononoke_types::ChangesetId;
 use repo_identity::RepoIdentityRef;
 use scuba_ext::MononokeScubaSampleBuilder;
@@ -105,6 +107,8 @@ impl BacksyncProcess {
             .with_source_and_target_repos()
             .with_dynamic_repos()
             .with_scribe_args()
+            .with_default_scuba_dataset(SCUBA_TABLE)
+            .with_scuba_logging_args()
             .build();
         let backsync_forever_subcommand = SubCommand::with_name(ARG_MODE_BACKSYNC_FOREVER)
             .about("Backsyncs all new bookmark moves");
@@ -294,14 +298,13 @@ pub async fn backsync_forever<M>(
     target_repo_dbs: Arc<TargetRepoDbs>,
     source_repo_name: String,
     target_repo_name: String,
-    live_commit_sync_config: CfgrLiveCommitSyncConfig,
+    live_commit_sync_config: Arc<dyn LiveCommitSyncConfig>,
     cancellation_requested: Arc<AtomicBool>,
 ) -> Result<(), Error>
 where
     M: SyncedCommitMapping + Clone + 'static,
 {
     let target_repo_id = commit_syncer.get_target_repo_id();
-    let live_commit_sync_config = Arc::new(live_commit_sync_config);
     let mut commit_only_backsync_future: Box<dyn futures::Future<Output = ()> + Send + Unpin> =
         Box::new(future::ready(()));
 
@@ -314,7 +317,9 @@ where
         }
         // We only care about public pushes because draft pushes are not in the bookmark
         // update log at all.
-        let enabled = live_commit_sync_config.push_redirector_enabled_for_public(target_repo_id);
+        let enabled = live_commit_sync_config
+            .push_redirector_enabled_for_public(&ctx, target_repo_id)
+            .await?;
 
         if enabled {
             let delay = calculate_delay(&ctx, &commit_syncer, &target_repo_dbs).await?;
@@ -374,19 +379,21 @@ where
 
     let counter_name = format_counter(&source_repo_id);
     let maybe_counter = counters.get_counter(ctx, &counter_name).await?;
-    let counter = maybe_counter.ok_or_else(|| format_err!("{} counter not found", counter_name))?;
+    let counter = maybe_counter
+        .ok_or_else(|| format_err!("{} counter not found", counter_name))?
+        .try_into()?;
     let source_repo = commit_syncer.get_source_repo();
     let next_entry = source_repo
         .bookmark_update_log()
-        .read_next_bookmark_log_entries(ctx.clone(), counter as u64, 1, Freshness::MostRecent)
+        .read_next_bookmark_log_entries(ctx.clone(), counter, 1, Freshness::MostRecent)
         .try_collect::<Vec<_>>();
     let remaining_entries = source_repo
         .bookmark_update_log()
-        .count_further_bookmark_log_entries(ctx.clone(), counter as u64, None);
+        .count_further_bookmark_log_entries(ctx.clone(), counter, None);
 
     let (next_entry, remaining_entries) = try_join!(next_entry, remaining_entries)?;
     let delay_secs = next_entry
-        .get(0)
+        .first()
         .map_or(0, |entry| entry.timestamp.since_seconds());
 
     Ok(Delay {
@@ -487,7 +494,13 @@ async fn run(
     let source_repo = args::resolve_repo_by_name(config_store, &matches, &source_repo_name)?;
     let target_repo = args::resolve_repo_by_name(config_store, &matches, &target_repo_name)?;
     let repo_tag = format!("{}=>{}", &source_repo_name, &target_repo_name);
-    let session_container = SessionContainer::new_with_defaults(fb);
+    let mut metadata = Metadata::default();
+    metadata.add_client_info(ClientInfo::default_with_entry_point(
+        ClientEntryPoint::MegarepoBacksyncer,
+    ));
+    let session_container = SessionContainer::builder(fb)
+        .metadata(Arc::new(metadata))
+        .build();
     let scribe = args::get_scribe(fb, &matches)?;
     let ctx = session_container
         .new_context_with_scribe(
@@ -509,8 +522,7 @@ async fn run(
         "syncing from repoid {:?} into repoid {:?}", source_repo.id, target_repo.id,
     );
 
-    let config_store = matches.config_store();
-    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new(logger, config_store)?;
+    let live_commit_sync_config = commit_syncer.live_commit_sync_config.clone();
 
     match matches.subcommand() {
         (ARG_MODE_BACKSYNC_ALL, _) => {
@@ -545,7 +557,7 @@ async fn run(
                     .await?,
             );
 
-            let mut scuba_sample = MononokeScubaSampleBuilder::new(fb, SCUBA_TABLE)?;
+            let mut scuba_sample = matches.scuba_sample_builder();
             scuba_sample.add("source_repo", source_repo.id.id());
             scuba_sample.add("source_repo_name", source_repo.name.clone());
             scuba_sample.add("target_repo", target_repo.id.id());

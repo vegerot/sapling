@@ -20,9 +20,8 @@ module.exports = {
     project: [
       workspaceRelative('isl/tsconfig.json'),
       workspaceRelative('isl-server/tsconfig.json'),
-      workspaceRelative('reviewstack/tsconfig.json'),
-      workspaceRelative('reviewstack.dev/tsconfig.json'),
       workspaceRelative('shared/tsconfig.json'),
+      workspaceRelative('components/tsconfig.json'),
       workspaceRelative('textmate/tsconfig.json'),
       workspaceRelative('vscode/tsconfig.json'),
     ],
@@ -50,12 +49,6 @@ module.exports = {
     'isl/start.js',
     'isl-server/codegen.js',
     // @fb-only
-    'reviewstack/src/generated/**',
-    'reviewstack/codegen.js',
-    'reviewstack/textmate.js',
-    'reviewstack.dev/build.js',
-    'reviewstack.dev/release.js',
-    'reviewstack.dev/start.js',
     // @fb-only
     'node_modules/**',
   ],
@@ -103,16 +96,31 @@ module.exports = {
     'object-shorthand': 'error',
     'prefer-arrow-callback': 'error',
     'react-hooks/rules-of-hooks': 'error',
-    // https://recoiljs.org/docs/introduction/installation/#eslint
-    'react-hooks/exhaustive-deps': [
-      'error',
-      {additionalHooks: '(useRecoilCallback|useRecoilTransaction_UNSTABLE)'},
-    ],
+    'react-hooks/exhaustive-deps': 'error',
     'sort-imports': 'off',
     yoda: 'error',
 
+    'no-restricted-imports': [
+      'error',
+      {
+        paths: [
+          {
+            name: 'jotai/utils',
+            importNames: ['atomFamily'],
+            message:
+              'atomFamily leaks memory. Use atomFamilyWeak(keyToAtom), or cached(keyToAtom), or useAtomValue(useMemo(() => keyToAtom(k), [k])), or useAtomGet and useAtomHas instead.',
+          },
+          {
+            name: 'react-dom/test-utils',
+            importNames: ['act'],
+            message: 'Prefer importing act from @testing-library/react instead.',
+          },
+        ],
+      },
+    ],
+
     // Custom rules
-    'rulesdir/recoil-key-matches-variable': 'error',
+    'rulesdir/jotai-maybe-use-family': 'error',
 
     // WARNINGS
     'require-await': 'warn',

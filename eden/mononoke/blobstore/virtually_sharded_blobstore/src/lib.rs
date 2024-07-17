@@ -5,6 +5,11 @@
  * GNU General Public License version 2.
  */
 
+#![feature(generic_assert)]
+// The clippy lint is not our fault and is a result of the bug https://fburl.com/7perds28
+#![allow(internal_features)]
+#![feature(core_intrinsics)]
+
 mod ratelimit;
 mod shard;
 
@@ -43,7 +48,6 @@ use shard::Shards;
 use shared_error::anyhow::IntoSharedError;
 use shared_error::anyhow::SharedError;
 use stats::prelude::*;
-use tunables::tunables;
 use twox_hash::XxHash;
 
 use crate::ratelimit::AccessReason;
@@ -412,15 +416,18 @@ async fn shared_read<T: Blobstore + 'static>(
 
 fn report_deduplicated_put(ctx: &CoreContext, key: &str) {
     STATS::puts_deduped.add_value(1);
-
     let mut scuba = ctx.scuba().clone();
-    if let Ok(Some(v)) = tunables()
-        .deduplicated_put_sampling_rate()
-        .unwrap_or_default()
-        .try_into()
-        .map(NonZeroU64::new)
-    {
-        scuba.sampled(v);
+
+    const DEFAULT_SAMPLING_RATE: u64 = 100000;
+
+    if let Some(sampling_rate) = NonZeroU64::new(
+        justknobs::get_as::<u64>(
+            "scm/mononoke:blobstore_deduplicated_put_sampling_rate",
+            None,
+        )
+        .unwrap_or(DEFAULT_SAMPLING_RATE),
+    ) {
+        scuba.sampled(sampling_rate);
     }
     scuba.add("key", key).log_with_msg("Put deduplicated", None);
 
@@ -484,32 +491,17 @@ impl<T: Blobstore + 'static> Blobstore for VirtuallyShardedBlobstore<T> {
                     SemaphoreAcquisition::Cancelled(CacheData::NotStorable, ticket) => {
                         // The data cannot be cached. We'll have to go to the blobstore.
                         STATS::gets_not_storable.add_value(1);
-                        if !tunables()
-                            .disable_large_blob_read_deduplication()
-                            .unwrap_or_default()
-                        {
-                            // Attempt to share with other readers of this blob.
-                            return shared_read(&inner, &ctx, key, ticket).await;
-                        } else {
-                            ticket.finish().await?;
-                            None
-                        }
+                        // Attempt to share with other readers of this blob.
+                        return shared_read(&inner, &ctx, key, ticket).await;
                     }
                     SemaphoreAcquisition::Acquired(permit) => Some(permit),
                 }
             } else {
                 // We already know the data can't be cached, so we'll have to go to the
                 // blobstore.
-                if !tunables()
-                    .disable_large_blob_read_deduplication()
-                    .unwrap_or_default()
-                {
-                    // Attempt to share with other reads of this blob.
-                    return shared_read(&inner, &ctx, key, ticket).await;
-                } else {
-                    ticket.finish().await?;
-                    None
-                }
+
+                // Attempt to share with other reads of this blob.
+                return shared_read(&inner, &ctx, key, ticket).await;
             };
 
             // NOTE: This is a no-op, but it's here to ensure permit is still in scope at this
@@ -1275,7 +1267,8 @@ mod test {
             }))
             .try_timed()
             .await?;
-            assert!(stats.completion_time.as_millis_unchecked() > 50);
+            let completion_time = stats.completion_time.as_millis_unchecked();
+            assert!(completion_time > 50);
 
             // is_present
             let (stats, _) = futures::future::try_join_all((0..10u64).map(|i| {
@@ -1284,7 +1277,8 @@ mod test {
             }))
             .try_timed()
             .await?;
-            assert!(stats.completion_time.as_millis_unchecked() > 50);
+            let completion_time = stats.completion_time.as_millis_unchecked();
+            assert!(completion_time > 50);
 
             // put
             let bytes = BlobstoreBytes::from_bytes("test foobar");
@@ -1293,7 +1287,8 @@ mod test {
             )
             .try_timed()
             .await?;
-            assert!(stats.completion_time.as_millis_unchecked() > 50);
+            let completion_time = stats.completion_time.as_millis_unchecked();
+            assert!(completion_time > 50);
 
             Ok(())
         }
@@ -1333,7 +1328,11 @@ mod test {
             }))
             .try_timed()
             .await?;
-            assert!(stats.completion_time.as_millis_unchecked() <= 100);
+            // If we counted the early cache hits for rate-limiting, we would expect this to take
+            // ~900ms (100 operations would first consume the burst budget of 10 and then we'd do 1
+            // more every 10ms).
+            let completion_time = stats.completion_time.as_millis_unchecked();
+            assert!(completion_time <= 600);
 
             // put
             let bytes = &BlobstoreBytes::from_bytes("test foobar");
@@ -1342,7 +1341,8 @@ mod test {
             }))
             .try_timed()
             .await?;
-            assert!(stats.completion_time.as_millis_unchecked() <= 100);
+            let completion_time = stats.completion_time.as_millis_unchecked();
+            assert!(completion_time <= 600);
 
             Ok(())
         }

@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
-use bytes::Bytes as BytesNew;
-use bytes_old::BufMut;
-use bytes_old::Bytes;
+use bytes::Buf;
+use bytes::BufMut;
+use bytes::Bytes;
 use quickcheck::Arbitrary;
 use quickcheck::Gen;
 
@@ -142,8 +142,8 @@ pub struct PartHeaderInner {
     pub part_id: PartId,
     // Part parameter keys are strings and values are arbitrary bytestrings
     // (which can even include null characters).
-    pub mparams: HashMap<String, BytesNew>,
-    pub aparams: HashMap<String, BytesNew>,
+    pub mparams: HashMap<String, Bytes>,
+    pub aparams: HashMap<String, Bytes>,
 }
 
 /// A bundle2 part header.
@@ -162,12 +162,12 @@ impl PartHeader {
     }
 
     #[inline]
-    pub fn mparams(&self) -> &HashMap<String, BytesNew> {
+    pub fn mparams(&self) -> &HashMap<String, Bytes> {
         &self.0.mparams
     }
 
     #[inline]
-    pub fn aparams(&self) -> &HashMap<String, BytesNew> {
+    pub fn aparams(&self) -> &HashMap<String, Bytes> {
         &self.0.aparams
     }
 
@@ -194,7 +194,7 @@ impl PartHeader {
         out_buf.put_slice(part_type);
 
         // part id
-        out_buf.put_u32_be(self.0.part_id);
+        out_buf.put_u32(self.0.part_id);
 
         // mandatory/advisory params
         let num_mparams = self.0.mparams.len() as u8;
@@ -204,20 +204,10 @@ impl PartHeader {
         out_buf.put_u8(num_aparams);
 
         // sort the params to ensure determinism
-        let mut mparams: Vec<(String, Bytes)> = self
-            .0
-            .mparams
-            .into_iter()
-            .map(|(k, v)| (k, bytes_ext::copy_from_new(v)))
-            .collect();
+        let mut mparams: Vec<(String, Bytes)> = self.0.mparams.into_iter().collect();
         mparams.sort();
 
-        let mut aparams: Vec<(String, Bytes)> = self
-            .0
-            .aparams
-            .into_iter()
-            .map(|(k, v)| (k, bytes_ext::copy_from_new(v)))
-            .collect();
+        let mut aparams: Vec<(String, Bytes)> = self.0.aparams.into_iter().collect();
         aparams.sort();
 
         // param sizes
@@ -259,18 +249,18 @@ pub fn decode(mut header_bytes: Bytes) -> Result<PartHeader> {
     // parameters: key, val are both strings of lengths corresponding to index in param_sizes
     // ---
     // This function assumes that the full header is available.
-    let type_size = header_bytes.drain_u8() as usize;
+    let type_size = header_bytes.get_u8() as usize;
     let part_type_encoded = header_bytes
-        .drain_str(type_size)
+        .get_str(type_size)
         .with_context(|| ErrorKind::Bundle2Decode("invalid part type".into()))?;
     let part_type = PartHeaderType::decode(&part_type_encoded)?;
 
     let mandatory = part_type_encoded.chars().any(|c| c.is_ascii_uppercase());
 
-    let part_id = header_bytes.drain_u32();
+    let part_id = header_bytes.get_u32();
 
-    let nmparams = header_bytes.drain_u8() as usize;
-    let naparams = header_bytes.drain_u8() as usize;
+    let nmparams = header_bytes.get_u8() as usize;
+    let naparams = header_bytes.get_u8() as usize;
 
     let mut param_sizes = Vec::with_capacity(nmparams + naparams);
     let mut header = PartHeaderBuilder::with_capacity(part_type, mandatory, nmparams, naparams)
@@ -279,8 +269,8 @@ pub fn decode(mut header_bytes: Bytes) -> Result<PartHeader> {
     for _ in 0..(nmparams + naparams) {
         // TODO: ensure none of the params is empty
         param_sizes.push((
-            header_bytes.drain_u8() as usize,
-            header_bytes.drain_u8() as usize,
+            header_bytes.get_u8() as usize,
+            header_bytes.get_u8() as usize,
         ));
     }
 
@@ -325,10 +315,9 @@ pub fn decode(mut header_bytes: Bytes) -> Result<PartHeader> {
     Ok(header.build(part_id))
 }
 
-fn decode_header_param(buf: &mut Bytes, ksize: usize, vsize: usize) -> Result<(String, BytesNew)> {
-    let key = buf.drain_str(ksize).context("invalid key")?;
+fn decode_header_param(buf: &mut Bytes, ksize: usize, vsize: usize) -> Result<(String, Bytes)> {
+    let key = buf.get_str(ksize).context("invalid key")?;
     let val = buf.split_to(vsize);
-    let val = bytes_ext::copy_from_old(val);
     Ok((key, val))
 }
 
@@ -337,8 +326,8 @@ fn decode_header_param(buf: &mut Bytes, ksize: usize, vsize: usize) -> Result<(S
 pub struct PartHeaderBuilder {
     part_type: PartHeaderType,
     mandatory: bool,
-    mparams: HashMap<String, BytesNew>,
-    aparams: HashMap<String, BytesNew>,
+    mparams: HashMap<String, Bytes>,
+    aparams: HashMap<String, Bytes>,
 }
 
 impl PartHeaderBuilder {
@@ -363,16 +352,13 @@ impl PartHeaderBuilder {
     pub fn add_mparam<S, B>(&mut self, key: S, val: B) -> Result<&mut Self>
     where
         S: Into<String>,
-        B: Into<BytesNew>,
+        B: Into<Bytes>,
     {
         let key = key.into();
         let val = val.into();
         self.check_param(&key, &val)?;
-        if self.mparams.len() >= u8::max_value() as usize {
-            bail!(
-                "number of mandatory params exceeds maximum {}",
-                u8::max_value()
-            );
+        if self.mparams.len() >= u8::MAX as usize {
+            bail!("number of mandatory params exceeds maximum {}", u8::MAX);
         }
         self.mparams.insert(key, val);
         Ok(self)
@@ -381,16 +367,13 @@ impl PartHeaderBuilder {
     pub fn add_aparam<S, B>(&mut self, key: S, val: B) -> Result<&mut Self>
     where
         S: Into<String>,
-        B: Into<BytesNew>,
+        B: Into<Bytes>,
     {
         let key = key.into();
         let val = val.into();
         self.check_param(&key, &val)?;
-        if self.aparams.len() >= u8::max_value() as usize {
-            bail!(
-                "number of advisory params exceeds maximum {}",
-                u8::max_value()
-            );
+        if self.aparams.len() >= u8::MAX as usize {
+            bail!("number of advisory params exceeds maximum {}", u8::MAX);
         }
         self.aparams.insert(key, val);
         Ok(self)
@@ -425,20 +408,20 @@ impl PartHeaderBuilder {
         if key.is_empty() {
             bail!("part '{:?}': empty key", self.part_type);
         }
-        if key.len() > u8::max_value() as usize {
+        if key.len() > u8::MAX as usize {
             bail!(
                 "part '{:?}': key '{}' exceeds max length {}",
                 self.part_type,
                 key,
-                u8::max_value()
+                u8::MAX
             );
         }
-        if val.len() > u8::max_value() as usize {
+        if val.len() > u8::MAX as usize {
             bail!(
                 "part '{:?}': value for key '{}' exceeds max length {}",
                 self.part_type,
                 key,
-                u8::max_value()
+                u8::MAX
             );
         }
         Ok(())
@@ -469,7 +452,7 @@ mod test {
     use super::*;
     use crate::quickcheck_types::QCBytes;
 
-    const MAX_LEN: usize = ::std::u8::MAX as usize;
+    const MAX_LEN: usize = u8::MAX as usize;
 
     #[test]
     fn test_check_params() {
@@ -543,7 +526,7 @@ mod test {
         Ok(TestResult::passed())
     }
 
-    fn assert_param<S: Into<String>, B: Into<BytesNew>>(
+    fn assert_param<S: Into<String>, B: Into<Bytes>>(
         header: &mut PartHeaderBuilder,
         key: S,
         val: B,

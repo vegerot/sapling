@@ -10,8 +10,11 @@
 #include <folly/Conv.h>
 #include <folly/futures/Future.h>
 #include <folly/logging/xlog.h>
-#include <git2.h>
+// TODO(T168360028)
+#include <git2.h> // @manual
 
+#include "eden/common/utils/EnumValue.h"
+#include "eden/common/utils/Throw.h"
 #include "eden/fs/model/Blob.h"
 #include "eden/fs/model/Hash.h"
 #include "eden/fs/model/Tree.h"
@@ -19,8 +22,6 @@
 #include "eden/fs/model/git/GitTree.h"
 #include "eden/fs/service/ThriftUtil.h"
 #include "eden/fs/store/ObjectFetchContext.h"
-#include "eden/fs/utils/EnumValue.h"
-#include "eden/fs/utils/Throw.h"
 #include "folly/String.h"
 
 #if defined(__has_feature)
@@ -144,6 +145,15 @@ ImmediateFuture<BackingStore::GetRootTreeResult> GitBackingStore::getRootTree(
   return GetRootTreeResult{getTreeImpl(treeID), treeID};
 }
 
+folly::SemiFuture<BackingStore::GetTreeMetaResult>
+GitBackingStore::getTreeMetadata(
+    const ObjectId& /*id*/,
+    const ObjectFetchContextPtr& /*context*/) {
+  return folly::makeSemiFuture<BackingStore::GetTreeMetaResult>(
+      std::domain_error(
+          "getTreeMetadata is not implemented for GitBackingStores"));
+}
+
 SemiFuture<BackingStore::GetTreeResult> GitBackingStore::getTree(
     const ObjectId& id,
     const ObjectFetchContextPtr& /*context*/) {
@@ -254,6 +264,13 @@ GitBackingStore::getBlobMetadata(
   return BackingStore::GetBlobMetaResult{
       nullptr, ObjectFetchContext::Origin::NotFetched};
 }
+
+ImmediateFuture<BackingStore::GetGlobFilesResult> GitBackingStore::getGlobFiles(
+    const RootId& /* id */,
+    const std::vector<std::string>& /* globs */) {
+  return folly::makeFuture<GetGlobFilesResult>(
+      std::runtime_error("getGlobFiles() is not supported on git"));
+};
 
 git_oid GitBackingStore::root2Oid(const RootId& rootId) {
   auto& value = rootId.value();

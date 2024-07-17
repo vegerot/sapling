@@ -1,6 +1,5 @@
-#debugruntest-compatible
 
-#require symlink tar unzip
+#require symlink tar unzip no-eden
 
   $ newrepo repo
   $ ln -s nothing dangling

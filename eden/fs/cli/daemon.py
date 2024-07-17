@@ -312,6 +312,7 @@ def get_edenfs_environment() -> Dict[str, str]:
         "SSH_AUTH_SOCK",
         "SSH_AGENT_PID",
         "KRB5CCNAME",
+        "SANDCASTLE",
         "SANDCASTLE_ALIAS",
         "SANDCASTLE_INSTANCE_ID",
         "SCRATCH_CONFIG_PATH",
@@ -326,6 +327,7 @@ def get_edenfs_environment() -> Dict[str, str]:
         "EDENSCM_EDENAPI",
         "RUST_BACKTRACE",
         "RUST_LIB_BACKTRACE",
+        "SL_LOG",  # alias for EDENSCM_LOG
         # Useful for environments that look like prod, but are actually corp
         "CONFIGERATOR_PRETEND_NOT_PROD",
         # Ensure EdenFS respects redirecting which cache directory to write to
@@ -334,6 +336,11 @@ def get_edenfs_environment() -> Dict[str, str]:
         "HG_TEST_REMOTE_CONFIG",
         # In some environment, this is used instead of the USER variable
         "CLOUD2PROD_IDENTITY",
+        # The following 4 are used on sl's .t tests
+        "HGRCPATH",
+        "SL_CONFIG_PATH",
+        "TESTTMP",
+        "HGUSER",
     ]
 
     if sys.platform == "win32":

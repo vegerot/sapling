@@ -5,61 +5,67 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {ShelvedChange} from './types';
-
 import serverAPI from './ClientToServerAPI';
 import {OpenComparisonViewButton} from './ComparisonView/OpenComparisonViewButton';
-import {FlexSpacer} from './ComponentUtils';
+import {FlexSpacer, Row} from './ComponentUtils';
 import {DropdownFields} from './DropdownFields';
 import {EmptyState} from './EmptyState';
-import {ErrorNotice} from './ErrorNotice';
+import {useCommandEvent} from './ISLShortcuts';
 import {OperationDisabledButton} from './OperationDisabledButton';
-import {Subtle} from './Subtle';
-import {Tooltip} from './Tooltip';
 import {ChangedFiles} from './UncommittedChanges';
 import {T, t} from './i18n';
+import {atomLoadableWithRefresh} from './jotaiUtils';
+import {DeleteShelveOperation} from './operations/DeleteShelveOperation';
 import {UnshelveOperation} from './operations/UnshelveOperation';
 import {RelativeDate} from './relativeDate';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {ErrorNotice} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {Kbd} from 'isl-components/Kbd';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
+import {useAtom} from 'jotai';
 import {useEffect} from 'react';
-import {selector, useRecoilValueLoadable, useRecoilRefresher_UNSTABLE} from 'recoil';
 import {ComparisonType} from 'shared/Comparison';
-import {Icon} from 'shared/Icon';
+import {KeyCode, Modifier} from 'shared/KeyboardShortcuts';
 
 import './ShelvedChanges.css';
 
-const shelvedChangesState = selector<Array<ShelvedChange>>({
-  key: 'shelvedChangesState',
-  get: async () => {
-    serverAPI.postMessage({
-      type: 'fetchShelvedChanges',
-    });
+const shelvedChangesState = atomLoadableWithRefresh(async _get => {
+  serverAPI.postMessage({
+    type: 'fetchShelvedChanges',
+  });
 
-    const result = await serverAPI.nextMessageMatching('fetchedShelvedChanges', () => true);
-    if (result.shelvedChanges.error != null) {
-      throw new Error(result.shelvedChanges.error.toString());
-    }
-    return result.shelvedChanges.value;
-  },
+  const result = await serverAPI.nextMessageMatching('fetchedShelvedChanges', () => true);
+  if (result.shelvedChanges.error != null) {
+    throw new Error(result.shelvedChanges.error.toString());
+  }
+  return result.shelvedChanges.value;
 });
 
 export function ShelvedChangesMenu() {
+  const additionalToggles = useCommandEvent('ToggleShelvedChangesDropdown');
   return (
     <Tooltip
       component={dismiss => <ShelvedChangesList dismiss={dismiss} />}
       trigger="click"
       placement="bottom"
-      title={t('Shelved Changes')}>
-      <VSCodeButton appearance="icon" data-testid="shelved-changes-button">
+      additionalToggles={additionalToggles}
+      group="topbar"
+      title={
+        <T replace={{$shortcut: <Kbd keycode={KeyCode.S} modifiers={[Modifier.ALT]} />}}>
+          Shelved Changes ($shortcut)
+        </T>
+      }>
+      <Button icon data-testid="shelved-changes-button">
         <Icon icon="archive" />
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }
 
 function ShelvedChangesList({dismiss}: {dismiss: () => void}) {
-  const shelvedChanges = useRecoilValueLoadable(shelvedChangesState);
-  const refresh = useRecoilRefresher_UNSTABLE(shelvedChangesState);
+  const [shelvedChanges, refresh] = useAtom(shelvedChangesState);
   useEffect(() => {
     // make sure we fetch whenever loading the shelved changes list
     refresh();
@@ -67,7 +73,7 @@ function ShelvedChangesList({dismiss}: {dismiss: () => void}) {
   return (
     <DropdownFields
       title={
-        <span className="shelved-changes-title">
+        <Row>
           <T>Shelved Changes</T>{' '}
           <Tooltip
             title={t(
@@ -75,7 +81,7 @@ function ShelvedChangesList({dismiss}: {dismiss: () => void}) {
             )}>
             <Icon icon="info" />
           </Tooltip>
-        </span>
+        </Row>
       }
       icon="archive"
       className="shelved-changes-dropdown"
@@ -85,15 +91,15 @@ function ShelvedChangesList({dismiss}: {dismiss: () => void}) {
       ) : shelvedChanges.state === 'hasError' ? (
         <ErrorNotice
           title="Could not fetch shelved changes"
-          error={shelvedChanges.errorOrThrow()}
+          error={shelvedChanges.error as Error}
         />
-      ) : shelvedChanges.valueOrThrow().length === 0 ? (
+      ) : shelvedChanges.data.length === 0 ? (
         <EmptyState small>
           <T>No shelved changes</T>
         </EmptyState>
       ) : (
         <div className="shelved-changes-list">
-          {shelvedChanges.valueOrThrow().map(change => {
+          {shelvedChanges.data.map(change => {
             const comparison = {
               type: ComparisonType.Committed,
               hash: change.hash,
@@ -106,17 +112,49 @@ function ShelvedChangesList({dismiss}: {dismiss: () => void}) {
                     <RelativeDate date={change.date} useShortVariant />
                   </Subtle>
                   <FlexSpacer />
-                  <OperationDisabledButton
-                    appearance="secondary"
-                    contextKey={`unshelve-${change.hash}`}
-                    className="unshelve-button"
-                    runOperation={() => {
-                      dismiss();
-                      return new UnshelveOperation(change);
-                    }}
-                    icon={<Icon icon="layers-active" slot="start" />}>
-                    <T>Unshelve</T>
-                  </OperationDisabledButton>
+                  <Tooltip title={t('Remove from the list of shelved changes')}>
+                    <OperationDisabledButton
+                      kind="icon"
+                      contextKey={`delete-shelve-${change.hash}`}
+                      data-testid={`delete-shelve-${change.hash}`}
+                      className="unshelve-button"
+                      runOperation={() => {
+                        dismiss();
+                        return new DeleteShelveOperation(change);
+                      }}
+                      icon={<Icon icon="trash" />}></OperationDisabledButton>
+                  </Tooltip>
+                  <Tooltip
+                    title={t(
+                      'Apply these changes without removing this from your list of shelved changes',
+                    )}>
+                    <OperationDisabledButton
+                      kind="icon"
+                      contextKey={`unshelve-keep-${change.hash}`}
+                      className="unshelve-button"
+                      runOperation={() => {
+                        dismiss();
+                        return new UnshelveOperation(change, true);
+                      }}
+                      icon={<Icon icon="layers-active" slot="start" />}>
+                      <T>Apply</T>
+                    </OperationDisabledButton>
+                  </Tooltip>
+                  <Tooltip
+                    title={t(
+                      'Apply these changes and remove this from your list of shelved changes',
+                    )}>
+                    <OperationDisabledButton
+                      contextKey={`unshelve-${change.hash}`}
+                      className="unshelve-button"
+                      runOperation={() => {
+                        dismiss();
+                        return new UnshelveOperation(change, false);
+                      }}
+                      icon={<Icon icon="layers-active" slot="start" />}>
+                      <T>Unshelve</T>
+                    </OperationDisabledButton>
+                  </Tooltip>
                 </div>
                 <OpenComparisonViewButton
                   comparison={comparison}

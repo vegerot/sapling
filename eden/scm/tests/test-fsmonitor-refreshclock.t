@@ -1,6 +1,5 @@
-#require fsmonitor
+#require fsmonitor no-eden
 
-  $ configure modernclient
   $ newclientrepo repo
   $ hg status
 

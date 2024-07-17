@@ -5,27 +5,31 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {RenderResult} from '@testing-library/react';
+
 import App from '../App';
+import {cancelAllHighlightingTasks} from '../ComparisonView/SplitDiffView/syntaxHighlighting';
 import platform from '../platform';
 import {
-  clearAllRecoilSelectorCaches,
-  closeCommitInfoSidebar,
   COMMIT,
   expectMessageSentToServer,
+  openCommitInfoSidebar,
   resetTestMessages,
   simulateCommits,
   simulateMessageFromServer,
   simulateUncommittedChangedFiles,
+  waitForWithTick,
 } from '../testUtils';
+import {GeneratedStatus} from '../types';
 import {act, screen, render, waitFor, fireEvent, cleanup, within} from '@testing-library/react';
-import fs from 'fs';
-import path from 'path';
+import fs from 'node:fs';
+import path from 'node:path';
 import {ComparisonType} from 'shared/Comparison';
-import {unwrap} from 'shared/utils';
+import {nextTick} from 'shared/testUtils';
+import {nullthrows} from 'shared/utils';
 
 afterEach(cleanup);
 
-jest.mock('../MessageBus');
 jest.mock('../platform');
 
 const UNCOMMITTED_CHANGES_DIFF = `\
@@ -86,23 +90,19 @@ diff --git someFile.js someFile.js
 
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
 
-// reset recoil caches between test runs
-afterEach(() => {
-  clearAllRecoilSelectorCaches();
-});
-
 describe('ComparisonView', () => {
+  let app: RenderResult | null = null;
   beforeEach(() => {
     mockFetchToSupportSyntaxHighlighting();
     resetTestMessages();
-    render(<App />);
+    app = render(<App />);
     act(() => {
-      closeCommitInfoSidebar();
+      openCommitInfoSidebar();
       simulateCommits({
         value: [
           COMMIT('1', 'some public base', '0', {phase: 'public'}),
           COMMIT('a', 'My Commit', '1'),
-          COMMIT('b', 'Another Commit', 'a', {isHead: true}),
+          COMMIT('b', 'Another Commit', 'a', {isDot: true}),
         ],
       });
       simulateUncommittedChangedFiles({
@@ -111,18 +111,29 @@ describe('ComparisonView', () => {
     });
   });
 
+  // Not afterEach because afterEach runs in a separate tick and can be too
+  // late to avoid act(..) warnings or timeout.
+  function unmountNow() {
+    cancelAllHighlightingTasks();
+    app?.unmount();
+  }
+
   afterEach(() => {
     jest.clearAllMocks();
   });
 
-  function clickComparisonViewButton() {
-    act(() => {
+  async function clickComparisonViewButton() {
+    await act(async () => {
       const button = screen.getByTestId('open-comparison-view-button-UNCOMMITTED');
       fireEvent.click(button);
+      await nextTick();
     });
   }
-  async function openUncommittedChangesComparison(diffContent = UNCOMMITTED_CHANGES_DIFF) {
-    clickComparisonViewButton();
+  async function openUncommittedChangesComparison(
+    diffContent?: string,
+    genereatedStatuses?: Record<string, GeneratedStatus>,
+  ) {
+    await clickComparisonViewButton();
     await waitFor(
       () =>
         expectMessageSentToServer({
@@ -135,10 +146,17 @@ describe('ComparisonView', () => {
     );
     act(() => {
       simulateMessageFromServer({
+        type: 'fetchedGeneratedStatuses',
+        results: genereatedStatuses ?? {},
+      });
+    });
+    await act(async () => {
+      simulateMessageFromServer({
         type: 'comparison',
         comparison: {type: ComparisonType.UncommittedChanges},
-        data: {diff: {value: diffContent}},
+        data: {diff: {value: diffContent ?? UNCOMMITTED_CHANGES_DIFF}},
       });
+      await nextTick();
     });
   }
   function inComparisonView() {
@@ -155,6 +173,8 @@ describe('ComparisonView', () => {
 
   it('Loads comparison', async () => {
     await openUncommittedChangesComparison();
+    // Prevent act(..) warnings. This cannot be afterEach() which is too late.
+    unmountNow();
   });
 
   it('parses files from comparison', async () => {
@@ -162,6 +182,7 @@ describe('ComparisonView', () => {
     expect(inComparisonView().getByText('someFile.txt')).toBeInTheDocument();
     expect(inComparisonView().getByText('newFile.txt')).toBeInTheDocument();
     expect(inComparisonView().getByText('deletedFile.txt')).toBeInTheDocument();
+    unmountNow();
   });
 
   it('show file contents', async () => {
@@ -172,6 +193,7 @@ describe('ComparisonView', () => {
     expect(inComparisonView().getAllByText('line 9')[0]).toBeInTheDocument();
     expect(inComparisonView().getAllByText('line 10')[0]).toBeInTheDocument();
     expect(inComparisonView().getAllByText('line 11')[0]).toBeInTheDocument();
+    unmountNow();
   });
 
   it('loads remaining lines', async () => {
@@ -192,7 +214,7 @@ describe('ComparisonView', () => {
     act(() => {
       simulateMessageFromServer({
         type: 'comparisonContextLines',
-        lines: ['line 1', 'line 2', 'line 3', 'line 4', 'line 5', 'line 6'],
+        lines: {value: ['line 1', 'line 2', 'line 3', 'line 4', 'line 5', 'line 6']},
         path: 'someFile.txt',
       });
     });
@@ -204,6 +226,7 @@ describe('ComparisonView', () => {
       expect(inComparisonView().getAllByText('line 5')[0]).toBeInTheDocument();
       expect(inComparisonView().getAllByText('line 6')[0]).toBeInTheDocument();
     });
+    unmountNow();
   });
 
   it('can close comparison', async () => {
@@ -211,6 +234,7 @@ describe('ComparisonView', () => {
     expect(inComparisonView().getByText('- modified')).toBeInTheDocument();
     closeComparisonView();
     expect(screen.queryByText('- modified')).not.toBeInTheDocument();
+    unmountNow();
   });
 
   it('invalidates cached remaining lines when the head commit changes', async () => {
@@ -234,11 +258,11 @@ describe('ComparisonView', () => {
     act(() => {
       simulateMessageFromServer({
         type: 'comparisonContextLines',
-        lines: ['line 1', 'line 2', 'line 3', 'line 4', 'line 5', 'line 6'],
+        lines: {value: ['line 1', 'line 2', 'line 3', 'line 4', 'line 5', 'line 6']},
         path: 'someFile.txt',
       });
     });
-    await waitFor(() => {
+    await waitForWithTick(() => {
       expect(inComparisonView().getAllByText('line 1')[0]).toBeInTheDocument();
       expect(inComparisonView().getAllByText('line 6')[0]).toBeInTheDocument();
     });
@@ -254,7 +278,7 @@ describe('ComparisonView', () => {
           COMMIT('1', 'some public base', '0', {phase: 'public'}),
           COMMIT('a', 'My Commit', '1'),
           COMMIT('b', 'Another Commit', 'a'),
-          COMMIT('c', 'New commit!', 'b', {isHead: true}),
+          COMMIT('c', 'New commit!', 'b', {isDot: true}),
         ],
       });
     });
@@ -278,22 +302,25 @@ describe('ComparisonView', () => {
     act(() => {
       simulateMessageFromServer({
         type: 'comparisonContextLines',
-        lines: [
-          'different line 1',
-          'different line 2',
-          'different line 3',
-          'different line 4',
-          'different line 5',
-          'different line 6',
-        ],
+        lines: {
+          value: [
+            'different line 1',
+            'different line 2',
+            'different line 3',
+            'different line 4',
+            'different line 5',
+            'different line 6',
+          ],
+        },
         path: 'someFile.txt',
       });
     });
     // new data is used
-    await waitFor(() => {
+    await waitForWithTick(() => {
       expect(inComparisonView().getAllByText('different line 1')[0]).toBeInTheDocument();
       expect(inComparisonView().getAllByText('different line 6')[0]).toBeInTheDocument();
     });
+    unmountNow();
   });
 
   it('refresh button requests new data', async () => {
@@ -308,6 +335,7 @@ describe('ComparisonView', () => {
       type: 'requestComparison',
       comparison: {type: ComparisonType.UncommittedChanges},
     });
+    unmountNow();
   });
 
   it('changing comparison mode requests new data', async () => {
@@ -322,20 +350,23 @@ describe('ComparisonView', () => {
       type: 'requestComparison',
       comparison: {type: ComparisonType.StackChanges},
     });
+    unmountNow();
   });
 
-  it('shows a spinner while a fetch is ongoing', () => {
-    clickComparisonViewButton();
+  it('shows a spinner while a fetch is ongoing', async () => {
+    await clickComparisonViewButton();
     expect(inComparisonView().getByTestId('comparison-loading')).toBeInTheDocument();
 
-    act(() => {
+    await act(async () => {
       simulateMessageFromServer({
         type: 'comparison',
         comparison: {type: ComparisonType.UncommittedChanges},
         data: {diff: {value: UNCOMMITTED_CHANGES_DIFF}},
       });
+      await nextTick();
     });
     expect(inComparisonView().queryByTestId('comparison-loading')).not.toBeInTheDocument();
+    unmountNow();
   });
 
   it('copies file path on click', async () => {
@@ -354,6 +385,7 @@ describe('ComparisonView', () => {
     });
     expect(platform.clipboardCopy).toHaveBeenCalledTimes(2);
     expect(platform.clipboardCopy).toHaveBeenLastCalledWith('some/path/foo.go');
+    unmountNow();
   });
 
   describe('syntax highlighting', () => {
@@ -366,21 +398,25 @@ describe('ComparisonView', () => {
       expect(tokens.length).toBeGreaterThan(0);
       // highlighted tokens have classes like mtk1, mtk2, etc.
       expect(tokens.some(token => /mtk\d+/.test(token.className))).toBe(true);
+      unmountNow();
     });
 
     it('renders highlighting in context lines and diff lines', async () => {
       await openUncommittedChangesComparison(DIFF_WITH_SYNTAX);
       await waitForSyntaxHighlightingToAppear(screen.getByTestId('comparison-view'));
 
-      expect(
-        within(screen.getByTestId('comparison-view')).queryAllByText('variable_in_context_line'),
-      ).toHaveLength(2);
-      expect(
-        within(screen.getByTestId('comparison-view')).getByText('variable_in_before'),
-      ).toBeInTheDocument();
-      expect(
-        within(screen.getByTestId('comparison-view')).getByText('variable_in_after'),
-      ).toBeInTheDocument();
+      await waitFor(() => {
+        expect(
+          within(screen.getByTestId('comparison-view')).queryAllByText('variable_in_context_line'),
+        ).toHaveLength(2);
+        expect(
+          within(screen.getByTestId('comparison-view')).getByText('variable_in_before'),
+        ).toBeInTheDocument();
+        expect(
+          within(screen.getByTestId('comparison-view')).getByText('variable_in_after'),
+        ).toBeInTheDocument();
+      });
+      unmountNow();
     });
 
     it('highlights expanded context lines', async () => {
@@ -403,7 +439,7 @@ describe('ComparisonView', () => {
       act(() => {
         simulateMessageFromServer({
           type: 'comparisonContextLines',
-          lines: ['const loaded_additional_context_variable = 5;'],
+          lines: {value: ['const loaded_additional_context_variable = 5;']},
           path: 'someFile.js',
         });
       });
@@ -413,19 +449,20 @@ describe('ComparisonView', () => {
           inComparisonView().queryAllByText('loaded_additional_context_variable'),
         ).toHaveLength(2);
       });
+      unmountNow();
     });
   });
 
-  describe('collapsing files', () => {
-    const makeFileDiff = (name: string, content: string) => {
-      return `diff --git file${name}.txt file${name}.txt
+  const makeFileDiff = (name: string, content: string) => {
+    return `diff --git file${name}.txt file${name}.txt
 --- file${name}.txt
 +++ file${name}.txt
 @@ -1,2 +1,2 @@
 ${content}
 `;
-    };
+  };
 
+  describe('collapsing files', () => {
     it('can click to collapse files', async () => {
       const SINGLE_CHANGE = makeFileDiff('1', '+const x = 1;');
       await openUncommittedChangesComparison(SINGLE_CHANGE);
@@ -465,7 +502,8 @@ ${content}
         'split-diff-view-file-header-expand-button',
         'split-diff-view-file-header-expand-button',
       ]);
-    });
+      unmountNow();
+    }, 20_000 /* potentially slow test */);
 
     it('a single large file is expanded so you always see something', async () => {
       const GIANT_FILE = makeFileDiff(
@@ -480,6 +518,70 @@ ${content}
       expect(inComparisonView().getAllByText('big_file_contents').length).toBeGreaterThan(0);
       // the small file starts collapsed
       expect(inComparisonView().queryByText('small_file_contents')).not.toBeInTheDocument();
+      unmountNow();
+    });
+  });
+
+  describe('genereated files', () => {
+    it('genereated status is fetched for files being compared', async () => {
+      const NORMAL_FILE = makeFileDiff('normal1', '+normal_contents');
+      const PARTIAL_FILE = makeFileDiff('partial1', '+partial_contents');
+      const GENERATED_FILE = makeFileDiff('generated1', '+generated_contents');
+      const ALL = [GENERATED_FILE, PARTIAL_FILE, NORMAL_FILE].join('\n');
+
+      await openUncommittedChangesComparison(ALL);
+      await waitFor(() => {
+        expectMessageSentToServer({
+          type: 'fetchGeneratedStatuses',
+          paths: ['filegenerated1.txt', 'filepartial1.txt', 'filenormal1.txt'],
+        });
+      });
+      unmountNow();
+    });
+
+    it('banner says that files are generated', async () => {
+      const NORMAL_FILE = makeFileDiff('normal2', '+normal_contents');
+      const PARTIAL_FILE = makeFileDiff('partial2', '+partial_contents');
+      const GENERATED_FILE = makeFileDiff('generated2', '+generated_contents');
+      const ALL = [GENERATED_FILE, PARTIAL_FILE, NORMAL_FILE].join('\n');
+
+      await openUncommittedChangesComparison(ALL, {
+        'filenormal2.txt': GeneratedStatus.Manual,
+        'filegenerated2.txt': GeneratedStatus.Generated,
+        'filepartial2.txt': GeneratedStatus.PartiallyGenerated,
+      });
+      expect(inComparisonView().getByText('This file is generated')).toBeInTheDocument();
+      expect(inComparisonView().getByText('This file is partially generated')).toBeInTheDocument();
+      unmountNow();
+    });
+
+    it('generated files are collapsed by default', async () => {
+      const NORMAL_FILE = makeFileDiff('normal3', '+normal_contents');
+      const PARTIAL_FILE = makeFileDiff('partial3', '+partial_contents');
+      const GENERATED_FILE = makeFileDiff('generated3', '+generated_contents');
+      const ALL = [GENERATED_FILE, PARTIAL_FILE, NORMAL_FILE].join('\n');
+
+      await openUncommittedChangesComparison(ALL, {
+        'filenormal3.txt': GeneratedStatus.Manual,
+        'filegenerated3.txt': GeneratedStatus.Generated,
+        'filepartial3.txt': GeneratedStatus.PartiallyGenerated,
+      });
+
+      // normal, partial start expanded
+      expect(inComparisonView().getByText('normal_contents')).toBeInTheDocument();
+      expect(inComparisonView().getByText('partial_contents')).toBeInTheDocument();
+      await waitFor(() => {
+        // genereated starts collapsed
+        expect(inComparisonView().queryByText('generated_contents')).not.toBeInTheDocument();
+      });
+
+      expect(inComparisonView().getByText('Show anyway')).toBeInTheDocument();
+      fireEvent.click(inComparisonView().getByText('Show anyway'));
+      await waitFor(() => {
+        // genereated now expands
+        expect(inComparisonView().getByText('generated_contents')).toBeInTheDocument();
+      });
+      unmountNow();
     });
   });
 });
@@ -493,10 +595,10 @@ function waitForSyntaxHighlightingToAppear(inside: HTMLElement): Promise<void> {
 
 function mockFetchToSupportSyntaxHighlighting(): jest.SpyInstance {
   return jest.spyOn(global, 'fetch').mockImplementation(
-    jest.fn(async url => {
-      if (url.includes('generated/textmate')) {
-        const match = /.*generated\/textmate\/(.*)$/.exec(url);
-        const filename = unwrap(match)[1];
+    jest.fn(async (url: URL) => {
+      if (url.pathname.includes('generated/textmate')) {
+        const match = /.*generated\/textmate\/(.*)$/.exec(url.pathname);
+        const filename = nullthrows(match)[1];
         const toPublicDir = (filename: string) =>
           path.normalize(path.join(__dirname, '../../public/generated/textmate', filename));
         if (filename === 'onig.wasm') {

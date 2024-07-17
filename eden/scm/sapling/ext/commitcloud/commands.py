@@ -28,12 +28,12 @@ from sapling.i18n import _, _n
 
 from . import (
     background,
-    backup,
     backuplock,
     backupstate,
     dependencies,
     error as ccerror,
     interactivehistory,
+    megarepoimport,
     move,
     scmdaemon,
     service,
@@ -114,7 +114,10 @@ def cloud(ui, repo, **opts):
 
 subcmd = cloud.subcommand(
     categories=[
-        ("Connect to a cloud workspace", ["authenticate", "join", "switch", "leave"]),
+        (
+            "Connect to a cloud workspace",
+            ["authenticate", "join", "switch", "leave"],
+        ),
         ("Synchronize with the connected cloud workspace", ["sync"]),
         (
             "Manage cloud workspaces",
@@ -124,13 +127,17 @@ subcmd = cloud.subcommand(
         ("View commits for a cloud workspace", ["log"]),
         (
             "Back up commits",
-            ["backup", "check"],
+            ["upload", "check"],
         ),
         ("Manage automatic backup or sync", ["disable", "enable"]),
         ("Enable sharing for a cloud workspace", ["share"]),
         (
             "Manage commits and bookmarks in workspaces",
             ["move", "copy", "hide", "archive"],
+        ),
+        (
+            "Import workspaces from different repositories (requires megarepo support)",
+            ["import"],
         ),
     ]
 )
@@ -204,7 +211,7 @@ def cloudjoin(ui, repo, **opts):
             )
             return 1
 
-        serv = service.get(ui)
+        serv = service.get(ui, repo)
         reponame = ccutil.getreponame(repo)
         # check that the workspace exists if the destination workspace
         # doesn't equal to the default workspace for the current user
@@ -375,7 +382,7 @@ def cloudrejoin(ui, repo, **opts):
             # The specific hostname workspace will be preferred over the default workspace.
             reponame = ccutil.getreponame(repo)
             hostnameworkspace = workspace.hostnameworkspace(ui)
-            winfos = service.get(ui).getworkspaces(
+            winfos = service.get(ui, repo).getworkspaces(
                 reponame, workspace.userworkspaceprefix(ui)
             )
 
@@ -510,7 +517,7 @@ cloudsmartlogopts = [
     + workspace.workspaceopts,
 )
 def cloudlog(ui, repo, **opts):
-    """Print the content of a given Commit Cloud workspace.
+    """print the content of a given Commit Cloud workspace.
 
     By default, '@prog@ cloud log' prints the commit's hash, non-trivial parents, user,
     date, time, and the single-line summary for all draft commits from the given workspace.
@@ -541,7 +548,7 @@ def cloudlog(ui, repo, **opts):
     workspacename = workspace.parseworkspaceordefault(ui, repo, opts)
 
     with progress.spinner(ui, _("fetching")):
-        serv = service.get(ui)
+        serv = service.get(ui, repo)
         slinfo = serv.getsmartlog(reponame, workspacename, repo, 0)
 
     # show all draft nodes using the provided or default template
@@ -550,7 +557,7 @@ def cloudlog(ui, repo, **opts):
     displayer = cmdutil.show_changeset(ui, repo, opts, buffered=True)
     limit = cmdutil.loglimit(opts)
 
-    for (rev, _type, ctx, parents) in revdag:
+    for rev, _type, ctx, parents in revdag:
         if ctx.mutable() and datematcher(ctx.date()[0]):
             if limit is not None:
                 if limit == 0:
@@ -602,7 +609,7 @@ def cloudsmartlog(ui, repo, templatealias="sl_cloud", **opts):
         % (workspacename, reponame),
         component="commitcloud",
     )
-    serv = service.get(ui)
+    serv = service.get(ui, repo)
 
     flags = []
     if ui.configbool("commitcloud", "sl_showremotebookmarks"):
@@ -752,7 +759,7 @@ def cloudmove(ui, repo, *revs, **opts):
             % (sourceworkspace, destinationworkspace)
         )
 
-    serv = service.get(ui)
+    serv = service.get(ui, repo)
     reponame = ccutil.getreponame(repo)
     currentworkspace = workspace.currentworkspace(repo)
 
@@ -861,7 +868,7 @@ def cloudhide(ui, repo, *revs, **opts):
 
 def checkauthenticated(ui, repo):
     """check if authentication works by sending an empty request"""
-    service.get(ui).check()
+    service.get(ui, repo).check()
 
 
 @subcmd(
@@ -886,7 +893,7 @@ def cloudrollback(ui, repo, *revs, **opts):
         raise error.Abort(_("workspace version must be specified"))
 
     version = int(version)
-    serv = service.get(ui)
+    serv = service.get(ui, repo)
     reponame = ccutil.getreponame(repo)
 
     ui.status(
@@ -907,78 +914,6 @@ def cloudrollback(ui, repo, *revs, **opts):
         _("rollback completed\n"),
         component="commitcloud",
     )
-
-
-@subcmd(
-    "backup",
-    [
-        ("r", "rev", [], _("revisions to back up")),
-        ("", "background", None, "run backup in background"),
-        (
-            "f",
-            "force",
-            None,
-            "reset local state (reinitialise the local cache of backed up heads from the server)",
-        ),
-    ],
-    _("[-r REV...]"),
-)
-def cloudbackup(ui, repo, *revs, **opts):
-    """back up commits to commit cloud
-
-    Commits that have already been backed up will be skipped.
-
-    If no revision is specified, backs up all visible commits.
-    """
-    revs = revs + tuple(opts.get("rev", ()))
-    if ui.configbool("commitcloud", "usehttpupload"):
-        opts["rev"] = revs
-        return cloudupload(ui, repo, **opts)
-
-    repo.ignoreautobackup = True
-
-    force = opts.get("force")
-    inbackground = opts.get("background")
-    if revs:
-        if inbackground:
-            raise error.Abort("'--background' cannot be used with specific revisions")
-        revs = scmutil.revrange(repo, revs)
-    else:
-        revs = None
-
-    if force and inbackground:
-        raise error.Abort("'--background' cannot be used with '--force'")
-
-    if inbackground:
-        background.backgroundbackup(repo)
-        return 0
-
-    backedup, failed = backup.backup(
-        repo,
-        revs,
-        connect_opts=opts,
-        force=force,
-    )
-
-    if backedup:
-        repo.ui.status(
-            _n("backed up %d commit\n", "backed up %d commits\n", len(backedup))
-            % len(backedup),
-            component="commitcloud",
-        )
-    if failed:
-        repo.ui.warn(
-            _n(
-                "failed to back up %d commit\n",
-                "failed to back up %d commits\n",
-                len(failed),
-            )
-            % len(failed),
-            component="commitcloud",
-        )
-    if not backedup and not failed:
-        repo.ui.status(_("nothing to back up\n"))
-    return 0 if not failed else 2
 
 
 @subcmd(
@@ -1009,7 +944,7 @@ def cloudlistworspaces(ui, repo, **opts):
         component="commitcloud",
     )
 
-    serv = service.get(ui)
+    serv = service.get(ui, repo)
     winfos = serv.getworkspaces(reponame, workspacenameprefix)
     if not winfos:
         ui.write(_("no workspaces found with the prefix %s\n") % workspacenameprefix)
@@ -1072,7 +1007,7 @@ def cloudlistworspaces(ui, repo, **opts):
 
 @subcmd("deleteworkspace|delete", [] + workspace.workspaceopts)
 def clouddeleteworkspace(ui, repo, **opts):
-    """Delete (archive) workspace from commit cloud"""
+    """delete (archive) workspace from commit cloud"""
 
     workspacename = workspace.parseworkspace(ui, opts)
     if workspacename is None:
@@ -1091,7 +1026,7 @@ def clouddeleteworkspace(ui, repo, **opts):
         return
 
     reponame = ccutil.getreponame(repo)
-    service.get(ui).updateworkspacearchive(reponame, workspacename, True)
+    service.get(ui, repo).updateworkspacearchive(reponame, workspacename, True)
     ui.status(
         _("workspace %s has been deleted\n") % workspacename, component="commitcloud"
     )
@@ -1099,14 +1034,14 @@ def clouddeleteworkspace(ui, repo, **opts):
 
 @subcmd("undeleteworkspace|undelete", [] + workspace.workspaceopts)
 def cloudundeleteworkspace(ui, repo, **opts):
-    """Restore (unarchive) workspace in commit cloud"""
+    """restore (unarchive) workspace in commit cloud"""
 
     workspacename = workspace.parseworkspace(ui, opts)
     if workspacename is None:
         raise error.Abort(_("workspace name should be provided\n"))
 
     reponame = ccutil.getreponame(repo)
-    service.get(ui).updateworkspacearchive(reponame, workspacename, False)
+    service.get(ui, repo).updateworkspacearchive(reponame, workspacename, False)
     ui.status(
         _("workspace %s has been restored\n") % workspacename, component="commitcloud"
     )
@@ -1214,7 +1149,7 @@ def cloudrenameworkspace(ui, repo, skipconfirmation=False, **opts):
         component="commitcloud",
     )
 
-    service.get(ui).renameworkspace(reponame, source, destination)
+    service.get(ui, repo).renameworkspace(reponame, source, destination)
 
     if source == currentworkspace:
         with backuplock.lock(repo), repo.wlock(), repo.lock():
@@ -1276,7 +1211,9 @@ def cloudreclaimworkspaces(ui, repo, **opts):
         )
         return 1
 
-    formerworkspaces = list(service.get(ui).getworkspaces(reponame, formeruserprefix))
+    formerworkspaces = list(
+        service.get(ui, repo).getworkspaces(reponame, formeruserprefix)
+    )
 
     if not formerworkspaces:
         ui.status(_("nothing to reclaim\n"), component="commitcloud")
@@ -1346,14 +1283,6 @@ def cloudreclaimworkspaces(ui, repo, **opts):
     scmdaemon.scmdaemonsyncopts
     + pullopts
     + [
-        (
-            "",
-            "reason",
-            "",
-            _(
-                "reason why the sync has been triggered (used for logging purposes) (ADVANCED)"
-            ),
-        ),
         (
             "",
             "best-effort",
@@ -1439,7 +1368,7 @@ def cloudcheck(ui, repo, **opts):
     revs = scmutil.revrange(repo, revs)
     helperkey = "results"
 
-    if ui.configbool("commitcloud", "usehttpupload") and remote:
+    if remote:
         # eden api based lookup
         nodestocheck = [repo[r].node() for r in revs]
         missingnodes = set(edenapi_upload._filtercommits(repo, nodestocheck))
@@ -1448,25 +1377,12 @@ def cloudcheck(ui, repo, **opts):
         }
     else:
         nodestocheck = [repo[r].hex() for r in revs]
-        if remote:
-            # wireproto based lookup
-            remotepath = ccutil.getremotepath(ui)
-            getconnection = lambda: repo.connectionpool.get(remotepath, opts)
-            isbackedup = {
-                nodestocheck[i]: res
-                for i, res in enumerate(
-                    dependencies.infinitepush.isbackedupnodes(
-                        getconnection, nodestocheck
-                    )
-                )
-            }
-        else:
-            # local backup state based lookup
-            backeduprevs = unfi.revs("backedup()")
-            isbackedup = {
-                node: (unfi[node].rev() in backeduprevs) or not unfi[node].mutable()
-                for node in nodestocheck
-            }
+        # local backup state based lookup
+        backeduprevs = unfi.revs("backedup()")
+        isbackedup = {
+            node: (unfi[node].rev() in backeduprevs) or not unfi[node].mutable()
+            for node in nodestocheck
+        }
 
         results = {helperkey: isbackedup}
 
@@ -1548,12 +1464,12 @@ def backupdisable(ui, repo, **opts):
 
 @subcmd("share")
 def shareworkspace(ui, repo, **opts):
-    """Marks the given workspace for sharing and prints out the corresponding ACL"""
+    """marks the given workspace for sharing and prints out the corresponding ACL"""
     workspacename = workspace.currentworkspace(repo)
     if workspacename is None:
         ui.write(_("You are not connected to any workspace\n"))
         return
-    sharing_data = service.get(ui).shareworkspace(
+    sharing_data = service.get(ui, repo).shareworkspace(
         ccutil.getreponame(repo), workspacename
     )
     ui.write(sharing_data["sharing_message"] + "\n")
@@ -1561,7 +1477,7 @@ def shareworkspace(ui, repo, **opts):
 
 @subcmd("status")
 def cloudstatus(ui, repo, **opts):
-    """Shows information about the state of the user's workspace"""
+    """shows information about the state of the user's workspace"""
 
     workspacename = workspace.currentworkspace(repo)
     if workspacename is None:
@@ -1571,7 +1487,9 @@ def cloudstatus(ui, repo, **opts):
     userworkspaceprefix = workspace.userworkspaceprefix(ui)
     if workspacename.startswith(userworkspaceprefix):
         # check it with the server
-        if not service.get(ui).getworkspace(ccutil.getreponame(repo), workspacename):
+        if not service.get(ui, repo).getworkspace(
+            ccutil.getreponame(repo), workspacename
+        ):
             ui.write(
                 _(
                     "Workspace: %s (renamed or removed) (run `@prog@ cloud list` and switch to a different one)\n"
@@ -1676,26 +1594,6 @@ def waitbackup(ui, repo, timeout):
 
 
 @command(
-    "pushbackup",
-    [
-        ("r", "rev", [], _("revisions to back up")),
-        ("", "background", None, "run backup in background"),
-    ],
-    _("[-r REV...]"),
-)
-def pushbackup(ui, repo, *revs, **opts):
-    """back up commits to commit cloud (DEPRECATED)
-
-    Commits that have already been backed up will be skipped.
-
-    If no revision is specified, backs up all visible commits.
-
-    '@prog@ pushbackup' is deprecated in favour of '@prog@ cloud backup'.
-    """
-    return cloudbackup(ui, repo, *revs, **opts)
-
-
-@command(
     "isbackedup",
     [
         ("r", "rev", [], _("show the specified revision or revset"), _("REV")),
@@ -1714,7 +1612,7 @@ def isbackedup(ui, repo, **opts):
 
 
 @subcmd(
-    "upload",
+    "upload||backup",
     [
         ("r", "rev", [], _("revisions to upload to Commit Cloud")),
         (
@@ -1723,10 +1621,12 @@ def isbackedup(ui, repo, **opts):
             None,
             "reupload commits without checking what is present on the server",
         ),
+        ("", "background", None, "run backup in background (DEPRECATED)"),
     ],
+    _("[-r] REV..."),
 )
-def cloudupload(ui, repo, **opts):
-    """Upload draft commits using EdenApi Uploads
+def cloudupload(ui, repo, *revs, **opts):
+    """upload draft commits using EdenApi Uploads
 
     Commits that have already been uploaded will be skipped.
     If no revision is specified, uploads all visible commits.
@@ -1734,14 +1634,13 @@ def cloudupload(ui, repo, **opts):
 
     repo.ignoreautobackup = True
 
-    revs = opts.get("rev")
+    revs = list(revs) + list(opts.get("rev", []))
     if revs:
         revs = scmutil.revrange(repo, revs)
     else:
         revs = None
 
-    with repo.lock():
-        state = backupstate.BackupState(repo, usehttp=True)
+    state = backupstate.BackupState(repo)
 
     uploaded, failed = upload.upload(
         repo, revs, force=opts.get("force"), localbackupstate=state
@@ -1762,6 +1661,28 @@ def cloudupload(ui, repo, **opts):
         return 2
 
 
+# Register main command name as _pushbackup so we don't conflict with hotfix extension
+# that adds back "pushbackup" command.
+@command(
+    "_pushbackup|pushbackup",
+    [
+        ("r", "rev", [], _("revisions to back up")),
+        ("", "background", None, "run backup in background"),
+    ],
+    _("[-r REV...]"),
+)
+def pushbackup(ui, repo, *revs, **opts):
+    """back up commits to commit cloud (DEPRECATED)
+
+    Commits that have already been backed up will be skipped.
+
+    If no revision is specified, backs up all visible commits.
+
+    '@prog@ pushbackup' is deprecated in favour of '@prog@ cloud backup'.
+    """
+    return cloudupload(ui, repo, *revs, **opts)
+
+
 @subcmd("tidyup", workspace.workspaceopts)
 def cloudtidyup(ui, repo, **opts):
     """tidy up commit cloud workspace
@@ -1772,7 +1693,7 @@ def cloudtidyup(ui, repo, **opts):
     workspacename = workspace.parseworkspaceordefault(ui, repo, opts)
     if workspacename is None:
         raise ccerror.WorkspaceError(ui, _("undefined workspace"))
-    serv = service.get(ui)
+    serv = service.get(ui, repo)
     ui.status(
         _("cleanup unnessesary remote bookmarks from the workspace %s for repo %s\n")
         % (workspacename, reponame),
@@ -1780,3 +1701,80 @@ def cloudtidyup(ui, repo, **opts):
     )
     serv.cleanupworkspace(reponame, workspacename)
     ui.status(_("cleanup completed\n"), component="commitcloud")
+
+
+@subcmd(
+    "import",
+    [
+        (
+            "",
+            "source-repo",
+            "",
+            _("repo associated with the workspace to improt from"),
+        ),
+        (
+            "",
+            "destination-repo",
+            "",
+            _("repo associated with the workspace to import to"),
+        ),
+    ]
+    + move.srcdstworkspaceopts
+    + pullopts,
+)
+def cloudimport(ui, repo, **opts):
+    """translate commits that belong to another repo into the current repo, and add them to the destination workspace"""
+    sourceworkspace, destinationworkspace, sourcerepo, destinationrepo = (
+        megarepoimport.validateimportparams(ui, repo, opts)
+    )
+    serv = service.get(ui, repo)
+    megarepoimport.fetchworkspaces(
+        ui,
+        repo,
+        sourceworkspace,
+        destinationworkspace,
+        sourcerepo,
+        destinationrepo,
+        serv,
+    )
+    currentworkspace = workspace.currentworkspace(repo)
+    currentrepo = ccutil.getreponame(repo)
+    start = util.timer()
+    # Translate heads and bookmarks
+    full = opts.get("full")
+    newheads, newbookmarks = megarepoimport.translateandpull(
+        ui,
+        repo,
+        currentrepo,
+        currentworkspace,
+        sourceworkspace,
+        destinationworkspace,
+        sourcerepo,
+        destinationrepo,
+        serv,
+        full,
+    )
+    # update the destination workspace
+    destcloudrefs = serv.getreferences(destinationrepo, destinationworkspace, 0)
+    # Dedupe changes to avoid unnecessary updates
+    uniquenewheads, uniquenewbookmarks, bookmarkstodelete = (
+        megarepoimport.dedupechanges(
+            ui, destcloudrefs.heads, newheads, destcloudrefs.bookmarks, newbookmarks
+        )
+    )
+
+    serv.updatereferences(
+        destinationrepo,
+        destinationworkspace,
+        destcloudrefs.version,
+        newheads=uniquenewheads,
+        newbookmarks=uniquenewbookmarks,
+        oldbookmarks=bookmarkstodelete,
+    )
+
+    # update local workspace
+    if currentrepo == destinationrepo and currentworkspace == destinationworkspace:
+        cloudsync(ui, repo, workspace=currentworkspace)
+
+    elapsed = util.timer() - start
+    ui.status_err(_("finished in %0.2f sec\n") % elapsed)

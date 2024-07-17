@@ -26,6 +26,7 @@ use megarepo_config::Target;
 use megarepo_error::MegarepoError;
 use megarepo_mapping::CommitRemappingState;
 use megarepo_mapping::SourceName;
+use metaconfig_types::RepoConfigArc;
 use mononoke_api::Mononoke;
 use mononoke_api::RepoContext;
 use mononoke_types::ChangesetId;
@@ -221,14 +222,24 @@ impl<'a> ChangeTargetConfig<'a> {
         )
         .await?;
 
+        let repo = self.find_repo_by_id(ctx, target.repo_id).await?;
+        let repo_config = repo.repo().repo_config_arc();
+
         // Contruct the new config structure and the remapping state
-        let new_config = self.megarepo_configs.get_config_by_version(
-            ctx.clone(),
-            target.clone(),
-            new_version.clone(),
-        )?;
-        let new_remapping_state =
-            CommitRemappingState::new(changesets_to_merge.clone(), new_version);
+        let new_config = self
+            .megarepo_configs
+            .get_config_by_version(
+                ctx.clone(),
+                repo_config,
+                target.clone(),
+                new_version.clone(),
+            )
+            .await?;
+        let new_remapping_state = CommitRemappingState::new(
+            changesets_to_merge.clone(),
+            new_version,
+            Some(target.bookmark.to_owned()),
+        );
 
         // Diff the configs to find out action items.
         let diff = diff_configs(
@@ -249,6 +260,7 @@ impl<'a> ChangeTargetConfig<'a> {
                 new_config.version.clone(),
                 message.clone(),
                 self.mutable_renames,
+                target.bookmark.to_owned(),
             )
             .await?;
         let additions_merge = if let Some(additions_merge_cs_id) = additions_merge_cs_id {
@@ -295,7 +307,7 @@ impl<'a> ChangeTargetConfig<'a> {
 
         let derivers = FuturesUnordered::new();
         for ty in derived_data_types {
-            let utils = derived_data_utils(ctx.fb, target_repo.inner_repo(), ty)?;
+            let utils = derived_data_utils(ctx.fb, target_repo.inner_repo(), *ty)?;
             derivers.push(utils.derive(
                 ctx.clone(),
                 target_repo.inner_repo().repo_derived_data_arc(),
@@ -329,6 +341,7 @@ impl<'a> ChangeTargetConfig<'a> {
         sync_config_version: SyncConfigVersion,
         message: Option<String>,
         mutable_renames: &Arc<MutableRenames>,
+        bookmark: String,
     ) -> Result<Option<ChangesetId>, MegarepoError> {
         if diff.added.is_empty() {
             return Ok(None);
@@ -362,6 +375,7 @@ impl<'a> ChangeTargetConfig<'a> {
                 false, /* write_commit_remapping_state */
                 sync_config_version,
                 message,
+                bookmark,
             )
             .await?,
         ))
@@ -388,11 +402,11 @@ impl<'a> ChangeTargetConfig<'a> {
             .changeset_fetcher()
             .get_parents(ctx, actual_target_location)
             .await?;
-        if parents.get(0) != Some(&expected_target_location) {
+        if parents.first() != Some(&expected_target_location) {
             return Err(MegarepoError::request(anyhow!(
                 "Neither {} nor its first parent {:?} point to a target location {}",
                 actual_target_location,
-                parents.get(0),
+                parents.first(),
                 expected_target_location,
             )));
         }

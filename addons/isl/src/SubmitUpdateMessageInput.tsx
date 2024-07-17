@@ -8,26 +8,46 @@
 import type {CommitInfo} from './types';
 
 import {diffUpdateMessagesState} from './CommitInfoView/CommitInfoState';
+import {MinHeightTextField} from './CommitInfoView/MinHeightTextField';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {T} from './i18n';
-import {VSCodeTextField} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilState, useRecoilValue} from 'recoil';
+import * as stylex from '@stylexjs/stylex';
+import {useAtom, useAtomValue} from 'jotai';
+import {useRef} from 'react';
+
+const styles = stylex.create({
+  full: {
+    width: '100%',
+  },
+});
+
+export function multiSubmitUpdateMessage(commits: Array<CommitInfo>) {
+  // Combine hashes to key the typed update message.
+  // This is kind of volatile, since if you change your selection at all, the message will be cleared.
+  // Note: order must be deterministic so that your selection order doesn't affect this key
+  const orderedCommits = commits.map(c => c.hash);
+  orderedCommits.sort();
+  const key = orderedCommits.join(',');
+  return diffUpdateMessagesState(key);
+}
 
 export function SubmitUpdateMessageInput({commits}: {commits: Array<CommitInfo>}) {
-  const provider = useRecoilValue(codeReviewProvider);
+  const provider = useAtomValue(codeReviewProvider);
+  const ref = useRef(null);
 
   // typically only one commit, but if you've selected multiple, we key the message on all hashes together.
-  const key = commits.map(c => c.hash).join(',');
-  const [message, setMessage] = useRecoilState(diffUpdateMessagesState(key));
+  const [message, setMessage] = useAtom(multiSubmitUpdateMessage(commits));
   if (message == null || provider?.supportsUpdateMessage !== true) {
     return null;
   }
   return (
-    <VSCodeTextField
-      style={{width: '100%'}}
+    <MinHeightTextField
+      ref={ref}
+      keepNewlines
+      containerXstyle={styles.full}
       value={message}
-      onChange={e => setMessage((e.target as HTMLInputElement).value)}>
+      onInput={e => setMessage(e.currentTarget.value)}>
       <T>Update Message</T>
-    </VSCodeTextField>
+    </MinHeightTextField>
   );
 }

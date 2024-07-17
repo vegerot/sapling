@@ -6,6 +6,7 @@
  */
 
 use std::path::Path;
+use std::path::MAIN_SEPARATOR_STR as SEP;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -52,7 +53,10 @@ fn get_bytecode(py: Python, name: &str) -> PyResult<Option<::pybytes::Bytes>> {
 fn get_source(py: Python, name: &str) -> PyResult<Option<::pybytes::Bytes>> {
     match python_modules::find_module(name) {
         None => Ok(None),
-        Some(m) => Ok(Some(to_bytes(py, m.source_code().as_bytes())?)),
+        Some(m) => match m.source_code() {
+            Some(s) => Ok(Some(to_bytes(py, s.as_bytes())?)),
+            None => Ok(None),
+        },
     }
 }
 
@@ -84,16 +88,26 @@ py_class!(pub class BindingsModuleFinder |py| {
         match python_modules::find_module(name) {
             None => Ok(None),
             Some(info) => {
-                let home = self.home(py);
-                if let Some(home) = home {
-                    let path = if info.is_package() {
-                        format!("{}/{}/__init__.py", home, name.replace('.', "/"))
+                tracing::debug!(name=name,"find_spec");
+                if info.is_stdlib() {
+                    tracing::trace!(" skip filesystem, is stdlib");
+                } else {
+                    let home = self.home(py);
+                    if let Some(home) = home {
+                        let path = if info.is_package() {
+                            format!("{}{SEP}{}{SEP}__init__.py", home, name.replace('.', SEP))
+                        } else {
+                            format!("{}{SEP}{}.py", home, name.replace('.', SEP))
+                        };
+                        if Path::new(&path).exists() {
+                            // Fallback to other finders.
+                            tracing::trace!(path=path, " use filesystem, not static");
+                            return Ok(None);
+                        } else {
+                            tracing::trace!(path=path, " skip filesystem, path does not exist");
+                        }
                     } else {
-                        format!("{}/{}.py", home, name.replace('.', "/"))
-                    };
-                    if Path::new(&path).exists() {
-                        // Fallback to other finders.
-                        return Ok(None);
+                        tracing::trace!(" skip filesystem, no home set");
                     }
                 }
                 // ModuleSpec(name, loader, *, origin=None, loader_state=None, is_package=None)
@@ -161,6 +175,14 @@ py_class!(pub class BindingsModuleFinder |py| {
         }
     }
 
+    // get_source is part of PEP 302. `linecache` can use it to provide source code.
+
+    def get_source(&self, module_name: &str) -> PyResult<Option<String>> {
+        match python_modules::find_module(module_name) {
+            None => Err(PyErr::new::<exc::ImportError, _>(py, module_name)),
+            Some(m) => Ok(m.source_code().map(|s| s.to_string())),
+        }
+    }
 });
 
 impl BindingsModuleFinder {

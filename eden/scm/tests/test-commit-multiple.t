@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 # reproduce issue2264, issue2516
 

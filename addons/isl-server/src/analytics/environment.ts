@@ -7,8 +7,8 @@
 
 import type {ApplicationInfo} from './types';
 
-import os from 'os';
-import {randomId, unwrap} from 'shared/utils';
+import os from 'node:os';
+import {randomId, nullthrows} from 'shared/utils';
 
 export function getUsername(): string {
   try {
@@ -16,14 +16,18 @@ export function getUsername(): string {
   } catch (osInfoError) {
     try {
       const {env} = process;
-      return unwrap(env.LOGNAME || env.USER || env.LNAME || env.USERNAME);
+      return nullthrows(env.LOGNAME || env.USER || env.LNAME || env.USERNAME);
     } catch (processEnvError) {
       throw new Error(String(processEnvError) + String(osInfoError));
     }
   }
 }
 
-export function generateAnalyticsInfo(platformName: string, version: string): ApplicationInfo {
+export function generateAnalyticsInfo(
+  platformName: string,
+  version: string,
+  sessionId?: string,
+): ApplicationInfo {
   return {
     platform: platformName,
     version,
@@ -31,8 +35,9 @@ export function generateAnalyticsInfo(platformName: string, version: string): Ap
     /**
      * Random id for this ISL session, created at startup.
      * Note: this is only generated on the server, so client-logged events share the ID with the server.
+     * May be manually specified instead of randomly created, e.g. if your platform has a well-defined session ID already.
      */
-    sessionId: randomId(),
+    sessionId: sessionId ?? randomId(),
     unixname: getUsername(),
     osArch: os.arch(),
     osType: os.platform(),

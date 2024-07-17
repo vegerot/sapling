@@ -1,4 +1,8 @@
-#debugruntest-compatible
+#modern-config-incompatible
+#modern-config-incompatible
+
+#require no-eden
+
   $ setconfig experimental.allowfilepeer=True
 
   $ configure dummyssh
@@ -6,7 +10,7 @@
   $ setconfig experimental.evolution=obsolete
   $ setconfig experimental.narrow-heads=true
   $ setconfig visibility.enabled=true
-  $ setconfig mutation.record=true mutation.enabled=true mutation.date="0 0"
+  $ setconfig mutation.record=true mutation.enabled=true
   $ setconfig pushrebase.trystackpush=true
 
 Set up server repository

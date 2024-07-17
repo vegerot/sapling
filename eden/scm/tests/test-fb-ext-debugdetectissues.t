@@ -1,4 +1,8 @@
-#debugruntest-compatible
+#modern-config-incompatible
+#modern-config-incompatible
+
+#require no-eden
+
   $ configure modern
 
   $ newserver master
@@ -14,7 +18,7 @@
   $ hg debugdetectissues
   ran issue detector 'cachesizeexceedslimit', found 0 issues
   $ cd ..
-  $ clone master shallow
+  $ clone master shallow --config remotenames.selectivepull=false
   $ cd shallow
   $ cat >> .hg/hgrc <<EOF
   > [remotefilelog]

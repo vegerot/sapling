@@ -33,7 +33,8 @@ use crate::VertexName;
 /// fast path (yet).
 ///
 /// `MetaSet` is different from a pure filtering set (ex. only has "contains"
-/// fast path), as `MetaSet` supports fast path for iteration.
+/// fast path), as `MetaSet` supports fast path for iteration, if the underlying
+/// set supports it.
 pub struct MetaSet {
     evaluate: Box<dyn Fn() -> BoxFuture<'static, Result<NameSet>> + Send + Sync>,
     evaluated: RwLock<Option<NameSet>>,
@@ -119,8 +120,15 @@ impl AsyncNameSetQuery for MetaSet {
         self.evaluate().await?.iter_rev().await
     }
 
-    async fn count(&self) -> Result<usize> {
-        self.evaluate().await?.count().await
+    async fn count_slow(&self) -> Result<u64> {
+        self.evaluate().await?.count_slow().await
+    }
+
+    async fn size_hint(&self) -> (u64, Option<u64>) {
+        match self.evaluated() {
+            Some(set) => set.size_hint().await,
+            None => (0, None),
+        }
     }
 
     async fn last(&self) -> Result<Option<VertexName>> {
@@ -199,9 +207,22 @@ mod tests {
     }
 
     #[test]
+    fn test_size_hint() -> Result<()> {
+        let set = meta_set(&["1", "2"]);
+
+        assert!(set.evaluated().is_none());
+        assert_eq!(nb(set.size_hint()), (0, None));
+
+        assert!(nb(set.contains(&"2".into()))?);
+        assert_eq!(nb(set.size_hint()), (2, Some(2)));
+
+        Ok(())
+    }
+
+    #[test]
     fn test_debug() {
         let set = meta_set(&["1", "3", "2", "7", "5"]);
-        assert_eq!(format!("{:?}", &set), "<meta ?>");
+        assert_eq!(dbg(&set), "<meta ?>");
         r(set.evaluate()).unwrap();
         assert_eq!(
             format!("{:5?}", &set),

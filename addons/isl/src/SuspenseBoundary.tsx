@@ -5,9 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import {ErrorBoundary} from './ErrorNotice';
+import {ErrorBoundary} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
 import {Suspense} from 'react';
-import {Icon} from 'shared/Icon';
 
 /**
  * <ErrorBoundary> and <Suspense>, with a default fallback.

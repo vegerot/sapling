@@ -10,22 +10,25 @@ import type {ValidatedRepoInfo} from './types';
 import type {ReactNode} from 'react';
 
 import {Delayed} from './Delayed';
-import {Tooltip} from './Tooltip';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {T, t} from './i18n';
 import {
+  EXIT_CODE_FORGET,
   operationList,
   queuedOperations,
-  repositoryInfo,
   useAbortRunningOperation,
-} from './serverAPIState';
+} from './operationsState';
+import {repositoryInfo} from './serverAPIState';
+import {processTerminalLines} from './terminalOutput';
 import {CommandRunner} from './types';
 import {short} from './utils';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilValue} from 'recoil';
-import {Icon} from 'shared/Icon';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
+import {useAtomValue} from 'jotai';
 import './CommandHistoryAndProgress.css';
-import {truncate} from 'shared/utils';
+import {notEmpty, truncate} from 'shared/utils';
 
 function OperationDescription(props: {
   info: ValidatedRepoInfo;
@@ -36,7 +39,7 @@ function OperationDescription(props: {
   const {info, operation, className} = props;
   const desc = operation.getDescriptionForDisplay();
 
-  const reviewProvider = useRecoilValue(codeReviewProvider);
+  const reviewProvider = useAtomValue(codeReviewProvider);
 
   if (desc?.description) {
     return <span className={className}>{desc.description}</span>;
@@ -59,15 +62,22 @@ function OperationDescription(props: {
           .map(arg => {
             if (typeof arg === 'object') {
               switch (arg.type) {
+                case 'config':
+                  // don't show configs in the UI
+                  return undefined;
                 case 'repo-relative-file':
                   return arg.path;
+                case 'exact-revset':
                 case 'succeedable-revset':
+                case 'optimistic-revset':
                   return props.long
                     ? arg.revset
                     : // truncate full commit hashes to short representation visually
                     // revset could also be a remote bookmark, so only do this if it looks like a hash
-                    /[a-z0-9]{40}/.test(arg.revset)
+                    /^[a-z0-9]{40}$/.test(arg.revset)
                     ? short(arg.revset)
+                    : arg.revset.length > 80
+                    ? arg.revset.slice(0, 80) + '...'
                     : arg.revset;
               }
             }
@@ -76,17 +86,18 @@ function OperationDescription(props: {
             }
             return arg;
           })
+          .filter(notEmpty)
           .join(' ')}
     </code>
   );
 }
 
 export function CommandHistoryAndProgress() {
-  const list = useRecoilValue(operationList);
-  const queued = useRecoilValue(queuedOperations);
+  const list = useAtomValue(operationList);
+  const queued = useAtomValue(queuedOperations);
   const abortRunningOperation = useAbortRunningOperation();
 
-  const info = useRecoilValue(repositoryInfo);
+  const info = useAtomValue(repositoryInfo);
   if (info?.type !== 'success') {
     return null;
   }
@@ -119,8 +130,7 @@ export function CommandHistoryAndProgress() {
     const hideUntil = new Date((progress.startTime?.getTime() || 0) + slowThreshold);
     abort = (
       <Delayed hideUntil={hideUntil}>
-        <VSCodeButton
-          appearance="secondary"
+        <Button
           data-testid="abort-button"
           disabled={progress.aborting}
           onClick={() => {
@@ -128,7 +138,7 @@ export function CommandHistoryAndProgress() {
           }}>
           <Icon slot="start" icon={progress.aborting ? 'loading' : 'stop-circle'} />
           <T>Abort</T>
-        </VSCodeButton>
+        </Button>
       </Delayed>
     );
   } else if (progress.exitCode === 0) {
@@ -138,11 +148,21 @@ export function CommandHistoryAndProgress() {
     // Exited (tested above) by abort.
     label = <T replace={{$command: command}}>Aborted $command</T>;
     icon = <Icon icon="stop-circle" aria-label={t('Command aborted')} />;
+  } else if (progress.exitCode === EXIT_CODE_FORGET) {
+    label = <span>{command}</span>;
+    icon = (
+      <Icon
+        icon="question"
+        aria-label={t('Command ran during disconnection. Exit status is lost.')}
+      />
+    );
   } else {
     label = <span>{command}</span>;
     icon = <Icon icon="error" aria-label={t('Command exited unsuccessfully')} />;
     showLastLineOfOutput = true;
   }
+
+  const processedLines = processTerminalLines(progress.commandOutput ?? []);
 
   return (
     <div className="progress-container" data-testid="progress-container">
@@ -158,7 +178,17 @@ export function CommandHistoryAndProgress() {
                 <br />
                 <b>Command output:</b>
                 <br />
-                <pre>{progress.commandOutput?.join('') || 'No output'}</pre>
+                {processedLines.length === 0 ? (
+                  <Subtle>
+                    <T>No output</T>
+                  </Subtle>
+                ) : (
+                  <pre>
+                    {processedLines.map((line, i) => (
+                      <div key={i}>{line}</div>
+                    ))}
+                  </pre>
+                )}
               </>
             )}
           </div>
@@ -188,9 +218,7 @@ export function CommandHistoryAndProgress() {
                   {progress.currentProgress.message}
                 </ProgressLine>
               ) : (
-                progress.commandOutput
-                  ?.slice(-1)
-                  .map((line, i) => <ProgressLine key={i}>{line}</ProgressLine>)
+                processedLines.length > 0 && <ProgressLine>{processedLines.at(-1)}</ProgressLine>
               )}
             </div>
           </div>

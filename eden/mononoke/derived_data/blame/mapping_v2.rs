@@ -18,7 +18,7 @@ use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
 use derived_data_manager::DerivationContext;
-use derived_data_service_if::types as thrift;
+use derived_data_service_if as thrift;
 use metaconfig_types::BlameVersion;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
@@ -55,6 +55,7 @@ impl BonsaiDerivable for RootBlameV2 {
     const VARIANT: DerivableType = DerivableType::BlameV2;
 
     type Dependencies = dependencies![RootUnodeManifestId];
+    type PredecessorDependencies = dependencies![];
 
     async fn derive_single(
         ctx: &CoreContext,
@@ -64,7 +65,7 @@ impl BonsaiDerivable for RootBlameV2 {
     ) -> Result<Self, Error> {
         let csid = bonsai.get_changeset_id();
         let root_manifest = derivation_ctx
-            .derive_dependency::<RootUnodeManifestId>(ctx, csid)
+            .fetch_dependency::<RootUnodeManifestId>(ctx, csid)
             .await?;
         if derivation_ctx.config().blame_version != BlameVersion::V2 {
             return Err(anyhow!(
@@ -82,7 +83,6 @@ impl BonsaiDerivable for RootBlameV2 {
         ctx: &CoreContext,
         derivation_ctx: &DerivationContext,
         bonsais: Vec<BonsaiChangeset>,
-        _gap_size: Option<usize>,
     ) -> Result<HashMap<ChangesetId, Self>, Error> {
         derive_blame_v2_in_batch(ctx, derivation_ctx, bonsais).await
     }

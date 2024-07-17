@@ -345,10 +345,19 @@ impl CommitGraph {
             ctx,
             cs_id1,
             cs_id2,
-            |edges| edges.skip_tree_parent,
-            |edges| edges.skip_tree_skew_ancestor,
-            |node| node.skip_tree_depth,
+            |edges| edges.parents.iter().copied().next(),
+            |edges| edges.p1_linear_skew_ancestor,
+            |node| node.p1_linear_depth,
         )
         .await
+    }
+
+    pub(crate) async fn changeset_node(
+        &self,
+        ctx: &CoreContext,
+        cs_id: ChangesetId,
+    ) -> Result<ChangesetNode> {
+        let edges = self.storage.fetch_edges(ctx, cs_id).await?;
+        Ok(edges.node)
     }
 }

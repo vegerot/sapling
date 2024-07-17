@@ -598,7 +598,7 @@ pub struct BlobstoreEnumerationData {
 
 #[derive(Debug, Error)]
 pub enum LoadableError {
-    #[error("Blobstore error")]
+    #[error(transparent)]
     Error(#[from] Error),
     #[error("Blob is missing: {0}")]
     Missing(String),
@@ -679,5 +679,25 @@ impl<'a, A: Blobstore, B: Blobstore> BlobCopier for GenericBlobstoreCopier<'a, A
             .with_context(|| format!("key {} not present", key))?;
         self.target.put(ctx, key, value.into_bytes()).await?;
         Ok(())
+    }
+}
+
+// Implement Loadable when additional data is carried alongside the blobstore key,
+// usually used for (FileType, LeafId) in bonsai manifests.
+#[async_trait]
+impl<T, L> Loadable for (T, L)
+where
+    T: Copy + Send + Sync + 'static,
+    L: Loadable + Sync,
+{
+    type Value = (T, L::Value);
+
+    async fn load<'a, B: Blobstore>(
+        &'a self,
+        ctx: &'a CoreContext,
+        blobstore: &'a B,
+    ) -> Result<Self::Value, LoadableError> {
+        let (t, id) = self;
+        Ok((*t, id.load(ctx, blobstore).await?))
     }
 }

@@ -6,19 +6,18 @@
  */
 
 import type {RepoRelativePath} from './types';
-import type {SetterOrUpdater} from 'recoil';
 import type {Hash, RepoPath} from 'shared/types/common';
 import type {ExportFile, ImportCommit} from 'shared/types/stack';
 
 import clientToServerAPI from './ClientToServerAPI';
 import {t} from './i18n';
-import {treeWithPreviews, uncommittedChangesWithPreviews} from './previews';
-import {clearOnCwdChange} from './recoilUtils';
+import {dagWithPreviews, uncommittedChangesWithPreviews} from './previews';
+import {atomResetOnCwdChange} from './repositoryData';
 import {latestUncommittedChangesTimestamp} from './serverAPIState';
 import {ChunkSelectState} from './stackEdit/chunkSelectState';
 import {assert} from './utils';
 import Immutable from 'immutable';
-import {selector, useRecoilState, useRecoilValue, atom} from 'recoil';
+import {atom, useAtom, useAtomValue} from 'jotai';
 import {RateLimiter} from 'shared/RateLimiter';
 import {SelfUpdate} from 'shared/immutableExt';
 
@@ -247,11 +246,9 @@ const defaultUncommittedPartialSelection = PartialSelection.empty({
 });
 
 /** PartialSelection for `wdir()`. See `UseUncommittedSelection` for the public API. */
-const uncommittedSelection = atom<PartialSelection>({
-  key: 'uncommittedSelection',
-  default: defaultUncommittedPartialSelection,
-  effects: [clearOnCwdChange()],
-});
+export const uncommittedSelection = atomResetOnCwdChange<PartialSelection>(
+  defaultUncommittedPartialSelection,
+);
 
 const wdirRev = 'wdir()';
 
@@ -275,7 +272,7 @@ export class UseUncommittedSelection {
 
   constructor(
     public selection: PartialSelection,
-    private setSelection: SetterOrUpdater<PartialSelection>,
+    private setSelection: (_v: PartialSelection) => void,
     wdirHash: Hash,
     private getPaths: () => Array<RepoRelativePath>,
     epoch: number,
@@ -509,43 +506,31 @@ export class UseUncommittedSelection {
   }
 }
 
-type OmitNotMatching<T, K> = {
-  [P in keyof T]: K extends P ? T[P] : never;
-};
-type ReadonlyPartialSelection = OmitNotMatching<
-  PartialSelection,
-  | 'getSelection'
-  | 'isFullyOrPartiallySelected'
-  | 'isPartiallySelected'
-  | 'isFullySelected'
-  | 'isDeselected'
-  | 'isEverythingSelected'
-  | 'isNothingSelected'
-  | 'hasChunkSelection'
->;
+export const isFullyOrPartiallySelected = atom(get => {
+  const sel = get(uncommittedSelection);
+  const uncommittedChanges = get(uncommittedChangesWithPreviews);
+  const epoch = get(latestUncommittedChangesTimestamp);
+  const dag = get(dagWithPreviews);
+  const wdirHash = dag.resolve('.')?.hash ?? '';
+  const getPaths = () => uncommittedChanges.map(c => c.path);
+  const emptyFunction = () => {};
+  // NOTE: Usually UseUncommittedSelection is only used in React, but this is
+  // a private shortcut path to get the logic outside React.
+  const selection = new UseUncommittedSelection(sel, emptyFunction, wdirHash, getPaths, epoch);
+  return selection.isFullyOrPartiallySelected.bind(selection);
+});
 
-/** Get the uncommitted selection state. */
+/** react hook to get the uncommitted selection state. */
 export function useUncommittedSelection() {
-  const [selection, setSelection] = useRecoilState(uncommittedSelection);
-  const uncommittedChanges = useRecoilValue(uncommittedChangesWithPreviews);
-  const epoch = useRecoilValue(latestUncommittedChangesTimestamp);
-  const tree = useRecoilValue(treeWithPreviews);
-  const wdirHash = tree.headCommit?.hash ?? '';
+  const [selection, setSelection] = useAtom(uncommittedSelection);
+  const uncommittedChanges = useAtomValue(uncommittedChangesWithPreviews);
+  const epoch = useAtomValue(latestUncommittedChangesTimestamp);
+  const dag = useAtomValue(dagWithPreviews);
+  const wdirHash = dag.resolve('.')?.hash ?? '';
   const getPaths = () => uncommittedChanges.map(c => c.path);
 
   return new UseUncommittedSelection(selection, setSelection, wdirHash, getPaths, epoch);
 }
-
-/** Get a readonly view of the selection state, accessible from a snapshot / outside of react hooks */
-export const uncommittedSelectionReadonly = selector<ReadonlyPartialSelection>({
-  key: 'uncommittedSelectionReadonly',
-  cachePolicy_UNSTABLE: {eviction: 'most-recent'},
-  get: ({get}) => {
-    const selection = get(uncommittedSelection);
-    // Return the selection exactly, but modify the type to discourage using non-readonly methods.
-    return selection as ReadonlyPartialSelection;
-  },
-});
 
 function mergeObjectToMap<V>(obj: {[path: string]: V} | undefined, map: Map<string, V>) {
   if (obj === undefined) {

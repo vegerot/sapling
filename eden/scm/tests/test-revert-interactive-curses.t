@@ -1,5 +1,4 @@
-#require tic
-#debugruntest-compatible
+#require tic no-eden
 
   $ eagerepo
 Revert interactive tests with the Curses interface

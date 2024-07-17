@@ -1,5 +1,4 @@
-#require git no-windows
-#debugruntest-compatible
+#require git no-windows no-eden
 
 Dedicated test about rebase with submodule involved.
 

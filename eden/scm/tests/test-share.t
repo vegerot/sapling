@@ -1,4 +1,5 @@
 #chg-compatible
+#debugruntest-incompatible
   $ setconfig experimental.allowfilepeer=True
 
 #require killdaemons
@@ -60,7 +61,7 @@ check original
   date:        Thu Jan 01 00:00:00 1970 +0000
   summary:     init
   
-  $ hg goto
+  $ hg goto tip
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ cat a             # should be two lines of "a"
   a
@@ -91,7 +92,7 @@ check in shared clone
   date:        Thu Jan 01 00:00:00 1970 +0000
   summary:     init
   
-  $ hg goto
+  $ hg goto tip
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ cat b             # should exist with one "b"
   b

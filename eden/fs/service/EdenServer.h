@@ -25,6 +25,8 @@
 #include <folly/ThreadLocal.h>
 #include <folly/futures/SharedPromise.h>
 
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/PathMap.h"
 #include "eden/fs/inodes/EdenMountHandle.h"
 #include "eden/fs/inodes/InodePtr.h"
 #include "eden/fs/inodes/overlay/OverlayChecker.h"
@@ -36,8 +38,6 @@
 #include "eden/fs/takeover/TakeoverHandler.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/IActivityRecorder.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/PathMap.h"
 
 DECLARE_bool(takeover);
 
@@ -64,7 +64,7 @@ class Dirstate;
 class EdenConfig;
 class EdenMount;
 class EdenServiceHandler;
-class HgQueuedBackingStore;
+class SaplingBackingStore;
 class IHiveLogger;
 class Journal;
 class LocalStore;
@@ -220,7 +220,7 @@ class EdenServer : private TakeoverHandler {
    * This function resets the TakeoverServer, resets the shutdownFuture, and
    * sets the state to RUNNING
    */
-  FOLLY_NODISCARD folly::Future<folly::Unit> recover(TakeoverData&& data);
+  FOLLY_NODISCARD ImmediateFuture<folly::Unit> recover(TakeoverData&& data);
 
   /**
    * Shut down the EdenServer after it has stopped running.
@@ -265,7 +265,7 @@ class EdenServer : private TakeoverHandler {
   /**
    * Mount and return an EdenMount.
    */
-  FOLLY_NODISCARD folly::Future<std::shared_ptr<EdenMount>> mount(
+  FOLLY_NODISCARD ImmediateFuture<std::shared_ptr<EdenMount>> mount(
       std::unique_ptr<CheckoutConfig> initialConfig,
       bool readOnly,
       OverlayChecker::ProgressCallback&& progressCallback = [](auto) {},
@@ -329,11 +329,11 @@ class EdenServer : private TakeoverHandler {
    */
   EdenMountHandle getMount(AbsolutePathPiece mountPath) const;
 
-  folly::Future<CheckoutResult> checkOutRevision(
+  ImmediateFuture<CheckoutResult> checkOutRevision(
       AbsolutePathPiece mountPath,
       std::string& rootHash,
       std::optional<folly::StringPiece> rootHgManifest,
-      OptionalProcessId clientPid,
+      const ObjectFetchContextPtr& fetchContext,
       folly::StringPiece callerName,
       CheckoutMode checkoutMode);
 
@@ -450,15 +450,15 @@ class EdenServer : private TakeoverHandler {
   std::unordered_set<std::shared_ptr<BackingStore>> getBackingStores();
 
   /**
-   * Look up all BackingStores which are HgQueuedBackingStore
+   * Look up all BackingStores which are SaplingBackingStore
    *
    * EdenServer maintains an internal cache of all known BackingStores,
    * so that multiple mount points that use the same repository can
    * share the same BackingStore object.
    *
    */
-  std::unordered_set<std::shared_ptr<HgQueuedBackingStore>>
-  getHgQueuedBackingStores();
+  std::unordered_set<std::shared_ptr<SaplingBackingStore>>
+  getSaplingBackingStores();
 
   /**
    * Schedule `fn` to run on the main server event base when the `timeout`
@@ -553,7 +553,7 @@ class EdenServer : private TakeoverHandler {
   // all mounts.
   void unloadInodes();
 
-  FOLLY_NODISCARD folly::Future<folly::Unit> createThriftServer();
+  FOLLY_NODISCARD folly::SemiFuture<folly::Unit> createThriftServer();
 
   void prepareThriftAddress() const;
 
@@ -562,17 +562,18 @@ class EdenServer : private TakeoverHandler {
    */
   FOLLY_NODISCARD folly::Future<folly::Unit> prepareImpl(
       std::shared_ptr<StartupLogger> logger);
-  FOLLY_NODISCARD std::vector<folly::Future<folly::Unit>> prepareMountsTakeover(
+  FOLLY_NODISCARD std::vector<ImmediateFuture<folly::Unit>>
+  prepareMountsTakeover(
       std::shared_ptr<StartupLogger> logger,
       std::vector<TakeoverData::MountInfo>&& takeoverMounts);
-  FOLLY_NODISCARD std::vector<folly::Future<folly::Unit>> prepareMounts(
+  FOLLY_NODISCARD std::vector<ImmediateFuture<folly::Unit>> prepareMounts(
       std::shared_ptr<StartupLogger> logger);
   static void incrementStartupMountFailures();
 
   /**
    * recoverImpl() contains the bulk of the implementation of recover()
    */
-  FOLLY_NODISCARD folly::Future<folly::Unit> recoverImpl(TakeoverData&& data);
+  FOLLY_NODISCARD ImmediateFuture<folly::Unit> recoverImpl(TakeoverData&& data);
 
   /**
    * Load and parse existing eden config.
@@ -648,12 +649,12 @@ class EdenServer : private TakeoverHandler {
   void shutdownSubscribers();
 
   /**
-   * collect the values of the counter for each HgQueuedBackingStore
+   * collect the values of the counter for each SaplingBackingStore
    * accessed by calling the getCounterFromStore function on the
    * each store
    */
-  std::vector<size_t> collectHgQueuedBackingStoreCounters(
-      std::function<size_t(const HgQueuedBackingStore&)> getCounterFromStore);
+  std::vector<size_t> collectSaplingBackingStoreCounters(
+      std::function<size_t(const SaplingBackingStore&)> getCounterFromStore);
 
   /*
    * Member variables.

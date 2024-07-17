@@ -11,9 +11,9 @@
 #include <folly/Synchronized.h>
 #include <bitset>
 
+#include "eden/common/utils/UnboundedQueueExecutor.h"
 #include "eden/fs/rocksdb/RocksHandles.h"
 #include "eden/fs/store/LocalStore.h"
-#include "eden/fs/utils/UnboundedQueueExecutor.h"
 
 namespace facebook::eden {
 
@@ -44,7 +44,7 @@ class RocksDbLocalStore final : public LocalStore {
   void clearKeySpace(KeySpace keySpace) override;
   void compactKeySpace(KeySpace keySpace) override;
   StoreResult get(KeySpace keySpace, folly::ByteRange key) const override;
-  FOLLY_NODISCARD folly::Future<std::vector<StoreResult>> getBatch(
+  FOLLY_NODISCARD ImmediateFuture<std::vector<StoreResult>> getBatch(
       KeySpace keySpace,
       const std::vector<folly::ByteRange>& keys) const override;
   bool hasKey(KeySpace keySpace, folly::ByteRange key) const override;

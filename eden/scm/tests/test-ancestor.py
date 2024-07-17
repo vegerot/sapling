@@ -13,9 +13,7 @@ import random
 import sys
 import time
 
-from hghave import require
-
-from sapling import ancestor, debugcommands, hg, pycompat, ui as uimod, util
+from sapling import ancestor, debugcommands, hg, ui as uimod
 from sapling.node import nullrev
 
 
@@ -95,6 +93,7 @@ def test_missingancestors(seed, rng):
     testcount = 10
     inccount = 10
     nerrs = [0]
+
     # the default mu and sigma give us a nice distribution of mostly
     # single-digit counts (including 0) with some higher ones
     def lognormrandom(mu, sigma):

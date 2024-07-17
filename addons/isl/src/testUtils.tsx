@@ -21,8 +21,8 @@ import type {Writable} from 'shared/typeUtils';
 import messageBus from './MessageBus';
 import {deserializeFromString, serializeToString} from './serialize';
 import {mostRecentSubscriptionIds} from './serverAPIState';
-import {screen, act, within} from '@testing-library/react';
-import {selector, snapshot_UNSTABLE} from 'recoil';
+import {screen, act, within, waitFor} from '@testing-library/react';
+import {nextTick} from 'shared/testUtils';
 
 const testMessageBus = messageBus as TestingEventBus;
 
@@ -30,21 +30,25 @@ export function simulateMessageFromServer(message: ServerToClientMessage): void 
   testMessageBus.simulateMessage(serializeToString(message));
 }
 
+/** Filter out binary messages, and filter by wanted type. */
+function filterMessages(wantedType?: string) {
+  let messages = testMessageBus.sent
+    .filter((msg: unknown): msg is string => !(msg instanceof ArrayBuffer))
+    .map(deserializeFromString) as Array<Partial<ClientToServerMessage>>;
+  if (wantedType != null) {
+    messages = messages.filter(msg => msg.type == null || msg.type === wantedType);
+  }
+  return messages;
+}
+
 export function expectMessageSentToServer(
   message: Partial<ClientToServerMessage | ClientToServerMessageWithPayload>,
 ): void {
-  expect(
-    testMessageBus.sent
-      .filter((msg: unknown): msg is string => !(msg instanceof ArrayBuffer))
-      .map(deserializeFromString),
-  ).toContainEqual(message);
+  expect(filterMessages(message.type)).toContainEqual(message);
 }
+
 export function expectMessageNOTSentToServer(message: Partial<ClientToServerMessage>): void {
-  expect(
-    testMessageBus.sent
-      .filter((msg: unknown): msg is string => !(msg instanceof ArrayBuffer))
-      .map(deserializeFromString),
-  ).not.toContainEqual(message);
+  expect(filterMessages(message.type)).not.toContainEqual(message);
 }
 
 /**
@@ -90,25 +94,50 @@ export function simulateUncommittedChangedFiles(files: Result<UncommittedChanges
     },
   });
 }
-export function simulateRepoConnected() {
+export function simulateRepoConnected(repoRoot?: string, cwd?: string) {
+  const root = repoRoot ?? '/path/to/repo';
   simulateMessageFromServer({
     type: 'repoInfo',
     info: {
       type: 'success',
-      repoRoot: '/path/to/repo',
-      dotdir: '/path/to/repo/.sl',
+      repoRoot: root,
+      dotdir: `${root}/.sl`,
       command: 'sl',
       pullRequestDomain: undefined,
       codeReviewSystem: {type: 'github', owner: 'owner', repo: 'repo', hostname: 'github.com'},
     },
+    cwd,
   });
+  testMessageBus.simulateServerStatusChange({type: 'open'});
 }
 
 export function resetTestMessages() {
-  testMessageBus.resetTestMessages();
+  act(() => {
+    testMessageBus.resetTestMessages();
+  });
+}
+
+export function commitInfoIsOpen(): boolean {
+  return (
+    screen.queryByTestId('commit-info-view') != null ||
+    screen.queryByTestId('commit-info-view-loading') != null
+  );
 }
 
 export function closeCommitInfoSidebar() {
+  if (!commitInfoIsOpen()) {
+    return;
+  }
+  screen.queryAllByTestId('drawer-label').forEach(el => {
+    const commitInfoTab = within(el).queryByText('Commit Info');
+    commitInfoTab?.click();
+  });
+}
+
+export function openCommitInfoSidebar() {
+  if (commitInfoIsOpen()) {
+    return;
+  }
   screen.queryAllByTestId('drawer-label').forEach(el => {
     const commitInfoTab = within(el).queryByText('Commit Info');
     commitInfoTab?.click();
@@ -120,7 +149,7 @@ export const emptyCommit: CommitInfo = {
   hash: '0',
   parents: [],
   phase: 'draft',
-  isHead: false,
+  isDot: false,
   author: 'author',
   date: new Date(),
   description: '',
@@ -173,7 +202,7 @@ export const TEST_COMMIT_HISTORY = [
   COMMIT('y', 'Commit Y', 'x'),
   COMMIT('x', 'Commit X', '2'),
   COMMIT('2', 'another public branch', '0', {phase: 'public', remoteBookmarks: ['remote/master']}),
-  COMMIT('e', 'Commit E', 'd', {isHead: true}),
+  COMMIT('e', 'Commit E', 'd', {isDot: true}),
   COMMIT('d', 'Commit D', 'c'),
   COMMIT('c', 'Commit C', 'b'),
   COMMIT('b', 'Commit B', 'a'),
@@ -215,8 +244,7 @@ export const fireMouseEvent = function (
   return elem.dispatchEvent(evt);
 };
 
-// See https://github.com/testing-library/user-event/issues/440
-export const dragAndDrop = (elemDrag: HTMLElement, elemDrop: HTMLElement) => {
+export const drag = (elemDrag: HTMLElement, elemDrop: HTMLElement) => {
   act(() => {
     // calculate positions
     let pos = elemDrag.getBoundingClientRect();
@@ -253,6 +281,15 @@ export const dragAndDrop = (elemDrag: HTMLElement, elemDrop: HTMLElement) => {
     fireMouseEvent('dragenter', elemDrop, center2X, center2Y);
     fireMouseEvent('mouseover', elemDrop, center2X, center2Y);
     fireMouseEvent('dragover', elemDrop, center2X, center2Y);
+  });
+};
+export const drop = (elemDrag: HTMLElement, elemDrop: HTMLElement) => {
+  act(() => {
+    // calculate positions
+    let pos = elemDrag.getBoundingClientRect();
+    pos = elemDrop.getBoundingClientRect();
+    const center2X = Math.floor((pos.left + pos.right) / 2);
+    const center2Y = Math.floor((pos.top + pos.bottom) / 2);
 
     // release dragged element on top of drop target
     fireMouseEvent('drop', elemDrop, center2X, center2Y);
@@ -261,7 +298,17 @@ export const dragAndDrop = (elemDrag: HTMLElement, elemDrop: HTMLElement) => {
   });
 };
 
-export function dragAndDropCommits(draggedCommit: Hash | HTMLElement, onto: Hash) {
+// See https://github.com/testing-library/user-event/issues/440
+export const dragAndDrop = (elemDrag: HTMLElement, elemDrop: HTMLElement) => {
+  drag(elemDrag, elemDrop);
+  drop(elemDrag, elemDrop);
+};
+
+export function dragAndDropCommits(
+  draggedCommit: Hash | HTMLElement,
+  onto: Hash,
+  op: typeof dragAndDrop | typeof drag | typeof drop = dragAndDrop,
+) {
   const draggableCommit =
     typeof draggedCommit !== 'string'
       ? draggedCommit
@@ -271,8 +318,28 @@ export function dragAndDropCommits(draggedCommit: Hash | HTMLElement, onto: Hash
   expect(dragTargetComit).toBeDefined();
 
   act(() => {
-    dragAndDrop(draggableCommit as HTMLElement, dragTargetComit as HTMLElement);
+    op(draggableCommit as HTMLElement, dragTargetComit as HTMLElement);
+    jest.advanceTimersByTime(2);
   });
+}
+
+export function dragCommits(draggedCommit: Hash | HTMLElement, onto: Hash) {
+  dragAndDropCommits(draggedCommit, onto, drag);
+}
+
+export function dropCommits(draggedCommit: Hash | HTMLElement, onto: Hash) {
+  dragAndDropCommits(draggedCommit, onto, drop);
+}
+
+/** Check that YouAreHere points to the given commit. */
+export function expectYouAreHerePointAt(hash: string) {
+  // The previous row of "hash" should be "YouAreHere".
+  //   YouAreHere
+  //  /
+  // hash
+  const row = screen.getByTestId(`dag-row-group-${hash}`);
+  const previousRow = row.previousElementSibling;
+  expect(previousRow).toHaveTextContent('You are here');
 }
 
 /**
@@ -292,16 +359,66 @@ export function suppressReactErrorBoundaryErrorMessages() {
   });
 }
 
-const clearSelectorCachesState = selector({
-  key: 'clearSelectorCachesState',
-  get: ({getCallback}) =>
-    getCallback(({snapshot, refresh}) => () => {
-      for (const node of snapshot.getNodes_UNSTABLE()) {
-        refresh(node);
-      }
-    }),
-});
+/**
+ * Print test name beforeEach. This can be useful to figure out which test prints
+ * React or testing-library warnings, if the stack trace does not include the test
+ * code.
+ */
+export function beforeEachPrintTestName() {
+  beforeEach(() => {
+    // eslint-disable-next-line no-console
+    console.log(`Starting test: ${expect.getState().currentTestName}`);
+  });
+}
 
-export const clearAllRecoilSelectorCaches = () => {
-  snapshot_UNSTABLE().getLoadable(clearSelectorCachesState).getValue();
-};
+/**
+ * Drop-in replacement of `waitFor` that includes a `nextTick` to workaround
+ * some `act()` warnings.
+ */
+export function waitForWithTick<T>(callback: () => Promise<T> | T): Promise<T> {
+  return waitFor(async () => {
+    await nextTick();
+    return callback();
+  });
+}
+
+/**
+ * Check that the "commit" is in the forked branch from "base".
+ *
+ *   o  <- does not return commit hashes here (not right-side)
+ *   :
+ *   |  ┌─────┐
+ *   |  │  o  │
+ *   |  │  :  │
+ *   |  │  o  │ <- return commit hashes here (right-side branch)
+ *   |  │  |  │
+ *   |  │  o  │
+ *   |  │ /   │
+ *   |  └─────┘
+ *   |  /
+ *   base
+ *
+ * This is a naive implementation that does not consider merges.
+ */
+export function scanForkedBranchHashes(base: string): string[] {
+  const baseRow = screen.getByTestId(`dag-row-group-${base}`);
+  const getAttr = (e: Element, attr: string) => e.querySelector(`[${attr}]`)?.getAttribute(attr);
+  const getNodeColumn = (row: Element) => parseInt(getAttr(row, 'data-nodecolumn') ?? '-1');
+  const baseIndent = getNodeColumn(baseRow);
+  // Scan rows above baseRow.
+  let prevRow = baseRow.previousElementSibling;
+  const branchHashes = [];
+  while (prevRow) {
+    const prevIndent = getNodeColumn(prevRow);
+    if (prevIndent <= baseIndent) {
+      // No longer right-side branch from 'base'.
+      break;
+    }
+    const hash = getAttr(prevRow, 'data-commit-hash');
+    if (hash) {
+      branchHashes.push(hash);
+    }
+    prevRow = prevRow.previousElementSibling;
+  }
+  return branchHashes;
+}

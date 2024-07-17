@@ -24,12 +24,12 @@ from . import (
     bundlerepo,
     clone as clonemod,
     cmdutil,
-    destutil,
     eagerpeer,
     edenfs,
     error,
     exchange,
     extensions,
+    git,
     identity,
     localrepo,
     lock,
@@ -257,6 +257,7 @@ def share(
     bookmarks: bool = True,
     defaultpath=None,
     relative: bool = False,
+    repository=repository,
 ):
     """create a shared repository"""
 
@@ -543,7 +544,7 @@ def clone(
         if destrepo:
             _writehgrc(destrepo, abspath, ui.configlist("_configs", "configfiles"))
             # Reload hgrc to pick up `%include` configs. We don't need to
-            # regenerate dynamicconfig here, unless the hgrc contains reponame or
+            # regenerate internalconfig here, unless the hgrc contains reponame or
             # username overrides (unlikely).
             destrepo.ui.reloadconfigs(destrepo.root)
 
@@ -649,6 +650,7 @@ def clone(
                 # client?
                 if (
                     getattr(destrepo, "nullableedenapi", None)
+                    and ui.configbool("remotenames", "selectivepull")
                     and destrepo.name
                     and (
                         (
@@ -858,7 +860,10 @@ def clonepreclose(
 
 
 def _showstats(repo, stats: Iterable[object], quietempty: bool = False) -> None:
-    if edenfs.requirement in repo.requirements:
+    if (
+        edenfs.requirement in repo.requirements
+        or git.DOTGIT_REQUIREMENT in repo.requirements
+    ):
         return _eden_showstats(repo, stats, quietempty)
 
     if quietempty and not any(stats):
@@ -891,7 +896,7 @@ def updaterepo(repo, node, overwrite, updatecheck=None):
     When overwrite is set, changes are clobbered, merged else
 
     returns stats (see pydoc merge.applyupdates)"""
-    return mergemod.update(
+    return mergemod.goto(
         repo,
         node,
         force=overwrite,
@@ -952,24 +957,17 @@ def updatetotally(
 
      * abort: abort if the working directory is dirty
      * none: don't check (merge working directory changes into destination)
-     * linear: check that update is linear before merging working directory
-               changes into destination
      * noconflict: check that the update does not result in file merges
 
     This returns whether conflict is detected at updating or not.
     """
     if updatecheck is None:
         updatecheck = ui.config("commands", "update.check")
-        if updatecheck not in ("abort", "none", "linear", "noconflict"):
+        if updatecheck not in ("abort", "none", "noconflict"):
             # If not configured, or invalid value configured
-            updatecheck = "linear"
+            updatecheck = "noconflict"
     with repo.wlock():
-        movemarkfrom = None
-        warndest = False
-        if checkout is None:
-            updata = destutil.destupdate(repo, clean=clean)
-            checkout, movemarkfrom, brev = updata
-            warndest = True
+        assert checkout is not None
 
         if clean:
             hasunresolved = _clean(repo, checkout)
@@ -978,18 +976,7 @@ def updatetotally(
                 cmdutil.bailifchanged(repo, merge=False)
                 updatecheck = "none"
             hasunresolved = _update(repo, checkout, updatecheck=updatecheck)
-        if not hasunresolved and movemarkfrom:
-            if movemarkfrom == repo["."].node():
-                pass  # no-op update
-            elif bookmarks.update(repo, [movemarkfrom], repo["."].node()):
-                b = ui.label(repo._activebookmark, "bookmarks.active")
-                ui.status(_("updating bookmark %s\n") % b)
-            else:
-                # this can happen with a non-linear update
-                b = ui.label(repo._activebookmark, "bookmarks")
-                ui.status(_("(leaving bookmark %s)\n") % b)
-                bookmarks.deactivate(repo)
-        elif brev in repo._bookmarks:
+        if brev in repo._bookmarks:
             if brev != repo._activebookmark:
                 b = ui.label(brev, "bookmarks.active")
                 ui.status(_("(activating bookmark %s)\n") % b)
@@ -1000,16 +987,13 @@ def updatetotally(
                 ui.status(_("(leaving bookmark %s)\n") % b)
             bookmarks.deactivate(repo)
 
-        if warndest:
-            destutil.statusotherdests(ui, repo)
-
     return hasunresolved
 
 
 def merge(repo, node, force=False, remind: bool = True, labels=None):
     """Branch merge with node, resolving changes. Return true if any
     unresolved conflicts."""
-    stats = mergemod.update(repo, node, branchmerge=True, force=force, labels=labels)
+    stats = mergemod.merge(repo, node, force=force, labels=labels)
     _showstats(repo, stats)
     if stats[3]:
         repo.ui.status(
@@ -1028,7 +1012,9 @@ def remoteui(src, opts):
 
     if hasattr(src, "ui"):  # looks like a repository
         # drop repo-specific config
-        dst = src.ui.copywithoutrepo()
+        dst = src.ui.copy()
+        dst.reloadconfigs(None)
+
         # to copy target options from repo
         src = src.ui
     else:

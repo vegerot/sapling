@@ -5,13 +5,13 @@
  * GNU General Public License version 2.
  */
 
+#include "eden/common/telemetry/NullStructuredLogger.h"
+#include "eden/common/testharness/TempFile.h"
+#include "eden/common/utils/FaultInjector.h"
 #include "eden/common/utils/benchharness/Bench.h"
 #include "eden/fs/model/BlobMetadata.h"
 #include "eden/fs/store/RocksDbLocalStore.h"
 #include "eden/fs/telemetry/EdenStats.h"
-#include "eden/fs/telemetry/NullStructuredLogger.h"
-#include "eden/fs/testharness/TempFile.h"
-#include "eden/fs/utils/FaultInjector.h"
 
 namespace {
 using namespace facebook::eden;
@@ -32,7 +32,7 @@ void getBlobMetadata(benchmark::State& st) {
   std::vector<ObjectId> ids;
   ids.reserve(N);
   for (size_t i = 0; i < N; ++i) {
-    ids.push_back(ObjectId{fmt::format("{:08x}", i)});
+    ids.emplace_back(fmt::format("{:08x}", i));
   }
 
   std::vector<BlobMetadata> metadata;

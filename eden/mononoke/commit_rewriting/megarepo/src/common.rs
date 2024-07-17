@@ -7,7 +7,6 @@
 
 use anyhow::format_err;
 use anyhow::Error;
-use blobrepo::save_bonsai_changesets;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
@@ -24,13 +23,20 @@ use mononoke_types::FileChange;
 use phases::PhasesRef;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedDataRef;
+use repo_identity::RepoIdentityRef;
 use slog::info;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::chunking::Chunker;
 
-pub trait Repo =
-    ChangesetsRef + RepoBlobstoreRef + PhasesRef + BookmarksRef + RepoDerivedDataRef + Send + Sync;
+pub trait Repo = ChangesetsRef
+    + RepoBlobstoreRef
+    + PhasesRef
+    + BookmarksRef
+    + RepoDerivedDataRef
+    + RepoIdentityRef
+    + Send
+    + Sync;
 
 #[derive(Clone, Debug)]
 pub struct ChangesetArgs {
@@ -89,7 +95,7 @@ async fn save_and_maybe_mark_public(
     mark_public: bool,
 ) -> Result<ChangesetId, Error> {
     let bcs_id = bcs.get_changeset_id();
-    save_bonsai_changesets(vec![bcs], ctx.clone(), repo).await?;
+    changesets_creation::save_changesets(ctx, repo, vec![bcs]).await?;
 
     if mark_public {
         repo.phases()
@@ -128,7 +134,7 @@ async fn create_bookmark(
     let mut transaction = repo.bookmarks().create_transaction(ctx.clone());
     transaction.force_set(&bookmark, bcs_id, BookmarkUpdateReason::ManualMove)?;
 
-    let commit_result = transaction.commit().await?;
+    let commit_result = transaction.commit().await?.is_some();
 
     if !commit_result {
         Err(format_err!("Logical failure while setting {:?}", bookmark))

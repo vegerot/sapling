@@ -1,3 +1,7 @@
+#modern-config-incompatible
+
+#require no-eden
+
 #chg-compatible
   $ setconfig experimental.allowfilepeer=True
 
@@ -58,7 +62,7 @@ is not shallow.)
   adding manifests
   adding file changes
 
-  $ hg up
+  $ hg up tip
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
   $ cat y

@@ -6,13 +6,14 @@
  */
 
 mod diff;
+mod factory_impls;
 mod iter;
 mod link;
-mod matcher;
 mod namecmp;
 mod store;
 #[cfg(any(test, feature = "for-tests"))]
 pub mod testutil;
+mod trait_impls;
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -32,12 +33,11 @@ use manifest::List;
 pub use manifest::Manifest;
 use minibytes::Bytes;
 use once_cell::sync::OnceCell;
-use parking_lot::RwLock;
 use pathmatcher::Matcher;
 use sha1::Digest;
 use sha1::Sha1;
 pub use store::Flag;
-use storemodel::TreeFormat;
+use storemodel::SerializationFormat;
 use thiserror::Error;
 use types::HgId;
 pub use types::PathComponent;
@@ -57,7 +57,6 @@ use crate::link::Durable;
 use crate::link::DurableEntry;
 use crate::link::Ephemeral;
 use crate::link::Leaf;
-pub use crate::matcher::ManifestMatcher;
 use crate::store::InnerStore;
 
 /// The Tree implementation of a Manifest dedicates an inner node for each directory in the
@@ -97,7 +96,7 @@ pub enum InsertErrorCause {
 
 impl TreeManifest {
     /// Instantiates a tree manifest that was stored with the specificed `HgId`
-    pub fn durable(store: Arc<dyn TreeStore + Send + Sync>, hgid: HgId) -> Self {
+    pub fn durable(store: Arc<dyn TreeStore>, hgid: HgId) -> Self {
         TreeManifest {
             store: InnerStore::new(store),
             root: Link::durable(hgid),
@@ -105,7 +104,7 @@ impl TreeManifest {
     }
 
     /// Instantiates a new tree manifest with no history
-    pub fn ephemeral(store: Arc<dyn TreeStore + Send + Sync>) -> Self {
+    pub fn ephemeral(store: Arc<dyn TreeStore>) -> Self {
         TreeManifest {
             store: InnerStore::new(store),
             root: Link::ephemeral(),
@@ -256,29 +255,18 @@ impl Manifest for TreeManifest {
 
     /// Write dirty trees using specified format to disk. Return the root tree id.
     fn flush(&mut self) -> Result<HgId> {
-        fn compute_sha1(content: &[u8], format: TreeFormat) -> HgId {
-            let mut hasher = Sha1::new();
-            match format {
-                TreeFormat::Git => hasher.update(format!("tree {}\0", content.len())),
-                TreeFormat::Hg => {
-                    // XXX: No p1, p2 to produce a genuine SHA1.
-                    // This code path is only meaningful for tests.
-                    assert!(
-                        cfg!(test),
-                        "flush() cannot be used with hg store, consider finalize() instead"
-                    );
-                }
-            }
-            hasher.update(content);
-            let buf: [u8; HgId::len()] = hasher.finalize().into();
-            (&buf).into()
-        }
         fn do_flush<'a, 'b, 'c>(
             store: &'a InnerStore,
             pathbuf: &'b mut RepoPathBuf,
             cursor: &'c mut Link,
-            format: TreeFormat,
+            format: SerializationFormat,
         ) -> Result<(HgId, store::Flag)> {
+            #[cfg(not(test))]
+            assert_eq!(
+                format,
+                SerializationFormat::Git,
+                "flush() cannot be used with hg store, use finalize() instead"
+            );
             loop {
                 let new_cursor = match cursor.as_mut_ref()? {
                     Leaf(file_metadata) => {
@@ -301,8 +289,7 @@ impl Manifest for TreeManifest {
                         });
                         let elements: Vec<_> = iter.collect::<Result<Vec<_>>>()?;
                         let entry = store::Entry::from_elements(elements, format);
-                        let hgid = compute_sha1(entry.as_ref(), format);
-                        store.insert_entry(pathbuf, hgid, entry)?;
+                        let hgid = store.insert_entry(pathbuf, entry)?;
 
                         let cell = OnceCell::new();
                         // TODO: remove clone
@@ -430,7 +417,7 @@ impl TreeManifest {
         fn compute_hgid<C: AsRef<[u8]>>(parent_tree_nodes: &[HgId], content: C) -> HgId {
             let mut hasher = Sha1::new();
             debug_assert!(parent_tree_nodes.len() <= 2);
-            let p1 = parent_tree_nodes.get(0).unwrap_or(HgId::null_id());
+            let p1 = parent_tree_nodes.first().unwrap_or(HgId::null_id());
             let p2 = parent_tree_nodes.get(1).unwrap_or(HgId::null_id());
             // Even if parents are sorted two hashes go into hash computation but surprise
             // the NULL_ID is not a special case in this case and gets sorted.
@@ -545,7 +532,7 @@ impl TreeManifest {
                 // need to convert to Ephemeral instead only verify the hash.
                 let links = link.mut_ephemeral_links(self.store, &self.path)?;
                 // finalize() is only used for hg format.
-                let format = TreeFormat::Hg;
+                let format = SerializationFormat::Hg;
                 let mut entry = store::EntryMut::new(format);
                 for (component, link) in links.iter_mut() {
                     self.path.push(component.as_path_component());
@@ -579,7 +566,7 @@ impl TreeManifest {
 
         assert_eq!(
             self.store.format(),
-            TreeFormat::Hg,
+            SerializationFormat::Hg,
             "finalize() can only be used for hg store, use flush() instead"
         );
         let mut executor = Executor::new(&self.store, &parent_trees)?;
@@ -608,7 +595,8 @@ impl TreeManifest {
 }
 
 pub trait ReadTreeManifest {
-    fn get(&self, commit_id: &HgId) -> Result<Arc<RwLock<TreeManifest>>>;
+    fn get(&self, commit_id: &HgId) -> Result<TreeManifest>;
+    fn get_root_id(&self, commit_id: &HgId) -> Result<HgId>;
 }
 
 /// The purpose of this function is to provide compatible behavior with the C++ implementation
@@ -626,7 +614,7 @@ pub trait ReadTreeManifest {
 // The suggestion received in code review was also to consider making the return type more
 // simple (RepoPath, HgId) and letting the call sites deal with the Bytes.
 pub fn compat_subtree_diff(
-    store: Arc<dyn TreeStore + Send + Sync>,
+    store: Arc<dyn TreeStore>,
     path: &RepoPath,
     hgid: HgId,
     mut other_nodes: Vec<HgId>,
@@ -706,7 +694,7 @@ pub fn compat_subtree_diff(
 /// Assuming nothing is available locally, prefetch must make O(depth) serial
 /// round trips to the server.
 pub fn prefetch(
-    store: Arc<dyn TreeStore + Send + Sync>,
+    store: Arc<dyn TreeStore>,
     mf_nodes: &[HgId],
     matcher: impl 'static + Matcher + Sync + Send,
 ) -> Result<()> {
@@ -717,20 +705,42 @@ pub fn prefetch(
     Ok(())
 }
 
+pub fn init() {
+    crate::factory_impls::setup_basic_tree_parser_constructor();
+}
+
 #[cfg(test)]
 mod tests {
     use manifest::testutil::*;
     use manifest::FileType;
     use store::Element;
+    use storemodel::InsertOpts;
+    use storemodel::Kind;
     use types::hgid::NULL_ID;
     use types::testutil::*;
 
     use self::testutil::*;
     use super::*;
 
+    trait TestInsert {
+        fn insert(&self, path: &RepoPath, hgid: HgId, data: Bytes) -> Result<()>;
+    }
+
+    impl<T: TreeStore> TestInsert for T {
+        fn insert(&self, path: &RepoPath, hgid: HgId, data: Bytes) -> Result<()> {
+            let opts = InsertOpts {
+                kind: Kind::Tree,
+                forced_id: Some(Box::new(hgid)),
+                ..Default::default()
+            };
+            self.insert_data(opts, path, data.as_ref())?;
+            Ok(())
+        }
+    }
+
     impl store::Entry {
         fn from_elements_hg(elements: Vec<Element>) -> Self {
-            Self::from_elements(elements, TreeFormat::Hg)
+            Self::from_elements(elements, SerializationFormat::Hg)
         }
     }
     fn store_element(path: &str, hex: &str, flag: store::Flag) -> store::Element {
@@ -805,6 +815,16 @@ mod tests {
                 "file path is already a directory",
             ],
         );
+    }
+
+    #[test]
+    fn test_contains_file() {
+        let mut tree = TreeManifest::ephemeral(Arc::new(TestStore::new()));
+        tree.insert(repo_path_buf("foo/bar"), make_meta("10"))
+            .unwrap();
+        assert!(tree.contains_file(repo_path("foo/bar")).unwrap());
+        assert!(!tree.contains_file(repo_path("foo")).unwrap());
+        assert!(!tree.contains_file(repo_path("baz")).unwrap());
     }
 
     #[test]
@@ -1479,11 +1499,11 @@ mod tests {
 
     #[test]
     fn test_list() {
-        test_list_format(TreeFormat::Git);
-        test_list_format(TreeFormat::Hg);
+        test_list_format(SerializationFormat::Git);
+        test_list_format(SerializationFormat::Hg);
     }
 
-    fn test_list_format(format: TreeFormat) {
+    fn test_list_format(format: SerializationFormat) {
         let mut tree = TreeManifest::ephemeral(Arc::new(TestStore::new().with_format(format)));
         let c1_meta = make_meta("10");
         tree.insert(repo_path_buf("a1/b1/c1"), c1_meta).unwrap();

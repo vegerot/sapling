@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This software may be used and distributed according to the terms of the
@@ -7,6 +9,7 @@
   $ eagerepo
   $ enable morestatus
   $ setconfig morestatus.show=True ui.origbackuppath=.hg/origs
+  $ setconfig checkout.use-rust=true
 
 Python utility:
 
@@ -53,7 +56,7 @@ Python utility:
   M A
   
   # The repository is in an unfinished *update* state.
-  # Unresolved merge conflicts:
+  # Unresolved merge conflicts (1):
   # 
   #     A
   # 
@@ -131,6 +134,8 @@ Python utility:
   
   # The repository is in an unfinished *merge* state.
   # No unresolved merge conflicts.
+  # To continue:                hg continue, then hg commit
+  # To abort:                   hg goto --clean .    (warning: this will discard uncommitted changes)
 
 # The state is confusing, but 'hg continue' can resolve it.
 

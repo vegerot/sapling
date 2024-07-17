@@ -19,16 +19,18 @@ use context::SessionContainer;
 use context::SessionId;
 use failure_ext::SlogKVError;
 use fbinit::FacebookInit;
-use futures::compat::Future01CompatExt;
-use futures_old::sync::mpsc;
-use futures_old::Future;
-use futures_old::Stream;
+use futures::channel::mpsc;
+use futures::future::TryFutureExt;
+use futures::sink::SinkExt;
+use futures::stream::StreamExt;
+use futures::stream::TryStreamExt;
 use futures_stats::TimedFutureExt;
 use hgproto::sshproto;
 use hgproto::HgProtoHandler;
 use maplit::hashmap;
 use maplit::hashset;
 use mononoke_api::Mononoke;
+use mononoke_configs::MononokeConfigs;
 use qps::Qps;
 use rate_limiting::Metric;
 use rate_limiting::RateLimitEnvironment;
@@ -64,6 +66,7 @@ pub async fn request_handler(
     fb: FacebookInit,
     reponame: String,
     mononoke: Arc<Mononoke>,
+    configs: Arc<MononokeConfigs>,
     _security_checker: &ConnectionSecurityChecker,
     stdio: Stdio,
     rate_limiter: Option<RateLimitEnvironment>,
@@ -107,6 +110,10 @@ pub async fn request_handler(
 
     scuba = scuba.with_seq("seq");
     scuba.add("repo", reponame);
+    if let Some(config_info) = configs.config_info().as_ref() {
+        scuba.add("config_store_version", config_info.content_hash.clone());
+        scuba.add("config_store_last_updated_at", config_info.last_updated_at);
+    }
     scuba.add_metadata(&metadata);
     scuba.sample_for_identities(metadata.identities());
 
@@ -161,7 +168,7 @@ pub async fn request_handler(
     // Construct a hg protocol handler
     let proto_handler = HgProtoHandler::new(
         conn_log.clone(),
-        stdin.map(|b| bytes_old::Bytes::from(b.as_ref())),
+        stdin,
         repo_client,
         sshproto::HgSshCommandDecode,
         sshproto::HgSshCommandEncode,
@@ -172,14 +179,15 @@ pub async fn request_handler(
 
     // send responses back
     let endres = proto_handler
-        .inspect(move |bytes| session.bump_load(Metric::EgressBytes, bytes.len() as f64))
+        .into_stream()
+        .inspect_ok(move |bytes| session.bump_load(Metric::EgressBytes, bytes.len() as f64))
         .map_err(Error::from)
-        .map(|b| Bytes::copy_from_slice(b.as_ref()))
-        .forward(stdout)
-        .map(|_| ());
+        .map_ok(|b| Bytes::copy_from_slice(b.as_ref()))
+        .forward(stdout.sink_map_err(Error::from))
+        .map_ok(|_| ());
 
     // If we got an error at this point, then catch it and print a message
-    let (stats, result) = endres.compat().timed().await;
+    let (stats, result) = endres.timed().await;
 
     let wireproto_calls = {
         let mut wireproto_calls = wireproto_calls.lock().expect("lock poisoned");
@@ -208,7 +216,7 @@ pub async fn request_handler(
             scuba.log_with_msg("Request finished - Success", None)
         }
         Err(err) => {
-            if err.is::<mpsc::SendError<Bytes>>() {
+            if err.is::<mpsc::SendError>() {
                 STATS::request_outcome_permille.add_value(0);
                 scuba.log_with_msg("Request finished - Client Disconnected", format!("{}", err));
             } else {

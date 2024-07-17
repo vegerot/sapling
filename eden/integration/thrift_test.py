@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 import binascii
 import hashlib
 import os
@@ -229,7 +231,7 @@ class ThriftTest(testcase.EdenRepoTest):
         with self.get_thrift_client_legacy() as client:
             results = client.getSHA1(self.mount_path_bytes, [b""], sync=SyncBehavior())
         self.assertEqual(1, len(results))
-        self.assert_sha1_error(results[0], "path cannot be the empty string")
+        self.assert_sha1_error(results[0], ": Is a directory")
 
     def test_get_blake3_throws_for_empty_string(self) -> None:
         with self.get_thrift_client_legacy() as client:
@@ -237,7 +239,7 @@ class ThriftTest(testcase.EdenRepoTest):
                 self.mount_path_bytes, [b""], sync=SyncBehavior()
             )
         self.assertEqual(1, len(results))
-        self.assert_blake3_error(results[0], "path cannot be the empty string")
+        self.assert_blake3_error(results[0], ": Is a directory")
 
     def test_get_sha1_throws_for_directory(self) -> None:
         with self.get_thrift_client_legacy() as client:

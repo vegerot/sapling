@@ -9,93 +9,43 @@ import type {Heartbeat} from './heartbeat';
 
 import {Copyable} from './Copyable';
 import {DropdownFields} from './DropdownFields';
-import {ErrorBoundary, ErrorNotice} from './ErrorNotice';
 import {Internal} from './Internal';
-import {Tooltip} from './Tooltip';
-import {tracker} from './analytics';
 import {DEFAULT_HEARTBEAT_TIMEOUT_MS, useHeartbeat} from './heartbeat';
 import {t, T} from './i18n';
 import platform from './platform';
 import {applicationinfo} from './serverAPIState';
-import {VSCodeButton, VSCodeDivider} from '@vscode/webview-ui-toolkit/react';
-import {Suspense, useEffect} from 'react';
-import {atom, DefaultValue, useRecoilState, useRecoilValue, useSetRecoilState} from 'recoil';
-import {Icon} from 'shared/Icon';
+import * as stylex from '@stylexjs/stylex';
+import {Button} from 'isl-components/Button';
+import {Divider} from 'isl-components/Divider';
+import {ErrorBoundary, ErrorNotice} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
+import {useAtomValue} from 'jotai';
+import {Suspense} from 'react';
 
 import './BugButton.css';
 
-export function BugButton() {
-  return (
-    <MaybeBugButtonNux>
-      <Tooltip
-        trigger="click"
-        component={dismiss => <BugDropdown dismiss={dismiss} />}
-        placement="bottom">
-        <VSCodeButton appearance="icon" data-testid="bug-button">
-          <Icon icon="bug" />
-        </VSCodeButton>
-      </Tooltip>
-    </MaybeBugButtonNux>
-  );
-}
-
-export const bugButtonNux = atom<string | null>({
-  key: 'bugButtonNux',
-  default: null,
-  effects: [
-    // track how long the nux is shown
-    ({onSet}) => {
-      let start: number | undefined;
-      onSet((value, previousValue) => {
-        if (value != null) {
-          // starting to show nux
-          start = Date.now();
-        } else {
-          // stopped showing nux by clearing value
-          tracker.track('ShowBugButtonNux', {
-            extras: {nux: previousValue instanceof DefaultValue ? null : previousValue},
-            duration: start == null ? undefined : Date.now() - start,
-          });
-        }
-      });
-    },
-  ],
+const styles = stylex.create({
+  centered: {
+    justifyContent: 'center',
+  },
 });
 
-/**
- * Allow other actions to show a new-user ("nux") tooltip on the bug icon.
- * This is useful to explain how to file a bug or opt out.
- */
-function MaybeBugButtonNux({children}: {children: JSX.Element}) {
-  const [nux, setNux] = useRecoilState(bugButtonNux);
-  if (nux == null) {
-    return children;
-  }
-
-  function Nux() {
-    return (
-      <div className="bug-button-nux">
-        {nux}
-        <VSCodeButton appearance="icon" onClick={() => setNux(null)}>
-          <Icon icon="x" />
-        </VSCodeButton>
-      </div>
-    );
-  }
+export function BugButton() {
   return (
-    <Tooltip trigger="manual" shouldShow component={Nux} placement="bottom">
-      {children}
+    <Tooltip
+      trigger="click"
+      component={dismiss => <BugDropdown dismiss={dismiss} />}
+      group="topbar"
+      placement="bottom">
+      <Button icon data-testid="bug-button">
+        <Icon icon="bug" />
+      </Button>
     </Tooltip>
   );
 }
 
 function BugDropdown({dismiss}: {dismiss: () => void}) {
-  const setBugButtonNux = useSetRecoilState(bugButtonNux);
-  useEffect(() => {
-    // unset nux if you open the bug menu
-    setBugButtonNux(null);
-  }, [setBugButtonNux]);
-
   const heartbeat = useHeartbeat();
 
   const AdditionalDebugContent = platform.AdditionalDebugContent;
@@ -111,7 +61,7 @@ function BugDropdown({dismiss}: {dismiss: () => void}) {
         <FileABug dismissBugDropdown={dismiss} heartbeat={heartbeat} />
         {AdditionalDebugContent && (
           <div className="additional-debug-content">
-            <VSCodeDivider />
+            <Divider />
             <ErrorBoundary>
               <Suspense>
                 <AdditionalDebugContent />
@@ -125,7 +75,7 @@ function BugDropdown({dismiss}: {dismiss: () => void}) {
 }
 
 function ISLVersion() {
-  const info = useRecoilValue(applicationinfo);
+  const info = useAtomValue(applicationinfo);
   if (info == null) {
     return <Icon icon="loading" />;
   }
@@ -138,7 +88,7 @@ function ISLVersion() {
 }
 
 function HeartbeatWarning({heartbeat}: {heartbeat: Heartbeat}) {
-  const appInfo = useRecoilValue(applicationinfo);
+  const appInfo = useAtomValue(applicationinfo);
   if (heartbeat.type === 'timeout') {
     return (
       <>
@@ -183,30 +133,30 @@ function FileABug({
 function OSSFileABug() {
   return (
     <>
-      <VSCodeButton
-        appearance="secondary"
+      <Button
+        xstyle={styles.centered}
         onClick={() => {
           platform.openExternalLink('https://sapling-scm.com/docs/addons/isl');
         }}>
         <Icon icon="book" slot="start" />
         <T>View Documentation</T>
-      </VSCodeButton>
-      <VSCodeButton
-        appearance="secondary"
+      </Button>
+      <Button
+        xstyle={styles.centered}
         onClick={() => {
           platform.openExternalLink('https://discord.gg/X6baZ94Vzh');
         }}>
         <Icon icon="comment-discussion" slot="start" />
         <T>Help and Feedback on Discord</T>
-      </VSCodeButton>
-      <VSCodeButton
-        appearance="secondary"
+      </Button>
+      <Button
+        xstyle={styles.centered}
         onClick={() => {
           platform.openExternalLink('https://github.com/facebook/sapling/issues');
         }}>
         <Icon icon="bug" slot="start" />
         <T>Report an Issue on GitHub</T>
-      </VSCodeButton>
+      </Button>
     </>
   );
 }

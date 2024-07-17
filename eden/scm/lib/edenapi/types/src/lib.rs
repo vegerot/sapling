@@ -5,7 +5,7 @@
  * GNU General Public License version 2.
  */
 
-//! Types shared between the EdenAPI client and server.
+//! Types shared between the SaplingRemoteAPI client and server.
 //!
 //! This crate exists primarily to provide a lightweight place to
 //! put types that need to be used by both the client and server.
@@ -30,6 +30,7 @@ pub mod anyid;
 pub mod batch;
 pub mod blame;
 pub mod bookmark;
+pub mod cloud;
 pub mod commit;
 pub mod commitid;
 pub mod errors;
@@ -37,6 +38,8 @@ pub mod file;
 pub mod history;
 pub mod land;
 pub mod metadata;
+pub mod segments;
+pub mod suffix_query;
 pub mod token;
 pub mod tree;
 pub mod wire;
@@ -49,6 +52,7 @@ pub use dag_types::Location as CommitLocation;
 pub use dag_types::PreparedFlatSegments;
 #[cfg(any(test, feature = "for-tests"))]
 use quickcheck_arbitrary_derive::Arbitrary;
+use serde::Serialize;
 use thiserror::Error;
 pub use types::hgid::HgId;
 pub use types::key::Key;
@@ -68,6 +72,15 @@ pub use crate::blame::BlameResult;
 pub use crate::bookmark::BookmarkEntry;
 pub use crate::bookmark::BookmarkRequest;
 pub use crate::bookmark::SetBookmarkRequest;
+pub use crate::bookmark::SetBookmarkResponse;
+pub use crate::cloud::CloudWorkspaceRequest;
+pub use crate::cloud::GetReferencesParams;
+pub use crate::cloud::GetSmartlogParams;
+pub use crate::cloud::ReferencesData;
+pub use crate::cloud::ReferencesDataResponse;
+pub use crate::cloud::UpdateReferencesParams;
+pub use crate::cloud::WorkspaceData;
+pub use crate::cloud::WorkspaceDataResponse;
 pub use crate::commit::make_hash_lookup_request;
 pub use crate::commit::AlterSnapshotRequest;
 pub use crate::commit::AlterSnapshotResponse;
@@ -126,6 +139,7 @@ pub use crate::history::HistoryRequest;
 pub use crate::history::HistoryResponse;
 pub use crate::history::HistoryResponseChunk;
 pub use crate::history::WireHistoryEntry;
+pub use crate::land::LandStackData;
 pub use crate::land::LandStackRequest;
 pub use crate::land::LandStackResponse;
 pub use crate::land::PushVar;
@@ -133,13 +147,14 @@ pub use crate::metadata::AnyFileContentId;
 pub use crate::metadata::Blake3;
 pub use crate::metadata::ContentId;
 pub use crate::metadata::DirectoryMetadata;
-pub use crate::metadata::DirectoryMetadataRequest;
 pub use crate::metadata::FileMetadata;
-pub use crate::metadata::FileMetadataRequest;
 pub use crate::metadata::FileType;
 pub use crate::metadata::FsnodeId;
 pub use crate::metadata::Sha1;
 pub use crate::metadata::Sha256;
+pub use crate::segments::CommitGraphSegments;
+pub use crate::suffix_query::SuffixQueryRequest;
+pub use crate::suffix_query::SuffixQueryResponse;
 pub use crate::token::FileContentTokenMetadata;
 pub use crate::token::IndexableId;
 pub use crate::token::UploadToken;
@@ -147,6 +162,7 @@ pub use crate::token::UploadTokenData;
 pub use crate::token::UploadTokenMetadata;
 pub use crate::token::UploadTokenSignature;
 pub use crate::tree::TreeAttributes;
+pub use crate::tree::TreeAuxData;
 pub use crate::tree::TreeChildDirectoryEntry;
 pub use crate::tree::TreeChildEntry;
 pub use crate::tree::TreeChildFileEntry;
@@ -169,32 +185,32 @@ pub struct InvalidHgId {
     parents: Parents,
 }
 
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[derive(Clone, Debug, Error, Eq, PartialEq, Serialize)]
 #[error("Error fetching key {key:?}: {err}")]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
-pub struct EdenApiServerError {
-    pub err: EdenApiServerErrorKind,
+pub struct SaplingRemoteApiServerError {
+    pub err: SaplingRemoteApiServerErrorKind,
     pub key: Option<Key>,
 }
 
-impl EdenApiServerError {
-    pub fn new(err: impl std::fmt::Debug) -> EdenApiServerError {
-        EdenApiServerError {
-            err: EdenApiServerErrorKind::OpaqueError(format!("{:?}", err)),
+impl SaplingRemoteApiServerError {
+    pub fn new(err: impl std::fmt::Debug) -> SaplingRemoteApiServerError {
+        SaplingRemoteApiServerError {
+            err: SaplingRemoteApiServerErrorKind::OpaqueError(format!("{:?}", err)),
             key: None,
         }
     }
 
-    pub fn with_key(key: Key, err: impl std::fmt::Debug) -> EdenApiServerError {
-        EdenApiServerError {
-            err: EdenApiServerErrorKind::OpaqueError(format!("{:?}", err)),
+    pub fn with_key(key: Key, err: impl std::fmt::Debug) -> SaplingRemoteApiServerError {
+        SaplingRemoteApiServerError {
+            err: SaplingRemoteApiServerErrorKind::OpaqueError(format!("{:?}", err)),
             key: Some(key),
         }
     }
 
-    pub fn with_path(path: RepoPathBuf, err: impl std::fmt::Debug) -> EdenApiServerError {
-        EdenApiServerError {
-            err: EdenApiServerErrorKind::OpaqueError(format!("{:?}", err)),
+    pub fn with_path(path: RepoPathBuf, err: impl std::fmt::Debug) -> SaplingRemoteApiServerError {
+        SaplingRemoteApiServerError {
+            err: SaplingRemoteApiServerErrorKind::OpaqueError(format!("{:?}", err)),
             key: Some(Key {
                 path,
                 hgid: *HgId::null_id(),
@@ -202,9 +218,9 @@ impl EdenApiServerError {
         }
     }
 
-    pub fn with_hgid(hgid: HgId, err: impl std::fmt::Debug) -> EdenApiServerError {
-        EdenApiServerError {
-            err: EdenApiServerErrorKind::OpaqueError(format!("{:?}", err)),
+    pub fn with_hgid(hgid: HgId, err: impl std::fmt::Debug) -> SaplingRemoteApiServerError {
+        SaplingRemoteApiServerError {
+            err: SaplingRemoteApiServerErrorKind::OpaqueError(format!("{:?}", err)),
             key: Some(Key {
                 hgid,
                 path: RepoPathBuf::new(),
@@ -213,9 +229,9 @@ impl EdenApiServerError {
     }
 }
 
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[derive(Clone, Debug, Error, Eq, PartialEq, Serialize)]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
-pub enum EdenApiServerErrorKind {
-    #[error("EdenAPI server returned an error with message: {0}")]
+pub enum SaplingRemoteApiServerErrorKind {
+    #[error("SaplingRemoteAPI server returned an error with message: {0}")]
     OpaqueError(String),
 }

@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
   $ hg init repo
@@ -157,19 +159,19 @@ githelp for grep with pattern and path
 
 githelp for reset, checking ~ in git becomes ~1 in mercurial
   $ hg githelp -- reset HEAD~
-  Mercurial has no strict equivalent to `git reset`.
+  Sapling has no strict equivalent to `git reset`.
   If you want to remove a commit, use `hg hide -r HASH`.
   If you want to move a bookmark, use `hg book -r HASH NAME`.
   If you want to undo a commit, use `hg uncommit.
   If you want to undo an amend, use `hg unamend.
   $ hg githelp -- reset "HEAD^"
-  Mercurial has no strict equivalent to `git reset`.
+  Sapling has no strict equivalent to `git reset`.
   If you want to remove a commit, use `hg hide -r HASH`.
   If you want to move a bookmark, use `hg book -r HASH NAME`.
   If you want to undo a commit, use `hg uncommit.
   If you want to undo an amend, use `hg unamend.
   $ hg githelp -- reset HEAD~3
-  Mercurial has no strict equivalent to `git reset`.
+  Sapling has no strict equivalent to `git reset`.
   If you want to remove a commit, use `hg hide -r HASH`.
   If you want to move a bookmark, use `hg book -r HASH NAME`.
   If you want to undo a commit, use `hg uncommit.
@@ -266,7 +268,7 @@ git merge-base
 
 githelp for git blame (tweakdefaults disabled)
   $ hg githelp -- git blame
-  hg annotate -udl
+  hg annotate -pudl
 
 githelp for git blame (tweakdefaults enabled)
   $ hg --config extensions.tweakdefaults= githelp -- git blame

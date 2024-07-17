@@ -141,7 +141,7 @@ def backgroundbackup(repo, reason=None):
         background_cmd = util.hgcmd() + ["cloud", "sync", "--best-effort"]
         background_cmd += ["--reason", reason]
     else:
-        background_cmd = util.hgcmd() + ["cloud", "backup"]
+        background_cmd = util.hgcmd() + ["cloud", "upload"]
     infinitepush_bgssh = ui.config("infinitepush", "bgssh")
     if infinitepush_bgssh:
         background_cmd += ["--config", "ui.ssh=%s" % infinitepush_bgssh]
@@ -205,6 +205,8 @@ def backgroundbackup(repo, reason=None):
         background_cmd[1:]
     ).avoidinherithandles().newsession().stdin(Stdio.null()).stdout(out).stderr(
         out
+    ).env(
+        "EDENSCM_LOG", "clienttelemetry=info"
     ).spawn()
 
 

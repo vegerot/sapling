@@ -590,22 +590,13 @@ effect and style see :prog:`help color`.
     (default: False)
 
 ``update.check``
-    Determines what level of checking :prog:`goto` will perform before moving
-    to a destination revision. Valid values are ``abort``, ``none``,
-    ``linear``, and ``noconflict``. ``abort`` always fails if the working
-    directory has uncommitted changes. ``none`` performs no checking, and may
-    result in a merge with uncommitted changes. ``linear`` allows any update
-    as long as it follows a straight line in the revision history, and may
-    trigger a merge with uncommitted changes. ``noconflict`` will allow any
-    update which would not trigger a merge with uncommitted changes, if any
-    are present.
-    (default: ``linear``)
-
-``update.requiredest``
-    Require that the user pass a destination when running :prog:`goto`.
-    For example, :prog:`goto .::` will be allowed, but a plain :prog:`goto`
-    will be disallowed.
-    (default: False)
+    Determines what level of checking :prog:`goto` will perform before moving to
+    a destination revision. Valid values are ``abort``, ``none``, and
+    ``noconflict``. ``abort`` always fails if the working directory has
+    uncommitted changes. ``none`` performs no checking, and may result in a
+    merge with uncommitted changes. ``noconflict`` will allow any update which
+    would not trigger a merge with uncommitted changes, if any are present.
+    (default: ``noconflict``)
 
 ``commit``
 ----------
@@ -2250,7 +2241,7 @@ User interface controls.
 
 ``askusername``
     Whether to prompt for a username when committing. If True, and
-    neither ``$HGUSER`` nor ``$EMAIL`` has been specified, then the user will
+    neither ``$HGUSER`` has been specified, then the user will
     be prompted to enter a username. If no username is entered, the
     default ``USER@HOST`` is used instead.
     (default: False)
@@ -2341,10 +2332,6 @@ User interface controls.
 ``graphnodetemplate``
     The template used to print changeset nodes in an ASCII revision graph.
     (default: ``{graphnode}``)
-
-``hgignore``
-    The hgignore feature is being deprecated. Use .gitignore instead.
-    Respect ``.hgignore`` at the root of a repo. (default: False)
 
 ``ignore``
     A file to read per-user ignore patterns from. This file should be
@@ -2531,7 +2518,7 @@ User interface controls.
     <fred@example.com>``. Environment variables in the
     username are expanded.
 
-    (default: ``$EMAIL`` or ``username@hostname``. If the username in
+    (default: ``username@hostname``. If the username in
     the config is empty, e.g. if the system admin set ``username =`` in the
     system config, it has to be specified manually or in a different
     config file)
@@ -2735,7 +2722,7 @@ HGMERGE
 
 HGRCPATH
     A list of files to search for configuration files.
-    Item separator is ":" on Unix, ";" on Windows. If HGRCPATH
+    Item separator is ";" or ":" on Unix, ";" on Windows. If HGRCPATH
     is not set, platform default search path is used. If empty, only
     the current repository config is read.
 
@@ -2789,14 +2776,10 @@ HGUSER
 
     - HGUSER (deprecated)
     - configuration files from the HGRCPATH
-    - EMAIL
     - interactive prompt
     - LOGNAME (with ``@hostname`` appended)
 
     (deprecated, see :prog:`help config.ui.username`)
-
-EMAIL
-    May be used as the author of a commit; see HGUSER.
 
 LOGNAME
     May be used as the author of a commit; see HGUSER.
@@ -4514,4 +4497,158 @@ When a log file crosses the size threshold, it is rotated into the next
 position. Log files beyond max-log-count are deleted. Note that there are no LRU
 sematics.
 
+"""
+
+automerge = r"""@Product@ provides a number of automatic merge algorithms to resolve
+conflicts that can not be resolved in the traditional 3-way merge.
+
+Configuration
+=============
+
+The following config sections control the behavior of automerge::
+
+  [automerge]
+
+  # Decision mode for the automerged result. Choose one from the list below:
+  #   - prompt
+  #   - accept
+  #   - reject
+  #   - review-in-file
+  # See the `Automerge Mode` section for more information.
+  mode = accept
+
+  # A list of automerge algorithms separated by comma. Currently, we support
+  # the following algorithms:
+  #   - adjacent-changes
+  #   - subset-changes
+  #   - sort-inserts
+  #   - word-merge (advanced)
+  # See the `Merge Algorithms` section for more information.
+  merge-algos = adjacent-changes,subset-changes
+
+  # Disable automerge for noninteractive use cases (including ISL (VS Code), CI/CD jobs).
+  # The automerge algorithms won't always give the desired result, so we disable
+  # it for noninteractive cases by default.
+  disable-for-noninteractive = True
+
+Automerge Mode
+==============
+
+prompt
+    Prompt the user to accept, reject the automerged result, or keep the conflict and
+    automerged result in the file and review them later.
+
+accept
+    Auto accept the automerged the result.
+
+reject
+    Auto reject the automerged result. If you want to disable automerge feature, you can
+    select this mode.
+
+review-in-file
+    Keep the conflict and automerged result in the file and review them later.
+
+
+Merge Algorithms
+================
+
+subset-changes
+    If the changes of one side is the subset of the other side, then the conflict will
+    be resolved and the other side changes are kept. Currently, we limit this to addtions
+    on both sides.
+
+    Here is an example of the conflict::
+
+        <<<<<<< dest
+        +
+        +   if (ignore_funny && 45 < len && !memcmp(name, "refs/", 5) &&
+        +       check_ref_format(name + 5))
+        +     continue;
+        +
+        =======
+        +
+        +   if (ignore_funny && 45 < len && !memcmp(name, "refs/", 5) &&
+        +       check_ref_format(name + 5))
+        +     continue;
+        +
+        +   name_len = strlen(name);
+        +   if (len != name_len + 41) {
+        +     if (server_capabilities)
+        +       free(server_capabilities);
+        +     server_capabilities = strdup(name + name_len + 1);
+        +   }
+        +
+        >>>>>>> source
+
+    It will be resolved to::
+
+          if (ignore_funny && 45 < len && !memcmp(name, "refs/", 5) &&
+              check_ref_format(name + 5))
+          continue;
+
+          name_len = strlen(name);
+          if (len != name_len + 41) {
+          if (server_capabilities)
+              free(server_capabilities);
+          server_capabilities = strdup(name + name_len + 1);
+          }
+
+adjacent-changes
+    Merge adjacent, non-overlapping modifications on both sides. The idea comes from
+    BitKeeper's smerge.
+
+    Here is an example of the conflict::
+
+        <<<<<<< dest
+          import {List} from 'immutable';
+        - import {cacheMethod} from 'shared/LRU';
+        + import {cached, LRU} from 'shared/LRU';
+        =======
+        - import {List} from 'immutable';
+        + import {List, Record} from 'immutable';
+          import {cacheMethod} from 'shared/LRU';
+        >>>>>>> source
+
+    It will be resolved to::
+
+          import {List, Record} from 'immutable';
+          import {cached, LRU} from 'shared/LRU';
+
+word-merge (advanced)
+    Run traditional 3-way merge on word level. This is more powerful since it's operating on
+    word level instead of line level. If you want to use this algorithm, we recommend using
+    it with 'prompt' mode first.
+
+    Here is an example of the conflict::
+
+        <<<<<<< dest
+        - This is the first line.
+        + That is the first line.
+        =======
+        - This is the first line.
+        + This is a first line.
+        >>>>>>> source
+
+    It will be resolved to::
+
+          That is a first line.
+
+sort-inserts
+    If both sides insert items in the same position of a "sorted array"
+    (e.g.: import statements, buck dependencies), then union them and sort them.
+
+    Here is an example of the conflict::
+
+          import a
+        <<<<<<< dest
+        + import b
+        ======= base
+        + import c
+        >>>>>>> source
+
+    It will be resolved to::
+
+          import a
+          import b
+          import c
 """

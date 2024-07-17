@@ -1,10 +1,7 @@
-#debugruntest-compatible
-#inprocess-hg-incompatible
   $ setconfig experimental.nativecheckout=true
   $ setconfig commands.update.check=noconflict
-  $ newserver server
 
-  $ newremoterepo myrepo
+  $ newclientrepo myrepo
 
   $ echo a > a
   $ hg add a
@@ -16,8 +13,9 @@
   0 files updated, 0 files merged, 1 files removed, 0 files unresolved
   $ echo x > b
   $ hg up 'desc(B)'
-  b: untracked file differs
-  abort: untracked files in working directory differ from files in requested revision
+  abort: 1 conflicting file changes:
+   b
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
   $ hg up 'desc(B)' --clean
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
@@ -29,8 +27,10 @@
   $ rm b
   $ hg rm b
   $ echo X > B
+TODO(sggutier): investigate why different combinations of eden / no-Windows behave differently
   $ hg add B
-  warning: possible case-folding collision for B
+  warning: possible case-folding collision for B (no-eden !)
+  adding b (windows !) (eden !)
   $ hg commit -m 'C'
   $ hg up 'desc(B)'
   1 files updated, 0 files merged, 1 files removed, 0 files unresolved
@@ -45,7 +45,7 @@
   $ hg up null
   abort: 1 conflicting file changes:
    a
-  (commit, shelve, goto --clean to discard all your changes, or update --merge to merge them)
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
 #if no-windows
 Replacing symlink with content

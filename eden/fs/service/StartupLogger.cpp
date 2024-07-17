@@ -16,12 +16,12 @@
 #include <sys/types.h>
 
 #include "eden/common/os/ProcessId.h"
+#include "eden/common/telemetry/SessionId.h"
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/SpawnedProcess.h"
 #include "eden/fs/privhelper/PrivHelper.h"
 #include "eden/fs/service/EdenInit.h"
 #include "eden/fs/service/StartupStatusSubscriber.h"
-#include "eden/fs/telemetry/SessionId.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/SpawnedProcess.h"
 
 #ifndef _WIN32
 #include <sys/wait.h>
@@ -51,6 +51,12 @@ DEFINE_string(
 DEFINE_int32(startupLoggerFd, -1, "The control pipe for startup logging");
 
 namespace {
+// Holds the path to the log file that the daemon is writing to.
+// NOTE: This variable should only ever be written to once in the lifetime
+// of the daemon. This is because the SIGHUP signal handler expects logPath_
+// to be immutable.
+std::optional<std::string> logPath_;
+
 void writeMessageToFile(folly::File&, folly::StringPiece);
 } // namespace
 
@@ -117,9 +123,10 @@ DaemonStartupLogger::DaemonStartupLogger(
     : StartupLogger(std::move(startupStatusChannel)) {}
 
 void DaemonStartupLogger::successImpl() {
-  if (!logPath_.empty()) {
+  if (logPath_.has_value()) {
     writeMessage(
-        folly::LogLevel::INFO, fmt::format("Logs available at {}", logPath_));
+        folly::LogLevel::INFO,
+        fmt::format("Logs available at {}", logPath_.value()));
   }
   sendResult(0);
 }
@@ -204,7 +211,7 @@ DaemonStartupLogger::ChildHandler::~ChildHandler() {
 
 DaemonStartupLogger::ChildHandler DaemonStartupLogger::spawnImpl(
     StringPiece logPath,
-    FOLLY_MAYBE_UNUSED PrivHelper* privHelper,
+    [[maybe_unused]] PrivHelper* privHelper,
     const std::vector<std::string>& argv) {
   XDCHECK(!logPath.empty());
 
@@ -247,11 +254,11 @@ DaemonStartupLogger::ChildHandler DaemonStartupLogger::spawnImpl(
     }
   }
   // Tell the child to run in the foreground, to avoid fork bombing ourselves.
-  args.push_back("--foreground");
+  args.emplace_back("--foreground");
   // We need to ensure that we pass down the log path, otherwise
   // getLogPath() will spot that we used --foreground and will pass an empty
   // logPath to this function.
-  args.push_back("--logPath");
+  args.emplace_back("--logPath");
   args.push_back(logPath.str());
 
 #ifndef _WIN32
@@ -263,14 +270,14 @@ DaemonStartupLogger::ChildHandler DaemonStartupLogger::spawnImpl(
     // startOrConnectToPrivHelper has an intentionally anemic argv parser.
     // It requires that the flag and the value be in separate
     // array entries.
-    args.push_back("--privhelper_fd");
+    args.emplace_back("--privhelper_fd");
     args.push_back(fmt::to_string(fd));
   }
 #endif
 
   // Set up a pipe for the child to pass back startup status
   Pipe exitStatusPipe;
-  args.push_back("--startupLoggerFd");
+  args.emplace_back("--startupLoggerFd");
   args.push_back(
       fmt::to_string(opts.inheritDescriptor(std::move(exitStatusPipe.write))));
 
@@ -278,6 +285,79 @@ DaemonStartupLogger::ChildHandler DaemonStartupLogger::spawnImpl(
   SpawnedProcess proc(args, std::move(opts));
   return ChildHandler{std::move(proc), std::move(exitStatusPipe.read)};
 }
+
+namespace {
+#ifndef _WIN32
+void write_cstr(int fileno, const char* str) {
+  if (str == nullptr) {
+    return;
+  }
+
+  (void)write(fileno, str, strlen(str));
+}
+
+void handleSigHup(int /*signum*/) {
+  // We cannot reuse redirectOutput() due to limitations when handling signals.
+  // Full rules: https://man7.org/linux/man-pages/man7/signal-safety.7.html
+  if (!logPath_.has_value()) {
+    return;
+  }
+  int fileno = open(
+      logPath_.value().c_str(),
+      O_APPEND | O_CREAT | O_WRONLY | O_CLOEXEC,
+      0644);
+  if (fileno == -1) {
+    int err = errno;
+    write_cstr(STDERR_FILENO, "Failed to reopen ");
+    write_cstr(fileno, logPath_.value().c_str());
+    write_cstr(fileno, ": ");
+#ifdef __APPLE__
+    // On macOS, strerrrodesc_np is not defined. We use sys_errlist instead
+    write_cstr(fileno, sys_errlist[err]);
+#else
+    write_cstr(fileno, strerrordesc_np(err));
+#endif
+    write_cstr(fileno, "\n");
+    return;
+  }
+
+  int res = dup2(fileno, STDOUT_FILENO);
+  if (res == -1) {
+    int err = errno;
+    write_cstr(fileno, "Failed to redirect stdout to ");
+    write_cstr(fileno, logPath_.value().c_str());
+    write_cstr(fileno, ": ");
+#ifdef __APPLE__
+    // On macOS, strerrrodesc_np is not defined. We use sys_errlist instead
+    write_cstr(fileno, sys_errlist[err]);
+#else
+    write_cstr(fileno, strerrordesc_np(err));
+#endif
+    write_cstr(fileno, "\n");
+    close(fileno);
+    return;
+  }
+
+  res = dup2(fileno, STDERR_FILENO);
+  if (res == -1) {
+    // stdout was successfully redirected; we can keep the log file open but
+    // report an error in the logs
+    int err = errno;
+    write_cstr(fileno, "Failed to redirect stderr to ");
+    write_cstr(fileno, logPath_.value().c_str());
+    write_cstr(fileno, ": ");
+#ifdef __APPLE__
+    // On macOS, strerrrodesc_np is not defined. We use sys_errlist instead
+    write_cstr(fileno, sys_errlist[err]);
+#else
+    write_cstr(fileno, strerrordesc_np(err));
+#endif
+    write_cstr(fileno, "\n");
+  }
+  close(fileno);
+}
+#endif // !_WIN32
+} // namespace
 
 void DaemonStartupLogger::initClient(
     folly::StringPiece logPath,
@@ -294,6 +374,17 @@ void DaemonStartupLogger::initClient(
   XDCHECK(!logPath.empty());
   pipe_ = std::move(pipe);
   redirectOutput(logPath);
+
+#ifndef _WIN32
+  // We use SIGHUP to signal when the log file has been rotated.
+  // Install a signal handler so that we can continue writing logs to the new
+  // log file that was created during rotation.
+  struct sigaction action = {};
+  action.sa_handler = handleSigHup;
+  sigemptyset(&action.sa_mask);
+  folly::checkUnixError(
+      sigaction(SIGHUP, &action, nullptr), "failed to set SIGHUP handler");
+#endif // !_WIN32
 }
 
 void DaemonStartupLogger::runParentProcess(
@@ -323,6 +414,9 @@ void DaemonStartupLogger::runParentProcess(
 
 void DaemonStartupLogger::redirectOutput(StringPiece logPath) {
   try {
+    // As mentioned above, the value of logPath_ must only be set once and
+    // henceforth be immutable for the duration of the daemon's lifetime.
+    XCHECK(!logPath_.has_value());
     logPath_ = logPath.str();
 
     // Save a copy of the original stderr descriptors, so we can still write

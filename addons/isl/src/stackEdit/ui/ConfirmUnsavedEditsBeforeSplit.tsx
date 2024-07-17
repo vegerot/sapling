@@ -11,19 +11,21 @@ import type {MutableRefObject} from 'react';
 
 import {Commit} from '../../Commit';
 import {
-  commitFieldsBeingEdited,
   editedCommitMessages,
+  getDefaultEditedCommitMessage,
   unsavedFieldsBeingEdited,
 } from '../../CommitInfoView/CommitInfoState';
 import {commitMessageFieldsSchema} from '../../CommitInfoView/CommitMessageFields';
 import {FlexSpacer} from '../../ComponentUtils';
-import {Tooltip} from '../../Tooltip';
 import {T, t} from '../../i18n';
+import {readAtom, writeAtom} from '../../jotaiUtils';
 import {CommitPreview} from '../../previews';
 import {useModal} from '../../useModal';
-import {VSCodeButton, VSCodeDivider} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilCallback, useRecoilValue} from 'recoil';
-import {Icon} from 'shared/Icon';
+import {Button} from 'isl-components/Button';
+import {Divider} from 'isl-components/Divider';
+import {Icon} from 'isl-components/Icon';
+import {useAtomValue} from 'jotai';
+import {useCallback} from 'react';
 import {useAutofocusRef} from 'shared/hooks';
 
 import './ConfirmUnsavedEditsBeforeSplit.css';
@@ -35,34 +37,31 @@ export function useConfirmUnsavedEditsBeforeSplit(): (
   kind: UnsavedEditConfirmKind,
 ) => Promise<boolean> {
   const showModal = useModal();
-  const showConfirmation = useRecoilCallback(
-    ({snapshot}) =>
-      async (commits: Array<CommitInfo>, kind: UnsavedEditConfirmKind): Promise<boolean> => {
-        const editedCommits = commits
-          .map(commit => [
-            commit,
-            snapshot.getLoadable(unsavedFieldsBeingEdited(commit.hash)).valueMaybe(),
-          ])
-          .filter(([_, f]) => f != null) as Array<[CommitInfo, FieldsBeingEdited]>;
-        if (editedCommits.some(([_, f]) => Object.values(f).some(Boolean))) {
-          const continueWithSplit = await showModal<boolean>({
-            type: 'custom',
-            component: ({returnResultAndDismiss}) => (
-              <PreSplitUnsavedEditsConfirmationModal
-                kind={kind}
-                editedCommits={editedCommits}
-                returnResultAndDismiss={returnResultAndDismiss}
-              />
-            ),
-            title:
-              kind === 'split'
-                ? t('Save edits before splitting?')
-                : t('Save edits before editing stack?'),
-          });
-          return continueWithSplit === true;
-        }
-        return true;
-      },
+  const showConfirmation = useCallback(
+    async (commits: Array<CommitInfo>, kind: UnsavedEditConfirmKind): Promise<boolean> => {
+      const editedCommits = commits
+        .map(commit => [commit, readAtom(unsavedFieldsBeingEdited(commit.hash))])
+        .filter(([_, f]) => f != null) as Array<[CommitInfo, FieldsBeingEdited]>;
+      if (editedCommits.some(([_, f]) => Object.values(f).some(Boolean))) {
+        const continueWithSplit = await showModal<boolean>({
+          type: 'custom',
+          component: ({returnResultAndDismiss}) => (
+            <PreSplitUnsavedEditsConfirmationModal
+              kind={kind}
+              editedCommits={editedCommits}
+              returnResultAndDismiss={returnResultAndDismiss}
+            />
+          ),
+          title:
+            kind === 'split'
+              ? t('Save edits before splitting?')
+              : t('Save edits before editing stack?'),
+        });
+        return continueWithSplit === true;
+      }
+      return true;
+    },
+    [showModal],
   );
 
   return (commits: Array<CommitInfo>, kind: UnsavedEditConfirmKind) => {
@@ -79,12 +78,11 @@ function PreSplitUnsavedEditsConfirmationModal({
   editedCommits: Array<[CommitInfo, FieldsBeingEdited]>;
   returnResultAndDismiss: (continueWithSplit: boolean) => unknown;
 }) {
-  const schema = useRecoilValue(commitMessageFieldsSchema);
+  const schema = useAtomValue(commitMessageFieldsSchema);
 
-  const resetEditedCommitMessage = useRecoilCallback(({reset}) => (commit: CommitInfo) => {
-    reset(editedCommitMessages(commit.hash));
-    reset(commitFieldsBeingEdited);
-  });
+  const resetEditedCommitMessage = useCallback((commit: CommitInfo) => {
+    writeAtom(editedCommitMessages(commit.hash), getDefaultEditedCommitMessage());
+  }, []);
 
   const commitsWithUnsavedEdits = editedCommits.filter(([_, fields]) =>
     Object.values(fields).some(Boolean),
@@ -136,14 +134,13 @@ function PreSplitUnsavedEditsConfirmationModal({
             </div>
           ))}
         </div>
-        <VSCodeDivider />
+        <Divider />
         <div className="use-modal-buttons">
           <FlexSpacer />
-          <VSCodeButton appearance="secondary" onClick={() => returnResultAndDismiss(false)}>
+          <Button onClick={() => returnResultAndDismiss(false)}>
             <T>Cancel</T>
-          </VSCodeButton>
-          <VSCodeButton
-            appearance="secondary"
+          </Button>
+          <Button
             onClick={() => {
               for (const [commit] of editedCommits) {
                 resetEditedCommitMessage(commit);
@@ -151,16 +148,16 @@ function PreSplitUnsavedEditsConfirmationModal({
               returnResultAndDismiss(true); // continue with split
             }}>
             <T>Discard Edits</T>
-          </VSCodeButton>
-          <VSCodeButton
+          </Button>
+          <Button
             ref={saveButtonRef as MutableRefObject<null>}
-            appearance="primary"
+            primary
             onClick={() => {
               // Unsaved edits will be automatically loaded by the split as the commits' text
               returnResultAndDismiss(true); // continue with split
             }}>
             <T>Save Edits</T>
-          </VSCodeButton>
+          </Button>
         </div>
       </>
     </div>

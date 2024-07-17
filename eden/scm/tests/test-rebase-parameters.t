@@ -1,3 +1,6 @@
+
+#require no-eden
+
 #chg-compatible
   $ eagerepo
   $ configure mutation-norecord dummyssh
@@ -61,31 +64,30 @@ These fail:
   nothing to rebase
 
   $ hg rebase --continue --abort
-  abort: cannot use both abort and continue
+  abort: can only use one of the following: abort, continue or quit
   [255]
 
   $ hg rebase --continue --collapse
-  abort: cannot use collapse with continue or abort
+  abort: cannot use collapse with continue, abort or quit
   [255]
 
   $ hg rebase --continue --dest 4
-  abort: abort and continue do not allow specifying revisions
+  abort: abort, continue and quit do not allow specifying revisions
   [255]
 
   $ hg rebase --base 5 --source 4
-  abort: cannot specify both a source and a base
+  abort: you must specify a destination (-d) for the rebase
   [255]
 
   $ hg rebase --rev 5 --source 4
-  abort: cannot specify both a revision and a source
+  abort: you must specify a destination (-d) for the rebase
   [255]
   $ hg rebase --base 5 --rev 4
-  abort: cannot specify both a revision and a base
+  abort: you must specify a destination (-d) for the rebase
   [255]
 
   $ hg rebase --base 'desc(G)'
-  abort: branch 'default' has 3 heads - please rebase to an explicit rev
-  (run 'hg heads .' to see heads)
+  abort: you must specify a destination (-d) for the rebase
   [255]
 
   $ hg rebase --rev 'desc(B) & !desc(B)' --dest 8
@@ -106,10 +108,11 @@ These fail:
   $ hg up -q 'desc(H)'
 
   $ hg rebase --dest 'desc(I)' --traceback
-  nothing to rebase - working directory parent is already an ancestor of destination 3e65a434aea7
+  1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  nothing to rebase - fast-forwarded to 3e65a434aea7
 
   $ hg rebase --dest 'desc(I)' -b.
-  nothing to rebase - "base" 4ea5b230dea3 is already an ancestor of destination 3e65a434aea7
+  nothing to rebase - 3e65a434aea7 is both "base" and destination
 
   $ hg rebase --dest 'desc(B) & !desc(B)'
   abort: empty revision set
@@ -124,7 +127,7 @@ Rebase with no arguments (from 3 onto 8):
   $ cd a1
   $ hg up -q -C 'desc(D)'
 
-  $ hg rebase
+  $ hg rebase -d master
   rebasing 112478962961 "B"
   rebasing 26805aba1e60 "C"
   rebasing f585351a92f8 "D"
@@ -152,7 +155,7 @@ Rebase with base == '.' => same as no arguments (from 3 onto 8):
   $ cd a2
   $ hg goto -q 'desc(D)'
 
-  $ hg rebase --base .
+  $ hg rebase --base . -d master
   rebasing 112478962961 "B"
   rebasing 26805aba1e60 "C"
   rebasing f585351a92f8 "D"
@@ -180,7 +183,7 @@ Specify only source (from 2 onto 8):
   $ cp -R a2heads a4
   $ cd a4
 
-  $ hg rebase --source 'desc("C")'
+  $ hg rebase --source 'desc("C")' -d master
   rebasing 26805aba1e60 "C"
   rebasing f585351a92f8 "D"
 
@@ -240,7 +243,7 @@ Specify only base (from 1 onto 8):
   $ cp -R a2heads a6
   $ cd a6
 
-  $ hg rebase --base 'desc("D")'
+  $ hg rebase --base 'desc("D")' -d master
   rebasing 112478962961 "B"
   rebasing 26805aba1e60 "C"
   rebasing f585351a92f8 "D"
@@ -327,7 +330,7 @@ Specify only revs (from 2 onto 8)
   $ cp -R a2heads a9
   $ cd a9
 
-  $ hg rebase --rev 'desc("C")::'
+  $ hg rebase --rev 'desc("C")::' -d master
   rebasing 26805aba1e60 "C"
   rebasing f585351a92f8 "D"
 
@@ -431,11 +434,11 @@ Test --tool parameter:
   $ hg rebase -c --tool internal:fail
   rebasing e4e3f3546619 "c2b"
 
-  $ hg rebase -i
+  $ hg rebase -i -d null
   abort: interactive history editing is supported by the 'histedit' extension (see "hg --config extensions.histedit= help -e histedit")
   [255]
 
-  $ hg rebase --interactive
+  $ hg rebase --interactive -d null
   abort: interactive history editing is supported by the 'histedit' extension (see "hg --config extensions.histedit= help -e histedit")
   [255]
 

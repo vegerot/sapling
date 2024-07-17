@@ -3,8 +3,9 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-strict
+
 # TODO(T65013742)
-# pyre-ignore-all-errors
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
@@ -14,6 +15,7 @@ import sys
 
 from thrift.transport.TSocket import TSocket
 from thrift.transport.TTransport import TTransportException
+from typing_extensions import Buffer
 
 
 if sys.platform == "win32":
@@ -47,6 +49,7 @@ WSASYS_STATUS_LEN: int = 128 + 1
 
 
 class WSAData64(ctypes.Structure):
+    # pyre-fixme[4]: Attribute must be annotated.
     _fields_ = [
         ("wVersion", ctypes.c_ushort),
         ("wHighVersion", ctypes.c_ushort),
@@ -58,6 +61,8 @@ class WSAData64(ctypes.Structure):
     ]
 
 
+# pyre-fixme[5]: Global expression must be annotated.
+# pyre-fixme[16]: Module `ctypes` has no attribute `windll`.
 WSAStartup = ctypes.windll.ws2_32.WSAStartup
 WSAStartup.argtypes = [ctypes.wintypes.WORD, ctypes.POINTER(WSAData64)]
 WSAStartup.restype = ctypes.c_int
@@ -69,6 +74,8 @@ WSAStartup.restype = ctypes.c_int
 #   int type,
 #   int protocol
 # );
+# pyre-fixme[5]: Global expression must be annotated.
+# pyre-fixme[16]: Module `ctypes` has no attribute `windll`.
 socket = ctypes.windll.ws2_32.socket
 socket.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
 socket.restype = ctypes.wintypes.HANDLE
@@ -79,6 +86,8 @@ socket.restype = ctypes.wintypes.HANDLE
 #   const sockaddr * name,
 #   int            namelen
 #   );
+# pyre-fixme[5]: Global expression must be annotated.
+# pyre-fixme[16]: Module `ctypes` has no attribute `windll`.
 connect = ctypes.windll.ws2_32.connect
 connect.argtypes = [ctypes.wintypes.HANDLE, ctypes.c_void_p, ctypes.c_int]
 connect.restype = ctypes.c_int
@@ -88,6 +97,8 @@ connect.restype = ctypes.c_int
 #   const sockaddr *name,
 #   int            namelen
 # );
+# pyre-fixme[5]: Global expression must be annotated.
+# pyre-fixme[16]: Module `ctypes` has no attribute `windll`.
 bind = ctypes.windll.ws2_32.bind
 bind.argtypes = [ctypes.wintypes.HANDLE, ctypes.c_void_p, ctypes.c_int]
 bind.restype = ctypes.c_int
@@ -99,6 +110,8 @@ bind.restype = ctypes.c_int
 #   int        len,
 #   int        flags
 # );
+# pyre-fixme[5]: Global expression must be annotated.
+# pyre-fixme[16]: Module `ctypes` has no attribute `windll`.
 send = ctypes.windll.ws2_32.send
 send.argtypes = [
     ctypes.wintypes.HANDLE,
@@ -114,6 +127,8 @@ send.restype = ctypes.c_int
 #   int    len,
 #   int    flags
 # );
+# pyre-fixme[5]: Global expression must be annotated.
+# pyre-fixme[16]: Module `ctypes` has no attribute `windll`.
 recv = ctypes.windll.ws2_32.recv
 recv.argtypes = [
     ctypes.wintypes.HANDLE,
@@ -126,11 +141,15 @@ recv.restype = ctypes.c_int
 # int closesocket(
 #   IN SOCKET s
 # );
+# pyre-fixme[5]: Global expression must be annotated.
+# pyre-fixme[16]: Module `ctypes` has no attribute `windll`.
 closesocket = ctypes.windll.ws2_32.closesocket
 closesocket.argtypes = [ctypes.wintypes.HANDLE]
 closesocket.restype = ctypes.c_int
 
 # int WSAGetLastError();
+# pyre-fixme[5]: Global expression must be annotated.
+# pyre-fixme[16]: Module `ctypes` has no attribute `windll`.
 WSAGetLastError = ctypes.windll.ws2_32.WSAGetLastError
 WSAGetLastError.argtypes = []
 WSAGetLastError.restype = ctypes.c_int
@@ -138,6 +157,8 @@ WSAGetLastError.restype = ctypes.c_int
 # setsockopt but "falsely" declared to accept DWORD* as
 # its parameter.  It's really char*, but we only use DWORD
 # values.
+# pyre-fixme[5]: Global expression must be annotated.
+# pyre-fixme[16]: Module `ctypes` has no attribute `windll`.
 WinSetIntSockOpt = ctypes.windll.ws2_32.setsockopt
 WinSetIntSockOpt.argtypes = [
     ctypes.wintypes.HANDLE,
@@ -153,6 +174,8 @@ WinSetIntSockOpt.restype = ctypes.c_int
 #   [in]      long   cmd,
 #   [in, out] u_long *argp
 # );
+# pyre-fixme[5]: Global expression must be annotated.
+# pyre-fixme[16]: Module `ctypes` has no attribute `windll`.
 ioctlsocket = ctypes.windll.ws2_32.ioctlsocket
 ioctlsocket.argtypes = [
     ctypes.wintypes.HANDLE,
@@ -163,6 +186,7 @@ ioctlsocket.restype = ctypes.c_int
 
 
 class SOCKADDR_UN(ctypes.Structure):
+    # pyre-fixme[4]: Attribute must be annotated.
     _fields_ = [("sun_family", ctypes.c_ushort), ("sun_path", ctypes.c_char * 108)]
 
 
@@ -182,7 +206,8 @@ class WindowsSocketHandle:
     address: str = ""
 
     @staticmethod
-    def _checkReturnCode(retcode):
+    # pyre-fixme[2]: Parameter must be annotated.
+    def _checkReturnCode(retcode) -> None:
         if retcode == -1:
             errcode = WSAGetLastError()
             if errcode == WSAECONNREFUSED:
@@ -205,7 +230,7 @@ class WindowsSocketHandle:
             else:
                 raise WindowsSocketException(errcode)
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._io_refs = 0  # stub to make socket.makefile work on this object
         wsa_data = WSAData64()
         # ctypes.c_ushort(514) = MAKE_WORD(2,2) which is for the winsock
@@ -217,20 +242,27 @@ class WindowsSocketHandle:
         fd = socket(self.AF_UNIX, self.SOCK_STREAM, 0)
         self._checkReturnCode(fd)
         self.fd = fd
+        # pyre-fixme[4]: Attribute must be annotated.
         self.type = self.SOCK_STREAM
+        # pyre-fixme[4]: Attribute must be annotated.
         self.family = self.AF_UNIX
+        # pyre-fixme[4]: Attribute must be annotated.
         self.proto = self.IPPROTO_TCP
 
     def fileno(self) -> int:
         return self.fd
 
     def settimeout(self, timeout: int) -> None:
+        # pyre-fixme[9]: timeout has type `int`; used as `c_ulong`.
         timeout = ctypes.wintypes.DWORD(0 if timeout is None else int(timeout * 1000))
         retcode = WinSetIntSockOpt(
             self.fd,
             SOL_SOCKET,
             SO_RCVTIMEO,
+            # pyre-fixme[6]: For 1st argument expected `_CData` but got `int`.
             ctypes.byref(timeout),
+            # pyre-fixme[6]: For 1st argument expected `Union[Type[_CData], _CData]`
+            #  but got `int`.
             ctypes.sizeof(timeout),
         )
         self._checkReturnCode(retcode)
@@ -238,7 +270,10 @@ class WindowsSocketHandle:
             self.fd,
             SOL_SOCKET,
             SO_SNDTIMEO,
+            # pyre-fixme[6]: For 1st argument expected `_CData` but got `int`.
             ctypes.byref(timeout),
+            # pyre-fixme[6]: For 1st argument expected `Union[Type[_CData], _CData]`
+            #  but got `int`.
             ctypes.sizeof(timeout),
         )
         self._checkReturnCode(retcode)
@@ -283,8 +318,11 @@ class WindowsSocketHandle:
         self._checkReturnCode(retsize)
         return buff.raw[0:retsize]
 
-    def recv_into(self, buffer, size=0):
+    # pyre-fixme[3]: Return type must be annotated.
+    def recv_into(self, buffer: Buffer, size: int = 0):
         if size == 0:
+            # pyre-fixme[6]: For 1st argument expected
+            #  `pyre_extensions.ReadOnly[Sized]` but got `Buffer`.
             size = len(buffer)
 
         dest = (ctypes.c_char * size).from_buffer(buffer)

@@ -6,17 +6,20 @@
  */
 
 import type {Repository} from 'isl-server/src/Repository';
-import type {ServerSideTracker} from 'isl-server/src/analytics/serverSideTracker';
+import type {RepositoryContext} from 'isl-server/src/serverTypes';
 import type {Operation} from 'isl/src/operations/Operation';
 import type {RepoRelativePath} from 'isl/src/types';
 import type {Comparison} from 'shared/Comparison';
 
+import {encodeDeletedFileUri} from './DeletedFileContentProvider';
 import {encodeSaplingDiffUri} from './DiffContentProvider';
 import {t} from './i18n';
 import {repoRelativePathForAbsolutePath} from 'isl-server/src/Repository';
 import {repositoryCache} from 'isl-server/src/RepositoryCache';
+import {findPublicAncestor} from 'isl-server/src/utils';
 import {RevertOperation} from 'isl/src/operations/RevertOperation';
-import path from 'path';
+import fs from 'node:fs';
+import path from 'node:path';
 import {ComparisonType, labelForComparison} from 'shared/Comparison';
 import * as vscode from 'vscode';
 
@@ -36,8 +39,15 @@ export const vscodeCommands = {
   ['sapling.open-file-diff']: (uri: vscode.Uri, comparison: Comparison) =>
     openDiffView(uri, comparison),
 
+  ['sapling.open-remote-file-link']: commandWithUriOrResourceState(
+    (repo: Repository, uri, path: RepoRelativePath) => openRemoteFileLink(repo, uri, path),
+  ),
+  ['sapling.copy-remote-file-link']: commandWithUriOrResourceState(
+    (repo: Repository, uri, path: RepoRelativePath) => openRemoteFileLink(repo, uri, path, true),
+  ),
+
   ['sapling.revert-file']: commandWithUriOrResourceState(async function (
-    this: Context,
+    this: RepositoryContext,
     repo: Repository,
     _,
     path: RepoRelativePath,
@@ -50,17 +60,27 @@ export const vscodeCommands = {
     if (choice !== 'Revert') {
       return;
     }
-    return runOperation(repo, new RevertOperation([path]), this.tracker);
+    return runOperation(this, repo, new RevertOperation([path]));
   }),
+};
+
+type surveyMetaData = {
+  diffId: string | undefined;
 };
 
 /** Type definitions for built-in or third-party VS Code commands we want to execute programatically. */
 type ExternalVSCodeCommands = {
   'vscode.diff': (left: vscode.Uri, right: vscode.Uri, title: string) => Thenable<unknown>;
   'workbench.action.closeSidebar': () => Thenable<void>;
+  'fb.survey.initStateUIByNamespace': (
+    surveyID: string,
+    namespace: string,
+    metadata: surveyMetaData,
+  ) => Thenable<void>;
   'sapling.open-isl': () => Thenable<void>;
   'sapling.close-isl': () => Thenable<void>;
   'sapling.isl.focus': () => Thenable<void>;
+  setContext: (key: string, value: unknown) => Thenable<void>;
   'fb-hg.open-or-focus-interactive-smartlog': (
     _: unknown,
     __?: unknown,
@@ -80,19 +100,17 @@ export function executeVSCodeCommand<K extends keyof VSCodeCommand>(
   id: K,
   ...args: Parameters<VSCodeCommand[K]>
 ): ReturnType<VSCodeCommand[K]> {
-  return vscode.commands.executeCommand(id, ...args) as ReturnType<VSCodeCommand[K]>;
+  // In tests 'vscode.commands' is not defined.
+  return vscode.commands?.executeCommand(id, ...args) as ReturnType<VSCodeCommand[K]>;
 }
 
-type Context = {
-  tracker: ServerSideTracker;
-};
-
 const runOperation = (
+  ctx: RepositoryContext,
   repo: Repository,
   operation: Operation,
-  tracker: ServerSideTracker,
 ): undefined => {
   repo.runOrQueueOperation(
+    ctx,
     {
       args: operation.getArgs(),
       id: operation.id,
@@ -100,34 +118,45 @@ const runOperation = (
       trackEventName: operation.trackEventName,
     },
     () => undefined, // TODO: Send this progress info to any existing ISL webview if there is one
-    tracker,
-    repo.info.repoRoot,
   );
   return undefined;
 };
 
-export function registerCommands(tracker: ServerSideTracker): Array<vscode.Disposable> {
-  const context: Context = {
-    tracker,
-  };
-
+export function registerCommands(ctx: RepositoryContext): Array<vscode.Disposable> {
   const disposables: Array<vscode.Disposable> = Object.entries(vscodeCommands).map(
     ([id, handler]) =>
       vscode.commands.registerCommand(id, (...args: Parameters<typeof handler>) =>
-        tracker.operation('RunVSCodeCommand', 'VSCodeCommandError', {extras: {command: id}}, () => {
-          return (handler as (...args: Array<unknown>) => unknown).apply(context, args);
-        }),
+        ctx.tracker.operation(
+          'RunVSCodeCommand',
+          'VSCodeCommandError',
+          {extras: {command: id}},
+          () => {
+            return (handler as (...args: Array<unknown>) => unknown).apply(ctx, args);
+          },
+        ),
       ),
   );
   return disposables;
 }
 
-function openDiffView(uri: vscode.Uri, comparison: Comparison): Thenable<unknown> {
+function fileExists(uri: vscode.Uri): Promise<boolean> {
+  return fs.promises
+    .access(uri.fsPath)
+    .then(() => true)
+    .catch(() => false);
+}
+
+async function openDiffView(uri: vscode.Uri, comparison: Comparison): Promise<unknown> {
   const {fsPath} = uri;
   const title = `${path.basename(fsPath)} (${t(labelForComparison(comparison))})`;
   const uriForComparison = encodeSaplingDiffUri(uri, comparison);
   if (comparison.type !== ComparisonType.Committed) {
-    return executeVSCodeCommand('vscode.diff', uriForComparison, uri, title);
+    return executeVSCodeCommand(
+      'vscode.diff',
+      uriForComparison,
+      (await fileExists(uri)) ? uri : encodeDeletedFileUri(uri),
+      title,
+    );
   }
   const uriForComparisonParent = encodeSaplingDiffUri(uri, {
     type: ComparisonType.Committed,
@@ -136,21 +165,66 @@ function openDiffView(uri: vscode.Uri, comparison: Comparison): Thenable<unknown
   return executeVSCodeCommand('vscode.diff', uriForComparisonParent, uriForComparison, title);
 }
 
+function openRemoteFileLink(
+  repo: Repository,
+  uri: vscode.Uri,
+  path: RepoRelativePath,
+  copyToClipboard = false,
+): void {
+  {
+    if (!repo.codeReviewProvider?.getRemoteFileURL) {
+      vscode.window.showErrorMessage(
+        t(`Remote link unsupported for this code review provider ($provider)`).replace(
+          '$provider',
+          repo.codeReviewProvider?.getSummaryName() ?? t('none'),
+        ),
+      );
+      return;
+    }
+
+    // Grab the selection if the command is for the active file (may not be true if triggered via file explorer)
+    const selection =
+      vscode.window.activeTextEditor?.document.uri.fsPath === uri.fsPath
+        ? vscode.window.activeTextEditor?.selection
+        : null;
+
+    const commits = repo.getSmartlogCommits()?.commits.value;
+    const head = repo.getHeadCommit();
+    if (!commits || !head) {
+      vscode.window.showErrorMessage(t(`No commits loaded in this repository yet`));
+      return;
+    }
+    const publicCommit = findPublicAncestor(commits, head);
+    const url = repo.codeReviewProvider.getRemoteFileURL(
+      path,
+      publicCommit?.hash ?? null,
+      selection ? {line: selection.start.line, char: selection.start.character} : undefined,
+      selection ? {line: selection.end.line, char: selection.end.character} : undefined,
+    );
+
+    if (copyToClipboard) {
+      vscode.env.clipboard.writeText(url);
+    } else {
+      vscode.env.openExternal(vscode.Uri.parse(url));
+    }
+  }
+}
+
 /**
  * Wrap a command implementation so it can be called with any of:
  * - current active file Uri for use from the command palette
  * - a vscode Uri for programmatic invocations
  * - a SourceControlResourceState for use from the VS Code SCM sidebar API
  */
-function commandWithUriOrResourceState<Ctx>(
+function commandWithUriOrResourceState(
   handler: (
     repo: Repository,
     uri: vscode.Uri,
     path: RepoRelativePath,
-  ) => undefined | Thenable<unknown>,
+  ) => unknown | Thenable<unknown>,
 ) {
   return function (
-    this: Ctx,
+    this: RepositoryContext,
     uriOrResource: vscode.Uri | vscode.SourceControlResourceState | undefined,
   ) {
     const uri =

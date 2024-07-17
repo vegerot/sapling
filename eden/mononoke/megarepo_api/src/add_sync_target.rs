@@ -21,6 +21,7 @@ use megarepo_config::MononokeMegarepoConfigs;
 use megarepo_config::SyncTargetConfig;
 use megarepo_error::MegarepoError;
 use megarepo_mapping::SourceName;
+use metaconfig_types::RepoConfigArc;
 use mononoke_api::Mononoke;
 use mononoke_api::RepoContext;
 use mononoke_types::ChangesetId;
@@ -123,6 +124,7 @@ impl<'a> AddSyncTarget<'a> {
                 true, /* write_commit_remapping_state */
                 sync_target_config.version.clone(),
                 message,
+                sync_target_config.target.bookmark.clone(),
             )
             .await?;
 
@@ -148,7 +150,7 @@ impl<'a> AddSyncTarget<'a> {
                 .iter();
             let derivers = FuturesUnordered::new();
             for ty in derived_data_types {
-                let utils = derived_data_utils(ctx.fb, repo.blob_repo(), ty)?;
+                let utils = derived_data_utils(ctx.fb, repo.blob_repo(), *ty)?;
                 derivers.push(utils.derive(
                     ctx.clone(),
                     repo.blob_repo().repo_derived_data_arc(),
@@ -172,8 +174,9 @@ impl<'a> AddSyncTarget<'a> {
 
         scuba.log_with_msg("Derived data", None);
 
+        let repo_config = repo.repo().repo_config_arc();
         self.megarepo_configs
-            .add_config_version(ctx.clone(), sync_target_config.clone())
+            .add_config_version(ctx.clone(), repo_config, sync_target_config.clone())
             .await?;
 
         self.create_bookmark(

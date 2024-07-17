@@ -19,6 +19,8 @@ use context::CoreContext;
 use futures::stream::TryStreamExt;
 use futures::Future;
 use futures::FutureExt;
+use itertools::Either;
+use mononoke_types::path::MPath;
 use mononoke_types::ChangesetId;
 use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
@@ -28,7 +30,6 @@ use crate::Entry;
 use crate::LeafInfo;
 use crate::PathTree;
 use crate::TreeInfo;
-use crate::TreeInfoSubentries;
 
 pub struct ManifestChanges<Leaf> {
     pub cs_id: ChangesetId,
@@ -189,26 +190,22 @@ where
         }
 
         struct UnfoldState<TreeId, LeafId, Leaf> {
-            path: Option<NonRootMPath>,
+            path: MPath,
             name: Option<MPathElement>,
             parent: Option<Entry<TreeId, LeafId>>,
             path_tree: PathTree<Vec<(ChangesetId, Leaf)>>,
         }
 
         enum FoldState<TreeId, LeafId, Leaf> {
-            Reuse(
-                Option<NonRootMPath>,
-                Option<MPathElement>,
-                Option<Entry<TreeId, LeafId>>,
-            ),
+            Reuse(Option<MPathElement>, Option<Entry<TreeId, LeafId>>),
             CreateLeaves(
-                Option<NonRootMPath>,
+                MPath,
                 MPathElement,
                 Option<Entry<TreeId, LeafId>>,
                 Vec<Leaf>,
             ),
             CreateTrees(
-                Option<NonRootMPath>,
+                MPath,
                 Option<MPathElement>,
                 Option<Entry<TreeId, LeafId>>,
                 // We might have a single file deletion, this field represents it
@@ -220,7 +217,7 @@ where
         let (_, entry_stack) = bounded_traversal::bounded_traversal(
             256,
             UnfoldState {
-                path: None,
+                path: MPath::ROOT,
                 name: None,
                 parent: parent.clone().map(Entry::Tree),
                 path_tree,
@@ -283,7 +280,7 @@ where
                                 while let Some((name, entry)) = stream.try_next().await? {
                                     let subentry =
                                         deps.entry(name.clone()).or_insert_with(|| UnfoldState {
-                                            path: Some(NonRootMPath::join_opt_element(path.as_ref(), &name)),
+                                            path: path.join_element(Some(&name)),
                                             name: Some(name),
                                             parent: Default::default(),
                                             path_tree: Default::default(),
@@ -295,7 +292,7 @@ where
                             for (name, path_tree) in subentries {
                                 let subentry =
                                     deps.entry(name.clone()).or_insert_with(|| UnfoldState {
-                                        path: Some(NonRootMPath::join_opt_element(path.as_ref(), &name)),
+                                        path: path.join_element(Some(&name)),
                                         name: Some(name),
                                         parent: Default::default(),
                                         path_tree: Default::default(),
@@ -308,13 +305,13 @@ where
                                 FoldState::CreateTrees(path, name, parent, maybe_file_deletion),
                                 deps,
                             ))
-                        } else if path.is_none() && parent.is_none() {
+                        } else if path.is_root() && parent.is_none() {
                             // This is a weird case - we got an empty commit with no parent.
                             // In that case  we want to create an empty root tree for this commit
-                            Ok((FoldState::CreateTrees(None, None, None, None), vec![]))
+                            Ok((FoldState::CreateTrees(MPath::ROOT, None, None, None), vec![]))
                         } else {
                             // No changes, no subentries - just reuse the entry
-                            Ok((FoldState::Reuse(path, name, parent.map(convert_to_intermediate_entry)), vec![]))
+                            Ok((FoldState::Reuse(name, parent.map(convert_to_intermediate_entry)), vec![]))
                         }
                     }
                     .boxed()
@@ -343,7 +340,7 @@ where
                                     );
                                 }
 
-                                let path = path.clone().context("unexpected empty path for leaf")?;
+                                let path = path.clone().into_optional_non_root_path().context("unexpected empty path for leaf")?;
                                 let entry_stack = Self::create_leaves(
                                     &ctx,
                                     path,
@@ -368,7 +365,7 @@ where
                                 .await?;
                                 Ok((name, entry_stack))
                             }
-                            FoldState::Reuse(_, name, maybe_entry) => {
+                            FoldState::Reuse(name, maybe_entry) => {
                                 let entry_stack = EntryStack {
                                     parent: maybe_entry.map(convert_to_intermediate_entry),
                                     values: vec![],
@@ -465,15 +462,18 @@ where
                             .list(ctx, &store)
                             .await?
                             .map_ok(|(path, entry)| {
-                                (path, (None, convert_to_intermediate_entry(entry)))
+                                (
+                                    path.to_smallvec(),
+                                    Either::Left((None, convert_to_intermediate_entry(entry))),
+                                )
                             })
                             .try_collect()
                             .await?;
                         let (upload_ctx, tree_id) = create_tree(
                             TreeInfo {
-                                path: Some(path.clone()),
+                                path: path.clone().into(),
                                 parents: vec![tree_id],
-                                subentries: TreeInfoSubentries::AllSubentries(subentries),
+                                subentries,
                             },
                             cs_id,
                         )
@@ -496,7 +496,7 @@ where
     }
 
     async fn create_trees(
-        path: Option<NonRootMPath>,
+        path: MPath,
         parent: Option<Entry<TreeId, IntermediateLeafId>>,
         stack_sub_entries: BTreeMap<MPathElement, EntryStack<TreeId, IntermediateLeafId, Ctx>>,
         create_tree: Arc<T>,
@@ -581,7 +581,7 @@ where
                 Some(delta) => delta,
                 None => {
                     // This directory hasn't been changed in `cs_id`, just continue...
-                    if path.is_none() && cur_sub_entries.is_empty() && parent.is_none() {
+                    if path.is_root() && cur_sub_entries.is_empty() && parent.is_none() {
                         // ... unless it's an empty root tree with no parents.
                         // That means we have an empty commit with no parents,
                         // and for that case let's create a new root object to match what
@@ -623,7 +623,13 @@ where
                     TreeInfo {
                         path: path.clone(),
                         parents: parent.clone().into_iter().collect(),
-                        subentries: TreeInfoSubentries::AllSubentries(cur_sub_entries.clone()),
+                        subentries: cur_sub_entries
+                            .clone()
+                            .into_iter()
+                            .map(|(name, (context, entry))| {
+                                (name.to_smallvec(), Either::Left((context, entry)))
+                            })
+                            .collect(),
                     },
                     *cs_id,
                 )
@@ -633,7 +639,7 @@ where
                 entry_stack
                     .values
                     .push((*cs_id, Some(ctx), Some(Entry::Tree(tree_id))));
-            } else if path.is_none() {
+            } else if path.is_root() {
                 // Everything is deleted in the repo - let's create a new root
                 // object
                 let (ctx, tree_id) = create_tree(

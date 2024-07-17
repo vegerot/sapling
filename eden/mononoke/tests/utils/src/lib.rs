@@ -21,8 +21,6 @@ use bookmarks::Bookmarks;
 use bookmarks::BookmarksRef;
 use bytes::Bytes;
 use bytes::BytesMut;
-use changeset_fetcher::ChangesetFetcher;
-use changeset_fetcher::ChangesetFetcherArc;
 use changesets::Changesets;
 use changesets::ChangesetsRef;
 use changesets_creation::save_changesets;
@@ -43,11 +41,14 @@ use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
 use mononoke_types::FileChange;
 use mononoke_types::FileType;
+use mononoke_types::GitLfs;
 use mononoke_types::NonRootMPath;
 use repo_blobstore::RepoBlobstore;
 use repo_blobstore::RepoBlobstoreArc;
 use repo_derived_data::RepoDerivedData;
 use repo_derived_data::RepoDerivedDataRef;
+use repo_identity::RepoIdentity;
+use repo_identity::RepoIdentityRef;
 
 pub mod drawdag;
 pub mod random;
@@ -55,10 +56,10 @@ pub mod random;
 pub trait Repo = BonsaiHgMappingRef
     + BookmarksRef
     + ChangesetsRef
-    + ChangesetFetcherArc
     + FilestoreConfigRef
     + RepoBlobstoreArc
     + RepoDerivedDataRef
+    + RepoIdentityRef
     + Send
     + Sync;
 
@@ -76,9 +77,6 @@ pub struct BasicTestRepo {
     pub changesets: dyn Changesets,
 
     #[facet]
-    pub changeset_fetcher: dyn ChangesetFetcher,
-
-    #[facet]
     pub bonsai_hg_mapping: dyn BonsaiHgMapping,
 
     #[facet]
@@ -89,6 +87,9 @@ pub struct BasicTestRepo {
 
     #[facet]
     pub repo_derived_data: RepoDerivedData,
+
+    #[facet]
+    pub repo_identity: RepoIdentity,
 }
 
 pub async fn list_working_copy_utf8(
@@ -242,7 +243,12 @@ impl<'a, R: Repo> CreateCommitContext<'a, R> {
     ) -> Self {
         self.files.insert(
             path.try_into().ok().expect("Invalid path"),
-            CreateFileContext::FromHelper(content.into(), FileType::Regular, None),
+            CreateFileContext::FromHelper(
+                content.into(),
+                FileType::Regular,
+                GitLfs::FullContent,
+                None,
+            ),
         );
         self
     }
@@ -279,7 +285,21 @@ impl<'a, R: Repo> CreateCommitContext<'a, R> {
     ) -> Self {
         self.files.insert(
             path.try_into().ok().expect("Invalid path"),
-            CreateFileContext::FromHelper(content.into(), t, None),
+            CreateFileContext::FromHelper(content.into(), t, GitLfs::FullContent, None),
+        );
+        self
+    }
+
+    pub fn add_file_with_type_and_lfs(
+        mut self,
+        path: impl TryInto<NonRootMPath>,
+        content: impl Into<Vec<u8>>,
+        t: FileType,
+        git_lfs: GitLfs,
+    ) -> Self {
+        self.files.insert(
+            path.try_into().ok().expect("Invalid path"),
+            CreateFileContext::FromHelper(content.into(), t, git_lfs, None),
         );
         self
     }
@@ -296,7 +316,31 @@ impl<'a, R: Repo> CreateCommitContext<'a, R> {
         );
         self.files.insert(
             path.try_into().ok().expect("Invalid path"),
-            CreateFileContext::FromHelper(content.into(), FileType::Regular, Some(copy_info)),
+            CreateFileContext::FromHelper(
+                content.into(),
+                FileType::Regular,
+                GitLfs::FullContent,
+                Some(copy_info),
+            ),
+        );
+        self
+    }
+
+    pub fn add_file_with_copy_info_and_type(
+        mut self,
+        path: impl TryInto<NonRootMPath>,
+        content: impl Into<Vec<u8>>,
+        (parent, parent_path): (impl Into<CommitIdentifier>, impl TryInto<NonRootMPath>),
+        file_type: FileType,
+        git_lfs: GitLfs,
+    ) -> Self {
+        let copy_info = (
+            parent_path.try_into().ok().expect("Invalid path"),
+            parent.into(),
+        );
+        self.files.insert(
+            path.try_into().ok().expect("Invalid path"),
+            CreateFileContext::FromHelper(content.into(), file_type, git_lfs, Some(copy_info)),
         );
         self
     }
@@ -399,7 +443,12 @@ impl<'a, R: Repo> CreateCommitContext<'a, R> {
 }
 
 enum CreateFileContext {
-    FromHelper(Vec<u8>, FileType, Option<(NonRootMPath, CommitIdentifier)>),
+    FromHelper(
+        Vec<u8>,
+        FileType,
+        GitLfs,
+        Option<(NonRootMPath, CommitIdentifier)>,
+    ),
     FromFileChange(FileChange),
     Deleted,
 }
@@ -412,7 +461,7 @@ impl CreateFileContext {
         parents: &[ChangesetId],
     ) -> Result<FileChange, Error> {
         let file_change = match self {
-            Self::FromHelper(content, file_type, copy_info) => {
+            Self::FromHelper(content, file_type, git_lfs, copy_info) => {
                 let content = Bytes::copy_from_slice(content.as_ref());
 
                 let meta = filestore::store(
@@ -441,7 +490,13 @@ impl CreateFileContext {
                     None => None,
                 };
 
-                FileChange::tracked(meta.content_id, file_type, meta.total_size, copy_info)
+                FileChange::tracked(
+                    meta.content_id,
+                    file_type,
+                    meta.total_size,
+                    copy_info,
+                    git_lfs,
+                )
             }
             Self::FromFileChange(file_change) => file_change,
             Self::Deleted => FileChange::Deletion,
@@ -646,7 +701,13 @@ pub async fn store_files<T: AsRef<str>>(
                 .unwrap()
                 .content_id;
 
-                let file_change = FileChange::tracked(content_id, FileType::Regular, size, None);
+                let file_change = FileChange::tracked(
+                    content_id,
+                    FileType::Regular,
+                    size,
+                    None,
+                    GitLfs::FullContent,
+                );
                 res.insert(path, file_change);
             }
             None => {
@@ -677,7 +738,13 @@ pub async fn store_rename(
     .unwrap()
     .content_id;
 
-    let file_change = FileChange::tracked(content_id, FileType::Regular, size, Some(copy_src));
+    let file_change = FileChange::tracked(
+        content_id,
+        FileType::Regular,
+        size,
+        Some(copy_src),
+        GitLfs::FullContent,
+    );
     (path, file_change)
 }
 

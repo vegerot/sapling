@@ -30,11 +30,13 @@ use crate::blob::Blob;
 use crate::blob::BlobstoreValue;
 use crate::blob::SkeletonManifestBlob;
 use crate::errors::MononokeTypeError;
-use crate::path::MPathElement;
+use crate::path::mpath_element::MPathElement;
+use crate::path::MPath;
 use crate::path::NonRootMPath;
 use crate::thrift;
 use crate::typed_hash::SkeletonManifestId;
 use crate::typed_hash::SkeletonManifestIdContext;
+use crate::PrefixTrie;
 
 /// A skeleton manifest is a manifest node containing summary information about the
 /// the structure of files (their names, but not their contents) that is useful
@@ -112,16 +114,17 @@ impl SkeletonManifest {
         blobstore: &'a impl Blobstore,
     ) -> Result<Option<(NonRootMPath, NonRootMPath)>> {
         let mut sk_mf = Cow::Borrowed(self);
-        let mut path: Option<NonRootMPath> = None;
+        let mut path = MPath::ROOT;
         'outer: loop {
             if sk_mf.summary.child_case_conflicts {
                 let mut lower_map = HashMap::new();
                 for name in sk_mf.subentries.keys() {
                     if let Some(lower_name) = name.to_lowercase_utf8() {
                         if let Some(other_name) = lower_map.insert(lower_name, name.clone()) {
+                            let optional_path = path.into_optional_non_root_path();
                             return Ok(Some((
-                                NonRootMPath::join_opt_element(path.as_ref(), &other_name),
-                                NonRootMPath::join_opt_element(path.as_ref(), name),
+                                NonRootMPath::join_opt_element(optional_path.as_ref(), &other_name),
+                                NonRootMPath::join_opt_element(optional_path.as_ref(), name),
                             )));
                         }
                     }
@@ -133,7 +136,7 @@ impl SkeletonManifest {
                         if subdir.summary.child_case_conflicts
                             || subdir.summary.descendant_case_conflicts
                         {
-                            path = Some(NonRootMPath::join_opt_element(path.as_ref(), name));
+                            path = path.join_element(Some(name));
                             sk_mf = Cow::Owned(subdir.id.load(ctx, blobstore).await?);
                             continue 'outer;
                         }
@@ -151,20 +154,28 @@ impl SkeletonManifest {
         ctx: &'a CoreContext,
         blobstore: &'a impl Blobstore,
         parents: Vec<SkeletonManifest>,
+        excluded_paths: &PrefixTrie,
     ) -> Result<Option<(NonRootMPath, NonRootMPath)>> {
         bounded_traversal(
             256,
-            (None, self, parents),
-            |(path, sk_mf, parents)| {
+            (MPath::ROOT, self, parents),
+            |(path, sk_mf, parents): (MPath, _, _)| {
                 async move {
                     if sk_mf.summary.child_case_conflicts {
-                        if let Some((name1, name2)) = sk_mf.first_new_child_case_conflict(&parents)
-                        {
-                            let path1 = NonRootMPath::join_opt_element(path.as_ref(), name1);
-                            let path2 = NonRootMPath::join_opt_element(path.as_ref(), name2);
-                            // Since we only want the first conflict, don't
-                            // recurse to child directories.
-                            return Ok((Some((path1, path2)), Vec::new()));
+                        if !excluded_paths.contains_prefix(path.as_ref()) {
+                            if let Some((name1, name2)) =
+                                sk_mf.first_new_child_case_conflict(&parents)
+                            {
+                                let optional_path = path.into_optional_non_root_path();
+                                let path1 =
+                                    NonRootMPath::join_opt_element(optional_path.as_ref(), name1);
+                                let path2 =
+                                    NonRootMPath::join_opt_element(optional_path.as_ref(), name2);
+
+                                // Since we only want the first conflict, don't
+                                // recurse to child directories.
+                                return Ok((Some((path1, path2)), Vec::new()));
+                            }
                         }
                     }
 
@@ -176,7 +187,7 @@ impl SkeletonManifest {
                     let recurse_ids = sk_mf
                         .recurse_new_descendant_case_conflicts(&parents)
                         .map(|(name, recurse_id, recurse_parent_ids)| async move {
-                            let recurse_path = NonRootMPath::join_opt_element(path.as_ref(), name);
+                            let recurse_path = path.join_element(Some(name));
                             let (recurse_sk_mf, recurse_parents) = try_join(
                                 recurse_id.load(ctx, blobstore),
                                 try_join_all(
@@ -186,7 +197,7 @@ impl SkeletonManifest {
                                 ),
                             )
                             .await?;
-                            Ok::<_, Error>((Some(recurse_path), recurse_sk_mf, recurse_parents))
+                            Ok::<_, Error>((recurse_path, recurse_sk_mf, recurse_parents))
                         })
                         .collect::<Vec<_>>();
 
@@ -301,7 +312,9 @@ impl SkeletonManifest {
         })
     }
 
-    pub(crate) fn from_thrift(t: thrift::SkeletonManifest) -> Result<SkeletonManifest> {
+    pub(crate) fn from_thrift(
+        t: thrift::skeleton_manifest::SkeletonManifest,
+    ) -> Result<SkeletonManifest> {
         let subentries = t
             .subentries
             .into_iter()
@@ -318,14 +331,14 @@ impl SkeletonManifest {
         })
     }
 
-    pub(crate) fn into_thrift(self) -> thrift::SkeletonManifest {
+    pub(crate) fn into_thrift(self) -> thrift::skeleton_manifest::SkeletonManifest {
         let subentries: SortedVectorMap<_, _> = self
             .subentries
             .into_iter()
             .map(|(basename, fsnode_entry)| (basename.into_thrift(), fsnode_entry.into_thrift()))
             .collect();
         let summary = self.summary.into_thrift();
-        thrift::SkeletonManifest {
+        thrift::skeleton_manifest::SkeletonManifest {
             subentries,
             summary,
         }
@@ -345,7 +358,9 @@ pub enum SkeletonManifestEntry {
 }
 
 impl SkeletonManifestEntry {
-    pub(crate) fn from_thrift(t: thrift::SkeletonManifestEntry) -> Result<SkeletonManifestEntry> {
+    pub(crate) fn from_thrift(
+        t: thrift::skeleton_manifest::SkeletonManifestEntry,
+    ) -> Result<SkeletonManifestEntry> {
         match t.directory {
             None => Ok(SkeletonManifestEntry::File),
             Some(skeleton_directory) => {
@@ -356,14 +371,14 @@ impl SkeletonManifestEntry {
         }
     }
 
-    pub(crate) fn into_thrift(self) -> thrift::SkeletonManifestEntry {
+    pub(crate) fn into_thrift(self) -> thrift::skeleton_manifest::SkeletonManifestEntry {
         let directory = match self {
             SkeletonManifestEntry::File => None,
             SkeletonManifestEntry::Directory(skeleton_directory) => {
                 Some(skeleton_directory.into_thrift())
             }
         };
-        thrift::SkeletonManifestEntry { directory }
+        thrift::skeleton_manifest::SkeletonManifestEntry { directory }
     }
 }
 
@@ -391,15 +406,15 @@ impl SkeletonManifestDirectory {
     }
 
     pub(crate) fn from_thrift(
-        t: thrift::SkeletonManifestDirectory,
+        t: thrift::skeleton_manifest::SkeletonManifestDirectory,
     ) -> Result<SkeletonManifestDirectory> {
         let id = SkeletonManifestId::from_thrift(t.id)?;
         let summary = SkeletonManifestSummary::from_thrift(t.summary)?;
         Ok(SkeletonManifestDirectory { id, summary })
     }
 
-    pub(crate) fn into_thrift(self) -> thrift::SkeletonManifestDirectory {
-        thrift::SkeletonManifestDirectory {
+    pub(crate) fn into_thrift(self) -> thrift::skeleton_manifest::SkeletonManifestDirectory {
+        thrift::skeleton_manifest::SkeletonManifestDirectory {
             id: self.id.into_thrift(),
             summary: self.summary.into_thrift(),
         }
@@ -424,7 +439,7 @@ pub struct SkeletonManifestSummary {
 
 impl SkeletonManifestSummary {
     pub(crate) fn from_thrift(
-        t: thrift::SkeletonManifestSummary,
+        t: thrift::skeleton_manifest::SkeletonManifestSummary,
     ) -> Result<SkeletonManifestSummary> {
         Ok(SkeletonManifestSummary {
             child_files_count: t.child_files_count as u64,
@@ -442,8 +457,8 @@ impl SkeletonManifestSummary {
         })
     }
 
-    pub(crate) fn into_thrift(self) -> thrift::SkeletonManifestSummary {
-        thrift::SkeletonManifestSummary {
+    pub(crate) fn into_thrift(self) -> thrift::skeleton_manifest::SkeletonManifestSummary {
+        thrift::skeleton_manifest::SkeletonManifestSummary {
             child_files_count: self.child_files_count as i64,
             descendant_files_count: self.descendant_files_count as i64,
             child_dirs_count: self.child_dirs_count as i64,

@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-strict
+
 import hashlib
 import json
 import os
@@ -28,14 +30,15 @@ from eden.fs.cli.doctor.problem import (
 from eden.fs.cli.doctor.util import CheckoutInfo
 from eden.fs.cli.filesystem import FsUtil
 from eden.fs.cli.prjfs import PRJ_FILE_STATE
-from eden.thrift.legacy import EdenClient
 from facebook.eden.constants import DIS_REQUIRE_LOADED, DIS_REQUIRE_MATERIALIZED
 from facebook.eden.ttypes import (
     DebugInvalidateRequest,
     EdenError,
+    GetCurrentSnapshotInfoRequest,
     GetScmStatusParams,
     MatchFileSystemRequest,
     MountId,
+    RootIdOptions,
     ScmFileStatus,
     SyncBehavior,
     TimeSpec,
@@ -100,7 +103,10 @@ class MercurialDataOnNFS(Problem):
             f" {dst_shared_path} which is on a NFS filesystem."
             f" Accessing files and directories in this repository will be slow."
         )
-        super().__init__(msg, severity=ProblemSeverity.ADVICE)
+        remediation = (
+            "To fix this, move the Mercurial data directory to a non-NFS filesystem."
+        )
+        super().__init__(msg, remediation, severity=ProblemSeverity.ADVICE)
 
 
 def check_shared_path(tracker: ProblemTracker, mount_path: Path) -> None:
@@ -182,34 +188,22 @@ class LowDiskSpace(Problem):
         super().__init__(message, severity=severity)
 
 
-class LowDiskSpaceMacOS(Problem, FixableProblem):
+class LowDiskSpaceMacOS(Problem):
     """
-    The LowDiskSpace problem **on macOS** is potentially fixable, so we have a separate class for it (as a subclass of FixableProblem).
-    For all other OSes, use the regular LowDiskSpace problem class.
+    The LowDiskSpace problem **on macOS** is potentially fixable, but we don't
+    have the permissions to fix it (see https://fburl.com/edenfs_purgeable).
+    We will give the user advice on how they can remediate themselves.
     """
+
+    util_purge = "eden du --purgeable"
 
     def __init__(self, message: str, severity: ProblemSeverity) -> None:
-        super().__init__(message, severity=severity)
-
-    def dry_run_msg(self) -> str:
-        return "Would attempt to purge the APFS cache\n"
-
-    def start_msg(self) -> str:
-        return "Trying to purge the APFS cache...\n"
-
-    def perform_fix(self) -> None:
-        apfs_util = "/System/Library/Filesystems/apfs.fs/Contents/Resources/apfs.util"
-        command = f"{apfs_util} -P ~/*"
-        try:
-            subprocess.run(
-                command,
-                shell=True,
-                stdout=subprocess.PIPE,
-                check=True,
-                text=True,
-            )
-        except subprocess.CalledProcessError as e:
-            raise RemediationError(f"Failed to purge APFS cache.\n{e}")
+        addtl_msg = (
+            f"\nA significant portion of your disk may be used up by purgeable "
+            f"space. You can check and clear purgeable space with: \n\n'{self.util_purge}'\n\n"
+            f"See https://fburl.com/edenfs_purgeable for more info.\n"
+        )
+        super().__init__(message + addtl_msg, severity=severity)
 
 
 def check_disk_usage(
@@ -595,7 +589,11 @@ def check_materialized_are_accessible(
                             == FILE_ATTRIBUTE_REPARSE_POINT
                         )
                         if is_reparse:
-                            dirent_mode = stat.S_IFREG
+                            dirent_mode = (
+                                stat.S_IFLNK
+                                if windows_symlinks_enabled
+                                else stat.S_IFREG
+                            )
                         else:
                             dirent_mode = stat.S_IFDIR
 
@@ -848,10 +846,20 @@ class HgStatusAndDiffMismatch(PathsProblem):
 
 def get_modified_files(instance: EdenInstance, checkout: EdenCheckout) -> List[Path]:
     with instance.get_thrift_client_legacy(timeout=60.0) as client:
+        # We are required to pass the active FilterId to getScmStatusV2. We
+        # can find the active FilterId with GetCurrentSnapshotInfo
+        snapshot_info = client.getCurrentSnapshotInfo(
+            GetCurrentSnapshotInfoRequest(MountId(bytes(checkout.path)))
+        )
+        active_filter = snapshot_info.filterId
+        rootId = RootIdOptions()
+        if active_filter is not None:
+            rootId = RootIdOptions(filterId=active_filter)
         status = client.getScmStatusV2(
             GetScmStatusParams(
                 mountPoint=bytes(checkout.path),
                 commit=checkout.get_snapshot().working_copy_parent.encode(),
+                rootIdOptions=rootId,
             )
         )
 

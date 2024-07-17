@@ -1,11 +1,13 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # coding=utf-8
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-  $ setconfig "visibility.enabled=true" "experimental.narrow-heads=1" "remotenames.selectivepull=1" "mutation.date=0 0" "metalog.track-config=0"
+  $ setconfig "visibility.enabled=true" "experimental.narrow-heads=1" "remotenames.selectivepull=1" "metalog.track-config=0"
 
   $ newrepo
   $ enable remotenames amend

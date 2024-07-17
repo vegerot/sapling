@@ -17,7 +17,6 @@ import glob
 import os
 import re
 import socket
-import subprocess
 import tempfile
 import time
 
@@ -317,7 +316,17 @@ def callcatch(ui, req, func):
                 # SSLError of Python 2.7.9 contains a unicode
                 reason = encoding.unitolocal(reason)
             ui.warn(_("error: %s\n") % reason, error=_("abort"))
-        elif hasattr(inst, "args") and inst.args and inst.args[0] == errno.EPIPE:
+        elif (
+            not ui.debugflag
+            and hasattr(inst, "args")
+            and inst.args
+            and inst.args[0] == errno.EPIPE
+            # "sl files . | head" yields "Broken pipe"
+            # "sl files ." then "q" in streampager yields "pipe reader has been dropped"
+            # But, Windows gives you a BrokenPipe error in different cases such as unlinking a file that is in use.
+            # Let's only eat the error if it explicitly mentions "pipe".
+            and "pipe" in inst.args[1]
+        ):
             pass
         elif getattr(inst, "strerror", None):
             filename = getattr(inst, "filename", None)
@@ -749,8 +758,20 @@ def origpath(ui, repo, filepath):
     if not origbackuppath:
         return filepath + ".orig"
 
+    origbackuppath = origbackuppath.replace("@DOTDIR@", ui.identity.dotdir())
+
     # Convert filepath from an absolute path into a path inside the repo.
     filepathfromroot = util.normpath(os.path.relpath(filepath, start=repo.root))
+
+    # Auto-correct identity path
+    if origbackuppath.startswith("."):
+        for ident in bindings.identity.all():
+            dotdir = ident.dotdir()
+            if origbackuppath.startswith(dotdir):
+                origbackuppath = (
+                    repo.ui.identity.dotdir() + origbackuppath[len(dotdir) :]
+                )
+                break
 
     origvfs = vfs.vfs(repo.wjoin(origbackuppath))
     origbackupdir = origvfs.dirname(filepathfromroot)
@@ -915,6 +936,11 @@ def addremove(repo, matcher, prefix, opts=None, dry_run=None, similarity=None):
     if similarity is None:
         similarity = float(opts.get("similarity") or 0)
 
+    # Is there a better place for this?
+    from . import git
+
+    git.maybe_cleanup_submodule_in_treestate(repo)
+
     rejected = []
 
     def badfn(f, msg):
@@ -1020,7 +1046,7 @@ def _findrenames(repo, matcher, added, removed, similarity):
         for old, new, score in similar.findrenames(repo, added, removed, similarity):
             if repo.ui.verbose or not matcher.exact(old) or not matcher.exact(new):
                 repo.ui.status(
-                    _("recording removal of %s as rename to %s " "(%d%% similar)\n")
+                    _("recording removal of %s as rename to %s (%d%% similar)\n")
                     % (matcher.rel(old), matcher.rel(new), score * 100)
                 )
             renames[new] = old

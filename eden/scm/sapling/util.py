@@ -34,7 +34,6 @@ import hashlib
 import itertools
 import mmap
 import os
-import platform as pyplatform
 import random
 import re as remod
 import shutil
@@ -46,7 +45,6 @@ import subprocess
 import sys
 import tempfile
 import textwrap
-import threading
 import time
 import traceback
 import types
@@ -135,6 +133,8 @@ else:
 
 
 # The main Rust IO. It handles progress and streampager.
+# This is for low-level operations where the `ui` object is not present.
+# If you have `ui`, use` ui.io` instead.
 get_main_io = bindings.io.IO.main
 
 # Define a fail point.
@@ -463,10 +463,10 @@ def popen3(cmd, env=None, newlines=False):
     return stdin, stdout, stderr
 
 
-def popen4(cmd, env=None, newlines=False, bufsize=-1):
+def popen4(cmd, env=None, newlines=False, bufsize=-1, shell=True):
     p = subprocess.Popen(
         cmd,
-        shell=True,
+        shell=shell,
         bufsize=bufsize,
         close_fds=closefds,
         stdin=subprocess.PIPE,
@@ -1049,15 +1049,18 @@ def lrucachefunc(func):
 
     else:
 
-        def f(*args):
-            if args not in cache:
+        def f(*args, **kwargs):
+            cachekey = args
+            if kwargs:
+                cachekey = (args, tuple(sorted(kwargs.items())))
+            if cachekey not in cache:
                 if len(cache) > 20:
                     del cache[order.popleft()]
-                cache[args] = func(*args)
+                cache[cachekey] = func(*args, **kwargs)
             else:
-                order.remove(args)
-            order.append(args)
-            return cache[args]
+                order.remove(cachekey)
+            order.append(cachekey)
+            return cache[cachekey]
 
     return f
 
@@ -1254,23 +1257,7 @@ def pathto(root, n1, n2):
     return pycompat.ossep.join(([".."] * len(a)) + b) or "."
 
 
-def mainfrozen():
-    """return True if we are a frozen executable.
-
-    The code supports py2exe (most common, Windows only) and tools/freeze
-    (portable, not much used).
-    """
-    return hasattr(sys, "frozen") or hasattr(
-        sys, "importers"
-    )  # new py2exe  # tools/freeze
-
-
-# the location of data files matching the source code
-# pyre-fixme[16]: Module `sys` has no attribute `frozen`.
-if mainfrozen() and getattr(sys, "frozen", None) != "macosx_app":
-    # executable version (py2exe) doesn't support __file__
-    datapath = os.path.dirname(pycompat.sysexecutable)
-elif "HGDATAPATH" in os.environ:
+if "HGDATAPATH" in os.environ:
     datapath = os.environ["HGDATAPATH"]
 else:
     datapath = os.path.dirname(__file__)
@@ -1287,17 +1274,8 @@ def hgexecutable():
     """
     if _hgexecutable is None:
         hg = encoding.environ.get("HG")
-        mainmod = sys.modules["__main__"]
         if hg:
             _sethgexecutable(hg)
-        elif mainfrozen():
-            if getattr(sys, "frozen", None) == "macosx_app":
-                # Env variable set by py2app
-                _sethgexecutable(encoding.environ["EXECUTABLEPATH"])
-            else:
-                _sethgexecutable(pycompat.sysexecutable)
-        elif os.path.basename(getattr(mainmod, "__file__", None) or "") == "hg":
-            _sethgexecutable(mainmod.__file__)
         else:
             exe = findexe("hg") or os.path.basename(sys.argv[0])
             _sethgexecutable(exe)
@@ -2406,7 +2384,7 @@ def parsedate(date):
     True
     >>> parsedate('yesterday ') == parsedate(
     ...     (datetime.date.today() - datetime.timedelta(days=1)
-    ...      ).strftime('%b %d'))
+    ...      ).strftime('%b %d %Y'))
     True
     >>> now, tz = makedate()
     >>> strnow, strtz = parsedate('now')
@@ -2523,6 +2501,65 @@ def stringmatcher(pattern, casesensitive=True):
         ipat = encoding.lower(pattern)
         match = lambda s: ipat == encoding.lower(s)
     return "literal", pattern, match
+
+
+def cachedstringmatcher(pattern, _cache={}):
+    # _cache is shared across function calls
+    result = _cache.get(pattern)
+    if result is None:
+        result = stringmatcher(pattern)[-1]
+        _cache[pattern] = result
+    return result
+
+
+def bytesmatcher(pattern):
+    """
+    accepts a byte string, possibly starting with b're:' or b'literal:' prefix.
+    returns the matcher name, pattern, and matcher function.
+    missing or unknown prefixes are treated as literal matches.
+
+    helper for tests:
+    >>> def test(pattern, *tests):
+    ...     kind, pattern, matcher = bytesmatcher(pattern)
+    ...     return (kind, pattern, [bool(matcher(t)) for t in tests])
+
+    exact matching (no prefix):
+    >>> test(b'abcdefg', b'abc', b'def', b'abcdefg')
+    ('literal', b'abcdefg', [False, False, True])
+
+    regex matching ('re:' prefix)
+    >>> test(b're:a.+b', b'nomatch', b'fooadef', b'fooadefbar')
+    ('re', b'a.+b', [False, False, True])
+
+    force exact matches ('literal:' prefix)
+    >>> test(b'literal:re:foobar', b'foobar', b're:foobar')
+    ('literal', b're:foobar', [False, True])
+
+    unknown prefixes are ignored and treated as literals
+    >>> test(b'foo:bar', b'foo', b'bar', b'foo:bar')
+    ('literal', b'foo:bar', [False, False, True])
+    """
+    if pattern.startswith(b"re:"):
+        pattern = pattern[3:]
+        try:
+            regex = remod.compile(pattern)
+        except remod.error as e:
+            raise error.ParseError(_("invalid regular expression: %s") % e)
+        return "re", pattern, regex.search
+    elif pattern.startswith(b"literal:"):
+        pattern = pattern[8:]
+
+    match = lambda x: x == pattern
+    return "literal", pattern, match
+
+
+def cachedbytesmatcher(pattern, _cache={}):
+    # _cache is shared across function calls
+    result = _cache.get(pattern)
+    if result is None:
+        result = bytesmatcher(pattern)[-1]
+        _cache[pattern] = result
+    return result
 
 
 def shortuser(user: str) -> str:
@@ -4907,3 +4944,47 @@ def dedup(items):
 
     """
     return list(collections.OrderedDict.fromkeys(items))
+
+
+def import_curses():
+    if os.name == "nt" and "_curses" not in sys.modules:
+        sys.modules["_curses"] = bindings.cext._curses
+        sys.modules["_curses_panel"] = bindings.cext._curses_panel
+
+    try:
+        import curses
+
+        curses.error
+
+    except (AttributeError, ImportError):
+        curses = False
+
+    return curses
+
+
+def no_recursion(func):
+    """Funtion decorator to avoid recursion of a free function.
+    If recursion happens, return None.
+
+    >>> @no_recursion
+    ... def f(x):
+    ...     return x if x < 1 else f(x - 1)
+    >>> f(0)
+    0
+    >>> f(1) is None
+    True
+    """
+    depth = 0
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        nonlocal depth
+        if depth > 0:
+            return None
+        try:
+            depth += 1
+            return func(*args, **kwargs)
+        finally:
+            depth -= 1
+
+    return wrapper

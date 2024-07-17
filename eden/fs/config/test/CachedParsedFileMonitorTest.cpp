@@ -7,15 +7,15 @@
 
 #include "eden/fs/config/EdenConfig.h"
 
-#include <folly/experimental/TestUtil.h>
 #include <folly/portability/GTest.h>
 #include <folly/test/TestUtils.h>
+#include <folly/testing/TestUtil.h>
 
+#include "eden/common/utils/FileUtils.h"
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/config/CachedParsedFileMonitor.h"
 #include "eden/fs/model/git/GitIgnore.h"
 #include "eden/fs/model/git/GitIgnoreFileParser.h"
-#include "eden/fs/utils/FileUtils.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 using facebook::eden::AbsolutePath;
 using facebook::eden::CachedParsedFileMonitor;

@@ -7,19 +7,19 @@
 
 #pragma once
 
-#include <folly/experimental/AtomicReadMostlyMainPtr.h>
+#include <folly/concurrency/memory/AtomicReadMostlyMainPtr.h>
 #include <folly/portability/Windows.h>
 #include <thrift/lib/cpp/util/EnumUtils.h>
 
+#include "eden/common/telemetry/TraceBus.h"
+#include "eden/common/utils/Guid.h"
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/RefPtr.h"
 #include "eden/fs/inodes/FsChannel.h"
 #include "eden/fs/prjfs/Enumerator.h"
 #include "eden/fs/prjfs/PrjfsDispatcher.h"
 #include "eden/fs/service/gen-cpp2/eden_types.h"
-#include "eden/fs/telemetry/TraceBus.h"
-#include "eden/fs/utils/Guid.h"
-#include "eden/fs/utils/PathFuncs.h"
 #include "eden/fs/utils/ProcessAccessLog.h"
-#include "eden/fs/utils/RefPtr.h"
 
 #ifdef _WIN32
 #include <ProjectedFSLib.h> // @manual
@@ -36,6 +36,8 @@ class Notifier;
 class ReloadableConfig;
 class PrjfsChannelInner;
 class PrjfsRequestContext;
+class StructuredLogger;
+class FaultInjector;
 
 using EdenStatsPtr = RefPtr<EdenStats>;
 
@@ -164,10 +166,14 @@ class PrjfsChannelInner {
   PrjfsChannelInner(
       std::unique_ptr<PrjfsDispatcher> dispatcher,
       const folly::Logger* straceLogger,
+      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      FaultInjector& faultInjector,
       ProcessAccessLog& processAccessLog,
+      std::shared_ptr<ReloadableConfig>& config,
       folly::Promise<folly::Unit> deletedPromise,
       std::shared_ptr<Notifier> notifier,
-      size_t prjfsTraceBusCapacity);
+      size_t prjfsTraceBusCapacity,
+      const std::shared_ptr<folly::Executor>& invalidationThreadPool);
 
   ~PrjfsChannelInner();
 
@@ -451,11 +457,28 @@ class PrjfsChannelInner {
   std::unique_ptr<PrjfsDispatcher> dispatcher_;
   const folly::Logger* const straceLogger_{nullptr};
 
+  // scuba logger
+  const std::shared_ptr<StructuredLogger> structuredLogger_;
+
+  FaultInjector& faultInjector_;
+
+  // thread pool used for invalidation operations. These can block and it's
+  // likely better not to run them on the same thread as we process requests
+  // PrjFS in case there is any re-entrancy.
+  const std::shared_ptr<folly::Executor> invalidationThreadPool_;
+
+  // The last time we logged a about a torn read the interval at which
+  // we log is set by EdenConfig::tornReadLogInterval.
+  std::shared_ptr<folly::Synchronized<std::chrono::steady_clock::time_point>>
+      lastTornReadLog_;
+
   std::shared_ptr<Notifier> notifier_;
 
   // The processAccessLog_ is owned by PrjfsChannel which is guaranteed to have
   // its lifetime be longer than that of PrjfsChannelInner.
   ProcessAccessLog& processAccessLog_;
+
+  std::shared_ptr<ReloadableConfig> config_;
 
   // Set of currently active directory enumerations.
   folly::Synchronized<folly::F14FastMap<Guid, std::shared_ptr<Enumerator>>>
@@ -490,10 +513,13 @@ class PrjfsChannel : public FsChannel {
       std::unique_ptr<PrjfsDispatcher> dispatcher,
       std::shared_ptr<ReloadableConfig> config,
       const folly::Logger* straceLogger,
+      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      FaultInjector& faultInjector,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
       Guid guid,
       bool enableWindowsSymlinks,
-      std::shared_ptr<Notifier> notifier);
+      std::shared_ptr<Notifier> notifier,
+      const std::shared_ptr<folly::Executor>& invalidationThreadPool);
 
   virtual ~PrjfsChannel();
 

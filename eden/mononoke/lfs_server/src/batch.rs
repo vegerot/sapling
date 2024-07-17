@@ -327,10 +327,15 @@ async fn internal_objects(
         .filter_map(|(maybe_obj, consistent_routing)| match maybe_obj {
             // Map the objects we have locally into an action routing to a Mononoke LFS server.
             Some(obj) => {
-                let uri = if let Some(consistent_routing) = consistent_routing && ctx.config.enable_consistent_routing() {
+                let uri = if let Some(consistent_routing) = consistent_routing
+                    && ctx.config.enable_consistent_routing()
+                {
                     let routing_key = generate_routing_key(consistent_routing, obj.oid);
-                    ctx.uri_builder
-                        .consistent_download_uri(&obj.id, routing_key, consistent_routing)
+                    ctx.uri_builder.consistent_download_uri(
+                        &obj.id,
+                        routing_key,
+                        consistent_routing,
+                    )
                 } else {
                     ctx.uri_builder.download_uri(&obj.id)
                 };
@@ -822,7 +827,7 @@ mod test {
         assert_eq!(&routing_key_base, &allowed_routing_key_base);
 
         // random key case
-        let allowed_routing_keys = vec![allowed_routing_key_base, allowed_routing_key_one];
+        let allowed_routing_keys = [allowed_routing_key_base, allowed_routing_key_one];
         for _ in 0..5 {
             let routing_key = generate_routing_key(NonZeroU16::new(2).unwrap(), ONES_SHA256);
             assert!(allowed_routing_keys.contains(&routing_key))

@@ -1,5 +1,6 @@
-#debugruntest-compatible
-  $ configure modernclient
+
+#require no-eden
+
 
   $ setconfig format.allowbundle1=true format.usegeneraldelta=yes
 
@@ -22,7 +23,7 @@ bundle w/o type option
   adding changesets
   adding manifests
   adding file changes
-  $ hg up
+  $ hg up tip
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ hg log | grep summary
   summary:     a
@@ -125,7 +126,7 @@ test bundle types
   % test bundle type v1
   searching for changes
   devel-warn: using deprecated bundlev1 format
-   at: */changegroup.py:* (makechangegroup) (glob)
+   at: *changegroup* (makechangegroup) (glob)
   1 changesets found
   HG10BZ
   c35a0f9217e65d1fdb90c936ffa7dbe679f83ddf
@@ -134,7 +135,7 @@ test bundle types
   % test bundle type gzip-v1
   searching for changes
   devel-warn: using deprecated bundlev1 format
-   at: */changegroup.py:* (makechangegroup) (glob)
+   at: *changegroup* (makechangegroup) (glob)
   1 changesets found
   HG10GZ
   c35a0f9217e65d1fdb90c936ffa7dbe679f83ddf
@@ -226,7 +227,7 @@ test garbage file
   $ echo garbage > bgarbage
   $ newclientrepo tgarbage
   $ hg unbundle ../bgarbage
-  abort: ../bgarbage: not a Mercurial bundle
+  abort: ../bgarbage: not a Sapling bundle
   [255]
   $ cd ..
 

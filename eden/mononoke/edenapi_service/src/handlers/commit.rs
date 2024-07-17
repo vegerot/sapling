@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Error;
+use async_stream::try_stream;
 use async_trait::async_trait;
 use blobstore::Loadable;
 use edenapi_types::wire::WireCommitHashToLocationRequestBatch;
@@ -59,12 +60,15 @@ use gotham::state::State;
 use gotham_derive::StateData;
 use gotham_derive::StaticResponseExtender;
 use gotham_ext::error::HttpError;
+use gotham_ext::middleware::request_context::RequestContext;
 use gotham_ext::middleware::scuba::ScubaMiddlewareState;
 use gotham_ext::response::TryIntoResponse;
 use mercurial_types::HgChangesetId;
 use mercurial_types::HgNodeHash;
 use mononoke_api::CreateInfo;
 use mononoke_api::MononokeError;
+use mononoke_api::XRepoLookupExactBehaviour;
+use mononoke_api::XRepoLookupSyncBehaviour;
 use mononoke_api_hg::HgRepoContext;
 use mononoke_types::hash::GitSha1;
 use mononoke_types::ChangesetId;
@@ -72,19 +76,17 @@ use mononoke_types::DateTime;
 use mononoke_types::FileChange;
 use mononoke_types::Globalrev;
 use serde::Deserialize;
-use tunables::tunables;
 use types::HgId;
 use types::Parents;
 
-use super::handler::EdenApiContext;
-use super::EdenApiHandler;
-use super::EdenApiMethod;
+use super::handler::SaplingRemoteApiContext;
 use super::HandlerInfo;
 use super::HandlerResult;
+use super::SaplingRemoteApiHandler;
+use super::SaplingRemoteApiMethod;
 use crate::context::ServerContext;
 use crate::errors::ErrorKind;
 use crate::middleware::request_dumper::RequestDumper;
-use crate::middleware::RequestContext;
 use crate::utils::cbor_stream_filtered_errors;
 use crate::utils::custom_cbor_stream;
 use crate::utils::get_repo;
@@ -92,7 +94,7 @@ use crate::utils::parse_cbor_request;
 use crate::utils::parse_wire_request;
 use crate::utils::to_create_change;
 use crate::utils::to_hg_path;
-use crate::utils::to_mononoke_path;
+use crate::utils::to_mpath;
 use crate::utils::to_revlog_changeset;
 
 /// XXX: This number was chosen arbitrarily.
@@ -137,12 +139,12 @@ async fn translate_location(
 }
 
 #[async_trait]
-impl EdenApiHandler for LocationToHashHandler {
+impl SaplingRemoteApiHandler for LocationToHashHandler {
     type Request = CommitLocationToHashRequestBatch;
     type Response = CommitLocationToHashResponse;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::CommitLocationToHash;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CommitLocationToHash;
     const ENDPOINT: &'static str = "/commit/location_to_hash";
 
     fn sampling_rate(_request: &Self::Request) -> NonZeroU64 {
@@ -150,7 +152,7 @@ impl EdenApiHandler for LocationToHashHandler {
     }
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
@@ -193,7 +195,7 @@ pub async fn hash_to_location(state: &mut State) -> Result<impl TryIntoResponse,
 
     state.put(HandlerInfo::new(
         &params.repo,
-        EdenApiMethod::CommitHashToLocation,
+        SaplingRemoteApiMethod::CommitHashToLocation,
     ));
 
     ScubaMiddlewareState::try_set_sampling_rate(state, nonzero_ext::nonzero!(256_u64));
@@ -235,7 +237,7 @@ pub async fn revlog_data(state: &mut State) -> Result<impl TryIntoResponse, Http
 
     state.put(HandlerInfo::new(
         &params.repo,
-        EdenApiMethod::CommitRevlogData,
+        SaplingRemoteApiMethod::CommitRevlogData,
     ));
 
     let sctx = ServerContext::borrow_from(state);
@@ -271,16 +273,16 @@ async fn commit_revlog_data(
 pub struct HashLookupHandler;
 
 #[async_trait]
-impl EdenApiHandler for HashLookupHandler {
+impl SaplingRemoteApiHandler for HashLookupHandler {
     type Request = Batch<CommitHashLookupRequest>;
     type Response = CommitHashLookupResponse;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::CommitHashLookup;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CommitHashLookup;
     const ENDPOINT: &'static str = "/commit/hash_lookup";
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
@@ -307,16 +309,16 @@ impl EdenApiHandler for HashLookupHandler {
 pub struct UploadHgChangesetsHandler;
 
 #[async_trait]
-impl EdenApiHandler for UploadHgChangesetsHandler {
+impl SaplingRemoteApiHandler for UploadHgChangesetsHandler {
     type Request = UploadHgChangesetsRequest;
     type Response = UploadTokensResponse;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::UploadHgChangesets;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::UploadHgChangesets;
     const ENDPOINT: &'static str = "/upload/changesets";
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
@@ -359,17 +361,17 @@ impl EdenApiHandler for UploadHgChangesetsHandler {
 pub struct UploadBonsaiChangesetHandler;
 
 #[async_trait]
-impl EdenApiHandler for UploadBonsaiChangesetHandler {
+impl SaplingRemoteApiHandler for UploadBonsaiChangesetHandler {
     type QueryStringExtractor = UploadBonsaiChangesetQueryString;
     type Request = UploadBonsaiChangesetRequest;
     type Response = UploadTokensResponse;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::UploadBonsaiChangeset;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::UploadBonsaiChangeset;
     const ENDPOINT: &'static str = "/upload/changeset/bonsai";
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
@@ -404,7 +406,7 @@ impl EdenApiHandler for UploadBonsaiChangesetHandler {
                     .map(|(path, fc)| {
                         let create_change = to_create_change(fc, bubble_id)
                             .with_context(|| anyhow!("Parsing file changes for {}", path))?;
-                        Ok((to_mononoke_path(path)?, create_change))
+                        Ok((to_mpath(path)?, create_change))
                     })
                     .collect::<anyhow::Result<_>>()?,
                 match bubble_id {
@@ -433,28 +435,28 @@ impl EdenApiHandler for UploadBonsaiChangesetHandler {
 pub struct FetchSnapshotHandler;
 
 #[async_trait]
-impl EdenApiHandler for FetchSnapshotHandler {
+impl SaplingRemoteApiHandler for FetchSnapshotHandler {
     type Request = FetchSnapshotRequest;
     type Response = FetchSnapshotResponse;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::FetchSnapshot;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::FetchSnapshot;
     const ENDPOINT: &'static str = "/snapshot";
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
         let cs_id = ChangesetId::from(request.cs_id);
         let bubble_id = repo
             .ephemeral_store()
-            .bubble_from_changeset(&cs_id)
+            .bubble_from_changeset(repo.ctx(), &cs_id)
             .await?
             .context("Snapshot not in a bubble")?;
         let labels = repo
             .ephemeral_store()
-            .labels_from_bubble(&bubble_id)
+            .labels_from_bubble(repo.ctx(), &bubble_id)
             .await
             .context("Failed to fetch labels associated with the snapshot")?;
         let blobstore = repo.bubble_blobstore(Some(bubble_id)).await?;
@@ -523,23 +525,23 @@ impl EdenApiHandler for FetchSnapshotHandler {
 pub struct AlterSnapshotHandler;
 
 #[async_trait]
-impl EdenApiHandler for AlterSnapshotHandler {
+impl SaplingRemoteApiHandler for AlterSnapshotHandler {
     type Request = AlterSnapshotRequest;
     type Response = AlterSnapshotResponse;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::AlterSnapshot;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::AlterSnapshot;
     const ENDPOINT: &'static str = "/snapshot/alter";
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
         let cs_id = ChangesetId::from(request.cs_id);
         let id = repo
             .ephemeral_store()
-            .bubble_from_changeset(&cs_id)
+            .bubble_from_changeset(repo.ctx(), &cs_id)
             .await?
             .context("Snapshot does not exist or has already expired")?;
         let (label_addition, label_removal) = (
@@ -554,16 +556,19 @@ impl EdenApiHandler for AlterSnapshotHandler {
         } else if label_addition {
             // Input has labels to add, so let's add the input labels.
             repo.ephemeral_store()
-                .add_bubble_labels(id, request.labels_to_add.clone())
+                .add_bubble_labels(repo.ctx(), id, request.labels_to_add.clone())
                 .await?;
         } else {
             // Input has labels to remove, or no labels as input at all. In either case,
             // we need to remove specific or all labels corresponding to the bubble.
             repo.ephemeral_store()
-                .remove_bubble_labels(id, request.labels_to_remove.clone())
+                .remove_bubble_labels(repo.ctx(), id, request.labels_to_remove.clone())
                 .await?;
         }
-        let current_labels = repo.ephemeral_store().labels_from_bubble(&id).await?;
+        let current_labels = repo
+            .ephemeral_store()
+            .labels_from_bubble(repo.ctx(), &id)
+            .await?;
         let response = AlterSnapshotResponse { current_labels };
         Ok(stream::once(async move { Ok(response) }).boxed())
     }
@@ -573,16 +578,16 @@ impl EdenApiHandler for AlterSnapshotHandler {
 pub struct EphemeralPrepareHandler;
 
 #[async_trait]
-impl EdenApiHandler for EphemeralPrepareHandler {
+impl SaplingRemoteApiHandler for EphemeralPrepareHandler {
     type Request = EphemeralPrepareRequest;
     type Response = EphemeralPrepareResponse;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::EphemeralPrepare;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::EphemeralPrepare;
     const ENDPOINT: &'static str = "/ephemeral/prepare";
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
@@ -605,16 +610,16 @@ impl EdenApiHandler for EphemeralPrepareHandler {
 pub struct GraphHandlerV2;
 
 #[async_trait]
-impl EdenApiHandler for GraphHandlerV2 {
+impl SaplingRemoteApiHandler for GraphHandlerV2 {
     type Request = CommitGraphRequest;
     type Response = CommitGraphEntry;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::CommitGraphV2;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CommitGraphV2;
     const ENDPOINT: &'static str = "/commit/graph_v2";
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
@@ -629,9 +634,25 @@ impl EdenApiHandler for GraphHandlerV2 {
             .map(|hg_id| HgChangesetId::new(HgNodeHash::from(hg_id)))
             .collect();
 
-        if tunables()
-            .enable_streaming_commit_graph_edenapi_endpoint()
-            .unwrap_or_default()
+        if common.is_empty()
+            && repo
+                .repo()
+                .config()
+                .commit_graph_config
+                .disable_commit_graph_v2_with_empty_common
+        {
+            Err(anyhow!(
+                "Commit graph v2 with empty common is not allowed for repo {}",
+                repo.repo().name(),
+            ))?
+        }
+
+        if justknobs::eval(
+            "scm/mononoke:enable_streaming_commit_graph_edenapi_endpoint",
+            None,
+            None,
+        )
+        .unwrap_or_default()
         {
             // If all the requested heads are public, return stream.
             if heads.len() < PHASES_CHECK_LIMIT && repo.is_all_public(&heads).await? {
@@ -675,16 +696,16 @@ impl EdenApiHandler for GraphHandlerV2 {
 pub struct GraphSegmentsHandler;
 
 #[async_trait]
-impl EdenApiHandler for GraphSegmentsHandler {
+impl SaplingRemoteApiHandler for GraphSegmentsHandler {
     type Request = CommitGraphSegmentsRequest;
     type Response = CommitGraphSegmentsEntry;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::CommitGraphSegments;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CommitGraphSegments;
     const ENDPOINT: &'static str = "/commit/graph_segments";
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
@@ -699,52 +720,51 @@ impl EdenApiHandler for GraphSegmentsHandler {
             .map(|hg_id| HgChangesetId::new(HgNodeHash::from(hg_id)))
             .collect();
 
-        let graph_segment_entries =
-            repo.graph_segments(common, heads)
-                .await?
-                .into_iter()
-                .map(|segment| {
-                    Ok(CommitGraphSegmentsEntry {
-                        head: HgId::from(segment.head.into_nodehash()),
-                        base: HgId::from(segment.base.into_nodehash()),
-                        length: segment.length,
-                        parents: segment
-                            .parents
-                            .into_iter()
-                            .map(|parent| CommitGraphSegmentParent {
-                                hgid: HgId::from(parent.hgid.into_nodehash()),
-                                location: parent.location.map(|location| {
-                                    location.map_descendant(|descendant| {
-                                        HgId::from(descendant.into_nodehash())
-                                    })
-                                }),
-                            })
-                            .collect(),
-                    })
-                });
-        Ok(stream::iter(graph_segment_entries).boxed())
+        Ok(try_stream! {
+            let graph_segments = repo.graph_segments(common, heads).await?;
+
+            for await segment in graph_segments {
+                let segment = segment?;
+                yield CommitGraphSegmentsEntry {
+                    head: HgId::from(segment.head.into_nodehash()),
+                    base: HgId::from(segment.base.into_nodehash()),
+                    length: segment.length,
+                    parents: segment
+                        .parents
+                        .into_iter()
+                        .map(|parent| CommitGraphSegmentParent {
+                            hgid: HgId::from(parent.hgid.into_nodehash()),
+                            location: parent.location.map(|location| {
+                                location.map_descendant(|descendant| {
+                                    HgId::from(descendant.into_nodehash())
+                                })
+                            }),
+                        })
+                        .collect(),
+                }
+            }
+        }
+        .boxed())
     }
 }
 
 pub struct CommitMutationsHandler;
 
 #[async_trait]
-impl EdenApiHandler for CommitMutationsHandler {
+impl SaplingRemoteApiHandler for CommitMutationsHandler {
     type Request = CommitMutationsRequest;
     type Response = CommitMutationsResponse;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::CommitMutations;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CommitMutations;
     const ENDPOINT: &'static str = "/commit/mutations";
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
-        if !tunables().mutation_generate_for_draft().unwrap_or_default() {
-            return Ok(stream::empty().boxed());
-        }
+
         let commits = request
             .commits
             .into_iter()
@@ -768,16 +788,16 @@ impl EdenApiHandler for CommitMutationsHandler {
 pub struct CommitTranslateId;
 
 #[async_trait]
-impl EdenApiHandler for CommitTranslateId {
+impl SaplingRemoteApiHandler for CommitTranslateId {
     type Request = CommitTranslateIdRequest;
     type Response = CommitTranslateIdResponse;
 
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
-    const API_METHOD: EdenApiMethod = EdenApiMethod::CommitTranslateId;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CommitTranslateId;
     const ENDPOINT: &'static str = "/commit/translate_id";
 
     async fn handler(
-        ectx: EdenApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let from_repo = match request.from_repo {
@@ -832,7 +852,13 @@ impl EdenApiHandler for CommitTranslateId {
                         (
                             id,
                             from_repo
-                                .xrepo_commit_lookup(&to_repo, bs.clone(), None)
+                                .xrepo_commit_lookup(
+                                    &to_repo,
+                                    bs.clone(),
+                                    None,
+                                    XRepoLookupSyncBehaviour::SyncIfAbsent,
+                                    XRepoLookupExactBehaviour::WorkingCopyEquivalence,
+                                )
                                 .await,
                         )
                     }

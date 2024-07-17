@@ -35,7 +35,7 @@ use crate::HgParents;
 use crate::MPathElement;
 use crate::Type;
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ManifestContent {
     pub files: SortedVectorMap<MPathElement, Entry<HgManifestId, (FileType, HgFileNodeId)>>,
 }
@@ -59,11 +59,8 @@ impl ManifestContent {
         data: &[u8],
     ) -> Result<SortedVectorMap<MPathElement, Entry<HgManifestId, (FileType, HgFileNodeId)>>> {
         let lines = data.split(|b| *b == b'\n');
-        let mut files = match lines.size_hint() {
-            // Split returns it count in the high size hint
-            (_, Some(high)) => SortedVectorMap::with_capacity(high),
-            (_, None) => SortedVectorMap::new(),
-        };
+        let count = lines.clone().count();
+        let mut files = SortedVectorMap::with_capacity(count);
 
         for line in lines {
             if line.is_empty() {
@@ -158,7 +155,7 @@ pub async fn fetch_manifest_envelope_opt<B: Blobstore>(
     ))
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct HgBlobManifest {
     node_id: HgNodeHash,
     p1: Option<HgNodeHash>,

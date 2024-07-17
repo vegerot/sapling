@@ -19,7 +19,7 @@ use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
 use derived_data_manager::DerivationContext;
-use derived_data_service_if::types as thrift;
+use derived_data_service_if as thrift;
 use mononoke_types::deleted_manifest_v2::DeletedManifestV2;
 use mononoke_types::BlobstoreBytes;
 use mononoke_types::BonsaiChangeset;
@@ -81,6 +81,7 @@ impl BonsaiDerivable for RootDeletedManifestV2Id {
     const VARIANT: DerivableType = DerivableType::DeletedManifests;
 
     type Dependencies = dependencies![RootUnodeManifestId];
+    type PredecessorDependencies = dependencies![];
 
     async fn derive_single(
         ctx: &CoreContext,
@@ -112,9 +113,8 @@ impl BonsaiDerivable for RootDeletedManifestV2Id {
         ctx: &CoreContext,
         derivation_ctx: &DerivationContext,
         bonsais: Vec<BonsaiChangeset>,
-        gap_size: Option<usize>,
     ) -> Result<HashMap<ChangesetId, Self>> {
-        RootDeletedManifestDeriver::derive_batch(ctx, derivation_ctx, bonsais, gap_size).await
+        RootDeletedManifestDeriver::derive_batch(ctx, derivation_ctx, bonsais).await
     }
 
     fn from_thrift(data: thrift::DerivedData) -> Result<Self> {

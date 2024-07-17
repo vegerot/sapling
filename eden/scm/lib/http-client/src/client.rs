@@ -9,7 +9,6 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use curl::easy::Easy2;
 use futures::prelude::*;
 use url::Url;
 
@@ -17,19 +16,16 @@ use crate::driver::MultiDriver;
 use crate::errors::Abort;
 use crate::errors::HttpClientError;
 use crate::event_listeners::HttpClientEventListeners;
-use crate::handler::Buffered;
 use crate::handler::HandlerExt;
-use crate::handler::Streaming;
 use crate::pool::Pool;
-use crate::progress::Progress;
 use crate::receiver::ChannelReceiver;
-use crate::receiver::Receiver;
 use crate::request::Method;
 use crate::request::Request;
 use crate::request::StreamRequest;
 use crate::response::AsyncResponse;
 use crate::response::Response;
 use crate::stats::Stats;
+use crate::Easy2H;
 
 pub type ResponseFuture =
     Pin<Box<dyn Future<Output = Result<AsyncResponse, HttpClientError>> + Send + 'static>>;
@@ -70,11 +66,20 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let version = curl::Version::get();
+
+        // Example values: "SecureTransport", "OpenSSL/1.1.1t", "Schannel"
+        let ssl_version = version.ssl_version();
+
+        tracing::debug!(curl_ssl=?ssl_version);
+
         Self {
             cert_path: None,
             key_path: None,
             ca_path: None,
-            convert_cert: cfg!(windows),
+
+            // Convert to PKCS#12 if we are using schannel, which doesn't like PEM.
+            convert_cert: ssl_version.is_some_and(|v| v.starts_with("Schannel")),
 
             client_info: None,
             disable_tls_verification: false,
@@ -118,38 +123,20 @@ impl HttpClient {
     ///
     /// The closure returns a boolean. If false, this function will
     /// return early and all other pending transfers will be aborted.
-    pub fn send<I, F>(&self, requests: I, response_cb: F) -> Result<Stats, HttpClientError>
+    pub fn send<I, F>(&self, requests: I, mut response_cb: F) -> Result<Stats, HttpClientError>
     where
         I: IntoIterator<Item = Request>,
         F: FnMut(Result<Response, HttpClientError>) -> Result<(), Abort>,
-    {
-        self.send_with_progress(requests, response_cb, |_| ())
-    }
-
-    /// Same as `send()`, but takes an additional closure for
-    /// monitoring the collective progress of all of the transfers.
-    /// The closure will be called whenever any of the underlying
-    /// transfers make progress.
-    pub fn send_with_progress<I, F, P>(
-        &self,
-        requests: I,
-        mut response_cb: F,
-        progress_cb: P,
-    ) -> Result<Stats, HttpClientError>
-    where
-        I: IntoIterator<Item = Request>,
-        F: FnMut(Result<Response, HttpClientError>) -> Result<(), Abort>,
-        P: FnMut(Progress),
     {
         let mut multi = self.pool.multi();
         multi
             .get_mut()
             .set_max_total_connections(self.config.max_concurrent_requests.unwrap_or(0))?;
-        let driver = MultiDriver::new(multi.get(), progress_cb, self.config.verbose_stats);
+        let driver = MultiDriver::new(multi.get(), self.config.verbose_stats);
 
         for mut request in requests {
             self.event_listeners.trigger_new_request(request.ctx_mut());
-            let handle: Easy2<Buffered> = request.try_into()?;
+            let handle: Easy2H = request.try_into()?;
             driver.add(handle)?;
         }
 
@@ -204,21 +191,6 @@ impl HttpClient {
         &self,
         requests: I,
     ) -> Result<(Vec<ResponseFuture>, StatsFuture), HttpClientError> {
-        self.send_async_with_progress(requests, |_| ())
-    }
-
-    /// Same as `send_async()`, but takes an additional closure for monitoring
-    /// the collective progress of all of the transfers. The closure will be
-    /// called whenever any of the underlying transfers make progress.
-    pub fn send_async_with_progress<I, P>(
-        &self,
-        requests: I,
-        progress_cb: P,
-    ) -> Result<(Vec<ResponseFuture>, StatsFuture), HttpClientError>
-    where
-        I: IntoIterator<Item = Request>,
-        P: FnMut(Progress) + Send + 'static,
-    {
         let client = self.clone();
 
         let mut stream_requests = Vec::new();
@@ -230,7 +202,7 @@ impl HttpClient {
 
             // Create a blocking streaming HTTP request to be dispatched on a
             // separate IO task.
-            stream_requests.push(req.into_streaming(receiver));
+            stream_requests.push(req.into_streaming(Box::new(receiver)));
 
             // Create response Future to return to the caller. The response is
             // linked to the request via channels, allowing async Rust code to
@@ -238,9 +210,7 @@ impl HttpClient {
             responses.push(AsyncResponse::new(streams, request_info).boxed());
         }
 
-        let task = tokio::task::spawn_blocking(move || {
-            client.stream_with_progress(stream_requests, progress_cb)
-        });
+        let task = async_runtime::spawn_blocking(move || client.stream(stream_requests));
 
         let stats = task.err_into::<HttpClientError>().map(|res| res?).boxed();
 
@@ -254,37 +224,19 @@ impl HttpClient {
     /// Note that this function is not asynchronous; it WILL BLOCK
     /// until all of the transfers are complete, and will return
     /// the total stats across all transfers when complete.
-    pub fn stream<I, R>(&self, requests: I) -> Result<Stats, HttpClientError>
+    pub fn stream<I>(&self, requests: I) -> Result<Stats, HttpClientError>
     where
-        I: IntoIterator<Item = StreamRequest<R>>,
-        R: Receiver,
-    {
-        self.stream_with_progress(requests, |_| ())
-    }
-
-    /// Same as `stream()`, but takes an additional closure for
-    /// monitoring the collective progress of all of the transfers.
-    /// The closure will be called whenever any of the underlying
-    /// transfers make progress.
-    pub fn stream_with_progress<I, R, P>(
-        &self,
-        requests: I,
-        progress_cb: P,
-    ) -> Result<Stats, HttpClientError>
-    where
-        I: IntoIterator<Item = StreamRequest<R>>,
-        R: Receiver,
-        P: FnMut(Progress),
+        I: IntoIterator<Item = StreamRequest>,
     {
         let mut multi = self.pool.multi();
         multi
             .get_mut()
             .set_max_total_connections(self.config.max_concurrent_requests.unwrap_or(0))?;
-        let driver = MultiDriver::new(multi.get(), progress_cb, self.config.verbose_stats);
+        let driver = MultiDriver::new(multi.get(), self.config.verbose_stats);
         for mut request in requests {
             self.event_listeners
                 .trigger_new_request(request.request.ctx_mut());
-            let handle: Easy2<Streaming<R>> = request.try_into()?;
+            let handle: Easy2H = request.try_into()?;
             driver.add(handle)?;
         }
 
@@ -329,9 +281,9 @@ impl HttpClient {
     /// Callback for `MultiDriver::perform` when working with
     /// a `Streaming` handler. Reports the result of the
     /// completed request to the handler's `Receiver`.
-    fn report_result_and_drop_receiver<R: Receiver>(
+    fn report_result_and_drop_receiver(
         &self,
-        res: Result<Easy2<Streaming<R>>, (Easy2<Streaming<R>>, curl::Error)>,
+        res: Result<Easy2H, (Easy2H, curl::Error)>,
     ) -> Result<(), Abort> {
         // We need to get the `Easy2` handle in both the
         // success and error cases since we ultimately
@@ -357,7 +309,7 @@ impl HttpClient {
         // Extract the `Receiver` from the `Streaming` handler
         // inside the Easy2 handle. If it's already gone, just
         // log it and move on. (This shouldn't normally happen.)
-        if let Some(receiver) = easy.get_mut().take_receiver() {
+        if let Some(mut receiver) = easy.get_mut().take_receiver() {
             receiver.done(res)
         } else {
             tracing::error!("Cannot report status because receiver is missing");
@@ -426,7 +378,6 @@ mod tests {
 
     use anyhow::Result;
     use http::StatusCode;
-    use mockito::mock;
     use url::Url;
 
     use super::*;
@@ -440,22 +391,27 @@ mod tests {
         let body2 = b"body2";
         let body3 = b"body3";
 
-        let mock1 = mock("GET", "/test1")
+        let mut server = mockito::Server::new();
+
+        let mock1 = server
+            .mock("GET", "/test1")
             .with_status(201)
             .with_body(body1)
             .create();
 
-        let mock2 = mock("GET", "/test2")
+        let mock2 = server
+            .mock("GET", "/test2")
             .with_status(201)
             .with_body(body2)
             .create();
 
-        let mock3 = mock("GET", "/test3")
+        let mock3 = server
+            .mock("GET", "/test3")
             .with_status(201)
             .with_body(body3)
             .create();
 
-        let server_url = Url::parse(&mockito::server_url())?;
+        let server_url = Url::parse(&server.url())?;
 
         let url1 = server_url.join("test1")?;
         let req1 = Request::get(url1);
@@ -495,34 +451,39 @@ mod tests {
         let body2 = b"body2";
         let body3 = b"body3";
 
-        let mock1 = mock("GET", "/test1")
+        let mut server = mockito::Server::new();
+
+        let mock1 = server
+            .mock("GET", "/test1")
             .with_status(201)
             .with_body(body1)
             .create();
 
-        let mock2 = mock("GET", "/test2")
+        let mock2 = server
+            .mock("GET", "/test2")
             .with_status(201)
             .with_body(body2)
             .create();
 
-        let mock3 = mock("GET", "/test3")
+        let mock3 = server
+            .mock("GET", "/test3")
             .with_status(201)
             .with_body(body3)
             .create();
 
-        let server_url = Url::parse(&mockito::server_url())?;
+        let server_url = Url::parse(&server.url())?;
 
         let url1 = server_url.join("test1")?;
         let rcv1 = TestReceiver::new();
-        let req1 = Request::get(url1).into_streaming(rcv1.clone());
+        let req1 = Request::get(url1).into_streaming(Box::new(rcv1.clone()));
 
         let url2 = server_url.join("test2")?;
         let rcv2 = TestReceiver::new();
-        let req2 = Request::get(url2).into_streaming(rcv2.clone());
+        let req2 = Request::get(url2).into_streaming(Box::new(rcv2.clone()));
 
         let url3 = server_url.join("test3")?;
         let rcv3 = TestReceiver::new();
-        let req3 = Request::get(url3).into_streaming(rcv3.clone());
+        let req3 = Request::get(url3).into_streaming(Box::new(rcv3.clone()));
 
         let client = HttpClient::new();
         let stats = client.stream(vec![req1, req2, req3])?;
@@ -553,22 +514,27 @@ mod tests {
         let body2 = b"body2";
         let body3 = b"body3";
 
-        let mock1 = mock("GET", "/test1")
+        let mut server = mockito::Server::new_async().await;
+
+        let mock1 = server
+            .mock("GET", "/test1")
             .with_status(201)
             .with_body(body1)
             .create();
 
-        let mock2 = mock("GET", "/test2")
+        let mock2 = server
+            .mock("GET", "/test2")
             .with_status(201)
             .with_body(body2)
             .create();
 
-        let mock3 = mock("GET", "/test3")
+        let mock3 = server
+            .mock("GET", "/test3")
             .with_status(201)
             .with_body(body3)
             .create();
 
-        let server_url = Url::parse(&mockito::server_url())?;
+        let server_url = Url::parse(&server.url())?;
 
         let url1 = server_url.join("test1")?;
         let req1 = Request::get(url1);
@@ -612,11 +578,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_listeners() -> Result<()> {
-        let server_url = Url::parse(&mockito::server_url())?;
+        let mut server = mockito::Server::new_async().await;
+        let server_url = Url::parse(&server.url())?;
 
         // this is actually used, it changes how mockito behaves
         const BODY: &[u8] = b"body";
-        let _mock1 = mock("GET", "/test1")
+        let _mock1 = server
+            .mock("GET", "/test1")
             .with_status(201)
             .with_body(BODY)
             .create();
@@ -696,7 +664,7 @@ mod tests {
         assert_eq!(stats, rx.recv()?);
         check_events(true);
 
-        let stats = client.send_with_progress(vec![request.clone()], |_| Ok(()), |_| ())?;
+        let stats = client.send(vec![request.clone()], |_| Ok(()))?;
         assert_eq!(stats, rx.recv()?);
         check_events(true);
 
@@ -705,18 +673,22 @@ mod tests {
         assert_eq!(stats, rx.recv()?);
         check_events(false);
 
-        let (_stream, stats) = client.send_async_with_progress(vec![request.clone()], |_| ())?;
+        let (_stream, stats) = client.send_async(vec![request.clone()])?;
         let stats = stats.await?;
         assert_eq!(stats, rx.recv()?);
         check_events(false);
 
-        let my_stream_req = || request.clone().into_streaming(TestReceiver::new());
+        let my_stream_req = || {
+            request
+                .clone()
+                .into_streaming(Box::new(TestReceiver::new()))
+        };
 
         let stats = client.stream(vec![my_stream_req()])?;
         assert_eq!(stats, rx.recv()?);
         check_events(false);
 
-        let stats = client.stream_with_progress(vec![my_stream_req()], |_| ())?;
+        let stats = client.stream(vec![my_stream_req()])?;
         assert_eq!(stats, rx.recv()?);
         check_events(false);
 

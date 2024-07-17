@@ -1,3 +1,7 @@
+#modern-config-incompatible
+
+#require no-eden
+
 #chg-compatible
   $ setconfig devel.segmented-changelog-rev-compat=true
   $ setconfig experimental.allowfilepeer=True
@@ -136,7 +140,7 @@ Test push hook locking
   pushing to ../2
   searching for changes
   devel-warn: using deprecated bundlev1 format
-   at: */changegroup.py:* (makechangegroup) (glob)
+   at: *changegroup* (makechangegroup) (glob)
   adding changesets
   adding manifests
   adding file changes

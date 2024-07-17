@@ -166,9 +166,12 @@ def _runcommandwrapper(orig, lui, repo, cmd, fullargs, *args):
     #
     # To detect a write command, wrap all possible entries:
     #  - transaction.__init__
-    #  - merge.update
+    #  - merge.goto
+    #  - merge.merge
     w = extensions.wrappedfunction
-    with w(merge, "update", log), w(transaction.transaction, "__init__", log):
+    with w(merge, "goto", log), w(merge, "merge", log), w(
+        transaction.transaction, "__init__", log
+    ):
         try:
             result = orig(lui, repo, cmd, fullargs, *args)
         finally:
@@ -302,10 +305,7 @@ def log(repo, command, tr):
 
 def unfinished(repo):
     """like cmdutil.checkunfinished without raising an Abort"""
-    for f, clearable, allowcommit, msg, hint in cmdutil.unfinishedstates:
-        if repo.localvfs.exists(f):
-            return True
-    return False
+    return repo._rsrepo.workingcopy().commandstate() is not None
 
 
 # Write: Logs
@@ -681,26 +681,6 @@ def _oldworkingcopyparent(repo, subset, x):
     return subset & smartset.baseset(revs, repo=repo)
 
 
-@revsetpredicate("oldnonobsworkingcopyparent")
-def _oldnonobsworkingcopyparent(repo, subset, x):
-    """``oldnonobsworkingcopyparent()``
-    previous non-obsolete working copy parent
-    """
-    max_candidates = repo.ui.configint(
-        "experimental", "max-old-nonobs-commit-candidates", 50
-    )
-    current_rev = repo["."].rev()
-    for i in range(1, max_candidates + 1):
-        revs = _getoldworkingcopyparent(repo, i)
-        rev = revs.first()
-        if (
-            not repo[rev].obsolete()
-            and rev != current_rev  # this is for 'amend' and 'restack' case
-        ):
-            return subset & smartset.baseset(revs, repo=repo)
-    raise error.Abort(_("not found previous non-obsolete commit"))
-
-
 # Templates
 templatefunc = registrar.templatefunc()
 
@@ -919,6 +899,10 @@ def undo(ui, repo, **opts):
         cmdutil.bailifchanged(repo)
 
         class undopreview(interactiveui.viewframe):
+            def __init__(self, ui, repo, index):
+                super().__init__(ui, repo)
+                self.index = index
+
             def render(self):
                 ui = self.ui
                 ui.pushbuffer()
@@ -940,21 +924,22 @@ def undo(ui, repo, **opts):
                 repo.ui.status(
                     _("<-: newer  " "->: older  " "q: abort  " "enter: confirm\n")
                 )
-                return ui.popbuffer()
+                return ui.popbuffer().splitlines(), None
 
-            def rightarrow(self):
-                self.index += 1
-
-            def leftarrow(self):
-                self.index -= 1
-
-            def enter(self):
-                del opts["preview"]
-                del opts["interactive"]
-                opts["absolute"] = "absolute"
-                opts["step"] = self.index
-                undo(ui, repo, **opts)
-                return
+            def handlekeypress(self, key):
+                if key == self.KEY_Q:
+                    self.finish()
+                if key == self.KEY_RETURN:
+                    del opts["preview"]
+                    del opts["interactive"]
+                    opts["absolute"] = "absolute"
+                    opts["step"] = self.index
+                    undo(ui, repo, **opts)
+                    self.finish()
+                if key == self.KEY_RIGHT:
+                    self.index += 1
+                if key == self.KEY_LEFT:
+                    self.index -= 1
 
         viewobj = undopreview(ui, repo, reverseindex)
         interactiveui.view(viewobj)

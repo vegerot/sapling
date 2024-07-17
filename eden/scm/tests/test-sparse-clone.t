@@ -1,11 +1,12 @@
-#debugruntest-compatible
+
+#require no-eden
+
 #inprocess-hg-incompatible
   $ setconfig experimental.allowfilepeer=True clone.use-rust=1 commands.force-rust=clone
   $ setconfig experimental.allowfilepeer=True
 
 test sparse
 
-  $ configure modernclient
   $ setconfig ui.username="nobody <no.reply@fb.com>"
   $ enable sparse rebase
 
@@ -39,10 +40,11 @@ Verify local clone with a sparse profile works
 
 Verify sparse clone with a non-existing sparse profile warns
 
-  $ hg clone --enable-profile nonexisting.sparse test:e1 clone5
+  $ SL_LOG=workingcopy=warn hg clone --enable-profile nonexisting.sparse test:e1 clone5
   Cloning * into $TESTTMP/clone5 (glob)
   Checking out 'master'
-  The profile 'nonexisting.sparse' does not exist. Check out a commit where it exists, or remove it with 'hg sparse disableprofile'.
+   WARN workingcopy::sparse: non-existent sparse profile include repo_path=RepoPathBuf("nonexisting.sparse")
+   WARN workingcopy::sparse: non-existent sparse profile include repo_path=RepoPathBuf("nonexisting.sparse")
   5 files updated
   $ cd clone5
   $ ls

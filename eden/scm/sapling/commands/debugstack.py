@@ -7,6 +7,8 @@ from __future__ import absolute_import
 
 import base64, collections, functools, stat
 
+import bindings
+
 from .. import context, hg, json, mutation, scmutil, smartset, visibility
 from ..i18n import _
 from ..node import bin, hex, nullid, wdirhex, wdirrev
@@ -55,6 +57,9 @@ def debugexportstack(ui, repo, **opts):
               // Present if the file content is not utf-8.
               "dataBase85": "base85 encoded data",
 
+              // Content "reference" representation if the file is too large.
+              "dataRef": {"node": hex_hash, "path": path},
+
               // Present if the file is copied from "path/from".
               // The content of "path/from" will be included in "relevant_map"
               // of the parent commits.
@@ -82,31 +87,23 @@ def debugexportstack(ui, repo, **opts):
     The commits are sorted topologically. Ancestors (roots) first, descendants
     (heads) last.
 
-    On error (ex. exceeds size limit), print a JSON object with "error" set
-    to the actual problem:
-
-        {"error": "too many commits"}
-        {"error": "too many files changed"}
-
     Configs::
 
-        # Maximum (explicitly requested) commits to export
-        experimental.exportstack-max-commit-count = 50
-
-        # Maximum files to export
-        experimental.exportstack-max-file-count = 200
-
-        # Maximum bytes of files to export
-        experimental.exportstack-max-bytes = 2M
+        # Maximum bytes of a file to export. Exceeding the limit will turn the
+        # file to "ref" representation.
+        experimental.exportstack-max-bytes = 1M
     """
     # size limits
-    max_commit_count = ui.configint("experimental", "exportstack-max-commit-count")
-    max_file_count = ui.configint("experimental", "exportstack-max-file-count")
-    max_bytes = ui.configbytes("experimental", "exportstack-max-bytes")
+    extra_tracked = opts.get("assume_tracked")
+    revs = scmutil.revrange(repo, opts.get("rev"))
+    revs.sort()
+    obj = _export(repo, revs, extra_tracked=extra_tracked)
+    ui.write("%s\n" % json.dumps(obj))
 
-    commit_limiter = _size_limiter(max_commit_count, "too many commits")
-    file_limiter = _size_limiter(max_file_count, "too many files")
-    bytes_limiter = _size_limiter(max_bytes, "too much data")
+
+def _export(repo, revs, max_bytes=None, extra_tracked=None):
+    if max_bytes is None:
+        max_bytes = repo.ui.configbytes("experimental", "exportstack-max-bytes")
 
     # Figure out relevant commits and files:
     # - If rev X modifies or deleted (not "added") a file, then the file in
@@ -118,40 +115,28 @@ def debugexportstack(ui, repo, **opts):
     relevant_map = collections.defaultdict(dict)
     requested_map = collections.defaultdict(dict)
 
-    revs = scmutil.revrange(repo, opts.get("rev"))
-    revs.sort()
-
-    try:
-        for ctx in revs.prefetch("text").iterctx():
-            commit_limiter(1)
-            pctx = ctx.p1()
-            files = requested_map[ctx.node()]
-            changed_files = ctx.files()
-            if ctx.node() is None:
-                # Consider other (untracked) files in wdir() defined by
-                # status.force-tracked.
-                extra_tracked = opts.get("assume_tracked")
-                if extra_tracked:
-                    existing_tracked = set(changed_files)
-                    for path in extra_tracked:
-                        if path not in existing_tracked:
-                            changed_files.append(path)
-            for path in changed_files:
-                file_limiter(1)
-                parent_paths = [path]
-                file_obj = _file_obj(ctx, path, parent_paths.append, bytes_limiter)
-                files[path] = file_obj
-                for pctx in ctx.parents():
-                    pfiles = relevant_map[pctx.node()]
-                    for ppath in parent_paths:
-                        # Skip relevant_map if included by requested_map.
-                        if ppath not in requested_map.get(pctx.node(), {}):
-                            pfiles[ppath] = _file_obj(
-                                pctx, ppath, limiter=bytes_limiter
-                            )
-    except ValueError as ex:
-        ui.write("%s\n" % json.dumps({"error": str(ex)}))
-        return 1
+    for ctx in revs.prefetch("text").iterctx():
+        pctx = ctx.p1()
+        files = requested_map[ctx.node()]
+        changed_files = ctx.files()
+        if ctx.node() is None:
+            # Consider other (untracked) files in wdir() defined by
+            # status.force-tracked.
+            if extra_tracked:
+                existing_tracked = set(changed_files)
+                for path in extra_tracked:
+                    if path not in existing_tracked:
+                        changed_files.append(path)
+        for path in changed_files:
+            parent_paths = [path]
+            file_obj = _file_obj(ctx, path, parent_paths.append, max_bytes=max_bytes)
+            files[path] = file_obj
+            for pctx in ctx.parents():
+                pfiles = relevant_map[pctx.node()]
+                for ppath in parent_paths:
+                    # Skip relevant_map if included by requested_map.
+                    if ppath not in requested_map.get(pctx.node(), {}):
+                        pfiles[ppath] = _file_obj(pctx, ppath, max_bytes=max_bytes)
 
     # Put together final result
     result = []
@@ -194,8 +179,7 @@ def debugexportstack(ui, repo, **opts):
             commit_obj["files"] = requested_map[node]
         result.append(commit_obj)
 
-    ui.write("%s\n" % json.dumps(result))
-    return 0
+    return result
 
 
 def _size_limiter(limit, error_message):
@@ -211,7 +195,7 @@ def _size_limiter(limit, error_message):
     return increase
 
 
-def _file_obj(ctx, path, set_copy_from=None, limiter=None):
+def _file_obj(ctx, path, set_copy_from=None, max_bytes=None):
     if ctx.node() is None:
         # For the working copy, use wvfs directly.
         # This allows exporting untracked files and properly report deleting
@@ -230,14 +214,15 @@ def _file_obj(ctx, path, set_copy_from=None, limiter=None):
             copy_from_path = renamed[0]
             if set_copy_from is not None:
                 set_copy_from(copy_from_path)
-        bdata = fctx.data()
-        if limiter is not None:
-            limiter(len(bdata))
         file_obj = {}
-        try:
-            file_obj["data"] = bdata.decode("utf-8")
-        except UnicodeDecodeError:
-            file_obj["dataBase85"] = base64.b85encode(bdata).decode()
+        if max_bytes is not None and fctx.size() > max_bytes:
+            file_obj["dataRef"] = {"node": ctx.hex(), "path": path}
+        else:
+            bdata = fctx.data()
+            try:
+                file_obj["data"] = bdata.decode("utf-8")
+            except UnicodeDecodeError:
+                file_obj["dataBase85"] = base64.b85encode(bdata).decode()
         if copy_from_path:
             file_obj["copyFrom"] = copy_from_path
         flags = fctx.flags()
@@ -366,55 +351,58 @@ def debugimportstack(ui, repo, **opts):
     There might be extra output caused by the "goto" operation after the first
     line. Those should be ignored by automation.
     """
+    try:
+        actions = json.loads(ui.fin.read())
+    except json.JSONDecodeError as ex:
+        obj = {"error": f"commit info is invalid JSON ({ex})"}
+    else:
+        try:
+            obj = _import(repo, actions)
+        except (ValueError, TypeError, KeyError, AttributeError) as ex:
+            obj = {"error": str(ex)}
+    ui.write("%s\n" % json.dumps(obj))
+    if obj and "error" in obj:
+        return 1
+
+
+def _import(repo, actions):
     wnode = repo["."].node()
     marks = Marks(wnode)
 
-    try:
-        try:
-            actions = json.loads(ui.fin.read())
-        except json.JSONDecodeError as ex:
-            raise ValueError(f"commit info is invalid JSON ({ex})")
+    with repo.wlock(), repo.lock(), repo.transaction("importstack"):
+        # Create commits.
+        commit_infos = [action[1] for action in actions if action[0] in "commit"]
+        _create_commits(repo, commit_infos, marks)
 
-        with repo.wlock(), repo.lock(), repo.transaction("importstack"):
-            # Create commits.
-            commit_infos = [action[1] for action in actions if action[0] in "commit"]
-            _create_commits(repo, commit_infos, marks)
+        # Handle "amend"
+        commit_infos = [action[1] for action in actions if action[0] in "amend"]
+        _create_commits(repo, commit_infos, marks, amend=True)
 
-            # Handle "amend"
-            commit_infos = [action[1] for action in actions if action[0] in "amend"]
-            _create_commits(repo, commit_infos, marks, amend=True)
+        # Handle "goto" or "reset".
+        to_hide = []
+        for action in actions:
+            action_name = action[0]
+            if action_name in {"commit", "amend"}:
+                # Handled by _create_commits already.
+                continue
+            elif action_name == "goto":
+                node = marks[action[1]["mark"]]
+                hg.updaterepo(repo, node, overwrite=True)
+            elif action_name == "reset":
+                node = marks[action[1]["mark"]]
+                _reset(repo, node)
+            elif action_name == "hide":
+                to_hide += [bin(n) for n in action[1]["nodes"]]
+            elif action_name == "write":
+                _write_files(repo, action[1])
+            else:
+                raise ValueError(f"unsupported action: {action}")
 
-            # Handle "goto" or "reset".
-            to_hide = []
-            for action in actions:
-                action_name = action[0]
-                if action_name in {"commit", "amend"}:
-                    # Handled by _create_commits already.
-                    continue
-                elif action_name == "goto":
-                    node = marks[action[1]["mark"]]
-                    hg.updaterepo(repo, node, overwrite=True)
-                elif action_name == "reset":
-                    node = marks[action[1]["mark"]]
-                    _reset(repo, node)
-                elif action_name == "hide":
-                    to_hide += [bin(n) for n in action[1]["nodes"]]
-                elif action_name == "write":
-                    _write_files(repo, action[1])
-                else:
-                    raise ValueError(f"unsupported action: {action}")
+        # Handle "hide".
+        if to_hide:
+            visibility.remove(repo, to_hide)
 
-            # Handle "hide".
-            if to_hide:
-                visibility.remove(repo, to_hide)
-
-    except (ValueError, TypeError, KeyError, AttributeError) as ex:
-        ui.write("%s\n" % json.dumps({"error": str(ex)}))
-        return 1
-
-    ui.write("%s\n" % json.dumps(marks.to_hex()))
-
-    return 0
+    return marks.to_hex()
 
 
 class Marks:
@@ -597,8 +585,16 @@ def _filectxfn(repo, mctx, path, files_dict):
     else:
         if "data" in file_info:
             data = file_info["data"].encode("utf-8")
-        else:
+        elif "dataBase85" in file_info:
             data = base64.b85decode(file_info["dataBase85"])
+        else:
+            data_ref = file_info["dataRef"]
+            ref_path = data_ref["path"]
+            ctx = repo[data_ref["node"]]
+            if ref_path in ctx:
+                data = ctx[ref_path].data()
+            else:
+                return None
         copied = file_info.get("copyFrom")
         flags = file_info.get("flags", "")
         if copied == ".":
@@ -681,3 +677,80 @@ def _existing_flags(wvfs, path):
     except FileNotFoundError:
         pass
     return flags
+
+
+@command(
+    "debugimportexport",
+    [
+        ("", "node-ipc", False, _("use node IPC to communicate messages")),
+    ],
+)
+def debugimportexport(ui, repo, **opts):
+    """interactively import and export contents
+
+    This command will read line delimited json from stdin and write results in stdout.
+    With ``--node-ipc``, the messages will be written via the nodejs channel instead of
+    stdio.
+
+    Supported inputs and their outputs:
+
+        # input: export commits (see debugexportstack); revs will be passed to formatspec
+        ["export", {"revs": ["parents(%s)", "."], "assumeTracked": [], "sizeLimit": 100}]
+        # => ["ok", debugexportstack result]
+
+        # input: import commits (see debugimportstack)
+        ["import", importStackActions]
+        # => ["ok", debugimportstack result]
+
+        # input: ping, output: ["ack"]; useful for heartbeat detection
+        ["ping"]
+        # => ["ok", "ack"]
+
+        # input: exit
+        ["exit"]
+        # => ["ok", null]
+        # side effect: process exit
+
+        # input: others or errors
+        ["error", {"message": "unsupported: ..."}]
+    """
+    if opts.get("node_ipc"):
+        ipc = bindings.nodeipc.IPC
+        recv = ipc.recv
+        send = ipc.send
+    else:
+
+        def recv():
+            line = ui.fin.readline()
+            if line is None:
+                return line
+            return json.loads(line.decode())
+
+        def send(obj):
+            line = json.dumps(obj) + "\n"
+            ui.write(line)
+            ui.flush()
+
+    while (req := recv()) is not None:
+        name = req[0]
+        try:
+            if name == "export":
+                revs = repo.revs(*req[1]["revs"])
+                max_bytes = req[1].get("sizeLimit")
+                extra_tracked = req[1].get("assumeTracked")
+                res = _export(repo, revs, max_bytes, extra_tracked)
+            elif name == "import":
+                actions = req[1]
+                res = _import(repo, actions)
+            elif name == "ping":
+                res = "ack"
+            elif name == "exit":
+                res = None
+            else:
+                raise ValueError(f"unsupported {name}")
+        except Exception as ex:
+            send(["error", {"message": str(ex)}])
+        else:
+            send(["ok", res])
+        if name == "exit":
+            break

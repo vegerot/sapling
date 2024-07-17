@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -119,6 +120,12 @@ impl FromConfigValue for String {
     }
 }
 
+impl FromConfigValue for Cow<'_, str> {
+    fn try_from_str(s: &str) -> Result<Self> {
+        Ok(Cow::Owned(s.to_string()))
+    }
+}
+
 /// Byte count specified with a unit. For example: `1.5 MB`.
 #[derive(Copy, Clone, Default)]
 pub struct ByteCount(u64);
@@ -194,6 +201,12 @@ impl<T: FromConfigValue> FromConfigValue for Vec<T> {
     }
 }
 
+impl FromConfigValue for Vec<Text> {
+    fn try_from_str(s: &str) -> Result<Self> {
+        Ok(parse_list(s))
+    }
+}
+
 impl<T: FromConfigValue> FromConfigValue for Option<T> {
     fn try_from_str(s: &str) -> Result<Self> {
         T::try_from_str(s).map(Option::Some)
@@ -212,7 +225,12 @@ impl<T: FromConfigValue> FromConfigValue for Option<T> {
 ///
 /// assert_eq!(
 ///     parse_list("this,is \"a small\" ,test"),
-///     vec!["this".to_string(), "is".to_string(), "a small".to_string(), "test".to_string()]
+///     vec![
+///         "this".to_string(),
+///         "is".to_string(),
+///         "a small".to_string(),
+///         "test".to_string()
+///     ]
 /// );
 /// ```
 pub fn parse_list<B: AsRef<str>>(value: B) -> Vec<Text> {

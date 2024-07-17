@@ -64,9 +64,9 @@ use blobrepo_utils::convert_diff_result_into_file_change_for_diamond_merge;
 use blobstore::Loadable;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarkKey;
+use bookmarks::BookmarkUpdateLogId;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
-use changeset_fetcher::ChangesetFetcherArc;
 use changesets::ChangesetsRef;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
@@ -96,6 +96,7 @@ use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
 use mononoke_types::FileChange;
 use mononoke_types::Generation;
+use mononoke_types::GitLfs;
 use mononoke_types::Timestamp;
 use pushrebase_hook::PushrebaseCommitHook;
 use pushrebase_hook::PushrebaseHook;
@@ -107,7 +108,6 @@ use repo_identity::RepoIdentityRef;
 use slog::info;
 use stats::prelude::*;
 use thiserror::Error;
-use tunables::tunables;
 
 define_stats! {
     prefix = "mononoke.pushrebase";
@@ -234,12 +234,12 @@ pub struct PushrebaseOutcome {
     pub retry_num: PushrebaseRetryNum,
     pub rebased_changesets: Vec<PushrebaseChangesetPair>,
     pub pushrebase_distance: PushrebaseDistance,
+    pub log_id: BookmarkUpdateLogId,
 }
 
 pub trait Repo = BonsaiHgMappingRef
     + BookmarksRef
     + ChangesetsRef
-    + ChangesetFetcherArc
     + RepoBlobstoreArc
     + RepoDerivedDataRef
     + RepoIdentityRef
@@ -334,11 +334,10 @@ async fn rebase_in_loop(
         let start_critical_section = Instant::now();
         // CRITICAL SECTION START: After getting the value of the bookmark
         let old_bookmark_value = get_bookmark_value(ctx, repo, onto_bookmark).await?;
-        let hooks = try_join_all(
-            prepushrebase_hooks
-                .iter()
-                .map(|h| h.in_critical_section().map_err(PushrebaseError::from)),
-        )
+        let hooks = try_join_all(prepushrebase_hooks.iter().map(|h| {
+            h.in_critical_section(ctx, old_bookmark_value)
+                .map_err(PushrebaseError::from)
+        }))
         .await?;
 
         let server_bcs = fetch_bonsai_range_ancestor_not_included(
@@ -396,7 +395,7 @@ async fn rebase_in_loop(
             .as_nanos()
             .try_into()
             .unwrap_or(i64::MAX);
-        if let Some((head, rebased_changesets)) = rebase_outcome {
+        if let Some((head, log_id, rebased_changesets)) = rebase_outcome {
             if should_log {
                 STATS::critical_section_success_duration_us
                     .add_value(critical_section_duration_us, repo_args.clone());
@@ -411,6 +410,7 @@ async fn rebase_in_loop(
                 retry_num,
                 rebased_changesets,
                 pushrebase_distance,
+                log_id,
             };
             return Ok(res);
         } else if should_log {
@@ -441,7 +441,14 @@ async fn do_rebase(
     onto_bookmark: &BookmarkKey,
     mut hooks: Vec<Box<dyn PushrebaseCommitHook>>,
     retry_num: PushrebaseRetryNum,
-) -> Result<Option<(ChangesetId, Vec<PushrebaseChangesetPair>)>, PushrebaseError> {
+) -> Result<
+    Option<(
+        ChangesetId,
+        BookmarkUpdateLogId,
+        Vec<PushrebaseChangesetPair>,
+    )>,
+    PushrebaseError,
+> {
     let (new_head, rebased_changesets) = create_rebased_changesets(
         ctx,
         repo,
@@ -483,13 +490,6 @@ async fn maybe_validate_commit(
     bcs_id: &ChangesetId,
     retry_num: PushrebaseRetryNum,
 ) -> Result<(), PushrebaseError> {
-    if tunables()
-        .pushrebase_disable_rebased_commit_validation()
-        .unwrap_or_default()
-    {
-        return Ok(());
-    }
-
     // Validation is expensive, so do it only once
     if !retry_num.is_first() {
         return Ok(());
@@ -986,6 +986,7 @@ async fn rebase_changeset(
                             remapping.get(cs).map(|(cs, _)| cs).cloned().unwrap_or(*cs),
                         )
                     }),
+                    GitLfs::FullContent,
                 );
             }
             FileChange::Deletion
@@ -1196,7 +1197,14 @@ async fn try_move_bookmark(
     new_value: ChangesetId,
     rebased_changesets: RebasedChangesets,
     hooks: Vec<Box<dyn PushrebaseTransactionHook>>,
-) -> Result<Option<(ChangesetId, Vec<PushrebaseChangesetPair>)>, PushrebaseError> {
+) -> Result<
+    Option<(
+        ChangesetId,
+        BookmarkUpdateLogId,
+        Vec<PushrebaseChangesetPair>,
+    )>,
+    PushrebaseError,
+> {
     let mut txn = repo.bookmarks().create_transaction(ctx);
 
     match old_value {
@@ -1226,15 +1234,18 @@ async fn try_move_bookmark(
         .boxed()
     };
 
-    let success = txn.commit_with_hook(Arc::new(sql_txn_hook)).await?;
+    let maybe_log_id = txn
+        .commit_with_hook(Arc::new(sql_txn_hook))
+        .await?
+        .map(BookmarkUpdateLogId::from);
 
-    let ret = if success {
-        Some((new_value, rebased_changesets_into_pairs(rebased_changesets)))
-    } else {
-        None
-    };
-
-    Ok(ret)
+    Ok(maybe_log_id.map(|log_id| {
+        (
+            new_value,
+            log_id,
+            rebased_changesets_into_pairs(rebased_changesets),
+        )
+    }))
 }
 
 #[cfg(test)]
@@ -1250,7 +1261,6 @@ mod tests {
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::BookmarkTransactionError;
     use bookmarks::Bookmarks;
-    use changeset_fetcher::ChangesetFetcher;
     use changesets::Changesets;
     use cloned::cloned;
     use commit_graph::CommitGraph;
@@ -1272,6 +1282,7 @@ mod tests {
     use maplit::hashset;
     use mononoke_types::BonsaiChangesetMut;
     use mononoke_types::FileType;
+    use mononoke_types::GitLfs;
     use mononoke_types::PrefixTrie;
     use mononoke_types::RepositoryId;
     use mutable_counters::MutableCounters;
@@ -1302,9 +1313,6 @@ mod tests {
 
         #[facet]
         bookmarks: dyn Bookmarks,
-
-        #[facet]
-        changeset_fetcher: dyn ChangesetFetcher,
 
         #[facet]
         repo_blobstore: RepoBlobstore,
@@ -1465,7 +1473,11 @@ mod tests {
 
         #[async_trait]
         impl PushrebaseHook for Hook {
-            async fn in_critical_section(&self) -> Result<Box<dyn PushrebaseCommitHook>, Error> {
+            async fn in_critical_section(
+                &self,
+                _ctx: &CoreContext,
+                _old_bookmark_value: Option<ChangesetId>,
+            ) -> Result<Box<dyn PushrebaseCommitHook>, Error> {
                 Ok(Box::new(*self) as Box<dyn PushrebaseCommitHook>)
             }
         }
@@ -1519,7 +1531,7 @@ mod tests {
             let ctx = CoreContext::test_mock(fb);
             let factory = TestRepoFactory::new(fb)?;
             let repo: PushrebaseTestRepo = factory.build().await?;
-            Linear::initrepo(fb, &repo).await;
+            Linear::init_repo(fb, &repo).await?;
             // Bottom commit of the repo
             let parents = vec!["2d7d4ba9ce0a6ffd222de7785b249ead9c51c536"];
             let bcs_id = CreateCommitContext::new(&ctx, &repo, parents)
@@ -1536,7 +1548,7 @@ mod tests {
                 .await?;
 
             let hook: Box<dyn PushrebaseHook> = Box::new(Hook(repo.repo_identity().id()));
-            let hooks = vec![hook];
+            let hooks = [hook];
 
             do_pushrebase_bonsai(
                 &ctx,
@@ -1544,7 +1556,7 @@ mod tests {
                 &Default::default(),
                 &book,
                 &hashset![bcs.clone()],
-                &hooks[..],
+                &hooks,
             )
             .map_err(|err| format_err!("{:?}", err))
             .await?;
@@ -1565,7 +1577,7 @@ mod tests {
                 &Default::default(),
                 &book,
                 &hashset![bcs],
-                &hooks[..],
+                &hooks,
             )
             .map_err(|err| format_err!("{:?}", err))
             .await?;
@@ -2330,6 +2342,7 @@ mod tests {
                 FileType::Executable,
                 file_1.size(),
                 /* copy_from */ None,
+                GitLfs::FullContent,
             );
 
             let bcs = CreateCommitContext::new(&ctx, &repo, vec![root])
@@ -2420,7 +2433,11 @@ mod tests {
 
     #[async_trait]
     impl PushrebaseHook for SleepHook {
-        async fn in_critical_section(&self) -> Result<Box<dyn PushrebaseCommitHook>, Error> {
+        async fn in_critical_section(
+            &self,
+            _ctx: &CoreContext,
+            _old_bookmark_value: Option<ChangesetId>,
+        ) -> Result<Box<dyn PushrebaseCommitHook>, Error> {
             let us = rand::thread_rng().gen_range(0..100);
             tokio::time::sleep(Duration::from_micros(us)).await;
             Ok(Box::new(*self) as Box<dyn PushrebaseCommitHook>)
@@ -3217,7 +3234,11 @@ mod tests {
 
         #[async_trait]
         impl PushrebaseHook for InvalidPushrebaseHook {
-            async fn in_critical_section(&self) -> Result<Box<dyn PushrebaseCommitHook>, Error> {
+            async fn in_critical_section(
+                &self,
+                _ctx: &CoreContext,
+                _old_bookmark_value: Option<ChangesetId>,
+            ) -> Result<Box<dyn PushrebaseCommitHook>, Error> {
                 Ok(Box::new(InvalidPushrebaseHook {}))
             }
         }
@@ -3286,7 +3307,7 @@ mod tests {
             .await?;
 
         let hook: Box<dyn PushrebaseHook> = Box::new(InvalidPushrebaseHook {});
-        let hooks = vec![hook];
+        let hooks = [hook];
 
         let bcs_merge = bcs_id_merge.load(&ctx, repo.repo_blobstore()).await?;
 
@@ -3297,7 +3318,7 @@ mod tests {
             &Default::default(),
             &book,
             &hashset![bcs_merge.clone()],
-            &hooks[..],
+            &hooks,
         )
         .await;
 

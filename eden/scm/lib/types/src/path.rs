@@ -223,6 +223,10 @@ impl RepoPathBuf {
         }
         self.0.push_str(s);
     }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 impl Ord for RepoPathBuf {
@@ -233,7 +237,7 @@ impl Ord for RepoPathBuf {
 
 impl PartialOrd for RepoPathBuf {
     fn partial_cmp(&self, other: &RepoPathBuf) -> Option<Ordering> {
-        self.as_repo_path().partial_cmp(other.as_repo_path())
+        Some(self.cmp(other))
     }
 }
 
@@ -392,6 +396,39 @@ impl RepoPath {
     /// converted to the system path separator.
     pub fn to_path(&self) -> PathBuf {
         self.components().map(PathComponent::as_str).collect()
+    }
+
+    /// Return whether base's components prefix self's components.
+    pub fn starts_with(&self, base: &Self, case_sensitive: bool) -> bool {
+        let mut self_components = self.components();
+        let mut base_components = base.components();
+        loop {
+            match (self_components.next(), base_components.next()) {
+                (Some(s), Some(b)) => {
+                    if s == b {
+                        continue;
+                    }
+
+                    if !case_sensitive
+                        && (s.0.eq_ignore_ascii_case(&b.0)
+                            || s.0.to_lowercase() == b.0.to_lowercase())
+                    {
+                        continue;
+                    }
+
+                    return false;
+                }
+                (Some(_) | None, None) => return true,
+                (None, Some(_)) => return false,
+            }
+        }
+    }
+
+    /// Create a new RepoPathBuf joining self with other.
+    pub fn join(&self, other: impl AsRef<RepoPath>) -> RepoPathBuf {
+        let mut buf = self.to_owned();
+        buf.push(other);
+        buf
     }
 }
 
@@ -1273,5 +1310,31 @@ mod tests {
             "foo/bar.txt",
             os_path(&["..", "..", "zuck", "tfb", "foo", "bar.txt"]),
         );
+    }
+
+    #[test]
+    fn test_starts_with() {
+        assert!(repo_path("").starts_with(repo_path(""), true));
+        assert!(repo_path("").starts_with(repo_path(""), false));
+
+        assert!(!repo_path("").starts_with(repo_path("foo"), true));
+        assert!(!repo_path("").starts_with(repo_path("foo"), false));
+
+        assert!(repo_path("foo").starts_with(repo_path(""), true));
+        assert!(repo_path("foo").starts_with(repo_path(""), false));
+
+        assert!(repo_path("foo").starts_with(repo_path("foo"), true));
+        assert!(repo_path("foo").starts_with(repo_path("foo"), false));
+
+        assert!(!repo_path("foobar").starts_with(repo_path("foo"), true));
+        assert!(!repo_path("foobar").starts_with(repo_path("foo"), false));
+
+        assert!(repo_path("foo/bar/baz").starts_with(repo_path("foo/bar"), true));
+        assert!(!repo_path("foo/bAr/baz").starts_with(repo_path("foo/bar"), true));
+        assert!(repo_path("foo/bAr/baz").starts_with(repo_path("foo/bar"), false));
+        assert!(repo_path("foo/bÄr/baz").starts_with(repo_path("foo/bär"), false));
+
+        assert!(!repo_path("foo/bar/baz").starts_with(repo_path("foo/bar/baz/qux"), true));
+        assert!(!repo_path("foo/bar/baz").starts_with(repo_path("foo/bar/baz/qux"), false));
     }
 }

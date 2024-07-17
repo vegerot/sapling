@@ -13,10 +13,11 @@
 #include <folly/Synchronized.h>
 #include <folly/Utility.h>
 #include <folly/logging/xlog.h>
+
+#include "eden/common/utils/ImmediateFuture.h"
 #include "eden/fs/nfs/MountdRpc.h"
 #include "eden/fs/nfs/portmap/RpcbindRpc.h"
 #include "eden/fs/nfs/rpc/RpcServer.h"
-#include "eden/fs/utils/ImmediateFuture.h"
 
 namespace facebook::eden {
 
@@ -60,11 +61,11 @@ class RpcbinddServerProcessor final : public RpcServerProcessor {
   }
 
  private:
-  typedef uint32_t RpcProtocolNumber;
-  typedef uint32_t RpcProtocolVersion;
-  typedef uint16_t PortNumber;
-  typedef std::pair<RpcProtocolNumber, RpcProtocolVersion> RpcIdentifier;
-  typedef std::map<RpcIdentifier, PortNumber> RpcMappings;
+  using RpcProtocolNumber = uint32_t;
+  using RpcProtocolVersion = uint32_t;
+  using PortNumber = uint16_t;
+  using RpcIdentifier = std::pair<RpcProtocolNumber, RpcProtocolVersion>;
+  using RpcMappings = std::map<RpcIdentifier, PortNumber>;
 
   // contains the registered RPC services. Maps (server protocol number & server
   // protocol version -> port. We assume all registered services are going to
@@ -211,13 +212,17 @@ ImmediateFuture<folly::Unit> RpcbinddServerProcessor::dispatchRpc(
 Rpcbindd::Rpcbindd(
     folly::EventBase* evb,
     std::shared_ptr<folly::Executor> threadPool,
-    const std::shared_ptr<StructuredLogger>& structuredLogger)
+    const std::shared_ptr<StructuredLogger>& structuredLogger,
+    size_t maximumInFlightRequests,
+    std::chrono::nanoseconds highNfsRequestsLogInterval)
     : proc_(std::make_shared<RpcbinddServerProcessor>()),
       server_(RpcServer::create(
           proc_,
           evb,
           std::move(threadPool),
-          structuredLogger)) {}
+          structuredLogger,
+          maximumInFlightRequests,
+          highNfsRequestsLogInterval)) {}
 
 void Rpcbindd::initialize() {
   server_->initialize(folly::SocketAddress("127.0.0.1", kPortmapPortNumber));

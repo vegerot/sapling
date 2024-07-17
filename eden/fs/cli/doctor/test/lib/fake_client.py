@@ -4,7 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
+
 
 import os
 from collections import defaultdict
@@ -21,6 +22,7 @@ class ResetParentsCommitsArgs(NamedTuple):
     parent1: bytes
     parent2: Optional[bytes]
     hg_root_manifest: Optional[bytes]
+    rootIdOptions: Optional[eden_ttypes.RootIdOptions]
 
 
 class FakeClient:
@@ -33,15 +35,15 @@ class FakeClient:
         def _get_default_mount_state() -> Optional[eden_ttypes.MountState]:
             return eden_ttypes.MountState.RUNNING
 
-        self._path_mount_state: Dict[
-            bytes, Optional[eden_ttypes.MountState]
-        ] = defaultdict(_get_default_mount_state)
+        self._path_mount_state: Dict[bytes, Optional[eden_ttypes.MountState]] = (
+            defaultdict(_get_default_mount_state)
+        )
 
-        self._path_mount_inode_info: Dict[
-            bytes, eden_ttypes.MountInodeInfo
-        ] = defaultdict(
-            lambda: eden_ttypes.MountInodeInfo(
-                unloadedInodeCount=1, loadedFileCount=2, loadedTreeCount=3
+        self._path_mount_inode_info: Dict[bytes, eden_ttypes.MountInodeInfo] = (
+            defaultdict(
+                lambda: eden_ttypes.MountInodeInfo(
+                    unloadedInodeCount=1, loadedFileCount=2, loadedTreeCount=3
+                )
             )
         )
 
@@ -50,6 +52,7 @@ class FakeClient:
     def __enter__(self) -> "FakeClient":
         return self
 
+    # pyre-fixme[2]: Parameter must be annotated.
     def __exit__(self, exc_type, exc_value, exc_traceback) -> None:
         pass
 
@@ -94,6 +97,7 @@ class FakeClient:
                 parent1=parents.parent1,
                 parent2=parents.parent2,
                 hg_root_manifest=params.hgRootManifest,
+                rootIdOptions=params.rootIdOptions,
             )
         )
 
@@ -143,3 +147,8 @@ class FakeClient:
         return eden_ttypes.GetScmStatusResult(
             status=eden_ttypes.ScmStatus(entries=dict())
         )
+
+    def getCurrentSnapshotInfo(
+        self, params: eden_ttypes.GetCurrentSnapshotInfoRequest
+    ) -> eden_ttypes.GetCurrentSnapshotInfoResponse:
+        return eden_ttypes.GetCurrentSnapshotInfoResponse(filterId=None)

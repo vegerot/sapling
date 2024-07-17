@@ -1,6 +1,7 @@
-#debugruntest-compatible
 
-  $ configure modernclient
+#require no-eden
+
+
 
   $ newclientrepo test1
 
@@ -35,10 +36,18 @@ Make sure --config options are available when loading config itself.
 "root" is not material - the important thing is that the regen-command is respected:
 
   $ echo > "$TESTTMP/test_hgrc"
-  $ HG_TEST_DYNAMICCONFIG="$TESTTMP/test_hgrc" LOG=configloader::hg=debug hg root --config "configs.regen-command=false" --config configs.generationtime=0 2>&1 | grep '^DEBUG.* spawn '
+  $ HG_TEST_INTERNALCONFIG="$TESTTMP/test_hgrc" LOG=configloader::hg=debug hg root --config "configs.regen-command=false" --config configs.generationtime=0 2>&1 | grep '^DEBUG.* spawn '
   DEBUG configloader::hg: spawn ["false"] because * (glob)
 
 Only load config a single time.
   $ LOG=configloader::hg=info hg files abc
-   INFO configloader::hg: loading config repo_path=$TESTTMP* (glob)
+   INFO configloader::hg: loading config repo_path=* (glob)
+  [1]
+
+Only load config a single time when repo config file doesn't exist:
+  $ ls .hg/hgrc
+  .hg/hgrc
+  $ rm .hg/hgrc
+  $ LOG=configloader::hg=info hg files abc --config paths.default=test:test1_server
+   INFO configloader::hg: loading config repo_path=* (glob)
   [1]

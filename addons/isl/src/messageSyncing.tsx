@@ -9,14 +9,11 @@ import type {DiffId} from './types';
 
 import serverAPI from './ClientToServerAPI';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
-import {selector} from 'recoil';
+import {atom} from 'jotai';
 
-export const messageSyncingEnabledState = selector({
-  key: 'messageSyncingEnabledState',
-  get: ({get}) => {
-    const provider = get(codeReviewProvider);
-    return provider?.enableMessageSyncing ?? false;
-  },
+export const messageSyncingEnabledState = atom(get => {
+  const provider = get(codeReviewProvider);
+  return provider?.enableMessageSyncing ?? false;
 });
 
 export async function updateRemoteMessage(

@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 
 We assume that log basically works (it has its own tests). This just covers uses
@@ -506,3 +508,5 @@ Confirm that --help works (it didn't when we used an alias)
       --hidden                consider hidden changesets
       --pager TYPE            when to paginate (boolean, always, auto, or never)
                               (default: auto)
+      --reason VALUE [+]      why this runs, usually set by automation
+                              (ADVANCED)

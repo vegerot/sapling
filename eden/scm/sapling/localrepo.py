@@ -33,6 +33,7 @@ from . import (
     changegroup,
     changelog2,
     color,
+    commitscheme,
     connectionpool,
     context,
     dirstate as dirstatemod,
@@ -367,6 +368,10 @@ class localrepository:
         "lfs",
         # enable symlinks on Windows
         "windowssymlinks",
+        # allows sparse eden (filteredfs) checkouts
+        "edensparse",
+        # live inside a ".git"
+        git.DOTGIT_REQUIREMENT,
     }
     _basestoresupported = {
         "visibleheads",
@@ -387,6 +392,8 @@ class localrepository:
         git.GIT_FORMAT_REQUIREMENT,
         # backed by git bare repo
         git.GIT_STORE_REQUIREMENT,
+        # live inside a ".git"
+        git.DOTGIT_REQUIREMENT,
         # lazy commit message (full idmap, partial hgcommits) + edenapi
         "lazytextchangelog",
         # lazy commit message (sparse idmap, partial hgcommits) + edenapi
@@ -397,6 +404,8 @@ class localrepository:
         # backed by Rust eagerepo::EagerRepo. Mainly used in tests or
         # fully local repos.
         eagerepo.EAGEREPO_REQUIREMENT,
+        # explicit requirement for a revlog repo using eager store (i.e. revlog2.py)
+        "eagercompat",
     }
     openerreqs = {"revlogv1", "generaldelta", "treemanifest"}
 
@@ -642,12 +651,23 @@ class localrepository:
 
         # needed by revlog2
         sfmt = self.storage_format()
-        if sfmt == "revlog" or not extensions.isenabled(self.ui, "treemanifest"):
+        if not create and (
+            sfmt == "revlog" or not extensions.isenabled(self.ui, "treemanifest")
+        ):
             from . import revlog2
 
             revlog2.patch_types()
 
             self.svfs._reporef = weakref.ref(self)
+
+            if (
+                "eagercompat" not in self.storerequirements
+                # seems incompatible with legacy lfs extension
+                and not extensions.isenabled(self.ui, "lfs")
+            ):
+                with self.lock(wait=False):
+                    self.storerequirements.add("eagercompat")
+                    self._writestorerequirements()
 
         try:
             self._visibilitymigration()
@@ -858,11 +878,21 @@ class localrepository:
 
     def commitpending(self):
         # If we have any pending manifests, commit them to disk.
+        flush_rust = False
         if "manifestlog" in self.__dict__:
             self.manifestlog.commitpending()
+        else:
+            flush_rust = True
 
         if "fileslog" in self.__dict__:
             self.fileslog.commitpending()
+        else:
+            flush_rust = True
+
+        if flush_rust:
+            # We have have done a pure-Rust operation that wrote to caches.
+            # Flush via the Rust repo.
+            self._rsrepo.invalidatestores()
 
         if "changelog" in self.__dict__ and self.changelog.isvertexlazy():
             # Errors are not fatal. We lost some caches downloaded from the
@@ -1005,13 +1035,26 @@ class localrepository:
 
     @util.timefunction("pull", 0, "ui")
     def pull(
-        self, source="default", bookmarknames=(), headnodes=(), headnames=(), quiet=True
+        self,
+        source="default",
+        bookmarknames=(),
+        headnodes=(),
+        headnames=(),
+        quiet=True,
+        visible=True,
+        remotebookmarks=None,
     ):
         """Pull specified revisions and remote bookmarks.
 
-        headnodes is a list of binary nodes to pull.
-        headnames is a list of text names (ex. hex prefix of a commit hash).
-        bookmarknames is a list of bookmark names to pull.
+        - headnodes is a list of binary nodes to pull.
+        - headnames is a list of text names (ex. hex prefix of a commit hash).
+        - bookmarknames is a list of bookmark names to pull.
+        - remotebookmarks is a map of {bookmark: node}. Instead of fetching the
+          new nodes of those remote bookmarks from server, we just use the value
+          from this map.
+
+        visible=False can disable updating visible heads. This means the pulled
+        commit hashes will not be visible, although bookmarks are still updated.
 
         If a remote bookmark no longer exists on the server-side, it will be
         removed.
@@ -1081,22 +1124,37 @@ class localrepository:
 
             # Resolve the bookmark names to heads.
             if bookmarknames:
-                if (
-                    self.ui.configbool("pull", "httpbookmarks")
-                    and self.nullableedenapi is not None
-                ):
-                    fetchedbookmarks = self.edenapi.bookmarks(list(bookmarknames))
-                    tracing.debug(
-                        "edenapi fetched bookmarks: %s" % str(fetchedbookmarks),
-                        target="pull::httpbookmarks",
-                    )
-                    remotebookmarks = {
-                        bm: n for (bm, n) in fetchedbookmarks.items() if n is not None
-                    }
-                else:
-                    remotebookmarks = remote.listkeyspatterns(
-                        "bookmarks", patterns=list(bookmarknames)
-                    )  # {name: hexnode}
+                # Convert nodes to hexnodes, so it matches the return type of bookmarks
+                # api calls below
+                remotebookmarks = {
+                    b: hex(n) for b, n in (remotebookmarks or {}).items()
+                }
+                missing_bookmarknames = [
+                    b for b in bookmarknames if b not in remotebookmarks
+                ]
+                if missing_bookmarknames:
+                    if (
+                        self.ui.configbool("pull", "httpbookmarks")
+                        and self.nullableedenapi is not None
+                    ):
+                        fetchedbookmarks = self.edenapi.bookmarks(missing_bookmarknames)
+                        tracing.debug(
+                            "edenapi fetched bookmarks: %s" % str(fetchedbookmarks),
+                            target="pull::httpbookmarks",
+                        )
+                        remotebookmarks.update(
+                            {
+                                bm: n
+                                for (bm, n) in fetchedbookmarks.items()
+                                if n is not None
+                            }
+                        )
+                    else:
+                        remotebookmarks.update(
+                            remote.listkeyspatterns(
+                                "bookmarks", patterns=missing_bookmarknames
+                            )
+                        )  # {name: hexnode}
 
                 for name in bookmarknames:
                     if name in remotebookmarks:
@@ -1167,25 +1225,16 @@ class localrepository:
 
             fastpathheads = set()
             fastpathcommits, fastpathsegments, fastpathfallbacks = 0, 0, 0
-            for (old, new) in fastpath:
+            for old, new in fastpath:
                 try:
-                    fastpulldata = self.edenapi.pullfastforwardmaster(old, new)
-                except Exception as e:
-                    self.ui.status_err(
-                        _("failed to get fast pull data (%s), using fallback path\n")
-                        % (e,)
+                    commits, segments = bindings.exchange.fastpull(
+                        self.ui._rcfg,
+                        self.edenapi,
+                        self.changelog.inner,
+                        [old],
+                        [new],
                     )
-                    fastpathfallbacks += 1
-                    continue
-                vertexopts = {
-                    "reserve_size": 0,
-                    "highest_group": 0,
-                }
-                try:
-                    commits, segments = self.changelog.inner.importpulldata(
-                        fastpulldata,
-                        [(new, vertexopts)],
-                    )
+
                     self.ui.status(
                         _("imported commit graph for %s (%s)\n")
                         % (
@@ -1205,6 +1254,12 @@ class localrepository:
                     tracing.warn(
                         "cannot use pull fast path: %s\n" % e, target="pull::fastpath"
                     )
+                except Exception as e:
+                    self.ui.status_err(
+                        _("failed to get fast pull data (%s), using fallback path\n")
+                        % (e,)
+                    )
+                    fastpathfallbacks += 1
 
             pullheads = heads - fastpathheads
 
@@ -1235,7 +1290,7 @@ class localrepository:
                     "obsolete": False,
                     "updatevisibility": False,
                 }
-                opargs = {"extras": extras}
+                opargs = {"extras": extras, "newpull": True}
                 pullheads = sorted(pullheads)
                 exchange.pull(self, remote, pullheads, opargs=opargs)
 
@@ -1252,7 +1307,7 @@ class localrepository:
                 )
 
             # Update visibleheads:
-            if heads:
+            if visible and heads:
                 # Exclude obvious public heads (not all public heads for
                 # performance). Note: legacy non-narrow-heads won't be
                 # able to provide only public heads and cannot use this
@@ -1330,15 +1385,10 @@ class localrepository:
         return bindings.copytrace.dagcopytrace(
             self.changelog.inner,
             self.manifestlog.datastore,
-            self.fileslog.filescmstore,
+            self.fileslog.filestore,
             self.changelog.dag,
             self.ui._rcfg,
         )
-
-    @util.propertycache
-    def _gitcopytrace(self):
-        gitdir = git.readgitdir(self)
-        return bindings.copytrace.gitcopytrace(gitdir)
 
     def _constructmanifest(self):
         # This is a temporary function while we migrate from manifest to
@@ -1355,10 +1405,16 @@ class localrepository:
 
     @repofilecache(localpaths=["dirstate"])
     def dirstate(self) -> "dirstatemod.dirstate":
-        if edenfs.requirement in self.requirements:
+        if (
+            edenfs.requirement in self.requirements
+            or git.DOTGIT_REQUIREMENT in self.requirements
+        ):
             return self._eden_dirstate
 
-        if not "treestate" in self.requirements:
+        if (
+            not "treestate" in self.requirements
+            and git.DOTGIT_REQUIREMENT not in self.requirements
+        ):
             raise errormod.RequirementError(
                 "legacy dirstate implementations are no longer supported"
             )
@@ -1411,6 +1467,10 @@ class localrepository:
                 )
 
         return dirstate_reimplementation.eden_dirstate(self, self.ui, self.root)
+
+    @util.propertycache
+    def commitscheme(self):
+        return commitscheme.schemes(self)
 
     def _dirstatevalidate(self, node: bytes) -> bytes:
         self.changelog.rev(node)
@@ -2193,7 +2253,10 @@ class localrepository:
         explicitly read the dirstate again (i.e. restoring it to a previous
         known good state)."""
         # eden_dirstate has its own invalidation logic.
-        if edenfs.requirement in self.requirements:
+        if (
+            edenfs.requirement in self.requirements
+            or git.DOTGIT_REQUIREMENT in self.requirements
+        ):
             self.dirstate.invalidate()
             return
 
@@ -2423,7 +2486,12 @@ class localrepository:
         # to be used as a working copy. Let's skip the sharedwlock to avoid
         # deadlock. See test-git-submodule-loop.t.
         sharedwlock = None
-        if self.shared() and self.submodule is None:
+        if (
+            self.shared()
+            and self.submodule is None
+            # Escape hatch in case we need to bring below locking back.
+            and self.ui.configbool("experimental", "allow-shared-wlock")
+        ):
             sharedwlock = self._lock(
                 self.sharedvfs,
                 "wlock",
@@ -2565,23 +2633,35 @@ class localrepository:
         if (
             metamatched
             and node is not None
-            # some filectxs do not support rawdata or flags
-            and hasattr(fctx, "rawdata")
-            and hasattr(fctx, "rawflags")
-            # some (external) filelogs do not have addrawrevision
-            and hasattr(flog, "addrawrevision")
-            # parents must match to be able to reuse rawdata
+            # "nodemap" is a remotefilelog detail
+            and hasattr(flog, "nodemap")
             and fctx.filelog().parents(node) == (fparent1, fparent2)
         ):
-            # node is different from fparents, no need to check manifest flag
-            changelist.append(fname)
             if node in flog.nodemap:
+                changelist.append(fname)
                 self.ui.debug("reusing %s filelog node (exact match)\n" % fname)
                 return node
-            self.ui.debug("reusing %s filelog rawdata\n" % fname)
-            return flog.addrawrevision(
-                fctx.rawdata(), tr, linkrev, fparent1, fparent2, node, fctx.rawflags()
-            )
+
+            if (
+                # some filectxs do not support rawdata or flags
+                hasattr(fctx, "rawdata")
+                and hasattr(fctx, "rawflags")
+                # some (external) filelogs do not have addrawrevision
+                and hasattr(flog, "addrawrevision")
+                # parents must match to be able to reuse rawdata
+            ):
+                # node is different from fparents, no need to check manifest flag
+                changelist.append(fname)
+                self.ui.debug("reusing %s filelog rawdata\n" % fname)
+                return flog.addrawrevision(
+                    fctx.rawdata(),
+                    tr,
+                    linkrev,
+                    fparent1,
+                    fparent2,
+                    node,
+                    fctx.rawflags(),
+                )
 
         # is the file changed?
         text = fctx.data()
@@ -2604,7 +2684,7 @@ class localrepository:
         fnode = git.submodule_node_from_fctx(fctx)
         if fnode is not None:
             return fnode
-        return self.fileslog.contentstore.writeobj("blob", fctx.data())
+        return self.fileslog.filestore.writeobj("blob", fctx.data())
 
     def checkcommitpatterns(self, wctx, match, status, fail):
         """check for commit arguments that aren't committable"""
@@ -2775,6 +2855,26 @@ class localrepository:
                     _("commit extras total size (%s) exceeds configured limit (%s)")
                     % (extraslen, extraslimit)
                 )
+
+        file_count_limit = self.ui.configint("commit", "file-count-limit")
+        if file_count_limit and file_count_limit < len(ctx.files()):
+            support = self.ui.config("ui", "supportcontact")
+            if support:
+                hint = (
+                    _(
+                        "contact %s for help or use '--config commit.file-count-limit=N' cautiously to override"
+                    )
+                    % support
+                )
+            else:
+                hint = _(
+                    "use '--config commit.file-count-limit=N' cautiously to override"
+                )
+            raise errormod.Abort(
+                _("commit file count (%d) exceeds configured limit (%d)")
+                % (len(ctx.files()), file_count_limit),
+                hint=hint,
+            )
 
         isgit = git.isgitformat(self)
         lock = self.lock()

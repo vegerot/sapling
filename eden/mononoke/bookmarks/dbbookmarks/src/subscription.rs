@@ -26,7 +26,6 @@ use rand::Rng;
 use slog::warn;
 use sql_ext::mononoke_queries;
 use stats::prelude::*;
-use tunables::tunables;
 
 use crate::store::GetLargestLogId;
 use crate::store::SelectAllUnordered;
@@ -65,10 +64,13 @@ impl SqlBookmarksSubscription {
             .await
             .context("Failed to start bookmarks read transaction")?;
 
-        let (txn, log_id_rows) =
-            GetLargestLogId::query_with_transaction(txn, &sql_bookmarks.repo_id)
-                .await
-                .context("Failed to read log id")?;
+        let (txn, log_id_rows) = GetLargestLogId::maybe_traced_query_with_transaction(
+            txn,
+            ctx.client_request_info(),
+            &sql_bookmarks.repo_id,
+        )
+        .await
+        .context("Failed to read log id")?;
 
         // Our ids start at 1 so we can default log_id to zero if it's missing.
         let log_id = log_id_rows
@@ -79,10 +81,11 @@ impl SqlBookmarksSubscription {
             .unwrap_or(0);
 
         let tok: i32 = rand::thread_rng().gen();
-        let (txn, bookmarks) = SelectAllUnordered::query_with_transaction(
+        let (txn, bookmarks) = SelectAllUnordered::maybe_traced_query_with_transaction(
             txn,
+            ctx.client_request_info(),
             &sql_bookmarks.repo_id,
-            &std::u64::MAX,
+            &u64::MAX,
             &tok,
             BookmarkKind::ALL_PUBLISHING,
             BookmarkCategory::ALL,
@@ -115,16 +118,7 @@ impl SqlBookmarksSubscription {
     }
 
     fn has_aged_out(&self) -> bool {
-        let max_age_ms = match tunables()
-            .bookmark_subscription_max_age_ms()
-            .unwrap_or_default()
-            .try_into()
-        {
-            Ok(duration) if duration > 0 => duration,
-            _ => DEFAULT_SUBSCRIPTION_MAX_AGE_MS,
-        };
-
-        self.last_refresh.elapsed() > Duration::from_millis(max_age_ms)
+        self.last_refresh.elapsed() > Duration::from_millis(DEFAULT_SUBSCRIPTION_MAX_AGE_MS)
     }
 }
 
@@ -148,12 +142,14 @@ impl BookmarksSubscription for SqlBookmarksSubscription {
 
         let conn = self.sql_bookmarks.connection(ctx, self.freshness);
 
-        let changes =
-            SelectUpdatedBookmarks::query(conn, &self.sql_bookmarks.repo_id, &self.log_id)
-                .await
-                .with_context(|| {
-                    format!("Failed to select updated bookmarks after {}", self.log_id)
-                })?;
+        let changes = SelectUpdatedBookmarks::maybe_traced_query(
+            conn,
+            ctx.client_request_info(),
+            &self.sql_bookmarks.repo_id,
+            &self.log_id,
+        )
+        .await
+        .with_context(|| format!("Failed to select updated bookmarks after {}", self.log_id))?;
 
         let mut max_log_id = None;
         let mut updates = HashMap::new();
@@ -182,18 +178,13 @@ impl BookmarksSubscription for SqlBookmarksSubscription {
                     self.bookmarks.insert(book, value);
                 }
                 None => {
-                    if tunables()
-                        .bookmark_subscription_protect_master()
-                        .unwrap_or_default()
-                    {
-                        if book.as_str() == "master" {
-                            warn!(
-                                ctx.logger(),
-                                "BookmarksSubscription: protect master kicked in!"
-                            );
-                            STATS::master_protected.add_value(1);
-                            continue;
-                        }
+                    if book.as_str() == "master" {
+                        warn!(
+                            ctx.logger(),
+                            "BookmarksSubscription: protect master kicked in!"
+                        );
+                        STATS::master_protected.add_value(1);
+                        continue;
                     }
 
                     self.bookmarks.remove(&book);
@@ -251,7 +242,6 @@ mod test {
     use mononoke_types_mocks::changesetid::ONES_CSID;
     use mononoke_types_mocks::repo::REPO_ZERO;
     use sql_construct::SqlConstruct;
-    use tunables::MononokeTunables;
 
     use super::*;
     use crate::builder::SqlBookmarksBuilder;
@@ -296,10 +286,6 @@ mod test {
 
     #[fbinit::test]
     async fn test_protect_master(fb: FacebookInit) -> Result<()> {
-        let protect_master = MononokeTunables::default();
-        protect_master
-            .update_bools(&hashmap! {"bookmark_subscription_protect_master".to_string() => true});
-
         let ctx = CoreContext::test_mock(fb);
         let bookmarks = SqlBookmarksBuilder::with_sqlite_in_memory()?.with_repo_id(REPO_ZERO);
         let conn = bookmarks.connections.write_connection.clone();
@@ -314,11 +300,7 @@ mod test {
         )];
         crate::transaction::insert_bookmarks(&conn, rows).await?;
 
-        let mut sub1 =
-            SqlBookmarksSubscription::create(&ctx, bookmarks.clone(), Freshness::MostRecent)
-                .await?;
-
-        let mut sub2 =
+        let mut sub =
             SqlBookmarksSubscription::create(&ctx, bookmarks.clone(), Freshness::MostRecent)
                 .await?;
 
@@ -326,11 +308,8 @@ mod test {
         txn.force_delete(&book, BookmarkUpdateReason::TestMove)?;
         txn.commit().await?;
 
-        tunables::with_tunables_async(protect_master, sub1.refresh(&ctx)).await?;
-        assert!(sub1.bookmarks.get(&book).is_some());
-
-        sub2.refresh(&ctx).await?;
-        assert!(sub2.bookmarks.get(&book).is_none());
+        sub.refresh(&ctx).await?;
+        assert!(sub.bookmarks.contains_key(&book));
 
         Ok(())
     }

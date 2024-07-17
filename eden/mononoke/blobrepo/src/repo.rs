@@ -19,6 +19,7 @@ use changeset_fetcher::ChangesetFetcher;
 use changeset_fetcher::SimpleChangesetFetcher;
 use changesets::Changesets;
 use changesets::ChangesetsRef;
+use commit_cloud::CommitCloud;
 use commit_graph::CommitGraph;
 use context::CoreContext;
 use ephemeral_blobstore::Bubble;
@@ -26,6 +27,7 @@ use filenodes::Filenodes;
 use filestore::FilestoreConfig;
 use git_symbolic_refs::GitSymbolicRefs;
 use mercurial_mutation::HgMutationStore;
+use metaconfig_types::RepoConfig;
 use mononoke_types::BonsaiChangeset;
 use mutable_counters::MutableCounters;
 use phases::Phases;
@@ -48,6 +50,9 @@ pub struct BlobRepoInner {
 
     #[init(repo_identity.name().to_string())]
     pub reponame: String,
+
+    #[facet]
+    pub config: RepoConfig,
 
     #[facet]
     pub repo_blobstore: RepoBlobstore,
@@ -114,6 +119,9 @@ pub struct BlobRepoInner {
 
     #[facet]
     pub repo_bookmark_attrs: RepoBookmarkAttrs,
+
+    #[facet]
+    pub commit_cloud: CommitCloud,
 }
 
 #[facet::container]
@@ -139,10 +147,12 @@ pub struct BlobRepo {
         dyn GitSymbolicRefs,
         dyn HgMutationStore,
         RepoDerivedData,
+        RepoConfig,
         dyn MutableCounters,
         dyn RepoPermissionChecker,
         dyn RepoLock,
         RepoBookmarkAttrs,
+        CommitCloud
     )]
     inner: Arc<BlobRepoInner>,
 }
@@ -162,7 +172,8 @@ impl BlobRepo {
 
     pub fn with_bubble(&self, bubble: Bubble) -> Self {
         let blobstore = bubble.wrap_repo_blobstore(self.repo_blobstore().clone());
-        let changesets = Arc::new(bubble.changesets(self));
+        let changesets = Arc::new(bubble.repo_changesets(self));
+        let commit_graph = Arc::new(bubble.repo_commit_graph(self));
         let changeset_fetcher =
             SimpleChangesetFetcher::new(changesets.clone(), self.repo_identity().id());
         let new_manager = self
@@ -170,13 +181,14 @@ impl BlobRepo {
             .repo_derived_data
             .manager()
             .clone()
-            .for_bubble(bubble, self);
+            .for_bubble(bubble);
         let repo_derived_data = self.inner.repo_derived_data.with_manager(new_manager);
         let mut inner = (*self.inner).clone();
         inner.repo_derived_data = Arc::new(repo_derived_data);
         inner.changesets = changesets;
         inner.changeset_fetcher = Arc::new(changeset_fetcher);
         inner.repo_blobstore = Arc::new(blobstore);
+        inner.commit_graph = commit_graph;
         Self {
             inner: Arc::new(inner),
         }
@@ -196,13 +208,13 @@ impl AsBlobRepo for BlobRepo {
     }
 }
 
-/// This function uploads bonsai changests object to blobstore in parallel, and then does
+/// This function uploads bonsai changesets object to blobstore in parallel, and then does
 /// sequential writes to changesets table. Parents of the changesets should already by saved
 /// in the repository.
 pub async fn save_bonsai_changesets(
     bonsai_changesets: Vec<BonsaiChangeset>,
     ctx: CoreContext,
-    container: &(impl ChangesetsRef + RepoBlobstoreRef),
+    container: &(impl ChangesetsRef + RepoBlobstoreRef + RepoIdentityRef),
 ) -> Result<(), Error> {
     changesets_creation::save_changesets(&ctx, container, bonsai_changesets).await
 }

@@ -71,6 +71,7 @@ pub struct IdSegment {
 // only 1 byte overhead.
 
 bitflags! {
+    #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
     pub struct SegmentFlags: u8 {
         /// This segment has roots (i.e. there is at least one id in
         /// `low..=high`, `parents(id)` is empty).
@@ -187,8 +188,12 @@ impl Segment {
         high: Id,
         parents: &[Id],
     ) -> Self {
-        debug_assert!(high >= low);
-        debug_assert!(parents.iter().all(|&p| p < low));
+        assert!(low.is_valid());
+        assert!(high.is_valid());
+        assert_eq!(low.group(), high.group());
+        assert!(high >= low);
+        assert!(parents.iter().all(|&p| p < low));
+        assert!(parents.iter().all(|&p| p.is_valid()));
         let mut buf = Vec::with_capacity(1 + 8 + (parents.len() + 2) * 4);
         buf.write_u8(flags.bits()).unwrap();
         buf.write_u8(level).unwrap();
@@ -290,30 +295,42 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use dag_types::Group;
     use quickcheck::quickcheck;
 
     use super::*;
+    use crate::tests::dbg;
 
     #[test]
     fn test_segment_roundtrip() {
-        fn prop(has_root: bool, level: Level, range1: u64, range2: u64, parents: Vec<u64>) -> bool {
+        fn prop(
+            has_root: bool,
+            level: Level,
+            group: u8,
+            range1: u64,
+            range2: u64,
+            parents: Vec<u64>,
+        ) -> bool {
             let flags = if has_root {
                 SegmentFlags::HAS_ROOT
             } else {
                 SegmentFlags::empty()
             };
-            let low = u64::min(range1, range2);
-            let high = u64::max(range1, range2);
-            let parents: Vec<Id> = parents.into_iter().filter(|&p| p < low).map(Id).collect();
-            let low = Id(low);
-            let high = Id(high);
+            let group = Group::ALL[(group as usize) % Group::ALL.len()];
+            let range = group.max_id().0 - group.min_id().0;
+            let mut low = group.min_id() + (range1 % range);
+            let mut high = group.min_id() + (range2 % range);
+            if high < low {
+                (low, high) = (high, low);
+            }
+            let parents: Vec<Id> = parents.into_iter().filter(|&p| p < low.0).map(Id).collect();
             let node = Segment::new(flags, level, low, high, &parents);
             node.flags().unwrap() == flags
                 && node.level().unwrap() == level
                 && node.span().unwrap() == (low..=high).into()
                 && node.parents().unwrap() == parents
         }
-        quickcheck(prop as fn(bool, Level, u64, u64, Vec<u64>) -> bool);
+        quickcheck(prop as fn(bool, Level, u8, u64, u64, Vec<u64>) -> bool);
     }
 
     #[test]
@@ -327,7 +344,7 @@ mod tests {
         );
         assert_eq!(
             describe_segment_bytes(&seg.0),
-            r#"# 02: Flags = ONLY_HEAD
+            r#"# 02: Flags = SegmentFlags(ONLY_HEAD)
 # 03: Level = 3
 # 00 00 00 00 00 00 00 ca: High = 202
 # 65: Delta = 101 (Low = 101)
@@ -342,6 +359,6 @@ mod tests {
     fn test_invalid_fmt() {
         let bytes = Bytes::from_static(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 1, 10]);
         let segment = Segment(bytes);
-        assert_eq!(format!("{:?}", segment), "10-10[10] (Invalid Parent!!)");
+        assert_eq!(dbg(segment), "10-10[10] (Invalid Parent!!)");
     }
 }

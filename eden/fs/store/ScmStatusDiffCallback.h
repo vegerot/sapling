@@ -10,10 +10,10 @@
 
 #include <folly/Synchronized.h>
 
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/model/Hash.h"
 #include "eden/fs/service/gen-cpp2/eden_types.h"
 #include "eden/fs/store/DiffCallback.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 namespace folly {
 template <typename T>
@@ -40,6 +40,8 @@ class ScmStatusDiffCallback : public DiffCallback {
    * the diff operation has completed.
    */
   ScmStatus extractStatus();
+  void setStatus(ScmStatus status);
+  ScmStatus peekStatus() const;
 
  private:
   folly::Synchronized<ScmStatus> data_;

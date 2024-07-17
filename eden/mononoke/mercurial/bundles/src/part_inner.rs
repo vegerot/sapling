@@ -9,29 +9,27 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::BufRead;
 use std::str;
 
 use anyhow::bail;
 use anyhow::ensure;
 use anyhow::Error;
 use anyhow::Result;
-use bytes_old::Bytes;
-use bytes_old::BytesMut;
-use futures_ext::BoxFuture;
-use futures_ext::FutureExt;
-use futures_ext::StreamExt;
-use futures_ext::StreamLayeredExt;
-use futures_old::future;
-use futures_old::Future;
-use futures_old::Stream;
+use bytes::BytesMut;
+use futures::future;
+use futures::future::BoxFuture;
+use futures::FutureExt;
+use futures::StreamExt;
+use futures::TryFutureExt;
+use futures::TryStreamExt;
+use futures_ext::stream::FbStreamExt;
 use lazy_static::lazy_static;
 use maplit::hashset;
 use slog::o;
 use slog::warn;
 use slog::Logger;
-use tokio_io::codec::Decoder;
-use tokio_io::AsyncRead;
+use tokio::io::AsyncBufRead;
+use tokio_util::codec::Decoder;
 
 use crate::capabilities;
 use crate::changegroup;
@@ -39,33 +37,47 @@ use crate::errors::ErrorKind;
 use crate::infinitepush;
 use crate::part_header::PartHeader;
 use crate::part_header::PartHeaderType;
-use crate::part_outer::OuterFrame;
 use crate::part_outer::OuterStream;
 use crate::pushrebase;
+use crate::utils::decode_stream;
 use crate::wirepack;
-use crate::OldBundle2Item;
+use crate::Bundle2Item;
 
 // --- Part parameters
 
 lazy_static! {
     static ref KNOWN_PARAMS: HashMap<PartHeaderType, HashSet<&'static str>> = {
         let mut m: HashMap<PartHeaderType, HashSet<&'static str>> = HashMap::new();
-        m.insert(PartHeaderType::Changegroup, hashset!{"version", "nbchanges", "treemanifest"});
-        // TODO(stash): currently ignore all the parameters. Later we'll
-        // support 'bookmark' parameter, and maybe 'create' and 'force' (although 'force' will
-        // probably) be renamed T26385545. 'bookprevnode' and 'pushbackbookmarks' will be
-        // removed T26384190.
-        m.insert(PartHeaderType::B2xInfinitepush, hashset!{
-            "pushbackbookmarks", "cgversion", "bookmark", "bookprevnode", "create", "force"});
-        m.insert(PartHeaderType::B2xInfinitepushBookmarks, hashset!{});
-        m.insert(PartHeaderType::B2xInfinitepushMutation, hashset!{});
-        m.insert(PartHeaderType::B2xCommonHeads, hashset!{});
-        m.insert(PartHeaderType::B2xRebase, hashset!{"onto", "newhead", "cgversion", "obsmarkerversions"});
-        m.insert(PartHeaderType::B2xRebasePack, hashset!{"version", "cache", "category"});
-        m.insert(PartHeaderType::B2xTreegroup2, hashset!{"version", "cache", "category"});
-        m.insert(PartHeaderType::Replycaps, hashset!{});
-        m.insert(PartHeaderType::Pushkey, hashset!{ "namespace", "key", "old", "new" });
-        m.insert(PartHeaderType::Pushvars, hashset!{});
+        m.insert(
+            PartHeaderType::Changegroup,
+            hashset! {"version", "nbchanges", "treemanifest"},
+        );
+        m.insert(
+            PartHeaderType::B2xInfinitepush,
+            hashset! {
+            "pushbackbookmarks", "cgversion", "bookmark", "bookprevnode", "create", "force"},
+        );
+        m.insert(PartHeaderType::B2xInfinitepushBookmarks, hashset! {});
+        m.insert(PartHeaderType::B2xInfinitepushMutation, hashset! {});
+        m.insert(PartHeaderType::B2xCommonHeads, hashset! {});
+        m.insert(
+            PartHeaderType::B2xRebase,
+            hashset! {"onto", "newhead", "cgversion", "obsmarkerversions"},
+        );
+        m.insert(
+            PartHeaderType::B2xRebasePack,
+            hashset! {"version", "cache", "category"},
+        );
+        m.insert(
+            PartHeaderType::B2xTreegroup2,
+            hashset! {"version", "cache", "category"},
+        );
+        m.insert(PartHeaderType::Replycaps, hashset! {});
+        m.insert(
+            PartHeaderType::Pushkey,
+            hashset! { "namespace", "key", "old", "new" },
+        );
+        m.insert(PartHeaderType::Pushvars, hashset! {});
         m
     };
 }
@@ -140,94 +152,120 @@ pub fn get_cg_unpacker(
 }
 
 /// Convert an OuterStream into an InnerStream using the part header.
-pub(crate) fn inner_stream<R: AsyncRead + BufRead + 'static + Send>(
+pub(crate) fn inner_stream<R: AsyncBufRead + Send + 'static>(
     logger: Logger,
     header: PartHeader,
     stream: OuterStream<R>,
-) -> (OldBundle2Item, BoxFuture<OuterStream<R>, Error>) {
+) -> (
+    Bundle2Item<'static>,
+    BoxFuture<'static, Result<OuterStream<R>, Error>>,
+) {
     let wrapped_stream = stream
-        .take_while(|frame| future::ok(frame.is_payload()))
-        .map(OuterFrame::get_payload as fn(OuterFrame) -> Bytes);
+        .try_take_while(|frame| {
+            futures::future::ok(frame.as_ref().map_or(false, |frame| frame.is_payload()))
+        })
+        .map_ok(|frame| frame.unwrap().get_payload());
     let (wrapped_stream, remainder) = wrapped_stream.return_remainder();
 
     let bundle2item = match *header.part_type() {
         PartHeaderType::Changegroup => {
-            let cg2_stream = wrapped_stream.decode(get_cg_unpacker(
-                logger.new(o!("stream" => "changegroup")),
-                header.clone(),
-                "version",
-            ));
-            OldBundle2Item::Changegroup(header, cg2_stream.boxify())
+            let cg2_stream = decode_stream(
+                wrapped_stream,
+                get_cg_unpacker(
+                    logger.new(o!("stream" => "changegroup")),
+                    header.clone(),
+                    "version",
+                ),
+            );
+            Bundle2Item::Changegroup(header, cg2_stream.boxed())
         }
         PartHeaderType::B2xCommonHeads => {
-            let heads_stream = wrapped_stream.decode(pushrebase::CommonHeadsUnpacker::new());
-            OldBundle2Item::B2xCommonHeads(header, heads_stream.boxify())
+            let heads_stream =
+                decode_stream(wrapped_stream, pushrebase::CommonHeadsUnpacker::new());
+            Bundle2Item::B2xCommonHeads(header, heads_stream.boxed())
         }
         PartHeaderType::B2xInfinitepush => {
-            let cg2_stream = wrapped_stream.decode(get_cg_unpacker(
-                logger.new(o!("stream" => "b2xinfinitepush")),
-                header.clone(),
-                "cgversion",
-            ));
-            OldBundle2Item::B2xInfinitepush(header, cg2_stream.boxify())
+            let cg2_stream = decode_stream(
+                wrapped_stream,
+                get_cg_unpacker(
+                    logger.new(o!("stream" => "b2xinfinitepush")),
+                    header.clone(),
+                    "cgversion",
+                ),
+            );
+            Bundle2Item::B2xInfinitepush(header, cg2_stream.boxed())
         }
         PartHeaderType::B2xInfinitepushBookmarks => {
-            let bookmarks_stream =
-                wrapped_stream.decode(infinitepush::InfinitepushBookmarksUnpacker::new());
-            OldBundle2Item::B2xInfinitepushBookmarks(header, bookmarks_stream.boxify())
+            let bookmarks_stream = decode_stream(
+                wrapped_stream,
+                infinitepush::InfinitepushBookmarksUnpacker::new(),
+            );
+            Bundle2Item::B2xInfinitepushBookmarks(header, bookmarks_stream.boxed())
         }
         PartHeaderType::B2xInfinitepushMutation => {
-            let mutation_stream =
-                wrapped_stream.decode(infinitepush::InfinitepushMutationUnpacker::new());
-            OldBundle2Item::B2xInfinitepushMutation(header, mutation_stream.boxify())
+            let mutation_stream = decode_stream(
+                wrapped_stream,
+                infinitepush::InfinitepushMutationUnpacker::new(),
+            );
+            Bundle2Item::B2xInfinitepushMutation(header, mutation_stream.boxed())
         }
         PartHeaderType::B2xTreegroup2 => {
-            let wirepack_stream = wrapped_stream.decode(wirepack::unpacker::new(
-                logger.new(o!("stream" => "wirepack")),
-                // Mercurial only knows how to send trees at the moment.
-                // TODO: add support for file wirepacks once that's a thing
-                wirepack::Kind::Tree,
-            ));
-            OldBundle2Item::B2xTreegroup2(header, wirepack_stream.boxify())
+            let wirepack_stream = decode_stream(
+                wrapped_stream,
+                wirepack::unpacker::new(
+                    logger.new(o!("stream" => "wirepack")),
+                    // Mercurial only knows how to send trees at the moment.
+                    // TODO: add support for file wirepacks once that's a thing
+                    wirepack::Kind::Tree,
+                ),
+            );
+            Bundle2Item::B2xTreegroup2(header, wirepack_stream.boxed())
         }
         PartHeaderType::Replycaps => {
-            let caps = wrapped_stream
-                .decode(capabilities::CapabilitiesUnpacker)
-                .collect()
-                .and_then(|caps| {
+            let caps = decode_stream(wrapped_stream, capabilities::CapabilitiesUnpacker)
+                .try_collect::<Vec<_>>()
+                .and_then(|caps| async move {
                     ensure!(caps.len() == 1, "Unexpected Replycaps payload: {:?}", caps);
                     Ok(caps.into_iter().next().unwrap())
                 });
-            OldBundle2Item::Replycaps(header, caps.boxify())
+            Bundle2Item::Replycaps(header, caps.boxed())
         }
         PartHeaderType::B2xRebasePack => {
-            let wirepack_stream = wrapped_stream.decode(wirepack::unpacker::new(
-                logger.new(o!("stream" => "wirepack")),
-                // Mercurial only knows how to send trees at the moment.
-                // TODO: add support for file wirepacks once that's a thing
-                wirepack::Kind::Tree,
-            ));
-            OldBundle2Item::B2xRebasePack(header, wirepack_stream.boxify())
+            let wirepack_stream = decode_stream(
+                wrapped_stream,
+                wirepack::unpacker::new(
+                    logger.new(o!("stream" => "wirepack")),
+                    // Mercurial only knows how to send trees at the moment.
+                    // TODO: add support for file wirepacks once that's a thing
+                    wirepack::Kind::Tree,
+                ),
+            );
+            Bundle2Item::B2xRebasePack(header, wirepack_stream.boxed())
         }
         PartHeaderType::B2xRebase => {
-            let cg2_stream = wrapped_stream.decode(get_cg_unpacker(
-                logger.new(o!("stream" => "bx2rebase")),
-                header.clone(),
-                "cgversion",
-            ));
-            OldBundle2Item::B2xRebase(header, cg2_stream.boxify())
+            let cg2_stream = decode_stream(
+                wrapped_stream,
+                get_cg_unpacker(
+                    logger.new(o!("stream" => "bx2rebase")),
+                    header.clone(),
+                    "cgversion",
+                ),
+            );
+            Bundle2Item::B2xRebase(header, cg2_stream.boxed())
         }
         PartHeaderType::Pushkey => {
             // Pushkey part has an empty part payload, but we still need to "parse" it
             // Otherwise polling remainder stream may fail.
-            let empty = wrapped_stream.decode(EmptyUnpacker).for_each(|_| Ok(()));
-            OldBundle2Item::Pushkey(header, Box::new(empty))
+            let empty =
+                decode_stream(wrapped_stream, EmptyUnpacker).try_for_each(|_| future::ok(()));
+            Bundle2Item::Pushkey(header, empty.boxed())
         }
         PartHeaderType::Pushvars => {
             // Pushvars part has an empty part payload, but we still need to "parse" it
             // Otherwise polling remainder stream may fail.
-            let empty = wrapped_stream.decode(EmptyUnpacker).for_each(|_| Ok(()));
-            OldBundle2Item::Pushvars(header, Box::new(empty))
+            let empty =
+                decode_stream(wrapped_stream, EmptyUnpacker).try_for_each(|_| future::ok(()));
+            Bundle2Item::Pushvars(header, empty.boxed())
         }
         _ => panic!("TODO: make this an error"),
     };
@@ -235,9 +273,9 @@ pub(crate) fn inner_stream<R: AsyncRead + BufRead + 'static + Send>(
     (
         bundle2item,
         remainder
-            .map(|s| s.into_inner().into_inner())
-            .from_err()
-            .boxify(),
+            .map_ok(|s| s.into_inner().into_inner())
+            .map_err(Error::from)
+            .boxed(),
     )
 }
 

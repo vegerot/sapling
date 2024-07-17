@@ -9,10 +9,11 @@ from __future__ import absolute_import
 
 import os
 
+from bindings import clientinfo
+
 from sapling import (
     blobstore,
     error,
-    extensions,
     json,
     perftrace,
     progress,
@@ -330,7 +331,7 @@ class _gitlfsremote:
         return self._metrics
 
     def _addextraheaders(self, req):
-        headers = {}
+        headers = {"X-Client-Info": clientinfo.clientinfo().to_json().decode()}
         for k, v in headers.items():
             req.add_header(k, v)
 

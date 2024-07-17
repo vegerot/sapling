@@ -29,17 +29,23 @@ from __future__ import absolute_import
 
 import datetime
 import re
+import sys
 import time
+
+import bindings
 
 from sapling import (
     bookmarks,
     cmdutil,
     commands,
     dagop,
+    error,
     extensions,
     graphmod,
+    hintutil,
     node as nodemod,
     phases,
+    pycompat,
     registrar,
     revset,
     revsetlang,
@@ -50,13 +56,17 @@ from sapling import (
 from sapling.i18n import _
 from sapling.pycompat import range
 
+if not pycompat.iswindows:
+    from . import interactiveui
+else:
+    interactiveui = None
+from . import rebase
 
 cmdtable = {}
 command = registrar.command(cmdtable)
 revsetpredicate = registrar.revsetpredicate()
 
 testedwith = "ships-with-fb-ext"
-commit_info = False
 
 # Remove unsupported --limit option.
 logopts = [opt for opt in commands.logopts if opt[1] != "limit"]
@@ -68,36 +78,9 @@ configitem("smartlog", "collapse-obsolete", default=True)
 configitem("smartlog", "max-commit-threshold", default=1000)
 
 
-def uisetup(ui):
-    def show(orig, self, ctx, *args):
-        res = orig(self, ctx, *args)
-
-        if commit_info and ctx == self.repo["."]:
-            changes = ctx.p1().status(ctx)
-            prefixes = ["M", "A", "R", "!", "?", "I", "C"]
-            labels = [
-                "status.modified",
-                "status.added",
-                "status.removed",
-                "status.deleted",
-                "status.unknown",
-                "status.ignored",
-                "status.copied",
-            ]
-            for prefix, label, change in zip(prefixes, labels, changes):
-                for fname in change:
-                    self.ui.write(
-                        self.ui.label(" {0} {1}\n".format(prefix, fname), label)
-                    )
-            self.ui.write("\n")
-        return res
-
-    extensions.wrapfunction(cmdutil.changeset_printer, "_show", show)
-    extensions.wrapfunction(cmdutil.changeset_templater, "_show", show)
-
-
 templatekeyword = registrar.templatekeyword()
 templatefunc = registrar.templatefunc()
+hint = registrar.hint()
 
 
 @templatekeyword("shelveenabled")
@@ -106,7 +89,7 @@ def shelveenabled(repo, ctx, **args):
     return "shelve" in extensions.enabled().keys()
 
 
-def getdag(ui, repo, revs, master, template):
+def getdag(ui, repo, revs, masterstring, template):
 
     knownrevs = set(revs)
     gpcache = {}
@@ -129,9 +112,10 @@ def getdag(ui, repo, revs, master, template):
     if simplifygrandparents:
         rootnodes = cl.tonodes(revs)
 
+    masterrev = repo.anyrevs([masterstring], user=True).first()
     firstbranch = []
-    if master is not None:
-        firstbranch.append(master)
+    if masterrev is not None:
+        firstbranch.append(masterrev)
     revs = repo.revs("sort(%ld,topo,topo.firstbranch=%ld)", revs, firstbranch)
     ctxstream = revs.prefetchbytemplate(repo, template).iterctx()
 
@@ -449,16 +433,28 @@ def smartdate(context, mapping, args):
         return templater.evalstring(context, mapping, args[3])
 
 
+@hint("smartlog-default-command")
+def hintsmartlogdefaultcommand():
+    return _("you can run smartlog with simply `@prog@`")
+
+
 @command(
     "smartlog|sl|slog|sm|sma|smar|smart|smartl|smartlo",
     [
         ("", "master", "", _("master bookmark"), _("BOOKMARK")),
         ("r", "rev", [], _("show the specified revisions or range"), _("REV")),
-        ("", "all", False, _("don't hide old local changesets"), ""),
-        ("", "commit-info", False, _("show changes in current changeset"), ""),
+        ("", "all", False, _("don't hide old local changesets")),
+        ("", "commit-info", False, _("show changes in current changeset")),
+        (
+            "i",
+            "interactive",
+            False,
+            _("enter command line interactive smartlog (EXPERIMENTAL)"),
+        ),
     ]
     + logopts,
     _("[OPTION]... [[-r] REV]"),
+    cmdtype=registrar.command.readonly,
 )
 def smartlog(ui, repo, *pats, **opts):
     """show a graph of the commits that are relevant to you
@@ -472,15 +468,41 @@ def smartlog(ui, repo, *pats, **opts):
     Excludes:
 
     - All commits under master that aren't related to your commits
-    - Your local commits that are older than a specified date"""
-    return _smartlog(ui, repo, *pats, **opts)
+    - Your local commits that are older than a specified date
+
+    ``--commit-info`` shows status-like file changes for the current commit, or
+    all drafts when using ``--verbose``. Note this is not the working copy
+    ``status`` and only works with default templates.
+
+    ``--stat` shows ``diff --stat``-like file changes for all drafts.
+    """
+
+    maybe_hint_about_default_command(ui)
+
+    overrides = {}
+    if opts.get("commit_info"):
+        if ui.verbose:
+            config = "'true'"
+        else:
+            config = "\"{ifeq(graphnode, '@', 'true')}\""
+        overrides[("templatealias", "sl_show_file_change_summary")] = config
+    with ui.configoverride(overrides):
+        return _smartlog(ui, repo, *pats, **opts)
 
 
-def getrevs(ui, repo, masterstring, **opts):
-    global commit_info
-    commit_info = opts.get("commit_info")
+def maybe_hint_about_default_command(ui):
+    # Make sure the default command is configured to run smartlog.
+    if ui.config("commands", "naked-default.in-repo") != "sl":
+        return
 
-    headrevs = opts.get("rev")
+    # Make sure the user typed "... sl" or "... smartlog".
+    if len(sys.argv) < 2 or sys.argv[-1] not in {"sl", "smartlog"}:
+        return
+
+    hintutil.trigger("smartlog-default-command")
+
+
+def getrevs(ui, repo, masterstring, headrevs):
     if headrevs:
         headspec = revsetlang.formatspec("%lr", headrevs)
     else:
@@ -490,7 +512,119 @@ def getrevs(ui, repo, masterstring, **opts):
         "smartlog(heads=%r, master=%r)", headspec, masterstring
     )
 
-    return set(repo.anyrevs([revstring], user=True))
+    revs = set(repo.anyrevs([revstring], user=True))
+
+    if -1 in revs:
+        revs.remove(-1)
+
+    return revs
+
+
+if interactiveui is not None:
+
+    class interactivesmartlog(interactiveui.viewframe):
+        def __init__(self, ui, repo, masterstring, headrevs, template, opts):
+            super().__init__(ui, repo)
+            self.masterstring = masterstring
+            self.template = template
+            self.headrevs = headrevs
+            self.opts = opts
+            self.dag_index = 0
+            self._compute_graph()
+            self.status = ""
+            self.rebase_source = None
+
+        # Compute new index of ctx in revdag
+        # TODO: Handle case where ctx is no longer in revdag. Currently should be impossible but could happen if we change what the selected_node is when rebasing.
+        def _new_index(self, ctx):
+            return [node[2] for node in self.revdag].index(ctx)
+
+        def _compute_graph(self):
+            revs = getrevs(self.ui, self.repo, self.masterstring, self.headrevs)
+            if len(revs) == 0:
+                self.finish()
+            self.revdag, self.reserved = getdag(
+                self.ui, self.repo, sorted(revs), self.masterstring, self.template
+            )
+
+        def render(self):
+            ui = self.ui
+            ui.pushbuffer()
+            # Print it!
+            displayer = cmdutil.show_changeset(
+                self.ui, self.repo, self.opts, buffered=True
+            )
+
+            current_line = 0
+            selected_rows = None
+
+            def on_output(ctx, output):
+                nonlocal current_line
+                nonlocal selected_rows
+                height = output.count("\n")
+                selected_ctx = self.revdag[self.dag_index][2]
+                if ctx == selected_ctx:
+                    # start and end indices (inclusive)
+                    selected_rows = (current_line, current_line + height - 1)
+                current_line += height
+
+            cmdutil.displaygraph(
+                self.ui,
+                self.repo,
+                self.revdag,
+                displayer,
+                reserved=self.reserved,
+                props={"highlighted_node": self.revdag[self.dag_index][2].hex()},
+                on_output=on_output,
+            )
+            output = ui.popbuffer().splitlines()
+            if selected_rows is None:
+                return output, None
+            return output, (selected_rows[1], interactiveui.Alignment.bottom)
+
+        def handlekeypress(self, key):
+            if key == self.KEY_Q:
+                self.finish()
+            if key == self.KEY_J or key == self.KEY_DOWN:
+                if self.dag_index < len(self.revdag) - 1:
+                    self.dag_index += 1
+            if key == self.KEY_K or key == self.KEY_UP:
+                if self.dag_index > 0:
+                    self.dag_index -= 1
+            if key == self.KEY_RETURN:
+                self.ui.pushbuffer(error=True)
+                selected_ctx = self.revdag[self.dag_index][2]
+                try:
+                    if self.rebase_source is None:
+                        # Equivalent to `hg update selected_ctx`
+                        commands.update(self.ui, self.repo, selected_ctx.hex())
+                    else:
+                        # Equivalent to `hg rebase -s self.rebase_source -d selected_ctx`
+                        rebase.rebase(
+                            self.ui,
+                            self.repo,
+                            source=self.rebase_source[2].hex(),
+                            dest=selected_ctx.hex(),
+                        )
+                        self.rebase_source = None
+                        self._compute_graph()
+                        self.dag_index = self._new_index(selected_ctx)
+                except Exception as ex:
+                    self.ui.write_err("operation failed: %s\n" % ex)
+                self.status = self.ui.popbuffer()
+            if key == self.KEY_R:
+                self.rebase_source = self.revdag[self.dag_index]
+                self.status = _("rebasing from %s") % (self.rebase_source[2])
+            if key == self.KEY_S:
+                bindings.commands.run(
+                    util.hgcmd()
+                    + [
+                        "show",
+                        self.revdag[self.dag_index][2].hex(),
+                        "--config",
+                        "pager.interface=fullscreen",
+                    ]
+                )
 
 
 def _smartlog(ui, repo, *pats, **opts):
@@ -500,18 +634,39 @@ def _smartlog(ui, repo, *pats, **opts):
         opts.get("master") or ui.config("smartlog", "master") or masterfallback
     )
 
-    masterrev = repo.anyrevs([masterstring], user=True).first()
-    revs = getrevs(ui, repo, masterstring, **opts)
+    template = opts.get("template") or ""
+    headrevs = opts.get("rev")
 
-    if -1 in revs:
-        revs.remove(-1)
+    if opts.get("interactive"):
+        if interactiveui is None:
+            raise error.Abort(_("interactive ui is not supported on Windows"))
+
+        viewobj = interactivesmartlog(ui, repo, masterstring, headrevs, template, opts)
+        if util.istest():
+            input_str = ui.fin.readline()
+            index = 0
+
+            def getchar():
+                nonlocal input_str
+                nonlocal index
+                # Automatically quit at end of input
+                if index >= len(input_str):
+                    return b"q"
+                ch = input_str[index]
+                index += 1
+                return ch
+
+            interactiveui.view(viewobj, getchar)
+        else:
+            interactiveui.view(viewobj)
+        return
+
+    revs = getrevs(ui, repo, masterstring, headrevs)
 
     if len(revs) == 0:
         return
-
     # Print it!
-    template = opts.get("template") or ""
-    revdag, reserved = getdag(ui, repo, sorted(revs), masterrev, template)
+    revdag, reserved = getdag(ui, repo, sorted(revs), masterstring, template)
     displayer = cmdutil.show_changeset(ui, repo, opts, buffered=True)
     ui.pager("smartlog")
     cmdutil.displaygraph(ui, repo, revdag, displayer, reserved=reserved)

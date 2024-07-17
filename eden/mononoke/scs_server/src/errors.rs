@@ -8,15 +8,17 @@
 use std::backtrace::BacktraceStatus;
 use std::error::Error as StdError;
 
+use derived_data_manager::DerivationError;
 use git_types::GitError;
 use megarepo_error::MegarepoError;
 use mononoke_api::MononokeError;
 use source_control as thrift;
-use source_control::services::source_control_service as service;
+use source_control_services::errors::source_control_service as service;
 
 pub(crate) enum ServiceError {
     Request(thrift::RequestError),
     Internal(thrift::InternalError),
+    Overload(thrift::OverloadError),
 }
 
 impl From<thrift::RequestError> for ServiceError {
@@ -31,10 +33,17 @@ impl From<thrift::InternalError> for ServiceError {
     }
 }
 
+impl From<thrift::OverloadError> for ServiceError {
+    fn from(e: thrift::OverloadError) -> Self {
+        Self::Overload(e)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum Status {
     RequestError,
     InternalError,
+    OverloadError,
 }
 
 /// Error can be logged to SCS scuba table
@@ -47,6 +56,7 @@ impl LoggableError for ServiceError {
         match self {
             Self::Request(err) => (Status::RequestError, format!("{:?}", err)),
             Self::Internal(err) => (Status::InternalError, format!("{:?}", err)),
+            Self::Overload(err) => (Status::OverloadError, format!("{:?}", err)),
         }
     }
 }
@@ -73,6 +83,13 @@ impl ServiceError {
                     reason,
                     backtrace,
                     source_chain,
+                    ..Default::default()
+                })
+            }
+            Self::Overload(thrift::OverloadError { reason, .. }) => {
+                let reason = format!("{}: {}", context, reason);
+                Self::Overload(thrift::OverloadError {
+                    reason,
                     ..Default::default()
                 })
             }
@@ -199,6 +216,13 @@ impl From<MononokeError> for ServiceError {
     }
 }
 
+impl From<DerivationError> for ServiceError {
+    fn from(e: DerivationError) -> Self {
+        let mononoke_error: MononokeError = e.into();
+        mononoke_error.into()
+    }
+}
+
 macro_rules! impl_into_thrift_error {
     ($t:ty) => {
         impl From<ServiceError> for $t {
@@ -206,6 +230,7 @@ macro_rules! impl_into_thrift_error {
                 match e {
                     ServiceError::Request(e) => e.into(),
                     ServiceError::Internal(e) => e.into(),
+                    ServiceError::Overload(e) => e.into(),
                 }
             }
         }
@@ -225,6 +250,7 @@ impl_into_thrift_error!(service::RepoDeleteBookmarkExn);
 impl_into_thrift_error!(service::RepoLandStackExn);
 impl_into_thrift_error!(service::RepoBookmarkInfoExn);
 impl_into_thrift_error!(service::RepoStackInfoExn);
+impl_into_thrift_error!(service::RepoStackGitBundleStoreExn);
 impl_into_thrift_error!(service::RepoPrepareCommitsExn);
 impl_into_thrift_error!(service::RepoUploadFileContentExn);
 impl_into_thrift_error!(service::CommitCommonBaseWithExn);
@@ -232,10 +258,12 @@ impl_into_thrift_error!(service::CommitFileDiffsExn);
 impl_into_thrift_error!(service::CommitLookupExn);
 impl_into_thrift_error!(service::CommitLookupPushrebaseHistoryExn);
 impl_into_thrift_error!(service::CommitInfoExn);
+impl_into_thrift_error!(service::CommitGenerationExn);
 impl_into_thrift_error!(service::CommitCompareExn);
 impl_into_thrift_error!(service::CommitIsAncestorOfExn);
 impl_into_thrift_error!(service::CommitFindFilesExn);
 impl_into_thrift_error!(service::CommitHistoryExn);
+impl_into_thrift_error!(service::CommitLinearHistoryExn);
 impl_into_thrift_error!(service::CommitListDescendantBookmarksExn);
 impl_into_thrift_error!(service::CommitRunHooksExn);
 impl_into_thrift_error!(service::CommitPathExistsExn);
@@ -266,7 +294,8 @@ impl_into_thrift_error!(service::MegarepoSyncChangesetExn);
 impl_into_thrift_error!(service::MegarepoSyncChangesetPollExn);
 impl_into_thrift_error!(service::MegarepoRemergeSourceExn);
 impl_into_thrift_error!(service::MegarepoRemergeSourcePollExn);
-impl_into_thrift_error!(service::UploadGitObjectExn);
+impl_into_thrift_error!(service::RepoUploadNonBlobGitObjectExn);
+impl_into_thrift_error!(service::RepoUploadPackfileBaseItemExn);
 impl_into_thrift_error!(service::CreateGitTreeExn);
 impl_into_thrift_error!(service::CreateGitTagExn);
 
@@ -366,6 +395,13 @@ pub(crate) fn not_available(reason: String) -> thrift::RequestError {
 pub(crate) fn not_implemented(reason: String) -> thrift::RequestError {
     thrift::RequestError {
         kind: thrift::RequestErrorKind::NOT_IMPLEMENTED,
+        reason,
+        ..Default::default()
+    }
+}
+
+pub(crate) fn overloaded(reason: String) -> thrift::OverloadError {
+    thrift::OverloadError {
         reason,
         ..Default::default()
     }

@@ -10,10 +10,10 @@
 #include <string>
 #include <vector>
 
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/SpawnedProcess.h"
 #include "eden/fs/model/RootId.h"
 #include "eden/fs/testharness/HgBinary.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/SpawnedProcess.h"
 
 namespace facebook::eden {
 
@@ -81,7 +81,8 @@ class HgRepo {
    */
   void hgInit(
       AbsolutePathPiece cacheDirectory,
-      std::vector<std::string> extraArgs = {});
+      std::vector<std::string> extraArgs = {},
+      bool isEagerRepo = true);
 
   /**
    * Call "hg clone" to create the repository.
@@ -100,6 +101,7 @@ class HgRepo {
 
   RootId commit(folly::StringPiece message);
   Hash20 getManifestForCommit(const RootId& commit);
+  Hash20 getHgIdForFile(const RootId& commit, RelativePathPiece repoRelPath);
 
   void mkdir(RelativePathPiece path, mode_t permissions = 0755);
   void mkdir(folly::StringPiece path, mode_t permissions = 0755) {
@@ -134,7 +136,7 @@ class HgRepo {
       std::vector<std::string>& cmd,
       RelativePathPiece path,
       const Args&... args) {
-    cmd.push_back(std::string{path.value()});
+    cmd.emplace_back(path.value());
     buildHgArgs(cmd, args...);
   }
   template <typename... Args>
@@ -142,7 +144,7 @@ class HgRepo {
       std::vector<std::string>& cmd,
       AbsolutePathPiece path,
       const Args&... args) {
-    cmd.push_back(std::string{path.value()});
+    cmd.emplace_back(path.value());
     buildHgArgs(cmd, args...);
   }
 

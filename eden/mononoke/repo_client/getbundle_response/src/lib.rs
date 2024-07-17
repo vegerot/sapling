@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -17,34 +18,27 @@ use blobrepo_hg::BlobRepoHg;
 use blobstore::Loadable;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bytes::Bytes;
-use bytes_old::Bytes as BytesOld;
-use changeset_fetcher::ChangesetFetcherRef;
-use changesets::ChangesetsRef;
 use cloned::cloned;
 use commit_graph::ArcCommitGraph;
 use commit_graph::CommitGraphArc;
+use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use context::PerfCounterType;
 use derived_data::BonsaiDerived;
 use filenodes_derivation::FilenodesOnlyPublic;
 use filestore::FetchKey;
 use futures::future;
+use futures::future::BoxFuture;
 use futures::future::FutureExt;
 use futures::future::TryFutureExt;
 use futures::stream;
+use futures::stream::BoxStream;
 use futures::stream::Stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
-use futures_01_ext::BoxFuture as OldBoxFuture;
-use futures_01_ext::BoxStream as OldBoxStream;
-use futures_01_ext::BufferedParams;
-use futures_01_ext::FutureExt as _;
-use futures_01_ext::StreamExt as OldStreamExt;
 use futures_ext::stream::FbStreamExt;
-use futures_old::future as old_future;
-use futures_old::stream as old_stream;
-use futures_old::Future as OldFuture;
-use futures_old::Stream as OldStream;
+use futures_ext::BufferedParams;
+use futures_ext::FbTryStreamExt;
 use futures_stats::TimedTryFutureExt;
 use futures_util::try_join;
 use manifest::find_intersection_of_diffs_and_parents;
@@ -84,7 +78,6 @@ use sha1::Sha1;
 use slog::debug;
 use slog::info;
 use slog::o;
-use tunables::tunables;
 
 use crate::errors::ErrorKind;
 
@@ -137,8 +130,7 @@ pub async fn create_getbundle_response(
             create_hg_changeset_part(ctx, blobrepo, commits_to_send.clone(), lfs_params).await?;
         parts.push(cg_part);
 
-        if !draft_commits.is_empty() && tunables().mutation_generate_for_draft().unwrap_or_default()
-        {
+        if !draft_commits.is_empty() {
             let mutations_fut = {
                 cloned!(ctx);
                 let hg_mutation_store = blobrepo.hg_mutation_store_arc();
@@ -147,8 +139,6 @@ pub async fn create_getbundle_response(
                         .all_predecessors(&ctx, draft_commits)
                         .await
                 }
-                .boxed()
-                .compat()
             };
             let mut_part = parts::infinitepush_mutation_part(mutations_fut)?;
             parts.push(mut_part);
@@ -160,7 +150,7 @@ pub async fn create_getbundle_response(
         let phase_heads = find_phase_heads(ctx, blobrepo, heads, phases).await?;
         parts.push(parts::phases_part(
             ctx.clone(),
-            old_stream::iter_ok(phase_heads),
+            stream::iter(phase_heads).map(anyhow::Ok),
         )?);
     }
 
@@ -418,9 +408,7 @@ async fn create_hg_changeset_part(
                 node,
                 HgBlobNode::new(Bytes::from(v), revlogcs.p1(), revlogcs.p2()),
             ))
-        })
-        .boxed()
-        .compat();
+        });
 
     let cg_version = if lfs_params.threshold.is_some() {
         CgVersion::Cg3Version
@@ -446,8 +434,8 @@ async fn hg_to_bonsai_stream(
                     .ok_or(ErrorKind::BonsaiNotFoundForHgChangeset(node))?;
 
                 let gen_num = repo
-                    .changeset_fetcher()
-                    .get_generation_number(ctx, bcs_id)
+                    .commit_graph()
+                    .changeset_generation(ctx, bcs_id)
                     .await?;
                 Ok((bcs_id, gen_num))
             }
@@ -509,7 +497,6 @@ pub async fn find_new_draft_commits_and_derive_filenodes_for_public_roots(
 ///
 /// If `heads = [D, E, F]` and `common = [C]` then `new_draft_commits = [D, E]`,
 /// and new_public_heads = `[A, B]`.
-///
 async fn find_new_draft_commits_and_public_roots(
     ctx: &CoreContext,
     repo: &BlobRepo,
@@ -574,7 +561,6 @@ async fn find_new_draft_commits_and_public_roots(
 ///
 /// If `heads = [D, E, F]` then this will return
 /// `[(F, public), (E, draft), (D, draft), (B, public)]`
-///
 async fn find_phase_heads(
     ctx: &CoreContext,
     repo: &BlobRepo,
@@ -610,7 +596,7 @@ async fn find_phase_heads(
 /// `draft_callback` returns true.
 async fn traverse_draft_commits(
     ctx: &CoreContext,
-    repo: &(impl ChangesetsRef + RepoDerivedDataRef + BonsaiHgMappingRef + Send + Sync),
+    repo: &(impl CommitGraphRef + RepoDerivedDataRef + BonsaiHgMappingRef + Send + Sync),
     phases: &dyn Phases,
     heads: &[HgChangesetId],
     mut public_callback: impl FnMut(ChangesetId, HgChangesetId),
@@ -655,14 +641,7 @@ async fn traverse_draft_commits(
         // TODO(mbthomas): After blobrepo refactoring, change to use a method that calls `Changesets::get_many`.
         let parents: Vec<_> = stream::iter(traverse)
             .map(move |csid| async move {
-                let parents = repo
-                    .changesets()
-                    .get(ctx, csid)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::format_err!("Commit {} does not exist in the repo", csid)
-                    })?
-                    .parents;
+                let parents = repo.commit_graph().changeset_parents(ctx, csid).await?;
 
                 Result::<_, Error>::Ok(parents)
             })
@@ -867,42 +846,41 @@ fn generate_lfs_file(
 pub fn create_manifest_entries_stream(
     ctx: CoreContext,
     blobstore: RepoBlobstore,
-    manifests: Vec<(Option<NonRootMPath>, HgManifestId, HgChangesetId)>,
-) -> OldBoxStream<OldBoxFuture<parts::TreepackPartInput, Error>, Error> {
-    old_stream::iter_ok(manifests)
-        .filter(|(fullpath, mf_id, _linknode)| {
-            !(fullpath.is_none() && mf_id.clone().into_nodehash() == NULL_HASH)
-        })
-        .map({
-            move |(fullpath, mf_id, linknode)| {
-                cloned!(ctx, blobstore);
-                async move {
-                    fetch_manifest_envelope(&ctx, &blobstore.boxed(), mf_id)
-                        .map_ok(move |mf_envelope| {
-                            let (p1, p2) = mf_envelope.parents();
-                            parts::TreepackPartInput {
-                                node: mf_id.into_nodehash(),
-                                p1,
-                                p2,
-                                content: BytesOld::from(mf_envelope.contents().as_ref()),
-                                fullpath,
-                                linknode: linknode.into_nodehash(),
-                            }
-                        })
-                        .await
-                }
-                .boxed()
-                .compat()
-                .boxify()
+    manifests: Vec<(MPath, HgManifestId, HgChangesetId)>,
+) -> BoxStream<'static, Result<BoxFuture<'static, Result<parts::TreepackPartInput, Error>>, Error>>
+{
+    stream::iter(
+        manifests
+            .into_iter()
+            .filter(|(fullpath, mf_id, _linknode)| {
+                !(fullpath.is_root() && mf_id.clone().into_nodehash() == NULL_HASH)
+            }),
+    )
+    .map({
+        move |(fullpath, mf_id, linknode)| {
+            cloned!(ctx, blobstore);
+            Ok(async move {
+                let mf_envelope = fetch_manifest_envelope(&ctx, &blobstore.boxed(), mf_id).await?;
+                let (p1, p2) = mf_envelope.parents();
+                Ok(parts::TreepackPartInput {
+                    node: mf_id.into_nodehash(),
+                    p1,
+                    p2,
+                    content: mf_envelope.contents().clone(),
+                    fullpath,
+                    linknode: linknode.into_nodehash(),
+                })
             }
-        })
-        .boxify()
+            .boxed())
+        }
+    })
+    .boxed()
 }
 
 async fn diff_with_parents(
     ctx: &CoreContext,
     repo: &(
-         impl ChangesetsRef + RepoDerivedDataRef + BonsaiHgMappingRef + RepoBlobstoreRef + Send + Sync
+         impl CommitGraphRef + RepoDerivedDataRef + BonsaiHgMappingRef + RepoBlobstoreRef + Send + Sync
      ),
     hg_cs_id: HgChangesetId,
 ) -> Result<
@@ -965,12 +943,14 @@ fn create_filenodes_weighted(
     ctx: CoreContext,
     repo: impl RepoBlobstoreRef + Clone + Sync + Send + 'static,
     entries: HashMap<NonRootMPath, Vec<PreparedFilenodeEntry>>,
-) -> impl OldStream<
-    Item = (
-        impl OldFuture<Item = (NonRootMPath, Vec<FilenodeEntry>), Error = Error>,
-        u64,
-    ),
-    Error = Error,
+) -> impl Stream<
+    Item = Result<
+        (
+            impl Future<Output = Result<(NonRootMPath, Vec<FilenodeEntry>), Error>>,
+            u64,
+        ),
+        Error,
+    >,
 > {
     let items = entries.into_iter().map({
         cloned!(ctx, repo);
@@ -983,34 +963,30 @@ fn create_filenodes_weighted(
                 .into_iter()
                 .map({
                     |entry| {
-                        {
-                            cloned!(ctx, repo);
-                            async move { entry.into_filenode(&ctx, repo.repo_blobstore()).await }
-                        }
-                        .boxed()
-                        .compat()
+                        cloned!(ctx, repo);
+                        async move { entry.into_filenode(&ctx, repo.repo_blobstore()).await }
                     }
                 })
                 .collect();
 
-            let fut = old_future::join_all(entry_futs).map(|entries| (path, entries));
+            let fut = future::try_join_all(entry_futs).map_ok(|entries| (path, entries));
 
-            (fut, total_weight)
+            anyhow::Ok((fut, total_weight))
         }
     });
-    old_stream::iter_ok(items)
+    stream::iter(items)
 }
 
 pub fn create_filenodes(
     ctx: CoreContext,
     repo: impl RepoBlobstoreRef + Clone + Sync + Send + 'static,
     entries: HashMap<NonRootMPath, Vec<PreparedFilenodeEntry>>,
-) -> impl OldStream<Item = (NonRootMPath, Vec<FilenodeEntry>), Error = Error> {
+) -> impl Stream<Item = Result<(NonRootMPath, Vec<FilenodeEntry>), Error>> {
     let params = BufferedParams {
         weight_limit: MAX_FILENODE_BYTES_IN_MEMORY,
         buffer_size: 100,
     };
-    create_filenodes_weighted(ctx, repo, entries).buffered_weight_limited(params)
+    create_filenodes_weighted(ctx, repo, entries).try_buffered_weight_limited(params)
 }
 
 // This function preserves the topological order of entries i.e. filenods or manifest
@@ -1018,7 +994,7 @@ pub fn create_filenodes(
 pub async fn get_manifests_and_filenodes(
     ctx: &CoreContext,
     repo: &(
-         impl ChangesetsRef + RepoDerivedDataRef + BonsaiHgMappingRef + RepoBlobstoreRef + Send + Sync
+         impl CommitGraphRef + RepoDerivedDataRef + BonsaiHgMappingRef + RepoBlobstoreRef + Send + Sync
      ),
     commits: impl IntoIterator<Item = HgChangesetId>,
     lfs_params: &SessionLfsParams,

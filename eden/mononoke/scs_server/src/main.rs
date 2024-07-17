@@ -20,11 +20,13 @@ use clap::Parser;
 use cloned::cloned;
 use cmdlib_logging::ScribeLoggingArgs;
 use connection_security_checker::ConnectionSecurityChecker;
-use environment::WarmBookmarksCacheDerivedData;
+use environment::BookmarkCacheDerivedData;
+use environment::BookmarkCacheKind;
+use environment::BookmarkCacheOptions;
 use executor_lib::args::ShardedExecutorArgs;
 use executor_lib::RepoShardedProcess;
 use executor_lib::RepoShardedProcessExecutor;
-use fb303_core::server::make_BaseService_server;
+use fb303_core_services::make_BaseService_server;
 use fbinit::FacebookInit;
 use megarepo_api::MegarepoApi;
 use metaconfig_types::ShardedService;
@@ -40,7 +42,7 @@ use panichandler::Fate;
 use permission_checker::DefaultAclProvider;
 use sharding_ext::RepoShard;
 use slog::info;
-use source_control::server::make_SourceControlService_server;
+use source_control_services::make_SourceControlService_server;
 use srserver::service_framework::BuildModule;
 use srserver::service_framework::ContextPropModule;
 use srserver::service_framework::Fb303Module;
@@ -87,6 +89,9 @@ struct ScsServerArgs {
     bound_address_file: Option<String>,
     #[clap(flatten)]
     sharded_executor_args: ShardedExecutorArgs,
+    /// Max memory to use for the thrift server
+    #[clap(long)]
+    max_memory: Option<usize>,
 }
 
 /// Struct representing the Source Control Service process when sharding by
@@ -186,7 +191,10 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     panichandler::set_panichandler(Fate::Abort);
 
     let app = MononokeAppBuilder::new(fb)
-        .with_warm_bookmarks_cache(WarmBookmarksCacheDerivedData::AllKinds)
+        .with_bookmarks_cache(BookmarkCacheOptions {
+            cache_kind: BookmarkCacheKind::Local,
+            derived_data: BookmarkCacheDerivedData::AllKinds,
+        })
         .with_app_extension(WarmBookmarksCacheExtension {})
         .with_app_extension(HooksAppExtension {})
         .with_app_extension(RepoFilterAppExtension {})
@@ -210,9 +218,13 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         .map(|_| ShardedService::SourceControlService);
     let repos_mgr = runtime.block_on(app.open_managed_repos(service_name))?;
     let mononoke = Arc::new(repos_mgr.make_mononoke_api()?);
-    let megarepo_api = Arc::new(runtime.block_on(MegarepoApi::new(&app, mononoke.clone()))?);
+    let megarepo_api = Arc::new(MegarepoApi::new(&app, mononoke.clone())?);
 
     let will_exit = Arc::new(AtomicBool::new(false));
+
+    if let Some(max_memory) = args.max_memory {
+        memory::set_max_memory(max_memory);
+    }
 
     // Initialize the FB303 Thrift stack.
 
@@ -235,6 +247,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         scuba_builder,
         args.scribe_logging_args.get_scribe(fb)?,
         security_checker,
+        app.configs(),
         &app.repo_configs().common,
     );
     let service = {

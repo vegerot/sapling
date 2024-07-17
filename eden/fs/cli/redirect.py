@@ -4,7 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
+
 
 import argparse
 import enum
@@ -23,8 +24,10 @@ from typing import Dict, Iterable, Optional, Set
 from thrift.Thrift import TApplicationException
 
 from . import cmd_util, mtab, subcmd as subcmd_mod, tabulate
+
 from .buck import is_buckd_running_for_path, stop_buckd_for_path, stop_buckd_for_repo
 from .config import CheckoutConfig, EdenCheckout, EdenInstance, load_toml_config
+from .prompt import prompt_confirmation
 from .subcmd import Subcmd
 from .util import mkscratch_bin
 
@@ -123,6 +126,7 @@ class RedirectionState(enum.Enum):
     # The symlink is present but points to the wrong place
     SYMLINK_INCORRECT = "symlink-incorrect"
 
+    # pyre-fixme[3]: Return type must be annotated.
     def __str__(self):
         return self.value
 
@@ -159,6 +163,7 @@ class RedirectionType(enum.Enum):
     SYMLINK = "symlink"
     UNKNOWN = "unknown"
 
+    # pyre-fixme[3]: Return type must be annotated.
     def __str__(self):
         return self.value
 
@@ -195,8 +200,10 @@ class Redirection:
         self.type = redir_type
         self.target = target
         self.source = source
+        # pyre-fixme[4]: Attribute must be annotated.
         self.state = state or RedirectionState.MATCHES_CONFIGURATION
 
+    # pyre-fixme[2]: Parameter must be annotated.
     def __eq__(self, b) -> bool:
         return (
             self.repo_path == b.repo_path
@@ -703,6 +710,7 @@ def file_size(path: Path) -> int:
     return st.st_size
 
 
+# pyre-fixme[2]: Parameter must be annotated.
 def run_cmd_quietly(args, check: bool = True) -> int:
     """Quietly run a command; if successful then its output is entirely suppressed.
     If it fails then raise an exception containing the output/error streams.
@@ -834,7 +842,7 @@ Warning: this operation will permanently delete the following volumes:
   {volumes_str}
 """
             )
-            if not cmd_util.prompt_confirmation("Proceed?"):
+            if not prompt_confirmation("Proceed?"):
                 print("Not deleting volumes")
                 return 2
 

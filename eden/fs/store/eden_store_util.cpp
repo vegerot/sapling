@@ -19,6 +19,9 @@
 #include <folly/logging/xlog.h>
 #include <folly/stop_watch.h>
 
+#include "eden/common/telemetry/NullStructuredLogger.h"
+#include "eden/common/utils/FaultInjector.h"
+#include "eden/common/utils/UserInfo.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/ReloadableConfig.h"
 #include "eden/fs/service/EdenInit.h"
@@ -26,9 +29,6 @@
 #include "eden/fs/store/KeySpace.h"
 #include "eden/fs/store/RocksDbLocalStore.h"
 #include "eden/fs/telemetry/EdenStats.h"
-#include "eden/fs/telemetry/NullStructuredLogger.h"
-#include "eden/fs/utils/FaultInjector.h"
-#include "eden/fs/utils/UserInfo.h"
 
 using namespace facebook::eden;
 using folly::make_array;
@@ -72,7 +72,7 @@ class Command {
           "This utility cannot be used while edenfs is running.");
     }
   }
-  virtual ~Command() {}
+  virtual ~Command() = default;
 
   virtual void run() = 0;
 
@@ -108,7 +108,7 @@ class Command {
 
 class CommandFactory {
  public:
-  virtual ~CommandFactory() {}
+  virtual ~CommandFactory() = default;
   virtual StringPiece name() const = 0;
   virtual StringPiece help() const = 0;
   virtual std::unique_ptr<Command> create() = 0;

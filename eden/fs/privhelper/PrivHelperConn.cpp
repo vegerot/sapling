@@ -25,9 +25,9 @@
 #include <folly/portability/Unistd.h>
 #include <sys/types.h>
 
-#include "eden/fs/utils/Bug.h"
-#include "eden/fs/utils/SystemError.h"
-#include "eden/fs/utils/Throw.h"
+#include "eden/common/utils/Bug.h"
+#include "eden/common/utils/SystemError.h"
+#include "eden/common/utils/Throw.h"
 
 using folly::ByteRange;
 using folly::checkUnixError;
@@ -219,21 +219,31 @@ void PrivHelperConn::createConnPair(folly::File& client, folly::File& server) {
 UnixSocket::Message PrivHelperConn::serializeMountRequest(
     uint32_t xid,
     StringPiece mountPoint,
-    bool readOnly) {
+    bool readOnly,
+    std::optional<StringPiece> vfsType) {
   auto msg = serializeRequestPacket(xid, REQ_MOUNT_FUSE);
   Appender appender(&msg.data, kDefaultBufferSize);
 
   serializeString(appender, mountPoint);
   serializeBool(appender, readOnly);
+  if (vfsType.has_value()) {
+    serializeString(appender, vfsType.value());
+  }
   return msg;
 }
 
 void PrivHelperConn::parseMountRequest(
     Cursor& cursor,
     string& mountPoint,
-    bool& readOnly) {
+    bool& readOnly,
+    string& vfsType) {
   mountPoint = deserializeString(cursor);
   readOnly = deserializeBool(cursor);
+  if (!cursor.isAtEnd()) {
+    vfsType = deserializeString(cursor);
+  } else {
+    vfsType = "fuse";
+  }
   checkAtEnd(cursor, "mount request");
 }
 

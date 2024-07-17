@@ -14,13 +14,16 @@ import functools
 import json
 import logging
 import os
+import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
 import time
 import typing
 import uuid
+from enum import Enum
 from pathlib import Path
 from typing import (
     Any,
@@ -44,6 +47,9 @@ from facebook.eden.ttypes import MountInfo as ThriftMountInfo, MountState
 from filelock import BaseFileLock, FileLock
 
 from . import configinterpolator, configutil, telemetry, util, version
+
+if sys.platform == "win32":
+    from .file_handler_tools import WinFileHandlerReleaser
 from .util import (
     FUSE_MOUNT_PROTOCOL_STRING,
     HealthStatus,
@@ -72,8 +78,9 @@ else:
 CONFIG_DOT_D = "config.d"
 # USER_CONFIG is relative to the HOME dir for the user
 USER_CONFIG = ".edenrc"
-# SYSTEM_CONFIG is relative to the etc eden dir
+# SYSTEM_CONFIG and DYNAMIC_CONFIG are relative to the etc eden dir
 SYSTEM_CONFIG = "edenfs.rc"
+DYNAMIC_CONFIG = "edenfs_dynamic.rc"
 
 # These paths are relative to the user's client directory.
 CLIENTS_DIR = "clients"
@@ -89,12 +96,18 @@ SNAPSHOT_MAGIC_2 = b"eden\x00\x00\x00\x02"
 SNAPSHOT_MAGIC_3 = b"eden\x00\x00\x00\x03"
 SNAPSHOT_MAGIC_4 = b"eden\x00\x00\x00\x04"
 
+# List of supported repository types. This should stay in sync with the list
+# in the Rust CLI at fs/cli_rs/edenfs-client/src/checkout.rs and the list in
+# the Daemon's CheckoutConfig at fs/config/CheckoutConfig.h.
 DEFAULT_REVISION = {  # supported repo name -> default bookmark
     "git": "refs/heads/master",
     "hg": "first(present(master) + .)",
+    "filteredhg": "first(present(master) + .)",
     "recas": "",
     "http": "",
 }
+
+HG_REPO_TYPES = ["hg", "filteredhg"]
 
 SUPPORTED_REPOS: KeysView[str] = DEFAULT_REVISION.keys()
 
@@ -104,11 +117,7 @@ SUPPORTED_MOUNT_PROTOCOLS: Set[str] = {
     PRJFS_MOUNT_PROTOCOL_STRING,
 }
 
-SUPPORTED_INODE_CATALOG_TYPES: Set[str] = {
-    "legacy",
-    "sqlite",
-    "inmemory",
-}
+SUPPORTED_INODE_CATALOG_TYPES: Set[str] = {"legacy", "sqlite", "inmemory", "lmdb"}
 
 # Create a readme file with this name in the mount point directory.
 # The intention is for this to contain instructions telling users what to do if their
@@ -129,6 +138,12 @@ currently running, or it simply does not have this checkout mounted yet.
 You can run "eden doctor" to check for problems with EdenFS and try to have it
 automatically remount your checkouts.
 """
+
+
+class CheckoutPathProblemType(Enum):
+    NESTED_CHECKOUT = "nested_checkout"
+    INSIDE_BACKING_REPO = "inside_backing_repo"
+    NONE = None
 
 
 class UsageError(Exception):
@@ -162,7 +177,7 @@ class CheckoutConfig(typing.NamedTuple):
 
     - backing_repo: The path where the true repo resides on disk.  For mercurial backing
         repositories this does not include the final ".hg" directory component.
-    - scm_type: "hg" or "git"
+    - scm_type: "hg", "filteredhg", or "git"
     - mount_protocol: "fuse", "nfs" or "prjfs"
     - case_sensitive: whether the mount point is case sensitive. Default to
       false on Windows and macOS.
@@ -202,19 +217,23 @@ class ListMountInfo(typing.NamedTuple):
     def to_json_dict(self) -> Dict[str, Any]:
         return {
             "data_dir": self.data_dir.as_posix(),
-            "state": MountState._VALUES_TO_NAMES.get(self.state)
-            if self.state is not None
-            else "NOT_RUNNING",
+            "state": (
+                MountState._VALUES_TO_NAMES.get(self.state)
+                if self.state is not None
+                else "NOT_RUNNING"
+            ),
             "configured": self.configured,
-            "backing_repo": self.backing_repo.as_posix()
-            if self.backing_repo is not None
-            else None,
+            "backing_repo": (
+                self.backing_repo.as_posix() if self.backing_repo is not None else None
+            ),
         }
 
 
 class SnapshotState(typing.NamedTuple):
     working_copy_parent: str
     last_checkout_hash: str
+    parent_filter_id: Optional[str] = None
+    last_filter_id: Optional[str] = None
 
 
 class AbstractEdenInstance:
@@ -225,17 +244,15 @@ class AbstractEdenInstance:
         except ValueError:
             return default
 
-    def get_config_value(self, key: str, default: str) -> str:
-        ...
+    def get_config_value(self, key: str, default: str) -> str: ...
 
-    def get_config_bool(self, key: str, default: bool) -> bool:
-        ...
+    def get_config_bool(self, key: str, default: bool) -> bool: ...
 
-    def get_config_strs(self, key: str, default: configutil.Strs) -> configutil.Strs:
-        ...
+    def get_config_strs(
+        self, key: str, default: configutil.Strs
+    ) -> configutil.Strs: ...
 
-    def get_checkouts(self) -> List["EdenCheckout"]:
-        ...
+    def get_checkouts(self) -> List["EdenCheckout"]: ...
 
 
 class EdenInstance(AbstractEdenInstance):
@@ -248,6 +265,7 @@ class EdenInstance(AbstractEdenInstance):
     _telemetry_logger: Optional[telemetry.TelemetryLogger] = None
     _home_dir: Path
     _user_config_path: Path
+    _dynamic_config_path: Path
     _system_config_path: Path
     _config_dir: Path
 
@@ -261,6 +279,7 @@ class EdenInstance(AbstractEdenInstance):
         self._etc_eden_dir = Path(etc_eden_dir or DEFAULT_ETC_EDEN_DIR)
         self._home_dir = Path(home_dir) if home_dir is not None else util.get_home_dir()
         self._user_config_path = self._home_dir / USER_CONFIG
+        self._dynamic_config_path = self._etc_eden_dir / DYNAMIC_CONFIG
         self._system_config_path = self._etc_eden_dir / SYSTEM_CONFIG
         self._interpolate_dict = interpolate_dict
 
@@ -372,6 +391,7 @@ class EdenInstance(AbstractEdenInstance):
                 result.append(config_d / name)
         result.sort()
         result.append(self._system_config_path)
+        result.append(self._dynamic_config_path)
         result.append(self._user_config_path)
         return result
 
@@ -406,6 +426,32 @@ class EdenInstance(AbstractEdenInstance):
 
     def log_sample(self, log_type: str, **kwargs: telemetry.TelemetryTypes) -> None:
         self.get_telemetry_logger().log(log_type, **kwargs)
+
+    def get_known_bad_edenfs_versions(self) -> Dict[str, List[str]]:
+        """
+        Get a dictionary mapping bad EdenFS versions to their reasons.
+        """
+        # 'bad_versions_config' format: [<bad_version_1>|<sev_1(optional):reason_1>,<bad_version_2>|<sev_2(optional):reason_2>]
+        bad_versions_config = self.get_config_strs(
+            "doctor.known-bad-edenfs-versions", default=configutil.Strs()
+        )
+        if not bad_versions_config:
+            return {}
+        bad_versions_map = {}
+        for item in bad_versions_config:
+            if "|" not in item:
+                log.warning(
+                    f"`known-bad-edenfs-versions` config has an invalid entry `{item}`.",
+                )
+                continue
+            version, reason = item.split("|", 1)
+            version = version.strip()
+            reason = reason.strip()
+            if version in bad_versions_map:
+                bad_versions_map[version].append(reason)
+            else:
+                bad_versions_map[version] = [reason]
+        return bad_versions_map
 
     def get_running_version_parts(self) -> Tuple[str, str]:
         """Get a tuple containing (version, release) of the currently running EdenFS
@@ -590,7 +636,11 @@ class EdenInstance(AbstractEdenInstance):
         return mount_points
 
     def clone(
-        self, checkout_config: CheckoutConfig, path: str, snapshot_id: str
+        self,
+        checkout_config: CheckoutConfig,
+        path: str,
+        snapshot_id: str,
+        filter_path: Optional[str] = None,
     ) -> None:
         if path in self._get_directory_map():
             raise Exception(
@@ -611,7 +661,11 @@ Do you want to run `eden mount %s` instead?"""
         # Store snapshot ID
         checkout = EdenCheckout(self, Path(path), Path(client_dir))
         if snapshot_id:
-            checkout.save_snapshot(snapshot_id)
+            if checkout_config.scm_type == "filteredhg":
+                filtered_root_id = util.create_filtered_rootid(snapshot_id, filter_path)
+                checkout.save_snapshot(filtered_root_id)
+            else:
+                checkout.save_snapshot(snapshot_id.encode())
         else:
             raise Exception("snapshot id not provided")
 
@@ -626,7 +680,7 @@ Do you want to run `eden mount %s` instead?"""
         with self.get_thrift_client_legacy() as client:
             client.mount(mount_info)
 
-        self._post_clone_checkout_setup(checkout, snapshot_id)
+        self._post_clone_checkout_setup(checkout, snapshot_id, filter_path)
 
         # Add mapping of mount path to client directory in config.json
         self._add_path_to_directory_map(Path(path), os.path.basename(client_dir))
@@ -719,20 +773,23 @@ Do you want to run `eden mount %s` instead?"""
                 raise
 
     def _post_clone_checkout_setup(
-        self, checkout: "EdenCheckout", commit_id: str
+        self,
+        checkout: "EdenCheckout",
+        commit_id: str,
+        filter_path: Optional[str] = None,
     ) -> None:
         # First, check to see if the post-clone setup has been run successfully
         # before.
         clone_success_path = checkout.state_dir / CLONE_SUCCEEDED
         is_initial_mount = not clone_success_path.is_file()
-        if is_initial_mount and checkout.get_config().scm_type == "hg":
+        if is_initial_mount and checkout.get_config().scm_type in HG_REPO_TYPES:
             from . import hg_util
 
-            hg_util.setup_hg_dir(checkout, commit_id)
+            hg_util.setup_hg_dir(checkout, commit_id, filter_path)
 
         clone_success_path.touch()
 
-        if checkout.get_config().scm_type == "hg":
+        if checkout.get_config().scm_type in HG_REPO_TYPES:
             env = os.environ.copy()
             # These are set by the par machinery and interfere with Mercurial's
             # own dynamic library loading.
@@ -748,6 +805,23 @@ Do you want to run `eden mount %s` instead?"""
                 ],
                 env=env,
             )
+
+            configs = dict()
+            if checkout.get_config().scm_type == "filteredhg":
+                configs["extensions.edensparse"] = ""
+                configs["extensions.sparse"] = "!"
+            for k, v in configs.items():
+                subprocess.check_call(
+                    [
+                        os.environ.get("EDEN_HG_BINARY", "hg"),
+                        "config",
+                        "--local",
+                        f"{k}={v}",
+                        "-R",
+                        str(checkout.path),
+                    ],
+                    env=env,
+                )
 
     def mount(self, path: Union[Path, str], read_only: bool) -> int:
         # Load the config info for this client, to make sure we
@@ -826,49 +900,6 @@ Do you want to run `eden mount %s` instead?"""
         with self.get_thrift_client_legacy(timeout=60) as client:
             client.unmount(os.fsencode(path))
 
-    def get_handle_path(self) -> Optional[Path]:
-        handle = shutil.which("handle.exe")
-        if handle:
-            return Path(handle)
-        return None
-
-    def check_handle(self, mount: Path) -> None:
-        handle = self.get_handle_path()
-
-        if not handle:
-            return
-
-        print(f"Checking handle.exe for processes using '{mount}'...")
-        print("Press ctrl+c to skip.")
-        try:
-            output = subprocess.check_output([handle, "-nobanner", mount])
-        except KeyboardInterrupt:
-            print("Handle check interrupted.\n")
-            print("If you want to find out which process is still using the repo, run:")
-            print(f"    handle.exe {mount}\n")
-            return
-        parsed = [
-            line.split() for line in output.decode(errors="ignore").splitlines() if line
-        ]
-        non_edenfs_process = any(filter(lambda x: x[0].lower() != "edenfs.exe", parsed))
-
-        # When no handle is found in the repo, handle.exe will report `"No
-        # matching handles found."`, which will be 4 words.
-        if not non_edenfs_process or not parsed or len(parsed[0]) == 4:
-            # Nothing other than edenfs.exe is holding handles to files from
-            # the repo, we can proceed with the removal
-            return
-
-        print(
-            "The following processes are still using the repo, please terminate them.\n"
-        )
-
-        for executable, _, pid, _, _type, _, path in parsed:
-            print(f"{executable}({pid}): {path}")
-
-        print()
-        return
-
     def destroy_mount(
         self, path: Union[Path, str], preserve_mount_point: bool = False
     ) -> None:
@@ -910,7 +941,9 @@ Do you want to run `eden mount %s` instead?"""
         shutil._rmtree_unsafe = old_rmtree_unsafe
         shutil._rmtree_safe_fd = old_rmtree_safe_fd
 
-    def cleanup_mount(self, path: Path, preserve_mount_point: bool = False) -> None:
+    def cleanup_mount(
+        self, path: Path, preserve_mount_point: bool = False, debug: bool = False
+    ) -> None:
         if sys.platform != "win32":
             # Delete the mount point
             # It should normally contain the readme file that we put there, but nothing
@@ -944,49 +977,84 @@ Do you want to run `eden mount %s` instead?"""
 
             errors = []
 
+            # On Windows, we cannot remove read-only files, so we need to make
+            # them writable before removing them. Let's give it a go if we are still here.
+            def chmod_readonly_files(func, path, ex):
+                try:
+                    os.chmod(path, stat.S_IWRITE)
+                    func(path)
+                except Exception as e:
+                    # We don't want to make things more confusing to the other by reporting errors on chmod
+                    if debug:
+                        print(f"  Failed to chmod {path}: {e}")
+
+            shutil.rmtree(
+                windows_prefix + os.fsencode(path), onerror=chmod_readonly_files
+            )
+
+            # See if this time (after chown) rmtree succeeded.
+            if not path.exists():
+                return
+
             def collect_errors(_f, path, ex):
                 errors.append((path, ex[1]))
 
             shutil.rmtree(windows_prefix + os.fsencode(path), onerror=collect_errors)
             if not path.exists():
+                # We were successful.
                 return
 
             print(f"Failed to remove {path}, the following files couldn't be removed:")
             for f in errors:
                 print(os.fsdecode(f[0].strip(windows_prefix)))
 
-            print(
-                f"""
-At this point your EdenFS mount is destroyed, but EdenFS is having
-trouble cleaning up leftovers. You will need to manually remove {path}.
-"""
-            )
-
+            # For those that failed, we might be able to do something with error codes
+            # 5 ERROR_ACCESS_DENIED - Access is denied (file is a running executable).
+            # 32 (ERROR_SHARING_VIOLATION) - The process cannot access the file because it is being used by another process.
+            # See # https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-
             used_by_other = any(
                 filter(
-                    lambda x: isinstance(x[1], OSError) and x[1].winerror == 32, errors
+                    lambda x: isinstance(x[1], OSError)
+                    and (x[1].winerror == 32 or x[1].winerror == 5),
+                    errors,
                 )
             )
 
             if used_by_other:
-                if self.get_handle_path():
-                    self.check_handle(path)
-                else:
-                    print(
-                        f"""\
-    It looks like {path} is still in use by another process. If you need help to
-    figure out which process, please try `handle.exe` from sysinternals:
+                # Use the hammer - kill all processes
+                winhr = WinFileHandlerReleaser(self)
+                winhr.stop_adb_server()
+                winhr.stop_buck2()
+                if not winhr.try_release(
+                    path
+                ):  # This will return True if there's a chance it could kill the processes.
+                    raise Exception("Failed to clear all resources")
 
-    handle.exe {path}
-
-    """
-                    )
-                print(
-                    f"After terminating the processes, please manually delete {path}."
+                # Reset the errors because we're going to do a new pass after killing things
+                errors = []
+                # Try again
+                shutil.rmtree(
+                    windows_prefix + os.fsencode(path), onerror=collect_errors
                 )
-                print()
+                if not path.exists():
+                    # Success this time.
+                    return
+                print(
+                    f"Failed to remove {path}, the following files couldn't be removed:"
+                )
+                for f in errors:
+                    print(
+                        f"{os.fsdecode(f[0].strip(windows_prefix))} win32 error: {f[1]}"
+                    )
 
-            raise errors[0][1]
+                print(
+                    f"""
+    At this point your EdenFS mount is destroyed, but EdenFS is having
+    trouble cleaning up leftovers. You will need to manually remove {path}.
+    """
+                )
+
+            raise Exception("Failed to delete mount.")
 
     def check_health(self, timeout: Optional[float] = None) -> HealthStatus:
         """
@@ -1455,6 +1523,27 @@ class EdenCheckout:
             inode_catalog_type=inode_catalog_type,
         )
 
+    def parse_snapshot_component(self, buf: bytes) -> Tuple[str, Optional[str]]:
+        """Parse a component from the snapshot file.
+
+        Returns a tuple containing the parsed hash and a filter id (if
+        applicable). For unfiltered repos, None is always returned for the
+        component's filter id.
+        """
+        decoded_hash = ""
+        decoded_filter = None
+        if self.get_config().scm_type == "filteredhg":
+            hash_len, varint_len = util.decode_varint(buf)
+            filter_offset = varint_len + hash_len
+            encoded_hash = buf[varint_len:filter_offset]
+            encoded_filter = buf[filter_offset:]
+            decoded_filter = encoded_filter.decode()
+            decoded_hash = encoded_hash.decode()
+        else:
+            decoded_hash = buf.decode()
+
+        return decoded_hash, decoded_filter
+
     def get_snapshot(self) -> SnapshotState:
         """Return the hex version of the parent hash in the SNAPSHOT file."""
         snapshot_path = self.state_dir / SNAPSHOT
@@ -1471,10 +1560,12 @@ class EdenCheckout:
                 parent = f.read(bodyLength)
                 if len(parent) != bodyLength:
                     raise RuntimeError("SNAPSHOT file too short")
-                decoded_parent = parent.decode()
+                decoded_parent, decoded_filter = self.parse_snapshot_component(parent)
                 return SnapshotState(
                     working_copy_parent=decoded_parent,
                     last_checkout_hash=decoded_parent,
+                    parent_filter_id=decoded_filter,
+                    last_filter_id=decoded_filter,
                 )
             elif header == SNAPSHOT_MAGIC_3:
                 (pid,) = struct.unpack(">L", f.read(4))
@@ -1488,9 +1579,10 @@ class EdenCheckout:
                 if len(fromParent) != toLength:
                     raise RuntimeError("SNAPSHOT file too short")
 
-                raise InProgressCheckoutError(
-                    fromParent.decode(), toParent.decode(), pid
-                )
+                decoded_to, _ = self.parse_snapshot_component(toParent)
+                decoded_from, _ = self.parse_snapshot_component(fromParent)
+
+                raise InProgressCheckoutError(decoded_from, decoded_to, pid)
             elif header == SNAPSHOT_MAGIC_4:
                 (working_copy_parent_length,) = struct.unpack(">L", f.read(4))
                 working_copy_parent = f.read(working_copy_parent_length)
@@ -1500,19 +1592,29 @@ class EdenCheckout:
                 checked_out_revision = f.read(checked_out_length)
                 if len(checked_out_revision) != checked_out_length:
                     raise RuntimeError("SNAPSHOT file too short")
+
+                working_copy_parent, parent_filter = self.parse_snapshot_component(
+                    working_copy_parent
+                )
+                (
+                    checked_out_revision,
+                    checked_out_filter,
+                ) = self.parse_snapshot_component(checked_out_revision)
                 return SnapshotState(
-                    working_copy_parent=working_copy_parent.decode(),
-                    last_checkout_hash=checked_out_revision.decode(),
+                    working_copy_parent=working_copy_parent,
+                    last_checkout_hash=checked_out_revision,
+                    parent_filter_id=parent_filter,
+                    last_filter_id=checked_out_filter,
                 )
             else:
                 raise RuntimeError("SNAPSHOT file has invalid header")
 
-    def save_snapshot(self, commit_id: str) -> None:
+    def save_snapshot(self, commit_id: bytes) -> None:
         """Write a new parent commit ID into the SNAPSHOT file."""
         snapshot_path = self.state_dir / SNAPSHOT
-        encoded = commit_id.encode()
         write_file_atomically(
-            snapshot_path, SNAPSHOT_MAGIC_2 + struct.pack(">L", len(encoded)) + encoded
+            snapshot_path,
+            SNAPSHOT_MAGIC_2 + struct.pack(">L", len(commit_id)) + commit_id,
         )
 
     def get_backing_repo(self) -> util.HgRepo:
@@ -1532,6 +1634,19 @@ class EdenCheckout:
         old_config = self.get_config()
 
         new_config = old_config._replace(mount_protocol=new_mount_protocol)
+
+        self.save_config(new_config)
+
+    def migrate_inode_catalog(self, new_inode_catalog_type: str) -> None:
+        """
+        Migrate this checkout to the new_inode_catalog_type. This will only take
+        effect if EdenFS is restarted. It is recommended to only run this while
+        EdenFS is stopped.
+        """
+
+        old_config = self.get_config()
+
+        new_config = old_config._replace(inode_catalog_type=new_inode_catalog_type)
 
         self.save_config(new_config)
 
@@ -1560,10 +1675,38 @@ def should_migrate_mount_protocol_to_nfs(instance: AbstractEdenInstance) -> bool
     return False
 
 
+_MIGRATE_EXISTING_TO_IN_MEMORY_CATALOG = "core.migrate_existing_to_in_memory_catalog"
+
+
+def should_migrate_inode_catalog_to_in_memory(instance: AbstractEdenInstance) -> bool:
+    if sys.platform != "win32":
+        return False
+
+    if util.is_sandcastle():
+        return False
+
+    # default to migration, allow override in Eden config
+    if instance.get_config_bool(_MIGRATE_EXISTING_TO_IN_MEMORY_CATALOG, default=True):
+        return True
+
+    return False
+
+
 def count_non_nfs_mounts(instance: AbstractEdenInstance) -> int:
     count = 0
     for checkout in instance.get_checkouts():
         if checkout.get_config().mount_protocol != util.NFS_MOUNT_PROTOCOL_STRING:
+            count += 1
+    return count
+
+
+def count_non_in_memory_inode_catalogs(instance: AbstractEdenInstance) -> int:
+    count = 0
+    for checkout in instance.get_checkouts():
+        if (
+            checkout.get_config().inode_catalog_type
+            != util.INODE_CATALOG_TYPE_IN_MEMORY_STRING
+        ):
             count += 1
     return count
 
@@ -1597,6 +1740,26 @@ def _do_nfs_migration(
     print(get_migration_success_message(util.NFS_MOUNT_PROTOCOL_STRING))
 
 
+# Checks for any non in memory catalogs and migrates them to in memory.
+def _do_in_memory_inode_catalog_migration(instance: EdenInstance) -> None:
+    if count_non_in_memory_inode_catalogs(instance) == 0:
+        # most the time this should be the case. we only need to migrate catalogs
+        # once, and then we should just be able to skip this all other times.
+        return
+
+    print("migrating mounts to inmemory inode catalog...")
+
+    for checkout in instance.get_checkouts():
+        if (
+            checkout.get_config().inode_catalog_type
+            != util.INODE_CATALOG_TYPE_IN_MEMORY_STRING
+        ):
+            checkout.migrate_inode_catalog(util.INODE_CATALOG_TYPE_IN_MEMORY_STRING)
+
+    instance.log_sample("migrate_existing_clones_to_in_memory")
+    print("Successfully migrated all your mounts to inmemory inode catalog.\n")
+
+
 def _do_manual_migration(
     instance: EdenInstance,
     migrate_to: str,
@@ -1608,23 +1771,23 @@ def _do_manual_migration(
     print(get_migration_success_message(migrate_to))
 
 
-def detect_nested_checkout(
+def detect_checkout_path_problem(
     path: Union[str, Path],
     instance: EdenInstance,
-) -> Tuple[Optional[EdenCheckout], Optional[Path]]:
-    """Get a tuple containing (checkout, rel_path) for any checkout that the provided
-    path is nested inside of.
+) -> Tuple[Optional[CheckoutPathProblemType], Optional[EdenCheckout]]:
+    """
+    Get a tuple containing (problem_type, checkout, rel_path) for any checkout that the provided
+    path is nested inside of, or for any checkout whose
+    backing_repo contains the provided path and the relative path of that
+    path within the backing_repo, along with the problem type.
 
-    A tuple of (None, None) is returned if the specified path is not nested inside
+    A tuple of (None, None, None) is returned if the specified path is not nested inside
     any existing checkouts.
     """
     if isinstance(path, str):
         path = Path(path)
 
     path = path.resolve(strict=False)
-    checkout = None
-    checkout_state_dir = None
-
     try:
         # However, we prefer to get the list from the current eden process (if one's running)
         instance.get_running_version()
@@ -1633,25 +1796,32 @@ def detect_nested_checkout(
         return None, None
 
     # Checkout list must be sorted so that parent paths are checked first
-    rel_path = None
     for checkout_path_str, mount_info in sorted(checkout_list):
         # symlinks could have been added since the mount was added, but
         # we will not worry about this case
         checkout_path = Path(checkout_path_str)
-        if path == checkout_path:
-            continue
-        else:
-            try:
-                rel_path = path.relative_to(checkout_path)
-            except ValueError:
-                continue
+        if path != checkout_path and is_child_path(checkout_path, path):
             checkout_state_dir = mount_info.data_dir
             checkout = EdenCheckout(instance, checkout_path, checkout_state_dir)
-            break
-    if checkout_state_dir is not None:
-        return checkout, rel_path
-    else:
-        return None, None
+            return CheckoutPathProblemType.NESTED_CHECKOUT, checkout
+
+        # check if path is inside backing folder of the current checkout
+        backing_repo = mount_info.backing_repo
+        if backing_repo is not None and is_child_path(backing_repo, path):
+            checkout_state_dir = mount_info.data_dir
+            checkout = EdenCheckout(instance, checkout_path_str, checkout_state_dir)
+            return CheckoutPathProblemType.INSIDE_BACKING_REPO, checkout
+
+    return None, None
+
+
+def is_child_path(parent_path: Path, child_path: Path) -> bool:
+    """Returns true if the parent path is a prefix of the child path"""
+    try:
+        rel_path = child_path.relative_to(parent_path)
+        return rel_path != Path("") and rel_path != Path(".")
+    except ValueError:
+        return False
 
 
 def find_eden(
@@ -1808,10 +1978,44 @@ def _verify_mount_point(mount_point: str) -> None:
 TomlConfigDict = Mapping[str, Mapping[str, Any]]
 
 
+def get_line_by_number(contents: str, line_num: int) -> Optional[str]:
+    lines = contents.splitlines()
+    if len(lines) < line_num or line_num < 1:
+        return None
+    return lines[line_num - 1]
+
+
+def get_line_number_from_exception_message(s: str) -> int:
+    match = re.search(r"line (\d+)", s)
+    if match:
+        return int(match.group(1))
+    else:
+        return -1
+
+
 def load_toml_config(path: Path) -> TomlConfigDict:
+    data: str = ""
+    hint: str = ""
     try:
-        return typing.cast(TomlConfigDict, toml.load(str(path)))
+        with open(path, "r") as file:
+            data = file.read()
+            return typing.cast(TomlConfigDict, toml.loads(data))
     except FileNotFoundError:
         raise
+    except ValueError as e:
+        print(f"Value error: {e}")
+        if e.args[0].startswith(
+            "Reserved escape sequence used"
+        ):  # OK to hardcode this text; it's hardcoded in toml lib too
+            hint = "\nHint: Check that you don't have single backslashes.\n"
+        line_num = get_line_number_from_exception_message(e.args[0])
+        if line_num != -1:
+            line = get_line_by_number(data, line_num)
+            if line is not None:
+                hint += f"Detected here (line {line_num}): \n\n{line}\n"
+
+        raise FileError(f"toml config file {str(path)} not valid: {str(e)}{hint}")
     except Exception as e:
-        raise FileError(f"toml config is either missing or corrupted : {str(e)}")
+        raise FileError(
+            f"toml config file {str(path)} is either missing or corrupted: {str(e)}"
+        )

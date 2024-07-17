@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 #inprocess-hg-incompatible
 
   $ eagerepo

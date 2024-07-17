@@ -6,6 +6,7 @@
  */
 
 use anyhow::Error;
+use bookmarks::BookmarkUpdateLogId;
 use context::CoreContext;
 use cross_repo_sync::CommitSyncer;
 use cross_repo_sync::Repo as CrossRepo;
@@ -45,7 +46,7 @@ pub fn add_common_fields<M: SyncedCommitMapping + Clone + 'static, R: CrossRepo>
 }
 
 /// Log the fact of successful syncing of the single changeset to Scuba
-fn log_success_to_scuba(
+pub fn log_success_to_scuba(
     mut scuba_sample: MononokeScubaSampleBuilder,
     source_cs_id: ChangesetId,
     maybe_synced_cs_id: Option<ChangesetId>,
@@ -237,7 +238,7 @@ pub fn log_backpressure(
 
 pub fn log_bookmark_update_result(
     ctx: &CoreContext,
-    entry_id: i64,
+    entry_id: BookmarkUpdateLogId,
     mut scuba_sample: MononokeScubaSampleBuilder,
     res: &Result<SyncResult, Error>,
     stats: FutureStats,

@@ -137,7 +137,7 @@ impl Scuba {
     }
 
     pub fn add_client_request_info(&mut self, ctx: &CoreContext) {
-        if let Some(client_info) = ctx.metadata().client_request_info() {
+        if let Some(client_info) = ctx.client_request_info() {
             self.multiplex_scuba.add_client_request_info(client_info);
             self.inner_blobstores_scuba
                 .add_client_request_info(client_info);
@@ -338,6 +338,8 @@ impl WalMultiplexedBlobstore {
             stats.completion_time.as_millis_unchecked() as i64,
         );
         ctx.perf_counters()
+            .set_max_counter(PerfCounterType::BlobPutsMaxSize, blob_size as i64);
+        ctx.perf_counters()
             .add_to_counter(PerfCounterType::BlobPutsTotalSize, blob_size as i64);
 
         result.map_err(|put_errors| {
@@ -502,6 +504,8 @@ impl WalMultiplexedBlobstore {
 
         match result {
             Ok(Some(ref data)) => {
+                ctx.perf_counters()
+                    .set_max_counter(PerfCounterType::BlobGetsMaxSize, data.len() as i64);
                 ctx.perf_counters()
                     .add_to_counter(PerfCounterType::BlobGetsTotalSize, data.len() as i64);
             }

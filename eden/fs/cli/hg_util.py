@@ -10,7 +10,7 @@ import binascii
 import os
 import typing
 from pathlib import Path
-from typing import BinaryIO, Dict, Tuple
+from typing import BinaryIO, Dict, Optional, Tuple
 
 import eden.dirstate
 
@@ -27,7 +27,9 @@ portablefilenames = ignore
 """
 
 
-def setup_hg_dir(checkout: EdenCheckout, commit_id: str) -> None:
+def setup_hg_dir(
+    checkout: EdenCheckout, commit_id: str, filter_path: Optional[str] = None
+) -> None:
     checkout_hg_dir = checkout.hg_dot_path
     try:
         checkout_hg_dir.mkdir()
@@ -66,6 +68,13 @@ def setup_hg_dir(checkout: EdenCheckout, commit_id: str) -> None:
         tuples_dict: Dict[str, Tuple[str, int, int]] = {}
         copymap: Dict[str, str] = {}
         eden.dirstate.write(f, parents, tuples_dict, copymap)
+
+    # If the checkout is using FilteredFS, we need to write an initial
+    # .hg/sparse file that indicates no filter is active.
+    if checkout.get_config().scm_type == "filteredhg":
+        (checkout_hg_dir / "sparse").write_text(
+            f"%include {filter_path}" if filter_path is not None else ""
+        )
 
 
 def get_backing_hg_dir(checkout: EdenCheckout) -> Path:
@@ -115,9 +124,14 @@ def get_requires_data(checkout: EdenCheckout) -> str:
     # the backing repository's dirstate.
     requires.discard("sqldirstate")
     requires.discard("treedirstate")
+    requires.discard("windowssymlinks")
+    requires.discard("edensparse")
 
     if checkout.get_config().enable_windows_symlinks:
         requires.add("windowssymlinks")
+
+    if checkout.get_config().scm_type == "filteredhg":
+        requires.add("edensparse")
 
     return "\n".join(sorted(requires)) + "\n"
 

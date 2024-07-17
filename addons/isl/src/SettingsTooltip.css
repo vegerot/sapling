@@ -17,3 +17,24 @@
   max-width: 500px;
   gap: var(--pad);
 }
+
+.setting-inline-dropdown {
+  display: flex;
+  flex-direction: row;
+  gap: var(--pad);
+  align-items: center;
+}
+
+.dropdown-container.setting-inline-dropdown label {
+  font-size: 80%;
+}
+
+.zoom-setting {
+  display: flex;
+  align-items: center;
+  gap: var(--halfpad);
+}
+
+.zoom-setting label {
+  font-size: 80%;
+}

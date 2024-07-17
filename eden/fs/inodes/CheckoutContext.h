@@ -15,16 +15,14 @@
 #include <folly/Synchronized.h>
 #include <folly/stop_watch.h>
 
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/InodePtrFwd.h"
 #include "eden/fs/service/gen-cpp2/eden_types.h"
 #include "eden/fs/store/StatsFetchContext.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 namespace folly {
 class exception_wrapper;
-template <typename T>
-class Future;
 struct Unit;
 } // namespace folly
 
@@ -93,14 +91,14 @@ class CheckoutContext {
    * Returns the list of conflicts and errors that were encountered during the
    * operation.
    */
-  folly::Future<std::vector<CheckoutConflict>> finish(RootId newSnapshot);
+  ImmediateFuture<std::vector<CheckoutConflict>> finish(RootId newSnapshot);
 
   /**
    * Flush the invalidation if needed.
    *
    * Return the list of conflicts and errors.
    */
-  folly::Future<std::vector<CheckoutConflict>> flush();
+  ImmediateFuture<std::vector<CheckoutConflict>> flush();
 
   void addConflict(ConflictType type, RelativePathPiece path);
   void

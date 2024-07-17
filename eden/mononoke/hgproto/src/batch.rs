@@ -59,7 +59,7 @@ pub fn escape<T: AsRef<[u8]>>(res: T) -> Vec<u8> {
 
 #[cfg(test)]
 mod test {
-    use bytes_old::Bytes;
+    use bytes::Bytes;
     use quickcheck::quickcheck;
     use quickcheck::TestResult;
 

@@ -4,9 +4,11 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-strict
+
 import abc
 from enum import IntEnum
-from typing import List, Optional, Set
+from typing import Any, List, Optional, Set
 
 from eden.fs.cli import ui
 from eden.fs.cli.config import AbstractEdenInstance, configutil
@@ -21,8 +23,11 @@ class RemediationError(Exception):
 class ProblemSeverity(IntEnum):
     # Note that we intentionally want to be able to compare severity values
     # using < and > operators.
+    ALL = 0
     ADVICE = 3
+    POTENTIALLY_SERIOUS = 4  # A bit more serious than ADVICE (for filtering)
     ERROR = 10
+    MELTDOWN = 255  # A condition in which nothing is safe; in practice, used to filter messages, but not actually used (for now) for any known problem
 
 
 class ProblemBase(abc.ABC):
@@ -57,6 +62,13 @@ class FixableProblem(ProblemBase):
     @abc.abstractmethod
     def perform_fix(self) -> None:
         """Attempt to automatically fix the problem."""
+
+    # This should be an abstractmethod but so I can incrementally implement the subfunctions
+    # it's a normal one for now
+    # @abc.abstractmethod
+    def check_fix(self) -> bool:
+        """Checks if the problem has been fixed."""
+        return True
 
 
 class Problem(ProblemBase):
@@ -123,56 +135,121 @@ class ProblemTracker(abc.ABC):
         else:
             self.add_problem_impl(problem)
 
-    def add_problem_impl(self, problem: ProblemBase) -> None:
-        ...
+    def add_problem_impl(self, problem: ProblemBase) -> None: ...
+
+
+class OutWriterWithSeverityFilter:
+    def __init__(self, out: ui.Output, min_severity_to_report: int) -> None:
+        self.out = out
+        self.min_severity_to_report = min_severity_to_report
+
+    def write(self, problem_severity: int, *args: Any, **kwargs: Any) -> None:
+        if problem_severity >= self.min_severity_to_report:
+            self.out.write(*args, **kwargs)
+
+    def writeln(self, problem_severity: int, *args: Any, **kwargs: Any) -> None:
+        if problem_severity >= self.min_severity_to_report:
+            self.out.writeln(*args, **kwargs)
 
 
 class ProblemFixer(ProblemTracker):
     def __init__(
-        self, instance: AbstractEdenInstance, out: ui.Output, debug: bool = False
+        self,
+        instance: AbstractEdenInstance,
+        out: ui.Output,
+        debug: bool = False,
+        min_severity_to_report: ProblemSeverity = ProblemSeverity.ALL,
     ) -> None:
         super().__init__(instance)
-        self._out = out
+        self._filtered_out = OutWriterWithSeverityFilter(out, min_severity_to_report)
         self.debug = debug
         self.num_problems = 0
         self.num_fixed_problems = 0
         self.num_failed_fixes = 0
         self.num_manual_fixes = 0
+        self.num_no_fixes = 0
+        self.num_advisory_fixes = 0
         self.problem_types: Set[str] = set()
+        self.problem_failed_fixes: Set[str] = set()
+        self.problem_manual_fixes: Set[str] = set()
+        self.problem_no_fixes: Set[str] = set()
+        self.problem_advisory_fixes: Set[str] = set()
         self.problem_description: List[str] = []
 
     def add_problem_impl(self, problem: ProblemBase) -> None:
         self.num_problems += 1
         problem_class = problem.__class__.__name__
         self.problem_types.add(problem_class)
-        self._out.writeln("- Found problem:", fg=self._out.YELLOW)
+        self._filtered_out.writeln(
+            problem.severity(), "- Found problem:", fg=self._filtered_out.out.YELLOW
+        )
         description = problem.format_description(debug=self.debug)
         self.problem_description.append(description)
-        self._out.writeln(description)
+        self._filtered_out.writeln(problem.severity(), description)
         if isinstance(problem, FixableProblem):
             self.fix_problem(problem)
         else:
-            self.num_manual_fixes += 1
             msg = problem.get_manual_remediation_message()
             if msg:
-                self._out.write(msg, end="\n\n")
+                if problem.severity() == ProblemSeverity.ADVICE:
+                    self.num_advisory_fixes += 1
+                    self.problem_advisory_fixes.add(problem.__class__.__name__)
+                else:
+                    self.num_manual_fixes += 1
+                    self.problem_manual_fixes.add(problem.__class__.__name__)
+                self._filtered_out.write(problem.severity(), msg, end="\n\n")
+            else:
+                self.num_no_fixes += 1
+                self.problem_no_fixes.add(problem.__class__.__name__)
+                self._filtered_out.write(
+                    problem.severity(),
+                    f"Found problem with no documented fix: {problem.__class__.__name__}, please contact the eden team for support",
+                    fg=self._filtered_out.out.RED,
+                    end="\n\n",
+                    flush=True,
+                )
 
     def fix_problem(self, problem: FixableProblem) -> None:
-        self._out.write(f"{problem.start_msg()}...", flush=True)
+        self._filtered_out.write(
+            problem.severity(), f"{problem.start_msg()}...", flush=True
+        )
         try:
             problem.perform_fix()
-            self._out.write("fixed", fg=self._out.GREEN, end="\n\n", flush=True)
-            self.num_fixed_problems += 1
+            if problem.check_fix():
+                self._filtered_out.write(
+                    problem.severity(),
+                    "fixed",
+                    fg=self._filtered_out.out.GREEN,
+                    end="\n\n",
+                    flush=True,
+                )
+                self.num_fixed_problems += 1
+            else:
+                self._filtered_out.writeln(
+                    problem.severity(), "error", fg=self._filtered_out.out.RED
+                )
+                self._filtered_out.write(
+                    problem.severity(),
+                    f"Attempted and failed to fix problem {problem.__class__.__name__}",
+                    end="\n\n",
+                    flush=True,
+                )
+                self.num_failed_fixes += 1
+                self.problem_failed_fixes.add(problem.__class__.__name__)
         except Exception as ex:
-            self._out.writeln("error", fg=self._out.RED)
-            self._out.write(
-                f"Failed to fix problem: {format_exception(ex, with_tb=True)}",
+            self._filtered_out.writeln(
+                problem.severity(), "error", fg=self._filtered_out.out.RED
+            )
+            self._filtered_out.write(
+                problem.severity(),
+                f"Failed to fix problem {problem.__class__.__name__}: {format_exception(ex, with_tb=True)}",
                 end="\n\n",
                 flush=True,
             )
             self.num_failed_fixes += 1
+            self.problem_failed_fixes.add(problem.__class__.__name__)
 
 
 class DryRunFixer(ProblemFixer):
     def fix_problem(self, problem: FixableProblem) -> None:
-        self._out.write(problem.dry_run_msg(), end="\n\n")
+        self._filtered_out.write(problem.severity(), problem.dry_run_msg(), end="\n\n")

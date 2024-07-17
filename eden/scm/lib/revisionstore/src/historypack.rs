@@ -14,7 +14,6 @@
 //! It consists of two files, with the following format:
 //!
 //! ```text
-//!
 //! .histpack
 //!     The pack itself is a series of file revisions with some basic header
 //!     information on each.
@@ -78,11 +77,9 @@
 //!     filename = <filename len : 2 byte unsigned int><filename value> [1]
 //!     nodeindexentry = <hgid: 20 byte> [1]
 //!                      <pack file hgid offset: 8 byte unsigned int> [1]
-//!
 //! ```
 //! [1]: new in version 1.
 
-use std::fs::File;
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
@@ -96,6 +93,7 @@ use anyhow::Result;
 use byteorder::BigEndian;
 use byteorder::ReadBytesExt;
 use byteorder::WriteBytesExt;
+use fs_err::File;
 use memmap2::Mmap;
 use memmap2::MmapOptions;
 use thiserror::Error;
@@ -298,6 +296,10 @@ impl HistoryPack {
         })
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn len(&self) -> usize {
         self.mmap.len()
     }
@@ -471,10 +473,10 @@ impl<'a> Iterator for HistoryPackIterator<'a> {
 #[cfg(test)]
 pub mod tests {
     use std::collections::HashMap;
-    use std::fs::set_permissions;
-    use std::fs::File;
-    use std::fs::OpenOptions;
 
+    use fs_err::set_permissions;
+    use fs_err::File;
+    use fs_err::OpenOptions;
     use quickcheck::quickcheck;
     use rand::SeedableRng;
     use rand_chacha::ChaChaRng;

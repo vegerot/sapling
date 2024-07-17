@@ -14,6 +14,9 @@
 #include <folly/chrono/Conv.h>
 #include <folly/logging/xlog.h>
 
+#include "eden/common/utils/Bug.h"
+#include "eden/common/utils/SystemError.h"
+#include "eden/common/utils/TimeUtil.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/ReloadableConfig.h"
 #include "eden/fs/inodes/FileInode.h"
@@ -21,10 +24,7 @@
 #include "eden/fs/inodes/ParentInodeInfo.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/telemetry/EdenStats.h"
-#include "eden/fs/utils/Bug.h"
 #include "eden/fs/utils/NotImplemented.h"
-#include "eden/fs/utils/SystemError.h"
-#include "eden/fs/utils/TimeUtil.h"
 
 using folly::Future;
 using folly::Promise;
@@ -284,6 +284,7 @@ ImmediateFuture<InodePtr> InodeMap::lookupInode(InodeNumber number) {
   // Look up the data in the unloadedInodes_ map.
   auto unloadedIter = data->unloadedInodes_.find(number);
   if (UNLIKELY(unloadedIter == data->unloadedInodes_.end())) {
+    stats_->increment(&InodeMapStats::lookupInodeError);
     if (mount_->throwEstaleIfInodeIsMissing()) {
       XLOG(DBG3) << "NFS inode " << number << " stale";
       // windows does not have ESTALE. We need some other error to turn into the
@@ -597,7 +598,11 @@ InodePtr InodeMap::lookupLoadedInode(InodeNumber number) {
   if (it == data->loadedInodes_.end()) {
     return nullptr;
   }
-  return it->second.getPtr();
+  auto inode = it->second.getPtr();
+  stats_->increment(
+      inode->isDir() ? &InodeMapStats::lookupTreeInodeHit
+                     : &InodeMapStats::lookupBlobInodeHit);
+  return inode;
 }
 
 TreeInodePtr InodeMap::lookupLoadedTree(InodeNumber number) {
@@ -677,18 +682,23 @@ InodePtr InodeMap::decFsRefcountHelper(
   // First check in the loaded inode map
   auto loadedIter = data->loadedInodes_.find(number);
   if (loadedIter != data->loadedInodes_.end()) {
+    auto inode = loadedIter->second.getPtr();
+    stats_->increment(
+        inode->isDir() ? &InodeMapStats::lookupTreeInodeHit
+                       : &InodeMapStats::lookupBlobInodeHit);
     // Acquire an InodePtr, so that we are always holding a pointer reference
     // on the inode when we decrement the fs refcount.
     //
     // This ensures that onInodeUnreferenced() will be processed at some point
     // after decrementing the FS refcount to 0, even if there were no
     // outstanding pointer references before this.
-    return loadedIter->second.getPtr();
+    return inode;
   }
 
   // If it wasn't loaded, it should be in the unloaded map
   auto unloadedIter = data->unloadedInodes_.find(number);
   if (UNLIKELY(unloadedIter == data->unloadedInodes_.end())) {
+    stats_->increment(&InodeMapStats::lookupInodeError);
     EDEN_BUG() << "InodeMap::decFsRefcount() called on unknown inode number "
                << number;
   }
@@ -828,7 +838,7 @@ void InodeMap::setUnmounted() {
 }
 
 Future<SerializedInodeMap> InodeMap::shutdown(
-    FOLLY_MAYBE_UNUSED bool doTakeover) {
+    [[maybe_unused]] bool doTakeover) {
   // Record that we are in the process of shutting down.
   auto future = Future<folly::Unit>::makeEmpty();
   {

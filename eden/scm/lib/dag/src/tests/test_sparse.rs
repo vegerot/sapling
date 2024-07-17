@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use futures::TryStreamExt;
+use nonblocking::non_blocking_result as nbr;
 
 use super::ProtocolMonitor;
 use super::TestDag;
@@ -17,8 +18,10 @@ use crate::ops::DagExportPullData;
 use crate::ops::DagImportPullData;
 use crate::ops::DagPersistent;
 use crate::ops::IdConvert;
+use crate::tests::dbg;
 use crate::Group;
 use crate::Id;
+use crate::Set;
 use crate::VertexListWithOptions;
 use crate::VertexName;
 
@@ -53,7 +56,7 @@ async fn test_sparse_dag() {
         // Note: some ids (ex. 11) does not have matching name in its IdMap.
         // The server-side non-master (X) is not cloned.
         assert_eq!(
-            format!("{:?}", &client.dag),
+            dbg(&client.dag),
             r#"Max Level: 0
  Level 0
   Group Master:
@@ -65,6 +68,8 @@ async fn test_sparse_dag() {
     5 : L+6 [] Root
     0 : I+4 [] Root OnlyHead
   Group Non-Master:
+   Segments: 0
+  Group Virtual:
    Segments: 0
 "#
         );
@@ -88,10 +93,7 @@ async fn test_sparse_dag() {
             let iter = all.iter().await.unwrap();
             iter.try_collect().await.unwrap()
         };
-        assert_eq!(
-            format!("{:?}", all),
-            "[M, E, D, C, B, J, L, K, I, H, G, F, A]"
-        );
+        assert_eq!(dbg(all), "[M, E, D, C, B, J, L, K, I, H, G, F, A]");
 
         assert_eq!(
             client.output(),
@@ -171,11 +173,11 @@ async fn test_add_heads() {
     );
 
     client.flush("G").await;
-    assert_eq!(client.output(), ["resolve names: [I], heads: [B]"]);
+    assert_eq!(client.output(), [] as [&str; 0]);
 
     let mut client = server.client_cloned_data().await;
     let heads = VertexListWithOptions::from(&["K".into()][..])
-        .with_highest_group(Group::MASTER)
+        .with_desired_group(Group::MASTER)
         .chain(&["G".into()][..]);
     client
         .dag
@@ -200,7 +202,7 @@ async fn test_basic_pull() {
     let missing = server.dag.only("D".into(), "B".into()).await.unwrap();
     let pull_data = server.dag.export_pull_data(&missing).await.unwrap();
 
-    let heads = VertexListWithOptions::from(&["D".into()][..]).with_highest_group(Group::MASTER);
+    let heads = VertexListWithOptions::from(&["D".into()][..]).with_desired_group(Group::MASTER);
     client
         .dag
         .import_pull_data(pull_data, &heads)
@@ -209,6 +211,26 @@ async fn test_basic_pull() {
 
     #[cfg(feature = "render")]
     assert_eq!(server.render_graph(), client.render_graph());
+}
+
+#[tokio::test]
+async fn test_pull_from_empty_assign_from_zero() {
+    let server = TestDag::draw("A..D  # master: D");
+    let mut client = server.client().await;
+    let missing = server.dag.only("D".into(), Set::empty()).await.unwrap();
+    let pull_data = server.dag.export_pull_data(&missing).await.unwrap();
+    let heads = VertexListWithOptions::from(&["D".into()][..]).with_desired_group(Group::MASTER);
+    client
+        .dag
+        .import_pull_data(pull_data, &heads)
+        .await
+        .unwrap();
+
+    let get_id = |s: &'static str| nbr(client.dag.vertex_id(s.into())).unwrap().0;
+    assert_eq!(get_id("A"), 0);
+    assert_eq!(get_id("B"), 1);
+    assert_eq!(get_id("C"), 2);
+    assert_eq!(get_id("D"), 3);
 }
 
 #[tokio::test]
@@ -273,6 +295,41 @@ async fn test_pull_remap() {
             B  1
             │
             A  0"
+    );
+}
+
+#[tokio::test]
+async fn test_pull_split() {
+    // Check that the client can split server segments for defragmentation purpose.
+    // This just tests the basic feature.
+    let mut server = TestDag::new();
+    server.drawdag(
+        r#"
+        A1..A9--B1..B9--D  B5-D  C5-D
+               \      /
+                C1..C9
+    "#,
+        &["D"],
+    );
+    let data = server.export_pull_data("", "D").await.unwrap();
+
+    // Import only the B5 branch without importing the segment containing B5 (head: B9).
+    let mut client = server.client().await;
+    client.import_pull_data(data.clone(), "B5").await.unwrap();
+    assert!(!client.contains_vertex_locally("B9"));
+    // There is only one flat segment.
+    assert_eq!(
+        client.dump_state().await,
+        "<spans [A1:B5+0:13]>\nLv0: RH0-13[]\n0->A1 8->A9 13->B5"
+    );
+
+    // Import only the C5 branch without importing the segment containing C5 (head: C9).
+    let mut client = server.client().await;
+    client.import_pull_data(data, "C5").await.unwrap();
+    assert!(!client.contains_vertex_locally("C9"));
+    assert_eq!(
+        client.dump_state().await,
+        "<spans [A1:C5+0:13]>\nLv0: RH0-13[]\n0->A1 8->A9 9->C1 13->C5"
     );
 }
 
@@ -458,6 +515,84 @@ P->C: 1->5, 1->N6, 3->8, 7->8, 9->N0
 }
 
 #[tokio::test]
+async fn test_flush_no_over_fetch() {
+    let server = TestDag::draw("A..E # master: E");
+    let mut client = server.client_cloned_data().await;
+
+    // Branch off "B".
+    client.drawdag_async("B-X-Y-Z", &[]).await;
+    assert_eq!(
+        client.output(),
+        [
+            "resolve names: [B], heads: [E]",
+            "resolve names: [X], heads: [E]"
+        ]
+    );
+
+    // Flush with a master head. Should not fetch anything.
+    let heads = VertexListWithOptions::from(vec![VertexName::copy_from(b"E")])
+        .with_desired_group(Group::MASTER);
+    client.dag.flush(&heads).await.unwrap();
+    assert_eq!(client.output(), [] as [&str; 0]);
+
+    // "D" remains unknown locally (E~1 is not fetched).
+    assert_eq!(
+        client
+            .dag
+            .contains_vertex_name_locally(&["D".into()])
+            .await
+            .unwrap(),
+        [false]
+    );
+}
+
+#[tokio::test]
+async fn test_offline_commit() {
+    // Test that in A-B-C-D-E, inserting Z with parent B does not trigger
+    // remote lookup if "C" is known (so "Z" and "C" are different vertexes).
+    //
+    // Practically, when checking out "B", prefetch its children "C" to make
+    // offline committing on top of "B" possible.
+
+    let server = TestDag::draw("A..E # master: E");
+
+    {
+        let mut client = server.client_cloned_data().await;
+
+        // Prefetch "B" and "C". Emulate the behavior of checking out "B"
+        // and prefetching B's children.
+        client
+            .dag
+            .vertex_id_batch(&["B".into(), "C".into()])
+            .await
+            .unwrap();
+        assert_eq!(client.output(), ["resolve names: [B, C], heads: [E]",]);
+        client.flush("").await;
+
+        // Add Z as pending, then flush. This should not trigger remote lookup.
+        // This emulates committing on top of "B".
+        client.add_one_vertex("Z", "B").await;
+        client.flush("").await;
+        assert_eq!(client.output(), [] as [&str; 0]);
+    }
+
+    {
+        // Comparsion. What will happen without prefetching children on checkout.
+        let mut client = server.client_cloned_data().await;
+
+        // Prefetch only B. Emulate checking out B without prefetching its children.
+        client.dag.vertex_id("B".into()).await.unwrap();
+        assert_eq!(client.output(), ["resolve names: [B], heads: [E]",]);
+
+        // Add Z as pending, then flush. This will trigger remote lookups to confirm that "Z" does
+        // not exist in the existing lazy graph.
+        client.add_one_vertex("Z", "B").await;
+        client.flush("").await;
+        assert_eq!(client.output(), ["resolve names: [Z], heads: [E]"]);
+    }
+}
+
+#[tokio::test]
 async fn test_resolve_misleading_merges() {
     // Test when the server graph gets more merges making vertexes
     // previously not a parent of a merge become a parent of a merge.
@@ -564,8 +699,8 @@ async fn test_resolve_mixed_result() {
             .with_remote(&server);
         let ids = client.dag.vertex_id_batch(&names).await;
         assert_eq!(
-            format!("{:?}", ids),
-            "Ok([Ok(0), Ok(1), Ok(2), Ok(3), Ok(4), Ok(5), Ok(6), Ok(7), Err(VertexNotFound(I)), Err(VertexNotFound(J)), Err(VertexNotFound(X))])",
+            dbg(ids),
+            "Ok([Ok(0), Ok(1), Ok(2), Ok(3), Ok(4), Ok(5), Ok(6), Ok(7), Err(VertexNotFound(I)), Err(VertexNotFound(J)), Err(VertexNotFound(X))])"
         );
         assert_eq!(
             client.output(),

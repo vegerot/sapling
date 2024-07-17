@@ -153,6 +153,22 @@ impl Status {
     pub fn contains(&self, path: &RepoPath) -> bool {
         self.all.contains_key(path)
     }
+
+    pub fn len(&self) -> usize {
+        self.all.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn dirty(&self) -> bool {
+        use FileStatus::*;
+        self.all
+            .iter()
+            .any(|(_, s)| matches!(s, Modified | Added | Deleted | Removed))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

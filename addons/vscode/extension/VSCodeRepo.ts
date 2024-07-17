@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {EnabledSCMApiFeature} from './types';
 import type {RepositoryReference} from 'isl-server/src/RepositoryCache';
 import type {ServerSideTracker} from 'isl-server/src/analytics/serverSideTracker';
 import type {Logger} from 'isl-server/src/logger';
@@ -13,12 +14,18 @@ import type {Comparison} from 'shared/Comparison';
 import type {Writable} from 'shared/typeUtils';
 
 import {encodeSaplingDiffUri} from './DiffContentProvider';
+import SaplingFileDecorationProvider from './SaplingFileDecorationProvider';
+import {executeVSCodeCommand} from './commands';
 import {getCLICommand} from './config';
 import {t} from './i18n';
 import {Repository} from 'isl-server/src/Repository';
 import {repositoryCache} from 'isl-server/src/RepositoryCache';
+import {ResolveOperation, ResolveTool} from 'isl/src/operations/ResolveOperation';
+import * as path from 'path';
 import {ComparisonType} from 'shared/Comparison';
 import * as vscode from 'vscode';
+
+const mergeConflictStartRegex = new RegExp('<{7}|>{7}|={7}|[|]{7}');
 
 export class VSCodeReposList {
   private knownRepos = new Map</* attached folder root */ string, RepositoryReference>();
@@ -27,7 +34,11 @@ export class VSCodeReposList {
 
   private reposByPath = new Map</* arbitrary subpath of repo */ string, VSCodeRepo>();
 
-  constructor(private logger: Logger, private tracker: ServerSideTracker) {
+  constructor(
+    private logger: Logger,
+    private tracker: ServerSideTracker,
+    private enabledFeatures: Set<EnabledSCMApiFeature>,
+  ) {
     if (vscode.workspace.workspaceFolders) {
       this.updateRepos(vscode.workspace.workspaceFolders, []);
     }
@@ -49,12 +60,12 @@ export class VSCodeReposList {
       if (this.knownRepos.has(fsPath)) {
         throw new Error(`Attempted to add workspace folder path twice: ${fsPath}`);
       }
-      const repoReference = repositoryCache.getOrCreate(
-        getCLICommand(),
-        this.logger,
-        this.tracker,
-        fsPath,
-      );
+      const repoReference = repositoryCache.getOrCreate({
+        cwd: fsPath,
+        cmd: getCLICommand(),
+        logger: this.logger,
+        tracker: this.tracker,
+      });
       this.knownRepos.set(fsPath, repoReference);
       repoReference.promise.then(repo => {
         if (repo instanceof Repository) {
@@ -63,7 +74,7 @@ export class VSCodeReposList {
           if (existing) {
             return;
           }
-          const vscodeRepo = new VSCodeRepo(repo, this.logger);
+          const vscodeRepo = new VSCodeRepo(repo, this.logger, this.enabledFeatures);
           this.vscodeRepos.set(root, vscodeRepo);
           repo.onDidDispose(() => {
             vscodeRepo.dispose();
@@ -78,6 +89,15 @@ export class VSCodeReposList {
       repo?.unref();
       this.knownRepos.delete(fsPath);
     }
+
+    executeVSCodeCommand('setContext', 'sapling:hasRepo', this.knownRepos.size > 0);
+
+    Promise.all(Array.from(this.knownRepos.values()).map(repo => repo.promise)).then(repos => {
+      const hasRemoteLinkRepo = repos.some(
+        repo => repo instanceof Repository && repo.codeReviewProvider?.getRemoteFileURL,
+      );
+      executeVSCodeCommand('setContext', 'sapling:hasRemoteLinkRepo', hasRemoteLinkRepo);
+    });
   }
 
   /** return the VSCodeRepo that contains the given path */
@@ -100,24 +120,41 @@ export class VSCodeReposList {
   }
 }
 
+type SaplingResourceState = vscode.SourceControlResourceState & {
+  status?: string;
+};
+export type SaplingResourceGroup = vscode.SourceControlResourceGroup & {
+  resourceStates: SaplingResourceState[];
+};
 /**
  * vscode-API-compatible repository.
  * This handles vscode-api integrations, but defers to Repository for any actual work.
  */
 export class VSCodeRepo implements vscode.QuickDiffProvider {
   private disposables: Array<vscode.Disposable> = [];
-  private sourceControl: vscode.SourceControl;
-  private resourceGroups: Record<
+  private sourceControl?: vscode.SourceControl;
+  private resourceGroups?: Record<
     'changes' | 'untracked' | 'unresolved' | 'resolved',
-    vscode.SourceControlResourceGroup
+    SaplingResourceGroup
   >;
   public rootUri: vscode.Uri;
   public rootPath: string;
 
-  constructor(public repo: Repository, private logger: Logger) {
+  constructor(
+    public repo: Repository,
+    private logger: Logger,
+    private enabledFeatures: Set<EnabledSCMApiFeature>,
+  ) {
     repo.onDidDispose(() => this.dispose());
     this.rootUri = vscode.Uri.file(repo.info.repoRoot);
     this.rootPath = repo.info.repoRoot;
+
+    this.autoResolveFilesOnSave();
+
+    if (!this.enabledFeatures.has('sidebar')) {
+      // if sidebar is not enabled, VSCodeRepo is mostly useless, but still used for checking which paths can be used for ISL and blame.
+      return;
+    }
 
     this.sourceControl = vscode.scm.createSourceControl(
       'sapling',
@@ -140,6 +177,7 @@ export class VSCodeRepo implements vscode.QuickDiffProvider {
       group.hideWhenEmpty = true;
     }
 
+    const fileDecorationProvider = new SaplingFileDecorationProvider(this, logger);
     this.disposables.push(
       repo.subscribeToUncommittedChanges(() => {
         this.updateResourceGroups();
@@ -147,25 +185,76 @@ export class VSCodeRepo implements vscode.QuickDiffProvider {
       repo.onChangeConflictState(() => {
         this.updateResourceGroups();
       }),
+      fileDecorationProvider,
     );
     this.updateResourceGroups();
   }
 
+  /** If this uri is for a file inside the repo, return the repo-relative path. Otherwise, return undefined.  */
+  public repoRelativeFsPath(uri: vscode.Uri): string | undefined {
+    return uri.scheme === this.rootUri.scheme &&
+      uri.authority === this.rootUri.authority &&
+      uri.fsPath.startsWith(this.rootPath)
+      ? path.relative(this.rootPath, uri.fsPath)
+      : undefined;
+  }
+
+  private autoResolveFilesOnSave(): vscode.Disposable {
+    return vscode.workspace.onDidSaveTextDocument(document => {
+      const repoRelativePath = this.repoRelativeFsPath(document.uri);
+      const conflicts = this.repo.getMergeConflicts();
+      if (conflicts == null || repoRelativePath == null) {
+        return;
+      }
+      const filesWithConflicts = conflicts.files?.map(file => file.path);
+      if (filesWithConflicts?.includes(repoRelativePath) !== true) {
+        return;
+      }
+      const autoResolveEnabled = vscode.workspace
+        .getConfiguration('sapling')
+        .get<boolean>('markConflictingFilesResolvedOnSave');
+      if (!autoResolveEnabled) {
+        return;
+      }
+      const allConflictsThisFileResolved = !mergeConflictStartRegex.test(document.getText());
+      if (!allConflictsThisFileResolved) {
+        return;
+      }
+      this.logger.info(
+        'auto marking file with no remaining conflicts as resolved:',
+        repoRelativePath,
+      );
+
+      this.repo.runOrQueueOperation(
+        this.repo.initialConnectionContext,
+        {
+          ...new ResolveOperation(repoRelativePath, ResolveTool.mark).getRunnableOperation(),
+          // Distinguish in analytics from manually resolving
+          trackEventName: 'AutoMarkResolvedOperation',
+        },
+        () => null,
+      );
+    });
+  }
+
   private updateResourceGroups() {
+    if (this.resourceGroups == null || this.sourceControl == null) {
+      return;
+    }
     const data = this.repo.getUncommittedChanges();
     const conflicts = this.repo.getMergeConflicts()?.files;
 
     // only show merge conflicts if they are given
     const fileChanges = conflicts ?? data?.files?.value ?? [];
 
-    const changes: Array<vscode.SourceControlResourceState> = [];
-    const untracked: Array<vscode.SourceControlResourceState> = [];
-    const unresolved: Array<vscode.SourceControlResourceState> = [];
-    const resolved: Array<vscode.SourceControlResourceState> = [];
+    const changes: Array<SaplingResourceState> = [];
+    const untracked: Array<SaplingResourceState> = [];
+    const unresolved: Array<SaplingResourceState> = [];
+    const resolved: Array<SaplingResourceState> = [];
 
     for (const change of fileChanges) {
       const uri = vscode.Uri.joinPath(this.rootUri, change.path);
-      const resource: vscode.SourceControlResourceState = {
+      const resource: SaplingResourceState = {
         command: {
           command: 'vscode.open',
           title: 'Open',
@@ -173,6 +262,7 @@ export class VSCodeRepo implements vscode.QuickDiffProvider {
         },
         resourceUri: uri,
         decorations: this.decorationForChange(change),
+        status: change.status,
       };
       switch (change.status) {
         case '?':
@@ -197,6 +287,10 @@ export class VSCodeRepo implements vscode.QuickDiffProvider {
 
     // don't include resolved files in count
     this.sourceControl.count = changes.length + untracked.length + unresolved.length;
+  }
+
+  public getResourceGroups() {
+    return this.resourceGroups;
   }
 
   public dispose() {

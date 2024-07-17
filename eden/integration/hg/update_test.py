@@ -4,14 +4,18 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 import logging
 import os
 import re
 import sys
 import threading
 from contextlib import contextmanager
+from enum import Enum
 from multiprocessing import Process
 from textwrap import dedent
+from threading import Thread
 from typing import Dict, Generator, List, Optional, Set
 
 from eden.fs.cli import util
@@ -210,19 +214,18 @@ class UpdateTest(EdenHgTestCase):
         with self.assertRaises(hgrepo.HgError) as context:
             self.hg("update", ".^", "--merge")
         self.assertIn(
-            b"1 conflicts while merging foo/bar.txt! "
-            b"(edit, then use 'hg resolve --mark')",
+            b"1 conflicts while merging foo/bar.txt!",
             context.exception.stderr,
         )
         self.assert_status({"foo/bar.txt": "M"}, op="updatemerge")
         self.assert_file_regex(
             "foo/bar.txt",
             """\
-            <<<<<<< working copy.*
+            <<<<<<< .*
             changing yet again
             =======
             test
-            >>>>>>> destination.*
+            >>>>>>> .*
             """,
         )
 
@@ -246,7 +249,10 @@ class UpdateTest(EdenHgTestCase):
         # both the working copy and the destination.
         with self.assertRaises(hgrepo.HgError) as context:
             self.repo.update(new_commit)
-        self.assertIn(b"abort: conflicting changes", context.exception.stderr)
+        self.assertIn(
+            b"abort: 1 conflicting file changes:\n" b" bar/some_new_file.txt\n",
+            context.exception.stderr,
+        )
         self.assertEqual(
             base_commit,
             self.repo.get_head_hash(),
@@ -298,7 +304,10 @@ class UpdateTest(EdenHgTestCase):
         # now the update aborts because some_new_file has the different contents
         with self.assertRaises(hgrepo.HgError) as context:
             self.repo.update(new_commit)
-        self.assertIn(b"abort: conflicting changes", context.exception.stderr)
+        self.assertIn(
+            b"1 conflicting file changes:\n" b" bar/some_new_file.txt",
+            context.exception.stderr,
+        )
         self.assertEqual(
             base_commit,
             self.repo.get_head_hash(),
@@ -372,8 +381,7 @@ class UpdateTest(EdenHgTestCase):
         with self.assertRaises(hgrepo.HgError) as context:
             self.repo.update(commit, merge=True)
         self.assertIn(
-            b"warning: 1 conflicts while merging some_new_file.txt! "
-            b"(edit, then use 'hg resolve --mark')",
+            b"warning: 1 conflicts while merging some_new_file.txt!",
             context.exception.stderr,
         )
         self.assertEqual(
@@ -386,11 +394,11 @@ class UpdateTest(EdenHgTestCase):
         self.assert_status({"some_new_file.txt": "M"}, op="updatemerge")
         merge_contents = dedent(
             """\
-        <<<<<<< working copy.*
+        <<<<<<< .*
         Re-create the file with different contents.
         =======
         Original contents.
-        >>>>>>> destination.*
+        >>>>>>> .*
         """
         )
         self.assertRegex(self.read_file("some_new_file.txt"), merge_contents)
@@ -455,8 +463,6 @@ class UpdateTest(EdenHgTestCase):
         result = self.repo.run_hg(
             "update",
             new_commit,
-            "--config",
-            "experimental.updatecheck=noconflict",
             check=False,
             traceback=False,
         )
@@ -466,9 +472,7 @@ class UpdateTest(EdenHgTestCase):
         self.assertRegex(
             result.stderr.decode("utf-8"),
             re.compile(
-                "abort: conflicting changes:\n"
-                "  foo/new_file.txt\n"
-                "\\(commit or (goto|update) --clean to discard changes\\)\n",
+                "abort: 1 conflicting file changes:\n" " foo/new_file.txt",
                 re.MULTILINE,
             ),
         )
@@ -501,6 +505,7 @@ class UpdateTest(EdenHgTestCase):
                             mountPoint=bytes(self.mount, encoding="utf-8"),
                             commit=bytes(hg_parent, encoding="utf-8"),
                             listIgnored=False,
+                            rootIdOptions=None,
                         )
                     )
             except EdenError as ex:
@@ -879,7 +884,7 @@ class UpdateTest(EdenHgTestCase):
                 flags=DIS_ENABLE_FLAGS,
                 sync=SyncBehavior(),
             )
-            inodes = dict((i.path.decode("utf8"), i) for i in inode_status)
+            inodes = {i.path.decode("utf8"): i for i in inode_status}
             self.assertNotIn("dir1", inodes)
             # dir2 will either be not loaded or not materialized.
             dir2 = next(inode for inode in inodes[""].entries if inode.name == b"dir2")
@@ -915,6 +920,48 @@ class UpdateTest(EdenHgTestCase):
 
         first_update.join()
 
+    def test_update_with_hg_failure(self) -> None:
+        """
+        Test running `hg update` to check that a failure that leads to hg and
+        edenfs states diverging is detected and fixed correctly.
+        """
+        new_contents = "New contents for bar.txt\n"
+        self.backing_repo.write_file("foo/bar.txt", new_contents)
+        self.backing_repo.commit("Update foo/bar.txt")
+
+        self.assert_status_empty()
+        self.assertNotEqual(new_contents, self.read_file("foo/bar.txt"))
+
+        # We expect an exception, and expect it to leave the repo in a bad state
+        with self.assertRaisesRegex(
+            hgrepo.HgError, r"Error set by checkout-pre-set-parents FAILPOINTS"
+        ):
+            self.repo.update(
+                self.commit2,
+                env={
+                    "FAILPOINTS": "checkout-pre-set-parents=return",
+                },
+            )
+
+        # Confirm that we'll get an error message about the divergent state
+        self.hg("config", "--local", "experimental.repair-eden-dirstate", "False")
+        with self.assertRaisesRegex(BaseException, r"error computing status: .*"):
+            self.repo.status()
+
+        # Setting the experimental.repair-eden-dirstate config option to true (the default) will fix the issue
+        self.hg("config", "--local", "experimental.repair-eden-dirstate", "True")
+        self.repo.status()
+
+
+class PrjFsState(Enum):
+    UNKNOWN = 0
+    VIRTUAL = 1
+    PLACEHOLDER = 2
+    HYDRATED_PLACEHOLDER = 3
+    DIRTY_PLACEHOLDER = 4
+    FULL = 5
+    TOMBSTONE = 6
+
 
 @hg_test
 # pyre-ignore[13]: T62487924
@@ -923,6 +970,7 @@ class UpdateCacheInvalidationTest(EdenHgTestCase):
     commit2: str
     commit3: str
     commit4: str
+    enable_fault_injection: bool = True
 
     def edenfs_logging_settings(self) -> Dict[str, str]:
         return {
@@ -1037,7 +1085,79 @@ class UpdateCacheInvalidationTest(EdenHgTestCase):
         poststats = os.stat(filepath)
         self.assertEqual(poststats.st_size, 7)
 
-    if sys.platform == "win32":
+    if sys.platform == "win32":  # noqa: C901
+
+        def _retry_update_after_failed_entry_cache_invalidation(
+            self,
+            initial_state: PrjFsState,
+        ) -> None:
+            self.hg(
+                "config", "--local", "experimental.abort-on-eden-conflict-error", "True"
+            )
+
+            if initial_state == PrjFsState.PLACEHOLDER:
+                # Stat file2 to populate a placeholder, making the file non-virtual.
+                os.stat(self.get_path("dir/file2"))
+            elif initial_state == PrjFsState.HYDRATED_PLACEHOLDER:
+                # Read file2 to hydrate its placeholder.
+                self.read_file("dir/file2")
+            elif initial_state == PrjFsState.FULL:
+                original_file2 = self.read_file("dir/file2")
+                self.write_file("dir/file2", "modified two")
+                self.write_file("dir/file2", original_file2)
+                self.assert_status({})
+            else:
+                raise ValueError("Unsupported initial state: {}".format(initial_state))
+
+            # Simulate failed invalidation of file2.
+            with self.eden.get_thrift_client_legacy() as client:
+                client.injectFault(
+                    FaultDefinition(
+                        keyClass="invalidateChannelEntryCache",
+                        keyValueRegex="file2",
+                        errorType="runtime_error",
+                    )
+                )
+            with self.assertRaises(hgrepo.HgError):
+                self.repo.update(self.commit1)
+
+            self.assertEqual(self.repo.get_head_hash(), self.commit4)
+            self.assert_unfinished_operation("update")
+
+            # Try to update again, this time without failure.
+            with self.eden.get_thrift_client_legacy() as client:
+                client.unblockFault(
+                    UnblockFaultArg(
+                        keyClass="invalidateChannelEntryCache", keyValueRegex="file2"
+                    )
+                )
+            self.repo.update(self.commit1)
+
+            self.assertEqual(self.repo.get_head_hash(), self.commit1)
+
+            # TODO(mshroyer): These two assertions should succeed for a
+            # successfully retried invalidation, but at the moment they fail.
+            # self.assert_status({}, op=None)
+            # self.assertEqual(self.read_file("dir/file2"), "two")
+
+        def test_retry_update_after_failed_entry_cache_invalidation_placeholder(
+            self,
+        ) -> None:
+            self._retry_update_after_failed_entry_cache_invalidation(
+                initial_state=PrjFsState.PLACEHOLDER,
+            )
+
+        def test_retry_update_after_failed_entry_cache_invalidation_hydrated_placeholder(
+            self,
+        ) -> None:
+            self._retry_update_after_failed_entry_cache_invalidation(
+                initial_state=PrjFsState.HYDRATED_PLACEHOLDER,
+            )
+
+        def test_retry_update_after_failed_entry_cache_invalidation_full(self) -> None:
+            self._retry_update_after_failed_entry_cache_invalidation(
+                initial_state=PrjFsState.FULL,
+            )
 
         def test_update_clean_lay_placeholder_on_full(self) -> None:
             self.repo.write_file("dir2/dir3/file1", "foobar")
@@ -1119,8 +1239,6 @@ class UpdateCacheInvalidationTest(EdenHgTestCase):
                     self.repo.update(self.commit4)
 
             self.assertEqual(self.read_file("dir/file2"), "new")
-            with self.assertRaises(hgrepo.HgError):
-                self.repo.status()
 
         def test_file_locked_removal(self) -> None:
             # TODO(zhaolong): remove this once this option is enabled everywhere.
@@ -1136,3 +1254,215 @@ class UpdateCacheInvalidationTest(EdenHgTestCase):
             self.assertEqual(self.read_file("dir/file3"), "three")
             with self.assertRaises(hgrepo.HgError):
                 self.repo.status()
+
+
+@hg_test
+# pyre-ignore[13]: T62487924
+class PrjFSStressTornReads(EdenHgTestCase):
+    long_file_commit: str = ""
+    short_file_commit: str = ""
+
+    enable_fault_injection: bool = True
+
+    def populate_backing_repo(self, repo: hgrepo.HgRepository) -> None:
+        repo.write_file("file", "1234567890\n")
+        self.long_file_commit = repo.commit("Initial commit.")
+        repo.write_file("file", "54321\n")
+        self.short_file_commit = repo.commit("Shorter file commit.")
+
+    def edenfs_logging_settings(self) -> Dict[str, str]:
+        return {"eden.strace": "DBG7"}
+
+    def test_torn_read_long_to_short(self) -> None:
+        self.repo.update(self.long_file_commit)
+        rel_path = "file"
+        path = self.mount_path / rel_path
+
+        read_exception: Optional[OSError] = None
+
+        def read_file() -> None:
+            nonlocal read_exception
+            with self.run_with_blocking_fault(
+                keyClass="PrjfsDispatcherImpl::read",
+                keyValueRegex="file",
+            ):
+                try:
+                    with path.open("rb") as f:
+                        f.read()
+                except Exception as err:
+                    read_exception = err
+
+        read_thread = Thread(target=read_file)
+        read_thread.start()
+
+        try:
+            self.repo.update(self.short_file_commit)
+        except Exception:
+            pass
+
+        self.remove_fault(keyClass="PrjfsDispatcherImpl::read", keyValueRegex="file")
+        self.wait_on_fault_unblock(
+            keyClass="PrjfsDispatcherImpl::read", keyValueRegex="file"
+        )
+        read_thread.join()
+        self.assertIsNotNone(read_exception)
+        if read_exception is not None:  # pyre :(
+            self.assertEqual(read_exception.errno, 22)  # invalid argument error
+
+    def test_torn_read_short_to_long(self) -> None:
+        self.repo.update(self.short_file_commit)
+
+        rel_path = "file"
+        path = self.mount_path / rel_path
+
+        read_contents = None
+
+        def read_file() -> None:
+            nonlocal read_contents
+            with self.run_with_blocking_fault(
+                keyClass="PrjfsDispatcherImpl::read",
+                keyValueRegex="file",
+            ):
+                with path.open("rb") as f:
+                    read_contents = f.read()
+
+        read_thread = Thread(target=read_file)
+        read_thread.start()
+
+        try:
+            self.repo.update(self.long_file_commit)
+        except Exception:
+            pass
+
+        self.remove_fault(keyClass="PrjfsDispatcherImpl::read", keyValueRegex="file")
+        self.wait_on_fault_unblock(
+            keyClass="PrjfsDispatcherImpl::read", keyValueRegex="file"
+        )
+        read_thread.join()
+        self.assertIsNotNone(read_contents)
+        # This is not correct behavior, we want the contents to be either
+        # the contents from the first or second commit, not this inconsitent
+        # mashup. This test is for not documenting the behavior of torn reads.
+        # This case requires a larger fix.
+        # TODO(kmancini): fix torn reads.
+        self.assertEqual(read_contents, b"123456")
+
+    def test_torn_read_invalidation(self) -> None:
+        self.repo.update(self.long_file_commit)
+        rel_path = "file"
+        path = self.mount_path / rel_path
+
+        read_exception: Optional[OSError] = None
+
+        def read_file() -> None:
+            nonlocal read_exception
+            with self.run_with_blocking_fault(
+                keyClass="PrjfsDispatcherImpl::read",
+                keyValueRegex="file",
+            ):
+                try:
+                    with path.open("rb") as f:
+                        f.read()
+                except Exception as err:
+                    read_exception = err
+
+        read_thread = Thread(target=read_file)
+        read_thread.start()
+
+        try:
+            self.repo.update(self.short_file_commit)
+        except Exception:
+            pass
+
+        self.remove_fault(keyClass="PrjfsDispatcherImpl::read", keyValueRegex="file")
+        self.wait_on_fault_unblock(
+            keyClass="PrjfsDispatcherImpl::read", keyValueRegex="file"
+        )
+        read_thread.join()
+        self.assertIsNotNone(read_exception)
+        if read_exception is not None:  # pyre :(
+            self.assertEqual(read_exception.errno, 22)  # invalid argument error
+
+        def read_file_without_error() -> Optional[str]:
+            try:
+                with path.open("rb") as f:
+                    return f.read()
+            except Exception:
+                return None
+
+        contents = util.poll_until(
+            read_file_without_error,
+            timeout=30,
+            interval=2,
+            timeout_ex=Exception(
+                f"path: {path} did not become readable. Invalidation didn't happen?"
+            ),
+        )
+
+        self.assertEqual(contents, b"54321\n")
+
+    def test_torn_read_invalidation_shutdown(self) -> None:
+        self.repo.update(self.long_file_commit)
+        rel_path = "file"
+        path = self.mount_path / rel_path
+
+        read_exception: Optional[OSError] = None
+
+        def read_file() -> None:
+            nonlocal read_exception
+            with self.run_with_blocking_fault(
+                keyClass="PrjfsDispatcherImpl::read",
+                keyValueRegex="file",
+            ):
+                try:
+                    with path.open("rb") as f:
+                        f.read()
+                except Exception as err:
+                    read_exception = err
+
+        read_thread = Thread(target=read_file)
+        read_thread.start()
+
+        self.wait_on_fault_hit(key_class="PrjfsDispatcherImpl::read")
+
+        try:
+            self.repo.update(self.short_file_commit)
+        except Exception:
+            pass
+
+        with self.eden.get_thrift_client_legacy() as client:
+            client.injectFault(
+                FaultDefinition(
+                    keyClass="PrjFSChannelInner::getFileData-invalidation",
+                    keyValueRegex="file",
+                    block=True,
+                )
+            )
+
+        self.remove_fault(keyClass="PrjfsDispatcherImpl::read", keyValueRegex="file")
+        self.wait_on_fault_unblock(
+            keyClass="PrjfsDispatcherImpl::read", keyValueRegex="file"
+        )
+        read_thread.join()
+
+        def stop_eden() -> None:
+            self.eden.shutdown()
+
+        shutdown_thread = Thread(target=stop_eden)
+        shutdown_thread.start()
+
+        try:
+            self.remove_fault(
+                keyClass="PrjFSChannelInner::getFileData-invalidation",
+                keyValueRegex="file",
+            )
+            self.unblock_fault(
+                keyClass="PrjFSChannelInner::getFileData-invalidation",
+                keyValueRegex="file",
+            )
+        finally:
+            # we can't let shutdown be on going when the test trys to
+            # clean up or we might hide the actual error.
+            # throws if eden exits uncleanly - which it does if there is some
+            # sort of crash.
+            shutdown_thread.join()

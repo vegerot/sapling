@@ -17,10 +17,12 @@ use bookmarks::BookmarkUpdateLog;
 use bookmarks::Bookmarks;
 use changeset_fetcher::ChangesetFetcher;
 use changesets::Changesets;
+use commit_cloud::CommitCloud;
 use commit_graph::CommitGraph;
 use ephemeral_blobstore::RepoEphemeralStore;
 use filenodes::Filenodes;
 use filestore::FilestoreConfig;
+use git_symbolic_refs::GitSymbolicRefs;
 use mercurial_mutation::HgMutationStore;
 use metaconfig_types::RepoConfig;
 use mutable_counters::MutableCounters;
@@ -67,6 +69,8 @@ pub struct InnerRepo {
         dyn RepoPermissionChecker,
         dyn RepoLock,
         CommitGraph,
+        dyn GitSymbolicRefs,
+        CommitCloud
     )]
     pub blob_repo: BlobRepo,
 

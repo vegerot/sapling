@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # coding=utf-8
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #

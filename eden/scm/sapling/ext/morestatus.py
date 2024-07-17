@@ -15,6 +15,7 @@ import os
 from sapling import (
     commands,
     hbisect,
+    localrepo,
     merge as mergemod,
     node as nodeutil,
     pycompat,
@@ -58,13 +59,13 @@ def conflictsmsg(repo, ui):
         )
         msg = (
             _(
-                """Unresolved merge conflicts:
+                """Unresolved merge conflicts (%d):
 
 %s
 
 To mark files as resolved:  @prog@ resolve --mark FILE"""
             )
-            % mergeliststr
+            % (len(unresolvedlist), mergeliststr)
         )
     else:
         msg = _("No unresolved merge conflicts.")
@@ -72,26 +73,38 @@ To mark files as resolved:  @prog@ resolve --mark FILE"""
     ui.warn(prefixlines(msg))
 
 
-def helpmessage(ui, continuecmd, abortcmd):
-    msg = _("To continue:                %s\n" "To abort:                   %s") % (
-        continuecmd,
-        abortcmd,
-    )
+def helpmessage(ui, continuecmd, abortcmd, quitcmd=None):
+    items = [
+        _("To continue:                %s") % continuecmd,
+        _("To abort:                   %s") % abortcmd,
+        _("To quit:                    %s") % quitcmd if quitcmd else None,
+    ]
+    msg = "\n".join(filter(None, items))
     ui.warn(prefixlines(msg))
 
 
 def rebasemsg(repo, ui):
-    helpmessage(ui, _("@prog@ rebase --continue"), _("@prog@ rebase --abort"))
+    helpmessage(
+        ui,
+        _("@prog@ rebase --continue"),
+        _("@prog@ rebase --abort"),
+        _("@prog@ rebase --quit"),
+    )
     dstnode, srcnode = repo.dirstate.parents()
     if srcnode != nodeutil.nullid:
         src = repo[srcnode]
         dst = repo[dstnode]
-        msg = _("\nRebasing from %s (%s)\n           to %s (%s)") % (
-            src,
-            src.shortdescription(),
-            dst,
-            dst.shortdescription(),
+
+        # fmt: off
+        msg = _(
+            "\n"
+            "Rebasing %s (%s)\n"
+            "      to %s (%s)"
+        ) % (
+            src, src.shortdescription(),
+            dst, dst.shortdescription(),
         )
+        # fmt: on
         ui.write_err(prefixlines(msg))
 
 
@@ -109,8 +122,7 @@ def updatecleanmsg(dest=None):
 
 
 def graftmsg(repo, ui):
-    # tweakdefaults requires `update` to have a rev hence the `.`
-    helpmessage(ui, _("@prog@ graft --continue"), updatecleanmsg())
+    helpmessage(ui, _("@prog@ graft --continue"), _("@prog@ graft --abort"))
 
 
 def updatemsg(repo, ui):
@@ -130,6 +142,10 @@ def updatemergemsg(repo, ui):
 def mergemsg(repo, ui):
     # tweakdefaults requires `update` to have a rev hence the `.`
     helpmessage(ui, _("@prog@ commit"), updatecleanmsg())
+
+
+def mergestate2msg(repo, ui):
+    helpmessage(ui, _("@prog@ continue, then @prog@ commit"), updatecleanmsg())
 
 
 def bisectmsg(repo, ui):
@@ -208,7 +224,7 @@ STATES = (
     # Sometimes you end up in a merge state when update completes, because you
     # ran `hg update --merge`. We should inform you that you can still use the
     # full suite of resolve tools to deal with conflicts in this state.
-    ("merge", fileexistspredicate("merge/state2"), None),
+    ("merge", fileexistspredicate("merge/state2"), mergestate2msg),
     # If there were no conflicts, you may still be in an interrupted update
     # state. Ideally, we should expand this update state to include the merge
     # updates mentioned above, so there's a way to "continue" and finish the
@@ -220,21 +236,23 @@ STATES = (
 def extsetup(ui):
     if ui.configbool("morestatus", "show") and not ui.plain():
         wrapcommand(commands.table, "status", statuscmd)
+
+        localrepo.localrepository._wlockfreeprefix.add(UPDATEARGS)
+
         # Write down `hg update` args to show the continue command in
         # interrupted update state.
         ui.setconfig("hooks", "pre-update.morestatus", saveupdateargs)
         ui.setconfig("hooks", "post-update.morestatus", cleanupdateargs)
 
 
-def saveupdateargs(repo, args, **kwargs):
+def saveupdateargs(repo, args: str, **kwargs) -> None:
     # args is a string containing all flags and arguments
-    with repo.wlock():
-        repo.localvfs.writeutf8(UPDATEARGS, args)
+    with repo.localvfs(UPDATEARGS, "wb", atomictemp=True) as fp:
+        fp.write(args.encode("utf-8"))
 
 
-def cleanupdateargs(repo, **kwargs):
-    with repo.wlock():
-        repo.localvfs.tryunlink(UPDATEARGS)
+def cleanupdateargs(repo, **kwargs) -> None:
+    repo.localvfs.tryunlink(UPDATEARGS)
 
 
 def statuscmd(orig, ui, repo, *pats, **opts):

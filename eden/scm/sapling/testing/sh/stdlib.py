@@ -10,12 +10,13 @@ For .t test specific commands such as "hg", look at t/runtime.py
 instead.
 """
 
+import re
 import sys
 import tarfile
 from functools import wraps
-from io import BytesIO
 from typing import BinaryIO, Callable, Dict, Iterator, List, Optional, Tuple
 
+from .bufio import BufIO
 from .types import Env, InterpResult, Scope, ShellExit, ShellFS, ShellReturn
 
 cmdtable = {}
@@ -56,8 +57,8 @@ def wrap(commandfunc) -> Callable[[Env], InterpResult]:
             kwargs["arg0"] = env.args[0]
         if "fs" in coargs:
             kwargs["fs"] = env.fs
-        # tempoarily allocated BytesIO on demand
-        allocated: Dict[str, BytesIO] = {}
+        # tempoarily allocated BufIO on demand
+        allocated: Dict[str, BufIO] = {}
         for name in ["stdin", "stdout", "stderr"]:
             if name in coargs:
                 f = getattr(env, name, None)
@@ -67,7 +68,7 @@ def wrap(commandfunc) -> Callable[[Env], InterpResult]:
                         # be allocated
                         f = allocated["stdout"]
                     else:
-                        f = BytesIO()
+                        f = BufIO()
                         allocated[name] = f
                 kwargs[name] = f
         ret = commandfunc(**kwargs)
@@ -98,6 +99,15 @@ def wrap(commandfunc) -> Callable[[Env], InterpResult]:
     return wrapper
 
 
+def _unescapechars(s: str) -> str:
+    return (
+        s.replace(r"\n", "\n")
+        .replace(r"\0", "\0")
+        .replace(r"\r", "\r")
+        .replace(r"\t", "\t")
+    )
+
+
 @command
 def echo(args: List[str]) -> str:
     eol = "\n"
@@ -108,19 +118,39 @@ def echo(args: List[str]) -> str:
                 eol = ""
             else:
                 raise NotImplementedError(f"echo {flags}")
-    return " ".join(args) + eol
+    return " ".join([_unescapechars(arg) for arg in args]) + eol
+
+
+@command
+def basename(args: List[str]) -> str:
+    return "".join(arg.rsplit("/", 1)[-1] + "\n" for arg in args)
+
+
+@command
+def dirname(args: List[str]) -> str:
+    return "".join(arg.rsplit("/", 1)[0] + "\n" for arg in args)
 
 
 @command
 def printf(args: List[str]):
-    fmt = (
-        args[0]
-        .replace(r"\n", "\n")
-        .replace(r"\0", "\0")
-        .replace(r"\r", "\r")
-        .replace(r"\t", "\t")
-    )
-    needed = fmt.count("%") - fmt.count("%%") * 2
+    fmt = list(_unescapechars(args[0]))
+    unescapeposs = []
+
+    # special treatment for %b
+    needed = 0
+    i = 0
+    fmtlen = len(fmt)
+    while i + 1 < fmtlen:
+        if fmt[i] == "%":
+            if fmt[i + 1] != "%":
+                if fmt[i + 1] == "b":
+                    unescapeposs.append(needed)
+                    fmt[i + 1] = "s"
+                needed += 1
+            i += 1
+        i += 1
+    fmt = "".join(fmt)
+
     i = 1
     out = []
     if not needed:
@@ -131,6 +161,8 @@ def printf(args: List[str]):
             if len(fmtargs) < needed:
                 fmtargs += ["" * (needed - len(args))]
             i += needed
+            for u in unescapeposs:
+                fmtargs[u] = _unescapechars(fmtargs[u])
             out.append(fmt % tuple(fmtargs))
     return "".join(out)
 
@@ -179,7 +211,7 @@ def local(args: List[str], env: Env):
 def wait(args: List[str], stdout: BinaryIO, env: Env):
     if args:
         raise NotImplementedError(f"wait {args=}")
-    for (thread, jobout) in env.jobs:
+    for thread, jobout in env.jobs:
         thread.join()
         stdout.write(jobout.getvalue())
     env.jobs.clear()
@@ -210,6 +242,19 @@ def cat(
     lines = list(_lines(fs, args, stdin, reporterror=reporterror))
     stdout.write(b"".join(lines))
     return exitcode
+
+
+@command
+def cmp(args: List[str], env: Env, fs: ShellFS) -> int:
+    expected = None
+    for path in args:
+        with fs.open(path, "rb") as f:
+            current = f.read()
+        if expected is None:
+            expected = current
+        elif expected != current:
+            return 1
+    return 0
 
 
 @command
@@ -273,44 +318,58 @@ def test(args: List[str], arg0: str, env: Env):
     if (arg0, args[-1]) in (("[", "]"), ("[[", "]]")):
         args = args[:-1]
     istrue: Optional[bool] = None
-    if len(args) == 3:
-        op = args[1]
-        if op in {"-gt", "-lt", "-ge", "-le", "-eq", "-ne"}:
-            lhs = int(args[0] or "0")
-            rhs = int(args[2] or "0")
-            istrue = getattr(lhs, f"__{op[1:]}__")(rhs)
-        if op in {"=", "==", "!="}:
-            lhs = args[0]
-            rhs = args[2]
-            istrue = lhs == rhs
-            if op == "!=":
-                istrue = not istrue
-    elif len(args) == 2:
-        op, arg = args
-        fs = env.fs
-        if op == "-n":
-            istrue = bool(arg)
-        elif op == "-z":
-            istrue = not bool(arg)
-        elif op == "-f":
-            istrue = fs.isfile(arg)
-        elif op == "-d":
-            istrue = fs.isdir(arg)
-        elif op == "-e":
-            try:
-                fs.stat(arg)
-                istrue = True
-            except FileNotFoundError:
-                istrue = False
-        elif op == "-x":
-            import stat
 
-            # pyre-fixme[9]: istrue has type `Optional[bool]`; used as `int`.
-            istrue = fs.stat(arg).st_mode & stat.S_IEXEC
-    if istrue is None:
-        raise NotImplementedError(f"test {args} is not implemented")
+    ors = [[]]
+    for v in args:
+        if v == "-o":
+            ors.append([])
+        else:
+            ors[-1].append(v)
+
+    for args in ors:
+        if len(args) == 3:
+            op = args[1]
+            if op in {"-gt", "-lt", "-ge", "-le", "-eq", "-ne"}:
+                lhs = int(args[0] or "0")
+                rhs = int(args[2] or "0")
+                istrue = getattr(lhs, f"__{op[1:]}__")(rhs)
+            if op in {"=", "==", "!="}:
+                lhs = args[0]
+                rhs = args[2]
+                istrue = lhs == rhs
+                if op == "!=":
+                    istrue = not istrue
+        elif len(args) == 2:
+            op, arg = args
+            fs = env.fs
+            if op == "-n":
+                istrue = bool(arg)
+            elif op == "-z":
+                istrue = not bool(arg)
+            elif op == "-f":
+                istrue = fs.isfile(arg)
+            elif op == "-d":
+                istrue = fs.isdir(arg)
+            elif op == "-e":
+                try:
+                    fs.stat(arg)
+                    istrue = True
+                except FileNotFoundError:
+                    istrue = False
+            elif op == "-x":
+                import stat
+
+                # pyre-fixme[9]: istrue has type `Optional[bool]`; used as `int`.
+                istrue = fs.stat(arg).st_mode & stat.S_IEXEC
+
+        if istrue:
+            break
+        if istrue is None:
+            raise NotImplementedError(f"test {args} is not implemented")
+
     if neg:
         istrue = not istrue
+
     return int(not istrue)
 
 
@@ -676,14 +735,14 @@ def ls(args: List[str], stdout: BinaryIO, stderr: BinaryIO, fs: ShellFS):
             raise NotImplementedError(f"ls with flag {arg}")
         elif fs.isdir(arg):
             entries += listdir(arg, listall=listall)
-        elif fs.exists(arg):
+        elif fs.lexists(arg):
             entries.append(arg)
         else:
             stderr.write(f"ls: {arg}: No such file or directory\n".encode())
             return 1
 
-    if not args:
-        entries = listdir("")
+    if not args or (listall and not entries):
+        entries = listdir("", listall=listall)
     entries = sorted(entries)
     lines = [f"{path}\n" for path in entries]
     stdout.write("".join(lines).encode())
@@ -752,13 +811,20 @@ def mkdir(args: List[str], fs: ShellFS):
 
 
 @command
-def chdir(args: List[str], env: Env, fs: ShellFS):
+def chdir(args: List[str], env: Env, stderr: BinaryIO, fs: ShellFS):
     if args:
         path = args[-1]
     else:
         path = env.getenv("HOME")
-    if path:
+    if not path:
+        stderr.write(f"cd: HOME not set\n".encode())
+        return 1
+    if fs.isdir(path):
         fs.chdir(path)
+        return 0
+    else:
+        stderr.write(f"cd: {path}: No such file or directory\n".encode())
+        return 1
 
 
 @command
@@ -913,6 +979,22 @@ def sleep(args: List[str]):
     import time
 
     time.sleep(duration)
+
+
+@command
+def pp(stdin: BinaryIO):
+    """pretty print a string"""
+    import json
+
+    data = stdin.read()
+    # we can extend it to support other formats
+    try:
+        obj = json.loads(data)
+    except Exception as e:
+        raise RuntimeError(f"invalid JSON: {e}")
+
+    s = json.dumps(obj, indent=2)
+    return f"{s}\n"
 
 
 def _lookup_python(name):

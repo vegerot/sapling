@@ -31,6 +31,8 @@ use crate::errors::bug;
 use crate::id::Group;
 use crate::id::Id;
 use crate::ops::Persist;
+use crate::ops::StorageVersion;
+use crate::ops::TryClone;
 use crate::segment::describe_segment_bytes;
 use crate::segment::hex;
 use crate::segment::Segment;
@@ -45,6 +47,9 @@ pub struct IndexedLogStore {
     log: log::Log,
     path: PathBuf,
     cached_max_level: AtomicU8,
+    /// Segments in Group::VIRTUAL that should not be written to disk.
+    /// Expected to be a few entries (like wdir() and null) so not stored in a sorted container.
+    virtual_segments: Vec<Segment>,
 }
 
 /// Fold (accumulator) that tracks IdSet covered in groups.
@@ -170,6 +175,12 @@ impl CoveredIdSetInner {
     }
 }
 
+impl StorageVersion for IndexedLogStore {
+    fn storage_version(&self) -> (u64, u64) {
+        self.log.version()
+    }
+}
+
 // Required functionality
 impl IdDagStore for IndexedLogStore {
     fn max_level(&self) -> Result<Level> {
@@ -191,6 +202,17 @@ impl IdDagStore for IndexedLogStore {
     }
 
     fn find_segment_by_head_and_level(&self, head: Id, level: u8) -> Result<Option<Segment>> {
+        if head.is_virtual() {
+            if level == 0 {
+                for seg in &self.virtual_segments {
+                    if seg.head()? == head {
+                        return Ok(Some(seg.clone()));
+                    }
+                }
+            }
+            return Ok(None);
+        }
+
         let key = Self::serialize_head_level_lookup_key(head, level);
         match self.log.lookup(Self::INDEX_LEVEL_HEAD, key)?.nth(0) {
             None => Ok(None),
@@ -199,6 +221,15 @@ impl IdDagStore for IndexedLogStore {
     }
 
     fn find_flat_segment_including_id(&self, id: Id) -> Result<Option<Segment>> {
+        if id.is_virtual() {
+            for seg in &self.virtual_segments {
+                if seg.high()? >= id && seg.low()? <= id {
+                    return Ok(Some(seg.clone()));
+                }
+            }
+            return Ok(None);
+        }
+
         let level = 0;
         let low = Self::serialize_head_level_lookup_key(id, level);
         let high = [level + 1];
@@ -207,6 +238,7 @@ impl IdDagStore for IndexedLogStore {
             .lookup_range(Self::INDEX_LEVEL_HEAD, &low[..]..&high[..])?;
         for entry in iter {
             let (_, entries) = entry?;
+            #[allow(clippy::never_loop)]
             for entry in entries {
                 let entry = entry?;
                 let seg = self.segment_from_slice(entry);
@@ -222,6 +254,11 @@ impl IdDagStore for IndexedLogStore {
     }
 
     fn insert_segment(&mut self, segment: Segment) -> Result<()> {
+        if segment.high()?.is_virtual() {
+            self.virtual_segments.push(segment);
+            return Ok(());
+        }
+
         let level = segment.level()?;
         self.cached_max_level.fetch_max(level, AcqRel);
         // When inserting a new flat segment, consider merging it with the last
@@ -247,6 +284,23 @@ impl IdDagStore for IndexedLogStore {
     }
 
     fn remove_flat_segment_unchecked(&mut self, segment: &Segment) -> Result<()> {
+        let span = segment.span()?;
+        if span.high.is_virtual() {
+            self.virtual_segments.retain(|s| {
+                if let Ok(s_span) = s.span() {
+                    if span.overlaps_with(&s_span) {
+                        assert_eq!(
+                            span, s_span,
+                            "bug: remove_flat_segment span must exact match"
+                        );
+                        return false /* remove it */;
+                    }
+                }
+                true /* keep it */
+            });
+            return Ok(());
+        }
+
         let max_level = self.max_level()?;
         let mut data =
             Vec::with_capacity(segment.0.len() + Self::MAGIC_REMOVE_SEGMENT.len() + LEVEL_BYTES);
@@ -271,15 +325,30 @@ impl IdDagStore for IndexedLogStore {
         inner.apply_removals();
         let id_sets = &inner.id_set_by_group;
         for group in groups {
-            result = result.union(&id_sets[group.0]);
+            if *group == Group::VIRTUAL {
+                for seg in &self.virtual_segments {
+                    let span = seg.span()?;
+                    result = result.union(&span.into());
+                }
+            } else {
+                result = result.union(&id_sets[group.0]);
+            }
         }
         Ok(result)
     }
 
     fn next_segments(&self, id: Id, level: Level) -> Result<Vec<Segment>> {
+        let mut result = Vec::new();
+        if id.is_virtual() {
+            if level == 0 {
+                let max_high_id = id.group().max_id();
+                result = self.filter_sort_virtual_segments(Span::new(id, max_high_id), true);
+            }
+            return Ok(result);
+        }
+
         let lower_bound = Self::serialize_head_level_lookup_key(id, level);
         let upper_bound = Self::serialize_head_level_lookup_key(id.group().max_id(), level);
-        let mut result = Vec::new();
         for entry in self
             .log
             .lookup_range(Self::INDEX_LEVEL_HEAD, &lower_bound[..]..=&upper_bound)?
@@ -297,6 +366,13 @@ impl IdDagStore for IndexedLogStore {
         max_high_id: Id,
         level: Level,
     ) -> Result<Box<dyn Iterator<Item = Result<Segment>> + 'a>> {
+        if max_high_id.is_virtual() {
+            let min_high_id = max_high_id.group().min_id();
+            let result =
+                self.filter_sort_virtual_segments(Span::new(min_high_id, max_high_id), false);
+            return Ok(Box::new(result.into_iter().map(Ok)));
+        }
+
         let lower_bound = Self::serialize_head_level_lookup_key(Id::MIN, level);
         let upper_bound = Self::serialize_head_level_lookup_key(max_high_id, level);
         let iter = self
@@ -321,6 +397,12 @@ impl IdDagStore for IndexedLogStore {
         min_high_id: Id,
         level: Level,
     ) -> Result<Box<dyn Iterator<Item = Result<Segment>> + 'a + Send + Sync>> {
+        if min_high_id.is_virtual() {
+            let max_high_id = min_high_id.group().max_id();
+            let result =
+                self.filter_sort_virtual_segments(Span::new(min_high_id, max_high_id), true);
+            return Ok(Box::new(result.into_iter().map(Ok)));
+        }
         let lower_bound = Self::serialize_head_level_lookup_key(min_high_id, level);
         let upper_bound = Self::serialize_head_level_lookup_key(Id::MAX, level);
         let iter = self
@@ -363,6 +445,14 @@ impl IdDagStore for IndexedLogStore {
                 }
             }
         }
+        for seg in &self.virtual_segments {
+            let parents = seg.parents()?;
+            for parent_id in parents {
+                if parent_span.contains(parent_id) {
+                    result.push((parent_id, seg.clone()));
+                }
+            }
+        }
         Ok(Box::new(result.into_iter().map(Ok)))
     }
 
@@ -394,14 +484,14 @@ impl Persist for IndexedLogStore {
         // Take a filesystem lock. The file name 'lock' is taken by indexedlog
         // running on Windows, so we choose another file name here.
         let lock_file = {
-            let mut path = self.path.clone();
-            path.push("wlock");
-            File::open(&path).or_else(|_| {
-                fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-            })?
+            let path = self.path.join("wlock");
+            // Some NFS implementation reports `EBADF` for `flock()` unless the file is opened
+            // with `O_RDWR`.
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&path)?
         };
         lock_file.lock_exclusive()?;
         Ok(lock_file)
@@ -462,6 +552,25 @@ impl IndexedLogStore {
             bytes
         };
         Segment(self.log.slice_to_bytes(bytes))
+    }
+
+    /// Filter and sort the virtual segments.
+    fn filter_sort_virtual_segments(&self, head_span: Span, ascending: bool) -> Vec<Segment> {
+        let mut result = Vec::new();
+        for seg in &self.virtual_segments {
+            if let Ok(head) = seg.head() {
+                if head_span.contains(head) {
+                    result.push(seg.clone());
+                }
+            }
+        }
+        // FIXME: check correctness
+        if ascending {
+            result.sort_unstable_by(|seg1, seg2| seg1.head().ok().cmp(&seg2.head().ok()));
+        } else {
+            result.sort_unstable_by(|seg1, seg2| seg2.head().ok().cmp(&seg1.head().ok()));
+        }
+        result
     }
 }
 
@@ -646,6 +755,12 @@ impl IndexedLogStore {
 
                 let seg = Segment(Bytes::copy_from_slice(data));
                 let mut result = Vec::new();
+                if let Ok(high) = seg.high() {
+                    assert!(
+                        !high.is_virtual(),
+                        "bug: VIRTUAL group should never be written to disk"
+                    );
+                }
                 if seg.level().ok() == Some(0) {
                     // This should never pass since MAGIC_CLEAR_NON_MASTER[0] != 0.
                     // ([0] stores level: u8).
@@ -679,6 +794,7 @@ impl IndexedLogStore {
             log,
             path,
             cached_max_level: AtomicU8::new(MAX_LEVEL_UNKNOWN),
+            virtual_segments: Default::default(),
         };
         Ok(iddag)
     }
@@ -692,26 +808,20 @@ impl IndexedLogStore {
             log,
             path,
             cached_max_level: AtomicU8::new(MAX_LEVEL_UNKNOWN),
+            virtual_segments: Default::default(),
         };
         Ok(iddag)
     }
+}
 
-    pub fn try_clone(&self) -> Result<IndexedLogStore> {
+impl TryClone for IndexedLogStore {
+    fn try_clone(&self) -> Result<IndexedLogStore> {
         let log = self.log.try_clone()?;
         let store = IndexedLogStore {
             log,
             path: self.path.clone(),
             cached_max_level: AtomicU8::new(self.cached_max_level.load(Acquire)),
-        };
-        Ok(store)
-    }
-
-    pub fn try_clone_without_dirty(&self) -> Result<IndexedLogStore> {
-        let log = self.log.try_clone_without_dirty()?;
-        let store = IndexedLogStore {
-            log,
-            path: self.path.clone(),
-            cached_max_level: AtomicU8::new(MAX_LEVEL_UNKNOWN),
+            virtual_segments: self.virtual_segments.clone(),
         };
         Ok(store)
     }
@@ -732,6 +842,10 @@ fn index_parent_key(parent_id: Id, child_id: Id) -> [u8; 17] {
 mod tests {
     use super::*;
     use crate::iddagstore::tests::dump_store_state;
+    use crate::tests::dbg;
+    use crate::tests::dbg_iter;
+    use crate::tests::nid;
+    use crate::tests::vid;
 
     #[test]
     fn test_merge_persisted_segments() -> Result<()> {
@@ -898,10 +1012,138 @@ mod tests {
         }
 
         let all = iddag.all_ids_in_groups(&Group::ALL).unwrap();
-        assert_eq!(format!("{:?}", &all), "0..=20 N5..=N15");
+        assert_eq!(dbg(&all), "0..=20 N5..=N15");
 
         let state = dump_store_state(&iddag, &all);
         assert_eq!(state, "\nLv0: RH0-20[], N5-N15[10]\nP->C: 10->N5");
+    }
+
+    #[test]
+    fn test_virtual_segment_query() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut iddag = IndexedLogStore::open(tmp.path())?;
+        let seg1 = Segment::new(SegmentFlags::HAS_ROOT, 0, vid(0), vid(5), &[]);
+        let seg2 = Segment::new(SegmentFlags::empty(), 0, vid(6), vid(10), &[Id(1), nid(2)]);
+        let seg3 = Segment::new(
+            SegmentFlags::empty(),
+            0,
+            vid(11),
+            vid(15),
+            &[vid(4), nid(2), nid(3)],
+        );
+        iddag.insert_segment(seg1.clone())?;
+        iddag.insert_segment(seg3.clone())?;
+        iddag.insert_segment(seg2.clone())?;
+
+        // find_segment_by_head_and_level
+        assert_eq!(
+            iddag.find_segment_by_head_and_level(vid(5), 0)?.as_ref(),
+            Some(&seg1),
+        );
+        assert_eq!(
+            iddag.find_segment_by_head_and_level(vid(15), 0)?.as_ref(),
+            Some(&seg3),
+        );
+        assert_eq!(
+            iddag.find_segment_by_head_and_level(vid(9), 0)?.as_ref(),
+            None,
+        );
+        assert_eq!(
+            iddag.find_segment_by_head_and_level(vid(5), 1)?.as_ref(),
+            None,
+        );
+
+        // find_flat_segment_including_id
+        assert_eq!(
+            iddag.find_flat_segment_including_id(vid(8))?.as_ref(),
+            Some(&seg2),
+        );
+        assert_eq!(
+            iddag.find_flat_segment_including_id(vid(20))?.as_ref(),
+            None,
+        );
+
+        // next_segments
+        assert_eq!(
+            iddag.next_segments(vid(7), 0)?,
+            [seg2.clone(), seg3.clone()],
+        );
+
+        // iter_segments_ascending
+        assert_eq!(
+            iddag
+                .iter_segments_ascending(vid(10), 0)?
+                .collect::<Result<Vec<_>>>()?,
+            [seg2.clone(), seg3.clone()],
+        );
+
+        // iter_segments_descending
+        assert_eq!(
+            iddag
+                .iter_segments_descending(vid(10), 0)?
+                .collect::<Result<Vec<_>>>()?,
+            [seg2.clone(), seg1.clone()],
+        );
+
+        // iter_flat_segments_with_parent
+        assert_eq!(
+            iddag
+                .iter_flat_segments_with_parent(nid(2))?
+                .collect::<Result<Vec<_>>>()?,
+            [seg3.clone(), seg2.clone()],
+        );
+        assert_eq!(
+            iddag
+                .iter_flat_segments_with_parent(vid(4))?
+                .collect::<Result<Vec<_>>>()?,
+            [seg3.clone()],
+        );
+
+        // iter_flat_segments_with_parent_span
+        assert_eq!(
+            iddag
+                .iter_flat_segments_with_parent_span(Span::new(nid(0), nid(10)))?
+                .collect::<Result<Vec<_>>>()?,
+            [
+                (nid(2), seg3.clone()),
+                (nid(3), seg3.clone()),
+                (nid(2), seg2.clone()),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_virtual_segment_rewrite() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut iddag = IndexedLogStore::open(tmp.path())?;
+        let seg1 = Segment::new(SegmentFlags::HAS_ROOT, 0, vid(0), vid(5), &[]);
+        let seg2 = Segment::new(SegmentFlags::HAS_ROOT, 0, vid(2), vid(10), &[nid(0)]);
+        iddag.insert_segment(seg1.clone())?;
+        assert_eq!(
+            iddag.find_flat_segment_including_id(vid(0))?.as_ref(),
+            Some(&seg1)
+        );
+        assert_eq!(
+            iddag.find_flat_segment_including_id(vid(3))?.as_ref(),
+            Some(&seg1)
+        );
+
+        // Remove seg1 and insert seg2.
+        iddag.remove_flat_segment(&seg1)?;
+        iddag.insert_segment(seg2.clone())?;
+        assert_eq!(iddag.find_flat_segment_including_id(vid(0))?.as_ref(), None);
+        assert_eq!(
+            iddag.find_flat_segment_including_id(vid(3))?.as_ref(),
+            Some(&seg2)
+        );
+
+        // Persist API works.
+        let lock = iddag.lock()?;
+        iddag.persist(&lock)?;
+
+        Ok(())
     }
 
     /// Turn a string generated by "describe_indexedlog_entry" back to bytes.
@@ -921,10 +1163,6 @@ mod tests {
         data
     }
 
-    fn nid(id: u64) -> Id {
-        Group::NON_MASTER.min_id() + id
-    }
-
     #[test]
     fn test_describe() -> Result<()> {
         let tmp = tempfile::tempdir()?;
@@ -938,7 +1176,7 @@ mod tests {
             describe_indexedlog_entry(bytes),
             r#"# f0: MAGIC_REWRITE_LAST_FLAT
 # 00 00 00 00 00 00 00 00 05: Previous index Level = 0, Head = 5
-# 01: Flags = HAS_ROOT
+# 01: Flags = SegmentFlags(HAS_ROOT)
 # 00: Level = 0
 # 00 00 00 00 00 00 00 0a: High = 10
 # 0a: Delta = 10 (Low = 0)
@@ -952,7 +1190,7 @@ mod tests {
             describe_indexedlog_entry(bytes),
             r#"# f1: MAGIC_REMOVE_SEGMENT
 # 00: Max Level = 0
-# 01: Flags = HAS_ROOT
+# 01: Flags = SegmentFlags(HAS_ROOT)
 # 00: Level = 0
 # 00 00 00 00 00 00 00 0a: High = 10
 # 0a: Delta = 10 (Low = 0)
@@ -961,14 +1199,5 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    fn dbg_iter<'a, T: std::fmt::Debug>(iter: Box<dyn Iterator<Item = Result<T>> + 'a>) -> String {
-        let v = iter.map(|s| s.unwrap()).collect::<Vec<_>>();
-        dbg(v)
-    }
-
-    fn dbg<T: std::fmt::Debug>(t: T) -> String {
-        format!("{:?}", t)
     }
 }

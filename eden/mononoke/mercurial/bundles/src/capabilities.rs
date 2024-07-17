@@ -12,11 +12,11 @@ use std::collections::HashMap;
 
 use anyhow::Error;
 use anyhow::Result;
-use bytes_old::Bytes;
-use bytes_old::BytesMut;
+use bytes::Bytes;
+use bytes::BytesMut;
 use mercurial_types::utils::percent_encode;
 use percent_encoding::percent_decode;
-use tokio_io::codec::Decoder;
+use tokio_util::codec::Decoder;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Capabilities {
@@ -51,7 +51,7 @@ impl Decoder for CapabilitiesUnpacker {
 
     fn decode_eof(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>> {
         let mut caps = HashMap::new();
-        for kv in buf.split(|b| b == &b'\n') {
+        for kv in buf.as_ref().split(|b| b == &b'\n') {
             let mut kv = kv.splitn(2, |b| b == &b'=');
             let key = percent_decode(kv.next().expect("must have at least 1 element"))
                 .decode_utf8()?
@@ -85,7 +85,7 @@ pub fn encode_capabilities(caps: Capabilities) -> Bytes {
         let values = itertools::join(values.into_iter().map(|v| percent_encode(&v)), ",");
         res.push(format!("{}={}", key, values));
     }
-    Bytes::from(itertools::join(res, "\n").as_str())
+    Bytes::from(itertools::join(res, "\n"))
 }
 
 #[cfg(test)]
@@ -107,7 +107,7 @@ mod test {
         let mut unpacker = CapabilitiesUnpacker;
 
         let decoded = unpacker
-            .decode_eof(&mut BytesMut::from(encoded))
+            .decode_eof(&mut BytesMut::from(&encoded[..]))
             .unwrap()
             .unwrap();
         assert_eq!(decoded.caps, caps);

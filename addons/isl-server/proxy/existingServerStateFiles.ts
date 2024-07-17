@@ -6,10 +6,10 @@
  */
 
 import rmtree from './rmtree';
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
-import {unwrap} from 'shared/utils';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {nullthrows} from 'shared/utils';
 
 export type ExistingServerInfo = {
   sensitiveToken: string;
@@ -28,7 +28,7 @@ export type ExistingServerInfo = {
 
 const cacheDir =
   process.platform == 'win32'
-    ? path.join(unwrap(process.env.LOCALAPPDATA), 'cache')
+    ? path.join(nullthrows(process.env.LOCALAPPDATA), 'cache')
     : process.platform == 'darwin'
     ? path.join(os.homedir(), 'Library/Caches')
     : process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');

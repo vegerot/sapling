@@ -14,11 +14,14 @@ use anyhow::bail;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
-use bytes_old::BytesMut;
+use byteorder::BigEndian;
+use byteorder::ByteOrder;
+use bytes::Buf;
+use bytes::BytesMut;
 use mercurial_types::RepoPath;
 use slog::trace;
 use slog::Logger;
-use tokio_codec::Decoder;
+use tokio_util::codec::Decoder;
 
 use super::DataEntry;
 use super::DataEntryVersion;
@@ -191,7 +194,7 @@ impl UnpackerInner {
             return Ok(DecodeRes::End);
         }
 
-        let filename_len = buf.peek_u16() as usize;
+        let filename_len = BigEndian::read_u16(&buf[..2]) as usize;
         if buf.len() < filename_len + 2 {
             return Ok(DecodeRes::None);
         }
@@ -204,7 +207,7 @@ impl UnpackerInner {
                 )),
             }
         } else {
-            let mpath = buf.drain_path(filename_len).with_context(|| {
+            let mpath = buf.get_path(filename_len).with_context(|| {
                 let msg = format!("invalid filename of length {}", filename_len);
                 ErrorKind::WirePackDecode(msg)
             })?;
@@ -225,7 +228,7 @@ impl UnpackerInner {
         if buf.len() < 4 {
             None
         } else {
-            Some(buf.drain_u32())
+            Some(buf.get_u32())
         }
     }
 
@@ -267,12 +270,10 @@ enum DecodeRes<T> {
 mod test {
     use std::io::Cursor;
 
-    use futures::compat::Future01CompatExt;
-    use futures_old::Future;
-    use futures_old::Stream;
+    use futures::TryStreamExt;
     use slog::o;
     use slog::Discard;
-    use tokio_codec::FramedRead;
+    use tokio_util::codec::FramedRead;
 
     use super::*;
 
@@ -284,41 +285,34 @@ mod test {
         let empty_1 = Cursor::new(WIREPACK_END);
         let unpacker = new(logger.clone(), Kind::Tree);
         let stream = FramedRead::new(empty_1, unpacker);
-        let collect_fut = stream.collect();
+        let parts: Vec<_> = stream.try_collect().await.unwrap();
 
-        let fut = collect_fut
-            .and_then(move |parts| {
-                assert_eq!(parts, vec![Part::End]);
+        assert_eq!(parts, vec![Part::End]);
 
-                // A file with no entries:
-                // - filename b"\0\x03foo"
-                // - history count: b"\0\0\0\0"
-                // - data count: b"\0\0\0\0"
-                // - next filename, end of stream: b"\0\0\0\0\0\0\0\0\0\0"
-                let empty_2 = Cursor::new(b"\0\x03foo\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
-                let unpacker = new(logger.clone(), Kind::File);
-                let stream = FramedRead::new(empty_2, unpacker);
-                stream.collect()
-            })
-            .map(|parts| {
-                let foo_dir = RepoPath::file("foo").unwrap();
-                assert_eq!(
-                    parts,
-                    vec![
-                        Part::HistoryMeta {
-                            path: foo_dir.clone(),
-                            entry_count: 0,
-                        },
-                        Part::DataMeta {
-                            path: foo_dir,
-                            entry_count: 0,
-                        },
-                        Part::End,
-                    ]
-                );
-            })
-            .map_err(|err| panic!("{:#?}", err));
+        // A file with no entries:
+        // - filename b"\0\x03foo"
+        // - history count: b"\0\0\0\0"
+        // - data count: b"\0\0\0\0"
+        // - next filename, end of stream: b"\0\0\0\0\0\0\0\0\0\0"
+        let empty_2 = Cursor::new(b"\0\x03foo\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
+        let unpacker = new(logger.clone(), Kind::File);
+        let stream = FramedRead::new(empty_2, unpacker);
+        let parts: Vec<_> = stream.try_collect().await.unwrap();
 
-        fut.compat().await.unwrap();
+        let foo_dir = RepoPath::file("foo").unwrap();
+        assert_eq!(
+            parts,
+            vec![
+                Part::HistoryMeta {
+                    path: foo_dir.clone(),
+                    entry_count: 0,
+                },
+                Part::DataMeta {
+                    path: foo_dir,
+                    entry_count: 0,
+                },
+                Part::End,
+            ]
+        );
     }
 }

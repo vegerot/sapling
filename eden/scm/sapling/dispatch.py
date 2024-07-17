@@ -25,6 +25,7 @@ import time
 import bindings
 
 from . import (
+    alerts,
     blackbox,
     cmdutil,
     color,
@@ -43,6 +44,7 @@ from . import (
     pycompat,
     registrar,
     scmutil,
+    tracing,
     ui as uimod,
     util,
 )
@@ -50,6 +52,7 @@ from .i18n import _, _x
 
 
 cliparser = bindings.cliparser
+rscontext = bindings.context.context
 
 
 unrecoverablewrite = registrar.command.unrecoverablewrite
@@ -65,10 +68,12 @@ class request:
         fout=None,
         ferr=None,
         prereposetups=None,
+        skipprehooks=False,
     ):
         self.args = args
         self.ui = ui
         self.repo = repo
+        self.skipprehooks = skipprehooks
 
         # The repo, if any, that ends up being used for command execution.
         self.cmdrepo = None
@@ -136,15 +141,11 @@ class request:
                 raise exc
 
 
-def run(args=None, fin=None, fout=None, ferr=None, config=None):
+def run(args, fin, fout, ferr, rctx: rscontext, skipprehooks: bool):
     "run the command in sys.argv"
     _initstdio()
-    if args is None:
-        args = pycompat.sysargv
 
-    ui = None
-    if config:
-        ui = uimod.ui(rcfg=config)
+    ui = uimod.ui(rctx=rctx)
 
     if not ui or ui.configbool("experimental", "mercurial-shim", True):
         from . import mercurialshim
@@ -154,7 +155,9 @@ def run(args=None, fin=None, fout=None, ferr=None, config=None):
         # (even though the shim module appears in sys.modules).
         sys.meta_path.insert(0, mercurialshim.MercurialImporter())
 
-    req = request(args[1:], fin=fin, fout=fout, ferr=ferr, ui=ui)
+    req = request(
+        args[1:], fin=fin, fout=fout, ferr=ferr, ui=ui, skipprehooks=skipprehooks
+    )
     err = None
     try:
         status = (dispatch(req) or 0) & 255
@@ -177,152 +180,39 @@ def run(args=None, fin=None, fout=None, ferr=None, config=None):
 
 def _preimportmodules():
     """pre-import modules that are side-effect free (used by chg server)"""
-    coremods = [
-        "ancestor",
-        "archival",
-        "bookmarks",
-        "branchmap",
-        "bundle2",
-        "bundlerepo",
-        "byterange",
-        "changegroup",
-        "changelog",
-        "color",
-        "config",
-        "configitems",
-        "connectionpool",
-        "context",
-        "copies",
-        "crecord",
-        "dagop",
-        "dagparser",
-        "destutil",
-        "dirstate",
-        "dirstateguard",
-        "discovery",
-        "exchange",
-        "filelog",
-        "filemerge",
-        "fileset",
-        "formatter",
-        "graphmod",
-        "hbisect",
-        "httpclient",
-        "httpconnection",
-        "localrepo",
-        "lock",
-        "mail",
-        "manifest",
-        "match",
-        "mdiff",
-        "merge",
-        "mergeutil",
-        "minirst",
-        "mononokepeer",
-        "namespaces",
-        "node",
-        "obsolete",
-        "parser",
-        "patch",
-        "pathutil",
-        "peer",
-        "phases",
-        "progress",
-        "pushkey",
-        "rcutil",
-        "repository",
-        "revlog",
-        "revset",
-        "revsetlang",
-        "rewriteutil",
-        "scmutil",
-        "server",
-        "setdiscovery",
-        "similar",
-        "simplemerge",
-        "smartset",
-        "sshpeer",
-        "sshserver",
-        "sslutil",
-        "statprof",
-        "store",
-        "streamclone",
-        "templatefilters",
-        "templatekw",
-        "templater",
-        "transaction",
-        "txnutil",
-        "url",
-        "urllibcompat",
-        "vfs",
-        "wireproto",
-        "worker",
-    ]
-    extmods = [
-        "absorb",
-        "amend",
-        "arcdiff",
-        "automv",
-        "blackbox",
-        "chistedit",
-        "clienttelemetry",
-        "commitcloud",
-        "conflictinfo",
-        "copytrace",
-        "crdump",
-        "debugshell",
-        "dialect",
-        "dirsync",
-        "extlib",
-        "extorder",
-        "extutil",
-        "fastlog",
-        "fbscmquery",
-        "fbhistedit",
-        "fsmonitor",
-        "ghstack",
-        "githelp",
-        "github",
-        "grpcheck",
-        "hgevents",
-        "histedit",
-        "infinitepush",
-        "journal",
-        "lfs",
-        "logginghelper",
-        "mergedriver",
-        "morestatus",
-        "myparent",
-        "phabdiff",
-        "phabstatus",
-        "phrevset",
-        "progressfile",
-        "pullcreatemarkers",
-        "pushrebase",
-        "rage",
-        "rebase",
-        "remotefilelog",
-        "remotenames",
-        "reset",
-        "sampling",
-        "schemes",
-        "share",
-        "shelve",
-        "sigtrace",
-        "simplecache",
-        "smartlog",
-        "snapshot",
-        "sparse",
-        "sshaskpass",
-        "stablerev",
-        "traceprof",
-        "treemanifest",
-        "tweakdefaults",
-        "undo",
-    ]
-    modnames = ["sapling.%s" % name for name in coremods]
+    extmods = []
+    extprefix = "sapling.ext."
+    modnames = sorted(bindings.modules.list())
+
+    is_win = pycompat.iswindows
+    win_modnames = {
+        "sapling.scmwindows",
+        "sapling.win32",
+        "sapling.windows_socket",
+        "sapling.windows",
+    }
+
     for name in modnames:
-        __import__(name)
+        # Skip other modules.
+        if not any(name.startswith(p) for p in ("ghstack", "sapling")):
+            continue
+        # Skip windows modules on non-windows platforms
+        if not is_win and name in win_modnames:
+            continue
+        # Extensions are handled below.
+        if name.startswith(extprefix):
+            parts = name.split(".")
+            if len(parts) == 3:
+                extmods.append(parts[-1])
+            continue
+        # Skip side-effect main modules.
+        if name.endswith("__main__"):
+            continue
+        try:
+            __import__(name)
+        except (ImportError, AttributeError):
+            # some modules might fail to import due to incompatible OS.
+            pass
     # Modules below are optional - expected to cause ImportError
     # in some build modes.
     optional_modnames = [
@@ -330,13 +220,12 @@ def _preimportmodules():
         # (ex. in `make oss` build).
         "sapling.eden_dirstate"
     ]
-    for name in optional_modnames:
-        try:
-            __import__(name)
-        except ImportError:
-            pass
     for extname in extmods:
-        extensions.preimport(extname)
+        try:
+            extensions.preimport(extname)
+        except (ImportError, AttributeError):
+            # some extensions might fail to import due to incompatible OS.
+            pass
 
 
 ischgserver = False
@@ -466,16 +355,18 @@ def dispatch(req):
 
             if metrics:
                 # developer config: devel.print-metrics
-                if ui.configbool("devel", "print-metrics"):
+
+                # This used to be a bool, but I changed it to a prefix list. Keep previous
+                # behavior around by using empty prefix to mean print everything.
+                prefix = ui.config("devel", "print-metrics")
+                if prefix == "":
                     # Print it out.
                     msg = "%s\n" % pformat({"metrics": metrics}).replace("'", " ")
                     ui.flush()
                     ui.write_err(msg, label="hgmetrics")
 
-                # Write to blackbox, and sampling
-                ui.log(
-                    "metrics", pformat({"metrics": metrics}, width=1024), **hgmetrics
-                )
+                # Write to blackbox
+                ui.log("metrics", pformat({"metrics": metrics}, width=1024))
         blackbox.sync()
 
     versionthresholddays = req.ui.configint("ui", "version-age-threshold-days")
@@ -862,19 +753,38 @@ def _joinfullargs(fullargs):
     return " ".join(fullargs)
 
 
-def runcommand(lui, repo, cmd, fullargs, ui, options, d, cmdpats, cmdoptions):
-    # run pre-hook, and abort if it fails
-    hook.hook(
-        lui,
-        repo,
-        "pre-%s" % cmd,
-        True,
-        args=_joinfullargs(fullargs),
-        pats=cmdpats,
-        opts=cmdoptions,
-    )
+def runcommand(
+    lui,
+    repo,
+    cmd,
+    fullargs,
+    ui,
+    options,
+    d,
+    cmdpats,
+    cmdoptions,
+    namesforhooks,
+    skipprehooks,
+):
+
+    fullargs = _joinfullargs(fullargs)
+
+    for name in namesforhooks:
+        # run pre-hook, and abort if it fails
+        hook.hook(
+            lui,
+            repo,
+            "pre-%s" % name,
+            True,
+            skipshell=skipprehooks,
+            args=fullargs,
+            pats=cmdpats,
+            opts=cmdoptions,
+        )
+
     try:
         hintutil.loadhintconfig(lui)
+        bindings.dag.configure(lui._rcfg)
         ui.log("jobid", jobid=encoding.environ.get("HG_JOB_ID", "unknown"))
         ret = _runcommand(ui, options, cmd, d)
 
@@ -884,27 +794,29 @@ def runcommand(lui, repo, cmd, fullargs, ui, options, d, cmdpats, cmdoptions):
             ret = 0 if repo else 1
 
         # run post-hook, passing command result
-        hook.hook(
-            lui,
-            repo,
-            "post-%s" % cmd,
-            False,
-            args=" ".join(fullargs),
-            result=ret,
-            pats=cmdpats,
-            opts=cmdoptions,
-        )
+        for name in namesforhooks:
+            hook.hook(
+                lui,
+                repo,
+                "post-%s" % name,
+                False,
+                args=fullargs,
+                result=ret,
+                pats=cmdpats,
+                opts=cmdoptions,
+            )
     except Exception as e:
-        # run failure hook and re-raise
-        hook.hook(
-            lui,
-            repo,
-            "fail-%s" % cmd,
-            False,
-            args=" ".join(fullargs),
-            pats=cmdpats,
-            opts=cmdoptions,
-        )
+        for name in namesforhooks:
+            # run failure hook and re-raise
+            hook.hook(
+                lui,
+                repo,
+                "fail-%s" % name,
+                False,
+                args=fullargs,
+                pats=cmdpats,
+                opts=cmdoptions,
+            )
         _log_exception(lui, e)
         raise
     if getattr(repo, "_txnreleased", False):
@@ -915,8 +827,7 @@ def runcommand(lui, repo, cmd, fullargs, ui, options, d, cmdpats, cmdoptions):
 
 def _log_exception(lui, e):
     try:
-        lui.log(
-            "exceptions",
+        lui.log_exception(
             exception_type=type(e).__name__,
             exception_msg=str(e),
             source="log_exception",
@@ -924,8 +835,7 @@ def _log_exception(lui, e):
     except Exception as e:
         try:
             wrapped = error.ProgrammingError("failed to log exception: {!r}".format(e))
-            lui.log(
-                "exceptions",
+            lui.log_exception(
                 exception_type=type(wrapped).__name__,
                 exception_msg=str(wrapped),
                 source="log_exception_wrapped",
@@ -996,12 +906,15 @@ def _dispatch(req):
         for ui_ in uis:
             ui_.setconfig("profiling", "enabled", "true", "--profile")
 
+    if lui.configbool("experimental", "evalframe-passthrough"):
+        bindings.cext.evalframe_set_pass_through()
+
     with profiling.profile(lui) as profiler:
         # progress behavior might be changed by extensions
         progress.init()
         # Configure extensions in phases: uisetup, extsetup, cmdtable, and
         # reposetup
-        extensions.loadall(lui)
+        extensions.initialload(lui)
         # Propagate any changes to lui.__class__ by extensions
         ui.__class__ = lui.__class__
 
@@ -1025,7 +938,13 @@ def _dispatch(req):
         fullargs = args
 
         cmd, func, args, options, cmdoptions, foundaliases = _parse(lui, args)
+
+        tracing.debug(
+            target="command_info", command=getattr(func, "legacyname", None) or cmd
+        )
+
         lui.cmdname = ui.cmdname = cmd
+        lui.cmdtype = ui.cmdtype = getattr(func, "cmdtype", None)
 
         # Do not profile the 'debugshell' command.
         if cmd == "debugshell":
@@ -1110,7 +1029,7 @@ def _dispatch(req):
         msg = _formatargs(fullargs)
         with perftrace.trace("Main Python Command"):
             repo = None
-            # Right now Rust `hgcommands` (undesirably) sets `func` to the
+            # Right now Rust `commands` (undesirably) sets `func` to the
             # command description, not a callable function.
             if not callable(func):
                 raise error.ProgrammingError(
@@ -1179,18 +1098,23 @@ def _dispatch(req):
             elif rpath:
                 ui.warn(_("warning: --repository ignored\n"))
 
-            from . import match as matchmod, mdiff
-
-            mdiff.init(ui)
-            matchmod.init(ui)
-
             ui.log("command", "%s\n", msg)
             if repo:
                 repo.dirstate.loginfo(ui, "pre")
             strcmdopt = cmdoptions
             d = lambda: util.checksignature(func)(ui, *args, **strcmdopt)
             ret = runcommand(
-                lui, repo, cmd, fullargs, ui, options, d, cmdpats, cmdoptions
+                lui,
+                repo,
+                cmd,
+                fullargs,
+                ui,
+                options,
+                d,
+                cmdpats,
+                cmdoptions,
+                func.namesforhooks,
+                req.skipprehooks,
             )
             hintutil.show(lui)
             if repo:
@@ -1241,6 +1165,7 @@ def _exceptionwarning(ui):
     return _("** @LongProduct@ (version %s) has crashed:\n") % util.version()
 
 
+# NB: handlecommandexception() is replaced by the errorredirect extension.
 def handlecommandexception(ui):
     """Produce a warning message for broken commands
 
@@ -1250,8 +1175,12 @@ def handlecommandexception(ui):
     if ui.configbool("devel", "silence-crash"):
         return True  # do not re-raise
     warning = _exceptionwarning(ui)
-    ui.log("command_exception", "%s\n%s\n", warning, util.smartformatexc())
+    crash = util.smartformatexc()
+    ui.log("command_exception", "%s\n%s\n", warning, crash)
     ui.warn(warning)
+
+    alerts.print_matching_alerts_for_exception(ui, crash)
+
     return False  # re-raise the exception
 
 
@@ -1269,5 +1198,5 @@ def getdebugmod(default=pdb):
             import ipdb
 
             return ipdb
-    except ModuleNotFoundError:
+    except ImportError:
         return default

@@ -5,15 +5,16 @@
  * GNU General Public License version 2.
  */
 
+#include <folly/Exception.h>
 #include <folly/File.h>
 #include <folly/FileUtil.h>
 #include <folly/init/Init.h>
 #include <folly/logging/Init.h>
 #include <folly/logging/LogConfigParser.h>
 #include <folly/logging/xlog.h>
+#include "eden/common/utils/UserInfo.h"
 #include "eden/fs/privhelper/PrivHelperFlags.h"
 #include "eden/fs/privhelper/PrivHelperServer.h"
-#include "eden/fs/utils/UserInfo.h"
 
 using namespace facebook::eden;
 

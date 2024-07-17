@@ -7,7 +7,7 @@
 
 import type {ChildProcessResponse} from './child';
 import type {StartServerArgs, StartServerResult} from './server';
-import type {IOType} from 'child_process';
+import type {IOType} from 'node:child_process';
 import type {PlatformName} from 'isl/src/types';
 
 import {
@@ -16,11 +16,11 @@ import {
   writeExistingServerFile,
 } from './existingServerStateFiles';
 import * as lifecycle from './serverLifecycle';
-import child_process from 'child_process';
-import crypto from 'crypto';
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
+import child_process from 'node:child_process';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const DEFAULT_PORT = '3001';
 
@@ -35,7 +35,7 @@ optional arguments:
   --json           Output machine-readable JSON
   --stdout         Write server logs to stdout instead of a tmp file
   --dev            Open on port 3000 despite hosting ${DEFAULT_PORT} (or custom port with -p)
-                   This is useless unless running from source to hook into CRA dev mode
+                   This is useless unless running from source to hook into Vite dev mode
   --kill           Do not start Sapling Web, just kill any previously running Sapling Web server on the specified port
                    Note that this will disrupt other windows still using the previous Sapling Web server.
   --force          Kill any existing Sapling Web server on the specified port, then start a new server.
@@ -45,6 +45,7 @@ optional arguments:
   --sl-version v   Set version number of sl was used to spawn the server (default: '(dev)')
   --platform       Set which platform implementation to use by changing the resulting URL.
                    Used to embed Sapling Web into non-browser web environments like IDEs.
+  --session id     Provide a specific ID for this session used in analytics.
 `;
 
 type JsonOutput =
@@ -81,6 +82,7 @@ type Args = {
   slVersion: string;
   command: string;
   cwd: string | undefined;
+  sessionId: string | undefined;
 };
 
 // Rudimentary arg parser to avoid the need for a third-party dependency.
@@ -103,6 +105,7 @@ export function parseArgs(args: Array<string> = process.argv.slice(2)): Args {
   let cwd: string | undefined = undefined;
   let slVersion = '(dev)';
   let platform: string | undefined = undefined;
+  let sessionId: string | undefined = undefined;
   let i = 0;
   function consumeArgValue(arg: string) {
     if (i >= len) {
@@ -166,6 +169,10 @@ export function parseArgs(args: Array<string> = process.argv.slice(2)): Args {
         stdout = true;
         break;
       }
+      case '--session': {
+        sessionId = consumeArgValue(arg);
+        break;
+      }
       case '--platform': {
         platform = consumeArgValue(arg);
         if (!isValidCustomPlatform(platform)) {
@@ -216,6 +223,7 @@ export function parseArgs(args: Array<string> = process.argv.slice(2)): Args {
     slVersion,
     command,
     cwd,
+    sessionId,
   };
 }
 
@@ -242,11 +250,25 @@ function generateToken(): Promise<string> {
 const validPlatforms: Array<PlatformName> = [
   'androidStudio',
   'androidStudioRemote',
-  'standalone',
   'webview',
+  'chromelike_app',
 ];
-function isValidCustomPlatform(name: unknown): name is PlatformName {
+function isValidCustomPlatform(name: string): name is PlatformName {
   return validPlatforms.includes(name as PlatformName);
+}
+/** Return the "index" html path like `androidStudio.html`. */
+function getPlatformIndexHtmlPath(name?: string): string {
+  if (name == null || name === 'browser') {
+    return '';
+  }
+  if (name === 'chromelike_app') {
+    // need to match isl/build/.vite/manifest.json
+    return 'chromelikeApp.html';
+  }
+  if (isValidCustomPlatform(name)) {
+    return `${encodeURIComponent(name)}.html`;
+  }
+  return '';
 }
 
 /**
@@ -321,6 +343,7 @@ export async function runProxyMain(args: Args) {
     force,
     slVersion,
     command,
+    sessionId,
   } = args;
   if (help) {
     errorAndExit(HELP_MESSAGE, 0);
@@ -390,13 +413,13 @@ export async function runProxyMain(args: Args) {
    */
   function getURL(port: number, token: string, cwd: string): URL {
     // Although `port` is where our server is actually hosting from,
-    // in dev mode CRA will start on 3000 and proxy requests to the server.
+    // in dev mode Vite will start on 3000 and proxy requests to the server.
     // We only get the source build by opening from port 3000.
-    const CRA_DEFAULT_PORT = 3000;
+    const VITE_DEFAULT_PORT = 3000;
 
     let serverPort: number;
     if (isDevMode) {
-      serverPort = CRA_DEFAULT_PORT;
+      serverPort = VITE_DEFAULT_PORT;
     } else {
       if (!Number.isInteger(port) || port < 0) {
         throw Error(`illegal port: \`${port}\``);
@@ -407,10 +430,10 @@ export async function runProxyMain(args: Args) {
       token: encodeURIComponent(token),
       cwd: encodeURIComponent(cwd),
     };
-    const platformPath =
-      platform && platform !== 'browser' && isValidCustomPlatform(platform)
-        ? `${encodeURIComponent(platform)}.html`
-        : '';
+    if (sessionId) {
+      urlArgs.sessionId = encodeURIComponent(sessionId);
+    }
+    const platformPath = getPlatformIndexHtmlPath(platform);
     const url = `http://localhost:${serverPort}/${platformPath}?${Object.entries(urlArgs)
       .map(([key, value]) => `${key}=${value}`)
       .join('&')}`;
@@ -633,20 +656,20 @@ function maybeOpenURL(url: URL): void {
   }
 
   let openCommand: string;
-  let commandOptions: string[] | null = null;
+  let shell = false;
+  let args: string[] = [href];
   switch (process.platform) {
     case 'darwin': {
       openCommand = '/usr/bin/open';
       break;
     }
     case 'win32': {
-      // We cannot use `powershell -command 'start <URL>'` because then
-      // `start <URL>` is a single argument and we have to worry about
-      // escaping it safely. We use this construction in combination with
-      // `windowsVerbatimArguments: true` below so that we do not have
-      // to take responsibility for escaping the URL.
-      openCommand = 'cmd';
-      commandOptions = ['/c', 'start'];
+      // START ["title"] command
+      openCommand = 'start';
+      // Trust `href`. Use naive quoting.
+      args = ['"ISL"', `"${href}"`];
+      // START is a shell (cmd.exe) builtin, not a standalone exe.
+      shell = true;
       break;
     }
     default: {
@@ -655,13 +678,12 @@ function maybeOpenURL(url: URL): void {
     }
   }
 
-  const args = commandOptions != null ? commandOptions.concat(href) : [href];
-
   // Note that if openCommand does not exist on the host, this will fail with
   // ENOENT. Often, this is fine: the user could start isl on a headless
   // machine, but then set up tunneling to reach the server from another host.
   const child = child_process.spawn(openCommand, args, {
     detached: true,
+    shell,
     stdio: 'ignore' as IOType,
     windowsHide: true,
     windowsVerbatimArguments: true,

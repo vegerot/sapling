@@ -9,11 +9,11 @@ use std::fmt::Display;
 use std::io;
 use std::io::Write;
 
-use bytes_old::Bytes;
-use bytes_old::BytesMut;
+use bytes::Bytes;
+use bytes::BytesMut;
+use futures::future;
 use futures::stream;
-use futures::Stream;
-use futures_ext::StreamExt;
+use futures::stream::StreamExt;
 use itertools::Itertools;
 
 use crate::batch;
@@ -56,10 +56,10 @@ pub fn encode(response: Response) -> OutputStream {
             for res in separated_results.iter() {
                 len += res.len();
             }
-            let len = format!("{}\n", len);
-            let len = stream::once(Ok(Bytes::from(len.as_bytes())));
+            let len = stream::once(future::ok(Bytes::from(format!("{}\n", len))));
 
-            len.chain(stream::iter_ok(separated_results)).boxify()
+            len.chain(stream::iter(separated_results.into_iter().map(Ok)))
+                .boxed()
         }
         Response::Single(resp) => encode_single(resp),
     }
@@ -69,13 +69,9 @@ fn encode_single(response: SingleResponse) -> OutputStream {
     let is_stream = response.is_stream();
     let res = encode_cmd(response);
     if is_stream {
-        stream::once(Ok(res)).boxify()
+        stream::once(future::ok(res)).boxed()
     } else {
-        stream::iter_ok(vec![
-            Bytes::from(format!("{}\n", res.len()).as_bytes()),
-            res,
-        ])
-        .boxify()
+        stream::iter(vec![Ok(Bytes::from(format!("{}\n", res.len()))), Ok(res)]).boxed()
     }
 }
 

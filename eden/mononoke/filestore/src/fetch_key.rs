@@ -30,6 +30,15 @@ pub enum FetchKey {
     Aliased(Alias),
 }
 
+impl Display for FetchKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Canonical(content_id) => f.write_fmt(format_args!("{:?}", content_id)),
+            Self::Aliased(alias) => f.write_fmt(format_args!("{:?}", alias)),
+        }
+    }
+}
+
 impl From<ContentId> for FetchKey {
     fn from(content_id: ContentId) -> Self {
         FetchKey::Canonical(content_id)
@@ -57,6 +66,12 @@ impl From<hash::Sha1> for FetchKey {
 impl From<hash::RichGitSha1> for FetchKey {
     fn from(hash: hash::RichGitSha1) -> Self {
         FetchKey::Aliased(Alias::GitSha1(hash.sha1()))
+    }
+}
+
+impl From<hash::GitSha1> for FetchKey {
+    fn from(hash: hash::GitSha1) -> Self {
+        FetchKey::Aliased(Alias::GitSha1(hash))
     }
 }
 

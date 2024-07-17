@@ -36,7 +36,8 @@ pub struct Hunk {
 ///
 /// # Example
 /// ```
-/// use xdiff::{diff_hunks, Hunk};
+/// use xdiff::diff_hunks;
+/// use xdiff::Hunk;
 /// let a = "a\n b\n c\n d\n";
 /// let b = "a\n c\n d\n e\n";
 /// let c = "a\n b\n c\n d\n e\n";
@@ -266,11 +267,18 @@ where
         self.emit(
             format!(
                 "@@ -{},{} +{},{} @@\n",
-                // Of course line ranges in the diff format start from 1.
-                &cluster_bounds.remove.start + 1,
+                // Increment since line numbers in a diff start from 1. If a
+                // hunk contains zero lines, the line number has to be one lower
+                // than one would expect. So, don't increment in that case.
+                cluster_bounds.remove.start
+                    + (if cluster_bounds.remove.is_empty() {
+                        0
+                    } else {
+                        1
+                    }),
                 &cluster_bounds.remove.len(),
-                &cluster_bounds.add.start + 1,
-                &cluster_bounds.add.len()
+                cluster_bounds.add.start + (if cluster_bounds.add.is_empty() { 0 } else { 1 }),
+                &cluster_bounds.add.len(),
             )
             .as_bytes(),
         );
@@ -583,6 +591,13 @@ impl<C: AsRef<[u8]>> FileContent<C> {
             _ => None,
         }
     }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            FileContent::Inline(c) => c.as_ref().is_empty(),
+            _ => false,
+        }
+    }
 }
 
 /// Struct representing the diffed file. Contains all the information
@@ -647,6 +662,17 @@ where
     match file {
         Some(file) => file.file_type == FileType::GitSubmodule,
         _ => false,
+    }
+}
+
+fn file_is_empty<P, C>(file: &Option<DiffFile<P, C>>) -> bool
+where
+    P: AsRef<[u8]>,
+    C: AsRef<[u8]>,
+{
+    match file {
+        Some(file) => file.contents.is_empty(),
+        None => false,
     }
 }
 
@@ -780,6 +806,16 @@ where
             }
             _ => {}
         }
+        return state.collect();
+    }
+
+    // Don't print anything else when adding an empty file.
+    if old_file.is_none() && file_is_empty(&new_file) {
+        return state.collect();
+    }
+
+    // Don't print anything else when removing an empty file.
+    if file_is_empty(&old_file) && new_file.is_none() {
         return state.collect();
     }
 
@@ -1031,11 +1067,55 @@ d
             r"diff --git a/x b/x
 --- a/x
 +++ b/x
-@@ -1,0 +1,4 @@
+@@ -0,0 +1,4 @@
 +a
 +b
 +c
 +d
+"
+        );
+    }
+
+    #[test]
+    fn test_diff_unified_with_zero_context_lines() {
+        let a = r#"lorem
+ipsum
+dolor
+sit
+consectetur
+"#;
+
+        let b = r#"lorem
+dolor
+sit
+amet
+consectetur
+"#;
+
+        assert_eq!(
+            String::from_utf8_lossy(&diff_unified(
+                Some(DiffFile {
+                    contents: FileContent::Inline(&a),
+                    path: "x",
+                    file_type: FileType::Regular,
+                }),
+                Some(DiffFile {
+                    contents: FileContent::Inline(&b),
+                    path: "x",
+                    file_type: FileType::Regular,
+                }),
+                DiffOpts {
+                    context: 0,
+                    copy_info: CopyInfo::None,
+                }
+            )),
+            r"diff --git a/x b/x
+--- a/x
++++ b/x
+@@ -2,1 +1,0 @@
+-ipsum
+@@ -4,0 +4,1 @@
++amet
 "
         );
     }
@@ -1069,6 +1149,48 @@ d
             )),
             r"diff --git a/x b/x
 Binary file x has changed
+"
+        );
+    }
+
+    #[test]
+    fn test_diff_unified_adding_empty_file() {
+        assert_eq!(
+            String::from_utf8_lossy(&diff_unified(
+                None,
+                Some(DiffFile {
+                    contents: FileContent::Inline(&""),
+                    path: "x",
+                    file_type: FileType::Regular,
+                }),
+                DiffOpts {
+                    context: 10,
+                    copy_info: CopyInfo::None,
+                }
+            )),
+            r"diff --git a/x b/x
+new file mode 100644
+"
+        );
+    }
+
+    #[test]
+    fn test_diff_unified_removing_empty_file() {
+        assert_eq!(
+            String::from_utf8_lossy(&diff_unified(
+                Some(DiffFile {
+                    contents: FileContent::Inline(&""),
+                    path: "x",
+                    file_type: FileType::Regular,
+                }),
+                None,
+                DiffOpts {
+                    context: 10,
+                    copy_info: CopyInfo::None,
+                }
+            )),
+            r"diff --git a/x b/x
+deleted file mode 100644
 "
         );
     }

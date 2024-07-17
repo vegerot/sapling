@@ -8,7 +8,7 @@
 //! Base types used throughout Mononoke.
 #![feature(round_char_boundary)]
 
-pub mod basename_suffix_skeleton_manifest;
+pub mod basename_suffix_skeleton_manifest_v3;
 pub mod blame_v2;
 pub mod blob;
 pub mod bonsai_changeset;
@@ -17,6 +17,7 @@ pub mod content_metadata_v2;
 pub mod datetime;
 pub mod deleted_manifest_common;
 pub mod deleted_manifest_v2;
+pub mod derivable_type;
 pub mod errors;
 pub mod fastlog_batch;
 pub mod file_change;
@@ -31,10 +32,13 @@ pub mod redaction_key_list;
 pub mod repo;
 pub mod sha1_hash;
 pub mod sharded_map;
+pub mod sharded_map_v2;
 pub mod skeleton_manifest;
 pub mod sql_types;
 pub mod svnrev;
-pub mod thrift_convert;
+pub mod test_manifest;
+pub mod test_sharded_manifest;
+pub mod trie_map;
 pub mod typed_hash;
 pub mod unode;
 
@@ -61,9 +65,11 @@ pub use content_metadata_v2::ContentAlias;
 pub use content_metadata_v2::ContentMetadataV2;
 pub use datetime::DateTime;
 pub use datetime::Timestamp;
+pub use derivable_type::DerivableType;
 pub use file_change::BasicFileChange;
 pub use file_change::FileChange;
 pub use file_change::FileType;
+pub use file_change::GitLfs;
 pub use file_change::TrackedFileChange;
 pub use file_contents::ChunkedFileContents;
 pub use file_contents::ContentChunkPointer;
@@ -71,24 +77,27 @@ pub use file_contents::FileContents;
 pub use generation::Generation;
 pub use generation::FIRST_GENERATION;
 pub use globalrev::Globalrev;
+pub use hash::MononokeDigest;
 pub use path::check_case_conflicts;
+pub use path::mpath_element::MPathElement;
+pub use path::mpath_element::MPathElementPrefix;
 pub use path::mpath_element_iter;
 pub use path::non_root_mpath_element_iter;
 pub use path::path_bytes_from_mpath;
-pub use path::MPathElement;
+pub use path::MPath;
 pub use path::MPathHash;
 pub use path::NonRootMPath;
 pub use path::PrefixTrie;
 pub use path::RepoPath;
-pub use path::TrieMap;
 pub use rawbundle2::RawBundle2;
 pub use redaction_key_list::RedactionKeyList;
 pub use repo::RepositoryId;
 pub use repo::REPO_PREFIX_REGEX;
 pub use svnrev::Svnrev;
 pub use thrift_convert::ThriftConvert;
-pub use typed_hash::BasenameSuffixSkeletonManifestId;
+pub use trie_map::TrieMap;
 pub use typed_hash::BlobstoreKey;
+pub use typed_hash::BssmV3DirectoryId;
 pub use typed_hash::ChangesetId;
 pub use typed_hash::ChangesetIdPrefix;
 pub use typed_hash::ChangesetIdsResolvedFromPrefix;
@@ -103,11 +112,31 @@ pub use typed_hash::ManifestUnodeId;
 pub use typed_hash::MononokeId;
 pub use typed_hash::RawBundle2Id;
 pub use typed_hash::SkeletonManifestId;
+pub use typed_hash::TestManifestId;
+pub use typed_hash::TestShardedManifestId;
 
 mod macros;
 
 pub mod thrift {
-    pub use mononoke_types_thrift::*;
+    pub use derived_data_type_if::DerivedDataType;
+    pub use mononoke_types_serialization::blame;
+    pub use mononoke_types_serialization::bonsai;
+    pub use mononoke_types_serialization::bssm;
+    pub use mononoke_types_serialization::changeset_info;
+    pub use mononoke_types_serialization::content;
+    pub use mononoke_types_serialization::data;
+    pub use mononoke_types_serialization::deleted_manifest;
+    pub use mononoke_types_serialization::fastlog;
+    pub use mononoke_types_serialization::fsnodes;
+    pub use mononoke_types_serialization::id;
+    pub use mononoke_types_serialization::path;
+    pub use mononoke_types_serialization::raw_bundle2;
+    pub use mononoke_types_serialization::redaction;
+    pub use mononoke_types_serialization::sharded_map;
+    pub use mononoke_types_serialization::skeleton_manifest;
+    pub use mononoke_types_serialization::test_manifest;
+    pub use mononoke_types_serialization::time;
+    pub use mononoke_types_serialization::unodes;
 }
 
 pub mod private {

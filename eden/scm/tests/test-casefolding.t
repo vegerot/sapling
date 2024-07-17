@@ -1,7 +1,6 @@
-#debugruntest-compatible
-#require icasefs
+#require icasefs no-eden
 
-  $ configure modernclient
+  $ setconfig checkout.use-rust=true
   $ hg debugfsinfo | grep 'case-sensitive:'
   case-sensitive: no
 
@@ -53,7 +52,7 @@ test changing case of path components
   $ hg ci -Am addb D/b
   $ hg mv D/b d/b
   D/b: not overwriting - file already committed
-  (hg rename --force to replace the file by recording a rename)
+  (use 'hg rename --amend --mark' to amend the current commit)
   $ hg mv D/b d/c
   $ hg st
   A D/c
@@ -67,12 +66,9 @@ test changing case of path components
   $ rm d/c
   $ echo c > D/c
   $ hg add "glob:**/c"
-  adding d/c (no-fsmonitor !)
-  warning: possible case-folding collision for D/c (fsmonitor !)
-  adding D/c (fsmonitor !)
+  adding D/c
   $ hg st
-  A d/c (no-fsmonitor !)
-  A D/c (fsmonitor !)
+  A D/c
   $ hg ci -m addc "glob:**/c"
   $ hg mv d/b d/e
   moving D/b to D/e
@@ -111,7 +107,7 @@ used to fail under case insensitive fs
 
   $ hg up -C 0
   1 files updated, 0 files merged, 2 files removed, 0 files unresolved
-  $ hg up -C
+  $ hg up -C tip
   2 files updated, 0 files merged, 1 files removed, 0 files unresolved
 
 no clobbering of untracked files with wrong casing
@@ -119,9 +115,10 @@ no clobbering of untracked files with wrong casing
   $ hg up -r 0
   1 files updated, 0 files merged, 2 files removed, 0 files unresolved
   $ echo gold > b
-  $ hg up
-  B: untracked file differs
-  abort: untracked files in working directory differ from files in requested revision
+  $ hg up tip
+  abort: 1 conflicting file changes:
+   B
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
   $ cat b
   gold

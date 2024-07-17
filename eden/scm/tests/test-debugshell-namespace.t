@@ -1,5 +1,4 @@
-#debugruntest-compatible
-#require ipython
+#require ipython no-eden
 
   $ eagerepo
   $ cat >> foo.py << EOF

@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This software may be used and distributed according to the terms of the
@@ -10,7 +12,7 @@
   $ cat >> $HGRCPATH << 'EOF'
   > [extensions]
   > arcconfig=$TESTDIR/../sapling/ext/extlib/phabricator/arcconfig.py
-  > phabstatus=
+  > fbcodereview=
   > smartlog=
   > EOF
   $ hg init repo
@@ -62,7 +64,7 @@
   > EOF
   $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit hg log -T '{syncstatus}\n' -r .
   Error talking to phabricator. No diff information can be provided.
-  Error info: Unexpected graphql response format
+  Error info: Unexpected graphql response format for D1
   Error
 
 # Missing hash doesn't make us explode

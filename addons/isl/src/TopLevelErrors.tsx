@@ -10,14 +10,15 @@ import type {RepoInfo} from './types';
 import type {TrackErrorName} from 'isl-server/src/analytics/eventNames';
 import type {ReactNode} from 'react';
 
-import {ErrorNotice} from './ErrorNotice';
+import {Internal} from './Internal';
 import {tracker} from './analytics';
 import {allDiffSummaries} from './codeReview/CodeReviewInfo';
 import {t, T} from './i18n';
 import platform from './platform';
 import {reconnectingStatus, repositoryInfo} from './serverAPIState';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilValue} from 'recoil';
+import {Button} from 'isl-components/Button';
+import {ErrorNotice} from 'isl-components/ErrorNotice';
+import {useAtomValue} from 'jotai';
 import {useThrottledEffect} from 'shared/hooks';
 
 type TopLevelErrorInfo = {
@@ -60,17 +61,21 @@ function computeTopLevelError(
       // no use tracking, since we can't reach the server anyway.
     };
   } else if (diffFetchError) {
-    if (repoInfo?.type === 'success' && repoInfo.codeReviewSystem.type === 'github') {
+    const internalResult = Internal.findInternalError?.(diffFetchError) as
+      | TopLevelErrorInfo
+      | undefined;
+    if (internalResult != null) {
+      return internalResult;
+    } else if (repoInfo?.type === 'success' && repoInfo.codeReviewSystem.type === 'github') {
       const learnAboutGhButton = (
-        <VSCodeButton
-          appearance="secondary"
+        <Button
           onClick={e => {
             platform.openExternalLink('https://sapling-scm.com/docs/git/intro');
             e.preventDefault();
             e.stopPropagation();
           }}>
           <T>Learn more</T>
-        </VSCodeButton>
+        </Button>
       );
       if (diffFetchError.message.startsWith('NotAuthenticatedError')) {
         const error = new Error(
@@ -105,9 +110,9 @@ function computeTopLevelError(
 }
 
 export function TopLevelErrors() {
-  const reconnectStatus = useRecoilValue(reconnectingStatus);
-  const repoInfo = useRecoilValue(repositoryInfo);
-  const diffFetchError = useRecoilValue(allDiffSummaries).error;
+  const reconnectStatus = useAtomValue(reconnectingStatus);
+  const repoInfo = useAtomValue(repositoryInfo);
+  const diffFetchError = useAtomValue(allDiffSummaries).error;
 
   const info = computeTopLevelError(repoInfo, reconnectStatus, diffFetchError);
 

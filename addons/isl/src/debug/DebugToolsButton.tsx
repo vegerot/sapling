@@ -5,34 +5,35 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import {Tooltip} from '../Tooltip';
 import {t} from '../i18n';
 import {debugToolsEnabledState} from './DebugToolsState';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
+import {useAtomValue} from 'jotai';
 import {lazy, Suspense} from 'react';
-import {useRecoilValue} from 'recoil';
-import {Icon} from 'shared/Icon';
 
 const DebugToolsMenu = lazy(() => import('./DebugToolsMenu'));
 
 export function DebugToolsButton() {
-  const debugEnabled = useRecoilValue(debugToolsEnabledState);
+  const debugEnabled = useAtomValue(debugToolsEnabledState);
   if (!debugEnabled) {
     return null;
   }
   return (
     <Tooltip
-      component={() => (
+      component={dismiss => (
         <Suspense fallback={<Icon icon="loading" />}>
-          <DebugToolsMenu />
+          <DebugToolsMenu dismiss={dismiss} />
         </Suspense>
       )}
       title={t('Debug Tools')}
       trigger="click"
+      group="topbar"
       placement="bottom">
-      <VSCodeButton appearance="icon">
+      <Button icon>
         <Icon icon="pulse" />
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }

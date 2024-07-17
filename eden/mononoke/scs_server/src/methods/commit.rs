@@ -28,16 +28,19 @@ use mononoke_api::ChangesetDiffItem;
 use mononoke_api::ChangesetFileOrdering;
 use mononoke_api::ChangesetHistoryOptions;
 use mononoke_api::ChangesetId;
+use mononoke_api::ChangesetLinearHistoryOptions;
 use mononoke_api::ChangesetPathContentContext;
 use mononoke_api::ChangesetPathDiffContext;
 use mononoke_api::ChangesetSpecifier;
 use mononoke_api::CopyInfo;
 use mononoke_api::MetadataDiff;
 use mononoke_api::MononokeError;
-use mononoke_api::MononokePath;
 use mononoke_api::RepoContext;
 use mononoke_api::UnifiedDiff;
 use mononoke_api::UnifiedDiffMode;
+use mononoke_api::XRepoLookupExactBehaviour;
+use mononoke_api::XRepoLookupSyncBehaviour;
+use mononoke_types::path::MPath;
 use source_control as thrift;
 
 use crate::commit_id::map_commit_identities;
@@ -125,8 +128,9 @@ async fn add_mutable_renames(
         if let Some(paths) = &params.paths {
             let paths: Vec<_> = paths
                 .iter()
-                .map(MononokePath::try_from)
-                .collect::<Result<_, MononokeError>>()?;
+                .map(MPath::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| MononokeError::InvalidRequest(error.to_string()))?;
             base_changeset
                 .add_mutable_renames(paths.into_iter())
                 .await?;
@@ -333,7 +337,8 @@ impl SourceControlServiceImpl {
                 Ok((
                     match path_pair.base_path {
                         Some(path) => {
-                            let mpath = MononokePath::try_from(&path)
+                            let mpath = MPath::try_from(&path)
+                                .map_err(|error| MononokeError::InvalidRequest(error.to_string()))
                                 .context("invalid base commit path")?;
                             base_commit_paths.push(mpath.clone());
                             Some(mpath)
@@ -343,7 +348,10 @@ impl SourceControlServiceImpl {
                     match &other_commit {
                         Some(_other_commit) => match path_pair.other_path {
                             Some(path) => {
-                                let mpath = MononokePath::try_from(&path)
+                                let mpath = MPath::try_from(&path)
+                                    .map_err(|error| {
+                                        MononokeError::InvalidRequest(error.to_string())
+                                    })
                                     .context("invalid other commit path")?;
                                 other_commit_paths.push(mpath.clone());
                                 Some(mpath)
@@ -491,6 +499,17 @@ impl SourceControlServiceImpl {
         changeset.into_response_with(&params.identity_schemes).await
     }
 
+    /// Get commit generation.
+    pub(crate) async fn commit_generation(
+        &self,
+        ctx: CoreContext,
+        commit: thrift::CommitSpecifier,
+        _params: thrift::CommitGenerationParams,
+    ) -> Result<i64, errors::ServiceError> {
+        let (_repo, changeset) = self.repo_changeset(ctx, &commit).await?;
+        Ok(changeset.generation().await?.value() as i64)
+    }
+
     /// Returns `true` if this commit is an ancestor of `other_commit`.
     pub(crate) async fn commit_is_ancestor_of(
         &self,
@@ -518,7 +537,7 @@ impl SourceControlServiceImpl {
         params: &thrift::CommitCompareParams,
     ) -> Result<Option<ChangesetContext>, errors::ServiceError> {
         let commit_parents = base_changeset.parents().await?;
-        let mut other_changeset_id = commit_parents.get(0).copied();
+        let mut other_changeset_id = commit_parents.first().copied();
 
         if params.follow_mutable_file_history.unwrap_or(false) {
             let mutable_parents = base_changeset.mutable_parents();
@@ -558,12 +577,12 @@ impl SourceControlServiceImpl {
         let (base_changeset, other_changeset) = match &params.other_commit_id {
             Some(id) => {
                 let (_repo, mut base_changeset, other_changeset) =
-                    self.repo_changeset_pair(ctx, &commit, id).await?;
+                    self.repo_changeset_pair(ctx.clone(), &commit, id).await?;
                 add_mutable_renames(&mut base_changeset, &params).await?;
                 (base_changeset, Some(other_changeset))
             }
             None => {
-                let (repo, mut base_changeset) = self.repo_changeset(ctx, &commit).await?;
+                let (repo, mut base_changeset) = self.repo_changeset(ctx.clone(), &commit).await?;
                 add_mutable_renames(&mut base_changeset, &params).await?;
                 let other_changeset = self
                     .find_commit_compare_parent(&repo, &mut base_changeset, &params)
@@ -571,6 +590,23 @@ impl SourceControlServiceImpl {
                 (base_changeset, other_changeset)
             }
         };
+
+        // Log the generation difference to drill down on clients making
+        // expensive `commit_compare` requests
+        let base_generation = base_changeset.generation().await?.value();
+        let other_generation = match other_changeset {
+            Some(ref cs) => cs.generation().await?.value(),
+            // If there isn't another commit, let's use the same generation
+            // to have a difference of 0.
+            None => base_generation,
+        };
+
+        let generation_diff = base_generation.abs_diff(other_generation);
+        let mut scuba = ctx.scuba().clone();
+        scuba.log_with_msg(
+            "Commit compare generation difference",
+            format!("{generation_diff}"),
+        );
 
         let mut last_path = None;
         let mut diff_items: BTreeSet<_> = params
@@ -587,13 +623,14 @@ impl SourceControlServiceImpl {
             diff_items = btreeset! { ChangesetDiffItem::FILES };
         }
 
-        let paths: Option<Vec<MononokePath>> = match params.paths {
+        let paths: Option<Vec<MPath>> = match params.paths {
             None => None,
             Some(paths) => Some(
                 paths
                     .iter()
-                    .map(|path| path.try_into())
-                    .collect::<Result<Vec<_>, _>>()?,
+                    .map(MPath::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| MononokeError::InvalidRequest(error.to_string()))?,
             ),
         };
         let (diff_files, diff_trees) = match params.ordered_params {
@@ -635,7 +672,7 @@ impl SourceControlServiceImpl {
                 let after = ordered_params
                     .after_path
                     .map(|after| {
-                        MononokePath::try_from(&after).map_err(|e| {
+                        MPath::try_from(&after).map_err(|e| {
                             errors::invalid_request(format!(
                                 "invalid continuation path '{}': {}",
                                 after, e
@@ -707,7 +744,7 @@ impl SourceControlServiceImpl {
         commit: thrift::CommitSpecifier,
         params: thrift::CommitFindFilesParams,
     ) -> Result<thrift::CommitFindFilesResponse, errors::ServiceError> {
-        let (_repo, changeset) = self.repo_changeset(ctx, &commit).await?;
+        let (_repo, changeset) = self.repo_changeset(ctx.clone(), &commit).await?;
         let limit: usize = check_range_and_convert(
             "limit",
             params.limit,
@@ -718,7 +755,7 @@ impl SourceControlServiceImpl {
                 prefixes
                     .into_iter()
                     .map(|prefix| {
-                        MononokePath::try_from(&prefix).map_err(|e| {
+                        MPath::try_from(&prefix).map_err(|e| {
                             errors::invalid_request(format!("invalid prefix '{}': {}", prefix, e))
                         })
                     })
@@ -728,7 +765,7 @@ impl SourceControlServiceImpl {
         };
         let ordering = match &params.after {
             Some(after) => {
-                let after = Some(MononokePath::try_from(after).map_err(|e| {
+                let after = Some(MPath::try_from(after).map_err(|e| {
                     errors::invalid_request(format!("invalid continuation path '{}': {}", after, e))
                 })?);
                 ChangesetFileOrdering::Ordered { after }
@@ -748,6 +785,7 @@ impl SourceControlServiceImpl {
             .map_ok(|path| path.to_string())
             .try_collect()
             .await?;
+
         Ok(thrift::CommitFindFilesResponse {
             files,
             ..Default::default()
@@ -830,6 +868,65 @@ impl SourceControlServiceImpl {
         .await?;
 
         Ok(thrift::CommitHistoryResponse {
+            history,
+            ..Default::default()
+        })
+    }
+
+    pub async fn commit_linear_history(
+        &self,
+        ctx: CoreContext,
+        commit: thrift::CommitSpecifier,
+        params: thrift::CommitLinearHistoryParams,
+    ) -> Result<thrift::CommitLinearHistoryResponse, errors::ServiceError> {
+        let (repo, changeset) = self.repo_changeset(ctx, &commit).await?;
+        let (descendants_of, exclude_changeset_and_ancestors) = try_join!(
+            async {
+                if let Some(descendants_of) = &params.descendants_of {
+                    Ok::<_, errors::ServiceError>(Some(
+                        self.changeset_id(&repo, descendants_of).await?,
+                    ))
+                } else {
+                    Ok(None)
+                }
+            },
+            async {
+                if let Some(exclude_changeset_and_ancestors) =
+                    &params.exclude_changeset_and_ancestors
+                {
+                    Ok::<_, errors::ServiceError>(Some(
+                        self.changeset_id(&repo, exclude_changeset_and_ancestors)
+                            .await?,
+                    ))
+                } else {
+                    Ok(None)
+                }
+            }
+        )?;
+
+        let limit: usize = check_range_and_convert("limit", params.limit, 0..)?;
+        let skip: u64 = check_range_and_convert("skip", params.skip, 0..)?;
+
+        let history_stream = changeset
+            .linear_history(ChangesetLinearHistoryOptions {
+                descendants_of,
+                exclude_changeset_and_ancestors,
+                skip,
+            })
+            .await?;
+        let history = collect_history(
+            history_stream,
+            // We set the skip to 0 as skipping is already done as part of ChangesetContext::linear_history.
+            0,
+            limit,
+            None,
+            None,
+            params.format,
+            &params.identity_schemes,
+        )
+        .await?;
+
+        Ok(thrift::CommitLinearHistoryResponse {
             history,
             ..Default::default()
         })
@@ -989,11 +1086,23 @@ impl SourceControlServiceImpl {
             None => None,
         };
 
+        let sync_behaviour = if params.no_ondemand_sync {
+            XRepoLookupSyncBehaviour::NeverSync
+        } else {
+            XRepoLookupSyncBehaviour::SyncIfAbsent
+        };
+        let exact = if params.exact {
+            XRepoLookupExactBehaviour::OnlyExactMapping
+        } else {
+            XRepoLookupExactBehaviour::WorkingCopyEquivalence
+        };
         match repo
             .xrepo_commit_lookup(
                 &other_repo,
                 ChangesetSpecifier::from_request(&commit.id)?,
                 candidate_selection_hint,
+                sync_behaviour,
+                exact,
             )
             .await?
         {

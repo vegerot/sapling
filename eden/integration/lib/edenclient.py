@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 import json
 import logging
 import os
@@ -107,6 +109,10 @@ class EdenFS:
         return self._home_dir / ".edenrc"
 
     @property
+    def dynamic_rc_path(self) -> Path:
+        return self._etc_eden_dir / "edenfs_dynamic.rc"
+
+    @property
     def system_rc_path(self) -> Path:
         return self._etc_eden_dir / "edenfs.rc"
 
@@ -149,6 +155,7 @@ class EdenFS:
         capture_stderr: bool = False,
         encoding: str = "utf-8",
         config_dir: bool = True,
+        env: Optional[Dict[str, str]] = None,
     ) -> str:
         """
         Run the specified eden command.
@@ -157,18 +164,27 @@ class EdenFS:
         Usage example: run_cmd('mount', 'my_eden_client')
         Throws a subprocess.CalledProcessError if eden exits unsuccessfully.
         """
-        cmd, env = self.get_edenfsctl_cmd_env(command, *args, config_dir=config_dir)
+        cmd, cmd_env = self.get_edenfsctl_cmd_env(command, *args, config_dir=config_dir)
+
+        # Merge explicit env with env vars supplied by the test harness.
+        # Explicitly provided env vars take precedence.
+        merged_env = {}
+        if env is not None:
+            merged_env = cmd_env | env
+        else:
+            merged_env = cmd_env
+
         try:
             stderr = subprocess.STDOUT if capture_stderr else subprocess.PIPE
             # TODO(T37669726): Re-enable LSAN.
-            env["LSAN_OPTIONS"] = "detect_leaks=0:verbosity=1:log_threads=1"
+            merged_env["LSAN_OPTIONS"] = "detect_leaks=0:verbosity=1:log_threads=1"
             completed_process = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=stderr,
                 check=True,
                 cwd=cwd,
-                env=env,
+                env=merged_env,
                 encoding=encoding,
             )
         except subprocess.CalledProcessError as ex:
@@ -199,6 +215,7 @@ class EdenFS:
         command: str,
         *args: str,
         config_dir: bool = True,
+        home_dir: bool = True,
     ) -> Tuple[List[str], Dict[str, str]]:
         """Combines the specified eden command args with the appropriate
         defaults.
@@ -215,11 +232,11 @@ class EdenFS:
             edenfsctl,
             "--etc-eden-dir",
             str(self._etc_eden_dir),
-            "--home-dir",
-            str(self._home_dir),
         ]
         if config_dir:
             cmd += ["--config-dir", str(self._eden_dir)]
+        if home_dir:
+            cmd += ["--home-dir", str(self._home_dir)]
         cmd.append(command)
         cmd.extend(args)
         return cmd, env
@@ -281,8 +298,6 @@ class EdenFS:
             "2",
             "--local_storage_engine_unsafe",
             self._storage_engine,
-            "--hgPath",
-            FindExe.HG_REAL,
         ]
 
         privhelper = FindExe.EDEN_PRIVHELPER
@@ -370,6 +385,7 @@ class EdenFS:
             stderr=subprocess.PIPE,
             universal_newlines=True,
             env=env,
+            errors="surrogateescape",
         )
 
         # TODO(T69605343): Until TPX properly knows how to redirect writes done
@@ -600,6 +616,8 @@ class EdenFS:
         allow_empty: bool = False,
         case_sensitive: Optional[bool] = None,
         enable_windows_symlinks: bool = False,
+        backing_store: Optional[str] = None,
+        filter_path: Optional[str] = None,
     ) -> None:
         """
         Run "eden clone"
@@ -613,6 +631,12 @@ class EdenFS:
             params.append("--case-insensitive")
         if enable_windows_symlinks:
             params.append("--enable-windows-symlinks")
+        if backing_store is not None:
+            params.append("--backing-store")
+            params.append(backing_store)
+        if filter_path is not None:
+            params.append("--filter-path")
+            params.append(filter_path)
         self.run_cmd(*params)
 
     def is_case_sensitive(self, path: Union[str, os.PathLike]) -> bool:

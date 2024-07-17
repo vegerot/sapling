@@ -28,24 +28,23 @@
 #include <folly/logging/xlog.h>
 #include <folly/portability/Unistd.h>
 #include <folly/system/ThreadName.h>
-#include <signal.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
 #include <chrono>
+#include <csignal>
 #include <set>
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/SysctlUtil.h"
+#include "eden/common/utils/Throw.h"
 #include "eden/fs/privhelper/NfsMountRpc.h"
-#include "eden/fs/privhelper/PrivHelperConn.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/SysctlUtil.h"
-#include "eden/fs/utils/Throw.h"
 
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h> // @manual
 #include <IOKit/kext/KextManager.h> // @manual
-#include <eden/fs/utils/Pipe.h>
-#include <eden/fs/utils/SpawnedProcess.h>
+#include <eden/common/utils/Pipe.h>
+#include <eden/common/utils/SpawnedProcess.h>
 #include <fuse_ioctl.h> // @manual
 #include <fuse_mount.h> // @manual
 #include <grp.h> // @manual
@@ -63,9 +62,9 @@ using std::string;
 
 namespace facebook::eden {
 
-PrivHelperServer::PrivHelperServer() {}
+PrivHelperServer::PrivHelperServer() = default;
 
-PrivHelperServer::~PrivHelperServer() {}
+PrivHelperServer::~PrivHelperServer() = default;
 
 void PrivHelperServer::init(folly::File socket, uid_t uid, gid_t gid) {
   initPartial(std::move(socket), uid, gid);
@@ -495,7 +494,10 @@ folly::File mountMacFuse(
 } // namespace
 #endif
 
-folly::File PrivHelperServer::fuseMount(const char* mountPath, bool readOnly) {
+folly::File PrivHelperServer::fuseMount(
+    const char* mountPath,
+    bool readOnly,
+    [[maybe_unused]] const char* vfsType) {
 #ifdef __APPLE__
   if (useDevEdenFs_) {
     return mountOSXFuse(mountPath, readOnly, fuseTimeout_, useDevEdenFs_);
@@ -546,10 +548,9 @@ folly::File PrivHelperServer::fuseMount(const char* mountPath, bool readOnly) {
   if (readOnly) {
     mountFlags |= MS_RDONLY;
   }
-  const char* type = "fuse";
   // The colon indicates to coreutils/gnulib that this is a remote
   // mount so it will not be displayed by `df --local`.
-  int rc = mount("edenfs:", mountPath, type, mountFlags, mountOpts.c_str());
+  int rc = mount("edenfs:", mountPath, vfsType, mountFlags, mountOpts.c_str());
   checkUnixError(rc, "failed to mount");
   return fuseDev;
 #endif
@@ -583,10 +584,12 @@ void PrivHelperServer::nfsMount(
     readdirplus_flag = NFS_MFLAG_RDIRPLUS;
   }
 
-  // Make the client use any source port, enable/disable rdirplus, soft but make
-  // the mount interruptible. While in theory we would want the mount to be
-  // soft, macOS force a maximum timeout of 60s, which in some case is too short
-  // for files to be fetched, thus disable it.
+  // Make the client use any source port, enable/disable rdirplus, and set the
+  // mount type to hard (but make it interruptible). While in theory we would
+  // want the mount to be soft, macOS force a maximum timeout of 60s, which in
+  // some case is too short for files to be fetched, thus disable it.
+  //
+  // See `man mount_nfs` for more options.
   mattrFlags |= NFS_MATTR_FLAGS;
   nfs_mattr_flags flags{
       NFS_MATTR_BITMAP_LEN,
@@ -844,12 +847,13 @@ UnixSocket::Message PrivHelperServer::processTakeoverStartupMsg(
 UnixSocket::Message PrivHelperServer::processMountMsg(Cursor& cursor) {
   string mountPath;
   bool readOnly;
-  PrivHelperConn::parseMountRequest(cursor, mountPath, readOnly);
+  string vfsType;
+  PrivHelperConn::parseMountRequest(cursor, mountPath, readOnly, vfsType);
   XLOG(DBG3) << "mount \"" << mountPath << "\"";
 
   sanityCheckMountPoint(mountPath);
 
-  auto fuseDev = fuseMount(mountPath.c_str(), readOnly);
+  auto fuseDev = fuseMount(mountPath.c_str(), readOnly, vfsType.c_str());
   mountPoints_.insert(mountPath);
 
   return makeResponse(std::move(fuseDev));
@@ -1158,9 +1162,9 @@ UnixSocket::Message PrivHelperServer::processMessage(
     PrivHelperConn::PrivHelperPacket& packet,
     Cursor& cursor,
     UnixSocket::Message& request) {
-  // In the future, we can use packet.header.version to decide how to handle
-  // each request. Each request handler can implement different handler logic
-  // for each known version (if needed).
+  // TODO(T185426586): In the future, we can use packet.header.version to
+  // decide how to handle each request. Each request handler can implement
+  // different handler logic for each known version (if needed).
   PrivHelperConn::MsgType msgType{packet.metadata.msg_type};
   XLOGF(
       DBG7,

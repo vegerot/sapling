@@ -5,18 +5,18 @@
  * GNU General Public License version 2.
  */
 
-#[cfg(feature = "eden")]
-pub mod edenfs;
-
+pub mod client;
 mod errors;
 mod filechangedetector;
 pub mod filesystem;
 pub mod git;
-mod metadata;
-pub mod physicalfs;
+pub mod metadata;
 pub mod sparse;
 pub mod status;
-mod util;
+pub mod util;
+pub mod wait;
 pub mod walker;
-pub mod watchmanfs;
+mod watchman_client;
 pub mod workingcopy;
+
+pub use workingcopy::WorkingCopy;

@@ -7,9 +7,7 @@
 
 from __future__ import absolute_import, print_function
 
-from hghave import require
-
-from sapling import error, peer, util, wireproto
+from sapling import error, peer, wireproto
 
 
 # equivalent of repo.repository
@@ -126,6 +124,7 @@ def unescapearg(escaped):
 
 # server side
 
+
 # equivalent of wireproto's global functions
 class server:
     def __init__(self, local):
@@ -169,6 +168,7 @@ class server:
 myserver = server(mylocal)
 
 # local side
+
 
 # equivalent of wireproto.encode/decodelist, that is, type-specific marshalling
 # here we just transform the strings a bit to check we're properly en-/decoding

@@ -51,10 +51,11 @@ _ignoreextensions = {
     "factotum",
     "fastmanifest",
     "fastpartialmatch",
+    "fbscmquery",
     "fbsparse",
     "fixcorrupt",
-    "graphlog",
     "gitlookup",
+    "graphlog",
     "hbisect",
     "hgcia",
     "hgk",
@@ -65,12 +66,16 @@ _ignoreextensions = {
     "morecolors",
     "mq",
     "nointerrupt",
-    "perftweaks",
-    "purge",
     "obsshelve",
-    "patchrmdir",
     "parentrevspec",
+    "patchrmdir",
+    "perftweaks",
+    "phabdiff",
+    "phabstatus",
+    "phrevset",
     "progress",
+    "pullcreatemarkers",
+    "purge",
     "releasenotes",
     "relink",
     "remoteid",
@@ -84,10 +89,6 @@ _ignoreextensions = {
 _exclude_list = {"extlib"}
 
 
-# root of the directory, or installed distribution
-_hgroot = os.path.abspath(os.path.join(__file__, "../../"))
-_sysroot = os.path.abspath(os.path.join(os.__file__, "../"))
-
 # List of extensions to always enable by default, unless overwritten by config.
 #
 # This allows us to integrate extensions into the codebase while leaving them in
@@ -100,8 +101,9 @@ DEFAULT_EXTENSIONS = {
     "githelp",
     "mergedriver",
     "progressfile",
-    "sampling",
     "remotefilelog",
+    "sampling",
+    "tweakdefaults",
 }
 
 # Similar to DEFAULT_EXTENSIONS. But cannot be disabled.
@@ -339,6 +341,9 @@ def load(ui, name, path):
         shortname = name
     if shortname in _ignoreextensions:
         return None
+
+    _loaded_extensions.add(shortname)
+
     if shortname in _extensions:
         return _extensions[shortname]
     _extensions[shortname] = None
@@ -354,21 +359,8 @@ def load(ui, name, path):
         if "ext" in sys.modules:
             ui.develwarn("extension %s imported incorrect modules" % name)
 
-    # Before we do anything with the extension, check against minimum stated
-    # compatibility. This gives extension authors a mechanism to have their
-    # extensions short circuit when loaded with a known incompatible version
-    # of Mercurial.
-    minver = getattr(mod, "minimumhgversion", None)
-    if minver and util.versiontuple(minver, 2) > util.versiontuple(n=2):
-        ui.warn(
-            _(
-                "(third party extension %s requires version %s or newer "
-                "of Mercurial; disabling)\n"
-            )
-            % (shortname, minver)
-        )
-        return
-    _validatecmdtable(ui, getattr(mod, "cmdtable", {}))
+    # the '_getattr()' triggers module import when the demand importer is active
+    _validatecmdtable(ui, _getattr(mod, "cmdtable", {}))
 
     _extensions[shortname] = mod
     _order.append(shortname)
@@ -377,11 +369,47 @@ def load(ui, name, path):
     return mod
 
 
+def _getattr(obj, name, default):
+    "getattr that verifies the name of AttributeError"
+    try:
+        return getattr(obj, name)
+    except AttributeError as e:
+        # AttributeError.name was added in 3.10, let's
+        # skip the check if Python version is < 3.10
+        if sys.version_info < (3, 10):
+            return default
+
+        if e.name == name:
+            return default
+        else:
+            raise
+
+
+_extension_being_loaded = None
+
+
+class _current_extension:
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        global _extension_being_loaded
+        self.prev_value = _extension_being_loaded
+        _extension_being_loaded = self.name
+        return None
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        global _extension_being_loaded
+        _extension_being_loaded = self.prev_value
+        return None
+
+
 def _runuisetup(name, ui):
     uisetup = getattr(_extensions[name], "uisetup", None)
     if uisetup:
         try:
-            uisetup(ui)
+            with _current_extension(name):
+                uisetup(ui)
         except Exception as inst:
             ui.traceback(force=True)
             msg = util.forcebytestr(inst)
@@ -390,6 +418,7 @@ def _runuisetup(name, ui):
                 notice=_("warning"),
             )
             return False
+
     return True
 
 
@@ -398,7 +427,8 @@ def _runextsetup(name, ui):
     if extsetup:
         try:
             try:
-                extsetup(ui)
+                with _current_extension(name):
+                    extsetup(ui)
             except TypeError:
                 # Try to use getfullargspec (Python 3) first, and fall
                 # back to getargspec only if it doesn't exist so as to
@@ -407,7 +437,8 @@ def _runextsetup(name, ui):
                     extsetup
                 ).args:
                     raise
-                extsetup()  # old extsetup with no ui argument
+                with _current_extension(name):
+                    extsetup()  # old extsetup with no ui argument
         except Exception as inst:
             ui.traceback(force=True)
             msg = util.forcebytestr(inst)
@@ -417,6 +448,17 @@ def _runextsetup(name, ui):
             )
             return False
     return True
+
+
+# Track which extensions are enabled for the current command invocation. This is for
+# debugruntest to disable extensions that were previously loaded in-process but are not
+# currently active.
+_loaded_extensions = set()
+
+
+def initialload(ui):
+    _loaded_extensions.clear()
+    loadall(ui)
 
 
 def loadall(ui, include_list=None):
@@ -437,7 +479,7 @@ def loadall(ui, include_list=None):
         result = [(k, v) for (k, v) in result if k in include_list]
 
     alreadyenabled = set(_order)
-    for (name, path) in result:
+    for name, path in result:
         if path:
             if path[0:1] == "!":
                 _disabledextensions[name] = path[1:]
@@ -642,6 +684,8 @@ def wrapcommand(table, command, wrapper, synopsis=None, docstring=None):
             key = alias
             break
 
+    wrapper = maybe_wrap_wrapper(wrapper)
+
     origfn = entry[0]
     wrap = functools.partial(util.checksignature(wrapper), util.checksignature(origfn))
     _updatewrapper(wrap, origfn, wrapper)
@@ -663,6 +707,8 @@ def wrapfilecache(cls, propname, wrapper):
     """
     propname = propname
     assert callable(wrapper)
+
+    wrapper = maybe_wrap_wrapper(wrapper)
     for currcls in cls.__mro__:
         if propname in currcls.__dict__:
             origfn = currcls.__dict__[propname].func
@@ -676,6 +722,22 @@ def wrapfilecache(cls, propname, wrapper):
 
     if currcls is object:
         raise AttributeError(r"type '%s' has no property '%s'" % (cls, propname))
+
+
+# For debugruntest, add an outer layer of wrapping so we can "disable" the inner wrapper
+# if the extension that installed the wrapper is not currently enabled.
+def maybe_wrap_wrapper(wrapper):
+    if not util.istest() or not _extension_being_loaded:
+        return wrapper
+
+    extname = _extension_being_loaded
+
+    def wrapperwrapper(origfn, *args, **kwargs):
+        if extname and not extname in _loaded_extensions:
+            return origfn(*args, **kwargs)
+        return wrapper(origfn, *args, **kwargs)
+
+    return wrapperwrapper
 
 
 class wrappedfunction:
@@ -728,6 +790,8 @@ def wrapfunction(container, funcname, wrapper):
     subclass trick.
     """
     assert callable(wrapper)
+
+    wrapper = maybe_wrap_wrapper(wrapper)
 
     origfn = getattr(container, funcname)
     assert callable(origfn)

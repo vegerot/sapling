@@ -49,7 +49,6 @@ pub fn mmap_bytes(file: &File, len: Option<u64>) -> io::Result<Bytes> {
         Ok(Bytes::new())
     } else {
         let bytes = Bytes::from(unsafe { MmapOptions::new().len(len as usize).map(file) }?);
-        #[cfg(unix)]
         crate::page_out::track_mmap_buffer(&bytes);
         Ok(bytes)
     }
@@ -264,10 +263,9 @@ pub(crate) fn mkdir_p(dir: impl AsRef<Path>) -> crate::Result<()> {
         fs::create_dir(dir).map(|_| {
             // fix_perm_path issues are not fatal
             let _ = fix_perm_path(dir, true);
-            ()
         })
     };
-    (|| -> crate::Result<()> {
+    {
         try_mkdir_once().or_else(|err| {
             match err.kind() {
                 io::ErrorKind::AlreadyExists => return Ok(()),
@@ -297,7 +295,7 @@ pub(crate) fn mkdir_p(dir: impl AsRef<Path>) -> crate::Result<()> {
             }
             Err(err).context(dir, "cannot mkdir")
         })
-    })()
+    }
 }
 
 /// Attempt to chmod a path.

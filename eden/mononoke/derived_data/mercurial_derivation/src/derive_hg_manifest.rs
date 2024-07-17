@@ -17,7 +17,6 @@ use blobstore::Loadable;
 use cloned::cloned;
 use context::CoreContext;
 use futures::channel::mpsc;
-use futures::compat::Future01CompatExt;
 use futures::future;
 use futures::future::try_join_all;
 use futures::future::BoxFuture;
@@ -29,6 +28,7 @@ use manifest::flatten_subentries;
 use manifest::Entry;
 use manifest::LeafInfo;
 use manifest::ManifestChanges;
+use manifest::SortedVectorTrieMap;
 use manifest::Traced;
 use manifest::TreeInfo;
 use mercurial_types::blobs::ContentBlobMeta;
@@ -39,12 +39,12 @@ use mercurial_types::blobs::UploadHgTreeEntry;
 use mercurial_types::manifest::Type as HgManifestType;
 use mercurial_types::HgFileNodeId;
 use mercurial_types::HgManifestId;
+use mononoke_types::path::MPath;
 use mononoke_types::ChangesetId;
 use mononoke_types::FileType;
 use mononoke_types::NonRootMPath;
 use mononoke_types::RepoPath;
 use mononoke_types::TrackedFileChange;
-use mononoke_types::TrieMap;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::derive_hg_changeset::store_file_change;
@@ -106,7 +106,7 @@ pub async fn derive_simple_hg_manifest_stack_without_copy_info(
                             store_file_change(
                                 ctx,
                                 blobstore,
-                                parents.get(0).map(|p| p.untraced().1),
+                                parents.first().map(|p| p.untraced().1),
                                 None,
                                 &path,
                                 &leaf,
@@ -169,7 +169,7 @@ pub async fn derive_hg_manifest(
         None => {
             // All files have been deleted, generate empty **root** manifest
             let tree_info = TreeInfo {
-                path: None,
+                path: MPath::ROOT,
                 parents,
                 subentries: Default::default(),
             };
@@ -189,7 +189,7 @@ async fn create_hg_manifest(
         Traced<ParentIndex, HgManifestId>,
         Traced<ParentIndex, (FileType, HgFileNodeId)>,
         (),
-        TrieMap<
+        SortedVectorTrieMap<
             Entry<Traced<ParentIndex, HgManifestId>, Traced<ParentIndex, (FileType, HgFileNodeId)>>,
         >,
     >,
@@ -265,7 +265,7 @@ async fn create_hg_manifest(
         contents.push(b'\n')
     }
 
-    let path = match path {
+    let path = match path.into_optional_non_root_path() {
         None => RepoPath::RootPath,
         Some(path) => RepoPath::DirectoryPath(path),
     };
@@ -285,7 +285,7 @@ async fn create_hg_manifest(
     .upload(ctx, blobstore);
 
     let (mfid, upload_fut) = match uploader {
-        Ok((mfid, fut)) => (mfid, fut.compat().map_ok(|_| ())),
+        Ok((mfid, fut)) => (mfid, fut.map_ok(|_| ())),
         Err(e) => return Err(e),
     };
 

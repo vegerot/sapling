@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-strict
+
 import ctypes
 import datetime
 import sys
@@ -47,33 +49,29 @@ else:
     # checking for us.
     class _win32:
         @staticmethod
-        def OpenProcess(desired_access: int, inherit_handle: bool, pid: int) -> _HANDLE:
-            ...
+        def OpenProcess(
+            desired_access: int, inherit_handle: bool, pid: int
+        ) -> _HANDLE: ...
 
         @staticmethod
         def OpenProcessToken(
             handle: _HANDLE, desired_access: int, token_handle: _PHANDLE
-        ) -> bool:
-            ...
+        ) -> bool: ...
 
         @staticmethod
-        def CloseHandle(handle: _HANDLE) -> None:
-            ...
+        def CloseHandle(handle: _HANDLE) -> None: ...
 
         @staticmethod
-        def TerminateProcess(handle: _HANDLE, exit_code: int) -> bool:
-            ...
+        def TerminateProcess(handle: _HANDLE, exit_code: int) -> bool: ...
 
         @staticmethod
-        def GetExitCodeProcess(handle: _HANDLE, exit_code: _LPDWORD) -> _BOOL:
-            ...
+        def GetExitCodeProcess(handle: _HANDLE, exit_code: _LPDWORD) -> _BOOL: ...
 
     class psapi:
         @staticmethod
         def GetProcessImageFileNameW(
             handle: _HANDLE, fileName: _LPWSTR, size: _DWORD
-        ) -> _DWORD:
-            ...
+        ) -> _DWORD: ...
 
     class advapi32:
         @staticmethod
@@ -83,11 +81,9 @@ else:
             token_information: ctypes._CArgObject,
             token_information_length: _DWORD,
             return_length: _PDWORD,
-        ) -> bool:
-            ...
+        ) -> bool: ...
 
-    def raise_win_error() -> NoReturn:
-        ...
+    def raise_win_error() -> NoReturn: ...
 
 
 _PROCESS_TERMINATE = 0x0001
@@ -139,7 +135,11 @@ def open_process(pid: int, access: int = _PROCESS_QUERY_LIMITED_INFORMATION) -> 
 def open_process_token(process_handle: Handle) -> Handle:
     token_handle = Handle.make_empty()
     if not _win32.OpenProcessToken(
-        process_handle.handle, _TOKEN_READ, token_handle.asref()
+        process_handle.handle,
+        _TOKEN_READ,
+        # pyre-fixme[6]: For 3rd argument expected `_PHANDLE` but got
+        #  `_Pointer[c_void_p]`.
+        token_handle.asref(),
     ):
         raise_win_error()
 
@@ -155,6 +155,8 @@ def is_token_elevated(token_handle: Handle) -> bool:
             _TOKEN_ELEVATION,
             ctypes.byref(elevation),
             ctypes.c_ulong(ctypes.sizeof(elevation)),
+            # pyre-fixme[6]: For 5th argument expected `_PDWORD` but got
+            #  `_Pointer[c_ulong]`.
             ctypes.pointer(output_size),
         )
         == 0
@@ -184,6 +186,7 @@ def get_exit_code(handle: Handle) -> Optional[int]:
     """
     STILL_ACTIVE = 259
     exit_code = _DWORD()
+    # pyre-fixme[6]: For 2nd argument expected `_LPDWORD` but got `_Pointer[c_ulong]`.
     if _win32.GetExitCodeProcess(handle.handle, ctypes.pointer(exit_code)) == 0:
         raise_win_error()
 

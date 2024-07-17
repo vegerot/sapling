@@ -1,4 +1,7 @@
-#debugruntest-compatible
+#modern-config-incompatible
+
+#require no-eden
+
 
 Push treeonly commits from a treeonly shallow repo to a treeonly server
 

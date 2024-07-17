@@ -1,6 +1,4 @@
-#debugruntest-compatible
 
-  $ eagerepo
   $ addcommit () {
   >     echo $1 > $1
   >     hg add $1
@@ -11,8 +9,7 @@
   >     hg commit -d "${2} 0" -m $1
   > }
 
-  $ hg init a
-  $ cd a
+  $ newclientrepo a
   $ addcommit "A" 0
   $ addcommit "B" 1
   $ echo "C" >> A
@@ -36,7 +33,9 @@ Correct the conflict without marking the file as resolved
 
   $ echo "ABCD" > A
   $ hg commit -m "Merged"
-  abort: unresolved merge conflicts (see 'hg help resolve')
+  abort: unresolved merge state
+  (use 'hg resolve' to continue or
+       'hg goto --clean' to abort - WARNING: will destroy uncommitted changes)
   [255]
 
 Mark the conflict as resolved and commit
@@ -58,7 +57,9 @@ Test that if a file is removed but not marked resolved, the commit still fails
   [1]
   $ hg rm --force A
   $ hg commit -m merged
-  abort: unresolved merge conflicts (see 'hg help resolve')
+  abort: unresolved merge state
+  (use 'hg resolve' to continue or
+       'hg goto --clean' to abort - WARNING: will destroy uncommitted changes)
   [255]
 
   $ hg resolve -ma

@@ -52,7 +52,7 @@ def extsetup(ui):
 def mvcheck(orig, ui, repo, *pats, **opts):
     """Hook to check for moves at commit time"""
     renames = None
-    disabled = opts.pop("no_automv", False) or opts.pop("no-move-detection", False)
+    disabled = opts.pop("no_automv", False) or opts.pop("no_move_detection", False)
     if not disabled:
         threshold = ui.configint("automv", "similarity")
         if not 0 <= threshold <= 100:
@@ -82,7 +82,7 @@ def _interestingfiles(repo, matcher, maxfiles):
     added = stat[1]
     removed = stat[2]
 
-    copy = copies._forwardcopies(repo["."], repo[None], matcher)
+    copy = copies.pathcopies(repo["."], repo[None], matcher)
     # remove the copy files for which we already have copy info
     added = [f for f in added if f not in copy]
 

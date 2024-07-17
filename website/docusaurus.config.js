@@ -58,7 +58,7 @@ const config = {
           ],
         },
         staticDocsProject: 'sapling',
-        trackingFile: 'xplat/staticdocs/WATCHED_FILES',
+        trackingFile: 'fbcode/staticdocs/WATCHED_FILES',
         'remark-code-snippets': {
           baseDir: '..',
         },
@@ -84,6 +84,11 @@ const config = {
           src: 'img/Sapling_icon-dark-green.svg',
         },
         items: [
+          {
+            href: '/docs/introduction/',
+            label: 'Documentation',
+            position: 'left',
+          },
           // Please keep GitHub link to the right for consistency.
           {
             href: gitHubRepo,
@@ -182,11 +187,6 @@ const config = {
         },
       };
     },
-
-    [require.resolve('docusaurus-lunr-search'), {
-        excludeRoutes: [
-        ]
-    }]
   ],
 };
 

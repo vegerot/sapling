@@ -174,11 +174,16 @@ def createremote(ui, repo, **opts) -> None:
     overrides = {}
     if ui.plain():
         overrides[("ui", "quiet")] = True
-    with repo.lock(), repo.transaction("snapshot"), ui.configoverride(overrides):
+    with repo.wlock(), repo.lock(), repo.transaction("snapshot"), ui.configoverride(
+        overrides
+    ):
         # Current working context
         wctx = repo[None]
 
         hgparents = parentsfromwctx(ui, wctx)
+        if hgparents is None:
+            raise error.Abort(_("snapshot creation requires working copy checkout"))
+
         _backupparents(repo, wctx)
 
         (time, tz) = wctx.date()

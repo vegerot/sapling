@@ -7,7 +7,10 @@
 
 #pragma once
 
-#include "eden/fs/utils/PathFuncs.h"
+#include <folly/portability/GFlags.h>
+#include "eden/common/utils/PathFuncs.h"
+
+DECLARE_string(hgPath);
 
 namespace facebook::eden {
 AbsolutePath findAndConfigureHgBinary();

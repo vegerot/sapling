@@ -9,33 +9,61 @@
 //!
 //! The graph of all commits in the repository.
 
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use anyhow::anyhow;
+use anyhow::bail;
 use anyhow::Result;
 use borrowed::borrowed;
 use commit_graph_types::edges::ChangesetNode;
-use commit_graph_types::edges::ChangesetParents;
+pub use commit_graph_types::edges::ChangesetParents;
+use commit_graph_types::frontier::AncestorsWithinDistance;
+use commit_graph_types::frontier::ChangesetFrontierWithinDistance;
+use commit_graph_types::segments::BoundaryChangesets;
+use commit_graph_types::segments::ChangesetSegment;
+use commit_graph_types::segments::SegmentDescription;
+use commit_graph_types::segments::SegmentedSliceDescription;
 use commit_graph_types::storage::CommitGraphStorage;
 use commit_graph_types::storage::Prefetch;
+use commit_graph_types::storage::PrefetchTarget;
 use context::CoreContext;
 use futures::stream;
 use futures::stream::BoxStream;
+use futures::stream::FuturesUnordered;
 use futures::Future;
+use futures::FutureExt;
 use futures::StreamExt;
+use futures::TryFutureExt;
 use futures::TryStreamExt;
+use itertools::Itertools;
+use memwrites_commit_graph_storage::MemWritesCommitGraphStorage;
 use mononoke_types::ChangesetId;
 use mononoke_types::ChangesetIdPrefix;
 use mononoke_types::ChangesetIdsResolvedFromPrefix;
 use mononoke_types::Generation;
+use mononoke_types::FIRST_GENERATION;
+use smallvec::smallvec;
 
 pub use crate::ancestors_stream::AncestorsStreamBuilder;
+pub use crate::compat::ParentsFetcher;
+pub use crate::linear::LinearAncestorsStreamBuilder;
+pub use crate::writer::ArcCommitGraphWriter;
+pub use crate::writer::BaseCommitGraphWriter;
+pub use crate::writer::CommitGraphWriter;
+pub use crate::writer::CommitGraphWriterArc;
+pub use crate::writer::CommitGraphWriterRef;
+pub use crate::writer::LoggingCommitGraphWriter;
 
 mod ancestors_stream;
 mod compat;
 mod core;
 mod frontier;
+mod linear;
 mod segments;
+mod writer;
 
 /// Commit Graph.
 ///
@@ -51,15 +79,30 @@ pub struct CommitGraph {
 }
 
 impl CommitGraph {
-    pub fn new(storage: Arc<dyn CommitGraphStorage>) -> CommitGraph {
-        CommitGraph { storage }
+    pub fn new(storage: Arc<dyn CommitGraphStorage>) -> Self {
+        Self { storage }
+    }
+
+    pub fn clone_with_replaced_storage(
+        &self,
+        replace_fn: impl FnOnce(Arc<dyn CommitGraphStorage>) -> Arc<dyn CommitGraphStorage>,
+    ) -> Self {
+        Self {
+            storage: replace_fn(self.storage.clone()),
+        }
+    }
+
+    pub fn with_memwrites_storage(self) -> Self {
+        Self {
+            storage: Arc::new(MemWritesCommitGraphStorage::new(self.storage)),
+        }
     }
 
     /// Add a new changeset to the commit graph.
     ///
     /// Returns true if a new changeset was inserted, or false if the
     /// changeset already existed.
-    pub async fn add(
+    pub(crate) async fn add(
         &self,
         ctx: &CoreContext,
         cs_id: ChangesetId,
@@ -68,7 +111,10 @@ impl CommitGraph {
         let parent_edges = self
             .storage
             .fetch_many_edges(ctx, &parents, Prefetch::None)
-            .await?;
+            .await?
+            .into_iter()
+            .map(|(k, v)| (k, v.into()))
+            .collect();
 
         self.storage
             .add(
@@ -118,20 +164,33 @@ impl CommitGraph {
         Ok(edges.node.generation)
     }
 
+    /// Return only the changesets that are found in the commit graph.
+    pub async fn known_changesets(
+        &self,
+        ctx: &CoreContext,
+        cs_ids: Vec<ChangesetId>,
+    ) -> Result<Vec<ChangesetId>> {
+        let edges = self
+            .storage
+            .maybe_fetch_many_edges(ctx, &cs_ids, Prefetch::None)
+            .await?;
+        Ok(edges.into_keys().collect())
+    }
+
     /// Returns a frontier for the ancestors of heads
     /// that satisfy a given property.
     ///
     /// Note: The property needs to be monotonic i.e. if the
     /// property holds for one changeset then it has to hold
     /// for all its parents.
-    pub async fn ancestors_frontier_with<MonotonicProperty, Out>(
-        &self,
-        ctx: &CoreContext,
+    pub async fn ancestors_frontier_with<'a, MonotonicProperty, Out>(
+        &'a self,
+        ctx: &'a CoreContext,
         heads: Vec<ChangesetId>,
         monotonic_property: MonotonicProperty,
     ) -> Result<Vec<ChangesetId>>
     where
-        MonotonicProperty: Fn(ChangesetId) -> Out + Send + Sync + 'static,
+        MonotonicProperty: Fn(ChangesetId) -> Out + Send + Sync + 'a,
         Out: Future<Output = Result<bool>>,
     {
         let mut ancestors_frontier = vec![];
@@ -216,6 +275,120 @@ impl CommitGraph {
             .await?
             .try_collect()
             .await
+    }
+
+    /// Returns all ancestors of any changeset in `heads` that are reachable
+    /// by taking no more than `max_distance` edges from some changeset in `heads`,
+    /// as well as the boundary changesets which are the changesets for which
+    /// the shortest distance to them is exactly `max_distance`.
+    /// NOTE: The ancestors property of AncestorsWithinDistance represents the ancestors
+    /// which are inside the boundary. The boundary ancestors are represented via the
+    /// boundaries field.
+    pub async fn ancestors_within_distance(
+        &self,
+        ctx: &CoreContext,
+        heads: Vec<ChangesetId>,
+        max_distance: u64,
+    ) -> Result<AncestorsWithinDistance> {
+        let cs_id_and_distance = self
+            .ancestors_within_distance_stream(ctx, heads, max_distance)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let (boundary, ancestors): (Vec<_>, Vec<_>) = cs_id_and_distance
+            .iter()
+            .partition(|(_, distance)| *distance == max_distance);
+
+        Ok(AncestorsWithinDistance {
+            ancestors: ancestors.into_iter().map(|(cs_id, _)| cs_id).collect(),
+            boundaries: boundary.into_iter().map(|(cs_id, _)| cs_id).collect(),
+        })
+    }
+
+    /// Returns a stream of all ancestors of any changeset in `heads` that are
+    /// reachable by taking no more than `max_distance` edges from some changeset
+    /// in `heads`. For each changeset we returns its changeset id alongside
+    /// the minimum distance it takes to reach the changeset.
+    pub async fn ancestors_within_distance_stream(
+        &self,
+        ctx: &CoreContext,
+        heads: Vec<ChangesetId>,
+        max_distance: u64,
+    ) -> Result<BoxStream<'static, Result<(ChangesetId, u64)>>> {
+        let frontier = self
+            .frontier_within_distance(ctx, heads, max_distance)
+            .await?;
+
+        struct AncestorsWithinDistanceState {
+            commit_graph: CommitGraph,
+            ctx: CoreContext,
+            frontier: ChangesetFrontierWithinDistance,
+        }
+
+        Ok(stream::try_unfold(
+            Box::new(AncestorsWithinDistanceState {
+                commit_graph: self.clone(),
+                ctx: ctx.clone(),
+                frontier,
+            }),
+            move |mut state| async move {
+                let AncestorsWithinDistanceState {
+                    commit_graph,
+                    ctx,
+                    frontier,
+                } = &mut *state;
+
+                if let Some((_generation, cs_ids_and_remaining_distance)) = frontier.pop_last() {
+                    let output_cs_ids = cs_ids_and_remaining_distance
+                        .iter()
+                        .map(|(cs_id, remaining_distance)| (*cs_id, max_distance - *remaining_distance))
+                        .collect::<Vec<_>>();
+
+                    let max_remaining_distance = cs_ids_and_remaining_distance.values().copied()
+                        .max()
+                        .unwrap_or_default();
+
+                    let cs_ids_to_lower = cs_ids_and_remaining_distance
+                        .iter()
+                        .filter(|(_, distance)| **distance >= 1)
+                        .map(|(cs_id, _)| *cs_id)
+                        .collect::<Vec<_>>();
+
+                    let all_edges = commit_graph
+                        .storage
+                        .fetch_many_edges(
+                            ctx,
+                            &cs_ids_to_lower,
+                            Prefetch::Hint(PrefetchTarget::LinearAncestors {
+                                generation: FIRST_GENERATION,
+                                steps: max_remaining_distance + 1,
+                            }),
+                        )
+                        .await?;
+
+                    for (cs_id, edges) in all_edges.into_iter() {
+                        let distance = *cs_ids_and_remaining_distance
+                            .get(&cs_id)
+                            .ok_or_else(|| anyhow!("missing distance for changeset {} (in CommitGraph::ancestors_within_distance)", cs_id))?;
+                        for parent in edges.parents.iter() {
+                            let parent_distance = frontier
+                                .entry(parent.generation)
+                                .or_default()
+                                .entry(parent.cs_id)
+                                .or_default();
+                            *parent_distance = std::cmp::max(*parent_distance, distance - 1);
+                        }
+                    }
+
+                    anyhow::Ok(Some((stream::iter(output_cs_ids).map(Ok), state)))
+                } else {
+                    Ok(None)
+                }
+            },
+        )
+        .try_flatten()
+        .boxed())
     }
 
     /// Returns a stream of all changesets that are both descendants of
@@ -322,7 +495,7 @@ impl CommitGraph {
         heads: Vec<ChangesetId>,
         needs_processing: NeedsProcessing,
         slice_size: u64,
-    ) -> Result<Vec<(u64, Vec<ChangesetId>)>>
+    ) -> Result<Vec<(Generation, Vec<ChangesetId>)>>
     where
         NeedsProcessing: Fn(Vec<ChangesetId>) -> Out,
         Out: Future<Output = Result<HashSet<ChangesetId>>>,
@@ -355,10 +528,14 @@ impl CommitGraph {
             // Only push changesets that are in this slice's range.
             // Any remaining changesets will be pushed in the next iterations.
             slices.push((
-                slice_start,
-                frontier.changesets_in_range(
-                    Generation::new(slice_start)..Generation::new(slice_start + slice_size),
-                ),
+                Generation::new(slice_start),
+                frontier
+                    .changesets_in_range(
+                        Generation::new(slice_start)..Generation::new(slice_start + slice_size),
+                    )
+                    // Sort to make the output deterministic.
+                    .sorted()
+                    .collect(),
             ));
 
             if slice_start > 1 {
@@ -374,6 +551,215 @@ impl CommitGraph {
         Ok(slices.into_iter().rev().collect())
     }
 
+    /// Slices ancestors of `heads` excluding ancestors of `common` into a sequence
+    /// of topologically ordered segmented slices for processing.
+    ///
+    /// Returns a tuple of the slices and the boundary changesets between the slices.
+    /// A boundary changeset is any changeset that is a parent of another changeset in
+    /// another slice.
+    ///
+    /// Each slice consists of a sequence of topologically ordered segments, and every segment
+    /// is represented using the changeset ids of its head and its base. Each slice is guaranteed
+    /// to have size equal to `slice_size` except possibly the last one which may be smaller.
+    pub async fn segmented_slice_ancestors(
+        &self,
+        ctx: &CoreContext,
+        heads: Vec<ChangesetId>,
+        common: Vec<ChangesetId>,
+        slice_size: u64,
+    ) -> Result<(Vec<SegmentedSliceDescription>, BoundaryChangesets)> {
+        let segments = self
+            .ancestors_difference_segments(ctx, heads, common)
+            .await?;
+
+        // Sort the segments in dfs order to try to minimize the number of boundary changesets.
+        let segments = Self::dfs_order_segments(ctx, segments);
+
+        // Go through the segments and try to add each to the current slice if the total
+        // number of changesets in the slice wouldn't exceed `slice_size`. Otherwise,
+        // split the current segment into two parts such that the first has `slice_size`
+        // - `current_slice_size` changesets and the second has the rest, then add the first
+        // part to the current slice and continue from the second part.
+
+        let mut slices = vec![];
+        let mut boundary_changesets: BoundaryChangesets = Default::default();
+
+        let mut current_segments = vec![];
+        let mut current_slice_heads: BTreeMap<ChangesetId, u64> = Default::default();
+        let mut current_slice_size = 0;
+
+        for mut segment in segments {
+            loop {
+                // Current slice is full. Add it to the list of slices and create a new one.
+                if current_slice_size == slice_size {
+                    slices.push(SegmentedSliceDescription {
+                        segments: std::mem::take(&mut current_segments),
+                    });
+                    current_slice_heads.clear();
+                    current_slice_size = 0;
+                }
+
+                // Go through all parents of the current segment and check if they are
+                // contained in another slice. If so, add them to boundary changesets.
+                for parent in segment.parents {
+                    // Check that the parent has a location. Otherwise it's part of
+                    // ancestors of `common` and shouldn't be added to boundary changesets.
+                    if let Some(location) = parent.location {
+                        // Parent is part of another slice if its location is either relative
+                        // to a head of a segment belonging to another slice or to a segment
+                        // belonging to the current slice but the distance is greater than
+                        // that segment length (which would mean that it belonged to the
+                        // first part of a segment that was split)
+                        match current_slice_heads.get(&location.head) {
+                            Some(length) if location.distance < *length => {}
+                            _ => {
+                                boundary_changesets.insert(parent.cs_id);
+                            }
+                        }
+                    }
+                }
+
+                if current_slice_size + segment.length <= slice_size {
+                    // Adding the current segment wouldn't cause the current slice to exceed
+                    // `slice_size`.
+                    current_segments.push(SegmentDescription {
+                        head: segment.head,
+                        base: segment.base,
+                    });
+                    current_slice_heads.insert(segment.head, segment.length);
+                    current_slice_size += segment.length;
+
+                    break;
+                } else {
+                    // Split the current segment into two parts.
+                    let split_cs_ids = self
+                        .locations_to_changeset_ids(
+                            ctx,
+                            segment.head,
+                            current_slice_size + segment.length - slice_size - 1,
+                            2,
+                        )
+                        .await?;
+
+                    let (split_base, split_head) = match split_cs_ids.as_slice() {
+                        [split_base, split_head] => (*split_base, *split_head),
+                        _ => {
+                            bail!(
+                                "Programmer error: split_cs_ids must have exactly two changeset ids"
+                            )
+                        }
+                    };
+
+                    // Add the first part to the current slice.
+                    current_segments.push(SegmentDescription {
+                        head: split_head,
+                        base: segment.base,
+                    });
+
+                    // The split head is a parent of the upcoming slice so
+                    // it's a boundary changeset.
+                    boundary_changesets.insert(split_head);
+
+                    // Continue loop using the second part of the segment.
+                    segment = ChangesetSegment {
+                        head: segment.head,
+                        base: split_base,
+                        length: current_slice_size + segment.length - slice_size,
+                        parents: smallvec![],
+                    };
+
+                    // Current slice is full. Add it to the list of slices and create a new one.
+                    slices.push(SegmentedSliceDescription {
+                        segments: std::mem::take(&mut current_segments),
+                    });
+                    current_slice_heads.clear();
+                    current_slice_size = 0;
+                }
+            }
+        }
+
+        // Make sure to add the last slice to the list of slices.
+        if current_slice_size > 0 {
+            slices.push(SegmentedSliceDescription {
+                segments: current_segments,
+            });
+        }
+
+        Ok((slices, boundary_changesets))
+    }
+
+    /// Runs the given `process` closure on all of the given changesets in local topological
+    /// order, running as many of them concurrently as possible.
+    ///
+    /// Note: local topological order here means that all parents of a changeset that are
+    /// contained in the input `cs_ids` are processed before itself, but if two changesets
+    /// are ancestors of each other and some of the changesets in the path betwen them are
+    /// not given in `cs_ids`, they are not guaranteed to be processed in topological order.
+    pub async fn process_topologically<Process, Fut>(
+        &self,
+        ctx: &CoreContext,
+        cs_ids: Vec<ChangesetId>,
+        process: Process,
+    ) -> Result<()>
+    where
+        Process: Fn(ChangesetId) -> Fut,
+        Fut: Future<Output = Result<()>> + Send,
+    {
+        // For each changeset in `cs_ids` this stores all other changesets that are in
+        // `cs_ids` that are immediate children of it.
+        let mut rdeps: HashMap<ChangesetId, HashSet<ChangesetId>> = Default::default();
+
+        // For each changeset in `cs_ids` this stores the number of other changesets in
+        // `cs_ids` that are immediate parents of it.
+        let mut deps_count: HashMap<ChangesetId, usize> = Default::default();
+
+        let all_edges = self
+            .storage
+            .fetch_many_edges(ctx, &cs_ids, Prefetch::None)
+            .await?;
+
+        let cs_ids = cs_ids.into_iter().collect::<HashSet<_>>();
+
+        for (cs_id, edges) in all_edges.iter() {
+            for parent in edges.parents.iter() {
+                if cs_ids.contains(&parent.cs_id) {
+                    rdeps.entry(parent.cs_id).or_default().insert(*cs_id);
+                    *deps_count.entry(*cs_id).or_default() += 1;
+                }
+            }
+        }
+
+        // futs contain a future produced by `process` for all changesets that have
+        // no dependencies left. All executing concurrently.
+        let mut futs: FuturesUnordered<_> = Default::default();
+
+        for cs_id in cs_ids {
+            if !deps_count.contains_key(&cs_id) {
+                futs.push(process(cs_id).map_ok(move |()| cs_id).boxed());
+            }
+        }
+
+        while let Some(result) = futs.next().await {
+            let cs_id = result?;
+
+            // After we finish process a changeset, we go through it's reverse dependencies
+            // and subtract one from their dependency count. If the count reaches zero, we
+            // add a new future to futs to begin processing it.
+            let children = rdeps.get(&cs_id).into_iter().flatten();
+            for child in children {
+                let entry = deps_count.get_mut(child).ok_or_else(|| {
+                    anyhow!("deps_count for a child can't be 0 (in process_topologically)")
+                })?;
+                *entry -= 1;
+                if *entry == 0 {
+                    futs.push(process(*child).map_ok(move |()| *child).boxed());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Returns the children of a single changeset.
     pub async fn changeset_children(
         &self,
@@ -381,5 +767,39 @@ impl CommitGraph {
         cs_id: ChangesetId,
     ) -> Result<Vec<ChangesetId>> {
         self.storage.fetch_children(ctx, cs_id).await
+    }
+
+    /// Returns the union of descendants of `cs_ids`.
+    pub async fn descendants(
+        &self,
+        ctx: &CoreContext,
+        cs_ids: Vec<ChangesetId>,
+    ) -> Result<Vec<ChangesetId>> {
+        let mut visited: HashSet<ChangesetId> = cs_ids.iter().copied().collect();
+        let mut descendants: Vec<ChangesetId> = cs_ids.clone();
+
+        // We will add a future for every traversed changeset to futs to
+        // fetch its children.
+        let mut futs: FuturesUnordered<_> = Default::default();
+
+        // Add children of initial changesets.
+        for cs_id in cs_ids {
+            futs.push(self.changeset_children(ctx, cs_id));
+        }
+
+        while let Some(result) = futs.next().await {
+            let children = result?;
+
+            for child in children {
+                // If we haven't traversed this changeset yet, add it to the output
+                // and add a future to fetch its children to futs.
+                if visited.insert(child) {
+                    descendants.push(child);
+                    futs.push(self.changeset_children(ctx, child));
+                }
+            }
+        }
+
+        Ok(descendants)
     }
 }

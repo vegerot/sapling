@@ -5,9 +5,10 @@
  * GNU General Public License version 2.
  */
 
-use std::collections::HashSet;
+use std::borrow::Cow;
 use std::future::Future;
 use std::net::IpAddr;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -26,8 +27,8 @@ use futures_stats::FutureStats;
 use futures_stats::TimedFutureExt;
 use identity::Identity;
 use login_objects_thrift::EnvironmentType;
-use maplit::hashset;
 use megarepo_api::MegarepoApi;
+use memory::MemoryStats;
 use metaconfig_types::CommonConfig;
 use metadata::Metadata;
 use mononoke_api::ChangesetContext;
@@ -41,23 +42,23 @@ use mononoke_api::RepoContext;
 use mononoke_api::SessionContainer;
 use mononoke_api::TreeContext;
 use mononoke_api::TreeId;
+use mononoke_configs::MononokeConfigs;
 use mononoke_types::hash::Sha1;
 use mononoke_types::hash::Sha256;
-use once_cell::sync::Lazy;
 use permission_checker::MononokeIdentity;
 use permission_checker::MononokeIdentitySet;
 use repo_authorization::AuthorizationContext;
 use scribe_ext::Scribe;
 use scuba_ext::MononokeScubaSampleBuilder;
 use scuba_ext::ScubaValue;
+use slog::debug;
 use slog::Logger;
 use source_control as thrift;
-use source_control::server::SourceControlService;
-use source_control::services::source_control_service as service;
+use source_control_services::errors::source_control_service as service;
+use source_control_services::SourceControlService;
 use srserver::RequestContext;
 use stats::prelude::*;
 use time_ext::DurationExt;
-use tunables::tunables;
 
 use crate::commit_id::CommitIdExt;
 use crate::errors;
@@ -70,8 +71,11 @@ use crate::specifiers::SpecifierExt;
 
 const FORWARDED_IDENTITIES_HEADER: &str = "scm_forwarded_identities";
 const FORWARDED_CLIENT_IP_HEADER: &str = "scm_forwarded_client_ip";
+const FORWARDED_CLIENT_PORT_HEADER: &str = "scm_forwarded_client_port";
 const FORWARDED_CLIENT_DEBUG_HEADER: &str = "scm_forwarded_client_debug";
 const FORWARDED_OTHER_CATS_HEADER: &str = "scm_forwarded_other_cats";
+const PER_REQUEST_READ_QPS: usize = 4000;
+const PER_REQUEST_WRITE_QPS: usize = 4000;
 
 define_stats! {
     prefix = "mononoke.scs_server";
@@ -80,6 +84,7 @@ define_stats! {
     total_request_internal_failure: timeseries(Rate, Sum),
     total_request_invalid: timeseries(Rate, Sum),
     total_request_cancelled: timeseries(Rate, Sum),
+    total_request_overloaded: timeseries(Rate, Sum),
 
     // permille is used in canaries, because canaries do not allow for tracking formulas
     total_request_internal_failure_permille: timeseries(Average),
@@ -88,8 +93,6 @@ define_stats! {
     // Duration per method
     method_completion_time_ms: dynamic_histogram("method.{}.completion_time_ms", (method: String); 10, 0, 1_000, Average, Sum, Count; P 5; P 50 ; P 90),
 }
-
-static POPULAR_METHODS: Lazy<HashSet<&'static str>> = Lazy::new(|| hashset! {});
 
 #[derive(Clone)]
 pub(crate) struct SourceControlServiceImpl {
@@ -100,6 +103,7 @@ pub(crate) struct SourceControlServiceImpl {
     pub(crate) scuba_builder: MononokeScubaSampleBuilder,
     pub(crate) identity: Identity,
     pub(crate) scribe: Scribe,
+    pub(crate) configs: Arc<MononokeConfigs>,
     identity_proxy_checker: Arc<ConnectionSecurityChecker>,
 }
 
@@ -114,6 +118,7 @@ impl SourceControlServiceImpl {
         mut scuba_builder: MononokeScubaSampleBuilder,
         scribe: Scribe,
         identity_proxy_checker: ConnectionSecurityChecker,
+        configs: Arc<MononokeConfigs>,
         common_config: &CommonConfig,
     ) -> Self {
         scuba_builder.add_common_server_data();
@@ -129,6 +134,7 @@ impl SourceControlServiceImpl {
                 common_config.internal_identity.id_data.as_str(),
             ),
             scribe,
+            configs,
             identity_proxy_checker: Arc::new(identity_proxy_checker),
         }
     }
@@ -180,15 +186,15 @@ impl SourceControlServiceImpl {
             }
         }
 
-        let sampling_rate = core::num::NonZeroU64::new(if POPULAR_METHODS.contains(name) {
-            tunables()
-                .scs_popular_methods_sampling_rate()
-                .unwrap_or_default() as u64
-        } else {
-            tunables()
-                .scs_other_methods_sampling_rate()
-                .unwrap_or_default() as u64
-        });
+        if let Some(config_info) = self.configs.as_ref().config_info().as_ref() {
+            scuba.add("config_store_version", config_info.content_hash.clone());
+            scuba.add("config_store_last_updated_at", config_info.last_updated_at);
+        }
+
+        let sampling_rate =
+            justknobs::get_as::<u64>("scm/mononoke:scs_method_sampling_rate", Some(name))
+                .ok()
+                .and_then(NonZeroU64::new);
         if let Some(sampling_rate) = sampling_rate {
             scuba.sampled(sampling_rate);
         } else {
@@ -259,9 +265,10 @@ impl SourceControlServiceImpl {
             .await;
 
         if is_trusted {
-            if let (Some(forwarded_identities), Some(forwarded_ip)) = (
+            if let (Some(forwarded_identities), Some(forwarded_ip), Some(forwarded_port)) = (
                 header(FORWARDED_IDENTITIES_HEADER)?,
                 header(FORWARDED_CLIENT_IP_HEADER)?,
+                header(FORWARDED_CLIENT_PORT_HEADER)?,
             ) {
                 let mut header_identities: MononokeIdentitySet =
                     serde_json::from_str(forwarded_identities.as_str())
@@ -269,6 +276,11 @@ impl SourceControlServiceImpl {
                 let client_ip = Some(
                     forwarded_ip
                         .parse::<IpAddr>()
+                        .map_err(errors::invalid_request)?,
+                );
+                let client_port = Some(
+                    forwarded_port
+                        .parse::<u16>()
                         .map_err(errors::invalid_request)?,
                 );
                 let client_debug = header(FORWARDED_CLIENT_DEBUG_HEADER)?.is_some();
@@ -281,6 +293,7 @@ impl SourceControlServiceImpl {
                     metadata::security::is_client_untrusted(|h| req_ctxt.header(h))
                         .map_err(errors::invalid_request)?,
                     client_ip,
+                    client_port,
                 )
                 .await;
 
@@ -289,8 +302,9 @@ impl SourceControlServiceImpl {
                 if let Some(other_cats) = header(FORWARDED_OTHER_CATS_HEADER)? {
                     metadata.add_raw_encoded_cats(other_cats);
                 }
-                let client_info = client_info
-                    .unwrap_or_else(|| ClientInfo::default_with_entry_point(ClientEntryPoint::SCS));
+                let client_info = client_info.unwrap_or_else(|| {
+                    ClientInfo::default_with_entry_point(ClientEntryPoint::ScsServer)
+                });
                 metadata.add_client_info(client_info);
                 return Ok(metadata);
             }
@@ -302,11 +316,12 @@ impl SourceControlServiceImpl {
             metadata::security::is_client_untrusted(|h| req_ctxt.header(h))
                 .map_err(errors::invalid_request)?,
             None,
+            None,
         )
         .await;
 
         let client_info = client_info
-            .unwrap_or_else(|| ClientInfo::default_with_entry_point(ClientEntryPoint::SCS));
+            .unwrap_or_else(|| ClientInfo::default_with_entry_point(ClientEntryPoint::ScsServer));
         metadata.add_client_info(client_info);
         Ok(metadata)
     }
@@ -319,11 +334,9 @@ impl SourceControlServiceImpl {
         let metadata = self.create_metadata(req_ctxt).await?;
         let session = SessionContainer::builder(self.fb)
             .metadata(Arc::new(metadata))
-            .blobstore_maybe_read_qps_limiter(tunables().scs_request_read_qps().unwrap_or_default())
+            .blobstore_maybe_read_qps_limiter(PER_REQUEST_READ_QPS)
             .await
-            .blobstore_maybe_write_qps_limiter(
-                tunables().scs_request_write_qps().unwrap_or_default(),
-            )
+            .blobstore_maybe_write_qps_limiter(PER_REQUEST_WRITE_QPS)
             .await
             .build();
         Ok(session)
@@ -382,10 +395,11 @@ impl SourceControlServiceImpl {
 
     fn bubble_fetcher_for_changeset(
         &self,
+        ctx: CoreContext,
         specifier: ChangesetSpecifier,
     ) -> impl FnOnce(RepoEphemeralStore) -> BoxFuture<'static, anyhow::Result<Option<BubbleId>>>
     {
-        move |ephemeral| async move { specifier.bubble_id(ephemeral).await }.boxed()
+        move |ephemeral| async move { specifier.bubble_id(&ctx, ephemeral).await }.boxed()
     }
 
     /// Get the repo and changeset specified by a `thrift::CommitSpecifier`.
@@ -396,13 +410,10 @@ impl SourceControlServiceImpl {
     ) -> Result<(RepoContext, ChangesetContext), errors::ServiceError> {
         let changeset_specifier = ChangesetSpecifier::from_request(&commit.id)?;
         let authz = AuthorizationContext::new(&ctx);
+        let bubble_fetcher =
+            self.bubble_fetcher_for_changeset(ctx.clone(), changeset_specifier.clone());
         let repo = self
-            .repo_impl(
-                ctx,
-                &commit.repo,
-                authz,
-                self.bubble_fetcher_for_changeset(changeset_specifier.clone()),
-            )
+            .repo_impl(ctx, &commit.repo, authz, bubble_fetcher)
             .await?;
         let changeset = repo
             .changeset(changeset_specifier)
@@ -430,13 +441,10 @@ impl SourceControlServiceImpl {
             )))?
         }
         let authz = AuthorizationContext::new(&ctx);
+        let bubble_fetcher =
+            self.bubble_fetcher_for_changeset(ctx.clone(), changeset_specifier.clone());
         let repo = self
-            .repo_impl(
-                ctx,
-                &commit.repo,
-                authz,
-                self.bubble_fetcher_for_changeset(changeset_specifier.clone()),
-            )
+            .repo_impl(ctx, &commit.repo, authz, bubble_fetcher)
             .await?;
         let (changeset, other_changeset) = try_join!(
             async {
@@ -569,23 +577,62 @@ impl SourceControlServiceImpl {
     }
 }
 
+fn should_log_memory_usage(method: &str) -> bool {
+    justknobs::eval("scm/mononoke:scs_log_memory_usage", None, Some(method)).unwrap_or(false)
+}
+
+fn log_start(ctx: &CoreContext, method: &str) -> Option<MemoryStats> {
+    let mut start_mem_stats = None;
+    let mut scuba = ctx.scuba().clone();
+    if should_log_memory_usage(method) {
+        if let Ok(stats) = memory::get_stats() {
+            scuba.add_memory_stats(&stats);
+            start_mem_stats = Some(stats);
+        }
+    }
+    scuba.log_with_msg("Request start", None);
+    start_mem_stats
+}
+
+fn add_request_end_memory_stats(
+    scuba: &mut MononokeScubaSampleBuilder,
+    method: &str,
+    start_mem_stats: Option<&MemoryStats>,
+) {
+    if should_log_memory_usage(method) {
+        if let Ok(stats) = memory::get_stats() {
+            scuba.add_memory_stats(&stats);
+            if let Some(start_mem_stats) = start_mem_stats {
+                let rss_used_delta =
+                    start_mem_stats.rss_free_bytes as isize - stats.rss_free_bytes as isize;
+                scuba.add("rss_used_delta", rss_used_delta);
+            }
+        }
+    }
+}
+
 fn log_result<T: AddScubaResponse>(
     ctx: CoreContext,
+    method: &str,
     stats: &FutureStats,
     result: &Result<T, impl errors::LoggableError>,
+    start_mem_stats: Option<&MemoryStats>,
 ) {
     let mut scuba = ctx.scuba().clone();
 
-    let (status, error, invalid_request, internal_failure) = match result {
+    add_request_end_memory_stats(&mut scuba, method, start_mem_stats);
+
+    let (status, error, invalid_request, internal_failure, overloaded) = match result {
         Ok(response) => {
             response.add_scuba_response(&mut scuba);
-            ("SUCCESS", None, 0, 0)
+            ("SUCCESS", None, 0, 0, 0)
         }
         Err(err) => {
             let (status, desc) = err.status_and_description();
             match status {
-                Status::RequestError => ("REQUEST_ERROR", Some(desc), 1, 0),
-                Status::InternalError => ("INTERNAL_ERROR", Some(desc), 0, 1),
+                Status::RequestError => ("REQUEST_ERROR", Some(desc), 1, 0, 0),
+                Status::InternalError => ("INTERNAL_ERROR", Some(desc), 0, 1, 0),
+                Status::OverloadError => ("OVERLOAD_ERROR", Some(desc), 0, 0, 1),
             }
         }
     };
@@ -597,13 +644,16 @@ fn log_result<T: AddScubaResponse>(
     STATS::total_request_cancelled.add_value(0);
     STATS::total_request_internal_failure_permille.add_value(internal_failure * 1000);
     STATS::total_request_invalid_permille.add_value(invalid_request * 1000);
+    STATS::total_request_overloaded.add_value(overloaded);
 
     ctx.perf_counters().insert_perf_counters(&mut scuba);
 
     scuba.add_future_stats(stats);
     scuba.add("status", status);
     if let Some(error) = error {
-        if !tunables().scs_error_log_sampling().unwrap_or_default() {
+        let scs_error_log_sampling =
+            justknobs::eval("scm/mononoke:scs_error_log_sampling", None, None).unwrap_or(true);
+        if !scs_error_log_sampling {
             scuba.unsampled();
         }
         scuba.add("error", error.as_str());
@@ -611,17 +661,90 @@ fn log_result<T: AddScubaResponse>(
     scuba.log_with_msg("Request complete", None);
 }
 
-fn log_cancelled(ctx: &CoreContext, stats: &FutureStats) {
+fn log_cancelled(
+    ctx: &CoreContext,
+    method: &str,
+    stats: &FutureStats,
+    start_mem_stats: Option<&MemoryStats>,
+) {
     STATS::total_request_success.add_value(0);
     STATS::total_request_internal_failure.add_value(0);
     STATS::total_request_invalid.add_value(0);
     STATS::total_request_cancelled.add_value(1);
 
     let mut scuba = ctx.scuba().clone();
+    add_request_end_memory_stats(&mut scuba, method, start_mem_stats);
     ctx.perf_counters().insert_perf_counters(&mut scuba);
     scuba.add_future_stats(stats);
     scuba.add("status", "CANCELLED");
     scuba.log_with_msg("Request cancelled", None);
+}
+
+fn check_memory_usage(
+    ctx: &CoreContext,
+    method: &str,
+    start_mem_stats: Option<&MemoryStats>,
+) -> Result<(), errors::ServiceError> {
+    let stats = match start_mem_stats {
+        Some(start_mem_stats) => Cow::Borrowed(start_mem_stats),
+        None => match memory::get_stats() {
+            Ok(stats) => Cow::Owned(stats),
+            _ => return Ok(()),
+        },
+    };
+    let rss_min_free_bytes =
+        justknobs::get_as::<usize>("scm/mononoke:scs_rss_min_free_bytes", Some(method))
+            .unwrap_or(0);
+    let rss_min_free_pct =
+        justknobs::get_as::<i32>("scm/mononoke:scs_rss_min_free_pct", Some(method)).unwrap_or(0);
+
+    if rss_min_free_bytes > 0 || rss_min_free_pct > 0 {
+        debug!(
+            ctx.logger(),
+            "{}: min free mem: {} {}%", method, rss_min_free_bytes, rss_min_free_pct
+        );
+
+        debug!(
+            ctx.logger(),
+            "{}: memory stats: free {} / total {} {:.1}%",
+            method,
+            stats.rss_free_bytes,
+            stats.total_rss_bytes,
+            stats.rss_free_pct
+        );
+
+        if stats.rss_free_bytes < rss_min_free_bytes {
+            debug!(
+                ctx.logger(),
+                "{}: not enough memory free, need at least {} bytes free, only {} free right now",
+                method,
+                rss_min_free_bytes,
+                stats.rss_free_bytes,
+            );
+
+            return Err(errors::overloaded(format!(
+                "Not enough memory free ({} < {})",
+                stats.rss_free_bytes, rss_min_free_bytes
+            ))
+            .into());
+        }
+        if stats.rss_free_pct < rss_min_free_pct as f32 {
+            debug!(
+                ctx.logger(),
+                "{}: not enough memory free, need at least {}% free, only {:.1}% free right now",
+                method,
+                rss_min_free_pct,
+                stats.rss_free_pct,
+            );
+
+            return Err(errors::overloaded(format!(
+                "Not enough memory free ({:.0}% < {}%)",
+                stats.rss_free_pct, rss_min_free_pct
+            ))
+            .into());
+        }
+    }
+    Ok(())
 }
 
 // Define a macro to construct a CoreContext based on the thrift parameters.
@@ -659,14 +782,16 @@ macro_rules! impl_thrift_methods {
             {
                 let handler = async move {
                     let ctx = create_ctx!(self.0, $method_name, req_ctxt, $( $param_name ),*).await?;
-                    ctx.scuba().clone().log_with_msg("Request start", None);
+                    let start_mem_stats = log_start(&ctx, stringify!($method_name));
                     STATS::total_request_start.add_value(1);
-                    let (stats, res) = (self.0)
-                        .$method_name(ctx.clone(), $( $param_name ),* )
-                        .timed()
-                        .on_cancel_with_data(|stats| log_cancelled(&ctx, &stats))
-                        .await;
-                    log_result(ctx, &stats, &res);
+                    let (stats, res) = async {
+                        check_memory_usage(&ctx, stringify!($method_name), start_mem_stats.as_ref())?;
+                        (self.0).$method_name(ctx.clone(), $( $param_name ),* ).await
+                    }
+                    .timed()
+                    .on_cancel_with_data(|stats| log_cancelled(&ctx, stringify!($method_name), &stats, start_mem_stats.as_ref()))
+                    .await;
+                    log_result(ctx, stringify!($method_name), &stats, &res, start_mem_stats.as_ref());
                     let method = stringify!($method_name).to_string();
                     STATS::method_completion_time_ms.add_value(stats.completion_time.as_millis_unchecked() as i64, (method,));
                     res.map_err(Into::into)
@@ -730,6 +855,11 @@ impl SourceControlService for SourceControlServiceThriftImpl {
             params: thrift::CommitInfoParams,
         ) -> Result<thrift::CommitInfo, service::CommitInfoExn>;
 
+        async fn commit_generation(
+            commit: thrift::CommitSpecifier,
+            params: thrift::CommitGenerationParams,
+        ) -> Result<i64, service::CommitGenerationExn>;
+
         async fn commit_is_ancestor_of(
             commit: thrift::CommitSpecifier,
             params: thrift::CommitIsAncestorOfParams,
@@ -749,6 +879,11 @@ impl SourceControlService for SourceControlServiceThriftImpl {
             commit: thrift::CommitSpecifier,
             params: thrift::CommitHistoryParams,
         ) -> Result<thrift::CommitHistoryResponse, service::CommitHistoryExn>;
+
+        async fn commit_linear_history(
+            commit: thrift::CommitSpecifier,
+            params: thrift::CommitLinearHistoryParams,
+        ) -> Result<thrift::CommitLinearHistoryResponse, service::CommitLinearHistoryExn>;
 
         async fn commit_list_descendant_bookmarks(
             commit: thrift::CommitSpecifier,
@@ -938,10 +1073,10 @@ impl SourceControlService for SourceControlServiceThriftImpl {
             token: thrift::MegarepoRemergeSourceToken,
         ) -> Result<thrift::MegarepoRemergeSourcePollResponse, service::MegarepoRemergeSourcePollExn>;
 
-        async fn upload_git_object(
+        async fn repo_upload_non_blob_git_object(
             repo: thrift::RepoSpecifier,
-            params: thrift::UploadGitObjectParams,
-        ) -> Result<thrift::UploadGitObjectResponse, service::UploadGitObjectExn>;
+            params: thrift::RepoUploadNonBlobGitObjectParams,
+        ) -> Result<thrift::RepoUploadNonBlobGitObjectResponse, service::RepoUploadNonBlobGitObjectExn>;
 
         async fn create_git_tree(
             repo: thrift::RepoSpecifier,
@@ -952,5 +1087,15 @@ impl SourceControlService for SourceControlServiceThriftImpl {
             repo: thrift::RepoSpecifier,
             params: thrift::CreateGitTagParams,
         ) -> Result<thrift::CreateGitTagResponse, service::CreateGitTagExn>;
+
+        async fn repo_stack_git_bundle_store(
+            repo: thrift::RepoSpecifier,
+            params: thrift::RepoStackGitBundleStoreParams,
+        ) -> Result<thrift::RepoStackGitBundleStoreResponse, service::RepoStackGitBundleStoreExn>;
+
+        async fn repo_upload_packfile_base_item(
+            repo: thrift::RepoSpecifier,
+            params: thrift::RepoUploadPackfileBaseItemParams,
+        ) -> Result<thrift::RepoUploadPackfileBaseItemResponse, service::RepoUploadPackfileBaseItemExn>;
     }
 }

@@ -1,9 +1,19 @@
-#debugruntest-compatible
-#inprocess-hg-incompatible
+#modern-config-incompatible
+
+#require no-eden
+
   $ setconfig format.use-segmented-changelog=true
   $ setconfig devel.segmented-changelog-rev-compat=true
   $ setconfig experimental.allowfilepeer=True
   $ setconfig clone.use-rust=1
+
+#testcases rustcheckout pythoncheckout
+
+#if rustcheckout
+  $ setconfig workingcopy.rust-checkout=true
+#else
+  $ setconfig workingcopy.rust-checkout=false
+#endif
 
   $ configure dummyssh
 
@@ -471,6 +481,7 @@ Test clone from the repository in (emulated) revlog format 0 (issue4203):
 
   $ mkdir issue4203
   $ mkdir -p src/.hg
+  $ touch src/.hg/requires
   $ echo foo > src/foo
   $ hg -R src add src/foo
   abort: legacy dirstate implementations are no longer supported!
@@ -563,6 +574,7 @@ Lower the warning threshold to simulate a large repo
   > EOF
 
 We should see a warning about no fsmonitor on supported platforms
+  $ setconfig checkout.use-rust=false
 
 #if linuxormacos no-fsmonitor
   $ hg clone a nofsmonitor
@@ -616,7 +628,7 @@ Warning not printed if working directory isn't empty
 
 #if linuxormacos no-fsmonitor
   $ hg up cf0fe1914066
-  (warning: large working directory being used without fsmonitor enabled; enable fsmonitor to improve performance; see "hg help -e fsmonitor")
+  (warning: large working directory being used without fsmonitor enabled; enable fsmonitor to improve performance; see "hg help -e fsmonitor") (?)
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
 #else
   $ hg up cf0fe1914066
@@ -624,4 +636,3 @@ Warning not printed if working directory isn't empty
 #endif
 
   $ cd ..
-

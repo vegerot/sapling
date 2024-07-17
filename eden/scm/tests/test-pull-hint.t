@@ -1,3 +1,7 @@
+#modern-config-incompatible
+
+#require no-eden
+
 #chg-compatible
   $ hg init test
   $ cd test

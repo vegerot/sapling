@@ -1,3 +1,7 @@
+#modern-config-incompatible
+
+#require no-eden
+
 TODO(debugruntest): this test fails on Mac
 #chg-compatible
   $ export SL_DEBUG_DISABLE_SYMLINKS=1
@@ -19,7 +23,7 @@ Extract a symlink on a platform not supporting them
   $ hg init t
   $ cd t
   $ hg pull -q "$TESTDIR/bundles/test-no-symlinks.hg"
-  $ hg goto
+  $ hg goto tip
   4 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ cat a.lnk && echo
   a
@@ -49,7 +53,7 @@ Bundle and extract again
   adding changesets
   adding manifests
   adding file changes
-  $ hg goto
+  $ hg goto tip
   5 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ cat a.lnk && echo
   a

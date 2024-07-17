@@ -23,7 +23,6 @@ Config::
 
 import heapq
 from collections import deque
-from threading import Event, Thread
 
 from sapling import error, extensions, match as matchmod, phases, revset, smartset
 from sapling.i18n import _
@@ -290,7 +289,7 @@ def fastlogfollow(orig, repo, subset, x, name, followfirst: bool = False):
             r = f in ctx and ctx[f].renamed()
             if r:
                 renamed.append((r[0], f))
-        for (src, dst) in renamed:
+        for src, dst in renamed:
             files.remove(dst)
             files.add(src)
 

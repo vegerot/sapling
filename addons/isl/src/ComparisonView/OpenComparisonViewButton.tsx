@@ -8,13 +8,13 @@
 import type {ReactNode} from 'react';
 import type {Comparison} from 'shared/Comparison';
 
-import {t} from '../i18n';
+import {T, t} from '../i18n';
 import {short} from '../utils';
 import {currentComparisonMode} from './atoms';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useSetRecoilState} from 'recoil';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {useSetAtom} from 'jotai';
 import {ComparisonType} from 'shared/Comparison';
-import {Icon} from 'shared/Icon';
 
 export function OpenComparisonViewButton({
   comparison,
@@ -25,18 +25,21 @@ export function OpenComparisonViewButton({
   buttonText?: ReactNode;
   onClick?: () => unknown;
 }) {
-  const setComparisonMode = useSetRecoilState(currentComparisonMode);
+  const isFake =
+    comparison.type === ComparisonType.Committed && comparison.hash.startsWith('OPTIMISTIC');
+  const setComparisonMode = useSetAtom(currentComparisonMode);
   return (
-    <VSCodeButton
+    <Button
       data-testid={`open-comparison-view-button-${comparison.type}`}
-      appearance="icon"
+      icon
+      disabled={isFake}
       onClick={() => {
         onClick?.();
         setComparisonMode({comparison, visible: true});
       }}>
       <Icon icon="files" slot="start" />
-      {buttonText ?? buttonLabelForComparison(comparison)}
-    </VSCodeButton>
+      {isFake ? <T>View Changes</T> : buttonText ?? buttonLabelForComparison(comparison)}
+    </Button>
   );
 }
 
@@ -50,5 +53,7 @@ function buttonLabelForComparison(comparison: Comparison): string {
       return t('View Stack Changes');
     case ComparisonType.Committed:
       return t('View Changes in $hash', {replace: {$hash: short(comparison.hash)}});
+    case ComparisonType.SinceLastCodeReviewSubmit:
+      return t('Compare $hash with remote', {replace: {$hash: short(comparison.hash)}});
   }
 }

@@ -22,6 +22,7 @@ use cpython_ext::error::ResultPyErrExt;
 use cpython_ext::PyNone;
 use cpython_ext::PyPath;
 use cpython_ext::PyPathBuf;
+use repo_minimal_info::RepoMinimalInfo;
 
 mod impl_into;
 
@@ -42,7 +43,7 @@ py_class!(pub class config |py| {
     data cfg: RefCell<ConfigSet>;
 
     def __new__(_cls) -> PyResult<config> {
-        config::create_instance(py, RefCell::new(ConfigSet::new()))
+        config::create_instance(py, RefCell::new(ConfigSet::new().named("pyconfig")))
     }
 
     def clone(&self) -> PyResult<config> {
@@ -56,7 +57,6 @@ py_class!(pub class config |py| {
         source: String,
         sections: Option<Vec<String>>,
         remap: Option<Vec<(String, String)>>,
-        readonly_items: Option<Vec<(String, String)>>
     ) -> PyResult<Vec<String>> {
         let mut cfg = self.cfg(py).borrow_mut();
 
@@ -67,9 +67,6 @@ py_class!(pub class config |py| {
         if let Some(remap) = remap {
             let map = remap.into_iter().collect();
             opts = opts.remap_sections(map);
-        }
-        if let Some(readonly_items) = readonly_items {
-            opts = opts.readonly_items(readonly_items);
         }
 
         let errors = cfg.load_path(path, &opts);
@@ -100,9 +97,7 @@ py_class!(pub class config |py| {
         for source in sources.as_ref().iter() {
             let value = source.value().as_ref().map(|v| PyUnicode::new(py, v));
             let file = source.location().map(|(path, range)| {
-                // Calculate the line number - count "\n" till range.start
-                let file = source.file_content().unwrap();
-                let line = 1 + file.slice(0..range.start).chars().filter(|ch| *ch == '\n').count();
+                let line = source.line_number().unwrap_or_default();
 
                 let pypath = if path.as_os_str().is_empty() {
                     PyPathBuf::from(String::from("<builtin>"))
@@ -144,27 +139,35 @@ py_class!(pub class config |py| {
 
     @staticmethod
     def load(repopath: Option<PyPathBuf>) -> PyResult<Self> {
-        let repopath = repopath.as_ref().map(|p| p.as_path());
+        let info = path_to_info(py, repopath)?;
         let mut cfg = ConfigSet::new();
-        cfg.load::<String, String>(repopath, None).map_pyerr(py)?;
+        cfg.load(info.as_ref(), Default::default()).map_pyerr(py)?;
         Self::create_instance(py, RefCell::new(cfg))
     }
 
     def reload(
         &self,
         repopath: Option<PyPathBuf>,
-        readonly_items: Option<Vec<(String, String)>>
     ) -> PyResult<PyNone> {
-        let repopath = repopath.as_ref().map(|p| p.as_path());
+        let info = path_to_info(py, repopath)?;
         let mut cfg = self.cfg(py).borrow_mut();
-        cfg.load(repopath, readonly_items).map_pyerr(py)?;
+        cfg.load(info.as_ref(), Default::default()).map_pyerr(py)?;
         Ok(PyNone)
     }
 
     def files(&self) -> PyResult<Vec<PyPathBuf>> {
-        self.cfg(py).borrow().files().iter().map(|p| p.as_path().try_into()).collect::<Result<Vec<PyPathBuf>>>().map_pyerr(py)
+        self.cfg(py).borrow().files().iter().map(|(p, _)| p.as_path().try_into()).collect::<Result<Vec<PyPathBuf>>>().map_pyerr(py)
     }
 });
+
+fn path_to_info(py: Python, path: Option<PyPathBuf>) -> PyResult<Option<RepoMinimalInfo>> {
+    // Ideally the callsite can provide `info` directly.
+    let info = match path {
+        None => None,
+        Some(p) => Some(RepoMinimalInfo::from_repo_root(p.to_path_buf()).map_pyerr(py)?),
+    };
+    Ok(info)
+}
 
 impl config {
     pub fn get_cfg(&self, py: Python) -> ConfigSet {

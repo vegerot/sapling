@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
   $ hg init a
@@ -173,7 +175,7 @@ Forgotten file can be added back (as either clean or modified)
   M a
   A c
   ? a.orig
-  $ hg up -C
+  $ hg up -C .
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
 forget and get should have the right order: added but missing dir should be
@@ -187,7 +189,7 @@ forgotten before file with same name is added
   $ echo a > d/a
   $ hg add d/a
   $ rm -r d
-  $ hg up -C
+  $ hg up -C .
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ cat d
   file d

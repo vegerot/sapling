@@ -10,39 +10,23 @@ import type {Mode} from './FileStackEditorLines';
 
 import {Row} from '../../ComponentUtils';
 import {EmptyState} from '../../EmptyState';
-import {VSCodeCheckbox} from '../../VSCodeCheckbox';
 import {t, T} from '../../i18n';
 import {FileStackEditorRow} from './FileStackEditor';
 import {bumpStackEditMetric, useStackEditState} from './stackEditState';
-import {
-  VSCodeDivider,
-  VSCodeDropdown,
-  VSCodeOption,
-  VSCodeRadio,
-  VSCodeRadioGroup,
-} from '@vscode/webview-ui-toolkit/react';
+import {Checkbox} from 'isl-components/Checkbox';
+import {Dropdown} from 'isl-components/Dropdown';
+import {RadioGroup} from 'isl-components/Radio';
+import {atom, useAtom} from 'jotai';
 import {useState} from 'react';
-import {atom, useRecoilState} from 'recoil';
-import {unwrap} from 'shared/utils';
+import {nullthrows} from 'shared/utils';
 
-import './VSCodeDropdown.css';
-
-const editModeAtom = atom<Mode>({
-  key: 'editModeAtom',
-  default: 'unified-diff',
-});
+const editModeAtom = atom<Mode>('unified-diff');
 
 export default function FileStackEditPanel() {
   const [fileIdx, setFileIdx] = useState<null | number>(null);
-  const [mode, setMode] = useRecoilState(editModeAtom);
+  const [mode, setMode] = useAtom(editModeAtom);
   const [textEdit, setTextEdit] = useState(false);
   const stackEdit = useStackEditState();
-
-  // VSCode toolkit does not provide a way to proper type `e`.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const handleModeChange = (e: any) => {
-    setMode(e.target.value);
-  };
 
   // File list dropdown.
   const commitStack = stackEdit.commitStack.maybeBuildFileStacks();
@@ -63,25 +47,21 @@ export default function FileStackEditPanel() {
         zIndex: 3,
       }}>
       <label htmlFor="stack-file-dropdown">File to edit</label>
-      <VSCodeDropdown
+      <Dropdown
         id="stack-file-dropdown"
-        value={fileIdx == null ? 'none' : fileIdx.toString()}
+        value={fileIdx == null ? 'none' : String(fileIdx)}
         style={{width: '100%', zIndex: 3}}
         onChange={e => {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const idx = (e.target as any).value;
+          const idx = e.currentTarget.value;
           setFileIdx(idx === 'none' ? null : parseInt(idx));
-        }}>
-        <VSCodeOption value="none">
-          <T>Select a file to edit</T>
-        </VSCodeOption>
-        <VSCodeDivider />
-        {pathFileIdxList.map(([path, idx]) => (
-          <VSCodeOption key={idx} value={idx.toString()}>
-            {path}
-          </VSCodeOption>
-        ))}
-      </VSCodeDropdown>
+        }}
+        options={
+          [
+            {value: 'none', name: t('Select a file to edit')},
+            ...pathFileIdxList.map(([path, idx]) => ({value: String(idx), name: path})),
+          ] as Array<{value: string; name: string}>
+        }
+      />
     </div>
   );
 
@@ -97,7 +77,7 @@ export default function FileStackEditPanel() {
   }
 
   // Properties for file stack editing.
-  const stack = unwrap(commitStack.fileStacks.get(fileIdx));
+  const stack = nullthrows(commitStack.fileStacks.get(fileIdx));
   const getTitle = (rev: Rev) =>
     commitStack.getCommitFromFileStackRev(fileIdx, rev)?.text ??
     t(
@@ -132,24 +112,22 @@ export default function FileStackEditPanel() {
         style={{
           marginLeft: 'calc(0px - var(--pad))',
           marginRight: 'calc(0px - var(--pad))',
-          minWidth: 'calc(100vw - 81px)',
-          minHeight: 'calc(100vh - 265px)',
+          minWidth: 'calc((100vw / var(--zoom)) - 81px)',
+          minHeight: 'calc((100vh / var(--zoom)) - 265px)',
         }}>
         {editorRow}
       </div>
       <Row>
-        <VSCodeRadioGroup value={mode} onChange={handleModeChange}>
-          <VSCodeRadio accessKey="u" value="unified-diff">
-            <T>Unified diff</T>
-          </VSCodeRadio>
-          <VSCodeRadio accessKey="s" value="side-by-side-diff">
-            <T>Side-by-side diff</T>
-          </VSCodeRadio>
-          <VSCodeRadio value="unified-stack">
-            <T>Unified stack (advanced)</T>
-          </VSCodeRadio>
-        </VSCodeRadioGroup>
-        <VSCodeCheckbox
+        <RadioGroup
+          choices={[
+            {value: 'unified-diff', title: t('Unified diff')},
+            {value: 'side-by-side-diff', title: t('Side by side diff')},
+            {value: 'unified-stack', title: t('Unified stack (advanced)')},
+          ]}
+          current={mode}
+          onChange={setMode}
+        />
+        <Checkbox
           accessKey="t"
           checked={textEdit || mode === 'side-by-side-diff'}
           disabled={mode === 'side-by-side-diff'}
@@ -157,7 +135,7 @@ export default function FileStackEditPanel() {
             setTextEdit(c => !c);
           }}>
           <T>Edit text</T>
-        </VSCodeCheckbox>
+        </Checkbox>
       </Row>
     </div>
   );

@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 from textwrap import dedent
 
 from eden.integration.lib import hgrepo
@@ -55,4 +57,26 @@ class CopyTest(EdenHgTestCase):
         """
             ),
             extended_status,
+        )
+
+    def test_copy_file_after(self) -> None:
+        self.repo.write_file("copy.txt", "aloha")
+        self.repo.commit("Forgot copy.\n")
+
+        self.hg("copy", "hello.txt", "copy.txt", "--after", "--force")
+        self.assert_status({"copy.txt": "M"})
+        self.assert_copy_map({"copy.txt": "hello.txt"})
+
+        self.hg("amend")
+        self.assert_status_empty()
+        self.assert_dirstate_empty()
+
+        self.assertEqual(
+            dedent(
+                """\
+        A copy.txt
+          hello.txt
+        """
+            ),
+            self.hg("status", "--change", ".", "--copies"),
         )

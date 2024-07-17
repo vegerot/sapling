@@ -17,11 +17,11 @@
 #include <folly/init/Init.h>
 #include <folly/logging/xlog.h>
 
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/UserInfo.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/monitor/EdenMonitor.h"
 #include "eden/fs/service/EdenInit.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/UserInfo.h"
 
 using std::string;
 using namespace facebook::eden;

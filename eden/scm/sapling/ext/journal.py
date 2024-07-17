@@ -16,6 +16,8 @@ import os
 import weakref
 from typing import Dict, NamedTuple, Tuple
 
+from bindings import journal as rsjournal
+
 from sapling import (
     bookmarks,
     cmdutil,
@@ -28,10 +30,10 @@ from sapling import (
     node,
     pycompat,
     registrar,
+    smartset,
     util,
 )
 from sapling.i18n import _
-
 
 cmdtable = {}
 command = registrar.command(cmdtable)
@@ -51,6 +53,7 @@ wdirparenttype = "wdirparent"
 # In a shared repository, what shared feature name is used
 # to indicate this namespace is shared with the source?
 sharednamespaces: Dict[str, str] = {bookmarktype: hg.sharedbookmarks}
+
 
 # Journal recording, register hooks and storage object
 def extsetup(ui) -> None:
@@ -180,82 +183,35 @@ def unsharejournal(orig, ui, repo, repopath):
     return orig(ui, repo, repopath)
 
 
-# TODO: Once we fully convert to Python 3 we can change this to the much nicer Python 3
-# style attribute annotations for these NamedTuple members.  For now we are stuck with
-# this uglier legacy syntax.
-class journalentry(
-    NamedTuple(
-        "journalentry",
-        [
-            ("timestamp", Tuple[float, int]),
-            ("user", str),
-            ("command", str),
-            ("namespace", str),
-            ("name", str),
-            ("oldhashes", Tuple[bytes, ...]),
-            ("newhashes", Tuple[bytes, ...]),
-        ],
-    )
-):
+revsetpredicate = registrar.revsetpredicate()
 
-    """Individual journal entry
 
-    * timestamp: a mercurial (time, timezone) tuple
-    * user: the username that ran the command
-    * command: the @prog@ command that triggered this record
-    * namespace: the entry namespace, an opaque string
-    * name: the name of the changed item, opaque string with meaning in the
-      namespace
-    * oldhashes: a tuple of one or more binary hashes for the old location
-    * newhashes: a tuple of one or more binary hashes for the new location
-
-    Handles serialisation from and to the storage format. Fields are
-    separated by newlines, hashes are written out in hex separated by commas,
-    timestamp and timezone are separated by a space.
-
+@revsetpredicate("oldnonobsworkingcopyparent")
+def _oldnonobsworkingcopyparent(repo, subset, x):
+    """``oldnonobsworkingcopyparent()``
+    previous non-obsolete working copy parent
     """
+    current_node = repo["."].node()
+    for entry in repo.journal.filtered(namespace="wdirparent"):
+        # Rebase can update wc to each commit as it goes. We don't want consider the last
+        # rebased commit as our last parent.
+        # TODO: this is fragile since "commands" records the actual CLI args, not the
+        # canonical command name.
+        if entry.command.startswith("rebase"):
+            continue
 
-    @classmethod
-    def fromstorage(cls, line: bytes) -> "journalentry":
-        split = pycompat.decodeutf8(line).split("\n")
-        if len(split) != 7:
-            raise ValueError("incorrect journalentry '%s'" % line)
+        nodes = entry.oldhashes
 
-        (
-            time,
-            user,
-            command,
-            namespace,
-            name,
-            oldhashes,
-            newhashes,
-        ) = split
-        timestamp, tz = time.split()
-        timestamp, tz = float(timestamp), int(tz)
-        oldhashes = tuple(node.bin(hash) for hash in oldhashes.split(","))
-        newhashes = tuple(node.bin(hash) for hash in newhashes.split(","))
-        return cls(
-            (timestamp, tz), user, command, namespace, name, oldhashes, newhashes
-        )
+        # Skip merge states.
+        if len(nodes) != 1:
+            continue
 
-    def serialize(self) -> bytes:
-        """String representation for storage"""
-        time = " ".join(map(str, self.timestamp))
-        oldhashes = ",".join([node.hex(hash) for hash in self.oldhashes])
-        newhashes = ",".join([node.hex(hash) for hash in self.newhashes])
-        return pycompat.encodeutf8(
-            "\n".join(
-                (
-                    time,
-                    self.user,
-                    self.command,
-                    self.namespace,
-                    self.name,
-                    oldhashes,
-                    newhashes,
-                )
-            )
-        )
+        if nodes[0] == current_node or repo[nodes[0]].obsolete():
+            continue
+
+        return subset & smartset.baseset(nodes, repo=repo)
+
+    return set()
 
 
 class journalstorage:
@@ -390,7 +346,7 @@ class journalstorage:
         if not isinstance(newhashes, list):
             newhashes = [newhashes]
 
-        return journalentry(
+        return rsjournal.journalentry(
             util.makedate(),
             self.user,
             self.command,
@@ -487,7 +443,7 @@ class journalstorage:
             if not line:
                 continue
             try:
-                yield journalentry.fromstorage(line)
+                yield rsjournal.journalentry.fromstorage(line)
             except ValueError as ex:
                 self.ui.debug("skipping corrupt journalentry: %s" % ex)
                 # If a journal entry is corrupt, just skip it.

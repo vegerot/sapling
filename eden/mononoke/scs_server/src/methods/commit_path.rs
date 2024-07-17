@@ -19,10 +19,9 @@ use futures::stream::TryStreamExt;
 use futures::try_join;
 use maplit::btreeset;
 use mononoke_api::ChangesetPathHistoryOptions;
-use mononoke_api::ChangesetSpecifier;
 use mononoke_api::MononokeError;
-use mononoke_api::MononokePath;
 use mononoke_api::PathEntry;
+use mononoke_types::path::MPath;
 use source_control as thrift;
 
 use crate::commit_id::map_commit_identities;
@@ -74,8 +73,8 @@ impl SourceControlServiceImpl {
                 let summary = tree.summary().await?;
                 let tree_info = thrift::TreeInfo {
                     id: tree.id().as_ref().to_vec(),
-                    simple_format_sha1: summary.simple_format_sha1.as_ref().to_vec(),
-                    simple_format_sha256: summary.simple_format_sha256.as_ref().to_vec(),
+                    simple_format_sha1: Some(summary.simple_format_sha1.as_ref().to_vec()),
+                    simple_format_sha256: Some(summary.simple_format_sha256.as_ref().to_vec()),
                     child_files_count: summary.child_files_count as i64,
                     child_files_total_size: summary.child_files_total_size as i64,
                     child_dirs_count: summary.child_dirs_count as i64,
@@ -120,7 +119,8 @@ impl SourceControlServiceImpl {
         let mut paths = vec![];
         for path in params.paths {
             let strpath = path.as_str();
-            let mpath = MononokePath::try_from(strpath)?;
+            let mpath = MPath::try_from(strpath)
+                .map_err(|error| MononokeError::InvalidRequest(error.to_string()))?;
             paths.push(mpath);
         }
 
@@ -267,12 +267,7 @@ impl SourceControlServiceImpl {
 
         // Collect author and date fields from the commit info.
         let info: HashMap<_, _> = future::try_join_all(csids.iter().map(move |csid| async move {
-            let changeset = repo
-                .changeset(ChangesetSpecifier::Bonsai(*csid))
-                .await?
-                .ok_or_else(|| {
-                    MononokeError::InvalidRequest(format!("failed to resolve commit: {}", csid))
-                })?;
+            let changeset = repo.changeset_from_existing_id(*csid);
             let (date, author, message) = try_join!(
                 changeset.author_date(),
                 changeset.author(),
@@ -568,7 +563,8 @@ impl SourceControlServiceImpl {
         let mut paths = HashSet::with_capacity(params.paths.len());
         for path in params.paths {
             let strpath = path.as_str();
-            let mpath = MononokePath::try_from(strpath)?;
+            let mpath = MPath::try_from(strpath)
+                .map_err(|error| MononokeError::InvalidRequest(error.to_string()))?;
             paths.insert(mpath);
         }
 

@@ -13,6 +13,9 @@
 #include <folly/portability/GTest.h>
 #include <folly/test/TestUtils.h>
 
+#include "eden/common/utils/CaseSensitivity.h"
+#include "eden/common/utils/FaultInjector.h"
+#include "eden/common/utils/StatTimes.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/digest/Blake3.h"
 #include "eden/fs/inodes/FileInode.h"
@@ -26,9 +29,6 @@
 #include "eden/fs/testharness/InodeUnloader.h"
 #include "eden/fs/testharness/TestChecks.h"
 #include "eden/fs/testharness/TestMount.h"
-#include "eden/fs/utils/CaseSensitivity.h"
-#include "eden/fs/utils/FaultInjector.h"
-#include "eden/fs/utils/StatTimes.h"
 
 #ifdef _WIN32
 #include "eden/fs/prjfs/Enumerator.h"
@@ -122,8 +122,8 @@ struct TestFileInfo {
     return contents;
   }
 
-  void setContents(folly::StringPiece contents) {
-    this->contents = contents;
+  void setContents(folly::StringPiece value) {
+    contents = value;
   }
 
   Hash20 getSHA1() const {
@@ -155,7 +155,7 @@ struct TestFileInfo {
   ContainedType containedType;
   mode_t mode;
   RelativePath path;
-  folly::Optional<struct timespec> mtime;
+  std::optional<struct timespec> mtime;
   int flags{0};
   std::string contents;
 
@@ -342,7 +342,7 @@ class TestFileDatabase {
   std::vector<TestFileInfo*> getChildren(RelativePathPiece path) {
     std::vector<TestFileInfo*> kids;
     for (auto& info : initialInfos_) {
-      if (info->path.view().size() && info->path.dirname() == path) {
+      if (!info->path.view().empty() && info->path.dirname() == path) {
         kids.emplace_back(&getEntry(info->path));
       }
     }
@@ -432,11 +432,11 @@ void verifyTreeState(
 
   std::vector<const TestFileInfo*> infos;
   if (0 == (verify_flags & VERIFY_WITH_MODIFICATIONS)) {
-    for (auto info : files.getOriginalItems()) {
+    for (const auto& info : files.getOriginalItems()) {
       infos.push_back(info.get());
     }
   } else {
-    for (auto info : files.getModifiedItems()) {
+    for (const auto& info : files.getModifiedItems()) {
       infos.push_back(info.get());
     }
   }
@@ -454,7 +454,7 @@ void verifyTreeState(
         flags += "loaded";
       }
       if (expected.flags & FLAG_M) {
-        if (flags.size()) {
+        if (!flags.empty()) {
           flags += ' ';
         }
         flags += "materialized";
@@ -631,7 +631,7 @@ TEST(VirtualInodeTest, findDoesNotChangeState) {
   auto mount = TestMount{MakeTestTreeBuilder(files)};
   VERIFY_TREE(flags);
 
-  for (auto info : files.getOriginalItems()) {
+  for (const auto& info : files.getOriginalItems()) {
     VERIFY_TREE(flags);
     auto virtualInode = mount.getVirtualInode(info->path);
     EXPECT_INODE_OR(virtualInode, *info.get());
@@ -721,7 +721,7 @@ TEST(VirtualInodeTest, getChildrenDoesNotChangeState) {
   auto mount = TestMount{MakeTestTreeBuilder(files)};
   VERIFY_TREE(flags);
 
-  for (auto info : files.getOriginalItems()) {
+  for (const auto& info : files.getOriginalItems()) {
     VERIFY_TREE(flags);
     auto virtualInode = mount.getVirtualInode(info->path);
     EXPECT_INODE_OR(virtualInode, *info.get());
@@ -748,7 +748,7 @@ TEST(VirtualInodeTest, getChildrenAttributes) {
       ENTRY_ATTRIBUTE_OBJECT_ID,
       EntryAttributeFlags{0}};
 
-  for (auto info : files.getOriginalItems()) {
+  for (const auto& info : files.getOriginalItems()) {
     VERIFY_TREE(flags);
     auto virtualInode = mount.getVirtualInode(info->path);
     EXPECT_INODE_OR(virtualInode, *info.get());
@@ -789,7 +789,7 @@ TEST(VirtualInodeTest, statDoesNotChangeState) {
   auto mount = TestMount{MakeTestTreeBuilder(files)};
   VERIFY_TREE(flags);
 
-  for (auto info : files.getOriginalItems()) {
+  for (const auto& info : files.getOriginalItems()) {
     VERIFY_TREE(flags);
     auto virtualInode = mount.getVirtualInode(info->path);
     EXPECT_INODE_OR(virtualInode, *info.get());
@@ -802,7 +802,7 @@ TEST(VirtualInodeTest, fileOpsOnCorrectObjectsOnly) {
   auto mount = TestMount{MakeTestTreeBuilder(files)};
 
   VERIFY_TREE(VERIFY_INITIAL);
-  for (auto info_ : files.getOriginalItems()) {
+  for (const auto& info_ : files.getOriginalItems()) {
     auto& info = *info_;
     auto virtualInode = mount.getVirtualInode(info.path);
     auto hashTry = virtualInode
@@ -891,7 +891,7 @@ TEST(VirtualInodeTest, getEntryAttributesDoesNotChangeState) {
   TestFileDatabase files;
   auto mount = TestMount{MakeTestTreeBuilder(files)};
 
-  for (auto info : files.getOriginalItems()) {
+  for (const auto& info : files.getOriginalItems()) {
     VERIFY_TREE(VERIFY_DEFAULT ^ VERIFY_SHA1 ^ VERIFY_BLAKE3);
     auto virtualInode = mount.getVirtualInode(info->path);
     EXPECT_INODE_OR(virtualInode, *info.get());
@@ -936,7 +936,7 @@ TEST(VirtualInodeTest, sha1DoesNotChangeState) {
   };
   for (auto verify_flags : verify_flag_sets) {
     VERIFY_TREE(verify_flags);
-    for (auto info_ : files.getOriginalItems()) {
+    for (const auto& info_ : files.getOriginalItems()) {
       auto& info = *info_;
       auto virtualInode = mount.getVirtualInode(info.path);
       EXPECT_INODE_OR(virtualInode, info);
@@ -986,7 +986,7 @@ TEST(VirtualInodeTest, unlinkMaterializesParents) {
 TEST(VirtualInodeTest, materializationPropagation) {
   // One by one, start with something fresh, load the one, and check the state
   TestFileDatabase files;
-  for (auto info_ : files.getOriginalItems()) {
+  for (const auto& info_ : files.getOriginalItems()) {
     auto& info = *info_;
     if (!info.isRegularFile()) {
       continue;
@@ -1048,7 +1048,7 @@ TEST(VirtualInodeTest, loadPropagation) {
   auto builder = MakeTestTreeBuilder(files);
   auto mount = TestMount(builder, true);
   auto edenMount = mount.getEdenMount();
-  for (auto info_ : files.getOriginalItems()) {
+  for (const auto& info_ : files.getOriginalItems()) {
     auto& info = *info_;
     VERIFY_TREE(VERIFY_INITIAL);
 

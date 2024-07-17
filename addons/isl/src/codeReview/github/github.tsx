@@ -6,16 +6,26 @@
  */
 
 import type {Operation} from '../../operations/Operation';
-import type {CodeReviewSystem, DiffId, DiffSummary, PreferredSubmitCommand} from '../../types';
+import type {
+  CodeReviewSystem,
+  CommitInfo,
+  DiffId,
+  DiffSummary,
+  PreferredSubmitCommand,
+} from '../../types';
 import type {UICodeReviewProvider} from '../UICodeReviewProvider';
+import type {SyncStatus} from '../syncStatus';
 import type {ReactNode} from 'react';
 
-import {Tooltip} from '../../Tooltip';
+import {OSSCommitMessageFieldSchema} from '../../CommitInfoView/OSSCommitMessageFieldsSchema';
+import {Internal} from '../../Internal';
 import {t, T} from '../../i18n';
 import {GhStackSubmitOperation} from '../../operations/GhStackSubmitOperation';
 import {PrSubmitOperation} from '../../operations/PrSubmitOperation';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
 import {PullRequestReviewDecision, PullRequestState} from 'isl-server/src/github/generated/graphql';
-import {Icon} from 'shared/Icon';
+import {MS_PER_DAY} from 'shared/constants';
 
 import './GitHubPRBadge.css';
 
@@ -27,6 +37,7 @@ export class GithubUICodeReviewProvider implements UICodeReviewProvider {
     private system: CodeReviewSystem & {type: 'github'},
     private preferredSubmitCommand: PreferredSubmitCommand,
   ) {}
+  cliName?: string | undefined;
 
   DiffBadgeContent({
     diff,
@@ -45,7 +56,7 @@ export class GithubUICodeReviewProvider implements UICodeReviewProvider {
             'github-diff-status' + (diff?.state ? ` github-diff-status-${diff.state}` : '')
           }>
           <Tooltip title={t('Click to open Pull Request in GitHub')} delayMs={500}>
-            {diff && <Icon icon={iconForPRState(diff.state)} />}
+            {diff && <Icon className="github-diff-badge-icon" icon={iconForPRState(diff.state)} />}
             {diff?.state && <PRStateLabel state={diff.state} />}
             {children}
           </Tooltip>
@@ -59,6 +70,14 @@ export class GithubUICodeReviewProvider implements UICodeReviewProvider {
     return `#${diffId}`;
   }
 
+  getSyncStatuses(
+    _commits: CommitInfo[],
+    _allDiffSummaries: Map<string, DiffSummary>,
+  ): Map<string, SyncStatus> {
+    // TODO: support finding the sync status for GitHub PRs
+    return new Map();
+  }
+
   RepoInfo = () => {
     return (
       <span>
@@ -67,12 +86,18 @@ export class GithubUICodeReviewProvider implements UICodeReviewProvider {
       </span>
     );
   };
-
+  isSplitSuggestionSupported(): boolean {
+    return false;
+  }
   submitOperation(_commits: [], options: {draft?: boolean; updateMessage?: string}): Operation {
     if (this.preferredSubmitCommand === 'ghstack') {
       return new GhStackSubmitOperation(options);
     }
     return new PrSubmitOperation(options);
+  }
+
+  submitCommandName() {
+    return `sl ${this.preferredSubmitCommand}`;
   }
 
   getSupportedStackActions() {
@@ -91,21 +116,33 @@ export class GithubUICodeReviewProvider implements UICodeReviewProvider {
     return diff.state === PullRequestState.Closed;
   }
 
+  commitMessageFieldsSchema =
+    Internal.CommitMessageFieldSchemaForGitHub ?? OSSCommitMessageFieldSchema;
+
   supportSubmittingAsDraft = 'newDiffsOnly' as const;
   supportsUpdateMessage = false;
+  submitDisabledReason = () =>
+    Internal.submitForGitHubDisabledReason?.(this.preferredSubmitCommand);
 
   enableMessageSyncing = false;
 
   supportsSuggestedReviewers = false;
+
+  supportsComparingSinceLastSubmit = false;
+
+  supportsRenderingMarkup = false;
+
+  gotoDistanceWarningAgeCutoff = 30 * MS_PER_DAY;
 }
 
-type BadgeState = PullRequestState | 'ERROR' | 'DRAFT';
+type BadgeState = PullRequestState | 'ERROR' | 'DRAFT' | 'MERGE_QUEUED';
 
 function iconForPRState(state?: BadgeState) {
   switch (state) {
     case 'ERROR':
       return 'error';
     case 'DRAFT':
+    case 'MERGE_QUEUED':
       return 'git-pull-request';
     case PullRequestState.Open:
       return 'git-pull-request';
@@ -130,6 +167,8 @@ function PRStateLabel({state}: {state: BadgeState}) {
       return <T>Draft</T>;
     case 'ERROR':
       return <T>Error</T>;
+    case 'MERGE_QUEUED':
+      return <T>Merge Queued</T>;
     default:
       return <T>{state}</T>;
   }

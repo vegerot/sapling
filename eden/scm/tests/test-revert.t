@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # coding=utf-8
 
 # Copyright (c) Meta Platforms, Inc. and affiliates.
@@ -192,7 +194,7 @@
   $ hg st d
   R d
 
-  $ hg goto -C
+  $ hg goto -C .
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
 #if execbit
@@ -368,7 +370,7 @@
   undeleting removed
   $ hg st -mardi
 
-  $ hg up -qC
+  $ hg up -qC .
   $ echo >> ignored
   $ hg rm removed
 
@@ -383,7 +385,7 @@
 # someone set up us the copies
 
   $ rm .gitignore
-  $ hg goto -C
+  $ hg goto -C .
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ hg mv ignored allyour
   $ hg copy removed base

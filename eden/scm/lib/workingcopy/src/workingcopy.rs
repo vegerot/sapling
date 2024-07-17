@@ -5,98 +5,150 @@
  * GNU General Public License version 2.
  */
 
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use configmodel::Config;
 use configmodel::ConfigExt;
+use context::CoreContext;
+#[cfg(feature = "eden")]
+use edenfs_client::EdenFsClient;
 use identity::Identity;
-use io::IO;
+use journal::Journal;
 use manifest::FileType;
 use manifest::Manifest;
 use manifest_tree::ReadTreeManifest;
 use manifest_tree::TreeManifest;
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use parking_lot::RwLock;
-use pathmatcher::DifferenceMatcher;
 use pathmatcher::DynMatcher;
 use pathmatcher::GitignoreMatcher;
 use pathmatcher::IntersectMatcher;
 use pathmatcher::Matcher;
 use pathmatcher::NegateMatcher;
 use pathmatcher::UnionMatcher;
+use regex::Regex;
+use repolock::LockedPath;
 use repolock::RepoLocker;
+use repostate::MergeState;
 use status::FileStatus;
 use status::Status;
 use status::StatusBuilder;
-use storemodel::ReadFileContents;
+use storemodel::FileStore;
+use tracing::debug;
 use treestate::filestate::StateFlags;
 use treestate::tree::VisitorResult;
 use treestate::treestate::TreeState;
+use types::hgid::NULL_ID;
 use types::repo::StorageFormat;
 use types::HgId;
 use types::RepoPath;
 use types::RepoPathBuf;
+use util::file::atomic_write;
+use util::file::read_to_string_if_exists;
+use util::file::unlink_if_exists;
 use vfs::VFS;
 
-#[cfg(feature = "eden")]
-use crate::edenfs::EdenFileSystem;
+use crate::client::WorkingCopyClient;
 use crate::errors;
+use crate::filesystem::DotGitFileSystem;
+#[cfg(feature = "eden")]
+use crate::filesystem::EdenFileSystem;
+use crate::filesystem::FileSystem;
 use crate::filesystem::FileSystemType;
 use crate::filesystem::PendingChange;
-use crate::filesystem::PendingChanges;
+use crate::filesystem::PhysicalFileSystem;
+use crate::filesystem::WatchmanFileSystem;
 use crate::git::parse_submodules;
-use crate::physicalfs::PhysicalFileSystem;
 use crate::status::compute_status;
 use crate::util::walk_treestate;
-use crate::watchmanfs::WatchmanFileSystem;
+use crate::watchman_client::DeferredWatchmanClient;
 
-type ArcReadFileContents = Arc<dyn ReadFileContents<Error = anyhow::Error> + Send + Sync>;
-type ArcReadTreeManifest = Arc<dyn ReadTreeManifest + Send + Sync>;
+#[cfg(not(feature = "eden"))]
+pub struct EdenFsClient {}
 
-struct FileSystem {
-    vfs: VFS,
-    file_store: ArcReadFileContents,
-    file_system_type: FileSystemType,
-    inner: Box<dyn PendingChanges + Send>,
-}
-
-impl AsRef<Box<dyn PendingChanges + Send>> for FileSystem {
-    fn as_ref(&self) -> &Box<dyn PendingChanges + Send> {
-        &self.inner
+#[cfg(not(feature = "eden"))]
+impl EdenFsClient {
+    pub fn from_wdir(_wdir_root: &Path) -> anyhow::Result<Self> {
+        panic!("cannot use EdenFS in a non-EdenFS build");
     }
 }
 
+type ArcFileStore = Arc<dyn FileStore>;
+type ArcReadTreeManifest = Arc<dyn ReadTreeManifest + Send + Sync>;
+type BoxFileSystem = Box<dyn FileSystem + Send>;
+
 pub struct WorkingCopy {
     vfs: VFS,
+    config: Arc<dyn Config>,
     ident: Identity,
     format: StorageFormat,
     treestate: Arc<Mutex<TreeState>>,
     tree_resolver: ArcReadTreeManifest,
-    filesystem: Mutex<FileSystem>,
-    ignore_matcher: Arc<GitignoreMatcher>,
-    locker: Arc<RepoLocker>,
-    dot_hg_path: PathBuf,
+    filestore: ArcFileStore,
+    pub(crate) filesystem: Mutex<BoxFileSystem>,
+    pub ignore_matcher: Arc<GitignoreMatcher>,
+    pub(crate) locker: Arc<RepoLocker>,
+    pub(crate) dot_hg_path: PathBuf,
+    pub journal: Journal,
+    watchman_client: Arc<DeferredWatchmanClient>,
 }
+
+const ACTIVE_BOOKMARK_FILE: &str = "bookmarks.current";
 
 impl WorkingCopy {
     pub fn new(
-        vfs: VFS,
+        path: &Path,
+        config: &Arc<dyn Config>,
         format: StorageFormat,
-        // TODO: Have constructor figure out FileSystemType
-        file_system_type: FileSystemType,
-        treestate: Arc<Mutex<TreeState>>,
         tree_resolver: ArcReadTreeManifest,
-        filestore: ArcReadFileContents,
-        config: &dyn Config,
+        filestore: ArcFileStore,
         locker: Arc<RepoLocker>,
+        // For dirstate
+        dot_dir: &Path,
+        has_requirement: &dyn Fn(&str) -> bool,
     ) -> Result<Self> {
-        tracing::debug!(target: "dirstate_size", dirstate_size=treestate.lock().len());
+        tracing::trace!("initializing vfs at {path:?}");
+        let vfs = VFS::new(path.to_path_buf())?;
+
+        let is_eden = has_requirement("eden");
+
+        // In case the "requires" file gets corrupted, check `.eden` directory
+        // and prevent treating edenfs as non-edenfs.
+        if !is_eden && path.join(".eden").is_dir() {
+            anyhow::bail!(
+                "Detected conflicting information about whether EdenFS is enabled.\n\
+                 This might indicate repo metadata (ex. {}) corruption.\n\
+                 To avoid further corruption, this is a fatal error.\n\
+                 Contact the Source Control support team for investigation.",
+                dot_dir.join("requires").display()
+            );
+        }
+
+        let file_system_type = if is_eden {
+            FileSystemType::Eden
+        } else if has_requirement("dotgit") {
+            FileSystemType::DotGit
+        } else {
+            let fsmonitor_ext = config.get("extensions", "fsmonitor");
+            let fsmonitor_mode = config.get_nonempty("fsmonitor", "mode");
+            let is_watchman = if fsmonitor_ext.is_none() || fsmonitor_ext == Some("!".into()) {
+                false
+            } else {
+                fsmonitor_mode.is_none() || fsmonitor_mode == Some("on".into())
+            };
+            if is_watchman {
+                FileSystemType::Watchman
+            } else {
+                FileSystemType::Normal
+            }
+        };
 
         let ignore_matcher = Arc::new(GitignoreMatcher::new(
             vfs.root(),
@@ -107,14 +159,21 @@ impl WorkingCopy {
             vfs.case_sensitive(),
         ));
 
-        let filesystem = Mutex::new(Self::construct_file_system(
+        let watchman_client = Arc::new(DeferredWatchmanClient::new(config.clone()));
+
+        let filesystem = Self::construct_file_system(
             vfs.clone(),
+            dot_dir,
+            config,
             file_system_type,
-            treestate.clone(),
             tree_resolver.clone(),
-            filestore,
+            filestore.clone(),
             locker.clone(),
-        )?);
+            watchman_client.clone(),
+        )?;
+        let treestate = filesystem.get_treestate()?;
+        tracing::debug!(target: "dirstate_size", dirstate_size=treestate.lock().len());
+        let filesystem = Mutex::new(filesystem);
 
         let root = vfs.root();
         let ident = match identity::sniff_dir(root)? {
@@ -124,17 +183,22 @@ impl WorkingCopy {
             }
         };
         let dot_hg_path = vfs.join(RepoPath::from_str(ident.dot_dir())?);
+        let journal = Journal::open(dot_hg_path.clone())?;
 
         Ok(WorkingCopy {
             vfs,
+            config: config.clone(),
             format,
             ident,
             treestate,
             tree_resolver,
+            filestore,
             filesystem,
             ignore_matcher,
             locker,
             dot_hg_path,
+            journal,
+            watchman_client,
         })
     }
 
@@ -143,12 +207,16 @@ impl WorkingCopy {
         &self.dot_hg_path
     }
 
-    pub fn lock(&self) -> Result<repolock::RepoLockHandle, repolock::LockError> {
-        self.locker.lock_working_copy(self.dot_hg_path.clone())
+    pub fn lock(&self) -> Result<LockedWorkingCopy, repolock::LockError> {
+        let locked_path = self.locker.lock_working_copy(self.dot_hg_path.clone())?;
+        Ok(LockedWorkingCopy {
+            dot_hg_path: locked_path,
+            wc: self,
+        })
     }
 
-    pub fn ensure_locked(&self) -> Result<(), repolock::LockError> {
-        self.locker.ensure_working_copy_locked(&self.dot_hg_path)
+    pub fn is_locked(&self) -> bool {
+        self.locker.working_copy_locked(&self.dot_hg_path)
     }
 
     pub fn treestate(&self) -> Arc<Mutex<TreeState>> {
@@ -163,24 +231,35 @@ impl WorkingCopy {
         self.treestate.lock().parents().collect()
     }
 
-    pub fn set_parents(&mut self, parents: &mut dyn Iterator<Item = &HgId>) -> Result<()> {
-        self.treestate.lock().set_parents(parents)
+    /// Return the first working copy parent, or the null commmit if there are no parents.
+    pub fn first_parent(&self) -> Result<HgId> {
+        Ok(self.parents()?.into_iter().next().unwrap_or(NULL_ID))
+    }
+
+    pub fn filestore(&self) -> ArcFileStore {
+        self.filestore.clone()
+    }
+
+    pub fn tree_resolver(&self) -> ArcReadTreeManifest {
+        self.tree_resolver.clone()
     }
 
     pub(crate) fn current_manifests(
         treestate: &TreeState,
         tree_resolver: &ArcReadTreeManifest,
-    ) -> Result<Vec<Arc<RwLock<TreeManifest>>>> {
+    ) -> Result<Vec<Arc<TreeManifest>>> {
         let mut parents = treestate.parents().peekable();
         if parents.peek_mut().is_some() {
-            parents.map(|p| tree_resolver.get(&p?)).collect()
+            parents
+                .map(|p| Ok(Arc::new(tree_resolver.get(&p?)?)))
+                .collect()
         } else {
             let null_commit = HgId::null_id().clone();
-            Ok(vec![
+            Ok(vec![Arc::new(
                 tree_resolver
                     .get(&null_commit)
                     .context("resolving null commit tree")?,
-            ])
+            )])
         }
     }
 
@@ -200,39 +279,50 @@ impl WorkingCopy {
 
     fn construct_file_system(
         vfs: VFS,
+        dot_dir: &Path,
+        config: &dyn Config,
         file_system_type: FileSystemType,
-        treestate: Arc<Mutex<TreeState>>,
         tree_resolver: ArcReadTreeManifest,
-        store: ArcReadFileContents,
+        store: ArcFileStore,
         locker: Arc<RepoLocker>,
-    ) -> Result<FileSystem> {
-        let inner: Box<dyn PendingChanges + Send> = match file_system_type {
+        watchman_client: Arc<DeferredWatchmanClient>,
+    ) -> Result<BoxFileSystem> {
+        Ok(match file_system_type {
             FileSystemType::Normal => Box::new(PhysicalFileSystem::new(
                 vfs.clone(),
+                dot_dir,
                 tree_resolver,
                 store.clone(),
-                treestate,
                 locker,
             )?),
             FileSystemType::Watchman => Box::new(WatchmanFileSystem::new(
                 vfs.clone(),
-                treestate,
+                dot_dir,
                 tree_resolver,
                 store.clone(),
                 locker,
+                watchman_client,
             )?),
             FileSystemType::Eden => {
                 #[cfg(not(feature = "eden"))]
                 panic!("cannot use EdenFS in a non-EdenFS build");
                 #[cfg(feature = "eden")]
-                Box::new(EdenFileSystem::new(vfs.clone(), treestate)?)
+                {
+                    let client = Arc::new(EdenFsClient::from_wdir(vfs.root())?);
+                    Box::new(EdenFileSystem::new(
+                        client,
+                        vfs.clone(),
+                        dot_dir,
+                        store.clone(),
+                    )?)
+                }
             }
-        };
-        Ok(FileSystem {
-            vfs,
-            file_store: store,
-            file_system_type,
-            inner,
+            FileSystemType::DotGit => Box::new(DotGitFileSystem::new(
+                vfs.clone(),
+                dot_dir,
+                store.clone(),
+                config,
+            )?),
         })
     }
 
@@ -262,87 +352,81 @@ impl WorkingCopy {
                     && file.state.intersects(StateFlags::EXIST_NEXT)
             },
         )?;
+        tracing::trace!(target: "workingcopy::added_files", ?added_files);
         Ok(added_files)
-    }
-
-    fn sparse_matcher(
-        &self,
-        manifests: &[Arc<RwLock<TreeManifest>>],
-    ) -> Result<Option<DynMatcher>> {
-        assert!(!manifests.is_empty());
-
-        let fs = &self.filesystem.lock();
-
-        if fs.file_system_type == FileSystemType::Eden {
-            return Ok(None);
-        }
-
-        let mut sparse_matchers: Vec<DynMatcher> = Vec::new();
-        for manifest in manifests.iter() {
-            if let Some((matcher, _hash)) = crate::sparse::repo_matcher(
-                &self.vfs,
-                &fs.vfs.root().join(self.ident.dot_dir()),
-                manifest.read().clone(),
-                fs.file_store.clone(),
-            )? {
-                sparse_matchers.push(matcher);
-            }
-        }
-
-        if sparse_matchers.is_empty() {
-            // Indicates we have no .hg/sparse (i.e. sparse is disabled).
-            Ok(None)
-        } else {
-            Ok(Some(Arc::new(UnionMatcher::new(sparse_matchers))))
-        }
     }
 
     pub fn status(
         &self,
-        mut matcher: DynMatcher,
-        last_write: SystemTime,
+        ctx: &CoreContext,
+        matcher: DynMatcher,
         include_ignored: bool,
-        config: &dyn Config,
-        io: &IO,
     ) -> Result<Status> {
+        let result = self.status_internal(ctx, matcher.clone(), include_ignored);
+
+        result.or_else(|e| {
+            if self
+                .config
+                .get_or("experimental", "repair-eden-dirstate", || true)?
+            {
+                let errmsg = e.to_string();
+                if errmsg.contains("EdenError: error computing status") {
+                    match parse_edenfs_status_error(&errmsg) {
+                        Some(parent) => {
+                            self.treestate
+                                .lock()
+                                .set_parents(&mut std::iter::once(&parent))?;
+                            tracing::warn!("repaired eden dirstate: set parent to {}", parent);
+                        }
+
+                        None => {
+                            tracing::warn!(
+                                "could not parse a parent from error message {}",
+                                errmsg
+                            );
+                            return Err(e);
+                        }
+                    }
+
+                    // retry
+                    return self.status_internal(ctx, matcher, include_ignored);
+                }
+            }
+            Err(e)
+        })
+    }
+
+    pub fn status_internal(
+        &self,
+        ctx: &CoreContext,
+        mut matcher: DynMatcher,
+        include_ignored: bool,
+    ) -> Result<Status> {
+        let span = tracing::info_span!("status", status_len = tracing::field::Empty);
+        let _enter = span.enter();
+
         let added_files = self.added_files()?;
 
         let manifests =
             WorkingCopy::current_manifests(&self.treestate.lock(), &self.tree_resolver)?;
-        let mut manifest_matchers: Vec<DynMatcher> = Vec::with_capacity(manifests.len());
 
-        let case_sensitive = self.vfs.case_sensitive();
-
-        for manifest in manifests.iter() {
-            manifest_matchers.push(Arc::new(manifest_tree::ManifestMatcher::new(
-                manifest.clone(),
-                case_sensitive,
-            )));
-        }
-
-        let sparse_matcher = self.sparse_matcher(&manifests)?;
+        let sparse_matcher = self
+            .filesystem
+            .lock()
+            .sparse_matcher(&manifests, self.ident.dot_dir())?;
 
         if let Some(sparse) = sparse_matcher.clone() {
             matcher = Arc::new(IntersectMatcher::new(vec![matcher, sparse]));
         }
 
-        // The GitignoreMatcher minus files in the repo. In other words, it does
-        // not match an ignored file that has been previously committed.
-        let mut ignore_matcher: DynMatcher = Arc::new(DifferenceMatcher::new(
-            self.ignore_matcher.clone(),
-            UnionMatcher::new(manifest_matchers),
-        ));
-
-        // If we have been asked to report ignored files, don't skip them in the matcher.
-        if !include_ignored {
-            matcher = Arc::new(DifferenceMatcher::new(matcher, ignore_matcher.clone()));
-        }
+        let mut ignore_matcher: DynMatcher = self.ignore_matcher.clone();
 
         // Treat files outside sparse profile as ignored.
         if let Some(sparse) = sparse_matcher.clone() {
             ignore_matcher = Arc::new(UnionMatcher::new(vec![
-                ignore_matcher,
+                // Check sparse matcher first. It is cheaper than ignore matcher.
                 Arc::new(NegateMatcher::new(sparse)),
+                ignore_matcher,
             ]));
         }
 
@@ -353,7 +437,7 @@ impl WorkingCopy {
             let git_modules_path = self.vfs.join(".gitmodules".try_into()?);
             if git_modules_path.exists() {
                 ignore_dirs.extend(
-                    parse_submodules(&util::file::read(&git_modules_path)?)?
+                    parse_submodules(&fs_err::read(&git_modules_path)?)?
                         .into_iter()
                         .map(|s| PathBuf::from(s.path)),
                 );
@@ -363,27 +447,13 @@ impl WorkingCopy {
         let pending_changes = self
             .filesystem
             .lock()
-            .inner
             .pending_changes(
+                ctx,
                 matcher.clone(),
                 ignore_matcher,
                 ignore_dirs,
                 include_ignored,
-                last_write,
-                config,
-                io,
             )?
-            .filter_map(|result| match result {
-                Ok(change_type) => match matcher.matches_file(change_type.get_path()) {
-                    Ok(true) => {
-                        tracing::trace!(?change_type, "pending change");
-                        Some(Ok(change_type))
-                    }
-                    Err(e) => Some(Err(e)),
-                    _ => None,
-                },
-                Err(e) => Some(Err(e)),
-            })
             // fs.pending_changes() won't return ignored files, but we want added ignored files to
             // show up in the results, so let's inject them here.
             .chain(added_files.into_iter().filter_map(|path| {
@@ -406,9 +476,20 @@ impl WorkingCopy {
                     Ok(_) => None,
                     Err(e) => Some(Err(e)),
                 }
-            }));
+            }))
+            .filter_map(|result| match result {
+                Ok(change_type) => match matcher.matches_file(change_type.get_path()) {
+                    Ok(true) => {
+                        tracing::trace!(?change_type, "pending change");
+                        Some(Ok(change_type))
+                    }
+                    Err(e) => Some(Err(e)),
+                    _ => None,
+                },
+                Err(e) => Some(Err(e)),
+            });
 
-        let p1_manifest = &*manifests[0].read();
+        let p1_manifest = manifests[0].as_ref();
         let mut status_builder = compute_status(
             p1_manifest,
             self.treestate.clone(),
@@ -417,7 +498,8 @@ impl WorkingCopy {
         )?;
 
         if !self.vfs.supports_symlinks()
-            && config
+            && ctx
+                .config
                 .get_or_default("unsafe", "filtersuspectsymlink")
                 .unwrap_or_default()
         {
@@ -425,7 +507,11 @@ impl WorkingCopy {
                 self.filter_accidential_symlink_changes(status_builder, p1_manifest)?;
         }
 
-        Ok(status_builder.build())
+        let status = status_builder.build();
+
+        span.record("status_len", status.len());
+
+        Ok(status)
     }
 
     // Filter out modified symlinks where it appears the symlink has
@@ -475,6 +561,7 @@ impl WorkingCopy {
             matcher,
             StateFlags::COPIED,
             StateFlags::empty(),
+            StateFlags::empty(),
             |path, state| {
                 let copied_path = state
                     .copied
@@ -490,5 +577,109 @@ impl WorkingCopy {
         )?;
 
         Ok(copied)
+    }
+
+    /// For supported working copies, get the "client" that talks to the external
+    /// "working copy" program for low-level access.
+    pub fn working_copy_client(&self) -> Result<Arc<dyn WorkingCopyClient>> {
+        match self.filesystem.lock().get_client() {
+            Some(v) => Ok(v),
+            None => anyhow::bail!("bug: working_copy_client() called on wrong type"),
+        }
+    }
+
+    pub fn read_merge_state(&self) -> Result<Option<MergeState>> {
+        // Conceptually it seems like read_merge_state should be on LockedWorkingCopy.
+        // In practice, light weight operations such as status+morestatus read the
+        // merge state without a lock, so we can't require a lock. The merge
+        // state is written atomically so we won't see an incomplete merge
+        // state, but if we read other state files without locking then things
+        // can be inconsistent.
+
+        MergeState::read(&self.dot_hg_path().join("merge/state2"))
+    }
+
+    pub fn active_bookmark(&self) -> Result<Option<String>> {
+        Ok(read_to_string_if_exists(
+            self.dot_hg_path.join(ACTIVE_BOOKMARK_FILE),
+        )?)
+    }
+
+    pub fn watchman_client(&self) -> Result<Arc<watchman_client::Client>> {
+        self.watchman_client.get()
+    }
+
+    pub fn config(&self) -> &Arc<dyn Config> {
+        &self.config
+    }
+}
+
+// Example:
+// error.EdenError: error computing status: requested parent commit is out-of-date: requested 71060cd2999820e7c1e8cb85a48ef045b1ae79b4, but current parent commit is 01f208e3ffbfa4c32985e9247f26567bf2ec4683. Try running `eden doctor` to remediate
+static EDENFS_STATUS_ERROR_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"current parent commit is ([^.]*)\.").unwrap());
+
+fn parse_edenfs_status_error(errmsg: &str) -> Option<HgId> {
+    let caps = EDENFS_STATUS_ERROR_RE.captures(errmsg)?;
+    let hash = caps.get(1)?;
+    HgId::from_str(hash.as_str()).ok()
+}
+
+pub struct LockedWorkingCopy<'a> {
+    dot_hg_path: LockedPath,
+    wc: &'a WorkingCopy,
+}
+
+impl<'a> std::ops::Deref for LockedWorkingCopy<'a> {
+    type Target = WorkingCopy;
+
+    fn deref(&self) -> &Self::Target {
+        self.wc
+    }
+}
+
+impl<'a> LockedWorkingCopy<'a> {
+    pub fn locked_dot_hg_path(&self) -> &LockedPath {
+        &self.dot_hg_path
+    }
+
+    pub fn write_merge_state(&self, ms: &MergeState) -> Result<()> {
+        let dir = self.dot_hg_path.join("merge");
+        fs_err::create_dir_all(&dir)?;
+        let mut f = util::file::atomic_open(&dir.join("state2"))?;
+        ms.serialize(f.as_file())?;
+        f.save()?;
+        Ok(())
+    }
+
+    pub fn set_parents(&self, parents: Vec<HgId>, parent_tree_hash: Option<HgId>) -> Result<()> {
+        debug!(?parents);
+
+        let p1 = parents
+            .first()
+            .context("At least one parent is required for setting parents")?
+            .clone();
+        let p2 = parents.get(1).copied();
+        self.treestate.lock().set_parents(&mut parents.iter())?;
+        self.filesystem.lock().set_parents(p1, p2, parent_tree_hash)
+    }
+
+    pub fn clear_merge_state(&self) -> Result<()> {
+        let merge_state_dir = self.dot_hg_path().join("merge");
+        if util::file::exists(&merge_state_dir)
+            .context("clearing merge state")?
+            .is_some()
+        {
+            fs_err::remove_dir_all(&merge_state_dir)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_active_bookmark(&self, bm: Option<String>) -> Result<()> {
+        let active_path = self.dot_hg_path.join(ACTIVE_BOOKMARK_FILE);
+        match bm {
+            Some(bm) => Ok(atomic_write(&active_path, |f| write!(f, "{bm}")).map(|_f| ())?),
+            None => Ok(unlink_if_exists(&active_path)?),
+        }
     }
 }

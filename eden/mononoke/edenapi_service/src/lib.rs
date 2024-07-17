@@ -24,10 +24,12 @@ use clientinfo::ClientEntryPoint;
 use fbinit::FacebookInit;
 use gotham::router::Router;
 use gotham_ext::handler::MononokeHttpHandler;
+use gotham_ext::middleware::ConfigInfoMiddleware;
 use gotham_ext::middleware::LoadMiddleware;
 use gotham_ext::middleware::LogMiddleware;
 use gotham_ext::middleware::MetadataMiddleware;
 use gotham_ext::middleware::PostResponseMiddleware;
+use gotham_ext::middleware::RequestContextMiddleware;
 use gotham_ext::middleware::ScubaMiddleware;
 use gotham_ext::middleware::ServerIdentityMiddleware;
 use gotham_ext::middleware::TimerMiddleware;
@@ -35,6 +37,7 @@ use gotham_ext::middleware::TlsSessionDataMiddleware;
 use http::HeaderValue;
 use metaconfig_types::CommonConfig;
 use mononoke_api::Mononoke;
+use mononoke_configs::MononokeConfigs;
 use rate_limiting::RateLimitEnvironment;
 use scuba_ext::MononokeScubaSampleBuilder;
 use slog::Logger;
@@ -42,24 +45,25 @@ use slog::Logger;
 use crate::context::ServerContext;
 use crate::handlers::build_router;
 use crate::middleware::OdsMiddleware;
-use crate::middleware::RequestContextMiddleware;
 use crate::middleware::RequestDumperMiddleware;
-use crate::scuba::EdenApiScubaHandler;
+use crate::scuba::SaplingRemoteApiScubaHandler;
 
-pub type EdenApi = MononokeHttpHandler<Router>;
+pub type SaplingRemoteApi = MononokeHttpHandler<Router>;
 
 pub fn build(
     fb: FacebookInit,
     logger: Logger,
-    mut scuba: MononokeScubaSampleBuilder,
+    scuba: MononokeScubaSampleBuilder,
     mononoke: Arc<Mononoke>,
     will_exit: Arc<AtomicBool>,
     test_friendly_loging: bool,
     tls_session_data_log_path: Option<&Path>,
     rate_limiter: Option<RateLimitEnvironment>,
+    configs: Arc<MononokeConfigs>,
     common_config: &CommonConfig,
     readonly: bool,
-) -> Result<EdenApi, Error> {
+    mtls_disabled: bool,
+) -> Result<SaplingRemoteApi, Error> {
     let ctx = ServerContext::new(mononoke, will_exit);
 
     let log_middleware = if test_friendly_loging {
@@ -76,11 +80,13 @@ pub fn build(
 
     let handler = MononokeHttpHandler::builder()
         .add(TlsSessionDataMiddleware::new(tls_session_data_log_path)?)
+        .add(ConfigInfoMiddleware::new(configs))
         .add(MetadataMiddleware::new(
             fb,
             logger.clone(),
             common_config.internal_identity.clone(),
-            ClientEntryPoint::EdenAPI,
+            ClientEntryPoint::SaplingRemoteApi,
+            mtls_disabled,
         ))
         .add(ServerIdentityMiddleware::new(HeaderValue::from_static(
             "edenapi_server",
@@ -93,14 +99,14 @@ pub fn build(
             rate_limiter,
             readonly,
         ))
-        .add(RequestDumperMiddleware::new(fb))
+        .add(RequestDumperMiddleware::new(
+            fb,
+            common_config.edenapi_dumper_scuba_table.clone(),
+        ))
         .add(LoadMiddleware::new())
         .add(log_middleware)
         .add(OdsMiddleware::new())
-        .add(<ScubaMiddleware<EdenApiScubaHandler>>::new({
-            scuba.add("log_tag", "EdenAPI Request Processed");
-            scuba
-        }))
+        .add(<ScubaMiddleware<SaplingRemoteApiScubaHandler>>::new(scuba))
         .add(TimerMiddleware::new())
         .build(router);
 

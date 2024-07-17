@@ -5,8 +5,6 @@
  * GNU General Public License version 2.
  */
 
-use std::fs::read_to_string;
-use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::io::Write;
 use std::path::Path;
@@ -16,11 +14,15 @@ use anyhow::Result;
 use configmodel::Config;
 use configmodel::ConfigExt;
 use edenapi::Stats;
+use fn_error_context::context;
+use fs_err::read_to_string;
+use fs_err::OpenOptions;
 use hgtime::HgTime;
 use repo_name::encode_repo_name;
 use tracing::Span;
 use util::path::create_dir;
 use util::path::create_shared_dir;
+use util::path::create_shared_dir_all;
 
 pub fn get_repo_name(config: &dyn Config) -> Result<String> {
     Ok(config.must_get("remotefilelog", "reponame")?)
@@ -29,13 +31,14 @@ pub fn get_repo_name(config: &dyn Config) -> Result<String> {
 fn get_config_cache_path(config: &dyn Config) -> Result<PathBuf> {
     let reponame = get_repo_name(config)?;
     let mut path: PathBuf = config.must_get("remotefilelog", "cachepath")?;
-    create_shared_dir(&path)?;
+    create_shared_dir_all(&path)?;
     path.push(encode_repo_name(reponame));
     create_shared_dir(&path)?;
 
     Ok(path)
 }
 
+#[context("get_cache_path")]
 pub fn get_cache_path(config: &dyn Config, suffix: &Option<impl AsRef<Path>>) -> Result<PathBuf> {
     let mut path = get_config_cache_path(config)?;
 
@@ -47,8 +50,8 @@ pub fn get_cache_path(config: &dyn Config, suffix: &Option<impl AsRef<Path>>) ->
     Ok(path)
 }
 
-pub fn get_local_path(local_path: PathBuf, suffix: &Option<impl AsRef<Path>>) -> Result<PathBuf> {
-    let mut path = local_path;
+#[context("get_local_path")]
+pub fn get_local_path(mut path: PathBuf, suffix: &Option<impl AsRef<Path>>) -> Result<PathBuf> {
     create_dir(&path)?;
 
     if let Some(ref suffix) = suffix {
@@ -59,31 +62,43 @@ pub fn get_local_path(local_path: PathBuf, suffix: &Option<impl AsRef<Path>>) ->
     Ok(path)
 }
 
+#[context("get_indexedlogdatastore_path")]
 pub fn get_indexedlogdatastore_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     let mut path = path.as_ref().to_owned();
     path.push("indexedlogdatastore");
-    create_shared_dir(&path)?;
+    create_shared_dir_all(&path)?;
     Ok(path)
 }
 
+#[context("get_indexedlogdatastore_aux_path")]
 pub fn get_indexedlogdatastore_aux_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     let mut path = path.as_ref().to_owned();
     path.push("indexedlogdatastore_aux");
-    create_shared_dir(&path)?;
+    create_shared_dir_all(&path)?;
     Ok(path)
 }
 
+#[context("get_indexedloghistorystore_path")]
 pub fn get_indexedloghistorystore_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     let mut path = path.as_ref().to_owned();
     path.push("indexedloghistorystore");
-    create_shared_dir(&path)?;
+    create_shared_dir_all(&path)?;
     Ok(path)
 }
 
+#[context("get_tree_aux_store_path")]
+pub fn get_tree_aux_store_path(path: impl AsRef<Path>) -> Result<PathBuf> {
+    let mut path = path.as_ref().to_owned();
+    path.push("treeaux");
+    create_dir(&path)?;
+    Ok(path)
+}
+
+#[context("get_packs_path")]
 pub fn get_packs_path(path: impl AsRef<Path>, suffix: &Option<PathBuf>) -> Result<PathBuf> {
     let mut path = path.as_ref().to_owned();
     path.push("packs");
-    create_shared_dir(&path)?;
+    create_shared_dir_all(&path)?;
 
     if let Some(suffix) = suffix {
         path.push(suffix);
@@ -97,14 +112,16 @@ pub fn get_cache_packs_path(config: &dyn Config, suffix: &Option<PathBuf>) -> Re
     get_packs_path(get_config_cache_path(config)?, suffix)
 }
 
+#[context("get_lfs_path")]
 fn get_lfs_path(store_path: impl AsRef<Path>) -> Result<PathBuf> {
     let mut path = store_path.as_ref().to_owned();
     path.push("lfs");
-    create_shared_dir(&path)?;
+    create_shared_dir_all(&path)?;
 
     Ok(path)
 }
 
+#[context("get_lfs_pointers_path")]
 pub fn get_lfs_pointers_path(store_path: impl AsRef<Path>) -> Result<PathBuf> {
     let mut path = get_lfs_path(store_path)?;
     path.push("pointers");
@@ -113,6 +130,7 @@ pub fn get_lfs_pointers_path(store_path: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(path)
 }
 
+#[context("get_lfs_objects_path")]
 pub fn get_lfs_objects_path(store_path: impl AsRef<Path>) -> Result<PathBuf> {
     let mut path = get_lfs_path(store_path)?;
     path.push("objects");
@@ -121,6 +139,7 @@ pub fn get_lfs_objects_path(store_path: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(path)
 }
 
+#[context("get_lfs_blobs_path")]
 pub fn get_lfs_blobs_path(store_path: impl AsRef<Path>) -> Result<PathBuf> {
     let mut path = get_lfs_path(store_path)?;
     path.push("blobs");

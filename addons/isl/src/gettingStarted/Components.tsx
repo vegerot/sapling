@@ -5,20 +5,21 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import {Link as LinkEl} from '../Link';
 import {T} from '../i18n';
 import platform from '../platform';
 import {themeState} from '../theme';
 import {Ribbon} from './Ribbon';
-import {VSCodeLink, VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilValue} from 'recoil';
-import {Icon} from 'shared/Icon';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {useAtomValue} from 'jotai';
 
 export function DismissButton({dismiss}: {dismiss: () => void}) {
   return (
     <div className="dismiss">
-      <VSCodeButton appearance="icon" onClick={dismiss}>
+      <Button icon onClick={dismiss}>
         <Icon icon="x" />
-      </VSCodeButton>
+      </Button>
     </div>
   );
 }
@@ -35,14 +36,14 @@ export function Link({
   onNavigate?: () => unknown;
 }) {
   return (
-    <VSCodeLink
+    <LinkEl
       className={className}
       onClick={() => {
         onNavigate?.();
         platform.openExternalLink(href);
       }}>
       {children}
-    </VSCodeLink>
+    </LinkEl>
   );
 }
 
@@ -101,7 +102,7 @@ export function Card({
   side: 'left' | 'right';
   comingSoon?: boolean;
 }) {
-  const theme = useRecoilValue(themeState);
+  const theme = useAtomValue(themeState);
   const imgEl = (
     <img src={theme === 'light' ? imgLight : imgDark} alt={alt} className="card-image" />
   );
@@ -120,6 +121,28 @@ export function Card({
           <T>Coming Soon!</T>
         </Ribbon>
       ) : null}
+    </div>
+  );
+}
+
+export function Callout({
+  title,
+  imgDark,
+  imgLight,
+  alt,
+}: {
+  title: React.ReactNode;
+  imgLight?: string;
+  imgDark?: string;
+  alt: string;
+}) {
+  const theme = useAtomValue(themeState);
+  return (
+    <div className="callout">
+      {imgLight && imgDark && (
+        <img src={theme === 'light' ? imgLight : imgDark} alt={alt} className="callout-image" />
+      )}
+      <span>{title}</span>
     </div>
   );
 }

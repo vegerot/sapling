@@ -17,7 +17,7 @@
 #include <folly/String.h>
 #include <folly/logging/xlog.h>
 #include <folly/portability/Unistd.h>
-#include "eden/fs/utils/FileUtils.h"
+#include "eden/common/utils/FileUtils.h"
 
 #ifdef __APPLE__
 #include <libproc.h> // @manual
@@ -237,7 +237,7 @@ std::optional<size_t> calculatePrivateBytes() {
 #endif
 }
 
-ProcessList readProcessIdsForPath(FOLLY_MAYBE_UNUSED const AbsolutePath& path) {
+ProcessList readProcessIdsForPath([[maybe_unused]] const AbsolutePath& path) {
   ProcessList pids;
 #ifdef __APPLE__
   // Obtain the number of bytes to allocate for the pids buffer.

@@ -9,17 +9,20 @@
 
 #include <folly/Range.h>
 #include <folly/futures/Future.h>
+#include <folly/memory/not_null.h>
 #include <memory>
 
+#include "eden/common/utils/ImmediateFuture.h"
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/model/BlobFwd.h"
 #include "eden/fs/model/BlobMetadataFwd.h"
 #include "eden/fs/model/ObjectId.h"
 #include "eden/fs/model/RootId.h"
 #include "eden/fs/model/TreeFwd.h"
+#include "eden/fs/model/TreeMetadataFwd.h"
+#include "eden/fs/store/BackingStoreType.h"
 #include "eden/fs/store/ImportPriority.h"
 #include "eden/fs/store/ObjectFetchContext.h"
-#include "eden/fs/utils/ImmediateFuture.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 namespace folly {
 template <typename T>
@@ -30,8 +33,6 @@ namespace facebook::eden {
 
 class TreeEntry;
 enum class TreeEntryType : uint8_t;
-
-enum BackingStoreType : uint8_t { EMPTY, GIT, HG, RECAS, HTTP };
 
 enum class ObjectComparison : uint8_t {
   /// Given the IDs alone, it's not possible to know whether the contents are
@@ -54,8 +55,23 @@ enum class ObjectComparison : uint8_t {
  */
 class BackingStore : public RootIdCodec, public ObjectIdCodec {
  public:
-  BackingStore() {}
-  virtual ~BackingStore() {}
+  BackingStore() = default;
+  virtual ~BackingStore() = default;
+
+  /**
+   * Policy describing the kind of data cached in the LocalStore.
+   */
+  enum class LocalStoreCachingPolicy {
+    NoCaching = 0,
+    Trees = 1 << 0,
+    Blobs = 1 << 1,
+    BlobMetadata = 1 << 2,
+    // TODO(T192128228): Add caching policy for TreeMetadata
+    TreesAndBlobMetadata = Trees | BlobMetadata,
+    Anything = Trees | Blobs | BlobMetadata,
+  };
+
+  virtual LocalStoreCachingPolicy getLocalStoreCachingPolicy() const = 0;
 
   /**
    * A BackingStore may support multiple object ID encodings. To help EdenFS
@@ -78,54 +94,36 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
   };
 
   /**
-   * Return the root Tree corresponding to the passed in RootId.
-   */
-  virtual ImmediateFuture<GetRootTreeResult> getRootTree(
-      const RootId& rootId,
-      const ObjectFetchContextPtr& context) = 0;
-
-  virtual ImmediateFuture<std::shared_ptr<TreeEntry>> getTreeEntryForObjectId(
-      const ObjectId& objectId,
-      TreeEntryType treeEntryType,
-      const ObjectFetchContextPtr& context) = 0;
-
-  /**
    * Return value of the getTree method.
    */
   struct GetTreeResult {
     /** The retrieved tree. */
-    TreePtr tree;
+    folly::not_null<TreePtr> tree;
     /** The fetch origin of the tree. */
     ObjectFetchContext::Origin origin;
   };
 
   /**
-   * Fetch a tree from the backing store.
-   *
-   * Return the tree and where it was found.
+   * Return value of the getTreeMetadata method.
    */
-  virtual folly::SemiFuture<GetTreeResult> getTree(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) = 0;
+  struct GetTreeMetaResult {
+    /**
+     * The retrieved tree metadata.
+     */
+    TreeMetadataPtr treeMeta;
+    /** The fetch origin of the tree metadata. */
+    ObjectFetchContext::Origin origin;
+  };
 
   /**
    * Return value of the getBlob method.
    */
   struct GetBlobResult {
     /** The retrieved blob. */
-    BlobPtr blob;
+    folly::not_null<BlobPtr> blob;
     /** The fetch origin of the blob. */
     ObjectFetchContext::Origin origin;
   };
-
-  /**
-   * Fetch a blob from the backing store.
-   *
-   * Return the blob and where it was found.
-   */
-  virtual folly::SemiFuture<GetBlobResult> getBlob(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) = 0;
 
   /**
    * Return value of the getBlobMetadata method.
@@ -134,10 +132,12 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
     /**
      * The retrieved blob metadata.
      *
-     * When the BackingStore is wrapped in a LocalStoreCachedBackingStore,
-     * setting this to a nullptr will make the LocalStoreCachedBackingStore
-     * fallback to fetching the blob, computing the blob metadata from it and
-     * store it in the LocalStore.
+     * If either BackingStore::LocalStoreCachingPolicy::BlobMetadata is not set
+     * or the blob metadata was not found in the LocalStore, setting this to a
+     * nullptr will make ObjectStore::getBlobMetadata fallback to fetching
+     * the blob, either from the LocalStore or from the BackingStore, to compute
+     * the blob metadata. It also may store the fetched blob and calculated blob
+     * metadata in the LocalStore, depending on the current caching policy.
      */
     BlobMetadataPtr blobMeta;
     /** The fetch origin of the blob metadata. */
@@ -145,25 +145,19 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
   };
 
   /**
-   * Fetch the blob metadata from the backing store.
-   *
-   * Return the blob metadata and where it was found.
+   * Return value of the getGlobFiles method.
    */
-  virtual folly::SemiFuture<GetBlobMetaResult> getBlobMetadata(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) = 0;
-
-  /**
-   * Prefetch all the blobs represented by the HashRange.
-   *
-   * The caller is responsible for making sure that the HashRange stays valid
-   * for as long as the returned SemiFuture.
-   */
-  FOLLY_NODISCARD virtual folly::SemiFuture<folly::Unit> prefetchBlobs(
-      ObjectIdRange /*ids*/,
-      const ObjectFetchContextPtr& /*context*/) {
-    return folly::unit;
-  }
+  struct GetGlobFilesResult {
+    /**
+     * The retrieved glob entries
+     * This command is unimplemented on some backing store impls
+     * and will return an error. This will trigger the client to fallback to
+     * looking up the globs locally.
+     */
+    std::vector<std::string> globFiles;
+    RootId rootId;
+    bool isLocal = false;
+  };
 
   virtual void periodicManagementTask() {}
 
@@ -174,7 +168,7 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
    * recording and return the fetched files since startRecordingFetch() is
    * called and clear the old records.
    *
-   * Currently implemented in HgQueuedBackingStore.
+   * Currently implemented in SaplingBackingStore.
    *
    * Note: Only stopRecordingFetch() clears old records. Calling
    * startRecordingFetch() a second time has no effect.
@@ -199,9 +193,10 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
    * Hash is widened to variable-width, eliminating the need for proxy hashes,
    * this API should be removed.
    */
-  virtual folly::SemiFuture<folly::Unit> importManifestForRoot(
+  virtual ImmediateFuture<folly::Unit> importManifestForRoot(
       const RootId& /*rootId*/,
-      const Hash20& /*manifest*/) {
+      const Hash20& /*manifest*/,
+      const ObjectFetchContextPtr& /*context*/) {
     return folly::unit;
   }
 
@@ -219,6 +214,90 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
   // Forbidden copy constructor and assignment operator
   BackingStore(BackingStore const&) = delete;
   BackingStore& operator=(BackingStore const&) = delete;
+
+  /**
+   * ObjectStore should be the only public place to access BackingStore and
+   * LocalStore.
+   */
+  friend class ObjectStore;
+
+  /**
+   * FilteredBackingStore also has underlying BackingStore and should have
+   * access to the following functions to access the underlying BackingStore.
+   */
+  friend class FilteredBackingStore;
+
+  /**
+   * Return the root Tree corresponding to the passed in RootId.
+   */
+  virtual ImmediateFuture<GetRootTreeResult> getRootTree(
+      const RootId& rootId,
+      const ObjectFetchContextPtr& context) = 0;
+
+  virtual ImmediateFuture<std::shared_ptr<TreeEntry>> getTreeEntryForObjectId(
+      const ObjectId& objectId,
+      TreeEntryType treeEntryType,
+      const ObjectFetchContextPtr& context) = 0;
+
+  /**
+   * Fetch a tree from the backing store.
+   *
+   * Return the tree and where it was found.
+   */
+  virtual folly::SemiFuture<GetTreeResult> getTree(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) = 0;
+
+  /**
+   * Fetch the tree metadata from the backing store.
+   *
+   * Return the tree metadata and where it was found.
+   */
+  virtual folly::SemiFuture<GetTreeMetaResult> getTreeMetadata(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) = 0;
+
+  /**
+   * Fetch a blob from the backing store.
+   *
+   * Return the blob and where it was found.
+   */
+  virtual folly::SemiFuture<GetBlobResult> getBlob(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) = 0;
+
+  /**
+   * Fetch the blob metadata from the backing store.
+   *
+   * Return the blob metadata and where it was found.
+   */
+  virtual folly::SemiFuture<GetBlobMetaResult> getBlobMetadata(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) = 0;
+
+  /**
+   * Fetch file paths matching the given glob suffixes
+   *
+   * Return the Glob result containing the list of file paths, dtype, and commit
+   * If the implementing BackingStore does not impolement this method, it will
+   * return an error. The caller should fallback to resolving globFiles locally
+   * in this case.
+   */
+  virtual ImmediateFuture<GetGlobFilesResult> getGlobFiles(
+      const RootId& id,
+      const std::vector<std::string>& globs) = 0;
+
+  /**
+   * Prefetch all the blobs represented by the HashRange.
+   *
+   * The caller is responsible for making sure that the HashRange stays valid
+   * for as long as the returned SemiFuture.
+   */
+  FOLLY_NODISCARD virtual folly::SemiFuture<folly::Unit> prefetchBlobs(
+      ObjectIdRange /*ids*/,
+      const ObjectFetchContextPtr& /*context*/) {
+    return folly::unit;
+  }
 };
 
 /**

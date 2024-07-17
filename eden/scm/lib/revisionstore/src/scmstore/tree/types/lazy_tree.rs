@@ -12,12 +12,14 @@ use edenapi_types::TreeChildEntry;
 use edenapi_types::TreeEntry;
 use manifest_tree::TreeEntry as ManifestTreeEntry;
 use minibytes::Bytes;
-use storemodel::TreeFormat;
+use storemodel::SerializationFormat;
 use types::HgId;
 use types::Key;
+use types::Parents;
 
 use crate::indexedlogdatastore::Entry;
 use crate::scmstore::file::FileAuxData;
+use crate::scmstore::tree::TreeAuxData;
 use crate::Metadata;
 
 /// A minimal tree enum that simply wraps the possible underlying tree types,
@@ -25,13 +27,18 @@ use crate::Metadata;
 #[derive(Debug)]
 pub(crate) enum LazyTree {
     /// A response from calling into the legacy storage API
-    ContentStore(Bytes, Metadata),
+    ContentStore(Bytes),
 
     /// An entry from a local IndexedLog. The contained Key's path might not match the requested Key's path.
     IndexedLog(Entry),
 
-    /// An EdenApi TreeEntry.
-    EdenApi(TreeEntry),
+    /// An SaplingRemoteApi TreeEntry.
+    SaplingRemoteApi(TreeEntry),
+}
+
+pub enum AuxData {
+    File(FileAuxData),
+    Tree(TreeAuxData),
 }
 
 impl LazyTree {
@@ -39,19 +46,19 @@ impl LazyTree {
     fn hgid(&self) -> Option<HgId> {
         use LazyTree::*;
         match self {
-            ContentStore(_, _) => None,
+            ContentStore(_) => None,
             IndexedLog(ref entry) => Some(entry.key().hgid),
-            EdenApi(ref entry) => Some(entry.key().hgid),
+            SaplingRemoteApi(ref entry) => Some(entry.key().hgid),
         }
     }
 
     /// The tree content, as would be encoded in the Mercurial blob
-    pub(crate) fn hg_content(&mut self) -> Result<Bytes> {
+    pub(crate) fn hg_content(&self) -> Result<Bytes> {
         use LazyTree::*;
         Ok(match self {
-            IndexedLog(ref mut entry) => entry.content()?,
-            ContentStore(ref blob, _) => blob.clone(),
-            EdenApi(ref entry) => entry.data()?.into(),
+            IndexedLog(ref entry) => entry.content()?,
+            ContentStore(ref blob) => blob.clone(),
+            SaplingRemoteApi(ref entry) => entry.data()?.into(),
         })
     }
 
@@ -60,64 +67,71 @@ impl LazyTree {
         use LazyTree::*;
         Ok(match self {
             IndexedLog(ref entry) => Some(entry.clone().with_key(key)),
-            EdenApi(ref entry) => Some(Entry::new(key, entry.data()?.into(), Metadata::default())),
+            SaplingRemoteApi(ref entry) => {
+                Some(Entry::new(key, entry.data()?.into(), Metadata::default()))
+            }
             // ContentStore handles caching internally
-            ContentStore(_, _) => None,
+            ContentStore(_) => None,
         })
     }
 
     pub fn manifest_tree_entry(&mut self) -> Result<ManifestTreeEntry> {
         // TODO(meyer): Make manifest-tree crate use minibytes::Bytes
         // Currently revisionstore is only for hg format.
-        let format = TreeFormat::Hg;
-        Ok(ManifestTreeEntry(
-            self.hg_content()?.into_vec().into(),
-            format,
-        ))
+        let format = SerializationFormat::Hg;
+        Ok(ManifestTreeEntry(self.hg_content()?, format))
     }
 
-    pub fn aux_data(&self) -> HashMap<HgId, FileAuxData> {
+    pub(crate) fn parents(&self) -> Option<Parents> {
+        match &self {
+            Self::SaplingRemoteApi(entry) => entry.parents,
+            _ => None,
+        }
+    }
+
+    pub(crate) fn aux_data(&self) -> Option<TreeAuxData> {
+        match &self {
+            Self::SaplingRemoteApi(entry) => entry.tree_aux_data.clone(),
+            _ => None,
+        }
+    }
+
+    pub fn children_aux_data(&self) -> HashMap<HgId, AuxData> {
         use LazyTree::*;
         match self {
-            EdenApi(entry) => entry
-                .children
-                .as_ref()
-                .map_or_else(HashMap::new, |childrens| {
-                    childrens
-                        .iter()
-                        .filter_map(|entry| {
-                            let child_entry = match entry {
-                                Err(err) => {
-                                    tracing::warn!("Error fetching child entry: {:?}", err);
-                                    return None;
+            SaplingRemoteApi(entry) => {
+                entry
+                    .children
+                    .as_ref()
+                    .map_or_else(HashMap::new, |childrens| {
+                        childrens
+                            .iter()
+                            .filter_map(|entry| {
+                                let child_entry = entry
+                                    .as_ref()
+                                    .inspect_err(|err| {
+                                        tracing::warn!("Error fetching child entry: {:?}", err);
+                                    })
+                                    .ok()?;
+                                match child_entry {
+                                    TreeChildEntry::File(file_entry) => {
+                                        file_entry.file_metadata.clone().map(|file_metadata| {
+                                            (
+                                                file_entry.key.hgid,
+                                                AuxData::File(file_metadata.into()),
+                                            )
+                                        })
+                                    }
+                                    TreeChildEntry::Directory(dir_entry) => {
+                                        dir_entry.tree_aux_data.map(|dir_metadata| {
+                                            (dir_entry.key.hgid, AuxData::Tree(dir_metadata))
+                                        })
+                                    }
                                 }
-                                Ok(file_entry) => file_entry,
-                            };
-                            // TODO: Also return directory aux data.
-                            if let TreeChildEntry::File(file_entry) = child_entry {
-                                file_entry.file_metadata.map(|file_metadata| {
-                                    (
-                                        file_entry.key.hgid,
-                                        FileAuxData {
-                                            total_size: file_metadata.size.unwrap(),
-                                            content_id: file_metadata.content_id.unwrap(),
-                                            content_sha1: file_metadata.content_sha1.unwrap(),
-                                            content_sha256: file_metadata
-                                                .content_sha256
-                                                .unwrap()
-                                                .into_byte_array()
-                                                .into(),
-                                            content_seeded_blake3: file_metadata
-                                                .content_seeded_blake3,
-                                        },
-                                    )
-                                })
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<HashMap<_, _>>()
-                }),
+                            })
+                            .collect::<HashMap<_, _>>()
+                    })
+            }
             _ => HashMap::new(),
         }
     }

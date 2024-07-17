@@ -1,6 +1,7 @@
 #chg-compatible
+#debugruntest-incompatible
 
-#require test-repo execbit hg10
+#require execbit
 
   $ eagerepo
   $ . "$TESTDIR/helpers-testrepo.sh"
@@ -11,7 +12,7 @@
   $ python << EOF
   > import os, stat
   > for path in open(os.path.join(os.environ["TESTTMP"], "filelist")).read().splitlines():
-  >     if path.startswith("fb/"):
+  >     if path.startswith("fb/") or path.startswith("tests/sapling"):
   >         continue
   >     content = open(path, "rb").read()
   >     isexec = bool(stat.S_IEXEC & os.stat(path).st_mode)
@@ -31,5 +32,6 @@
   >     elif not isexec and interpreter and not isrs:
   >         print("%s is not an executable but does have #!" % path)
   > EOF
+  run_buck_hgpython.sh is a Shell script but does not have Shell interpreter specified
   tests/infinitepush/library.sh is not an executable but does have #!
   tests/stresstest-atomicreplace.py is not an executable but does have #!

@@ -26,17 +26,15 @@ use scuba_ext::MononokeScubaSampleBuilder;
 use scuba_ext::ScubaValue;
 use time_ext::DurationExt;
 
+use super::request_context::RequestContext;
 use super::HeadersDuration;
-use super::RequestLoad;
+use crate::middleware::ConfigInfo;
 use crate::middleware::MetadataState;
 use crate::middleware::Middleware;
 use crate::middleware::PostResponseCallbacks;
 use crate::middleware::PostResponseInfo;
 use crate::response::HeadersMeta;
 use crate::state_ext::StateExt;
-
-/// HTTP header used to correlate the request with the client-side logging
-const CLIENT_CORRELATOR: &str = "x-client-correlator";
 
 /// Common HTTP-related Scuba columns that the middlware will set automatically.
 /// Applications using the middleware are encouraged to follow a similar pattern
@@ -67,8 +65,6 @@ pub enum HttpScubaKey {
     ClientCorrelator,
     /// The client identities received for the client, if any.
     ClientIdentities,
-    /// The request load when this request was admitted.
-    RequestLoad,
     /// A unique ID identifying this request.
     RequestId,
     /// How long it took to send headers.
@@ -81,6 +77,10 @@ pub enum HttpScubaKey {
     ResponseBytesSent,
     /// How many bytes were received from the client (should normally equal the content length)
     RequestBytesReceived,
+    /// The config store version at the time of the request.
+    ConfigStoreVersion,
+    /// The config store last update time at the time of the request.
+    ConfigStoreLastUpdatedAt,
 }
 
 impl AsRef<str> for HttpScubaKey {
@@ -100,13 +100,14 @@ impl AsRef<str> for HttpScubaKey {
             ClientIp => "client_ip",
             ClientCorrelator => "client_correlator",
             ClientIdentities => "client_identities",
-            RequestLoad => "request_load",
             RequestId => "request_id",
             HeadersDurationMs => "headers_duration_ms",
             DurationMs => "duration_ms",
             ClientHostname => "client_hostname",
             ResponseBytesSent => "response_bytes_sent",
             RequestBytesReceived => "request_bytes_received",
+            ConfigStoreVersion => "config_store_version",
+            ConfigStoreLastUpdatedAt => "config_store_last_updated_at",
         }
     }
 }
@@ -118,13 +119,22 @@ impl From<HttpScubaKey> for String {
 }
 
 pub trait ScubaHandler: Send + 'static {
+    /// Construct an instance of this scuba handler from the Gotham `State`.
     fn from_state(state: &State) -> Self;
 
-    fn populate_scuba(self, info: &PostResponseInfo, scuba: &mut MononokeScubaSampleBuilder);
+    /// Log to scuba that this request was processed.
+    fn log_processed(self, info: &PostResponseInfo, scuba: MononokeScubaSampleBuilder);
+
+    /// Log to scuba that this request was cancelled.
+    fn log_cancelled(scuba: MononokeScubaSampleBuilder) {
+        let _ = scuba;
+    }
 }
 
 #[derive(Clone)]
 pub struct ScubaMiddleware<H> {
+    /// Fallback scuba sample builder to use if the request context is not
+    /// available.
     scuba: MononokeScubaSampleBuilder,
     _phantom: PhantomHandler<H>,
 }
@@ -149,7 +159,7 @@ impl<H> ScubaMiddleware<H> {
 /// This isn't actually necessary since the middleware itself does not contain
 /// an instance of the handler. (The handler is instantiated shortly before it
 /// is used in a post-request callback.) Therefore, it is safe to manually mark
-/// `PhantomData<H>` with these traits via a wrapper struct, ensuring that
+/// `PhantomHandler<H>` with these traits via a wrapper struct, ensuring that
 /// the middleware automatically implements the required marker traits.
 #[derive(Clone)]
 struct PhantomHandler<H>(PhantomData<H>);
@@ -218,15 +228,6 @@ fn populate_scuba(scuba: &mut MononokeScubaSampleBuilder, state: &mut State) {
             header::USER_AGENT,
             |header| header.to_string(),
         );
-
-        // TODO(rajshar): Remove this once the ClientRequestInfo pieces are deployed in Prod
-        add_header(
-            scuba,
-            headers,
-            HttpScubaKey::ClientCorrelator,
-            CLIENT_CORRELATOR,
-            |header| header.to_string(),
-        );
     }
 
     if let Some(metadata_state) = MetadataState::try_borrow_from(state) {
@@ -243,8 +244,15 @@ fn populate_scuba(scuba: &mut MononokeScubaSampleBuilder, state: &mut State) {
         scuba.add(HttpScubaKey::ClientIdentities, identities);
     }
 
-    if let Some(request_load) = RequestLoad::try_borrow_from(state) {
-        scuba.add(HttpScubaKey::RequestLoad, request_load.0);
+    if let Some(config_version) = ConfigInfo::try_borrow_from(state) {
+        scuba.add(
+            HttpScubaKey::ConfigStoreVersion,
+            config_version.version.clone(),
+        );
+        scuba.add(
+            HttpScubaKey::ConfigStoreLastUpdatedAt,
+            config_version.last_updated_at.clone(),
+        );
     }
 
     scuba.add(HttpScubaKey::RequestId, state.short_request_id());
@@ -269,16 +277,16 @@ fn log_stats<H: ScubaHandler>(
     let callbacks = state.try_borrow_mut::<PostResponseCallbacks>()?;
     callbacks.add(move |info| {
         if let Some(duration) = info.duration {
-            // If tunables say we should, log high values unsampled
-            if let Ok(threshold) = tunables::tunables()
-                .edenapi_unsampled_duration_threshold_ms()
-                .unwrap_or_default()
-                .try_into()
-            {
-                if duration.as_millis_unchecked() > threshold {
-                    scuba.unsampled();
-                }
+            let threshold: u64 = justknobs::get_as::<u64>(
+                "scm/mononoke_timeouts:edenapi_unsampled_duration_threshold_ms",
+                None,
+            )
+            .unwrap_or_default();
+
+            if duration.as_millis_unchecked() > threshold {
+                scuba.unsampled();
             }
+
             scuba.add(HttpScubaKey::DurationMs, duration.as_millis_unchecked());
         }
 
@@ -304,17 +312,10 @@ fn log_stats<H: ScubaHandler>(
             scuba.add_prefixed_stream_stats(stats);
         }
 
-        handler.populate_scuba(info, &mut scuba);
-
-        scuba.log();
+        handler.log_processed(info, scuba);
     });
 
     Some(())
-}
-
-fn log_cancelled(mut scuba: MononokeScubaSampleBuilder) {
-    scuba.add("log_tag", "EdenAPI Request Cancelled");
-    scuba.log();
 }
 
 #[derive(StateData)]
@@ -372,17 +373,28 @@ impl ScubaMiddlewareState {
 #[async_trait::async_trait]
 impl<H: ScubaHandler> Middleware for ScubaMiddleware<H> {
     async fn inbound(&self, state: &mut State) -> Option<Response<Body>> {
-        // Reset the scuba sequence counter for each request.
-        let mut scuba = self.scuba.clone().with_seq("seq");
+        // Get the scuba sample builder from the ctx in the request context.
+        let mut scuba = if let Some(req) = state.try_borrow::<RequestContext>() {
+            req.ctx.scuba().clone()
+        } else {
+            // Use the fallback scuba sample builder instead, resetting the
+            // scuba sequence counter for each request.
+            self.scuba.clone().with_seq("seq")
+        };
 
         // Populate the sample builder with values available at the start of the request.
         populate_scuba(&mut scuba, state);
+
+        // Update the request context with the populated scuba sample builder.
+        if let Some(req) = state.try_borrow_mut::<RequestContext>() {
+            req.ctx = req.ctx.with_mutated_scuba(|_| scuba.clone());
+        }
 
         // Ensure we log if the request is cancelled.
         let scuba = scopeguard::guard(
             scuba,
             Box::new(|scuba| {
-                log_cancelled(scuba);
+                H::log_cancelled(scuba);
             }) as Box<dyn FnOnce(MononokeScubaSampleBuilder) + Send>,
         );
 
@@ -393,15 +405,43 @@ impl<H: ScubaHandler> Middleware for ScubaMiddleware<H> {
     async fn outbound(&self, state: &mut State, response: &mut Response<Body>) {
         if let Some(scuba_middleware) = state.try_take::<ScubaMiddlewareState>() {
             // Defuse the scopeguard so that we will no longer log cancellation.
-            let scuba = ScopeGuard::into_inner(scuba_middleware.0);
+            let mut scuba = ScopeGuard::into_inner(scuba_middleware.0).clone();
+            let status = &response.status();
 
             if let Some(uri) = Uri::try_borrow_from(state) {
-                if uri.path() == "/health_check" {
-                    return;
+                if uri.path() == "/health_check" || uri.path() == "/proxygen/health_check" {
+                    if !justknobs::eval("scm/mononoke:health_check_scuba_log_enabled", None, None)
+                        .unwrap_or(false)
+                    {
+                        return;
+                    }
+
+                    let sampling_rate = core::num::NonZeroU64::new(
+                        if status.as_u16() >= 200 || status.as_u16() < 299 {
+                            const FALLBACK_SAMPLING_RATE: u64 = 1000;
+                            justknobs::get_as::<u64>(
+                                "scm/mononoke:health_check_scuba_log_success_sampling_rate",
+                                None,
+                            )
+                            .unwrap_or(FALLBACK_SAMPLING_RATE)
+                        } else {
+                            const FALLBACK_SAMPLING_RATE: u64 = 1;
+                            justknobs::get_as::<u64>(
+                                "scm/mononoke:health_check_scuba_log_failure_sampling_rate",
+                                None,
+                            )
+                            .unwrap_or(FALLBACK_SAMPLING_RATE)
+                        },
+                    );
+                    if let Some(sampling_rate) = sampling_rate {
+                        scuba.sampled(sampling_rate);
+                    } else {
+                        scuba.unsampled();
+                    }
                 }
             }
 
-            log_stats::<H>(scuba, state, &response.status());
+            log_stats::<H>(scuba, state, status);
         }
     }
 }

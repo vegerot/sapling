@@ -4,7 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# pyre-unsafe
+# pyre-strict
+
 
 import binascii
 import os
@@ -55,12 +56,16 @@ class FakeEdenInstance(AbstractEdenInstance):
         self._tmp_dir = tmp_dir
         self._status = status
         self._build_info = build_info if build_info else {}
+        # pyre-fixme[4]: Attribute must be annotated.
         self._config = config if config else {}
 
+        # pyre-fixme[4]: Attribute must be annotated.
         self._eden_dir = Path(self._tmp_dir) / "eden"
         self._eden_dir.mkdir()
+        # pyre-fixme[4]: Attribute must be annotated.
         self.clients_path = self._eden_dir / "clients"
         self.clients_path.mkdir()
+        # pyre-fixme[4]: Attribute must be annotated.
         self.default_backing_repo = (
             Path(self._tmp_dir) / ".eden-backing-repos" / "main_repo"
         )
@@ -151,7 +156,7 @@ class FakeEdenInstance(AbstractEdenInstance):
             typing.cast(EdenInstance, self), Path(full_path), state_dir
         )
         eden_checkout.save_config(config)
-        eden_checkout.save_snapshot(snapshot)
+        eden_checkout.save_snapshot(snapshot.encode())
 
         if active and self._status == fb303_status.ALIVE:
             # Report the mount in /proc/mounts
@@ -309,3 +314,6 @@ class FakeEdenInstance(AbstractEdenInstance):
 
     def get_running_version(self) -> str:
         return version_mod.format_eden_version(self.get_running_version_parts())
+
+    def get_known_bad_edenfs_versions(self) -> Dict[str, List[str]]:
+        return {}

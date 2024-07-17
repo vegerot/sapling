@@ -45,7 +45,7 @@ _fixsys()
 del globals()["_fixsys"]
 
 
-def run(args=None, fin=None, fout=None, ferr=None, config=None):
+def run(args, fin, fout, ferr, ctx, skipprehooks):
     import sys
 
     if args is None:
@@ -54,11 +54,11 @@ def run(args=None, fin=None, fout=None, ferr=None, config=None):
     if args[1:2] == ["start-pfc-server"]:
         # chgserver code path
 
-        # Disable tracing as early as possible. Any use of Rust
-        # tracing pre-fork messes things up post-fork.
-        from . import tracing
+        from . import prefork
 
-        tracing.disabletracing = True
+        # Set a global so other modules know we are about to fork. They may want
+        # to avoid doing/initializing certain things that are not fork safe.
+        prefork.prefork = True
 
         # no demandimport, since chgserver wants to preimport everything.
         from . import dispatch
@@ -66,9 +66,9 @@ def run(args=None, fin=None, fout=None, ferr=None, config=None):
         dispatch.runchgserver(args[2:])
     else:
         # non-chgserver code path
-        # - no chg in use: hgcommands::run -> HgPython::run_hg -> here
+        # - no chg in use: commands::run -> HgPython::run_hg -> here
         # - chg client: chgserver.runcommand -> bindings.commands.run ->
-        #               hgcommands::run -> HgPython::run_hg -> here
+        #               commands::run -> HgPython::run_hg -> here
 
         from . import traceimport
 
@@ -83,4 +83,4 @@ def run(args=None, fin=None, fout=None, ferr=None, config=None):
         # so 'import dispatch' happens after demandimport
         from . import dispatch
 
-        dispatch.run(args, fin, fout, ferr, config)
+        dispatch.run(args, fin, fout, ferr, ctx, skipprehooks)

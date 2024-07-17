@@ -6,9 +6,16 @@
  */
 
 import type {ThemeColor} from './theme';
-import type {Disposable, OneIndexedLineNumber, PlatformName, RepoRelativePath} from './types';
+import type {
+  Disposable,
+  OneIndexedLineNumber,
+  PlatformName,
+  RepoRelativePath,
+  ServerToClientMessage,
+} from './types';
 import type {LazyExoticComponent} from 'react';
 import type {Comparison} from 'shared/Comparison';
+import type {Json} from 'shared/typeUtils';
 
 import {browserPlatform} from './BrowserPlatform';
 
@@ -21,9 +28,29 @@ export interface Platform {
   platformName: PlatformName;
   confirm(message: string, details?: string): Promise<boolean>;
   openFile(path: RepoRelativePath, options?: {line?: OneIndexedLineNumber}): void;
+  openFiles(paths: Array<RepoRelativePath>, options?: {line?: OneIndexedLineNumber}): void;
+  canCustomizeFileOpener: boolean;
+  openContainingFolder?(path: RepoRelativePath): void;
   openDiff?(path: RepoRelativePath, comparison: Comparison): void;
   openExternalLink(url: string): void;
-  clipboardCopy(value: string): void;
+  clipboardCopy(text: string, html?: string): void;
+  chooseFile?(title: string, multi: boolean): Promise<Array<File>>;
+  /** Whether to ask to configure an external merge tool. Useful for standalone platforms, but not embedded ones like vscode. */
+  upsellExternalMergeTool: boolean;
+  /**
+   * Get stored data from local persistant cache (usually browser local storage).
+   * Note: Some platforms may not support this (e.g. browser with localStorage disabled),
+   * or it may not be persisted indefinitely---usual localStorage caveats apply.
+   */
+  getPersistedState<T extends Json>(key: string): T | null;
+  /** see getPersistedState  */
+  setPersistedState<T extends Json>(key: string, value: T): void;
+  /** see getPersistedState  */
+  clearPersistedState(): void;
+  /** see getPersistedState  */
+  getAllPersistedState(): Json | undefined;
+
+  handleServerMessage?: (message: ServerToClientMessage) => void;
 
   /**
    * Component representing additional buttons/info in the help menu.
@@ -38,11 +65,15 @@ export interface Platform {
    */
   GettingStartedContent?: LazyExoticComponent<({dismiss}: {dismiss: () => void}) => JSX.Element>;
   /** Content to show as a tooltip on the bug button after going through the getting started experience */
-  GettingStartedBugNuxContent?: string;
+  GettingStartedBugNuxContent?: LazyExoticComponent<
+    ({dismiss}: {dismiss: () => void}) => JSX.Element
+  >;
 
   theme?: {
     getTheme(): ThemeColor;
+    getThemeName?(): string | undefined;
     onDidChangeTheme(callback: (theme: ThemeColor) => unknown): Disposable;
+    resetCSS?: string;
   };
 }
 

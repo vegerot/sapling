@@ -11,8 +11,9 @@ import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import IntEnum
-from io import BytesIO
 from typing import Any, BinaryIO, Callable, Dict, List, Optional, Set, Tuple
+
+from .bufio import BufIO
 
 
 @dataclass
@@ -113,7 +114,7 @@ class Env:
     parent: Optional[Env] = None
 
     # background jobs
-    jobs: List[Tuple[threading.Thread, BytesIO]] = field(default_factory=list)
+    jobs: List[Tuple[threading.Thread, BufIO]] = field(default_factory=list)
 
     def getenv(self, name: str) -> str:
         if name == "PWD":
@@ -288,6 +289,9 @@ class ShellFS(ABC):
     def stat(self, path: str):
         raise NotImplementedError
 
+    def lstat(self, path: str):
+        raise NotImplementedError
+
     def utime(self, path: str, time: int):
         raise NotImplementedError
 
@@ -298,6 +302,14 @@ class ShellFS(ABC):
         raise NotImplementedError
 
     def exists(self, path: str):
+        raise NotImplementedError
+
+    def lexists(self, path: str):
+        """
+        Return True if path refers to an existing path. Returns True for
+        broken symbolic links. Equivalent to exists() on platforms lacking
+        os.lstat().
+        """
         raise NotImplementedError
 
     def listdir(self, path: str) -> List[str]:

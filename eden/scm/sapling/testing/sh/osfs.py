@@ -8,7 +8,7 @@ import os
 import shutil
 from typing import BinaryIO, List
 
-from .testfs import NullIO
+from .bufio import BufIO
 from .types import ShellFS
 
 
@@ -17,7 +17,7 @@ class OSFS(ShellFS):
 
     def open(self, path: str, mode: str) -> BinaryIO:
         if path == "/dev/null":
-            return NullIO()
+            return BufIO.devnull()
         path = self._absjoin(path)
         if "b" not in mode:
             mode += "b"
@@ -58,6 +58,10 @@ class OSFS(ShellFS):
         path = self._absjoin(path)
         return os.stat(path)
 
+    def lstat(self, path: str):
+        path = self._absjoin(path)
+        return os.lstat(path)
+
     def isdir(self, path: str):
         path = self._absjoin(path)
         return os.path.isdir(path)
@@ -69,6 +73,10 @@ class OSFS(ShellFS):
     def exists(self, path: str):
         path = self._absjoin(path)
         return os.path.exists(path)
+
+    def lexists(self, path: str):
+        path = self._absjoin(path)
+        return os.path.lexists(path)
 
     def listdir(self, path: str) -> List[str]:
         path = self._absjoin(path)
@@ -86,7 +94,7 @@ class OSFS(ShellFS):
                 os.unlink(dst)
             except FileNotFoundError:
                 pass
-        os.rename(src, dst)
+        shutil.move(src, dst)
 
     def rm(self, path: str):
         path = self._absjoin(path)

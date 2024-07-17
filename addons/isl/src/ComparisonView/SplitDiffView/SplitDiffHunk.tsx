@@ -5,18 +5,20 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {TokenizedDiffHunk, TokenizedHunk} from './syntaxHighlighting';
-import type {Context, LineRangeParams, OneIndexedLineNumber} from './types';
-import type {Hunk, ParsedDiff} from 'diff';
+import type {TokenizedDiffHunk, TokenizedHunk} from './syntaxHighlightingTypes';
+import type {Context, OneIndexedLineNumber} from './types';
 import type {ReactNode} from 'react';
+import type {Hunk, ParsedDiff} from 'shared/patch/parse';
 
-import SplitDiffRow from './SplitDiffRow';
+import {T, t} from '../../i18n';
+import {useFetchLines} from '../ComparisonView';
+import SplitDiffRow, {BlankLineNumber} from './SplitDiffRow';
 import {useTableColumnSelection} from './copyFromSelectedColumn';
 import {useTokenizedContents, useTokenizedHunks} from './syntaxHighlighting';
 import {diffChars} from 'diff';
+import {ErrorNotice} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
 import React, {useCallback, useState} from 'react';
-import {useRecoilValueLoadable} from 'recoil';
-import {Icon} from 'shared/Icon';
 import organizeLinesIntoGroups from 'shared/SplitDiffView/organizeLinesIntoGroups';
 import {
   applyTokenizationToLine,
@@ -25,15 +27,14 @@ import {
 
 const MAX_INPUT_LENGTH_FOR_INTRALINE_DIFF = 300;
 
-export type SplitDiffTableProps<Id> = {
-  ctx: Context<Id>;
+export type SplitDiffTableProps = {
+  ctx: Context;
   path: string;
   patch: ParsedDiff;
-  preamble?: Array<React.ReactElement>;
 };
 
 export const SplitDiffTable = React.memo(
-  <Id,>({ctx, path, patch, preamble}: SplitDiffTableProps<Id>): React.ReactElement => {
+  ({ctx, path, patch}: SplitDiffTableProps): React.ReactElement => {
     const [deletedFileExpanded, setDeletedFileExpanded] = useState<boolean>(false);
     const [expandedSeparators, setExpandedSeparators] = useState<Readonly<Set<string>>>(
       () => new Set(),
@@ -51,13 +52,14 @@ export const SplitDiffTable = React.memo(
 
     const {className: tableSelectionClassName, ...tableSelectionProps} = useTableColumnSelection();
 
-    const t = ctx.translate ?? (s => s);
-
     const isDeleted = patch.newFileName === '/dev/null';
+    const isAdded = patch.type === 'Added';
+
+    const unified = ctx.display === 'unified';
 
     const {hunks} = patch;
     const lastHunkIndex = hunks.length - 1;
-    const rows: React.ReactElement[] = [...(preamble ?? [])];
+    const rows: React.ReactElement[] = [];
     if (!isDeleted || deletedFileExpanded) {
       hunks.forEach((hunk, index) => {
         // Show a separator before the first hunk if the file starts with a
@@ -66,23 +68,18 @@ export const SplitDiffTable = React.memo(
           // TODO: test empty file that went from 644 to 755?
           const key = 's0';
           if (expandedSeparators.has(key)) {
-            const range: LineRangeParams<Id> = {
-              id: ctx.id,
-              start: 1,
-              numLines: hunk.oldStart - 1,
-            };
             rows.push(
               <ExpandingSeparator
                 key={key}
                 ctx={ctx}
-                range={range}
                 path={path}
+                start={1}
+                numLines={hunk.oldStart - 1}
                 beforeLineStart={1}
                 afterLineStart={1}
-                t={t}
               />,
             );
-          } else {
+          } else if (ctx.supportsExpandingContext) {
             const numLines = Math.max(hunk.oldStart, hunk.newStart) - 1;
             rows.push(
               <HunkSeparator key={key} numLines={numLines} onExpand={() => onExpand(key)} t={t} />,
@@ -90,32 +87,30 @@ export const SplitDiffTable = React.memo(
           }
         }
 
-        addRowsForHunk(hunk, path, rows, tokenization?.[index], ctx.openFileToLine);
+        addRowsForHunk(unified, hunk, path, rows, tokenization?.[index], ctx.openFileToLine);
 
-        if (index !== lastHunkIndex) {
-          const nextHunk = hunks[index + 1];
-          const key = `s${hunk.oldStart}`;
+        const isLast = index === lastHunkIndex;
+        const nextHunk = hunks[index + 1];
+        const key = `s${hunk.oldStart}`;
+        const canExpand = !isLast || !(isAdded || isDeleted || isHunkProbablyAtEndOfFile(hunk)); // added and deleted files are already expanded
+        if (canExpand) {
           if (expandedSeparators.has(key)) {
             const start = hunk.oldStart + hunk.oldLines;
-            const numLines = nextHunk.oldStart - start;
-            const range: LineRangeParams<Id> = {
-              id: ctx.id,
-              start,
-              numLines,
-            };
+            const MAX_LINES_FETCH = 10000; // We don't know the total number of lines, so for the last hunk we just request a lot of lines.
+            const numLines = isLast ? MAX_LINES_FETCH : nextHunk.oldStart - start;
             rows.push(
               <ExpandingSeparator
                 key={key}
                 ctx={ctx}
-                range={range}
+                start={start}
+                numLines={numLines}
                 path={path}
                 beforeLineStart={hunk.oldStart + hunk.oldLines}
                 afterLineStart={hunk.newStart + hunk.newLines}
-                t={t}
               />,
             );
-          } else {
-            const numLines = nextHunk.oldStart - hunk.oldLines - hunk.oldStart;
+          } else if (ctx.supportsExpandingContext) {
+            const numLines = isLast ? null : nextHunk.oldStart - hunk.oldLines - hunk.oldStart;
             rows.push(
               <HunkSeparator key={key} numLines={numLines} onExpand={() => onExpand(key)} t={t} />,
             );
@@ -134,9 +129,25 @@ export const SplitDiffTable = React.memo(
       );
     }
 
+    if (unified) {
+      return (
+        <table
+          className={
+            'split-diff-view-hunk-table display-unified ' + (tableSelectionClassName ?? '')
+          }
+          {...tableSelectionProps}>
+          <colgroup>
+            <col width={50} />
+            <col width={50} />
+            <col width={'100%'} />
+          </colgroup>
+          <tbody>{rows}</tbody>
+        </table>
+      );
+    }
     return (
       <table
-        className={'split-diff-view-hunk-table ' + (tableSelectionClassName ?? '')}
+        className={'split-diff-view-hunk-table display-split ' + (tableSelectionClassName ?? '')}
         {...tableSelectionProps}>
         <colgroup>
           <col width={50} />
@@ -151,9 +162,22 @@ export const SplitDiffTable = React.memo(
 );
 
 /**
+ * If the last hunk of a file doesn't have as many context lines as it should,
+ * it's because it's at the end of the file. This is a clue we can skip showing
+ * the expander.
+ * This util should only be called on the last hunk in the file.
+ */
+function isHunkProbablyAtEndOfFile(hunk: Hunk): boolean {
+  // we could conceivably check if the initial context length matches the end length, but that's not true in short files.
+  const CONTEXT_LENGTH = 4;
+  return !hunk.lines.slice(-CONTEXT_LENGTH).every(line => line.startsWith(' '));
+}
+
+/**
  * Adds new rows to the supplied `rows` array.
  */
 function addRowsForHunk(
+  unified: boolean,
   hunk: Hunk,
   path: string,
   rows: React.ReactElement[],
@@ -171,6 +195,7 @@ function addRowsForHunk(
   groups.forEach(group => {
     const {common, removed, added} = group;
     addUnmodifiedRows(
+      unified,
       common,
       path,
       'common',
@@ -185,6 +210,11 @@ function addRowsForHunk(
     afterLineNumber += common.length;
     beforeTokenizedIndex += common.length;
     afterTokenizedIndex += common.length;
+
+    // split content, or before lines when unified
+    const linesA = [];
+    // after lines when unified, or empty when using "split"
+    const linesB = [];
 
     const maxIndex = Math.max(removed.length, added.length);
     for (let index = 0; index < maxIndex; ++index) {
@@ -205,62 +235,120 @@ function addRowsForHunk(
         }
 
         const [before, after] = beforeAndAfter;
-        rows.push(
-          <SplitDiffRow
-            key={`${beforeLineNumber}/${afterLineNumber}`}
-            beforeLineNumber={beforeLineNumber}
-            before={before}
-            afterLineNumber={afterLineNumber}
-            after={after}
-            rowType="modify"
-            path={path}
-            openFileToLine={openFileToLine}
-          />,
-        );
+        const [beforeLine, beforeChange, afterLine, afterChange] = SplitDiffRow({
+          beforeLineNumber,
+          before,
+          afterLineNumber,
+          after,
+          rowType: 'modify',
+          path,
+          unified,
+          openFileToLine,
+        });
+
+        if (unified) {
+          linesA.push(
+            <tr key={`${beforeLineNumber}/${afterLineNumber}:b`}>
+              {beforeLine}
+              <BlankLineNumber before />
+              {beforeChange}
+            </tr>,
+          );
+          linesB.push(
+            <tr key={`${beforeLineNumber}/${afterLineNumber}:a`}>
+              <BlankLineNumber after />
+              {afterLine}
+              {afterChange}
+            </tr>,
+          );
+        } else {
+          linesA.push(
+            <tr key={`${beforeLineNumber}/${afterLineNumber}`}>
+              {beforeLine}
+              {beforeChange}
+              {afterLine}
+              {afterChange}
+            </tr>,
+          );
+        }
         ++beforeLineNumber;
         ++afterLineNumber;
         ++beforeTokenizedIndex;
         ++afterTokenizedIndex;
       } else if (removedLine != null) {
-        rows.push(
-          <SplitDiffRow
-            key={`${beforeLineNumber}/`}
-            beforeLineNumber={beforeLineNumber}
-            before={
-              tokenization?.[0] == null
-                ? removedLine
-                : applyTokenizationToLine(removedLine, tokenization[0][beforeTokenizedIndex])
-            }
-            afterLineNumber={null}
-            after={null}
-            rowType="remove"
-            path={path}
-            openFileToLine={openFileToLine}
-          />,
-        );
+        const [beforeLine, beforeChange, afterLine, afterChange] = SplitDiffRow({
+          beforeLineNumber,
+          before:
+            tokenization?.[0] == null
+              ? removedLine
+              : applyTokenizationToLine(removedLine, tokenization[0][beforeTokenizedIndex]),
+          afterLineNumber: null,
+          after: null,
+          rowType: 'remove',
+          path,
+          unified,
+          openFileToLine,
+        });
+
+        if (unified) {
+          linesA.push(
+            <tr key={`${beforeLineNumber}/`}>
+              {beforeLine}
+              <BlankLineNumber before />
+              {beforeChange}
+            </tr>,
+          );
+        } else {
+          linesA.push(
+            <tr key={`${beforeLineNumber}/`}>
+              {beforeLine}
+              {beforeChange}
+              {afterLine}
+              {afterChange}
+            </tr>,
+          );
+        }
         ++beforeLineNumber;
         ++beforeTokenizedIndex;
       } else {
-        rows.push(
-          <SplitDiffRow
-            key={`/${afterLineNumber}`}
-            beforeLineNumber={null}
-            before={null}
-            afterLineNumber={afterLineNumber}
-            after={
-              tokenization?.[1] == null
-                ? addedLine
-                : applyTokenizationToLine(addedLine, tokenization[1][afterTokenizedIndex])
-            }
-            rowType="add"
-            path={path}
-            openFileToLine={openFileToLine}
-          />,
-        );
+        const [beforeLine, beforeChange, afterLine, afterChange] = SplitDiffRow({
+          beforeLineNumber: null,
+          before: null,
+          afterLineNumber,
+          after:
+            tokenization?.[1] == null
+              ? addedLine
+              : applyTokenizationToLine(addedLine, tokenization[1][afterTokenizedIndex]),
+          rowType: 'add',
+          path,
+          unified,
+          openFileToLine,
+        });
+
+        if (unified) {
+          linesB.push(
+            <tr key={`/${afterLineNumber}`}>
+              <BlankLineNumber after />
+              {afterLine}
+              {afterChange}
+            </tr>,
+          );
+        } else {
+          linesA.push(
+            <tr key={`/${afterLineNumber}`}>
+              {beforeLine}
+              {beforeChange}
+              {afterLine}
+              {afterChange}
+            </tr>,
+          );
+        }
         ++afterLineNumber;
         ++afterTokenizedIndex;
       }
     }
+
+    rows.push(...linesA, ...linesB);
   });
 }
 
@@ -279,6 +367,7 @@ function InlineRowButton({onClick, label}: {onClick: () => unknown; label: React
  * Adds new rows to the supplied `rows` array.
  */
 function addUnmodifiedRows(
+  unified: boolean,
   lines: string[],
   path: string,
   rowType: 'common' | 'expanded',
@@ -292,26 +381,40 @@ function addUnmodifiedRows(
   let beforeLineNumber = initialBeforeLineNumber;
   let afterLineNumber = initialAfterLineNumber;
   lines.forEach((lineContent, i) => {
-    rows.push(
-      <SplitDiffRow
-        key={`${beforeLineNumber}/${afterLineNumber}`}
-        beforeLineNumber={beforeLineNumber}
-        before={
-          tokenizationBefore?.[i] == null
-            ? lineContent
-            : applyTokenizationToLine(lineContent, tokenizationBefore[i])
-        }
-        afterLineNumber={afterLineNumber}
-        after={
-          tokenizationAfter?.[i] == null
-            ? lineContent
-            : applyTokenizationToLine(lineContent, tokenizationAfter[i])
-        }
-        rowType={rowType}
-        path={path}
-        openFileToLine={openFileToLine}
-      />,
-    );
+    const [beforeLine, beforeChange, afterLine, afterChange] = SplitDiffRow({
+      beforeLineNumber,
+      before:
+        tokenizationBefore?.[i] == null
+          ? lineContent
+          : applyTokenizationToLine(lineContent, tokenizationBefore[i]),
+      afterLineNumber,
+      after:
+        tokenizationAfter?.[i] == null
+          ? lineContent
+          : applyTokenizationToLine(lineContent, tokenizationAfter[i]),
+      rowType,
+      path,
+      unified,
+      openFileToLine,
+    });
+    if (unified) {
+      rows.push(
+        <tr key={`${beforeLineNumber}/${afterLineNumber}`}>
+          {beforeLine}
+          {afterLine}
+          {beforeChange}
+        </tr>,
+      );
+    } else {
+      rows.push(
+        <tr key={`${beforeLineNumber}/${afterLineNumber}`}>
+          {beforeLine}
+          {beforeChange}
+          {afterLine}
+          {afterChange}
+        </tr>,
+      );
+    }
     ++beforeLineNumber;
     ++afterLineNumber;
   });
@@ -361,7 +464,7 @@ function HunkSeparator({
   onExpand,
   t,
 }: {
-  numLines: number;
+  numLines: number | null;
   onExpand: () => unknown;
   t: (s: string) => string;
 }): React.ReactElement | null {
@@ -371,7 +474,14 @@ function HunkSeparator({
   // TODO: Ensure numLines is never below a certain threshold: it takes up more
   // space to display the separator than it does to display the text (though
   // admittedly fetching the collapsed text is an async operation).
-  const label = numLines === 1 ? t('Expand 1 line') : t(`Expand ${numLines} lines`);
+  const label =
+    numLines == null
+      ? // to expand the remaining lines at the end of the file, we don't know the size ahead of time,
+        // just omit the amount to be expanded
+        t('Expand lines')
+      : numLines === 1
+      ? t('Expand 1 line')
+      : t(`Expand ${numLines} lines`);
   return (
     <SeparatorRow>
       <InlineRowButton label={label} onClick={onExpand} />
@@ -379,67 +489,63 @@ function HunkSeparator({
   );
 }
 
-type ExpandingSeparatorProps<Id> = {
-  ctx: Context<Id>;
-  path: string;
-  range: LineRangeParams<Id>;
-  beforeLineStart: number;
-  afterLineStart: number;
-  t: (s: string) => string;
-};
-
 /**
  * This replaces a <HunkSeparator> when the user clicks on it to expand the
  * hidden file contents.
+ * By rendering this, additional lines are automatically fetched.
  */
-function ExpandingSeparator<Id>({
+function ExpandingSeparator({
   ctx,
   path,
-  range,
+  start,
+  numLines,
   beforeLineStart,
   afterLineStart,
-  t,
-}: ExpandingSeparatorProps<Id>): React.ReactElement {
-  const loadable = useRecoilValueLoadable(ctx.atoms.lineRange(range));
+}: {
+  ctx: Context;
+  path: string;
+  numLines: number;
+  start: number;
+  beforeLineStart: number;
+  afterLineStart: number;
+}): React.ReactElement {
+  const result = useFetchLines(ctx, numLines, start);
 
-  const tokenization = useTokenizedContents(path, loadable.valueMaybe());
-  switch (loadable.state) {
-    case 'hasValue': {
-      const rows: React.ReactElement[] = [];
-      const lines = loadable.contents;
-      addUnmodifiedRows(
-        lines,
-        path,
-        'expanded',
-        beforeLineStart,
-        afterLineStart,
-        rows,
-        tokenization,
-        tokenization,
-        ctx.openFileToLine,
-      );
-      return <>{rows}</>;
-    }
-    case 'loading': {
-      return (
-        <SeparatorRow>
-          <div className="split-diff-view-loading-row">
-            <Icon icon="loading" />
-            <span>{t('Loading...')}</span>
-          </div>
-        </SeparatorRow>
-      );
-    }
-    case 'hasError': {
-      return (
-        <SeparatorRow>
-          <div className="split-diff-view-error-row">
-            {t('Error:')} {loadable.contents.message}
-          </div>
-        </SeparatorRow>
-      );
-    }
+  const tokenization = useTokenizedContents(path, result?.value);
+  if (result == null) {
+    return (
+      <SeparatorRow>
+        <div className="split-diff-view-loading-row">
+          <Icon icon="loading" />
+          <span>{t('Loading...')}</span>
+        </div>
+      </SeparatorRow>
+    );
   }
+  if (result.error) {
+    return (
+      <SeparatorRow>
+        <div className="split-diff-view-error-row">
+          <ErrorNotice error={result.error} title={<T>Unable to fetch additional lines</T>} />
+        </div>
+      </SeparatorRow>
+    );
+  }
+
+  const rows: React.ReactElement[] = [];
+  addUnmodifiedRows(
+    ctx.display === 'unified',
+    result.value,
+    path,
+    'expanded',
+    beforeLineStart,
+    afterLineStart,
+    rows,
+    tokenization,
+    tokenization,
+    ctx.openFileToLine,
+  );
+  return <>{rows}</>;
 }
 
 function SeparatorRow({children}: {children: React.ReactNode}): React.ReactElement {

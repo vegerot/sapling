@@ -7,6 +7,7 @@
 
 include "eden/fs/config/eden_config.thrift"
 include "fb303/thrift/fb303_core.thrift"
+include "thrift/annotation/thrift.thrift"
 
 namespace cpp2 facebook.eden
 namespace java com.facebook.eden.thrift
@@ -422,9 +423,7 @@ union FileAttributeDataOrErrorV2 {
  * in a certain directory.
  */
 union DirListAttributeDataOrError {
-  1: map<PathString, FileAttributeDataOrErrorV2> (
-    rust.type = "sorted_vector_map::SortedVectorMap",
-  ) dirListAttributeData;
+  1: map_PathString_FileAttributeDataOrErrorV2_3516 dirListAttributeData;
   2: EdenError error;
 }
 
@@ -873,6 +872,30 @@ struct DebugGetBlobMetadataResponse {
   1: list<BlobMetadataWithOrigin> metadatas;
 }
 
+struct DebugGetScmTreeRequest {
+  1: MountId mountId;
+  # id of the blob we would like to fetch SCM tree for
+  2: ThriftObjectId id;
+  # where we should fetch the blob SCM tree from
+  3: DataFetchOriginSet origins; # DataFetchOrigin
+}
+
+union ScmTreeOrError {
+  1: list<ScmTreeEntry> treeEntries;
+  2: EdenError error;
+}
+
+struct ScmTreeWithOrigin {
+  # the SCM tree data
+  1: ScmTreeOrError scmTreeData;
+  # where the SCM tree was fetched from
+  2: DataFetchOrigin origin;
+}
+
+struct DebugGetScmTreeResponse {
+  1: list<ScmTreeWithOrigin> trees;
+}
+
 struct ActivityRecorderResult {
   // 0 if the operation has failed. For example,
   // fail to start recording due to file permission issue
@@ -1054,6 +1077,20 @@ enum HgImportCause {
   PREFETCH = 3,
 }
 
+enum FetchedSource {
+  LOCAL = 0,
+  REMOTE = 1,
+  // The data is fetched. However, the fetch mode was AllowRemote
+  // and on the Eden side the source of the fetch is unknown.
+  // It could be local or remote
+  UNKNOWN = 2,
+  // The data is not fetched yet.
+  // We don't know the source on some of the Sapling events. For example,
+  // on the start events: before we fetch the data we don't know where
+  // we will be able to find it
+  NOT_AVAILABLE_YET = 3,
+}
+
 struct HgEvent {
   1: TraceEventTimes times;
 
@@ -1069,6 +1106,7 @@ struct HgEvent {
   7: optional RequestInfo requestInfo;
   8: HgImportPriority importPriority;
   9: HgImportCause importCause;
+  10: FetchedSource fetchedSource;
 }
 
 /**
@@ -1299,6 +1337,13 @@ struct PrefetchParams {
   // When set, the globs list must be empty and the globbing pattern will be obtained
   // from an online service.
   7: optional PredictiveFetch predictiveGlob;
+  // When true, returns list of prefetched files.
+  8: bool returnPrefetchedFiles = false;
+}
+
+/** Result for prefetchFiles(). */
+struct PrefetchResult {
+  1: optional Glob prefetchedFiles;
 }
 
 /** Params for globFiles(). */
@@ -1446,6 +1491,20 @@ struct GetScmStatusResult {
   2: string version;
 }
 
+/**
+ * Sometimes additional modifiers need to be applied to the RootID that Eden
+ * receives from clients. This structure contains any such option and should
+ * only be extended with optional fields.
+ */
+struct RootIdOptions {
+  /**
+   * The ID of the filter that should be applied to the supplied RootId. The
+   * filter determines which entries in the repository should be hidden from
+   * the working copy.
+   */
+  1: optional string filterId;
+}
+
 struct GetScmStatusParams {
   /**
    * The Eden checkout to query
@@ -1472,6 +1531,8 @@ struct GetScmStatusParams {
 
   // Pass unique identifier of this request's caller.
   4: optional ClientRequestInfo cri;
+
+  5: optional RootIdOptions rootIdOptions;
 }
 
 /**
@@ -1525,6 +1586,8 @@ struct CheckOutRevisionParams {
 
   // Pass unique identifier of this request's caller.
   2: optional ClientRequestInfo cri;
+
+  3: optional RootIdOptions rootIdOptions;
 }
 
 struct ResetParentCommitsParams {
@@ -1542,6 +1605,19 @@ struct ResetParentCommitsParams {
 
   // Pass unique identifier of this request's caller.
   2: optional ClientRequestInfo cri;
+
+  3: optional RootIdOptions rootIdOptions;
+}
+
+struct GetCurrentSnapshotInfoRequest {
+  // Mount for which you want information.
+  1: MountId mountId;
+  // Pass unique identifier of this request's caller.
+  2: optional ClientRequestInfo cri;
+}
+
+struct GetCurrentSnapshotInfoResponse {
+  1: optional string filterId;
 }
 
 struct RemoveRecursivelyParams {
@@ -1584,6 +1660,14 @@ struct ChangeOwnershipRequest {
 }
 
 struct ChangeOwnershipResponse {}
+
+struct GetBlockedFaultsRequest {
+  1: string keyclass;
+}
+
+struct GetBlockedFaultsResponse {
+  1: list<string> keyValues;
+}
 
 service EdenService extends fb303_core.BaseService {
   list<MountInfo> listMounts() throws (1: EdenError ex);
@@ -1631,6 +1715,15 @@ service EdenService extends fb303_core.BaseService {
     1: PathString mountPoint,
     2: WorkingDirectoryParents parents,
     3: ResetParentCommitsParams params,
+  ) throws (1: EdenError ex);
+
+  /**
+   * Gets information about the current snapshot (i.e. last checked out commit)
+   * Currently, we only expose thethe current filter for the working copy. If
+   * the working copy is not filtered then the returned filter will be none.
+   */
+  GetCurrentSnapshotInfoResponse getCurrentSnapshotInfo(
+    1: GetCurrentSnapshotInfoRequest params,
   ) throws (1: EdenError ex);
 
   /**
@@ -1878,6 +1971,8 @@ service EdenService extends fb303_core.BaseService {
   Glob globFiles(1: GlobParams params) throws (1: EdenError ex);
 
   /**
+   * DEPRECATED: use prefetchFilesV2
+   *
    * Has the same behavior as globFiles, but should be called in the case of a prefetch.
    * This request could be deprioritized since it will be assumed that this call is used
    * for optimization and the result not relied on for operations. This command does not
@@ -1885,6 +1980,17 @@ service EdenService extends fb303_core.BaseService {
    */
   void prefetchFiles(1: PrefetchParams params) throws (1: EdenError ex) (
     priority = 'BEST_EFFORT',
+  );
+
+  /**
+   * Has the same behavior as globFiles, but should be called in the case of a prefetch.
+   * This call is used when prefetching instead of globbing, to allow for different behaviors.
+   * This command returns a PrefetchResult, which contains the list of prefetched files.
+   * If returnPrefetchedFiles is true, this command will return the prefetched files.
+   */
+  @thrift.Priority{level = thrift.RpcPriority.BEST_EFFORT}
+  PrefetchResult prefetchFilesV2(1: PrefetchParams params) throws (
+    1: EdenError ex,
   );
 
   /**
@@ -2008,6 +2114,9 @@ service EdenService extends fb303_core.BaseService {
   //////// Debugging APIs ////////
 
   /**
+   * DEPRECATED: Use debugGetTree().
+   * TODO: remove this API after 07/01/2024
+   *
    * Get the contents of a source control Tree.
    *
    * This can be used to confirm if eden's LocalStore contains information
@@ -2022,6 +2131,10 @@ service EdenService extends fb303_core.BaseService {
     1: PathString mountPoint,
     2: ThriftObjectId id,
     3: bool localStoreOnly,
+  ) throws (1: EdenError ex);
+
+  DebugGetScmTreeResponse debugGetTree(
+    1: DebugGetScmTreeRequest request,
   ) throws (1: EdenError ex);
 
   /**
@@ -2110,6 +2223,11 @@ service EdenService extends fb303_core.BaseService {
    * Get the list of outstanding Thrift requests
    */
   list<ThriftRequestMetadata> debugOutstandingThriftRequests();
+
+  /**
+   * Get the list of outstanding file download events from source control servers
+   */
+  list<HgEvent> debugOutstandingHgEvents(1: PathString mountPoint);
 
   /**
    * Start recording performance metrics such as files read
@@ -2283,8 +2401,8 @@ service EdenService extends fb303_core.BaseService {
   );
 
   /**
-   * Gets a list of hg events stored in Eden's Hg ActivityBuffer. Used for
-   * retroactive debugging by the `eden trace hg --retroactive` command.
+   * Gets a list of Sapling events stored in Eden's Sapling ActivityBuffer. Used for
+   * retroactive debugging by the `eden trace sl --retroactive` command.
    */
   GetRetroactiveHgEventsResult getRetroactiveHgEvents(
     1: GetRetroactiveHgEventsParams params,
@@ -2322,6 +2440,10 @@ service EdenService extends fb303_core.BaseService {
    */
   i64 unblockFault(1: UnblockFaultArg info) throws (1: EdenError ex);
 
+  GetBlockedFaultsResponse getBlockedFaults(
+    1: GetBlockedFaultsRequest request,
+  ) throws (1: EdenError ex);
+
   /**
    * Directly load a BackingStore object identified by id at the given path.
    *
@@ -2353,3 +2475,8 @@ service EdenService extends fb303_core.BaseService {
     1: EdenError ex,
   );
 }
+
+// The following were automatically generated and may benefit from renaming.
+typedef map<PathString, FileAttributeDataOrErrorV2> (
+  rust.type = "sorted_vector_map::SortedVectorMap",
+) map_PathString_FileAttributeDataOrErrorV2_3516

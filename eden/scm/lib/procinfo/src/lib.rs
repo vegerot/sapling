@@ -142,6 +142,11 @@ pub fn max_rss_bytes() -> u64 {
     0
 }
 
+// Get current process id.
+pub fn current_pid() -> u32 {
+    unsafe { libc::getpid() as u32 }
+}
+
 /// Get the parent pid. Return 0 on error or unsupported platform.
 /// If pid is 0, return the parent pid of the current process.
 pub fn parent_pid(pid: u32) -> u32 {
@@ -163,8 +168,8 @@ pub fn parent_pid(pid: u32) -> u32 {
         if let Ok(content) = std::fs::read_to_string(format!("/proc/{}/status", pid)) {
             let prefix = "PPid:";
             for line in content.lines() {
-                if line.starts_with(prefix) {
-                    if let Ok(ppid) = line[prefix.len()..].trim().parse() {
+                if let Some(suffix) = line.strip_prefix(prefix) {
+                    if let Ok(ppid) = suffix.trim().parse() {
                         return ppid;
                     }
                 }

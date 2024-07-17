@@ -1,7 +1,6 @@
-#debugruntest-compatible
   $ setconfig experimental.allowfilepeer=True
 
-#require symlink execbit
+#require symlink execbit no-eden
 
   $ eagerepo
   $ enable amend morestatus rebase

@@ -1,9 +1,12 @@
-#debugruntest-compatible
+#modern-config-incompatible
+
+#require no-eden
+
 #inprocess-hg-incompatible
   $ setconfig experimental.allowfilepeer=True
 
   $ configure dummyssh
-  $ enable tweakdefaults remotenames rebase
+  $ enable remotenames rebase
 
   $ hg init master
   $ cd master

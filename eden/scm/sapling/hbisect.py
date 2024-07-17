@@ -16,11 +16,16 @@
 from __future__ import absolute_import
 
 import collections
-from typing import Optional, Sized
+from typing import Optional, Sized, Tuple, TYPE_CHECKING
+
+import bindings
 
 from . import error, pycompat
 from .i18n import _
 from .node import hex, short
+
+if TYPE_CHECKING:
+    import sapling
 
 
 def bisect(repo, state):
@@ -34,104 +39,90 @@ def bisect(repo, state):
     'good' is True if bisect is searching for a first good changeset, False
     if searching for a first bad one.
     """
+    # States:
+    # - skip: user provided "skip" nodes. Not lazy.
+    # - skip_revs: user provided "skip" revset. Might be expensive/lazy.
+    # - good: marked as good nodes
+    # - bad: marked as bad ndoes
+    # - badtogood: True if bad is root, good is head; False if bad is head
+    # - roots, heads: defines the bisect range based on bad and good
+    # - rootnode, headnode: current (small) bisect range, for display only
+    # - candidate: bisect range
+    # - unskipped: bisect range, excluding "fast" skipped nodes
+    # - bestnode: the best node to test next
+    cl = repo.changelog
+    dag = cl.dag
+    skip, skip_revs = _state_to_nodes_revs(repo, state, "skip")
+    good = dag.sort(state["good"])
+    bad = dag.sort(state["bad"])
 
-    changelog = repo.changelog
-    clparents = changelog.parentrevs
-    skip = _state_to_revs(repo, state, "skip")
+    badtogood = bool(dag.range(bad, good))
+    if badtogood:
+        roots, heads = bad, good
+    else:
+        roots, heads = good, bad
 
-    def buildancestors(bad, good):
-        badrev = min([changelog.rev(n) for n in bad])
-        goodrev = max([changelog.rev(n) for n in good])
-        ancestors = collections.defaultdict(lambda: None)
-        for rev in repo.revs("descendants(%ln) - ancestors(%ln)", good, good):
-            ancestors[rev] = []
-        if ancestors[badrev] is None:
-            return badrev, goodrev, None
-        return badrev, goodrev, ancestors
+    # rootnode and headnode are for display purpose only.
+    rootnode = roots.first()  # DESC order, first = max
+    headnode = heads.last()  # DESC order, last = min
 
-    good = False
-    badrev, goodrev, ancestors = buildancestors(state["bad"], state["good"])
-    if not ancestors:  # looking for bad to good transition?
-        good = True
-        badrev, goodrev, ancestors = buildancestors(state["good"], state["bad"])
-    bad = changelog.node(badrev)
-    if not ancestors:  # now we're confused
-        if (
-            len(state["bad"]) == 1
-            and len(state["good"]) == 1
-            and state["bad"] != state["good"]
-        ):
-            raise error.Abort(_("starting revisions are not directly related"))
-        raise error.Abort(
-            _("inconsistent state, %s:%s is good and bad") % (badrev, short(bad))
+    bestnode, untested, first_heads = dag.suggest_bisect(roots, heads, skip)
+    total = len(untested) + 1
+    if bestnode is None:
+        if not untested:
+            if len(good) == 1 and len(bad) == 1 and len(dag.range(roots, heads)) < 1:
+                raise error.Abort(_("starting revisions are not directly related"))
+            overlap = first_heads & dag.ancestors(roots)
+            if overlap:
+                raise error.Abort(
+                    _("inconsistent state, %s is good and bad") % short(overlap.first())
+                )
+
+        return (
+            list((first_heads + untested).iterrev()),
+            0,
+            badtogood,
+            headnode,
+            rootnode,
         )
 
-    badnode = changelog.node(badrev)
-    goodnode = changelog.node(goodrev)
+    # Handle a lazy skip_revs.
+    if skip_revs is not None:
+        # To avoid applying the (potentially slow) lazy skip calculation to the
+        # entire "roots::heads" (or "unskipped") set, we test the lazy skip
+        # condition around the "bestnode" commit.
+        unskipped = untested - skip
+        ancestors = dag.ancestors([bestnode]) & unskipped
+        not_ancestors = unskipped - ancestors
+        zip_set = ancestors.union_zip(not_ancestors.reverse())
 
-    # build children dict
-    children = {}
-    visit = collections.deque([badrev])
-    candidates = []
-    while visit:
-        rev = visit.popleft()
-        if ancestors[rev] == []:
-            candidates.append(rev)
-            for prev in clparents(rev):
-                if prev != -1:
-                    if prev in children:
-                        children[prev].append(rev)
-                    else:
-                        children[prev] = [rev]
-                        visit.append(prev)
+        # PERF: We reuse the revset prefetch fields from "skip_revs". This
+        # helps reduce round-trips for revset iteration (by look ahead and
+        # batch fetch text, hash, associated code review states). However, more
+        # complex revsets that need file/tree data (ex. modifies(path)) won't
+        # be batched this way. We need new infra to express dynamic, complex
+        # prefetch needs.
+        bar = bindings.progress.model.ProgressBar(
+            _("skipping"), len(unskipped), _("commits")
+        )
+        inc = bar.increase_position
+        for ctx in cl.torevset(zip_set).prefetch(*skip_revs.prefetchfields()).iterctx():
+            if ctx.rev() in skip_revs:
+                inc(1)
+                continue
+            bestnode = ctx.node()
+            break
+        else:
+            # everything is skipped
+            return (
+                list((first_heads + untested).iterrev()),
+                0,
+                badtogood,
+                headnode,
+                rootnode,
+            )
 
-    candidates.sort()
-    # have we narrowed it down to one entry?
-    # or have all other possible candidates besides 'bad' have been skipped?
-    tot = len(candidates)
-    unskipped = {c for c in candidates if (c not in skip) and (c != badrev)}
-    if tot == 1 or not unskipped:
-        return ([changelog.node(c) for c in candidates], 0, good, badnode, goodnode)
-    unskipped.add(badrev)
-    perfect = tot // 2
-
-    # find the best node to test
-    best_rev = None
-    best_len = -1
-    poison = set()
-    for rev in candidates:
-        if rev in poison:
-            # poison children
-            poison.update(children.get(rev, []))
-            continue
-
-        a = ancestors[rev] or [rev]
-        ancestors[rev] = None
-
-        x = len(a)  # number of ancestors
-        y = tot - x  # number of non-ancestors
-        value = min(x, y)  # how good is this test?
-        if value > best_len and rev in unskipped:
-            best_len = value
-            best_rev = rev
-            if value == perfect:  # found a perfect candidate? quit early
-                break
-
-        if y < perfect and rev in unskipped:  # all downhill from here?
-            # poison children
-            poison.update(children.get(rev, []))
-            continue
-
-        for c in children.get(rev, []):
-            if ancestors[c]:
-                ancestors[c] = list(set(ancestors[c] + a))
-            else:
-                ancestors[c] = a + [c]
-
-    assert best_rev is not None
-    best_node = changelog.node(best_rev)
-
-    return ([best_node], tot, good, badnode, goodnode)
+    return ([bestnode], total, badtogood, headnode, rootnode)
 
 
 def checksparsebisectskip(repo, candidatenode, badnode, goodnode) -> str:
@@ -145,7 +136,10 @@ def checksparsebisectskip(repo, candidatenode, badnode, goodnode) -> str:
     """
 
     def diffsparsematch(node, diff):
-        if not hasattr(repo, "sparsematch"):
+        shouldsparsematch = hasattr(repo, "sparsematch") and (
+            "eden" not in repo.requirements or "edensparse" in repo.requirements
+        )
+        if not shouldsparsematch:
             return True
         rev = repo.changelog.rev(node)
         sparsematch = repo.sparsematch(rev)
@@ -218,6 +212,31 @@ def checkstate(state) -> bool:
         raise error.Abort(_("cannot bisect (no known good revisions)"))
     else:
         raise error.Abort(_("cannot bisect (no known bad revisions)"))
+
+
+def _state_to_nodes_revs(
+    repo, state, kind
+) -> Tuple["bindings.dag.nameset", Optional["sapling.smartset.abstractsmartset"]]:
+    """Return (nodes, revset | None).
+    'nodes' is the non-lazy Rust set, 'revset' could be a 'lazy' set.
+    """
+    items = state[kind]
+    nodes = []
+    revset_exprs = []
+
+    for item in items:
+        if isinstance(item, bytes):
+            nodes.append(item)
+        elif item.startswith("revset:"):
+            revset_exprs.append(item[7:])
+        else:
+            raise error.Abort(_("invalid node: %s, kind: %s") % (item, kind))
+
+    lazy_set = None
+    if revset_exprs:
+        lazy_set = repo.revs("%lr", revset_exprs)
+
+    return repo.changelog.dag.sort(nodes), lazy_set
 
 
 def _state_to_revs(repo, state, kind):

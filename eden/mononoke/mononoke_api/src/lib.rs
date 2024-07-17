@@ -6,7 +6,7 @@
  */
 
 #![feature(error_generic_member_access)]
-#![feature(provide_any)]
+#![feature(trait_alias)]
 
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use anyhow::Error;
 pub use bookmarks::BookmarkCategory;
 pub use bookmarks::BookmarkKey;
 use mononoke_repos::MononokeRepos;
-use mononoke_types::RepositoryId;
+pub use mononoke_types::RepositoryId;
 
 use crate::repo::RepoContextBuilder;
 
@@ -42,6 +42,7 @@ pub use crate::changeset::ChangesetContext;
 pub use crate::changeset::ChangesetDiffItem;
 pub use crate::changeset::ChangesetFileOrdering;
 pub use crate::changeset::ChangesetHistoryOptions;
+pub use crate::changeset::ChangesetLinearHistoryOptions;
 pub use crate::changeset::Generation;
 pub use crate::changeset_path::ChangesetPathContentContext;
 pub use crate::changeset_path::ChangesetPathHistoryOptions;
@@ -62,7 +63,6 @@ pub use crate::file::FileId;
 pub use crate::file::FileMetadata;
 pub use crate::file::FileType;
 pub use crate::file::HeaderlessUnifiedDiff;
-pub use crate::path::MononokePath;
 pub use crate::repo::create_changeset::CreateChange;
 pub use crate::repo::create_changeset::CreateChangeFile;
 pub use crate::repo::create_changeset::CreateCopyInfo;
@@ -73,6 +73,8 @@ pub use crate::repo::BookmarkInfo;
 pub use crate::repo::Repo;
 pub use crate::repo::RepoContext;
 pub use crate::repo::StoreRequest;
+pub use crate::repo::XRepoLookupExactBehaviour;
+pub use crate::repo::XRepoLookupSyncBehaviour;
 pub use crate::specifiers::ChangesetId;
 pub use crate::specifiers::ChangesetIdPrefix;
 pub use crate::specifiers::ChangesetPrefixSpecifier;
@@ -122,7 +124,7 @@ impl Mononoke {
         match self.repos.get_by_name(name.as_ref()) {
             None => Ok(None),
             Some(repo) => Ok(Some(
-                RepoContextBuilder::new(ctx, repo, self.repos.as_ref()).await?,
+                RepoContextBuilder::new(ctx, repo, self.repos.clone()).await?,
             )),
         }
     }
@@ -138,7 +140,7 @@ impl Mononoke {
         match self.repos.get_by_id(repo_id.id()) {
             None => Ok(None),
             Some(repo) => Ok(Some(
-                RepoContextBuilder::new(ctx, repo, self.repos.as_ref()).await?,
+                RepoContextBuilder::new(ctx, repo, self.repos.clone()).await?,
             )),
         }
     }

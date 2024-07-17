@@ -3,6 +3,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-strict
+
 from typing import Dict
 
 from eden.fs.cli.config import EdenInstance
@@ -32,7 +34,7 @@ def check_recent_writes(
 
     # Don't report counters that has a count less than this number
     minWriteThresholdString = instance.get_config_value(
-        "doctor.recent-writes-problem-threshold", "10000"
+        "doctor.recent-writes-problem-threshold", "50000"
     )
 
     # this can throw a parse exception, but instead of handling it here I think it's better to
@@ -67,6 +69,7 @@ def check_recent_writes(
         tracker.add_problem(
             ElevatedRecentWritesProblem(
                 description=message,
+                remediation=f"See: {get_elevated_recent_writes_error_message_link()}",
                 severity=ProblemSeverity.ADVICE,
             )
         )
@@ -130,7 +133,6 @@ def format_output_message(result: Dict[str, int], minWriteThreshold: int) -> str
         f"We have detected {totalCounts} write operations to the virtual repo.\n"
         "These are expensive operations and you may be able to increase your performance by using a redirect\n"
         "for non-source controlled items such as build products or temporary files:\n"
-        f"See: {get_elevated_recent_writes_error_message_link()}"
     )
 
     return message

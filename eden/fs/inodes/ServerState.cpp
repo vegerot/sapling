@@ -10,6 +10,8 @@
 #include <folly/logging/xlog.h>
 #include <folly/portability/GFlags.h>
 
+#include "eden/common/utils/FaultInjector.h"
+#include "eden/common/utils/UnboundedQueueExecutor.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/ReloadableConfig.h"
 #include "eden/fs/model/git/TopLevelIgnores.h"
@@ -17,8 +19,6 @@
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/FsEventLogger.h"
 #include "eden/fs/utils/Clock.h"
-#include "eden/fs/utils/FaultInjector.h"
-#include "eden/fs/utils/UnboundedQueueExecutor.h"
 
 DEFINE_bool(
     fault_injection_block_mounts,
@@ -44,6 +44,7 @@ ServerState::ServerState(
     EdenStatsPtr edenStats,
     std::shared_ptr<PrivHelper> privHelper,
     std::shared_ptr<UnboundedQueueExecutor> threadPool,
+    std::shared_ptr<folly::Executor> fsChannelThreadPool,
     std::shared_ptr<Clock> clock,
     std::shared_ptr<ProcessInfoCache> processInfoCache,
     std::shared_ptr<StructuredLogger> structuredLogger,
@@ -57,6 +58,7 @@ ServerState::ServerState(
       edenStats_{std::move(edenStats)},
       privHelper_{std::move(privHelper)},
       threadPool_{std::move(threadPool)},
+      fsChannelThreadPool_{std::move(fsChannelThreadPool)},
       clock_{std::move(clock)},
       processInfoCache_{std::move(processInfoCache)},
       structuredLogger_{std::move(structuredLogger)},
@@ -67,10 +69,11 @@ ServerState::ServerState(
               ? std::make_shared<NfsServer>(
                     privHelper_.get(),
                     mainEventBase,
-                    initialConfig.numNfsThreads.getValue(),
-                    initialConfig.maxNfsInflightRequests.getValue(),
+                    fsChannelThreadPool_,
                     initialConfig.runInternalRpcbind.getValue(),
-                    structuredLogger_)
+                    structuredLogger_,
+                    initialConfig.maxFsChannelInflightRequests.getValue(),
+                    initialConfig.highFsRequestsLogInterval.getValue())
               : nullptr},
       config_{std::move(reloadableConfig)},
       userIgnoreFileMonitor_{CachedParsedFileMonitor<GitIgnoreFileParser>{

@@ -41,17 +41,11 @@ use mononoke_types::RepoPath;
 use crate::mapping::FilenodesOnlyPublic;
 use crate::mapping::PreparedRootFilenode;
 
-pub async fn derive_filenodes(
+pub(crate) async fn derive_filenodes(
     ctx: &CoreContext,
     derivation_ctx: &DerivationContext,
     bcs: BonsaiChangeset,
 ) -> Result<FilenodesOnlyPublic> {
-    if tunables::tunables()
-        .filenodes_disabled()
-        .unwrap_or_default()
-    {
-        return Ok(FilenodesOnlyPublic::Disabled);
-    }
     let (_, public_filenode, non_roots) =
         prepare_filenodes_for_cs(ctx, derivation_ctx, bcs).await?;
     if !non_roots.is_empty() {
@@ -63,17 +57,10 @@ pub async fn derive_filenodes(
             return Ok(FilenodesOnlyPublic::Disabled);
         }
     }
-    // In case it got updated while deriving
-    if tunables::tunables()
-        .filenodes_disabled()
-        .unwrap_or_default()
-    {
-        return Ok(FilenodesOnlyPublic::Disabled);
-    }
     Ok(public_filenode)
 }
 
-pub async fn derive_filenodes_in_batch(
+pub(crate) async fn derive_filenodes_in_batch(
     ctx: &CoreContext,
     derivation_ctx: &DerivationContext,
     batch: Vec<BonsaiChangeset>,
@@ -89,7 +76,7 @@ pub async fn derive_filenodes_in_batch(
     .await
 }
 
-pub async fn prepare_filenodes_for_cs(
+pub(crate) async fn prepare_filenodes_for_cs(
     ctx: &CoreContext,
     derivation_ctx: &DerivationContext,
     bcs: BonsaiChangeset,
@@ -130,18 +117,21 @@ pub async fn prepare_filenodes_for_cs(
     }
 }
 
-pub async fn generate_all_filenodes(
+/// Pre-condition: HgChangeset for this bcs has already been derived by this point.
+/// This is enforced when interacting with this through this crate's API:
+/// the BonsaiDerivable implementation in mapping.rs
+pub(crate) async fn generate_all_filenodes(
     ctx: &CoreContext,
     derivation_ctx: &DerivationContext,
     bcs: &BonsaiChangeset,
 ) -> Result<Vec<PreparedFilenode>> {
     let blobstore = derivation_ctx.blobstore();
     let hg_id = derivation_ctx
-        .derive_dependency::<MappedHgChangesetId>(ctx, bcs.get_changeset_id())
+        .fetch_dependency::<MappedHgChangesetId>(ctx, bcs.get_changeset_id())
         .await?
         .hg_changeset_id();
     let root_mf = hg_id.load(ctx, &blobstore).await?.manifestid();
-    // In case of non-existant manifest (that's created by hg if the first commit in the repo
+    // In case of non-existent manifest (that's created by hg if the first commit in the repo
     // is empty) it's fine to return the empty list of filenodes.
     if root_mf.clone().into_nodehash() == NULL_HASH {
         return Ok(vec![]);
@@ -303,31 +293,28 @@ mod tests {
     use async_trait::async_trait;
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::Bookmarks;
-    use changeset_fetcher::ChangesetFetcher;
     use changesets::Changesets;
     use cloned::cloned;
-    use derived_data_manager::BatchDeriveOptions;
+    use commit_graph::CommitGraph;
+    use commit_graph::CommitGraphRef;
     use fbinit::FacebookInit;
     use filenodes::FilenodeRange;
+    use filenodes::FilenodeResult;
     use filenodes::Filenodes;
     use filestore::FilestoreConfig;
     use fixtures::Linear;
     use fixtures::TestRepoFixture;
-    use futures::compat::Stream01CompatExt;
     use manifest::ManifestOps;
-    use maplit::hashmap;
     use mercurial_derivation::DeriveHgChangeset;
     use mononoke_types::FileType;
     use repo_blobstore::RepoBlobstore;
     use repo_derived_data::RepoDerivedData;
     use repo_derived_data::RepoDerivedDataRef;
-    use revset::AncestorsNodeStream;
+    use repo_identity::RepoIdentity;
     use slog::info;
     use test_repo_factory::TestRepoFactory;
     use tests_utils::resolve_cs_id;
     use tests_utils::CreateCommitContext;
-    use tunables::with_tunables;
-    use tunables::MononokeTunables;
 
     use super::*;
 
@@ -344,11 +331,13 @@ mod tests {
         #[facet]
         filestore_config: FilestoreConfig,
         #[facet]
-        changeset_fetcher: dyn ChangesetFetcher,
+        commit_graph: CommitGraph,
         #[facet]
         changesets: dyn Changesets,
         #[facet]
         filenodes: dyn Filenodes,
+        #[facet]
+        repo_identity: RepoIdentity,
     }
 
     async fn verify_filenodes(
@@ -358,6 +347,13 @@ mod tests {
         expected_paths: Vec<RepoPath>,
     ) -> Result<()> {
         let bonsai = cs_id.load(ctx, &repo.repo_blobstore).await?;
+
+        // Satisfy the precondition for this function:
+        // hgchangesets was derived already
+        repo.repo_derived_data()
+            .manager()
+            .derive::<MappedHgChangesetId>(ctx, cs_id, None)
+            .await?;
         let filenodes = generate_all_filenodes(
             ctx,
             &repo.repo_derived_data().manager().derivation_context(None),
@@ -560,62 +556,22 @@ mod tests {
     }
 
     #[fbinit::test]
-    fn derive_disabled_filenodes(fb: FacebookInit) -> Result<()> {
-        let tunables = MononokeTunables::default();
-        tunables.update_bools(&hashmap! {"filenodes_disabled".to_string() => true});
-
-        with_tunables(tunables, || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()?;
-            runtime.block_on(test_derive_disabled_filenodes(fb))
-        })
-    }
-
-    async fn test_derive_disabled_filenodes(fb: FacebookInit) -> Result<()> {
-        let ctx = CoreContext::test_mock(fb);
-        let repo: TestRepo = test_repo_factory::build_empty(ctx.fb).await?;
-        let cs = CreateCommitContext::new_root(&ctx, &repo).commit().await?;
-        let derived = repo
-            .repo_derived_data()
-            .derive::<FilenodesOnlyPublic>(&ctx, cs)
-            .await?;
-        assert_eq!(derived, FilenodesOnlyPublic::Disabled);
-
-        assert_eq!(
-            repo.repo_derived_data()
-                .fetch_derived::<FilenodesOnlyPublic>(&ctx, cs)
-                .await?
-                .unwrap(),
-            FilenodesOnlyPublic::Disabled
-        );
-
-        Ok(())
-    }
-
-    #[fbinit::test]
     async fn verify_batch_and_sequential_derive(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
         let repo1: TestRepo = test_repo_factory::build_empty(ctx.fb).await?;
-        Linear::initrepo(fb, &repo1).await;
+        Linear::init_repo(fb, &repo1).await?;
         let repo2: TestRepo = test_repo_factory::build_empty(ctx.fb).await?;
-        Linear::initrepo(fb, &repo2).await;
+        Linear::init_repo(fb, &repo2).await?;
         let master_cs_id = resolve_cs_id(&ctx, &repo1, "master").await?;
-        let mut cs_ids =
-            AncestorsNodeStream::new(ctx.clone(), &repo1.changeset_fetcher, master_cs_id)
-                .compat()
-                .try_collect::<Vec<_>>()
-                .await?;
+        let mut cs_ids = repo1
+            .commit_graph()
+            .ancestors_difference(&ctx, vec![master_cs_id], vec![])
+            .await?;
         cs_ids.reverse();
 
         let manager1 = repo1.repo_derived_data().manager();
         manager1
-            .derive_exactly_batch::<FilenodesOnlyPublic>(
-                &ctx,
-                cs_ids.clone(),
-                BatchDeriveOptions::Parallel { gap_size: None },
-                None,
-            )
+            .derive_exactly_batch::<FilenodesOnlyPublic>(&ctx, cs_ids.clone(), None)
             .await?;
         let batch = manager1
             .fetch_derived_batch::<FilenodesOnlyPublic>(&ctx, cs_ids.clone(), None)
@@ -657,28 +613,22 @@ mod tests {
             })
             .build()
             .await?;
-        Linear::initrepo(fb, &repo).await;
+        Linear::init_repo(fb, &repo).await?;
         let commit8 =
             resolve_cs_id(&ctx, &repo, "a9473beb2eb03ddb1cccc3fbaeb8a4820f9cd157").await?;
         let commit8 = repo.derive_hg_changeset(&ctx, commit8).await?;
         *filenodes_cs_id.lock().unwrap() = Some(commit8);
         let master_cs_id = resolve_cs_id(&ctx, &repo, "master").await?;
-        let mut cs_ids =
-            AncestorsNodeStream::new(ctx.clone(), &repo.changeset_fetcher, master_cs_id)
-                .compat()
-                .try_collect::<Vec<_>>()
-                .await?;
+        let mut cs_ids = repo
+            .commit_graph()
+            .ancestors_difference(&ctx, vec![master_cs_id], vec![])
+            .await?;
         cs_ids.reverse();
 
         let manager = repo.repo_derived_data().manager();
 
         match manager
-            .derive_exactly_batch::<FilenodesOnlyPublic>(
-                &ctx,
-                cs_ids.clone(),
-                BatchDeriveOptions::Parallel { gap_size: None },
-                None,
-            )
+            .derive_exactly_batch::<FilenodesOnlyPublic>(&ctx, cs_ids.clone(), None)
             .await
         {
             Ok(_) => {}

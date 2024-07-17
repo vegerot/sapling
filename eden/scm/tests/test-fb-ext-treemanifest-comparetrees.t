@@ -1,4 +1,5 @@
 #chg-compatible
+#debugruntest-incompatible
   $ setconfig experimental.allowfilepeer=True
 
   $ . "$TESTDIR/library.sh"
@@ -20,8 +21,6 @@
 Clone it
   $ cd ..
   $ hgcloneshallow ssh://user@dummy/master client1 -q --config extensions.treemanifest= --config treemanifest.treeonly=True
-  fetching tree '' 1dd55a482f8027ebff785185b3691491312757d3
-  1 trees fetched over * (glob)
   1 files fetched over * (glob) (?)
   $ cd client1
   $ cat >> .hg/hgrc <<EOF

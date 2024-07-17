@@ -13,6 +13,9 @@
 #include <sys/stat.h>
 #include <optional>
 #include <vector>
+
+#include "eden/common/utils/CaseSensitivity.h"
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/fuse/FuseDispatcher.h"
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/InodeNumber.h"
@@ -21,12 +24,8 @@
 #include "eden/fs/inodes/overlay/gen-cpp2/overlay_types.h"
 #include "eden/fs/model/TreeEntry.h"
 #include "eden/fs/testharness/FakeClock.h"
-#include "eden/fs/utils/CaseSensitivity.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 namespace folly {
-template <typename T>
-class Future;
 struct Unit;
 class ManualExecutor;
 
@@ -314,13 +313,13 @@ class TestMount {
    * Walk the entire tree and load all inode objects.
    */
   void loadAllInodes();
-  FOLLY_NODISCARD folly::Future<folly::Unit> loadAllInodesFuture();
+  FOLLY_NODISCARD ImmediateFuture<folly::Unit> loadAllInodesFuture();
 
   /**
    * Load all inodes [recursively] under the specified subdirectory.
    */
   static void loadAllInodes(const TreeInodePtr& treeInode);
-  FOLLY_NODISCARD static folly::Future<folly::Unit> loadAllInodesFuture(
+  FOLLY_NODISCARD static ImmediateFuture<folly::Unit> loadAllInodesFuture(
       const TreeInodePtr& treeInode);
 
   /** Convenience method for getting the Tree for the root of the mount. */

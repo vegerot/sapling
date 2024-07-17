@@ -25,15 +25,18 @@ use url::Url;
 
 use crate::client::Client;
 use crate::errors::ConfigError;
-use crate::errors::EdenApiError;
-use crate::EdenApi;
+use crate::errors::SaplingRemoteApiError;
+use crate::SaplingRemoteApi;
 
-/// External function that constructs other kinds of `EdenApi` from config.
+/// External function that constructs other kinds of `SaplingRemoteApi` from config.
 static CUSTOM_BUILD_FUNCS: Lazy<
     RwLock<
         Vec<
             Box<
-                dyn (Fn(&dyn configmodel::Config) -> Result<Option<Arc<dyn EdenApi>>, EdenApiError>)
+                dyn (Fn(
+                        &dyn configmodel::Config,
+                    )
+                        -> Result<Option<Arc<dyn SaplingRemoteApi>>, SaplingRemoteApiError>)
                     + Send
                     + Sync
                     + 'static,
@@ -42,7 +45,7 @@ static CUSTOM_BUILD_FUNCS: Lazy<
     >,
 > = Lazy::new(Default::default);
 
-/// Builder for creating new EdenAPI clients.
+/// Builder for creating new SaplingRemoteAPI clients.
 pub struct Builder<'a> {
     config: &'a dyn configmodel::Config,
     repo_name: Option<String>,
@@ -50,7 +53,7 @@ pub struct Builder<'a> {
 
 impl<'a> Builder<'a> {
     /// Populate a `Builder` from a Mercurial configuration.
-    pub fn from_config(config: &'a dyn configmodel::Config) -> Result<Self, EdenApiError> {
+    pub fn from_config(config: &'a dyn configmodel::Config) -> Result<Self, SaplingRemoteApiError> {
         let builder = Self {
             config,
             repo_name: None,
@@ -65,8 +68,9 @@ impl<'a> Builder<'a> {
     }
 
     /// Build the client.
-    pub fn build(self) -> Result<Arc<dyn EdenApi>, EdenApiError> {
+    pub fn build(self) -> Result<Arc<dyn SaplingRemoteApi>, SaplingRemoteApiError> {
         {
+            // Hook in other SaplingRemoteAPI implementations such as eagerepo (used for tests).
             let funcs = CUSTOM_BUILD_FUNCS.read();
             for func in funcs.iter() {
                 if let Some(client) = func(self.config)? {
@@ -84,10 +88,12 @@ impl<'a> Builder<'a> {
         Ok(Arc::new(builder.build()?))
     }
 
-    /// Register a customized builder that can produce a non-HTTP `EdenApi` from config.
+    /// Register a customized builder that can produce a non-HTTP `SaplingRemoteApi` from config.
     pub fn register_customize_build_func<F>(func: F)
     where
-        F: (Fn(&dyn configmodel::Config) -> Result<Option<Arc<dyn EdenApi>>, EdenApiError>)
+        F: (Fn(
+                &dyn configmodel::Config,
+            ) -> Result<Option<Arc<dyn SaplingRemoteApi>>, SaplingRemoteApiError>)
             + Send
             + Sync
             + 'static,
@@ -101,7 +107,7 @@ impl<'a> Builder<'a> {
     }
 }
 
-/// Builder for creating new HTTP EdenAPI clients.
+/// Builder for creating new HTTP SaplingRemoteAPI clients.
 ///
 /// You probably want to use [`Builder`] instead.
 #[derive(Debug, Default)]
@@ -109,13 +115,15 @@ pub struct HttpClientBuilder {
     repo_name: Option<String>,
     server_url: Option<Url>,
     headers: HashMap<String, String>,
-    max_files: Option<usize>,
-    max_trees: Option<usize>,
     try_route_consistently: bool,
-    max_history: Option<usize>,
-    max_location_to_hash: Option<usize>,
-    max_commit_mutations: Option<usize>,
-    max_commit_translate_id: Option<usize>,
+    augmented_trees: bool,
+    max_files_per_batch: Option<usize>,
+    max_trees_per_batch: Option<usize>,
+    max_history_per_batch: Option<usize>,
+    max_location_to_hash_per_batch: Option<usize>,
+    max_commit_mutations_per_batch: Option<usize>,
+    max_commit_translate_id_per_batch: Option<usize>,
+    min_batch_size: Option<usize>,
     timeout: Option<Duration>,
     debug: bool,
     http_version: Option<HttpVersion>,
@@ -132,12 +140,12 @@ impl HttpClientBuilder {
     }
 
     /// Build the HTTP client.
-    pub fn build(self) -> Result<Client, EdenApiError> {
+    pub fn build(self) -> Result<Client, SaplingRemoteApiError> {
         self.try_into().map(Client::with_config)
     }
 
     /// Populate a `HttpClientBuilder` from a Mercurial configuration.
-    pub fn from_config(config: &dyn configmodel::Config) -> Result<Self, EdenApiError> {
+    pub fn from_config(config: &dyn configmodel::Config) -> Result<Self, SaplingRemoteApiError> {
         // XXX: Ideally, the repo name would be a required field, obtained from a `Repo` object from
         // the `clidispatch` crate. Unforunately, not all callsites presently have access to a
         // populated `Repo` object, and it isn't trivial to just initialize one (requires a path to
@@ -158,20 +166,41 @@ impl HttpClientBuilder {
             .transpose()
             .map_err(|e| ConfigError::Invalid("edenapi.headers".into(), e))?
             .unwrap_or_default();
+
+        let source = if std::env::current_exe()
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.contains("edenfs"))
+            })
+            .unwrap_or_default()
+        {
+            "EdenFs"
+        } else {
+            "Sapling"
+        };
+
         headers.insert(
             "User-Agent".to_string(),
-            format!("Sapling/{}", version::VERSION),
+            format!("{}/{}", source, version::VERSION),
         );
 
         let max_requests = get_config(config, "edenapi", "maxrequests")?;
-        let max_files = get_config(config, "edenapi", "maxfiles")?;
-        let max_trees = get_config(config, "edenapi", "maxtrees")?;
         let try_route_consistently =
             get_config(config, "edenapi", "try-route-consistently")?.unwrap_or_default();
-        let max_history = get_config(config, "edenapi", "maxhistory")?;
-        let max_location_to_hash = get_config(config, "edenapi", "maxlocationtohash")?;
-        let max_commit_mutations = get_config(config, "edenapi", "maxcommitmutations")?;
-        let max_commit_translate_id = get_config(config, "edenapi", "maxcommittranslateid")?;
+
+        let augmented_trees = get_config(config, "edenapi", "augmented-trees")?.unwrap_or_default();
+
+        let min_batch_size = get_config(config, "edenapi", "min-batch-size")?;
+        let max_files_per_batch = get_config(config, "edenapi", "maxfiles")?;
+        let max_trees_per_batch = get_config(config, "edenapi", "maxtrees")?;
+        let max_history_per_batch = get_config(config, "edenapi", "maxhistory")?;
+        let max_location_to_hash_per_batch = get_config(config, "edenapi", "maxlocationtohash")?;
+        let max_commit_mutations_per_batch = get_config(config, "edenapi", "maxcommitmutations")?;
+        let max_commit_translate_id_per_batch =
+            get_config(config, "edenapi", "maxcommittranslateid")?;
+
         let timeout = get_config(config, "edenapi", "timeout")?.map(Duration::from_secs);
         let debug = get_config(config, "edenapi", "debug")?.unwrap_or_default();
         let http_version =
@@ -180,7 +209,7 @@ impl HttpClientBuilder {
             "1.1" => HttpVersion::V11,
             "2" => HttpVersion::V2,
             x => {
-                return Err(EdenApiError::BadConfig(ConfigError::Invalid(
+                return Err(SaplingRemoteApiError::BadConfig(ConfigError::Invalid(
                     "edenapi.http-version".into(),
                     anyhow!("invalid http version {}", x),
                 )));
@@ -210,13 +239,15 @@ impl HttpClientBuilder {
             repo_name,
             server_url: Some(server_url),
             headers,
-            max_files,
-            max_trees,
             try_route_consistently,
-            max_history,
-            max_location_to_hash,
-            max_commit_mutations,
-            max_commit_translate_id,
+            augmented_trees,
+            max_files_per_batch,
+            max_trees_per_batch,
+            max_history_per_batch,
+            max_location_to_hash_per_batch,
+            max_commit_mutations_per_batch,
+            max_commit_translate_id_per_batch,
+            min_batch_size,
             timeout,
             debug,
             http_version,
@@ -271,29 +302,29 @@ impl HttpClientBuilder {
 
     /// Maximum number of keys per file request. Larger requests will be
     /// split up into concurrently-sent batches.
-    pub fn max_files(mut self, size: Option<usize>) -> Self {
-        self.max_files = size;
+    pub fn max_files_per_batch(mut self, size: Option<usize>) -> Self {
+        self.max_files_per_batch = size;
         self
     }
 
     /// Maximum number of keys per tree request. Larger requests will be
     /// split up into concurrently-sent batches.
-    pub fn max_trees(mut self, size: Option<usize>) -> Self {
-        self.max_trees = size;
+    pub fn max_trees_per_batch(mut self, size: Option<usize>) -> Self {
+        self.max_trees_per_batch = size;
         self
     }
 
     /// Maximum number of keys per history request. Larger requests will be
     /// split up into concurrently-sent batches.
-    pub fn max_history(mut self, size: Option<usize>) -> Self {
-        self.max_history = size;
+    pub fn max_history_per_batch(mut self, size: Option<usize>) -> Self {
+        self.max_history_per_batch = size;
         self
     }
 
     /// Maximum number of locations per location to has request. Larger requests will be split up
     /// into concurrently-sent batches.
-    pub fn max_location_to_hash(mut self, size: Option<usize>) -> Self {
-        self.max_location_to_hash = size;
+    pub fn max_location_to_hash_per_batch(mut self, size: Option<usize>) -> Self {
+        self.max_location_to_hash_per_batch = size;
         self
     }
 
@@ -360,13 +391,15 @@ pub(crate) struct Config {
     pub(crate) repo_name: String,
     pub(crate) server_url: Url,
     pub(crate) headers: HashMap<String, String>,
-    pub(crate) max_files: Option<usize>,
-    pub(crate) max_trees: Option<usize>,
     pub(crate) try_route_consistently: bool,
-    pub(crate) max_history: Option<usize>,
-    pub(crate) max_location_to_hash: Option<usize>,
-    pub(crate) max_commit_mutations: Option<usize>,
-    pub(crate) max_commit_translate_id: Option<usize>,
+    pub(crate) augmented_trees: bool,
+    pub(crate) max_files_per_batch: Option<usize>,
+    pub(crate) max_trees_per_batch: Option<usize>,
+    pub(crate) max_history_per_batch: Option<usize>,
+    pub(crate) max_location_to_hash_per_batch: Option<usize>,
+    pub(crate) max_commit_mutations_per_batch: Option<usize>,
+    pub(crate) max_commit_translate_id_per_batch: Option<usize>,
+    pub(crate) min_batch_size: Option<usize>,
     pub(crate) timeout: Option<Duration>,
     #[allow(dead_code)]
     pub(crate) debug: bool,
@@ -379,20 +412,22 @@ pub(crate) struct Config {
 }
 
 impl TryFrom<HttpClientBuilder> for Config {
-    type Error = EdenApiError;
+    type Error = SaplingRemoteApiError;
 
     fn try_from(builder: HttpClientBuilder) -> Result<Self, Self::Error> {
         let HttpClientBuilder {
             repo_name,
             server_url,
             headers,
-            max_files,
-            max_trees,
             try_route_consistently,
-            max_history,
-            max_location_to_hash,
-            max_commit_mutations,
-            max_commit_translate_id,
+            augmented_trees,
+            max_files_per_batch,
+            max_trees_per_batch,
+            max_history_per_batch,
+            max_location_to_hash_per_batch,
+            max_commit_mutations_per_batch,
+            max_commit_translate_id_per_batch,
+            min_batch_size,
             timeout,
             debug,
             http_version,
@@ -415,21 +450,23 @@ impl TryFrom<HttpClientBuilder> for Config {
         }
 
         // Setting these to 0 is the same as None.
-        let max_files = max_files.filter(|n| *n > 0);
-        let max_trees = max_trees.filter(|n| *n > 0);
-        let max_history = max_history.filter(|n| *n > 0);
+        let max_files_per_batch = max_files_per_batch.filter(|n| *n > 0);
+        let max_trees_per_batch = max_trees_per_batch.filter(|n| *n > 0);
+        let max_history_per_batch = max_history_per_batch.filter(|n| *n > 0);
 
         Ok(Config {
             repo_name,
             server_url,
             headers,
-            max_files,
-            max_trees,
             try_route_consistently,
-            max_history,
-            max_location_to_hash,
-            max_commit_mutations,
-            max_commit_translate_id,
+            augmented_trees,
+            max_files_per_batch,
+            max_trees_per_batch,
+            max_history_per_batch,
+            max_location_to_hash_per_batch,
+            max_commit_mutations_per_batch,
+            max_commit_translate_id_per_batch,
+            min_batch_size,
             timeout,
             debug,
             http_version,

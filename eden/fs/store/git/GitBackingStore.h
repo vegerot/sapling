@@ -9,9 +9,9 @@
 
 #include <folly/Range.h>
 
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/store/BackingStore.h"
 #include "eden/fs/store/ObjectFetchContext.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 struct git_oid;
 struct git_repository;
@@ -45,24 +45,9 @@ class GitBackingStore final : public BijectiveBackingStore {
   ObjectId parseObjectId(folly::StringPiece objectId) override;
   std::string renderObjectId(const ObjectId& objectId) override;
 
-  ImmediateFuture<GetRootTreeResult> getRootTree(
-      const RootId& rootId,
-      const ObjectFetchContextPtr& context) override;
-  ImmediateFuture<std::shared_ptr<TreeEntry>> getTreeEntryForObjectId(
-      const ObjectId& /* objectId */,
-      TreeEntryType /* treeEntryType */,
-      const ObjectFetchContextPtr& /* context */) override {
-    throw std::domain_error("unimplemented");
+  LocalStoreCachingPolicy getLocalStoreCachingPolicy() const override {
+    return localStoreCachingPolicy_;
   }
-  folly::SemiFuture<BackingStore::GetTreeResult> getTree(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) override;
-  folly::SemiFuture<BackingStore::GetBlobResult> getBlob(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) override;
-  folly::SemiFuture<BackingStore::GetBlobMetaResult> getBlobMetadata(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) override;
 
   // TODO(T119221752): Implement for all BackingStore subclasses
   int64_t dropAllPendingRequestsFromQueue() override {
@@ -76,6 +61,31 @@ class GitBackingStore final : public BijectiveBackingStore {
   GitBackingStore(GitBackingStore const&) = delete;
   GitBackingStore& operator=(GitBackingStore const&) = delete;
 
+  ImmediateFuture<GetRootTreeResult> getRootTree(
+      const RootId& rootId,
+      const ObjectFetchContextPtr& context) override;
+  ImmediateFuture<std::shared_ptr<TreeEntry>> getTreeEntryForObjectId(
+      const ObjectId& /* objectId */,
+      TreeEntryType /* treeEntryType */,
+      const ObjectFetchContextPtr& /* context */) override {
+    throw std::domain_error("unimplemented");
+  }
+  folly::SemiFuture<BackingStore::GetTreeResult> getTree(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
+  folly::SemiFuture<BackingStore::GetTreeMetaResult> getTreeMetadata(
+      const ObjectId& /*id*/,
+      const ObjectFetchContextPtr& /*context*/) override;
+  folly::SemiFuture<BackingStore::GetBlobResult> getBlob(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
+  folly::SemiFuture<BackingStore::GetBlobMetaResult> getBlobMetadata(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
+  ImmediateFuture<GetGlobFilesResult> getGlobFiles(
+      const RootId& id,
+      const std::vector<std::string>& globs) override;
+
   TreePtr getTreeImpl(const ObjectId& id);
   BlobPtr getBlobImpl(const ObjectId& id);
 
@@ -85,6 +95,9 @@ class GitBackingStore final : public BijectiveBackingStore {
   static ObjectId oid2Hash(const git_oid* oid);
 
   git_repository* repo_{nullptr};
+
+  LocalStoreCachingPolicy localStoreCachingPolicy_ =
+      LocalStoreCachingPolicy::TreesAndBlobMetadata;
 };
 
 } // namespace facebook::eden

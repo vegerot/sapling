@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use async_runtime::try_block_unless_interrupted;
 use checkout::Action;
 use checkout::ActionMap;
 use checkout::Checkout;
@@ -19,6 +18,7 @@ use checkout::CheckoutPlan;
 use checkout::Conflict;
 use checkout::Merge;
 use checkout::MergeResult;
+use configmodel::Config;
 use cpython::*;
 use cpython_ext::convert::ImplInto;
 use cpython_ext::ExtractInnerRef;
@@ -29,16 +29,18 @@ use manifest_tree::Diff;
 use manifest_tree::TreeManifest;
 use pathmatcher::Matcher;
 use progress_model::ProgressBar;
-use pyconfigloader::config;
 use pymanifest::treemanifest;
 use pypathmatcher::extract_matcher;
 use pypathmatcher::extract_option_matcher;
 use pystatus::status as PyStatus;
 use pytreestate::treestate as PyTreeState;
-use storemodel::ReadFileContents;
+use storemodel::FileStore;
 use vfs::VFS;
 
-type ArcReadFileContents = Arc<dyn ReadFileContents<Error = anyhow::Error> + Send + Sync>;
+type ArcFileStore = Arc<dyn FileStore>;
+
+#[cfg(feature = "eden")]
+pub mod feature_eden;
 
 pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
     let name = [package, "checkout"].join(".");
@@ -49,21 +51,27 @@ pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
     m.add(
         py,
         "fixsymlinks",
-        py_fn!(py, fix_symlinks(paths: Vec<PyPathBuf>, root: PyPathBuf)),
+        py_fn!(py, fix_symlinks(paths: Vec<String>, root: PyPathBuf)),
     )?;
+    #[cfg(feature = "eden")]
+    feature_eden::populate_module(py, &m)?;
     Ok(m)
 }
 
-#[cfg(windows)]
-fn fix_symlinks(py: Python, paths: Vec<PyPathBuf>, root: PyPathBuf) -> PyResult<PyNone> {
-    let vfs = VFS::new(root.to_path_buf()).map_pyerr(py)?;
-    let paths = paths.iter().map(|p| p.to_string()).collect::<Vec<_>>();
-    checkout::update_symlinks(&paths, &vfs).map_pyerr(py)?;
-    Ok(PyNone)
-}
-
-#[cfg(not(windows))]
-fn fix_symlinks(_py: Python, _paths: Vec<PyPathBuf>, _root: PyPathBuf) -> PyResult<PyNone> {
+fn fix_symlinks(py: Python, paths: Vec<String>, root: PyPathBuf) -> PyResult<PyNone> {
+    #[cfg(windows)]
+    {
+        use storemodel::types::RepoPath;
+        let vfs = VFS::new(root.to_path_buf()).map_pyerr(py)?;
+        let paths: Vec<&RepoPath> = paths
+            .iter()
+            .map(|p| RepoPath::from_str(p.as_str()).map_err(anyhow::Error::from))
+            .collect::<Result<_>>()
+            .map_pyerr(py)?;
+        checkout::update_symlinks(&paths, &vfs).map_pyerr(py)?;
+    }
+    #[cfg(not(windows))]
+    let _ = (py, paths, root);
     Ok(PyNone)
 }
 
@@ -72,7 +80,7 @@ py_class!(class checkoutplan |py| {
 
     def __new__(
         _cls,
-        config: &config,
+        config: ImplInto<Arc<dyn Config + Send + Sync>>,
         root: PyPathBuf,
         current_manifest: &treemanifest,
         target_manifest: &treemanifest,
@@ -81,7 +89,7 @@ py_class!(class checkoutplan |py| {
         sparse_change: Option<(PyObject, PyObject)> = None,
         progress_path: Option<PyPathBuf> = None,
     ) -> PyResult<checkoutplan> {
-        let config = config.get_cfg(py);
+        let config = config.into();
         let matcher: Arc<dyn Matcher + Send + Sync> = extract_option_matcher(py, matcher)?;
 
         let current = current_manifest.get_underlying(py);
@@ -96,8 +104,8 @@ py_class!(class checkoutplan |py| {
         let current_lock = current_manifest.get_underlying(py);
         let target_lock = target_manifest.get_underlying(py);
         if let Some((old_sparse_matcher, new_sparse_matcher)) = sparse_change {
-            let old_matcher = extract_matcher(py, old_sparse_matcher)?;
-            let new_matcher = extract_matcher(py, new_sparse_matcher)?;
+            let old_matcher = extract_matcher(py, old_sparse_matcher)?.0;
+            let new_matcher = extract_matcher(py, new_sparse_matcher)?.0;
             actions = py.allow_threads(move || {
                 let current = current_lock.read();
                 let target = target_lock.read();
@@ -116,7 +124,7 @@ py_class!(class checkoutplan |py| {
     def check_unknown_files(
         &self,
         manifest: &treemanifest,
-        store: ImplInto<ArcReadFileContents>,
+        store: ImplInto<ArcFileStore>,
         state: &PyTreeState,
         status: &PyStatus,
     ) -> PyResult<Vec<String>> {
@@ -128,8 +136,7 @@ py_class!(class checkoutplan |py| {
         let unknown = py.allow_threads(move || -> Result<_> {
             let mut state = state.lock();
             let manifest = manifest.read();
-            try_block_unless_interrupted(
-            plan.check_unknown_files(&*manifest, store.as_ref(), &mut state, status))
+            plan.check_unknown_files(&*manifest, store.as_ref(), &mut state, status)
         }).map_pyerr(py)?;
         Ok(unknown.into_iter().map(|p|p.to_string()).collect())
     }
@@ -142,21 +149,20 @@ py_class!(class checkoutplan |py| {
         Ok(conflicts)
     }
 
-    def apply(&self, store: ImplInto<ArcReadFileContents>) -> PyResult<PyNone> {
+    def apply(&self, store: ImplInto<ArcFileStore>) -> PyResult<Vec<(PyPathBuf, PyObject)>> {
         let plan = self.plan(py);
         let store = store.into();
-        py.allow_threads(|| try_block_unless_interrupted(
-            plan.apply_store(store.as_ref())
-        )).map_pyerr(py)?;
-        Ok(PyNone)
+        Ok(py.allow_threads(|| plan.apply_store(store.as_ref())).map_pyerr(py)?
+           .remove_failed
+           .into_iter()
+           .map(|e| (e.0.into(), Err::<(), _>(e.1).map_pyerr(py).unwrap_err().instance(py)))
+           .collect())
     }
 
-    def apply_dry_run(&self, store: ImplInto<ArcReadFileContents>) -> PyResult<(usize, u64)> {
+    def apply_dry_run(&self, store: ImplInto<ArcFileStore>) -> PyResult<(usize, u64)> {
         let plan = self.plan(py);
         let store = store.into();
-        py.allow_threads(|| try_block_unless_interrupted(
-            plan.apply_store_dry_run(store.as_ref())
-        )).map_pyerr(py)
+        py.allow_threads(|| plan.apply_store_dry_run(store.as_ref())).map_pyerr(py)
     }
 
     def stats(&self) -> PyResult<(usize, usize, usize, usize)> {
@@ -172,7 +178,7 @@ py_class!(class checkoutplan |py| {
         let vfs = plan.vfs();
         let state = state.get_state(py);
         py.allow_threads(move || -> Result<()> {
-            let bar = ProgressBar::register_new("recording", plan.all_files().count() as u64, "files");
+            let bar = ProgressBar::new_adhoc("recording", plan.all_files().count() as u64, "files");
 
             let mut state = state.lock();
 

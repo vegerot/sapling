@@ -7,8 +7,8 @@
 
 import type * as vscode from 'vscode';
 
-import fs from 'fs';
-import path from 'path';
+import fs from 'node:fs';
+import path from 'node:path';
 import {tryJsonParse} from 'shared/utils';
 
 // VS Code requires a restart if you change the configured language,
@@ -62,7 +62,7 @@ export async function ensureTranslationsLoaded(
  * The translations live in package.nls.*.json files,
  * which includes translations for values within package.json,
  * such as command names. These nls files are included in the
- * distributed extension VSIX, but are not bundled directly into the JS by webpack.
+ * distributed extension VSIX, but are not bundled directly into the JS when bundling.
  */
 export function t(key: string): string {
   return translations?.[key] ?? key;

@@ -10,14 +10,14 @@
 #include <fb303/BaseService.h>
 #include <optional>
 #include "eden/common/os/ProcessId.h"
+#include "eden/common/telemetry/TraceBus.h"
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/RefPtr.h"
 #include "eden/fs/eden-config.h"
 #include "eden/fs/inodes/EdenMountHandle.h"
 #include "eden/fs/inodes/InodePtrFwd.h"
 #include "eden/fs/service/gen-cpp2/StreamingEdenService.h"
 #include "eden/fs/telemetry/ActivityBuffer.h"
-#include "eden/fs/telemetry/TraceBus.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/RefPtr.h"
 
 namespace folly {
 template <typename T>
@@ -45,6 +45,8 @@ class ImmediateFuture;
 class UsageService;
 
 extern const char* const kServiceName;
+
+const int EXPENSIVE_GLOB_FILES_DURATION = 5;
 
 struct ThriftRequestTraceEvent : TraceEventBase {
   enum Type : unsigned char {
@@ -105,9 +107,11 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
 
   std::unique_ptr<apache::thrift::AsyncProcessor> getProcessor() override;
 
-  void mount(std::unique_ptr<MountArgument> mount) override;
+  folly::SemiFuture<folly::Unit> semifuture_mount(
+      std::unique_ptr<MountArgument> mount) override;
 
-  void unmount(std::unique_ptr<std::string> mountPoint) override;
+  folly::SemiFuture<folly::Unit> semifuture_unmount(
+      std::unique_ptr<std::string> mountPoint) override;
 
   void listMounts(std::vector<MountInfo>& results) override;
 
@@ -122,6 +126,10 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
       std::unique_ptr<std::string> mountPoint,
       std::unique_ptr<WorkingDirectoryParents> parents,
       std::unique_ptr<ResetParentCommitsParams> params) override;
+
+  void getCurrentSnapshotInfo(
+      GetCurrentSnapshotInfoResponse& out,
+      std::unique_ptr<GetCurrentSnapshotInfoRequest> params) override;
 
   folly::SemiFuture<folly::Unit> semifuture_synchronizeWorkingCopy(
       std::unique_ptr<std::string> mountPoint,
@@ -198,6 +206,9 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
   folly::SemiFuture<folly::Unit> semifuture_prefetchFiles(
       std::unique_ptr<PrefetchParams> params) override;
 
+  folly::SemiFuture<std::unique_ptr<PrefetchResult>> semifuture_prefetchFilesV2(
+      std::unique_ptr<PrefetchParams> params) override;
+
   folly::SemiFuture<std::unique_ptr<Glob>> semifuture_predictiveGlobFiles(
       std::unique_ptr<GlobParams> params) override;
 
@@ -237,6 +248,10 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
   apache::thrift::ResponseAndServerStream<ChangesSinceResult, ChangedFileResult>
   streamChangesSince(std::unique_ptr<StreamChangesSinceParams> params) override;
 
+  apache::thrift::ResponseAndServerStream<ChangesSinceResult, ChangedFileResult>
+  streamSelectedChangesSince(
+      std::unique_ptr<StreamSelectedChangesSinceParams> params) override;
+
   folly::SemiFuture<std::unique_ptr<ScmStatus>> semifuture_getScmStatus(
       std::unique_ptr<std::string> mountPoint,
       bool listIgnored,
@@ -266,6 +281,10 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
   semifuture_debugGetBlobMetadata(
       std::unique_ptr<DebugGetBlobMetadataRequest> request) override;
 
+  folly::SemiFuture<std::unique_ptr<DebugGetScmTreeResponse>>
+  semifuture_debugGetTree(
+      std::unique_ptr<DebugGetScmTreeRequest> request) override;
+
   void debugInodeStatus(
       std::vector<TreeInodeDebugInfo>& inodeInfo,
       std::unique_ptr<std::string> mountPoint,
@@ -287,6 +306,10 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
 
   void debugOutstandingThriftRequests(
       std::vector<ThriftRequestMetadata>& outstandingCalls) override;
+
+  void debugOutstandingHgEvents(
+      std::vector<HgEvent>& outstandingEvents,
+      std::unique_ptr<std::string> mountPoint) override;
 
   void debugStartRecordingActivity(
       ActivityRecorderResult& result,
@@ -359,6 +382,9 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
   void injectFault(std::unique_ptr<FaultDefinition> fault) override;
   bool removeFault(std::unique_ptr<RemoveFaultArg> fault) override;
   int64_t unblockFault(std::unique_ptr<UnblockFaultArg> info) override;
+  void getBlockedFaults(
+      GetBlockedFaultsResponse& out,
+      std::unique_ptr<GetBlockedFaultsRequest> request) override;
 
   folly::SemiFuture<std::unique_ptr<SetPathObjectIdResult>>
   semifuture_setPathObjectId(
@@ -421,16 +447,6 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
   EdenMountHandle lookupMount(
       apache::thrift::field_ref<const std::string&> mountId);
   EdenMountHandle lookupMount(const std::string& mountId);
-
-  ImmediateFuture<Hash20> getSHA1ForPath(
-      const EdenMount& edenMount,
-      RelativePath path,
-      const ObjectFetchContextPtr& fetchContext);
-
-  ImmediateFuture<Hash32> getBlake3ForPath(
-      const EdenMount& edenMount,
-      RelativePath path,
-      const ObjectFetchContextPtr& fetchContext);
 
   void fillDaemonInfo(DaemonInfo& info);
 

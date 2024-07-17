@@ -21,6 +21,14 @@
 #include <folly/system/Pid.h>
 #include <folly/system/ThreadName.h>
 
+#include "eden/common/telemetry/StructuredLogger.h"
+#include "eden/common/utils/Bug.h"
+#include "eden/common/utils/FaultInjector.h"
+#include "eden/common/utils/Future.h"
+#include "eden/common/utils/ImmediateFuture.h"
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/SpawnedProcess.h"
+#include "eden/common/utils/UnboundedQueueExecutor.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/MountProtocol.h"
 #include "eden/fs/config/ReloadableConfig.h"
@@ -51,24 +59,17 @@
 #include "eden/fs/store/DiffCallback.h"
 #include "eden/fs/store/DiffContext.h"
 #include "eden/fs/store/ObjectStore.h"
-#include "eden/fs/store/ScmStatusDiffCallback.h"
 #include "eden/fs/store/StatsFetchContext.h"
 #include "eden/fs/store/TreeLookupProcessor.h"
-#include "eden/fs/telemetry/StructuredLogger.h"
-#include "eden/fs/utils/Bug.h"
+#include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/Clock.h"
 #include "eden/fs/utils/EdenError.h"
-#include "eden/fs/utils/FaultInjector.h"
 #include "eden/fs/utils/FsChannelTypes.h"
-#include "eden/fs/utils/Future.h"
-#include "eden/fs/utils/ImmediateFuture.h"
 #include "eden/fs/utils/NfsSocket.h"
 #include "eden/fs/utils/NotImplemented.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/SpawnedProcess.h"
-#include "eden/fs/utils/UnboundedQueueExecutor.h"
 
 #include <chrono>
+#include <memory>
 
 using folly::Future;
 using folly::makeFuture;
@@ -77,7 +78,6 @@ using folly::Unit;
 using std::make_unique;
 using std::shared_ptr;
 
-DEFINE_int32(fuseNumThreads, 16, "how many fuse dispatcher threads to spawn");
 DEFINE_string(
     edenfsctlPath,
     "edenfsctl",
@@ -140,7 +140,7 @@ constexpr PathComponentPiece kNfsdSocketName{"nfsd.socket"_pc};
 class EdenMount::JournalDiffCallback : public DiffCallback {
  public:
   explicit JournalDiffCallback()
-      : data_{folly::in_place, std::unordered_set<RelativePath>()} {}
+      : data_{std::in_place, std::unordered_set<RelativePath>()} {}
 
   void ignoredPath(RelativePathPiece, dtype_t) override {}
 
@@ -169,9 +169,10 @@ class EdenMount::JournalDiffCallback : public DiffCallback {
   FOLLY_NODISCARD ImmediateFuture<StatsFetchContext> performDiff(
       EdenMount* mount,
       TreeInodePtr rootInode,
-      std::vector<std::shared_ptr<const Tree>> rootTrees) {
-    auto diffContext =
-        mount->createDiffContext(this, folly::CancellationToken{});
+      std::vector<std::shared_ptr<const Tree>> rootTrees,
+      std::shared_ptr<CheckoutContext> ctx) {
+    auto diffContext = mount->createDiffContext(
+        this, folly::CancellationToken{}, ctx->getFetchContext());
     auto rawContext = diffContext.get();
 
     return rootInode
@@ -291,7 +292,10 @@ EdenMount::EdenMount(
       inodeTraceBus_{TraceBus<InodeTraceEvent>::create(
           "inode",
           serverState_->getEdenConfig()->InodeTraceBusCapacity.getValue())},
-      clock_{serverState_->getClock()} {
+      clock_{serverState_->getClock()},
+      scmStatusCache_{ScmStatusCache::create(
+          serverState_->getReloadableConfig()->getEdenConfig().get(),
+          serverState_->getStats().copy())} {
   subscribeInodeActivityBuffer();
 }
 
@@ -345,7 +349,7 @@ InodeCatalogOptions EdenMount::getInodeCatalogOptions(
   return options;
 }
 
-FOLLY_NODISCARD folly::Future<folly::Unit> EdenMount::initialize(
+FOLLY_NODISCARD ImmediateFuture<folly::Unit> EdenMount::initialize(
     OverlayChecker::ProgressCallback&& progressCallback,
     const std::optional<SerializedInodeMap>& takeover,
     const std::optional<MountProtocol>& takeoverMountProtocol) {
@@ -364,12 +368,8 @@ FOLLY_NODISCARD folly::Future<folly::Unit> EdenMount::initialize(
       "EdenMount::initialize");
   return serverState_->getFaultInjector()
       .checkAsync("mount", getPath().view())
-      .semi()
-      .via(getServerThreadPool().get())
       .thenValue([this, parent](auto&&) {
-        return objectStore_->getRootTree(parent, context)
-            .semi()
-            .via(&folly::QueuedImmediateExecutor::instance());
+        return objectStore_->getRootTree(parent, context);
       })
       .thenValue(
           [this,
@@ -430,9 +430,7 @@ FOLLY_NODISCARD folly::Future<folly::Unit> EdenMount::initialize(
         // TODO: It would be nice if the .eden inode was created before
         // allocating inode numbers for the Tree's entries. This would give the
         // .eden directory inode number 2.
-        return setupDotEden(std::move(initTreeNode))
-            .semi()
-            .via(&folly::QueuedImmediateExecutor::instance());
+        return setupDotEden(std::move(initTreeNode));
       })
       .thenTry([this](auto&& result) {
         if (result.hasException()) {
@@ -612,6 +610,13 @@ ImmediateFuture<folly::Unit> EdenMount::setupDotEden(TreeInodePtr root) {
 folly::SemiFuture<Unit> EdenMount::performBindMounts() {
   auto mountPath = getPath();
   auto systemConfigDir = getEdenConfig()->getSystemConfigDir();
+  SpawnedProcess::Options opts;
+#ifdef _WIN32
+  opts.creationFlags(CREATE_NO_WINDOW);
+  opts.nullStderr();
+  opts.nullStdin();
+  opts.nullStdout();
+#endif // _WIN32
   return folly::makeSemiFutureWith([&] {
            std::vector<std::string> argv{
                FLAGS_edenfsctlPath,
@@ -621,7 +626,7 @@ folly::SemiFuture<Unit> EdenMount::performBindMounts() {
                "fixup",
                "--mount",
                mountPath.c_str()};
-           return SpawnedProcess(argv).future_wait();
+           return SpawnedProcess(argv, std::move(opts)).future_wait();
          })
       .deferValue([mountPath](ProcessStatus returnCode) {
         if (returnCode.exitStatus() == 0) {
@@ -772,7 +777,7 @@ ImmediateFuture<SetPathObjectIdResultAndTimes> EdenMount::setPathsToObjectIds(
       if (facebook::eden::ObjectType::TREE == object.type) {
         // If the path is root, and setting to tree type, no more than one tree
         // is allowed.
-        if (parentToObjectsMap[path.dirname()].size() > 0) {
+        if (!parentToObjectsMap[path.dirname()].empty()) {
           throw std::domain_error(
               "SetPathObjectId does not support set multiple trees on root");
         }
@@ -785,14 +790,14 @@ ImmediateFuture<SetPathObjectIdResultAndTimes> EdenMount::setPathsToObjectIds(
   }
   objects.clear();
 
-  for (auto& [path, objects] : parentToObjectsMap) {
+  for (auto& [path, objs] : parentToObjectsMap) {
     const folly::stop_watch<> stopWatch;
     auto setPathObjectIdTime = std::make_shared<SetPathObjectIdTimes>();
 
     auto ctx = std::make_shared<CheckoutContext>(
         this,
         checkoutMode,
-        std::nullopt,
+        context->getClientPid(),
         "setPathObjectId",
         context->getRequestInfo());
 
@@ -805,16 +810,16 @@ ImmediateFuture<SetPathObjectIdResultAndTimes> EdenMount::setPathsToObjectIds(
 
     // A special case is set root to a tree. Then setPathObjectId is essentially
     // checkout
-    bool setOnRoot = path.empty() && objects.size() == 1 &&
-        objects.at(0).path.empty() &&
-        facebook::eden::ObjectType::TREE == objects.at(0).type;
+    bool setOnRoot = path.empty() && objs.size() == 1 &&
+        objs.at(0).path.empty() &&
+        facebook::eden::ObjectType::TREE == objs.at(0).type;
 
     auto getTargetTreeInodeFuture =
         ensureDirectoryExists(path, ctx->getFetchContext());
 
     std::vector<ImmediateFuture<shared_ptr<TreeEntry>>> getTreeEntryFutures;
     if (!setOnRoot) {
-      for (auto& object : objects) {
+      for (auto& object : objs) {
         ImmediateFuture<shared_ptr<TreeEntry>> getTreeEntryFuture =
             objectStore_->getTreeEntryForObjectId(
                 object.id,
@@ -825,10 +830,10 @@ ImmediateFuture<SetPathObjectIdResultAndTimes> EdenMount::setPathsToObjectIds(
     }
 
     auto getRootTreeFuture = setOnRoot
-        ? objectStore_->getTree(objects.at(0).id, ctx->getFetchContext())
+        ? objectStore_->getTree(objs.at(0).id, ctx->getFetchContext())
         : collectAllSafe(std::move(getTreeEntryFutures))
               .thenValue(
-                  [objects = std::move(objects),
+                  [objs_2 = std::move(objs),
                    caseSensitive = getCheckoutConfig()->getCaseSensitive()](
                       std::vector<shared_ptr<TreeEntry>> entries) {
                     // Make up a fake ObjectId for this tree.
@@ -839,7 +844,7 @@ ImmediateFuture<SetPathObjectIdResultAndTimes> EdenMount::setPathsToObjectIds(
                     Tree::container treeEntries{caseSensitive};
                     for (size_t i = 0; i < entries.size(); ++i) {
                       treeEntries.emplace(
-                          PathComponent{objects.at(i).path.basename()},
+                          PathComponent{objs_2.at(i).path.basename()},
                           std::move(*entries.at(i)));
                     }
 
@@ -1341,10 +1346,10 @@ ImmediateFuture<folly::Unit> EdenMount::waitForPendingWrites() const {
   }
 }
 
-folly::Future<CheckoutResult> EdenMount::checkout(
+ImmediateFuture<CheckoutResult> EdenMount::checkout(
     TreeInodePtr rootInode,
     const RootId& snapshotHash,
-    OptionalProcessId clientPid,
+    const ObjectFetchContextPtr& fetchContext,
     folly::StringPiece thriftMethodCaller,
     CheckoutMode checkoutMode) {
   const folly::stop_watch<> stopWatch;
@@ -1390,7 +1395,11 @@ folly::Future<CheckoutResult> EdenMount::checkout(
   }
 
   auto ctx = std::make_shared<CheckoutContext>(
-      this, checkoutMode, clientPid, thriftMethodCaller);
+      this,
+      checkoutMode,
+      fetchContext->getClientPid(),
+      thriftMethodCaller,
+      fetchContext->getRequestInfo());
   XLOG(DBG1) << "starting checkout for " << this->getPath() << ": " << oldParent
              << " to " << snapshotHash;
 
@@ -1401,29 +1410,26 @@ folly::Future<CheckoutResult> EdenMount::checkout(
   setLastCheckoutTime(EdenTimestamp{clock_->getRealtime()});
 
   auto journalDiffCallback = std::make_shared<JournalDiffCallback>();
+
+  using RootTreeTuple = std::
+      tuple<ObjectStore::GetRootTreeResult, ObjectStore::GetRootTreeResult>;
+
   return serverState_->getFaultInjector()
       .checkAsync("checkout", getPath().view())
-      .semi()
-      .via(getServerThreadPool().get())
       .thenValue([this, ctx, parent1Hash = oldParent, snapshotHash](auto&&) {
         XLOG(DBG7) << "Checkout: getRoots";
         auto fromTreeFuture =
             objectStore_->getRootTree(parent1Hash, ctx->getFetchContext());
         auto toTreeFuture =
             objectStore_->getRootTree(snapshotHash, ctx->getFetchContext());
-        return collectAllSafe(fromTreeFuture, toTreeFuture)
-            .semi()
-            .via(&folly::QueuedImmediateExecutor::instance());
+        return collectAllSafe(fromTreeFuture, toTreeFuture);
       })
-      .thenValue([this](std::tuple<
-                        ObjectStore::GetRootTreeResult,
-                        ObjectStore::GetRootTreeResult> treeResults) {
+      .thenValue([this](RootTreeTuple treeResults) {
         XLOG(DBG7) << "Checkout: waitForPendingWrites";
-        return waitForPendingWrites()
-            .thenValue([treeResults = std::move(treeResults)](auto&&) {
+        return waitForPendingWrites().thenValue(
+            [treeResults = std::move(treeResults)](auto&&) {
               return treeResults;
-            })
-            .semi();
+            });
       })
       .thenValue(
           [this,
@@ -1435,9 +1441,7 @@ folly::Future<CheckoutResult> EdenMount::checkout(
            resumingCheckout =
                std::holds_alternative<ParentCommitState::InterruptedCheckout>(
                    oldState)](
-              std::tuple<
-                  IObjectStore::GetRootTreeResult,
-                  IObjectStore::GetRootTreeResult> treeResults) {
+              RootTreeTuple treeResults) -> ImmediateFuture<RootTreeTuple> {
             XLOG(DBG7) << "Checkout: performDiff";
             checkoutTimes->didLookupTrees = stopWatch.elapsed();
             // Call JournalDiffCallback::performDiff() to compute the changes
@@ -1447,7 +1451,7 @@ folly::Future<CheckoutResult> EdenMount::checkout(
             // If we are doing a dry-run update we aren't going to create a
             // journal entry, so we can skip this step entirely.
             if (ctx->isDryRun()) {
-              return folly::makeFuture(treeResults);
+              return treeResults;
             }
 
             auto& fromTree = std::get<0>(treeResults);
@@ -1456,19 +1460,15 @@ folly::Future<CheckoutResult> EdenMount::checkout(
               trees.push_back(std::get<1>(treeResults).tree);
             }
             return journalDiffCallback
-                ->performDiff(this, rootInode, std::move(trees))
+                ->performDiff(this, rootInode, std::move(trees), ctx)
                 .thenValue([ctx, journalDiffCallback, treeResults](
                                const StatsFetchContext& diffFetchContext) {
                   ctx->getStatsContext().merge(diffFetchContext);
                   return treeResults;
-                })
-                .semi()
-                .via(&folly::QueuedImmediateExecutor::instance());
+                });
           })
       .thenValue([this, rootInode, ctx, checkoutTimes, stopWatch, snapshotHash](
-                     std::tuple<
-                         ObjectStore::GetRootTreeResult,
-                         ObjectStore::GetRootTreeResult> treeResults) {
+                     RootTreeTuple treeResults) {
         checkoutTimes->didDiff = stopWatch.elapsed();
 
         // Perform the requested checkout operation after the journal diff
@@ -1508,8 +1508,6 @@ folly::Future<CheckoutResult> EdenMount::checkout(
 
         return serverState_->getFaultInjector()
             .checkAsync("inodeCheckout", getPath().view())
-            .semi()
-            .via(getServerThreadPool().get())
             .thenValue([ctx, treeResults = std::move(treeResults), rootInode](
                            auto&&) mutable {
               auto& [fromTree, toTree] = treeResults;
@@ -1726,10 +1724,12 @@ ImmediateFuture<folly::Unit> EdenMount::chown(uid_t uid, gid_t gid) {
 std::unique_ptr<DiffContext> EdenMount::createDiffContext(
     DiffCallback* callback,
     folly::CancellationToken cancellation,
+    const ObjectFetchContextPtr& fetchContext,
     bool listIgnored) const {
   return make_unique<DiffContext>(
       callback,
       cancellation,
+      fetchContext,
       listIgnored,
       getCheckoutConfig()->getCaseSensitive(),
       getCheckoutConfig()->getEnableWindowsSymlinks(),
@@ -1759,11 +1759,12 @@ ImmediateFuture<Unit> EdenMount::diff(
 
 ImmediateFuture<Unit> EdenMount::diff(
     TreeInodePtr rootInode,
-    DiffCallback* callback,
+    ScmStatusDiffCallback* callback,
     const RootId& commitHash,
     bool listIgnored,
     bool enforceCurrentParent,
-    folly::CancellationToken cancellation) const {
+    folly::CancellationToken cancellation,
+    const ObjectFetchContextPtr& fetchContext) const {
   if (enforceCurrentParent) {
     auto parentInfo = parentState_.rlock();
 
@@ -1783,15 +1784,22 @@ ImmediateFuture<Unit> EdenMount::diff(
     }
 
     if (parentInfo->workingCopyParentRootId != commitHash) {
+      // TODO: We should really add a method to FilteredBackingStore that
+      // allows us to render a FOID as the underlying ObjectId. This would
+      // avoid the round trip we're doing here.
+      auto renderedParentRootId =
+          objectStore_->renderRootId(parentInfo->workingCopyParentRootId);
+      auto renderedCommitHash = objectStore_->renderRootId(commitHash);
+
       // Log this occurrence to Scuba
       getServerState()->getStructuredLogger()->logEvent(ParentMismatch{
           commitHash.value(), parentInfo->workingCopyParentRootId.value()});
       return makeImmediateFuture<Unit>(newEdenError(
           EdenErrorType::OUT_OF_DATE_PARENT,
           "error computing status: requested parent commit is out-of-date: requested ",
-          commitHash,
+          folly::hexlify(renderedCommitHash),
           ", but current parent commit is ",
-          parentInfo->workingCopyParentRootId,
+          folly::hexlify(renderedParentRootId),
           ".\nTry running `eden doctor` to remediate"));
     }
 
@@ -1801,13 +1809,55 @@ ImmediateFuture<Unit> EdenMount::diff(
   }
 
   // Create a DiffContext object for this diff operation.
-  auto context =
-      createDiffContext(callback, std::move(cancellation), listIgnored);
+  auto context = createDiffContext(
+      callback, std::move(cancellation), fetchContext, listIgnored);
   DiffContext* ctxPtr = context.get();
 
   // stateHolder() exists to ensure that the DiffContext and the EdenMount
   // exists until the diff completes.
   auto stateHolder = [ctx = std::move(context), rootInode]() {};
+
+  // only check/update the cache if config is enabled
+  if (getEdenConfig()->hgEnableCachedResultForStatusRequest.getValue()) {
+    auto latestInfo = getJournal().getLatest();
+    if (latestInfo.has_value()) {
+      auto key = ScmStatusCache::makeKey(commitHash, listIgnored);
+      auto curSequenceID = latestInfo.value().sequenceID;
+      {
+        auto lockedCachePtr = scmStatusCache_.rlock();
+        if ((*lockedCachePtr)->contains(key)) {
+          auto cachedStatusPtr = (*lockedCachePtr)->get(key);
+          if (cachedStatusPtr->seq == curSequenceID) {
+            getStats()->increment(&JournalStats::journalStatusCacheHit);
+            callback->setStatus(cachedStatusPtr->status);
+            return folly::unit;
+          }
+        }
+        getStats()->increment(&JournalStats::journalStatusCacheMiss);
+      }
+
+      return diff(rootInode, ctxPtr, commitHash)
+          .thenValue([this, curSequenceID, callback, key = std::move(key)](
+                         auto&&) mutable {
+            auto lockedCachePtr = scmStatusCache_.wlock();
+            ScmStatus newStatus = callback->peekStatus();
+            if (newStatus.entries_ref().value().size() >
+                getEdenConfig()->scmStatusCacheMaxEntriesPerItem.getValue()) {
+              // we don't have a good way to invalidate a single cache entry but
+              // as long as we cap the total size it should be fine if we leave
+              // some expired entries behind.
+              getStats()->increment(&JournalStats::journalStatusCacheSkip);
+              return;
+            }
+            (*lockedCachePtr)
+                ->insert(
+                    std::move(key),
+                    std::make_shared<const SeqStatusPair>(
+                        curSequenceID, std::move(newStatus)));
+          })
+          .ensure(std::move(stateHolder));
+    }
+  }
 
   return diff(rootInode, ctxPtr, commitHash).ensure(std::move(stateHolder));
 }
@@ -1816,10 +1866,12 @@ ImmediateFuture<std::unique_ptr<ScmStatus>> EdenMount::diff(
     TreeInodePtr rootInode,
     const RootId& commitHash,
     folly::CancellationToken cancellation,
+    const ObjectFetchContextPtr& fetchContext,
     bool listIgnored,
     bool enforceCurrentParent) {
   auto callback = std::make_unique<ScmStatusDiffCallback>();
   auto callbackPtr = callback.get();
+
   return this
       ->diff(
           std::move(rootInode),
@@ -1827,7 +1879,8 @@ ImmediateFuture<std::unique_ptr<ScmStatus>> EdenMount::diff(
           commitHash,
           listIgnored,
           enforceCurrentParent,
-          std::move(cancellation))
+          std::move(cancellation),
+          fetchContext)
       .thenValue([callback = std::move(callback)](auto&&) {
         return std::make_unique<ScmStatus>(callback->extractStatus());
       });
@@ -1920,17 +1973,23 @@ std::unique_ptr<FuseChannel, FsChannelDeleter> makeFuseChannel(
       mount->getServerState()->getPrivHelper(),
       std::move(fuseFd),
       mount->getPath(),
-      FLAGS_fuseNumThreads,
+      mount->getServerState()->getFsChannelThreadPool(),
+      mount->getServerState()
+          ->getEdenConfig()
+          ->fuseNumDispatcherThreads.getValue(),
       EdenDispatcherFactory::makeFuseDispatcher(mount),
       &mount->getStraceLogger(),
       mount->getServerState()->getProcessInfoCache(),
       mount->getServerState()->getFsEventLogger(),
+      mount->getServerState()->getStructuredLogger(),
       std::chrono::duration_cast<folly::Duration>(
           edenConfig->fuseRequestTimeout.getValue()),
       mount->getServerState()->getNotifier(),
       mount->getCheckoutConfig()->getCaseSensitive(),
       mount->getCheckoutConfig()->getRequireUtf8Path(),
-      edenConfig->fuseMaximumRequests.getValue(),
+      edenConfig->fuseMaximumBackgroundRequests.getValue(),
+      edenConfig->maxFsChannelInflightRequests.getValue(),
+      edenConfig->highFsRequestsLogInterval.getValue(),
       mount->getCheckoutConfig()->getUseWriteBackCache(),
       mount->getServerState()
           ->getEdenConfig()
@@ -2029,18 +2088,21 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
                   NfsServer::NfsMountInfo mountInfo) mutable {
                 auto [channel, mountdAddr] = std::move(mountInfo);
 #ifndef _WIN32
+                // Channel is later moved. We must assign addr to a local var
+                // to avoid the possibility of a use-after-move bug.
+                auto addr = channel->getAddr();
                 // TODO: teach privhelper or something to mount on Windows
                 return serverState_->getPrivHelper()
                     ->nfsMount(
                         mountPath.view(),
                         mountdAddr,
-                        channel->getAddr(),
+                        addr,
                         readOnly,
                         iosize,
                         useReaddirplus)
                     .thenTry([this,
                               mountPromise = std::move(mountPromise),
-                              channel = std::move(channel)](
+                              channel_2 = std::move(channel)](
                                  Try<folly::Unit>&& try_) mutable {
                       if (try_.hasException()) {
                         mountPromise->setException(try_.exception());
@@ -2048,7 +2110,7 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
                       }
 
                       mountPromise->setValue();
-                      channel_ = std::move(channel);
+                      channel_ = std::move(channel_2);
                       return makeFuture(folly::unit);
                     });
 #else
@@ -2072,10 +2134,13 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
                          EdenDispatcherFactory::makePrjfsDispatcher(this),
                          serverState_->getReloadableConfig(),
                          &getStraceLogger(),
+                         serverState_->getStructuredLogger(),
+                         serverState_->getFaultInjector(),
                          serverState_->getProcessInfoCache(),
                          getCheckoutConfig()->getRepoGuid(),
                          getCheckoutConfig()->getEnableWindowsSymlinks(),
-                         this->getServerState()->getNotifier()));
+                         this->getServerState()->getNotifier(),
+                         this->getInvalidationThreadPool()));
                  return FsChannelPtr{std::move(channel)};
                })
             .thenTry([this, mountPromise](Try<FsChannelPtr>&& channel) {
@@ -2093,7 +2158,11 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
             });
 #else
         return serverState_->getPrivHelper()
-            ->fuseMount(mountPath.view(), readOnly)
+            ->fuseMount(
+                mountPath.view(),
+                readOnly,
+                std::make_optional<folly::StringPiece>(
+                    edenConfig->fuseVfsType.getValue()))
             .thenTry(
                 [mountPath, mountPromise, this](Try<folly::File>&& fuseDevice)
                     -> folly::Future<folly::Unit> {

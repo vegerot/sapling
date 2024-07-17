@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This software may be used and distributed according to the terms of the
@@ -13,6 +15,8 @@
   > automv=
   > rebase=
   > EOF
+  $ setconfig automv.similarity=75
+  $ setconfig commands.update.check=none
 
 # Setup repo
 
@@ -150,7 +154,7 @@
   $ hg status -C
   A b.txt
   R a.txt
-  $ hg commit --no-automv -m msg
+  $ hg commit --no-move-detection -m msg
   $ hg status --change . -C
   A b.txt
   R a.txt

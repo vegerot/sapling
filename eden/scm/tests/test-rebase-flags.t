@@ -1,8 +1,7 @@
-#debugruntest-compatible
 
   $ eagerepo
   $ configure mutation-norecord
-#require execbit
+#require execbit no-eden
 
   $ tellmeabout() {
   > if [ -x $1 ]; then

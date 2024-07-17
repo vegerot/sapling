@@ -6,9 +6,9 @@
  */
 
 use std::cmp::min;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fs::File;
 use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Write;
@@ -35,16 +35,21 @@ use anyhow::Error;
 use anyhow::Result;
 use async_runtime::block_on;
 use async_runtime::stream_to_iter;
+use clientinfo::get_client_request_info_thread_local;
+use clientinfo::ClientInfo;
+use clientinfo_async::get_client_request_info_task_local;
+use clientinfo_async::with_client_request_info_scope;
 use configmodel::convert::ByteCount;
 use configmodel::Config;
 use configmodel::ConfigExt;
+use fs_err::File;
 use futures::future::FutureExt;
 use futures::stream::iter;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
 use hg_http::http_client;
 use hg_http::http_config;
-use hgstore::strip_metadata;
+use hgstore::strip_hg_file_metadata;
 use http::status::StatusCode;
 use http_client::Encoding;
 use http_client::HttpClient;
@@ -59,6 +64,7 @@ use indexedlog::log::IndexOutput;
 use indexedlog::rotate;
 use indexedlog::DefaultOpenOptions;
 use indexedlog::Repair;
+use itertools::Itertools;
 use lfs_protocol::ObjectAction;
 use lfs_protocol::ObjectStatus;
 use lfs_protocol::Operation;
@@ -70,7 +76,6 @@ use mincode::deserialize;
 use mincode::serialize;
 use minibytes::Bytes;
 use parking_lot::Mutex;
-use parking_lot::RwLock;
 use rand::thread_rng;
 use rand::Rng;
 use serde_derive::Deserialize;
@@ -120,9 +125,8 @@ use crate::util::get_lfs_pointers_path;
 struct LfsPointersStore(Store);
 
 pub(crate) struct LfsIndexedLogBlobsStore {
-    inner: RwLock<Store>,
+    inner: Store,
     chunk_size: usize,
-    skip_hash_on_read: bool,
 }
 
 /// The `LfsBlobsStore` holds the actual blobs. Lookup is done via the content hash (sha256) of the
@@ -143,6 +147,7 @@ pub(crate) struct HttpLfsRemote {
     client: Arc<HttpClient>,
     concurrent_fetches: usize,
     download_chunk_size: Option<NonZeroU64>,
+    max_batch_size: usize,
     http_options: Arc<HttpOptions>,
 }
 
@@ -178,7 +183,7 @@ pub struct LfsRemote {
 ///    "objects". Under that directory, the string representation of its content hash is used to
 ///    find the file storing the data: <2-digits hex>/<62-digits hex>
 pub struct LfsStore {
-    pointers: RwLock<LfsPointersStore>,
+    pointers: LfsPointersStore,
     blobs: LfsBlobsStore,
 }
 
@@ -226,7 +231,7 @@ pub(crate) struct LfsPointersEntry {
 
 impl DefaultOpenOptions<rotate::OpenOptions> for LfsPointersStore {
     fn default_open_options() -> rotate::OpenOptions {
-        Self::default_store_open_options().into_shared_open_options()
+        Self::default_store_open_options(&BTreeMap::<&str, &str>::new()).into_rotated_open_options()
     }
 }
 
@@ -234,8 +239,8 @@ impl LfsPointersStore {
     const INDEX_NODE: usize = 0;
     const INDEX_SHA256: usize = 1;
 
-    fn default_store_open_options() -> StoreOpenOptions {
-        StoreOpenOptions::new()
+    fn default_store_open_options(config: &dyn Config) -> StoreOpenOptions {
+        StoreOpenOptions::new(config)
             .max_log_count(4)
             .max_bytes_per_log(40_000_000 / 4)
             .index("node", |_| {
@@ -253,23 +258,25 @@ impl LfsPointersStore {
     }
 
     fn open_options(config: &dyn Config) -> Result<StoreOpenOptions> {
-        let mut open_options = Self::default_store_open_options();
+        let mut open_options = Self::default_store_open_options(config);
         if let Some(log_size) = config.get_opt::<ByteCount>("lfs", "pointersstoresize")? {
             open_options = open_options.max_bytes_per_log(log_size.value() / 4);
         }
         Ok(open_options)
     }
 
-    /// Create a local `LfsPointersStore`.
-    fn local(path: &Path, config: &dyn Config) -> Result<Self> {
+    /// Create a permanent `LfsPointersStore`.
+    fn permanent(path: &Path, config: &dyn Config) -> Result<Self> {
         let path = get_lfs_pointers_path(path)?;
-        Ok(Self(LfsPointersStore::open_options(config)?.local(path)?))
+        Ok(Self(
+            LfsPointersStore::open_options(config)?.permanent(path)?,
+        ))
     }
 
-    /// Create a shared `LfsPointersStore`.
-    fn shared(path: &Path, config: &dyn Config) -> Result<Self> {
+    /// Create a rotated `LfsPointersStore`.
+    fn rotated(path: &Path, config: &dyn Config) -> Result<Self> {
         let path = get_lfs_pointers_path(path)?;
-        Ok(Self(LfsPointersStore::open_options(config)?.shared(path)?))
+        Ok(Self(LfsPointersStore::open_options(config)?.rotated(path)?))
     }
 
     /// Read an entry from the slice and deserialize it.
@@ -279,10 +286,11 @@ impl LfsPointersStore {
 
     /// Find the pointer corresponding to the passed in `StoreKey`.
     fn entry(&self, key: &StoreKey) -> Result<Option<LfsPointersEntry>> {
+        let log = self.0.read();
         let mut iter = match key {
-            StoreKey::HgId(key) => self.0.lookup(Self::INDEX_NODE, key.hgid)?,
+            StoreKey::HgId(key) => log.lookup(Self::INDEX_NODE, key.hgid)?,
             StoreKey::Content(hash, _) => match hash {
-                ContentHash::Sha256(hash) => self.0.lookup(Self::INDEX_SHA256, hash)?,
+                ContentHash::Sha256(hash) => log.lookup(Self::INDEX_SHA256, hash)?,
             },
         };
 
@@ -299,7 +307,18 @@ impl LfsPointersStore {
         self.entry(key)
     }
 
-    fn add(&mut self, entry: LfsPointersEntry) -> Result<()> {
+    /// Find the pointer corresponding to the passed in `HgId`.
+    fn get_by_hgid(&self, hgid: &HgId) -> Result<Option<LfsPointersEntry>> {
+        let log = self.0.read();
+        let mut iter = log.lookup(Self::INDEX_NODE, hgid)?;
+        let buf = match iter.next() {
+            None => return Ok(None),
+            Some(buf) => buf?,
+        };
+        Self::get_from_slice(buf).map(Some)
+    }
+
+    fn add(&self, entry: LfsPointersEntry) -> Result<()> {
         self.0.append(serialize(&entry)?)
     }
 }
@@ -314,7 +333,7 @@ struct LfsIndexedLogBlobsEntry {
 
 impl DefaultOpenOptions<rotate::OpenOptions> for LfsIndexedLogBlobsStore {
     fn default_open_options() -> rotate::OpenOptions {
-        Self::default_store_open_options().into_shared_open_options()
+        Self::default_store_open_options(&BTreeMap::<&str, &str>::new()).into_rotated_open_options()
     }
 }
 
@@ -325,8 +344,8 @@ impl LfsIndexedLogBlobsStore {
             .value() as usize)
     }
 
-    fn default_store_open_options() -> StoreOpenOptions {
-        StoreOpenOptions::new()
+    fn default_store_open_options(config: &dyn Config) -> StoreOpenOptions {
+        StoreOpenOptions::new(config)
             .max_log_count(4)
             .max_bytes_per_log(20_000_000_000 / 4)
             .auto_sync_threshold(50 * 1024 * 1024)
@@ -336,7 +355,7 @@ impl LfsIndexedLogBlobsStore {
     }
 
     fn open_options(config: &dyn Config) -> Result<StoreOpenOptions> {
-        let mut open_options = Self::default_store_open_options();
+        let mut open_options = Self::default_store_open_options(config);
         if let Some(log_size) = config.get_opt::<ByteCount>("lfs", "blobsstoresize")? {
             open_options = open_options.max_bytes_per_log(log_size.value() / 4);
         }
@@ -348,18 +367,17 @@ impl LfsIndexedLogBlobsStore {
         Ok(open_options)
     }
 
-    pub fn shared(path: &Path, config: &dyn Config) -> Result<Self> {
+    pub fn rotated(path: &Path, config: &dyn Config) -> Result<Self> {
         let path = get_lfs_blobs_path(path)?;
         Ok(Self {
-            inner: RwLock::new(LfsIndexedLogBlobsStore::open_options(config)?.shared(path)?),
+            inner: LfsIndexedLogBlobsStore::open_options(config)?.rotated(path)?,
             chunk_size: LfsIndexedLogBlobsStore::chunk_size(config)?,
-            skip_hash_on_read: config.get_or("lfs", "skiphashonread", || false)?,
         })
     }
 
     pub fn get(&self, hash: &Sha256, total_size: u64) -> Result<Option<Bytes>> {
-        let store = self.inner.read();
-        let chunks_iter = store
+        let log = self.inner.read();
+        let chunks_iter = log
             .lookup(0, hash)?
             .map(|data| Ok(deserialize::<LfsIndexedLogBlobsEntry>(data?)?));
 
@@ -370,7 +388,6 @@ impl LfsIndexedLogBlobsStore {
             .filter_map(|res: Result<_, Error>| res.ok())
             .enumerate()
             .collect();
-        drop(store);
 
         if chunks.is_empty() {
             return Ok(None);
@@ -414,29 +431,19 @@ impl LfsIndexedLogBlobsStore {
         }
 
         let data: Bytes = res.into();
-        if self.skip_hash_on_read {
-            if data.len() as u64 == total_size || is_redacted(&data) {
-                Ok(Some(data))
-            } else {
-                Ok(None)
-            }
+        // Skip SHA256 hash check on reading. Data integrity is checked by indexedlog xxhash and
+        // length. The SHA256 check can be slow (~90% of data reading time!).
+        if data.len() as u64 == total_size || is_redacted(&data) {
+            Ok(Some(data))
         } else {
-            let apparent_hash = ContentHash::sha256(&data).unwrap_sha256();
-            if &apparent_hash == hash || is_redacted(&data) {
-                Ok(Some(data))
-            } else {
-                if data.len() as u64 == total_size {
-                    tracing::debug!(target: "lfs_read_hash_mismatch", lfs_read_hash_mismatch=&hash.to_hex()[..]);
-                }
-                Ok(None)
-            }
+            Ok(None)
         }
     }
 
     /// Test whether a blob is in the store. It returns true if at least one chunk is present, and
     /// thus it is possible that one of the chunk is missing.
     pub fn contains(&self, hash: &Sha256) -> Result<bool> {
-        Ok(self.inner.read().lookup(0, hash)?.next().is_some())
+        Ok(!self.inner.read().lookup(0, hash)?.is_empty()?)
     }
 
     fn chunk(mut data: Bytes, chunk_size: usize) -> impl Iterator<Item = (Range<usize>, Bytes)> {
@@ -471,27 +478,27 @@ impl LfsIndexedLogBlobsStore {
 
         for entry in chunks {
             let serialized = serialize(&entry)?;
-            self.inner.write().append(serialized)?;
+            self.inner.append(serialized)?;
         }
 
         Ok(())
     }
 
     pub fn flush(&self) -> Result<()> {
-        self.inner.write().flush()
+        self.inner.flush()
     }
 }
 
 impl LfsBlobsStore {
-    /// Store the local blobs in their loose format, ie: one file on disk per LFS blob.
-    pub fn local(path: &Path) -> Result<Self> {
+    /// Store the blobs in their loose format, ie: one file on disk per LFS blob.
+    pub fn loose_objects(path: &Path) -> Result<Self> {
         Ok(LfsBlobsStore::Loose(get_lfs_objects_path(path)?, true))
     }
 
-    /// Store the shared blobs in an `IndexedLog`, but still allow reading blobs in their loose
+    /// Store the blobs in a rotated `IndexedLog`, but still allow reading blobs in their loose
     /// format.
-    pub fn shared(path: &Path, config: &dyn Config) -> Result<Self> {
-        let indexedlog = Box::new(LfsBlobsStore::IndexedLog(LfsIndexedLogBlobsStore::shared(
+    pub fn rotated_or_loose_objects(path: &Path, config: &dyn Config) -> Result<Self> {
+        let indexedlog = Box::new(LfsBlobsStore::IndexedLog(LfsIndexedLogBlobsStore::rotated(
             path, config,
         )?));
         let loose = Box::new(LfsBlobsStore::Loose(get_lfs_objects_path(path)?, false));
@@ -631,27 +638,24 @@ pub(crate) enum LfsStoreEntry {
 
 impl LfsStore {
     fn new(pointers: LfsPointersStore, blobs: LfsBlobsStore) -> Result<Self> {
-        Ok(Self {
-            pointers: RwLock::new(pointers),
-            blobs,
-        })
+        Ok(Self { pointers, blobs })
     }
 
-    /// Create a new local `LfsStore`.
+    /// Create a new permanent `LfsStore`.
     ///
-    /// Local stores will `fsync(2)` data to disk, and will never rotate data out of the store.
-    pub fn local(path: impl AsRef<Path>, config: &dyn Config) -> Result<Self> {
+    /// Permanent stores will `fsync(2)` data to disk, and will never rotate data out of the store.
+    pub fn permanent(path: impl AsRef<Path>, config: &dyn Config) -> Result<Self> {
         let path = path.as_ref();
-        let pointers = LfsPointersStore::local(path, config)?;
-        let blobs = LfsBlobsStore::local(path)?;
+        let pointers = LfsPointersStore::permanent(path, config)?;
+        let blobs = LfsBlobsStore::loose_objects(path)?;
         LfsStore::new(pointers, blobs)
     }
 
-    /// Create a new shared `LfsStore`.
-    pub fn shared(path: impl AsRef<Path>, config: &dyn Config) -> Result<Self> {
+    /// Create a new rotated `LfsStore`.
+    pub fn rotated(path: impl AsRef<Path>, config: &dyn Config) -> Result<Self> {
         let path = path.as_ref();
-        let pointers = LfsPointersStore::shared(path, config)?;
-        let blobs = LfsBlobsStore::shared(path, config)?;
+        let pointers = LfsPointersStore::rotated(path, config)?;
+        let blobs = LfsBlobsStore::rotated_or_loose_objects(path, config)?;
         LfsStore::new(pointers, blobs)
     }
 
@@ -666,7 +670,7 @@ impl LfsStore {
     }
 
     fn blob_impl(&self, key: StoreKey) -> Result<StoreResult<(LfsPointersEntry, Bytes)>> {
-        let pointer = self.pointers.read().entry(&key)?;
+        let pointer = self.pointers.entry(&key)?;
 
         match pointer {
             None => Ok(StoreResult::NotFound(key)),
@@ -698,8 +702,12 @@ impl LfsStore {
     // TODO(meyer): This is a crappy name, albeit so is blob_impl.
     /// Fetch whatever content is available for the specified StoreKey. Like blob_impl above, but returns just
     /// the LfsPointersEntry when that's all that's found. Mostly copy-pasted from blob_impl above.
-    pub(crate) fn fetch_available(&self, key: &StoreKey) -> Result<Option<LfsStoreEntry>> {
-        let pointer = self.pointers.read().entry(key)?;
+    pub(crate) fn fetch_available(
+        &self,
+        key: &StoreKey,
+        ignore_result: bool,
+    ) -> Result<Option<LfsStoreEntry>> {
+        let pointer = self.pointers.entry(key)?;
 
         match pointer {
             None => Ok(None),
@@ -709,16 +717,37 @@ impl LfsStore {
                 // or return NotFound like blob_impl?
                 None => Ok(Some(LfsStoreEntry::PointerOnly(entry))),
                 Some(content_hash) => {
-                    match self
-                        .blobs
-                        .get(&content_hash.clone().unwrap_sha256(), entry.size)?
-                    {
-                        None => Ok(Some(LfsStoreEntry::PointerOnly(entry))),
-                        Some(blob) => Ok(Some(LfsStoreEntry::PointerAndBlob(entry, blob))),
+                    if ignore_result {
+                        match self.blobs.contains(&content_hash.clone().unwrap_sha256())? {
+                            false => Ok(Some(LfsStoreEntry::PointerOnly(entry))),
+                            // Insert stub entry since the result doesn't matter.
+                            true => Ok(Some(LfsStoreEntry::PointerAndBlob(entry, Bytes::new()))),
+                        }
+                    } else {
+                        match self
+                            .blobs
+                            .get(&content_hash.clone().unwrap_sha256(), entry.size)?
+                        {
+                            None => Ok(Some(LfsStoreEntry::PointerOnly(entry))),
+                            Some(blob) => Ok(Some(LfsStoreEntry::PointerAndBlob(entry, blob))),
+                        }
                     }
                 }
             },
         }
+    }
+
+    /// Directly get the local content. Do not ask remote servers.
+    pub(crate) fn get_local_content_direct(&self, id: &HgId) -> Result<Option<Bytes>> {
+        let pointer = match self.pointers.get_by_hgid(id)? {
+            None => return Ok(None),
+            Some(v) => v,
+        };
+        let hash = match pointer.content_hashes.get(&ContentHashType::Sha256) {
+            None => return Ok(None),
+            Some(v) => v,
+        };
+        self.blobs.get(hash.sha256_ref(), pointer.size)
     }
 
     pub fn add_blob(&self, hash: &Sha256, blob: Bytes) -> Result<()> {
@@ -726,7 +755,7 @@ impl LfsStore {
     }
 
     pub(crate) fn add_pointer(&self, pointer_entry: LfsPointersEntry) -> Result<()> {
-        self.pointers.write().add(pointer_entry)
+        self.pointers.add(pointer_entry)
     }
 }
 
@@ -736,7 +765,7 @@ impl LocalStore for LfsStore {
             .iter()
             .filter_map(|k| match k {
                 StoreKey::HgId(key) => {
-                    let entry = self.pointers.read().get(&k.clone());
+                    let entry = self.pointers.get(&k.clone());
                     match entry {
                         Ok(None) | Err(_) => Some(k.clone()),
                         Ok(Some(entry)) => match entry.content_hashes.get(&ContentHashType::Sha256)
@@ -798,7 +827,7 @@ pub(crate) fn lfs_from_hg_file_blob(
     hgid: HgId,
     raw_content: &Bytes,
 ) -> Result<(LfsPointersEntry, Bytes)> {
-    let (data, copy_from) = strip_metadata(raw_content)?;
+    let (data, copy_from) = strip_hg_file_metadata(raw_content)?;
     let pointer = LfsPointersEntry::from_file_content(hgid, &data, copy_from)?;
     Ok((pointer, data))
 }
@@ -816,10 +845,10 @@ impl HgIdDataStore for LfsStore {
     }
 
     fn get_meta(&self, key: StoreKey) -> Result<StoreResult<Metadata>> {
-        let entry = self.pointers.read().get(&key)?;
+        let entry = self.pointers.get(&key)?;
         if let Some(entry) = entry {
             Ok(StoreResult::Found(Metadata {
-                size: Some(entry.size.try_into()?),
+                size: Some(entry.size),
                 flags: None,
             }))
         } else {
@@ -837,12 +866,12 @@ impl HgIdMutableDeltaStore for LfsStore {
         ensure!(delta.base.is_none(), "Deltas aren't supported.");
         let (lfs_pointer_entry, blob) = lfs_from_hg_file_blob(delta.key.hgid, &delta.data)?;
         self.blobs.add(&lfs_pointer_entry.sha256(), blob)?;
-        self.pointers.write().add(lfs_pointer_entry)
+        self.pointers.add(lfs_pointer_entry)
     }
 
     fn flush(&self) -> Result<Option<Vec<PathBuf>>> {
         self.blobs.flush()?;
-        self.pointers.write().0.flush()?;
+        self.pointers.0.flush()?;
         Ok(None)
     }
 }
@@ -868,7 +897,7 @@ impl ContentDataStore for LfsStore {
     }
 
     fn metadata(&self, key: StoreKey) -> Result<StoreResult<ContentMetadata>> {
-        let pointer = self.pointers.read().entry(&key)?;
+        let pointer = self.pointers.entry(&key)?;
 
         match pointer {
             None => Ok(StoreResult::NotFound(key)),
@@ -949,19 +978,16 @@ impl LfsPointersEntry {
         for line in lines {
             if line.starts_with(LFS_POINTER_VERSION) {
                 continue;
-            } else if line.starts_with(LFS_POINTER_OID_SHA256) {
-                let oid = &line[LFS_POINTER_OID_SHA256.len()..];
-                hash = Some(oid.parse::<Sha256>()?);
-            } else if line.starts_with(LFS_POINTER_SIZE) {
-                let stored_size = &line[LFS_POINTER_SIZE.len()..];
-                size = Some(stored_size.parse::<usize>()?);
-            } else if line.starts_with(LFS_POINTER_X_HG_COPY) {
-                path = Some(RepoPath::from_str(&line[LFS_POINTER_X_HG_COPY.len()..])?.to_owned());
-            } else if line.starts_with(LFS_POINTER_X_HG_COPYREV) {
-                copy_hgid = Some(HgId::from_str(&line[LFS_POINTER_X_HG_COPYREV.len()..])?);
-            } else if line.starts_with(LFS_POINTER_X_IS_BINARY) {
-                let stored_is_binary = &line[LFS_POINTER_X_IS_BINARY.len()..];
-                is_binary = stored_is_binary.parse::<u8>()? == 1;
+            } else if let Some(suffix) = line.strip_prefix(LFS_POINTER_OID_SHA256) {
+                hash = Some(suffix.parse::<Sha256>()?);
+            } else if let Some(suffix) = line.strip_prefix(LFS_POINTER_SIZE) {
+                size = Some(suffix.parse::<usize>()?);
+            } else if let Some(suffix) = line.strip_prefix(LFS_POINTER_X_HG_COPY) {
+                path = Some(RepoPath::from_str(suffix)?.to_owned());
+            } else if let Some(suffix) = line.strip_prefix(LFS_POINTER_X_HG_COPYREV) {
+                copy_hgid = Some(HgId::from_str(suffix)?);
+            } else if let Some(suffix) = line.strip_prefix(LFS_POINTER_X_IS_BINARY) {
+                is_binary = suffix.parse::<u8>()? == 1;
             } else {
                 bail!("unknown metadata: {}", line);
             }
@@ -1052,7 +1078,7 @@ impl HgIdMutableDeltaStore for LfsMultiplexer {
         if metadata.is_lfs() {
             // This is an lfs pointer blob. Let's parse it and extract what matters.
             let pointer = LfsPointersEntry::from_bytes(&delta.data, delta.key.hgid.clone())?;
-            return self.lfs.pointers.write().add(pointer);
+            return self.lfs.pointers.add(pointer);
         }
 
         if delta.data.len() > self.threshold {
@@ -1157,7 +1183,18 @@ impl LfsRemoteInner {
                 let res = async {
                     let request_timeout = http_options.request_timeout;
 
-                    let req = add_extra(req);
+                    let mut req = add_extra(req);
+
+                    // Set up client_request_info fetched from a task local
+                    if let Some(client_request_info) = get_client_request_info_task_local() {
+                        if let Ok(client_info) =
+                            ClientInfo::new_with_client_request_info(client_request_info)
+                        {
+                            if let Ok(client_info_json) = client_info.to_json() {
+                                req.set_client_info(&Some(client_info_json));
+                            }
+                        }
+                    }
 
                     let (responses, _) = client.send_async(vec![req])?;
                     let mut stream = responses.into_iter().collect::<FuturesUnordered<_>>();
@@ -1281,19 +1318,11 @@ impl LfsRemoteInner {
 
     fn send_batch_request(
         http: &HttpLfsRemote,
-        objs: &HashSet<(Sha256, usize)>,
+        objects: Vec<RequestObject>,
         operation: Operation,
     ) -> Result<Option<ResponseBatch>> {
         let span = info_span!("LfsRemote::send_batch_inner");
         let _guard = span.enter();
-
-        let objects = objs
-            .iter()
-            .map(|(oid, size)| RequestObject {
-                oid: LfsSha256(oid.into_inner()),
-                size: *size as u64,
-            })
-            .collect::<Vec<_>>();
 
         let batch = RequestBatch {
             operation,
@@ -1318,7 +1347,12 @@ impl LfsRemoteInner {
             .await
         };
 
-        let response = block_on(response_fut)?;
+        // Fetch ClientRequestInfo from a thread local and pass to async code
+        let maybe_client_request_info = get_client_request_info_thread_local();
+        let response = block_on(with_client_request_info_scope(
+            maybe_client_request_info,
+            response_fut,
+        ))?;
         Ok(Some(serde_json::from_slice(response.as_ref())?))
     }
 
@@ -1451,69 +1485,82 @@ impl LfsRemoteInner {
         mut write_to_store: impl FnMut(Sha256, Bytes) -> Result<()>,
         mut error_handler: impl FnMut(Sha256, Error),
     ) -> Result<()> {
-        let response = LfsRemoteInner::send_batch_request(http, objs, operation)?;
-        let response = match response {
-            None => return Ok(()),
-            Some(response) => response,
-        };
+        let request_objs_iter = objs.iter().map(|(oid, size)| RequestObject {
+            oid: LfsSha256(oid.into_inner()),
+            size: *size as u64,
+        });
 
-        let mut futures = Vec::new();
-
-        for object in response.objects {
-            let oid = object.object.oid;
-            let actions = match object.status {
-                ObjectStatus::Ok {
-                    authenticated: _,
-                    actions,
-                } => Some(actions),
-                ObjectStatus::Err { error: e } => {
-                    error_handler(
-                        Sha256::from(oid.0),
-                        anyhow!("LFS fetch error {} - {}", e.code, e.message),
-                    );
-                    None
-                }
+        for request_objs_chunk in &request_objs_iter.chunks(http.max_batch_size) {
+            let response =
+                LfsRemoteInner::send_batch_request(http, request_objs_chunk.collect(), operation)?;
+            let response = match response {
+                None => return Ok(()),
+                Some(response) => response,
             };
 
-            for (op, action) in actions.into_iter().flat_map(|h| h.into_iter()) {
-                let oid = Sha256::from(oid.0);
+            let mut futures = Vec::new();
+            // Fetch ClientRequestInfo from a thread local and pass to async code
+            let maybe_client_request_info = get_client_request_info_thread_local();
 
-                let fut = match op {
-                    Operation::Upload => LfsRemoteInner::process_upload(
-                        http.client.clone(),
-                        action,
-                        oid,
-                        object.object.size,
-                        read_from_store.clone(),
-                        http.http_options.clone(),
-                    )
-                    .map(|_| None)
-                    .left_future(),
-                    Operation::Download => LfsRemoteInner::process_download(
-                        http.client.clone(),
-                        http.download_chunk_size,
-                        action,
-                        oid,
-                        object.object.size,
-                        http.http_options.clone(),
-                    )
-                    .map(Some)
-                    .right_future(),
+            for object in response.objects {
+                let oid = object.object.oid;
+                let actions = match object.status {
+                    ObjectStatus::Ok {
+                        authenticated: _,
+                        actions,
+                    } => Some(actions),
+                    ObjectStatus::Err { error: e } => {
+                        error_handler(
+                            Sha256::from(oid.0),
+                            anyhow!("LFS fetch error {} - {}", e.code, e.message),
+                        );
+                        None
+                    }
                 };
 
-                futures.push(fut);
+                for (op, action) in actions.into_iter().flat_map(|h| h.into_iter()) {
+                    let oid = Sha256::from(oid.0);
+
+                    let fut = match op {
+                        Operation::Upload => LfsRemoteInner::process_upload(
+                            http.client.clone(),
+                            action,
+                            oid,
+                            object.object.size,
+                            read_from_store.clone(),
+                            http.http_options.clone(),
+                        )
+                        .map(|_| None)
+                        .left_future(),
+                        Operation::Download => LfsRemoteInner::process_download(
+                            http.client.clone(),
+                            http.download_chunk_size,
+                            action,
+                            oid,
+                            object.object.size,
+                            http.http_options.clone(),
+                        )
+                        .map(Some)
+                        .right_future(),
+                    };
+
+                    futures.push(with_client_request_info_scope(
+                        maybe_client_request_info.clone(),
+                        fut,
+                    ));
+                }
             }
-        }
 
-        // Request blobs concurrently.
-        let stream = stream_to_iter(iter(futures).buffer_unordered(http.concurrent_fetches));
+            // Request blobs concurrently.
+            let stream = stream_to_iter(iter(futures).buffer_unordered(http.concurrent_fetches));
 
-        // It's awkward that the futures are shared for uploading and downloading. We use Some(_)
-        // to indicate if the result came from the download path, and 'flatten' filters out the
-        // Nones.
-        for result in stream.flatten() {
-            let (sha, data) = result?;
-            write_to_store(sha, data)?;
+            // It's awkward that the futures are shared for uploading and downloading. We use Some(_)
+            // to indicate if the result came from the download path, and 'flatten' filters out the
+            // Nones.
+            for result in stream.flatten() {
+                let (sha, data) = result?;
+                write_to_store(sha, data)?;
+            }
         }
 
         Ok(())
@@ -1636,6 +1683,9 @@ impl LfsRemote {
                 .map(|s| NonZeroU64::new(s).context("download chunk size cannot be 0"))
                 .transpose()?;
 
+            // Pick something relatively low. Doesn't seem like we need many concurrent LFS downloads to saturate available BW.
+            let max_batch_size = config.get_or("lfs", "max-batch-size", || 100)?;
+
             let client = http_client("lfs", http_config(config, &url)?);
 
             Ok(Self {
@@ -1648,6 +1698,7 @@ impl LfsRemote {
                     client: Arc::new(client),
                     concurrent_fetches,
                     download_chunk_size,
+                    max_batch_size,
                     http_options: Arc::new(HttpOptions {
                         accept_zstd,
                         http_version,
@@ -1717,8 +1768,8 @@ fn move_blob(hash: &Sha256, size: u64, from: &LfsStore, to: &LfsStore) -> Result
 
         (|| -> Result<()> {
             let key = StoreKey::from(ContentHash::Sha256(*hash));
-            if let Some(pointer) = from.pointers.read().entry(&key)? {
-                to.pointers.write().add(pointer)?
+            if let Some(pointer) = from.pointers.entry(&key)? {
+                to.pointers.add(pointer)?
             }
             Ok(())
         })()
@@ -1737,24 +1788,26 @@ impl RemoteDataStore for LfsRemoteStore {
         let mut not_found = Vec::new();
 
         let stores = if let Some(local_store) = self.remote.local.as_ref() {
-            vec![self.remote.shared.clone(), local_store.clone()]
+            vec![
+                (self.remote.shared.clone(), false),
+                (local_store.clone(), true),
+            ]
         } else {
-            vec![self.remote.shared.clone()]
+            vec![(self.remote.shared.clone(), false)]
         };
 
         let mut obj_set = HashMap::new();
         let objs = keys
             .iter()
             .map(|k| {
-                for store in &stores {
-                    let pointers = store.pointers.read();
-                    if let Some(pointer) = pointers.entry(k)? {
+                for (store, is_local) in &stores {
+                    if let Some(pointer) = store.pointers.entry(k)? {
                         if let Some(content_hash) =
                             pointer.content_hashes.get(&ContentHashType::Sha256)
                         {
                             obj_set.insert(
                                 content_hash.clone().unwrap_sha256(),
-                                (k.clone(), pointers.0.is_local()),
+                                (k.clone(), *is_local),
                             );
                             return Ok(Some((
                                 content_hash.clone().unwrap_sha256(),
@@ -1830,7 +1883,7 @@ impl RemoteDataStore for LfsRemoteStore {
         let objs = keys
             .iter()
             .map(|k| {
-                if let Some(pointer) = local_store.pointers.read().entry(k)? {
+                if let Some(pointer) = local_store.pointers.entry(k)? {
                     match pointer.content_hashes.get(&ContentHashType::Sha256) {
                         None => Ok(None),
                         Some(content_hash) => Ok(Some((
@@ -1955,7 +2008,7 @@ impl RemoteDataStore for LfsFallbackRemoteStore {
                 .collect::<Vec<_>>(),
         )?;
 
-        not_found.extend(not_prefetched.into_iter());
+        not_found.extend(not_prefetched);
         Ok(not_found)
     }
 
@@ -2075,10 +2128,11 @@ mod tests {
     use crate::testutil::TestBlob;
 
     #[test]
-    fn test_new_shared() -> Result<()> {
+    fn test_new_rotated() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_new_shared");
-        let _ = LfsStore::shared(&dir, &config)?;
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_new_shared");
+        let _ = LfsStore::rotated(&dir, &config)?;
 
         let mut lfs_dir = dir.as_ref().to_owned();
         lfs_dir.push("lfs");
@@ -2089,10 +2143,11 @@ mod tests {
     }
 
     #[test]
-    fn test_new_local() -> Result<()> {
+    fn test_new_permanent() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_new_local");
-        let _ = LfsStore::local(&dir, &config)?;
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_new_local");
+        let _ = LfsStore::permanent(&dir, &config)?;
 
         let mut lfs_dir = dir.as_ref().to_owned();
         lfs_dir.push("lfs");
@@ -2105,8 +2160,9 @@ mod tests {
     #[test]
     fn test_add() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_add");
-        let store = LfsStore::shared(&dir, &config)?;
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_add");
+        let store = LfsStore::rotated(&dir, &config)?;
 
         let k1 = key("a", "2");
         let delta = Delta {
@@ -2118,7 +2174,7 @@ mod tests {
         store.add(&delta, &Default::default())?;
         store.flush()?;
 
-        let indexedlog_blobs = LfsIndexedLogBlobsStore::shared(dir.path(), &config)?;
+        let indexedlog_blobs = LfsIndexedLogBlobsStore::rotated(dir.path(), &config)?;
         let hash = ContentHash::sha256(&delta.data).unwrap_sha256();
 
         assert!(indexedlog_blobs.contains(&hash)?);
@@ -2134,8 +2190,9 @@ mod tests {
     #[test]
     fn test_loose() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_loose");
-        let blob_store = LfsBlobsStore::shared(dir.path(), &config)?;
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_loose");
+        let blob_store = LfsBlobsStore::rotated_or_loose_objects(dir.path(), &config)?;
         let loose_store = LfsBlobsStore::loose(get_lfs_objects_path(dir.path())?);
 
         let data = Bytes::from(&[1, 2, 3, 4][..]);
@@ -2151,8 +2208,9 @@ mod tests {
     #[test]
     fn test_add_get_missing() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_add_get_missing");
-        let store = LfsStore::shared(&dir, &config)?;
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_add_get_missing");
+        let store = LfsStore::rotated(&dir, &config)?;
 
         let k1 = key("a", "2");
         let delta = Delta {
@@ -2174,8 +2232,9 @@ mod tests {
     #[test]
     fn test_add_get() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_add_get");
-        let store = LfsStore::shared(&dir, &config)?;
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_add_get");
+        let store = LfsStore::rotated(&dir, &config)?;
 
         let k1 = key("a", "2");
         let delta = Delta {
@@ -2194,9 +2253,10 @@ mod tests {
     #[test]
     fn test_invalid_hash() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_invalid_hash");
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_invalid_hash");
 
-        let store = LfsIndexedLogBlobsStore::shared(dir.path(), &config)?;
+        let store = LfsIndexedLogBlobsStore::rotated(dir.path(), &config)?;
 
         let bad_hash = ContentHash::sha256(&Bytes::from_static(b"wrong")).unwrap_sha256();
         let data = Bytes::from_static(b"oops");
@@ -2212,30 +2272,25 @@ mod tests {
     #[test]
     fn test_prefer_newer_chunks() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_invalid_hash");
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_invalid_hash");
 
-        let store = LfsIndexedLogBlobsStore::shared(dir.path(), &config)?;
+        let store = LfsIndexedLogBlobsStore::rotated(dir.path(), &config)?;
 
         let data = Bytes::from_static(b"data");
         let hash = ContentHash::sha256(&data).unwrap_sha256();
 
         // Insert some poisoned chunks under the same hash.
-        store
-            .inner
-            .write()
-            .append(serialize(&LfsIndexedLogBlobsEntry {
-                sha256: hash.clone(),
-                range: (0..2),
-                data: Bytes::from_static(b"oo"),
-            })?)?;
-        store
-            .inner
-            .write()
-            .append(serialize(&LfsIndexedLogBlobsEntry {
-                sha256: hash.clone(),
-                range: (2..4),
-                data: Bytes::from_static(b"ps"),
-            })?)?;
+        store.inner.append(serialize(&LfsIndexedLogBlobsEntry {
+            sha256: hash.clone(),
+            range: (0..2),
+            data: Bytes::from_static(b"oo"),
+        })?)?;
+        store.inner.append(serialize(&LfsIndexedLogBlobsEntry {
+            sha256: hash.clone(),
+            range: (2..4),
+            data: Bytes::from_static(b"ps"),
+        })?)?;
 
         // Insert the new, correct data.
         store.add(&hash, data.clone())?;
@@ -2251,10 +2306,11 @@ mod tests {
     #[test]
     fn test_add_get_split() -> Result<()> {
         let dir = TempDir::new()?;
-        let mut config = make_lfs_config(&dir, "test_add_get_split");
+        let server = mockito::Server::new();
+        let mut config = make_lfs_config(&server, &dir, "test_add_get_split");
         setconfig(&mut config, "lfs", "blobschunksize", "2");
 
-        let store = LfsStore::shared(&dir, &config)?;
+        let store = LfsStore::rotated(&dir, &config)?;
 
         let k1 = key("a", "2");
         let delta = Delta {
@@ -2279,9 +2335,10 @@ mod tests {
     #[test]
     fn test_partial_blob() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_partial_blob");
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_partial_blob");
 
-        let store = LfsIndexedLogBlobsStore::shared(dir.path(), &config)?;
+        let store = LfsIndexedLogBlobsStore::rotated(dir.path(), &config)?;
 
         let data = Bytes::from(&[1, 2, 3, 4][..]);
         let partial = data.slice(2..);
@@ -2293,7 +2350,7 @@ mod tests {
             data: partial,
         };
 
-        store.inner.write().append(serialize(&entry)?)?;
+        store.inner.append(serialize(&entry)?)?;
         store.flush()?;
 
         assert_eq!(store.get(&sha256, data.len() as u64)?, None);
@@ -2304,9 +2361,10 @@ mod tests {
     #[test]
     fn test_full_chunked() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_full_chunked");
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_full_chunked");
 
-        let store = LfsIndexedLogBlobsStore::shared(dir.path(), &config)?;
+        let store = LfsIndexedLogBlobsStore::rotated(dir.path(), &config)?;
 
         let data = Bytes::from(&[1, 2, 3, 4, 5, 6, 7][..]);
         let sha256 = ContentHash::sha256(&data).unwrap_sha256();
@@ -2320,21 +2378,21 @@ mod tests {
             range: Range { start: 0, end: 1 },
             data: first,
         };
-        store.inner.write().append(serialize(&first_entry)?)?;
+        store.inner.append(serialize(&first_entry)?)?;
 
         let second_entry = LfsIndexedLogBlobsEntry {
             sha256: sha256.clone(),
             range: Range { start: 1, end: 4 },
             data: second,
         };
-        store.inner.write().append(serialize(&second_entry)?)?;
+        store.inner.append(serialize(&second_entry)?)?;
 
         let last_entry = LfsIndexedLogBlobsEntry {
             sha256: sha256.clone(),
             range: Range { start: 4, end: 7 },
             data: last,
         };
-        store.inner.write().append(serialize(&last_entry)?)?;
+        store.inner.append(serialize(&last_entry)?)?;
 
         store.flush()?;
 
@@ -2346,9 +2404,10 @@ mod tests {
     #[test]
     fn test_overlapped_chunked() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_overlapped_chunked");
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_overlapped_chunked");
 
-        let store = LfsIndexedLogBlobsStore::shared(dir.path(), &config)?;
+        let store = LfsIndexedLogBlobsStore::rotated(dir.path(), &config)?;
 
         let data = Bytes::from(&[1, 2, 3, 4, 5, 6, 7][..]);
         let sha256 = ContentHash::sha256(&data).unwrap_sha256();
@@ -2362,21 +2421,21 @@ mod tests {
             range: Range { start: 0, end: 4 },
             data: first,
         };
-        store.inner.write().append(serialize(&first_entry)?)?;
+        store.inner.append(serialize(&first_entry)?)?;
 
         let second_entry = LfsIndexedLogBlobsEntry {
             sha256: sha256.clone(),
             range: Range { start: 2, end: 3 },
             data: second,
         };
-        store.inner.write().append(serialize(&second_entry)?)?;
+        store.inner.append(serialize(&second_entry)?)?;
 
         let last_entry = LfsIndexedLogBlobsEntry {
             sha256: sha256.clone(),
             range: Range { start: 2, end: 7 },
             data: last,
         };
-        store.inner.write().append(serialize(&last_entry)?)?;
+        store.inner.append(serialize(&last_entry)?)?;
 
         store.flush()?;
 
@@ -2401,7 +2460,7 @@ mod tests {
             };
 
             let with_metadata = rebuild_metadata(data.clone(), &pointer);
-            let (without, copy) = strip_metadata(&with_metadata)?;
+            let (without, copy) = strip_hg_file_metadata(&with_metadata)?;
 
             Ok(data == without && copy == copy_from)
         }
@@ -2410,8 +2469,9 @@ mod tests {
     #[test]
     fn test_add_get_copyfrom() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_add_get_copyform");
-        let store = LfsStore::shared(&dir, &config)?;
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_add_get_copyform");
+        let store = LfsStore::rotated(&dir, &config)?;
 
         let k1 = key("a", "2");
         let delta = Delta {
@@ -2436,8 +2496,9 @@ mod tests {
     #[test]
     fn test_multiplexer_smaller_than_threshold() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_multiplexer_smaller_than_threshold");
-        let lfs = Arc::new(LfsStore::shared(&dir, &config)?);
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_multiplexer_smaller_than_threshold");
+        let lfs = Arc::new(LfsStore::rotated(&dir, &config)?);
 
         let dir = TempDir::new()?;
         let indexedlog_config = IndexedLogHgIdDataStoreConfig {
@@ -2446,10 +2507,11 @@ mod tests {
             max_bytes: None,
         };
         let indexedlog = Arc::new(IndexedLogHgIdDataStore::new(
+            &config,
             &dir,
             ExtStoredPolicy::Ignore,
             &indexedlog_config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?);
 
         let multiplexer = LfsMultiplexer::new(lfs, indexedlog.clone(), 10);
@@ -2473,8 +2535,9 @@ mod tests {
     #[test]
     fn test_multiplexer_larger_than_threshold() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_multiplexer_larger_than_threshold");
-        let lfs = Arc::new(LfsStore::shared(&dir, &config)?);
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_multiplexer_larger_than_threshold");
+        let lfs = Arc::new(LfsStore::rotated(&dir, &config)?);
 
         let dir = TempDir::new()?;
         let indexedlog_config = IndexedLogHgIdDataStoreConfig {
@@ -2483,10 +2546,11 @@ mod tests {
             max_bytes: None,
         };
         let indexedlog = Arc::new(IndexedLogHgIdDataStore::new(
+            &config,
             &dir,
             ExtStoredPolicy::Ignore,
             &indexedlog_config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?);
 
         let multiplexer = LfsMultiplexer::new(lfs, indexedlog.clone(), 4);
@@ -2510,8 +2574,9 @@ mod tests {
     #[test]
     fn test_multiplexer_add_pointer() -> Result<()> {
         let lfsdir = TempDir::new()?;
-        let config = make_lfs_config(&lfsdir, "test_multiplexer_add_pointer");
-        let lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &lfsdir, "test_multiplexer_add_pointer");
+        let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
 
         let dir = TempDir::new()?;
         let indexedlog_config = IndexedLogHgIdDataStoreConfig {
@@ -2520,10 +2585,11 @@ mod tests {
             max_bytes: None,
         };
         let indexedlog = Arc::new(IndexedLogHgIdDataStore::new(
+            &config,
             &dir,
             ExtStoredPolicy::Ignore,
             &indexedlog_config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?);
 
         let multiplexer = LfsMultiplexer::new(lfs, indexedlog.clone(), 4);
@@ -2565,8 +2631,8 @@ mod tests {
 
         multiplexer.flush()?;
 
-        let lfs = LfsStore::shared(&lfsdir, &config)?;
-        let entry = lfs.pointers.read().get(&k)?;
+        let lfs = LfsStore::rotated(&lfsdir, &config)?;
+        let entry = lfs.pointers.get(&k)?;
 
         assert!(entry.is_some());
 
@@ -2587,8 +2653,9 @@ mod tests {
     #[test]
     fn test_multiplexer_add_copy_from_pointer() -> Result<()> {
         let lfsdir = TempDir::new()?;
-        let config = make_lfs_config(&lfsdir, "test_multiplexer_add_copy_pointer");
-        let lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &lfsdir, "test_multiplexer_add_copy_pointer");
+        let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
 
         let dir = TempDir::new()?;
         let indexedlog_config = IndexedLogHgIdDataStoreConfig {
@@ -2597,10 +2664,11 @@ mod tests {
             max_bytes: None,
         };
         let indexedlog = Arc::new(IndexedLogHgIdDataStore::new(
+            &config,
             &dir,
             ExtStoredPolicy::Ignore,
             &indexedlog_config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?);
 
         let multiplexer = LfsMultiplexer::new(lfs, indexedlog.clone(), 4);
@@ -2645,8 +2713,8 @@ mod tests {
 
         multiplexer.flush()?;
 
-        let lfs = LfsStore::shared(&lfsdir, &config)?;
-        let entry = lfs.pointers.read().get(&k)?;
+        let lfs = LfsStore::rotated(&lfsdir, &config)?;
+        let entry = lfs.pointers.get(&k)?;
 
         assert!(entry.is_some());
 
@@ -2667,8 +2735,9 @@ mod tests {
     #[test]
     fn test_multiplexer_blob_with_header() -> Result<()> {
         let lfsdir = TempDir::new()?;
-        let config = make_lfs_config(&lfsdir, "test_multiplexer_blob_with_header");
-        let lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &lfsdir, "test_multiplexer_blob_with_header");
+        let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
 
         let dir = TempDir::new()?;
         let indexedlog_config = IndexedLogHgIdDataStoreConfig {
@@ -2677,10 +2746,11 @@ mod tests {
             max_bytes: None,
         };
         let indexedlog = Arc::new(IndexedLogHgIdDataStore::new(
+            &config,
             &dir,
             ExtStoredPolicy::Ignore,
             &indexedlog_config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?);
 
         let blob = Bytes::from(&b"\x01\nTHIS IS A BLOB WITH A HEADER"[..]);
@@ -2726,7 +2796,6 @@ mod tests {
         use std::sync::atomic::AtomicBool;
 
         #[cfg(fbcode_build)]
-        use mockito::mock;
         use parking_lot::Mutex;
 
         use super::*;
@@ -2763,14 +2832,15 @@ mod tests {
             let sentinel = Sentinel::new();
             let cachedir = TempDir::new()?;
             let lfsdir = TempDir::new()?;
-            let config = make_lfs_config(&cachedir, "test_lfs_proxy_non_present");
+            let mut server = mockito::Server::new();
+            let config = make_lfs_config(&server, &cachedir, "test_lfs_proxy_non_present");
 
             let blob = &example_blob();
-            let _m1 = get_lfs_batch_mock(200, &[blob]);
+            let _m1 = get_lfs_batch_mock(&mut server, 200, &[blob]);
 
-            let _m2 = get_lfs_download_mock(200, blob);
+            let _m2 = get_lfs_download_mock(&mut server, 200, blob);
 
-            let lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
+            let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
             let remote = LfsRemote::new(lfs, None, &config)?;
 
             let objs = [(blob.sha, blob.size)]
@@ -2790,11 +2860,12 @@ mod tests {
 
             let cachedir = TempDir::new()?;
             let lfsdir = TempDir::new()?;
-            let config = make_lfs_config(&cachedir, "test_lfs_proxy_no_http");
+            let server = mockito::Server::new();
+            let config = make_lfs_config(&server, &cachedir, "test_lfs_proxy_no_http");
 
             set_var("https_proxy", "fwdproxy:8082");
 
-            let lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
+            let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
             let remote = LfsRemote::new(lfs, None, &config)?;
 
             let blob = example_blob();
@@ -2817,11 +2888,12 @@ mod tests {
 
             let cachedir = TempDir::new()?;
             let lfsdir = TempDir::new()?;
-            let config = make_lfs_config(&cachedir, "test_lfs_proxy_http");
+            let server = mockito::Server::new();
+            let config = make_lfs_config(&server, &cachedir, "test_lfs_proxy_http");
 
             set_var("https_proxy", "http://fwdproxy:8082");
 
-            let lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
+            let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
             let remote = LfsRemote::new(lfs, None, &config)?;
 
             let blob = example_blob();
@@ -2842,17 +2914,18 @@ mod tests {
             let sentinel = Sentinel::new();
             let cachedir = TempDir::new()?;
             let lfsdir = TempDir::new()?;
-            let config = make_lfs_config(&cachedir, "test_lfs_no_proxy");
+            let mut server = mockito::Server::new();
+            let config = make_lfs_config(&server, &cachedir, "test_lfs_no_proxy");
 
             let blob = &example_blob();
-            let _m1 = get_lfs_batch_mock(200, &[blob]);
+            let _m1 = get_lfs_batch_mock(&mut server, 200, &[blob]);
 
-            let _m2 = get_lfs_download_mock(200, blob);
+            let _m2 = get_lfs_download_mock(&mut server, 200, blob);
 
             set_var("http_proxy", "http://shouldnt-touch-this:8082");
             set_var("NO_PROXY", "localhost,127.0.0.1");
 
-            let lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
+            let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
             let remote = LfsRemote::new(lfs, None, &config)?;
 
             let objs = [(blob.sha, blob.size)]
@@ -2865,7 +2938,11 @@ mod tests {
             Ok(())
         }
 
-        fn test_download<C>(configure: C, blobs: &[&TestBlob]) -> Result<()>
+        fn test_download<C>(
+            server: &mut mockito::ServerGuard,
+            configure: C,
+            blobs: &[&TestBlob],
+        ) -> Result<()>
         where
             C: for<'a> FnOnce(&'a mut BTreeMap<String, String>),
         {
@@ -2873,14 +2950,14 @@ mod tests {
 
             let cachedir = TempDir::new()?;
             let lfsdir = TempDir::new()?;
-            let mut config = make_lfs_config(&cachedir, "test_download");
+            let mut config = make_lfs_config(server, &cachedir, "test_download");
             configure(&mut config);
-            let lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
+            let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
             let remote = LfsRemote::new(lfs, None, &config)?;
 
             let _mocks: Vec<_> = blobs
                 .iter()
-                .map(|b| get_lfs_download_mock(200, b))
+                .map(|b| get_lfs_download_mock(server, 200, b))
                 .collect();
 
             let objs = [
@@ -2925,9 +3002,11 @@ mod tests {
 
             let blobs = vec![&b1, &b2, &b3];
 
-            let _m1 = get_lfs_batch_mock(200, &blobs);
+            let mut server = mockito::Server::new();
+            let _m1 = get_lfs_batch_mock(&mut server, 200, &blobs);
 
             test_download(
+                &mut server,
                 |config| setconfig(config, "lfs", "http-version", "1.1"),
                 &blobs,
             )
@@ -2945,9 +3024,11 @@ mod tests {
 
             let blobs = vec![&b1, &b2, &b3];
 
-            let _m1 = get_lfs_batch_mock(200, &blobs);
+            let mut server = mockito::Server::new();
+            let _m1 = get_lfs_batch_mock(&mut server, 200, &blobs);
 
             test_download(
+                &mut server,
                 |config| setconfig(config, "lfs", "http-version", "2"),
                 &blobs,
             )
@@ -2964,9 +3045,11 @@ mod tests {
             let b3 = nonexistent_blob();
             let blobs = vec![&blob1, &blob2, &b3];
 
-            let _m1 = get_lfs_batch_mock(200, &blobs);
+            let mut server = mockito::Server::new();
+            let _m1 = get_lfs_batch_mock(&mut server, 200, &blobs);
 
             test_download(
+                &mut server,
                 |config| {
                     setconfig(config, "lfs", "download-chunk-size", "3");
                 },
@@ -2980,10 +3063,11 @@ mod tests {
 
             let cachedir = TempDir::new()?;
             let lfsdir = TempDir::new()?;
-            let mut config = make_lfs_config(&cachedir, "test_lfs_invalid_http");
+            let server = mockito::Server::new();
+            let mut config = make_lfs_config(&server, &cachedir, "test_lfs_invalid_http");
             setconfig(&mut config, "lfs", "http-version", "3");
 
-            let lfs = Arc::new(LfsStore::shared(&lfsdir, &config).unwrap());
+            let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config).unwrap());
             let result = LfsRemote::new(lfs, None, &config);
 
             assert!(result.is_err());
@@ -2997,11 +3081,12 @@ mod tests {
 
             let cachedir = TempDir::new()?;
             let lfsdir = TempDir::new()?;
-            let mut config = make_lfs_config(&cachedir, "test_lfs_request_timeout");
+            let server = mockito::Server::new();
+            let mut config = make_lfs_config(&server, &cachedir, "test_lfs_request_timeout");
 
             setconfig(&mut config, "lfs", "requesttimeout", "0");
 
-            let lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
+            let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
             let remote = LfsRemote::new(lfs, None, &config)?;
 
             let blob = (
@@ -3025,14 +3110,15 @@ mod tests {
 
             let cachedir = TempDir::new()?;
             let lfsdir = TempDir::new()?;
-            let config = make_lfs_config(&cachedir, "test_lfs_remote_datastore");
+            let mut server = mockito::Server::new();
+            let config = make_lfs_config(&server, &cachedir, "test_lfs_remote_datastore");
 
             let blob = &example_blob();
 
-            let _m1 = get_lfs_batch_mock(200, &[blob]);
-            let _m2 = get_lfs_download_mock(200, blob);
+            let _m1 = get_lfs_batch_mock(&mut server, 200, &[blob]);
+            let _m2 = get_lfs_download_mock(&mut server, 200, blob);
 
-            let lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
+            let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
             let remote = Arc::new(LfsRemote::new(lfs.clone(), None, &config)?);
 
             let key = key("a/b", "1234");
@@ -3049,7 +3135,7 @@ mod tests {
             };
 
             // Populate the pointer store. Usually, this would be done via a previous remotestore call.
-            lfs.pointers.write().add(pointer)?;
+            lfs.pointers.add(pointer)?;
 
             let remotedatastore = remote.datastore(lfs);
 
@@ -3075,23 +3161,25 @@ mod tests {
 
             let cachedir = TempDir::new()?;
             let lfsdir = TempDir::new()?;
-            let mut config = make_lfs_config(&cachedir, "test_lfs_redacted");
+            let mut server = mockito::Server::new();
+            let mut config = make_lfs_config(&server, &cachedir, "test_lfs_redacted");
             setconfig(
                 &mut config,
                 "lfs",
                 "url",
-                &[mockito::server_url(), "/repo".to_string()].concat(),
+                &[server.url(), "/repo".to_string()].concat(),
             );
 
             let blob = &example_blob();
 
-            let _m1 = get_lfs_batch_mock(200, &[blob]);
+            let _m1 = get_lfs_batch_mock(&mut server, 200, &[blob]);
 
-            let _m2 = mock("GET", format!("/repo/download/{}", blob.oid).as_str())
+            let _m2 = server
+                .mock("GET", format!("/repo/download/{}", blob.oid).as_str())
                 .with_status(410)
                 .create();
 
-            let lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
+            let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
             let remote = LfsRemote::new(lfs, None, &config)?;
 
             let objs = [(blob.sha, blob.size)]
@@ -3116,10 +3204,11 @@ mod tests {
         let _env_lock = crate::env_lock();
 
         let cachedir = TempDir::new()?;
-        let mut config = make_lfs_config(&cachedir, "test_lfs_remote_file");
+        let server = mockito::Server::new();
+        let mut config = make_lfs_config(&server, &cachedir, "test_lfs_remote_file");
 
         let lfsdir = TempDir::new()?;
-        let lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
+        let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
 
         let remote = TempDir::new()?;
         let remote_lfs_file_store = LfsBlobsStore::Loose(remote.path().to_path_buf(), false);
@@ -3175,11 +3264,12 @@ mod tests {
         let _env_lock = crate::env_lock();
 
         let cachedir = TempDir::new()?;
-        let mut config = make_lfs_config(&cachedir, "test_lfs_upload_remote_file");
+        let server = mockito::Server::new();
+        let mut config = make_lfs_config(&server, &cachedir, "test_lfs_upload_remote_file");
 
         let lfsdir = TempDir::new()?;
-        let shared_lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
-        let local_lfs = Arc::new(LfsStore::local(&lfsdir, &config)?);
+        let shared_lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
+        let local_lfs = Arc::new(LfsStore::permanent(&lfsdir, &config)?);
 
         let remote_dir = TempDir::new()?;
         let remote_lfs_file_store = LfsBlobsStore::Loose(remote_dir.path().to_path_buf(), false);
@@ -3231,11 +3321,12 @@ mod tests {
         let _env_lock = crate::env_lock();
 
         let cachedir = TempDir::new()?;
-        let mut config = make_lfs_config(&cachedir, "test_lfs_upload_move_to_shared");
+        let server = mockito::Server::new();
+        let mut config = make_lfs_config(&server, &cachedir, "test_lfs_upload_move_to_shared");
 
         let lfsdir = TempDir::new()?;
-        let shared_lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
-        let local_lfs = Arc::new(LfsStore::local(&lfsdir, &config)?);
+        let shared_lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
+        let local_lfs = Arc::new(LfsStore::permanent(&lfsdir, &config)?);
 
         let k1 = key("a", "2");
         let delta = Delta {
@@ -3271,8 +3362,9 @@ mod tests {
     #[test]
     fn test_blob() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_blob");
-        let store = LfsStore::shared(&dir, &config)?;
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_blob");
+        let store = LfsStore::rotated(&dir, &config)?;
 
         let data = Bytes::from(&[1, 2, 3, 4][..]);
         let k1 = key("a", "2");
@@ -3293,8 +3385,9 @@ mod tests {
     #[test]
     fn test_metadata() -> Result<()> {
         let dir = TempDir::new()?;
-        let config = make_lfs_config(&dir, "test_metadata");
-        let store = LfsStore::shared(&dir, &config)?;
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &dir, "test_metadata");
+        let store = LfsStore::rotated(&dir, &config)?;
 
         let k1 = key("a", "2");
         let data = Bytes::from(&[1, 2, 3, 4][..]);
@@ -3324,15 +3417,17 @@ mod tests {
     fn test_lfs_skips_server_for_empty_batch() -> Result<()> {
         let cachedir = TempDir::new()?;
         let lfsdir = TempDir::new()?;
-        let mut config = make_lfs_config(&cachedir, "test_lfs_skips_server_for_empty_batch");
+        let server = mockito::Server::new();
+        let mut config =
+            make_lfs_config(&server, &cachedir, "test_lfs_skips_server_for_empty_batch");
 
-        let store = Arc::new(LfsStore::local(&lfsdir, &config)?);
+        let store = Arc::new(LfsStore::permanent(&lfsdir, &config)?);
 
         // 192.0.2.0 won't be routable, since that's TEST-NET-1. This test will fail if we attempt
         // to connect.
         setconfig(&mut config, "lfs", "url", "http://192.0.2.0/");
 
-        let lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
+        let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
         let remote = Arc::new(LfsRemote::new(lfs, None, &config)?);
 
         let resp = remote.datastore(store).prefetch(&[]);
@@ -3394,18 +3489,19 @@ mod tests {
                 backoff_config.split(',').count() + 1
             };
 
-            let m1 = get_lfs_batch_mock(200, &blobs).expect(1);
-            let m2 = get_lfs_download_mock(408, &blob1)
+            let mut server = mockito::Server::new();
+            let m1 = get_lfs_batch_mock(&mut server, 200, &blobs).expect(1);
+            let m2 = get_lfs_download_mock(&mut server, 408, &blob1)
                 .pop()
                 .unwrap()
                 .expect(req_count);
             let cachedir = TempDir::new()?;
-            let mut config = make_lfs_config(&cachedir, "test_download");
+            let mut config = make_lfs_config(&server, &cachedir, "test_download");
 
             setconfig(&mut config, "lfs", "backofftimes", backoff_config);
 
             let lfsdir = TempDir::new()?;
-            let lfs = Arc::new(LfsStore::shared(&lfsdir, &config)?);
+            let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
             let remote = LfsRemote::new(lfs, None, &config)?;
             let objs = [(blobs[0].sha, blobs[0].size)]
                 .iter()

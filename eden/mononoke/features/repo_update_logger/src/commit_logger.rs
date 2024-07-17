@@ -16,10 +16,9 @@ use async_trait::async_trait;
 use blobstore::Loadable;
 use bookmarks_types::BookmarkKey;
 use bookmarks_types::BookmarkKind;
-use changeset_fetcher::ChangesetFetcherRef;
-use changesets::ChangesetsRef;
 use chrono::DateTime;
 use chrono::Utc;
+use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use ephemeral_blobstore::BubbleId;
 use futures::stream;
@@ -42,6 +41,7 @@ use serde_derive::Serialize;
 #[cfg(fbcode_build)]
 use whence_logged::WhenceScribeLogged;
 
+#[derive(Debug)]
 pub struct CommitInfo {
     changeset_id: ChangesetId,
     bubble_id: Option<NonZeroU64>,
@@ -88,6 +88,7 @@ fn extract_differential_revision(message: &str) -> Option<&str> {
     Some(RE.captures(message)?.get(1)?.as_str())
 }
 
+#[derive(Debug)]
 pub struct ChangedFilesInfo {
     changed_files_count: u64,
     changed_files_size: u64,
@@ -146,7 +147,7 @@ struct PlainCommitInfo {
 impl PlainCommitInfo {
     async fn new(
         ctx: &CoreContext,
-        repo: &(impl ChangesetsRef + RepoIdentityRef),
+        repo: &(impl CommitGraphRef + RepoIdentityRef),
         received_timestamp: DateTime<Utc>,
         bookmark: Option<(&BookmarkKey, BookmarkKind)>,
         commit_info: CommitInfo,
@@ -163,13 +164,15 @@ impl PlainCommitInfo {
         } = commit_info;
         let repo_id = repo.repo_identity().id().id();
         let repo_name = repo.repo_identity().name().to_string();
-        let cs = repo
-            .changesets()
-            .get(ctx, changeset_id)
+        let parents = repo
+            .commit_graph()
+            .changeset_parents(ctx, changeset_id)
             .await?
-            .ok_or_else(|| anyhow!("Changeset not found: {}", changeset_id))?;
-        let parents = cs.parents;
-        let generation = Generation::new(cs.gen);
+            .to_vec();
+        let generation = repo
+            .commit_graph()
+            .changeset_generation(ctx, changeset_id)
+            .await?;
         let user_unix_name = ctx.metadata().unix_name().map(|un| un.to_string());
         let user_identities = ctx.metadata().identities().clone();
         let source_hostname = ctx.metadata().client_hostname().map(|hn| hn.to_string());
@@ -179,7 +182,7 @@ impl PlainCommitInfo {
 
         let (mut pusher_correlator, mut pusher_entry_point, mut pusher_main_id) =
             (None, None, None);
-        if let Some(cri) = ctx.metadata().client_request_info() {
+        if let Some(cri) = ctx.client_request_info() {
             pusher_correlator = Some(cri.correlator.clone());
             pusher_entry_point = Some(cri.entry_point.to_string());
             pusher_main_id = cri.main_id.clone();
@@ -267,7 +270,7 @@ impl Loggable for PlainCommitInfo {
 
 pub async fn log_new_commits(
     ctx: &CoreContext,
-    repo: &(impl RepoIdentityRef + ChangesetsRef + RepoConfigRef),
+    repo: &(impl RepoIdentityRef + CommitGraphRef + RepoConfigRef),
     bookmark: Option<(&BookmarkKey, BookmarkKind)>,
     commit_infos: Vec<CommitInfo>,
 ) {
@@ -308,7 +311,7 @@ pub async fn log_new_commits(
 
 pub async fn log_new_bonsai_changesets(
     ctx: &CoreContext,
-    repo: &(impl RepoIdentityRef + ChangesetsRef + RepoConfigRef),
+    repo: &(impl RepoIdentityRef + CommitGraphRef + RepoConfigRef),
     bookmark: &BookmarkKey,
     kind: BookmarkKind,
     commits_to_log: Vec<BonsaiChangeset>,
@@ -330,7 +333,7 @@ pub async fn log_new_bonsai_changesets(
 /// once when they're actually created, second time when they become public.
 pub async fn find_draft_ancestors(
     ctx: &CoreContext,
-    repo: &(impl RepoIdentityRef + RepoConfigRef + PhasesRef + ChangesetFetcherRef + RepoBlobstoreRef),
+    repo: &(impl RepoIdentityRef + RepoConfigRef + PhasesRef + CommitGraphRef + RepoBlobstoreRef),
     to_cs_id: ChangesetId,
 ) -> Result<Vec<BonsaiChangeset>, Error> {
     ctx.scuba()
@@ -354,7 +357,7 @@ pub async fn find_draft_ancestors(
         }
         drafts.push(cs_id);
 
-        let parents = repo.changeset_fetcher().get_parents(ctx, cs_id).await?;
+        let parents = repo.commit_graph().changeset_parents(ctx, cs_id).await?;
         for p in parents {
             if visited.insert(p) {
                 queue.push_back(p);

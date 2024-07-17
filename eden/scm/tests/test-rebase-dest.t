@@ -1,3 +1,6 @@
+
+#require no-eden
+
 #chg-compatible
   $ eagerepo
   $ setconfig experimental.allowfilepeer=True
@@ -16,17 +19,19 @@ Require a destination
   $ echo c >> c
   $ hg commit -qAm cc
   $ hg rebase
-  abort: you must specify a destination
-  (use: hg rebase -d REV)
+  abort: you must specify a destination (-d) for the rebase
   [255]
   $ hg rebase -d 'desc(bb)'
   rebasing 5db65b93a12b "cc"
   $ hg rebase -d 'desc(aa)' -r . -q
   $ HGPLAIN=1 hg rebase
-  rebasing 889b0bc6a730 "cc"
+  abort: you must specify a destination (-d) for the rebase
+  [255]
   $ hg rebase -d 'desc(aa)' -r . -q
   $ hg --config commands.rebase.requiredest=False rebase
-  rebasing 279de9495438 "cc"
+  abort: you must specify a destination (-d) for the rebase
+  [255]
+  $ hg rebase -d 'desc(bb)' -r . -q
 
 Requiring dest should not break continue or other rebase options
   $ hg up 'desc(bb)' -q
@@ -66,40 +71,14 @@ Check rebase.requiredest interaction with pull --rebase
   $ echo f > f
   $ hg commit -qAm ff
   $ hg pull --rebase
-  abort: rebase destination required by configuration
-  (use hg pull followed by hg rebase -d DEST)
+  abort: missing rebase destination - supply --dest / -d
   [255]
 
 Setup rebase with multiple destinations
 
   $ cd $TESTTMP
 
-  $ cat >> $TESTTMP/maprevset.py <<EOF
-  > from __future__ import absolute_import
-  > from sapling import registrar, revset, revsetlang, smartset
-  > revsetpredicate = registrar.revsetpredicate()
-  > cache = {}
-  > @revsetpredicate('map')
-  > def map(repo, subset, x):
-  >     """(set, mapping)"""
-  >     setarg, maparg = revsetlang.getargs(x, 2, 2, '')
-  >     rset = revset.getset(repo, smartset.fullreposet(repo), setarg)
-  >     mapstr = revsetlang.getstring(maparg, '')
-  >     map = dict(a.split(':') for a in mapstr.split(','))
-  >     rev = rset.first()
-  >     desc = repo[rev].description()
-  >     newdesc = map.get(desc)
-  >     if newdesc == 'null':
-  >         revs = [-1]
-  >     else:
-  >         query = revsetlang.formatspec('desc(%s)', newdesc)
-  >         revs = repo.revs(query)
-  >     return smartset.baseset(revs, repo=repo)
-  > EOF
-
   $ setglobalconfig ui.allowemptycommit=1 phases.publish=false
-  $ setglobalconfig experimental.evolution=true
-  $ setglobalconfig extensions.maprevset="$TESTTMP/maprevset.py"
   $ readglobalconfig <<EOF
   > [alias]
   > tglog = log -G --template "{node|short} {desc} {instabilities}" -r 'sort(all(), topo)'
@@ -284,7 +263,7 @@ Move to a previous parent:
   
 Source overlaps with destination:
 
-  $ rebasewithdag -s 'B+C+D' -d 'map(SRC, "B:C,C:D")' <<'EOS'
+  $ rebasewithdag -r B -d C -r C -d D <<'EOS'
   > B C D
   >  \|/
   >   A
@@ -301,7 +280,7 @@ Source overlaps with destination:
   
 Detect cycles early:
 
-  $ rebasewithdag -r 'all()-Z' -d 'map(SRC, "A:B,B:C,C:D,D:B")' <<'EOS'
+  $ rebasewithdag -r A -d B -r B -d C -r C -d D -r D -d B <<'EOS'
   > A B C
   >  \|/
   >   | D
@@ -313,7 +292,7 @@ Detect cycles early:
 
 Detect source is ancestor of dest in runtime:
 
-  $ rebasewithdag -r 'C+B' -d 'map(SRC, "C:B,B:D")' -q <<'EOS'
+  $ rebasewithdag -r C -d B -r B -d D -q <<'EOS'
   >   D
   >   |
   > B C
@@ -322,6 +301,30 @@ Detect source is ancestor of dest in runtime:
   > EOS
   abort: source is ancestor of destination
   [255]
+
+Multiple revs in a single `-r` with multiple `-d`s:
+
+  $ rebasewithdag -r B+C -d F -r D+E -d G -q <<'EOS'
+  > C E G
+  > | | |
+  > B D F
+  >  \|/
+  >   A
+  > EOS
+  o  872b42428f04 'E'
+  │
+  o  7179160121a5 'D'
+  │
+  │ o  da73d8827d0d 'C'
+  │ │
+  │ o  050c10d2df5a 'B'
+  │ │
+  o │  051cf22dff5c 'G'
+  ├─╯
+  o  8908a377a434 'F'
+  │
+  o  426bada5c675 'A'
+  
 
 "Already rebased" fast path still works:
 
@@ -351,7 +354,7 @@ Detect source is ancestor of dest in runtime:
   
 Massively rewrite the DAG:
 
-  $ rebasewithdag -r 'all()' -d 'map(SRC, "A:I,I:null,H:A,B:J,J:C,C:H,D:E,F:G,G:K,K:D,E:B")' <<'EOS'
+  $ rebasewithdag -r A -d I -r I -d null -r H -d A -r B -d J -r J -d C -r C -d H -r D -d E -r F -d G -r G -d K -r K -d D -r E -d B <<'EOS'
   > D G K
   > | | |
   > C F J

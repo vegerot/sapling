@@ -23,11 +23,148 @@
 
 from __future__ import absolute_import
 
-from typing import List, Tuple
+import functools
+import hashlib
+from contextlib import contextmanager
+from typing import List, Optional, Tuple
 
-from . import error, mdiff, pycompat, util
+from bindings import clientinfo
+
+from . import error, match, mdiff, pycompat, util
 from .i18n import _
 from .pycompat import range
+
+_DEFAULT_CACHE_SIZE = 10000
+_automerge_cache = util.lrucachedict(_DEFAULT_CACHE_SIZE)
+_automerge_prompt_msg = _(
+    "%(conflict)s\n"
+    "Above conflict can be resolved automatically "
+    "(see '@prog@ help automerge' for details):\n"
+    "<<<<<<< automerge algorithm yields:\n"
+    " %(merged_lines)s"
+    ">>>>>>>\n"
+    "Accept this resolution?\n"
+    "(a)ccept it, (r)eject it, or review it in (f)ile:"
+    "$$ &Accept $$ &Reject $$ &File"
+)
+
+
+class AutomergeSummary:
+    def __init__(self):
+        self.spans = []
+
+    def add(self, start, length):
+        self.spans.append((start, start + length))
+
+    def summary(self) -> Optional[str]:
+        def span_str(span):
+            s, e = span
+            return str(e) if s + 1 == e else f"{s+1}-{e}"
+
+        if not self.spans:
+            return None
+
+        lines = ",".join(span_str(s) for s in self.spans)
+        if "-" in lines:
+            msg = _(" lines %s have been resolved by automerge algorithms\n") % (lines)
+        else:
+            msg = _(" line %s has been resolved by automerge algorithms\n") % (lines)
+        return msg
+
+
+class AutomergeMetrics:
+    def __init__(self):
+        # config
+        self.mode = None
+        self.merge_algos = None
+        self.disable_for_noninteractive = None
+        self.interactive = None
+        self.repo = None
+
+        # derived metrics from config
+        self.enabled = 0
+
+        # conflicts can be automerged
+        self.total = 0
+        self.accepted = 0
+        self.rejected = 0
+        self.review_in_file = 0
+
+        # conflicts that can't be resolved by traditional merge algorithm
+        self.conflicts = 0
+
+        # rebase metrics
+        self.duration = 0
+        self.has_exception = 0
+        self.local_commit = None
+        self.base_commit = None
+        self.other_commit = None
+        self.base_filepath = None
+
+        # command metrics
+        self.command = None
+        self.client_correlator = None
+
+    @classmethod
+    def init_from_ui(cls, ui, repo_name):
+        obj = cls()
+        obj.mode = ui.config("automerge", "mode")
+        obj.merge_algos = ",".join(get_enabled_automerge_algos(ui))
+        obj.disable_for_noninteractive = ui.config(
+            "automerge", "disable-for-noninteractive"
+        )
+        obj.interactive = ui.interactive()
+        obj.repo = repo_name
+
+        obj.command = ui.cmdname
+        obj.client_correlator = clientinfo.get_client_request_info()["correlator"]
+        return obj
+
+    def to_dict(self):
+        metrics = {}
+        for key, value in self.__dict__.items():
+            if value is not None:
+                key = f"automerge_{key}"
+                metrics[key] = value
+        return metrics
+
+    def set_commits(self, localctx, basectx, otherctx):
+        def get_hex(fctx):
+            ctx = fctx.changectx()
+            return ctx.hex() if ctx.node() else ctx.p1().hex()
+
+        self.local_commit = get_hex(localctx)
+        self.base_commit = get_hex(basectx)
+        self.other_commit = get_hex(otherctx)
+        self.base_filepath = basectx.path()
+
+
+_automerge_metrics = AutomergeMetrics()
+
+
+@contextmanager
+def managed_merge_resource(ui, repo_name):
+    global _automerge_cache
+    global _automerge_metrics
+
+    _automerge_metrics = AutomergeMetrics.init_from_ui(ui, repo_name)
+    start_time_ms = int(util.timer() * 1000)
+    try:
+        yield
+    except Exception:
+        _automerge_metrics.has_exception = 1
+        raise
+    finally:
+        # clear cache when exiting
+        size = ui.configint("automerge", "cache-size", _DEFAULT_CACHE_SIZE)
+        _automerge_cache = util.lrucachedict(size)
+
+        # log metrics
+        end_time_ms = int(util.timer() * 1000)
+        _automerge_metrics.duration = end_time_ms - start_time_ms
+
+        metrics = _automerge_metrics.to_dict()
+        ui.log("merge_conflicts", **metrics)
 
 
 def intersect(ra, rb):
@@ -63,24 +200,14 @@ def compare_range(a, astart, aend, b, bstart, bend):
     return True
 
 
+### automerge algorithms
+
+
 class CantShowWordConflicts(Exception):
     pass
 
 
-class wordmergemode:
-    enforced = "enforced"  # Enforced word merge. Cannot draw conflict regions.
-    ondemand = "ondemand"  # Try line merge first. Only use word merge if it can solve conflicts.
-    disabled = "disabled"  # Do not ever attempt to do word merge.
-
-    @classmethod
-    def fromui(cls, ui):
-        if ui.configbool("merge", "word-merge"):
-            return cls.ondemand
-        else:
-            return cls.disabled
-
-
-def trywordmerge(base_lines, a_lines, b_lines):
+def automerge_wordmerge(m3, base_lines, a_lines, b_lines) -> Optional[List[bytes]]:
     """Try resolve conflicts using wordmerge.
     Return resolved lines, or None if merge failed.
     """
@@ -88,11 +215,147 @@ def trywordmerge(base_lines, a_lines, b_lines):
     atext = b"".join(a_lines)
     btext = b"".join(b_lines)
     try:
-        m3 = Merge3Text(basetext, atext, btext, wordmerge=wordmergemode.enforced)
-        text = b"".join(render_minimized(m3)[0])
+        m3_word = Merge3Text(basetext, atext, btext, in_wordmerge=True)
+        text = b"".join(render_minimized(m3_word)[0])
         return text.splitlines(True)
     except CantShowWordConflicts:
         return None
+
+
+def automerge_sort_inserts(m3, base_lines, a_lines, b_lines) -> Optional[List[bytes]]:
+    """This algorithm tries to resolve conflicts caused by insertions
+    on both sides (e.g.: import insertions)."""
+    if base_lines or not m3.file_type:
+        return None
+
+    key = f"import-pattern:{m3.file_type}"
+    pattern = m3.ui.config("automerge", key)
+    if not pattern:
+        return None
+    matchfn = util.cachedbytesmatcher(pattern.encode())
+    if all(matchfn(line) for line in a_lines) and all(
+        matchfn(line) for line in b_lines
+    ):
+        merged_lines = sorted(set(a_lines + b_lines))
+        return merged_lines
+
+    return None
+
+
+def automerge_adjacent_changes(
+    m3, base_lines, a_lines, b_lines
+) -> Optional[List[bytes]]:
+    # require something to be changed
+    if not base_lines:
+        return None
+
+    ablocks = unmatching_blocks(base_lines, a_lines)
+    bblocks = unmatching_blocks(base_lines, b_lines)
+
+    k = 0
+    indexes = [0, 0]
+    merged_lines = []
+    A, B, BASE = range(3)
+    while indexes[A] < len(ablocks) and indexes[B] < len(bblocks):
+        ablock, bblock = ablocks[indexes[A]], bblocks[indexes[B]]
+        if is_overlap(ablock[0], ablock[1], bblock[0], bblock[1]):
+            return None
+        elif is_non_unique_separator_for_insertion(
+            base_lines, a_lines, b_lines, ablock, bblock
+        ):
+            return None
+
+        i, block, lines = (
+            (A, ablock, a_lines) if ablock[0] < bblock[0] else (B, bblock, b_lines)
+        )
+        # add base lines before the block
+        while k < block[0]:
+            merged_lines.append(base_lines[k])
+            k += 1
+        # skip base lines being deleted
+        k += block[1] - block[0]
+        # add new lines from the block
+        merged_lines.extend(lines[block[2] : block[3]])
+
+        indexes[i] += 1
+
+    if indexes[A] < len(ablocks):
+        blocks, index, lines = ablocks, indexes[A], a_lines
+    else:
+        blocks, index, lines = bblocks, indexes[B], b_lines
+
+    while index < len(blocks):
+        block = blocks[index]
+        index += 1
+
+        while k < block[0]:
+            merged_lines.append(base_lines[k])
+            k += 1
+        k += block[1] - block[0]
+        merged_lines.extend(lines[block[2] : block[3]])
+
+    # add base lines at the end of block
+    merged_lines.extend(base_lines[k:])
+
+    return merged_lines
+
+
+def automerge_subset_changes(m3, base_lines, a_lines, b_lines) -> Optional[List[bytes]]:
+    if base_lines:
+        return None
+    if len(a_lines) > len(b_lines):
+        return automerge_subset_changes(m3, base_lines, b_lines, a_lines)
+    if is_sub_list(a_lines, b_lines):
+        return b_lines
+
+
+def is_non_unique_separator_for_insertion(
+    base_lines, a_lines, b_lines, ablock, bblock
+) -> bool:
+    # no insertion on both sides
+    if not (ablock[0] == bblock[0] or ablock[1] == bblock[1]):
+        return False
+
+    if ablock[1] <= bblock[0]:
+        base_start, base_end = ablock[1], bblock[0]
+    else:
+        base_start, base_end = bblock[1], ablock[0]
+
+    if base_start <= base_end:
+        # empty is a subset of any list
+        return True
+
+    base_list = base_lines[base_start:base_end]
+    a_list = a_lines[ablock[3] : ablock[4]]
+    b_list = b_lines[bblock[3] : bblock[4]]
+    return is_sub_list(base_list, a_list) or is_sub_list(base_list, b_list)
+
+
+def is_sub_list(list1, list2):
+    "check if list1 is a sublist of list2"
+    # PERF: might be able to use rolling hash to optimize the time complexity
+    len1, len2 = len(list1), len(list2)
+    if len1 > len2:
+        return False
+    for i in range(len2 - len1 + 1):
+        if list1 == list2[i : i + len1]:
+            return True
+    return False
+
+
+def unmatching_blocks(lines1, lines2):
+    """Produce unmatching blocks, in (a1, a2, b1, b2) format.
+
+    `lines1[a1:a2]` unmatches `lines2[b1:b2]`.
+    """
+    text1 = b"".join(lines1)
+    text2 = b"".join(lines2)
+    blocks = mdiff.allblocks(text1, text2, lines1=lines1, lines2=lines2)
+    return [b[0] for b in blocks if b[1] == "!"]
+
+
+def is_overlap(s1, e1, s2, e2):
+    return not (s1 >= e2 or s2 >= e1)
 
 
 def splitwordswithoutemptylines(text):
@@ -116,29 +379,85 @@ def splitwordswithoutemptylines(text):
     return result
 
 
+AUTOMERGE_ALGORITHMS = {
+    "word-merge": automerge_wordmerge,
+    "adjacent-changes": automerge_adjacent_changes,
+    "subset-changes": automerge_subset_changes,
+    "sort-inserts": automerge_sort_inserts,
+}
+
+
+def get_enabled_automerge_algos(ui):
+    result = []
+    automerge_algos = ui.configlist("automerge", "merge-algos")
+    for name in AUTOMERGE_ALGORITHMS:
+        if name in automerge_algos or ui.configbool("automerge", f"{name}.enable"):
+            result.append(name)
+    return result
+
+
 class Merge3Text:
     """3-way merge of texts.
 
     Given strings BASE, OTHER, THIS, tries to produce a combined text
     incorporating the changes from both BASE->OTHER and BASE->THIS."""
 
-    def __init__(self, basetext, atext, btext, wordmerge=wordmergemode.disabled):
+    def __init__(
+        self,
+        basetext,
+        atext,
+        btext,
+        ui=None,
+        in_wordmerge=False,
+        premerge=False,
+        file_path=None,
+    ):
+        self.in_wordmerge = in_wordmerge
+
+        # ui is used for (1) getting automerge configs; (2) prompt choices
+        self.ui = ui
+        self.automerge_fns = {}
+        self.automerge_mode = ""
+        self.init_automerge_fields(ui)
+        self.premerge = premerge
+        self.file_path = file_path
+
+        if in_wordmerge and self.automerge_fns:
+            raise error.Abort(
+                _("word-level merge does not support automerge algorithms")
+            )
+
         self.basetext = basetext
         self.atext = atext
         self.btext = btext
-        if wordmerge is wordmergemode.enforced:
-            split = splitwordswithoutemptylines
-        else:
-            split = mdiff.splitnewlines
+
+        split = (
+            splitwordswithoutemptylines if self.in_wordmerge else mdiff.splitnewlines
+        )
         self.base = split(basetext)
         self.a = split(atext)
         self.b = split(btext)
-        self.wordmerge = wordmerge
-        self.automerge_fns = (
-            [trywordmerge] if wordmerge == wordmergemode.ondemand else []
-        )
 
-    def merge_groups(self, automerge=False):
+    def init_automerge_fields(self, ui):
+        if not ui:
+            return
+        self.automerge_mode = ui.config("automerge", "mode") or "reject"
+        automerge_fns = self.automerge_fns
+        automerge_algos = get_enabled_automerge_algos(ui)
+        for name in automerge_algos:
+            automerge_fns[name] = AUTOMERGE_ALGORITHMS[name]
+
+    @util.propertycache
+    def file_type(self) -> Optional[str]:
+        if not self.file_path:
+            return None
+        for pat, typ in self.ui.configitems("filetype-patterns"):
+            mf = match.match("", "", [pat])
+            if mf(self.file_path):
+                return typ
+        return None
+
+    def merge_groups(self):
         """Yield sequence of line groups.
 
         Each one is a tuple:
@@ -170,23 +489,22 @@ class Merge3Text:
             elif what == "b":
                 yield what, self.b[t[1] : t[2]]
             elif what == "conflict":
-                if self.wordmerge is wordmergemode.enforced:
+                if self.in_wordmerge:
                     raise CantShowWordConflicts()
 
                 base_lines = self.base[t[1] : t[2]]
                 a_lines = self.a[t[3] : t[4]]
                 b_lines = self.b[t[5] : t[6]]
-                merged_lines = None
-                if automerge:
-                    for fn in self.automerge_fns:
-                        merged_lines = fn(base_lines, a_lines, b_lines)
-                        if merged_lines is not None:
-                            yield "automerge", merged_lines
-                            break
-                if merged_lines is None:
-                    yield (what, (base_lines, a_lines, b_lines))
+                yield (what, (base_lines, a_lines, b_lines))
             else:
                 raise ValueError(what)
+
+    def run_automerge(self, base_lines, a_lines, b_lines):
+        for name, fn in self.automerge_fns.items():
+            merged_lines = fn(self, base_lines, a_lines, b_lines)
+            if merged_lines is not None:
+                return name, merged_lines
+        return None
 
     def merge_regions(self):
         """Return sequences of matching and conflicting regions.
@@ -281,7 +599,7 @@ class Merge3Text:
         """
 
         ia = ib = 0
-        if self.wordmerge is wordmergemode.enforced:
+        if self.in_wordmerge:
 
             def escape(word):
                 # escape "word" so it looks like a line ending with "\n"
@@ -382,63 +700,184 @@ def _minimize(a_lines, b_lines):
     return lines_before, new_a_lines, new_b_lines, lines_after
 
 
+def try_automerge_conflict(
+    m3, group_lines, name_base, name_a, name_b, render_conflict_fn, newline=b"\n"
+):
+    def automerge_cache_key(conflict_group_lines):
+        m = hashlib.sha256()
+        for lines in conflict_group_lines:
+            for line in lines:
+                m.update(line)
+        return m.digest()
+
+    def render_automerged_lines(merge_algorithm, merged_lines, newline):
+        lines = []
+        lines.append(
+            (b"<<<<<<< '%s' automerge algorithm yields:" % merge_algorithm.encode())
+            + newline
+        )
+        lines.extend(merged_lines)
+        lines.append(b">>>>>>>" + newline)
+        return lines
+
+    def automerge_enabled(ui, automerge_mode):
+        if not ui or automerge_mode == "reject":
+            return False
+
+        if ui.configbool("automerge", "disable-for-noninteractive", True):
+            return ui.interactive()
+
+        return True
+
+    automerge_mode = m3.automerge_mode
+    ui = m3.ui
+
+    base_lines, a_lines, b_lines = group_lines
+    extra_lines = []
+
+    merged_res = m3.run_automerge(base_lines, a_lines, b_lines)
+    is_enabled = automerge_enabled(ui, automerge_mode)
+
+    _automerge_metrics.conflicts += 1
+    _automerge_metrics.enabled = int(is_enabled)
+    _automerge_metrics.total += bool(merged_res)
+
+    if is_enabled and merged_res:
+        merge_algorithm, merged_lines = merged_res
+        if automerge_mode == "accept":
+            _automerge_metrics.accepted += 1
+            return merge_algorithm, merged_lines
+        elif automerge_mode == "prompt":
+            cache_key = automerge_cache_key(group_lines)
+            if cache_key not in _automerge_cache:
+                prompt = {
+                    "conflict": b"".join(
+                        _render_diff_conflict(
+                            base_lines,
+                            a_lines,
+                            b_lines,
+                            name_base,
+                            name_a,
+                            name_b,
+                            newline=newline,
+                            one_side=False,
+                        )
+                    ).decode(),
+                    "merged_lines": b" ".join(merged_lines).decode(),
+                    "merge_algorithm": merge_algorithm,
+                }
+                index = ui.promptchoice(_automerge_prompt_msg % prompt, 1)
+                _automerge_cache[cache_key] = index
+            index = _automerge_cache[cache_key]
+            if index == 0:  # accept
+                _automerge_metrics.accepted += 1
+                return merge_algorithm, merged_lines
+            elif index == 2:  # review-in-file
+                _automerge_metrics.review_in_file += 1
+                extra_lines.extend(
+                    render_automerged_lines(merge_algorithm, merged_lines, newline)
+                )
+            else:
+                _automerge_metrics.rejected += 1
+        elif automerge_mode == "review-in-file":
+            _automerge_metrics.review_in_file += 1
+            extra_lines.extend(
+                render_automerged_lines(merge_algorithm, merged_lines, newline)
+            )
+        else:
+            _automerge_metrics.rejected += 1
+
+    lines = render_conflict_fn(base_lines, a_lines, b_lines)
+    lines.extend(extra_lines)
+    return None, lines
+
+
 def render_minimized(
     m3,
     name_a=None,
     name_b=None,
+    name_base=None,
     start_marker=b"<<<<<<<",
     mid_marker=b"=======",
     end_marker=b">>>>>>>",
 ) -> Tuple[List[bytes], int]:
     """Return merge in cvs-like form."""
-    conflictscount = 0
+
+    def render_minimized_conflict(base_lines, a_lines, b_lines):
+        lines = []
+        minimized = _minimize(a_lines, b_lines)
+        lines_before, a_lines, b_lines, lines_after = minimized
+        lines.extend(lines_before)
+        lines.append(start_marker + newline)
+        lines.extend(a_lines)
+        lines.append(mid_marker + newline)
+        lines.extend(b_lines)
+        lines.append(end_marker + newline)
+        lines.extend(lines_after)
+        return lines
+
     newline = _detect_newline(m3)
     if name_a:
         start_marker = start_marker + b" " + name_a
     if name_b:
         end_marker = end_marker + b" " + name_b
 
-    merge_groups = m3.merge_groups(automerge=True)
-    lines = []
-    for what, group_lines in merge_groups:
-        if what == "conflict":
-            conflictscount += 1
-            base_lines, a_lines, b_lines = group_lines
-            minimized = _minimize(a_lines, b_lines)
-            lines_before, a_lines, b_lines, lines_after = minimized
-            lines.extend(lines_before)
-            lines.append(start_marker + newline)
-            lines.extend(a_lines)
-            lines.append(mid_marker + newline)
-            lines.extend(b_lines)
-            lines.append(end_marker + newline)
-            lines.extend(lines_after)
-        else:
-            lines.extend(group_lines)
-
-    return lines, conflictscount
+    return _apply_conflict_render(
+        m3, name_a, name_b, name_base, render_minimized_conflict, newline
+    )
 
 
 def render_merge3(m3, name_a, name_b, name_base) -> Tuple[List[bytes], int]:
     """Return merge in cvs-like form."""
-    conflictscount = 0
-    newline = _detect_newline(m3)
-    merge_groups = m3.merge_groups(automerge=True)
-    lines = []
 
-    for what, group_lines in merge_groups:
+    def render_merge3_conflict(base_lines, a_lines, b_lines):
+        lines = []
+        lines.append(b"<<<<<<< " + name_a + newline)
+        lines.extend(a_lines)
+        lines.append(b"||||||| " + name_base + newline)
+        lines.extend(base_lines)
+        lines.append(b"=======" + newline)
+        lines.extend(b_lines)
+        lines.append(b">>>>>>> " + name_b + newline)
+        return lines
+
+    newline = _detect_newline(m3)
+    return _apply_conflict_render(
+        m3, name_a, name_b, name_base, render_merge3_conflict, newline
+    )
+
+
+def _apply_conflict_render(m3, name_a, name_b, name_base, render_fn, newline):
+    conflictscount = 0
+    lines = []
+    automerge_summary = AutomergeSummary()
+
+    for what, group_lines in m3.merge_groups():
         if what == "conflict":
-            conflictscount += 1
-            base_lines, a_lines, b_lines = group_lines
-            lines.append(b"<<<<<<< " + name_a + newline)
-            lines.extend(a_lines)
-            lines.append(b"||||||| " + name_base + newline)
-            lines.extend(base_lines)
-            lines.append(b"=======" + newline)
-            lines.extend(b_lines)
-            lines.append(b">>>>>>> " + name_b + newline)
+            automerge_algo, merged_lines = try_automerge_conflict(
+                m3,
+                group_lines,
+                name_base,
+                name_a,
+                name_b,
+                render_fn,
+                newline,
+            )
+            if automerge_algo:
+                automerge_summary.add(len(lines), len(merged_lines))
+            else:
+                conflictscount += 1
+            lines.extend(merged_lines)
         else:
             lines.extend(group_lines)
+
+    # to avoid printing duplicate messages in both `premerge` and `merge``, we skip
+    # the logic when it's in `premerge`` and there are conflicts, as it will
+    # call `merge` later
+    if not (m3.premerge and conflictscount) and (
+        automerge_msg := automerge_summary.summary()
+    ):
+        m3.ui.status(automerge_msg)
 
     return lines, conflictscount
 
@@ -475,62 +914,93 @@ def _picklabels(overrides):
 
 
 def render_mergediff(m3, name_a, name_b, name_base):
+    return _render_mergediff_ext(m3, name_a, name_b, name_base, one_side=True)
+
+
+def render_mergediff2(m3, name_a, name_b, name_base):
+    return _render_mergediff_ext(m3, name_a, name_b, name_base, one_side=False)
+
+
+def _render_mergediff_ext(m3, name_a, name_b, name_base, one_side):
     newline = _detect_newline(m3)
-    lines = []
-    conflictscount = 0
-    for what, group_lines in m3.merge_groups(automerge=True):
-        if what == "conflict":
-            base_lines, a_lines, b_lines = group_lines
-            basetext = b"".join(base_lines)
-            bblocks = list(
-                mdiff.allblocks(
-                    basetext,
-                    b"".join(b_lines),
-                    lines1=base_lines,
-                    lines2=b_lines,
-                )
-            )
-            ablocks = list(
-                mdiff.allblocks(
-                    basetext,
-                    b"".join(a_lines),
-                    lines1=base_lines,
-                    lines2=b_lines,
-                )
-            )
+    render_conflict_fn = functools.partial(
+        _render_diff_conflict,
+        name_base=name_base,
+        name_a=name_a,
+        name_b=name_b,
+        newline=newline,
+        one_side=one_side,
+    )
+    return _apply_conflict_render(
+        m3, name_a, name_b, name_base, render_conflict_fn, newline
+    )
 
-            def matchinglines(blocks):
-                return sum(block[1] - block[0] for block, kind in blocks if kind == "=")
 
-            def difflines(blocks, lines1, lines2):
-                for block, kind in blocks:
-                    if kind == "=":
-                        for line in lines1[block[0] : block[1]]:
-                            yield b" " + line
-                    else:
-                        for line in lines1[block[0] : block[1]]:
-                            yield b"-" + line
-                        for line in lines2[block[2] : block[3]]:
-                            yield b"+" + line
+def _render_diff_conflict(
+    base_lines,
+    a_lines,
+    b_lines,
+    name_base=b"",
+    name_a=b"",
+    name_b=b"",
+    newline=b"\n",
+    one_side=True,  # diff on one side of the conflict, other diff on both sides
+):
+    basetext = b"".join(base_lines)
+    bblocks = list(
+        mdiff.allblocks(
+            basetext,
+            b"".join(b_lines),
+            lines1=base_lines,
+            lines2=b_lines,
+        )
+    )
+    ablocks = list(
+        mdiff.allblocks(
+            basetext,
+            b"".join(a_lines),
+            lines1=base_lines,
+            lines2=b_lines,
+        )
+    )
 
-            lines.append(b"<<<<<<<" + newline)
-            if matchinglines(ablocks) < matchinglines(bblocks):
-                lines.append(b"======= " + name_a + newline)
-                lines.extend(a_lines)
-                lines.append(b"------- " + name_base + newline)
-                lines.append(b"+++++++ " + name_b + newline)
-                lines.extend(difflines(bblocks, base_lines, b_lines))
+    def matchinglines(blocks):
+        return sum(block[1] - block[0] for block, kind in blocks if kind == "=")
+
+    def difflines(blocks, lines1, lines2):
+        for block, kind in blocks:
+            if kind == "=":
+                for line in lines1[block[0] : block[1]]:
+                    yield b" " + line
             else:
-                lines.append(b"------- " + name_base + newline)
-                lines.append(b"+++++++ " + name_a + newline)
-                lines.extend(difflines(ablocks, base_lines, a_lines))
-                lines.append(b"======= " + name_b + newline)
-                lines.extend(b_lines)
-            lines.append(b">>>>>>>" + newline)
-            conflictscount += 1
+                for line in lines1[block[0] : block[1]]:
+                    yield b"-" + line
+                for line in lines2[block[2] : block[3]]:
+                    yield b"+" + line
+
+    lines = []
+    if one_side:
+        lines.append(b"<<<<<<<" + newline)
+        if matchinglines(ablocks) < matchinglines(bblocks):
+            lines.append(b"======= " + name_a + newline)
+            lines.extend(a_lines)
+            lines.append(b"------- " + name_base + newline)
+            lines.append(b"+++++++ " + name_b + newline)
+            lines.extend(difflines(bblocks, base_lines, b_lines))
         else:
-            lines.extend(group_lines)
-    return lines, conflictscount
+            lines.append(b"------- " + name_base + newline)
+            lines.append(b"+++++++ " + name_a + newline)
+            lines.extend(difflines(ablocks, base_lines, a_lines))
+            lines.append(b"======= " + name_b + newline)
+            lines.extend(b_lines)
+        lines.append(b">>>>>>>" + newline)
+    else:
+        lines.append(b"<<<<<<< " + name_a + newline)
+        lines.extend(difflines(ablocks, base_lines, a_lines))
+        lines.append(b"======= " + name_base + newline)
+        lines.extend(difflines(bblocks, base_lines, b_lines))
+        lines.append(b">>>>>>> " + name_b + newline)
+    return lines
 
 
 def _resolve(m3, sides):
@@ -574,7 +1044,18 @@ def simplemerge(ui, localctx, basectx, otherctx, **opts):
     except error.Abort:
         return 1
 
-    m3 = Merge3Text(basetext, localtext, othertext, wordmerge=wordmergemode.fromui(ui))
+    _automerge_metrics.set_commits(localctx, basectx, otherctx)
+
+    file_path = basectx.path()
+    premerge = opts.get("premerge", False)
+    m3 = Merge3Text(
+        basetext,
+        localtext,
+        othertext,
+        ui=ui,
+        premerge=premerge,
+        file_path=file_path,
+    )
 
     conflictscount = 0
     if mode == "union":
@@ -588,7 +1069,7 @@ def simplemerge(ui, localctx, basectx, otherctx, **opts):
     elif mode == "merge3":
         lines, conflictscount = render_merge3(m3, name_a, name_b, name_base)
     else:
-        lines, conflictscount = render_minimized(m3, name_a, name_b)
+        lines, conflictscount = render_minimized(m3, name_a, name_b, name_base)
 
     mergedtext = b"".join(lines)
     if opts.get("print"):

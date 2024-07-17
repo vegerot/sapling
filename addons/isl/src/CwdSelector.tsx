@@ -5,71 +5,143 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {AbsolutePath} from './types';
+import type {AbsolutePath, CwdInfo} from './types';
 
 import serverAPI from './ClientToServerAPI';
+import {Row} from './ComponentUtils';
 import {DropdownField, DropdownFields} from './DropdownFields';
-import {Tooltip} from './Tooltip';
+import {useCommandEvent} from './ISLShortcuts';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
-import {T} from './i18n';
-import {repositoryInfo, serverCwd} from './serverAPIState';
-import {
-  VSCodeBadge,
-  VSCodeButton,
-  VSCodeDivider,
-  VSCodeRadio,
-  VSCodeRadioGroup,
-} from '@vscode/webview-ui-toolkit/react';
-import {atom, useRecoilValue} from 'recoil';
-import {Icon} from 'shared/Icon';
-import {minimalDisambiguousPaths} from 'shared/minimalDisambiguousPaths';
+import {T, t} from './i18n';
+import {writeAtom} from './jotaiUtils';
+import {serverCwd} from './repositoryData';
+import {repositoryInfo} from './serverAPIState';
+import {registerCleanup, registerDisposable} from './utils';
+import {Badge} from 'isl-components/Badge';
+import {Button} from 'isl-components/Button';
+import {ButtonDropdown} from 'isl-components/ButtonDropdown';
+import {Divider} from 'isl-components/Divider';
+import {Icon} from 'isl-components/Icon';
+import {Kbd} from 'isl-components/Kbd';
+import {RadioGroup} from 'isl-components/Radio';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
+import {atom, useAtomValue} from 'jotai';
+import {KeyCode, Modifier} from 'shared/KeyboardShortcuts';
 import {basename} from 'shared/utils';
 
-export const availableCwds = atom<Array<AbsolutePath>>({
-  key: 'availableCwds',
-  default: [],
-  effects: [
-    ({setSelf}) => {
-      const disposable = serverAPI.onMessageOfType('platform/availableCwds', event => {
-        setSelf(event.options);
-      });
-      return () => disposable.dispose();
-    },
+/**
+ * Give the relative path to `path` from `root`
+ * For example, relativePath('/home/user', '/home') -> 'user'
+ */
+export function relativePath(root: AbsolutePath, path: AbsolutePath) {
+  if (root == null || path === '') {
+    return '';
+  }
+  return path.replace(root, '');
+}
 
-    () =>
-      serverAPI.onConnectOrReconnect(() =>
-        serverAPI.postMessage({
-          type: 'platform/subscribeToAvailableCwds',
-        }),
-      ),
-  ],
-});
+/**
+ * Trim a suffix if it exists
+ * maybeTrim('abc/', '/') -> 'abc'
+ * maybeTrim('abc', '/') -> 'abc'
+ */
+function maybeTrim(s: string, c: string): string {
+  return s.endsWith(c) ? s.slice(0, -c.length) : s;
+}
+
+function getRepoLabel(repoRoot: AbsolutePath, cwd: string) {
+  const sep = guessPathSep(cwd);
+  const repoBasename = maybeTrim(basename(repoRoot, sep), sep);
+  const repoRelativeCwd = relativePath(repoRoot, cwd);
+  if (repoRelativeCwd === '') {
+    return repoBasename;
+  }
+  return repoBasename + repoRelativeCwd;
+}
+
+export const availableCwds = atom<Array<CwdInfo>>([]);
+registerCleanup(
+  availableCwds,
+  serverAPI.onConnectOrReconnect(() => {
+    serverAPI.postMessage({
+      type: 'platform/subscribeToAvailableCwds',
+    });
+  }),
+  import.meta.hot,
+);
+
+registerDisposable(
+  availableCwds,
+  serverAPI.onMessageOfType('platform/availableCwds', event =>
+    writeAtom(availableCwds, event.options),
+  ),
+  import.meta.hot,
+);
 
 export function CwdSelector() {
-  const info = useRecoilValue(repositoryInfo);
+  const info = useAtomValue(repositoryInfo);
+  const currentCwd = useAtomValue(serverCwd);
+  const additionalToggles = useCommandEvent('ToggleCwdDropdown');
+  const allOptions = useCwdOptions();
+  const options = allOptions.filter(opt => opt.valid);
   if (info?.type !== 'success') {
     return null;
   }
-  const repoBasename = basename(info.repoRoot);
+  const repoLabel = getRepoLabel(info.repoRoot, currentCwd);
   return (
-    <Tooltip trigger="click" component={() => <CwdDetails />} placement="bottom">
-      <VSCodeButton appearance="icon" data-testid="cwd-dropdown-button">
-        <Icon icon="folder" slot="start" />
-        {repoBasename}
-      </VSCodeButton>
+    <Tooltip
+      trigger="click"
+      component={dismiss => <CwdDetails dismiss={dismiss} />}
+      additionalToggles={additionalToggles}
+      group="topbar"
+      placement="bottom"
+      title={
+        <T replace={{$shortcut: <Kbd keycode={KeyCode.C} modifiers={[Modifier.ALT]} />}}>
+          Repository info & cwd ($shortcut)
+        </T>
+      }>
+      {options.length < 2 ? (
+        <Button icon data-testid="cwd-dropdown-button">
+          <Icon icon="folder" />
+          {repoLabel}
+        </Button>
+      ) : (
+        // use a ButtonDropdown as a shortcut to quickly change cwd
+        <ButtonDropdown
+          data-testid="cwd-dropdown-button"
+          kind="icon"
+          options={options}
+          selected={
+            options.find(opt => opt.id === currentCwd) ?? {
+              id: currentCwd,
+              label: repoLabel,
+              valid: true,
+            }
+          }
+          icon={<Icon icon="folder" />}
+          onClick={
+            () => null // fall through to the Tooltip
+          }
+          onChangeSelected={value => {
+            if (value.id !== currentCwd) {
+              changeCwd(value.id);
+            }
+          }}></ButtonDropdown>
+      )}
     </Tooltip>
   );
 }
 
-function CwdDetails() {
-  const info = useRecoilValue(repositoryInfo);
+function CwdDetails({dismiss}: {dismiss: () => unknown}) {
+  const info = useAtomValue(repositoryInfo);
   const repoRoot = info?.type === 'success' ? info.repoRoot : null;
-  const provider = useRecoilValue(codeReviewProvider);
-  const cwd = useRecoilValue(serverCwd);
+  const provider = useAtomValue(codeReviewProvider);
+  const cwd = useAtomValue(serverCwd);
   return (
     <DropdownFields title={<T>Repository info</T>} icon="folder" data-testid="cwd-details-dropdown">
-      <CwdSelections />
-      <DropdownField title={<T>Active repository</T>}>
+      <CwdSelections dismiss={dismiss} divider />
+      <DropdownField title={<T>Active working directory</T>}>
         <code>{cwd}</code>
       </DropdownField>
       <DropdownField title={<T>Repository Root</T>}>
@@ -78,7 +150,7 @@ function CwdDetails() {
       {provider != null ? (
         <DropdownField title={<T>Code Review Provider</T>}>
           <span>
-            <VSCodeBadge>{provider?.name}</VSCodeBadge> <provider.RepoInfo />
+            <Badge>{provider?.name}</Badge> <provider.RepoInfo />
           </span>
         </DropdownField>
       ) : null}
@@ -86,48 +158,72 @@ function CwdDetails() {
   );
 }
 
-function CwdSelections() {
-  const currentCwd = useRecoilValue(serverCwd);
-  const cwdOptions = useRecoilValue(availableCwds);
-  if (cwdOptions.length < 2) {
+function changeCwd(newCwd: string) {
+  serverAPI.postMessage({
+    type: 'changeCwd',
+    cwd: newCwd,
+  });
+  serverAPI.cwdChanged();
+}
+
+function useCwdOptions() {
+  const cwdOptions = useAtomValue(availableCwds);
+
+  return cwdOptions.map((cwd, index) => ({
+    id: cwdOptions[index].cwd,
+    label: cwd.repoRelativeCwdLabel ?? cwd.cwd,
+    valid: cwd.repoRoot != null,
+  }));
+}
+
+function guessPathSep(path: string): '/' | '\\' {
+  if (path.includes('\\')) {
+    return '\\';
+  } else {
+    return '/';
+  }
+}
+
+export function CwdSelections({dismiss, divider}: {dismiss: () => unknown; divider?: boolean}) {
+  const currentCwd = useAtomValue(serverCwd);
+  const options = useCwdOptions();
+  if (options.length < 2) {
     return null;
   }
 
-  const paths = minimalDisambiguousPaths(cwdOptions);
-
   return (
-    <DropdownField title={<T>Change active repository</T>}>
-      <VSCodeRadioGroup
-        orientation="vertical"
-        value={currentCwd}
-        onChange={e => {
-          const newCwd = (e.target as HTMLOptionElement).value as string;
+    <DropdownField title={<T>Change active working directory</T>}>
+      <RadioGroup
+        choices={options.map(({id, label, valid}) => ({
+          title: valid ? (
+            label
+          ) : (
+            <Row key={id}>
+              {label}{' '}
+              <Subtle>
+                <T>Not a valid repository</T>
+              </Subtle>
+            </Row>
+          ),
+          value: id,
+          tooltip: valid
+            ? id
+            : t('Path $path does not appear to be a valid Sapling repository', {
+                replace: {$path: id},
+              }),
+          disabled: !valid,
+        }))}
+        current={currentCwd}
+        onChange={newCwd => {
           if (newCwd === currentCwd) {
             // nothing to change
             return;
           }
-          serverAPI.postMessage({
-            type: 'changeCwd',
-            cwd: newCwd,
-          });
-          serverAPI.cwdChanged();
-        }}>
-        {paths.map((shortCwd, index) => {
-          const fullCwd = cwdOptions[index];
-          return (
-            <VSCodeRadio
-              key={shortCwd}
-              value={fullCwd}
-              checked={fullCwd === currentCwd}
-              tabIndex={0}>
-              <Tooltip key={shortCwd} title={fullCwd} placement="right">
-                {shortCwd}
-              </Tooltip>
-            </VSCodeRadio>
-          );
-        })}
-      </VSCodeRadioGroup>
-      <VSCodeDivider />
+          changeCwd(newCwd);
+          dismiss();
+        }}
+      />
+      {divider && <Divider />}
     </DropdownField>
   );
 }

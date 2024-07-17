@@ -27,7 +27,7 @@ With the GitHub CLI caching your credentials, you will be able to run commands l
 
 ## Pull requests
 
-When it comes to working with pull requests from Sapling, you have three options: `sl pr`, `sl ghstack`, and `sl push`. Each has its tradeoffs, so you may opt to use a different solution, depending on the scenario:
+When it comes to working with pull requests from Sapling, you have two options: `sl pr` and `sl push`. Each has its tradeoffs, so you may opt to use a different solution, depending on the scenario:
 
 ### `sl pr` (aka "Sapling stack")
 
@@ -40,19 +40,6 @@ See the dedicated [Sapling Stack](./sapling-stack.md) page for more information.
 **Cons:**
 
 - Creates "overlapping" pull requests that may be confusing to reviewers using the GitHub pull request UI. Reviewers are strongly encouraged to use [ReviewStack](../addons/reviewstack.md) for code review instead of GitHub.
-
-### `sl ghstack` (aka [ghstack](https://github.com/ezyang/ghstack) for Sapling)
-
-See the dedicated [ghstack](./ghstack.md) page for more information.
-
-**Pros:**
-
-- Each generated pull request contains one reviewable commit in GitHub.
-
-**Cons:**
-
-- Can only be used if you have _write_ access to the repository.
-- You will NOT be able to merge these pull requests using the normal GitHub UI.
 
 :::tip
 
@@ -76,8 +63,8 @@ If you don't have write access to the repo, you can [fork](https://docs.github.c
 GitHub website, add your fork as a remote, then push to your fork:
 
 ```
-sl paths --add myfork ssh://git@github.com/my-username/sapling.git
-sl push --to myfork/my-new-feature
+sl paths --add my-fork ssh://git@github.com/my-username/sapling.git
+sl push --to my-fork/my-new-feature
 ```
 
 After push, open the repo webpage. You will see GitHub detected the push:

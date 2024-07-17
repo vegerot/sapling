@@ -47,6 +47,7 @@ configtable = {}
 configitem = registrar.configitem(configtable)
 
 configitem("github", "pull-request-include-reviewstack", default=True)
+configitem("github", "preserve-pull-request-description", default=False)
 
 
 @hint("unlink-closed-pr")
@@ -67,7 +68,7 @@ def extsetup(ui):
 @command(
     "pr",
     [],
-    _("<submit|get|link|unlink|...>"),
+    _("<submit|pull|list|link|unlink|...>"),
 )
 def pull_request_command(ui, repo, *args, **opts):
     """exchange local commit data with GitHub pull requests"""
@@ -137,9 +138,7 @@ def pull_cmd(ui, repo, *args, **opts):
     """import a pull request into your working copy
 
     The PULL_REQUEST can be specified as either a URL:
-
-        https://github.com/facebook/sapling/pull/321
-
+    `https://github.com/facebook/sapling/pull/321`
     or just the PR number within the GitHub repository identified by
     `sl config paths.default`.
     """
@@ -376,7 +375,7 @@ def _getnamespace(_repo) -> namespace:
 
 @autopullpredicate("ghrevset", priority=90, rewritepullrev=True)
 def _autopullghpr(repo, name, rewritepullrev: bool = False) -> Optional[pullattempt]:
-    if repo.ui.plain():
+    if repo.ui.plain(feature="ghrevset"):
         return
 
     if not repo.ui.configbool("ghrevset", "autopull"):

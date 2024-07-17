@@ -1,8 +1,6 @@
-#require no-fsmonitor
-#debugruntest-compatible
+#require no-fsmonitor no-eden
 
 setup
-  $ configure modernclient
   $ readconfig <<EOF
   > [alias]
   > blackbox = blackbox --no-timestamp --no-sid
@@ -17,8 +15,6 @@ command, exit codes, and duration
   $ echo a > a
   $ hg add a
   $ hg blackbox --pattern '{"legacy_log":{"service":["or","command","command_finish"]}}'
-  [legacy][command] up -q tip
-  [legacy][command_finish] up -q tip exited 0 after 0.00 seconds
   [legacy][command] add a
   [legacy][command_finish] add a exited 0 after 0.00 seconds
   [legacy][command] blackbox --pattern '{"legacy_log":{"service":["or","command","command_finish"]}}'
@@ -37,6 +33,8 @@ FIXME: (recursive) alias expansion is not logged
   [legacy][env_vars]
   [legacy][command_info] (?)
   [legacy][env_vars] (?)
+  [legacy][command_info]
+  [legacy][env_vars]
   [legacy][command] so-confusing
   [legacy][dirstate_info]
   [legacy][jobid]
@@ -45,6 +43,8 @@ FIXME: (recursive) alias expansion is not logged
   [legacy][command_finish] so-confusing exited 0 after 0.00 seconds
   [legacy][connectionpool]
   [legacy][command_info]
+  [legacy][metrics] {'metrics': {'scmstore': {'tree': * (glob) (?)
+  [legacy][metrics] {'metrics': {'scmstore': {'file': * (glob) (?)
   [commmand_finish] exited 0 in 0 ms, max RSS: 0 bytes
   [tracing] (binary data of * bytes) (glob)
   [command] [*, "blackbox"] started by uid 0 as pid 0 with nice 0 (glob)
@@ -84,8 +84,6 @@ clone, commit, pull
   [legacy][command_finish] pull -q -B head1 exited 0 after 0.00 seconds
   [legacy][command] pull -q -B head2
   [legacy][command_finish] pull -q -B head2 exited 0 after 0.00 seconds
-  [legacy][command] up -q tip
-  [legacy][command_finish] up -q tip exited 0 after 0.00 seconds
   [legacy][command] pull
   [legacy][command_finish] pull exited 0 after 0.00 seconds
   [legacy][command] blackbox --pattern '{"legacy_log":{"service":["or","command","command_finish","command_alias"]}}'
@@ -106,11 +104,9 @@ extension and python hooks - use the eol extension for a pythonhook
   $ echo 'eol=' >> .hg/hgrc
   $ echo '[hooks]' >> .hg/hgrc
   $ echo 'update = echo hooked' >> .hg/hgrc
-  $ hg goto
+  $ hg goto tip
   hooked
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  updated to "d02f48003e62: c"
-  1 other heads for branch "default"
   $ cat >> .hg/hgrc <<EOF
   > [extensions]
   > # disable eol, because it is not needed for subsequent tests

@@ -8,7 +8,6 @@
 import type {ReactNode} from 'react';
 
 import App from '../App';
-import {Tooltip, TooltipRootContainer} from '../Tooltip';
 import {
   resetTestMessages,
   expectMessageSentToServer,
@@ -16,13 +15,12 @@ import {
   COMMIT,
   closeCommitInfoSidebar,
 } from '../testUtils';
-import {fireEvent, render, screen, within} from '@testing-library/react';
+import {fireEvent, render, screen, within, act} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import {act} from 'react-dom/test-utils';
+import {Tooltip} from 'isl-components/Tooltip';
+import {ViewportOverlayRoot} from 'isl-components/ViewportOverlay';
 
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
-
-jest.mock('../MessageBus');
 
 describe('tooltips in ISL', () => {
   let unmount: () => void;
@@ -41,7 +39,7 @@ describe('tooltips in ISL', () => {
         value: [
           COMMIT('1', 'some public base', '0', {phase: 'public'}),
           COMMIT('a', 'My Commit', '1'),
-          COMMIT('b', 'Another Commit', 'a', {isHead: true}),
+          COMMIT('b', 'Another Commit', 'a', {isDot: true}),
         ],
       });
     });
@@ -63,7 +61,7 @@ describe('tooltips in ISL', () => {
     it('shows settings dropdown when clicked', () => {
       clickSettingsGearToMakeTooltip();
 
-      const settingsDropdown = within(screen.getByTestId('tooltip-root-container')).getByTestId(
+      const settingsDropdown = within(screen.getByTestId('viewport-overlay-root')).getByTestId(
         'settings-dropdown',
       );
       expect(settingsDropdown).toBeInTheDocument();
@@ -72,7 +70,7 @@ describe('tooltips in ISL', () => {
     it('clicking inside tooltip does not dismiss it', () => {
       clickSettingsGearToMakeTooltip();
 
-      const settingsDropdown = within(screen.getByTestId('tooltip-root-container')).getByTestId(
+      const settingsDropdown = within(screen.getByTestId('viewport-overlay-root')).getByTestId(
         'settings-dropdown',
       );
       const themeDropdown = within(settingsDropdown).getByText('Theme');
@@ -81,7 +79,7 @@ describe('tooltips in ISL', () => {
         fireEvent.click(themeDropdown!);
       });
 
-      const settingsDropdown2 = within(screen.getByTestId('tooltip-root-container')).getByTestId(
+      const settingsDropdown2 = within(screen.getByTestId('viewport-overlay-root')).getByTestId(
         'settings-dropdown',
       );
       expect(settingsDropdown2).toBeInTheDocument();
@@ -93,7 +91,7 @@ describe('tooltips in ISL', () => {
         fireEvent.click(settingsButton);
       });
 
-      const settingsDropdown = within(screen.getByTestId('tooltip-root-container')).queryByTestId(
+      const settingsDropdown = within(screen.getByTestId('viewport-overlay-root')).queryByTestId(
         'settings-dropdown',
       );
       expect(settingsDropdown).toBeInTheDocument();
@@ -102,7 +100,7 @@ describe('tooltips in ISL', () => {
         fireEvent.click(screen.getByTestId('commit-a')!);
       });
 
-      const settingsDropdown2 = within(screen.getByTestId('tooltip-root-container')).queryByTestId(
+      const settingsDropdown2 = within(screen.getByTestId('viewport-overlay-root')).queryByTestId(
         'settings-dropdown',
       );
       expect(settingsDropdown2).not.toBeInTheDocument();
@@ -115,7 +113,7 @@ describe('tooltips in ISL', () => {
       const refreshButton = screen.getByTestId('refresh-button').parentElement as HTMLElement;
       userEvent.hover(refreshButton);
 
-      const refreshButtonTooltip = within(screen.getByTestId('tooltip-root-container')).getByText(
+      const refreshButtonTooltip = within(screen.getByTestId('viewport-overlay-root')).getByText(
         REFRESH_BUTTON_HOVER_TEXT,
       );
       expect(refreshButtonTooltip).toBeInTheDocument();
@@ -123,7 +121,7 @@ describe('tooltips in ISL', () => {
       userEvent.unhover(refreshButton);
 
       expect(
-        within(screen.getByTestId('tooltip-root-container')).queryByText(REFRESH_BUTTON_HOVER_TEXT),
+        within(screen.getByTestId('viewport-overlay-root')).queryByText(REFRESH_BUTTON_HOVER_TEXT),
       ).not.toBeInTheDocument();
     });
 
@@ -131,7 +129,7 @@ describe('tooltips in ISL', () => {
       const refreshButton = screen.getByTestId('refresh-button').parentElement as HTMLElement;
       userEvent.hover(refreshButton);
 
-      const refreshButtonTooltip = within(screen.getByTestId('tooltip-root-container')).getByText(
+      const refreshButtonTooltip = within(screen.getByTestId('viewport-overlay-root')).getByText(
         REFRESH_BUTTON_HOVER_TEXT,
       );
       expect(refreshButtonTooltip).toBeInTheDocument();
@@ -139,7 +137,7 @@ describe('tooltips in ISL', () => {
       userEvent.keyboard('{Escape}');
 
       expect(
-        within(screen.getByTestId('tooltip-root-container')).queryByText(REFRESH_BUTTON_HOVER_TEXT),
+        within(screen.getByTestId('viewport-overlay-root')).queryByText(REFRESH_BUTTON_HOVER_TEXT),
       ).not.toBeInTheDocument();
     });
   });
@@ -149,7 +147,7 @@ describe('tooltip', () => {
   function renderCustom(node: ReactNode) {
     render(
       <div className="isl-root">
-        <TooltipRootContainer />
+        <ViewportOverlayRoot />
         {node}
       </div>,
     );
@@ -252,6 +250,56 @@ describe('tooltip', () => {
       const innerDismiss = screen.getByText('my button');
       fireEvent.click(innerDismiss);
       expect(onDismiss).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('groups', () => {
+    it('dismisses other tooltips in the same group', () => {
+      const content = (value: string) => {
+        return () => <div>{value}</div>;
+      };
+      renderCustom(
+        <div>
+          <Tooltip trigger="click" group="test" component={content('Tooltip A')}>
+            Button A
+          </Tooltip>
+          <Tooltip trigger="click" group="test" component={content('Tooltip B')}>
+            Button B
+          </Tooltip>
+        </div>,
+      );
+      const a = screen.getByText('Button A');
+      const b = screen.getByText('Button B');
+      fireEvent.click(a);
+      expect(screen.getByText('Tooltip A')).toBeInTheDocument();
+      expect(screen.queryByText('Tooltip B')).not.toBeInTheDocument();
+      fireEvent.click(b);
+      expect(screen.queryByText('Tooltip A')).not.toBeInTheDocument();
+      expect(screen.getByText('Tooltip B')).toBeInTheDocument();
+    });
+
+    it('does not dismiss from other groups', () => {
+      const content = (value: string) => {
+        return () => <div>{value}</div>;
+      };
+      renderCustom(
+        <div>
+          <Tooltip trigger="click" group="test1" component={content('Tooltip A')}>
+            Button A
+          </Tooltip>
+          <Tooltip trigger="click" group="test2" component={content('Tooltip B')}>
+            Button B
+          </Tooltip>
+        </div>,
+      );
+      const a = screen.getByText('Button A');
+      const b = screen.getByText('Button B');
+      fireEvent.click(a);
+      expect(screen.getByText('Tooltip A')).toBeInTheDocument();
+      expect(screen.queryByText('Tooltip B')).not.toBeInTheDocument();
+      fireEvent.click(b);
+      expect(screen.getByText('Tooltip A')).toBeInTheDocument();
+      expect(screen.getByText('Tooltip B')).toBeInTheDocument();
     });
   });
 });

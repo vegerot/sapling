@@ -20,8 +20,10 @@ import struct
 
 from bindings import (
     checkout as nativecheckout,
+    error as rusterror,
     status as nativestatus,
     worker as rustworker,
+    workingcopy as rustworkingcopy,
 )
 from sapling import tracing
 
@@ -40,44 +42,19 @@ from . import (
     progress,
     pycompat,
     scmutil,
-    treestate,
     util,
     worker,
 )
 from .i18n import _
 from .node import addednodeid, bin, hex, nullhex, nullid, wdirhex
-from .pycompat import decodeutf8, encodeutf8
-
-_pack = struct.pack
-_unpack = struct.unpack
+from .pycompat import encodeutf8
 
 
 class mergestate:
     """track 3-way merge state of individual files
 
-    The merge state is stored on disk when needed. For more about the format,
-    see the documentation for `_readrecords`.
-
-    Each record can contain arbitrary content, and has an associated type. This
-    `type` should be a letter. If `type` is uppercase, the record is mandatory:
-    versions of Mercurial that don't support it should abort. If `type` is
-    lowercase, the record can be safely ignored.
-
-    Currently known records:
-
-    L: the node of the "local" part of the merge (hexified version)
-    O: the node of the "other" part of the merge (hexified version)
-    F: a file to be merged entry
-    C: a change/delete or delete/change conflict
-    D: a file that the external merge driver will merge internally
-       (experimental)
-    P: a path conflict (file vs directory)
-    m: the external merge driver defined for this merge plus its run state
-       (experimental)
-    f: a (filename, dictionary) tuple of optional values for a given file
-    X: unsupported mandatory record type (used in tests)
-    x: unsupported advisory record type (used in tests)
-    l: the labels for the parts of the merge.
+    The merge state is stored on disk when needed. See the
+    repostate::merge_state module for details on the format.
 
     Merge driver run states (experimental):
     u: driver-resolved files unmarked -- needs to be run next time we're about
@@ -111,7 +88,7 @@ class mergestate:
     def read(repo):
         """Initialize the merge state, reading it from disk."""
         ms = mergestate(repo)
-        ms._read()
+        ms._read(repo._rsrepo.workingcopy().mergestate())
         return ms
 
     def __init__(self, repo):
@@ -120,42 +97,32 @@ class mergestate:
         Do not use this directly! Instead call read() or clean()."""
         self._repo = repo
         self._dirty = False
-        self._labels = None
 
     def reset(self, node=None, other=None, labels=None, ancestors=None):
-        self._state = {}
-        self._stateextras = {}
-        self._local = None
-        self._other = None
-        self._ancestors = None
-        self._labels = labels
-        for var in ("localctx", "otherctx"):
-            if var in vars(self):
-                delattr(self, var)
-        if node:
-            self._local = node
-            self._other = other
+        shutil.rmtree(self._repo.localvfs.join("merge"), True)
+
+        self._read(rustworkingcopy.mergestate(node, other, labels))
+
         if ancestors:
             self._ancestors = ancestors
-        self._readmergedriver = None
-        if self.mergedriver:
-            self._mdstate = "s"
-        else:
-            self._mdstate = "u"
-        shutil.rmtree(self._repo.localvfs.join("merge"), True)
-        self._results = {}
-        self._dirty = False
 
-    def _read(self):
+    def _read(self, rust_ms):
         """Analyse each record content to restore a serialized state from disk
 
         This function process "record" entry produced by the de-serialization
         of on disk file.
         """
-        self._state = {}
-        self._stateextras = {}
-        self._local = None
-        self._other = None
+        self._rust_ms = rust_ms
+
+        if md := rust_ms.mergedriver():
+            self._readmergedriver = md[0]
+            self._mdstate = md[1]
+        else:
+            self._readmergedriver = None
+            self._mdstate = "s"
+
+        self._results = {}
+        self._dirty = False
 
         # Note: _ancestors isn't written into the state file since the current
         # state file predates it.
@@ -166,87 +133,6 @@ class mergestate:
         for var in ("localctx", "otherctx", "ancestorctxs"):
             if var in vars(self):
                 delattr(self, var)
-        self._readmergedriver = None
-        self._mdstate = "s"
-        unsupported = set()
-        records = self._readrecords()
-        for rtype, record in records:
-            if rtype == "L":
-                self._local = bin(record)
-            elif rtype == "O":
-                self._other = bin(record)
-            elif rtype == "m":
-                bits = record.split("\0", 1)
-                mdstate = bits[1]
-                if len(mdstate) != 1 or mdstate not in "ums":
-                    # the merge driver should be idempotent, so just rerun it
-                    mdstate = "u"
-
-                self._readmergedriver = bits[0]
-                self._mdstate = mdstate
-            elif rtype in "FDCP":
-                bits = record.split("\0")
-                self._state[bits[0]] = bits[1:]
-            elif rtype == "f":
-                filename, rawextras = record.split("\0", 1)
-                extraparts = rawextras.split("\0")
-                extras = {}
-                i = 0
-                while i < len(extraparts):
-                    extras[extraparts[i]] = extraparts[i + 1]
-                    i += 2
-
-                self._stateextras[filename] = extras
-            elif rtype == "l":
-                labels = record.split("\0", 2)
-                self._labels = [l for l in labels if len(l) > 0]
-            elif not rtype.islower():
-                unsupported.add(rtype)
-        self._results = {}
-        self._dirty = False
-
-        if unsupported:
-            raise error.UnsupportedMergeRecords(unsupported)
-
-    def _readrecords(self):
-        """Read on disk merge state for version 2 file
-
-        This format is a list of arbitrary records of the form:
-
-          [type][length][content]
-
-        `type` is a single character, `length` is a 4 byte integer, and
-        `content` is an arbitrary byte sequence of length `length`.
-
-        Returns list of records [(TYPE, data), ...]."""
-        records = []
-        try:
-            f = self._repo.localvfs(self.statepath)
-            data = f.read()
-            off = 0
-            end = len(data)
-            while off < end:
-                rtype = data[off : off + 1]
-                off += 1
-                length = _unpack(">I", data[off : (off + 4)])[0]
-                off += 4
-                record = data[off : (off + length)]
-                off += length
-
-                # This "t" was a measure to fix compatibility with old versions
-                # of Mercurial. I removed the "t" writer in D46075828, but I'm
-                # leaving the reader since merge states could still contain the
-                # "t". This can be deleted once we aren't worried about old
-                # merge state files.
-                if rtype == b"t":
-                    rtype, record = record[0:1], record[1:]
-
-                records.append((decodeutf8(rtype), decodeutf8(record)))
-            f.close()
-        except IOError as err:
-            if err.errno != errno.ENOENT:
-                raise
-        return records
 
     @util.propertycache
     def mergedriver(self):
@@ -293,6 +179,19 @@ class mergestate:
             )
         return [self._repo[node] for node in self._ancestors]
 
+    @util.propertycache
+    def _local(self):
+        return self._rust_ms.local()
+
+    @util.propertycache
+    def _other(self):
+        return self._rust_ms.other()
+
+    @util.propertycache
+    def _labels(self):
+        # Maintain historical behavior of no labels being `None`, not `[]`.
+        return self._rust_ms.labels() or None
+
     def active(self):
         """Whether mergestate is active.
 
@@ -303,65 +202,19 @@ class mergestate:
         # reasons.
         return (
             bool(self._local)
-            or bool(self._state)
+            or not self._rust_ms.isempty()
             or self._repo.localvfs.exists(self.statepath)
         )
 
     def commit(self):
         """Write current state on disk (if necessary)"""
         if self._dirty:
-            records = self._makerecords()
-            self._writerecords(records)
-            self._dirty = False
-
-    def _makerecords(self):
-        records = []
-        records.append(("L", hex(self._local)))
-        records.append(("O", hex(self._other)))
-        if self.mergedriver:
-            records.append(("m", "\0".join([self.mergedriver, self._mdstate])))
-        # Write out state items. In all cases, the value of the state map entry
-        # is written as the contents of the record. The record type depends on
-        # the type of state that is stored, and capital-letter records are used
-        # to prevent older versions of Mercurial that do not support the feature
-        # from loading them.
-        for filename, v in pycompat.iteritems(self._state):
-            if v[0] == "d":
-                # Driver-resolved merge. These are stored in 'D' records.
-                records.append(("D", "\0".join([filename] + v)))
-            elif v[0] in ("pu", "pr"):
-                # Path conflicts. These are stored in 'P' records.  The current
-                # resolution state ('pu' or 'pr') is stored within the record.
-                records.append(("P", "\0".join([filename] + v)))
-            elif v[1] == nullhex or v[6] == nullhex:
-                # Change/Delete or Delete/Change conflicts. These are stored in
-                # 'C' records. v[1] is the local file, and is nullhex when the
-                # file is deleted locally ('dc'). v[6] is the remote file, and
-                # is nullhex when the file is deleted remotely ('cd').
-                records.append(("C", "\0".join([filename] + v)))
+            if md := self.mergedriver:
+                self._rust_ms.setmergedriver((md, self._mdstate))
             else:
-                # Normal files.  These are stored in 'F' records.
-                records.append(("F", "\0".join([filename] + v)))
-        for filename, extras in sorted(pycompat.iteritems(self._stateextras)):
-            rawextras = "\0".join(
-                "%s\0%s" % (k, v) for k, v in pycompat.iteritems(extras)
-            )
-            records.append(("f", "%s\0%s" % (filename, rawextras)))
-        if self._labels is not None:
-            labels = "\0".join(self._labels)
-            records.append(("l", labels))
-        return records
+                self._rust_ms.setmergedriver(None)
 
-    def _writerecords(self, records):
-        """Write out current state to file on disk"""
-        f = self._repo.localvfs(self.statepath, "w")
-        for key, data in records:
-            assert len(key) == 1
-            key = encodeutf8(key)
-            data = encodeutf8(data)
-            format = ">sI%is" % len(data)
-            f.write(_pack(format, key, len(data), data))
-        f.close()
+            self._repo._rsrepo.workingcopy().writemergestate(self._rust_ms)
 
     def add(self, fcl, fco, fca, fd):
         """add a new (potentially?) conflicting file the merge state
@@ -377,17 +230,20 @@ class mergestate:
         else:
             hash = hex(hashlib.sha1(encodeutf8(fcl.path())).digest())
             self._repo.localvfs.write("merge/" + hash, fcl.data())
-        self._state[fd] = [
-            "u",
-            hash,
-            fcl.path(),
-            fca.path(),
-            hex(fca.filenode()),
-            fco.path(),
-            hex(fco.filenode()),
-            fcl.flags(),
-        ]
-        self._stateextras[fd] = {"ancestorlinknode": hex(fca.node())}
+        self._rust_ms.insert(
+            fd,
+            [
+                "u",
+                hash,
+                fcl.path(),
+                fca.path(),
+                hex(fca.filenode()),
+                fco.path(),
+                hex(fco.filenode()),
+                fcl.flags(),
+            ],
+        )
+        self._rust_ms.setextra(fd, "ancestorlinknode", hex(fca.node()))
         self._dirty = True
 
     def addpath(self, path, frename, forigin):
@@ -396,23 +252,23 @@ class mergestate:
         frename: the filename the conflicting file was renamed to
         forigin: origin of the file ('l' or 'r' for local/remote)
         """
-        self._state[path] = ["pu", frename, forigin]
+        self._rust_ms.insert(path, ["pu", frename, forigin])
         self._dirty = True
 
     def __contains__(self, dfile):
-        return dfile in self._state
+        return self._rust_ms.contains(dfile)
 
     def __getitem__(self, dfile):
-        return self._state[dfile][0]
+        return self._rust_ms.get(dfile)[0]
 
     def __iter__(self):
-        return iter(sorted(self._state))
+        return iter(sorted(self._rust_ms.files()))
 
     def files(self):
-        return self._state.keys()
+        return self._rust_ms.files()
 
     def mark(self, dfile, state):
-        self._state[dfile][0] = state
+        self._rust_ms.setstate(dfile, state)
         self._dirty = True
 
     def mdstate(self):
@@ -420,27 +276,21 @@ class mergestate:
 
     def unresolved(self):
         """Obtain the paths of unresolved files."""
-
-        for f, entry in pycompat.iteritems(self._state):
-            if entry[0] in ("u", "pu"):
-                yield f
+        return self._rust_ms.files(("u", "pu"))
 
     def driverresolved(self):
         """Obtain the paths of driver-resolved files."""
-
-        for f, entry in self._state.items():
-            if entry[0] == "d":
-                yield f
+        return self._rust_ms.files(("d",))
 
     def extras(self, filename):
-        return self._stateextras.setdefault(filename, {})
+        return self._rust_ms.extras(filename)
 
     def _resolve(self, preresolve, dfile, wctx):
         """rerun merge process for file path `dfile`"""
         if self[dfile] in "rd":
             return True, 0
-        stateentry = self._state[dfile]
-        state, hexdnode, lfile, afile, hexanode, ofile, hexonode, flags = stateentry
+        stateentry = self._rust_ms.get(dfile)
+        _state, hexdnode, lfile, afile, hexanode, ofile, hexonode, flags = stateentry
         dnode = bin(hexdnode)
         onode = bin(hexonode)
         anode = bin(hexanode)
@@ -515,8 +365,7 @@ class mergestate:
                     fcd = ex.fcd
         if r is None:
             # no real conflict
-            del self._state[dfile]
-            self._stateextras.pop(dfile, None)
+            self._rust_ms.remove(dfile)
             self._dirty = True
         elif not r:
             self.mark(dfile, "r")
@@ -767,7 +616,7 @@ def _checkunknownfiles(repo, wctx, mctx, force, actions):
                 # (1) this is probably the wrong behavior here -- we should
                 #     probably abort, but some actions like rebases currently
                 #     don't like an abort happening in the middle of
-                #     merge.update.
+                #     merge.update/goto.
                 if not different:
                     actions[f] = ("g", (fl2, False), "remote created")
                 elif config == "abort":
@@ -995,7 +844,10 @@ def manifestmerge(
 
     boolbm = pycompat.bytestr(bool(branchmerge))
     boolf = pycompat.bytestr(bool(force))
-    sparsematch = getattr(repo, "sparsematch", None)
+    shouldsparsematch = hasattr(repo, "sparsematch") and (
+        "eden" not in repo.requirements or "edensparse" in repo.requirements
+    )
+    sparsematch = getattr(repo, "sparsematch", None) if shouldsparsematch else None
     repo.ui.note(_("resolving manifests\n"))
     repo.ui.debug(" branchmerge: %s, force: %s\n" % (boolbm, boolf))
     repo.ui.debug(" ancestor: %s, local: %s, remote: %s\n" % (pa, wctx, p2))
@@ -1443,10 +1295,13 @@ def updateone(repo, fctxfunc, wctx, f, flags, backup=False, backgroundclose=Fals
         # They are handled separately.
         return 0
     wctx[f].clearunknown()
-    data = fctx.data()
-    wctx[f].write(data, flags, backgroundclose=backgroundclose)
+    wctx[f].write(fctx, flags, backgroundclose=backgroundclose)
 
-    return len(data)
+    if fctx.flags() == "m":
+        # size() doesn't seem to work for submodules
+        return len(fctx.data())
+    else:
+        return fctx.size()
 
 
 def batchget(repo, mctx, wctx, actions):
@@ -1497,9 +1352,11 @@ def applyupdates(repo, actions, wctx, mctx, overwrite, labels=None, ancestors=No
         node=wctx.p1().node(),
         other=mctx.node(),
         # Ancestor can include the working copy, so we use this helper:
-        ancestors=[scmutil.contextnodesupportingwdir(c) for c in ancestors]
-        if ancestors
-        else None,
+        ancestors=(
+            [scmutil.contextnodesupportingwdir(c) for c in ancestors]
+            if ancestors
+            else None
+        ),
         labels=labels,
     )
 
@@ -1614,7 +1471,7 @@ def applyupdates(repo, actions, wctx, mctx, overwrite, labels=None, ancestors=No
             if wctx[f0].lexists():
                 repo.ui.note(_("moving %s to %s\n") % (f0, f))
                 wctx[f].audit()
-                wctx[f].write(wctx.filectx(f0).data(), wctx.filectx(f0).flags())
+                wctx[f].write(wctx.filectx(f0), wctx.filectx(f0).flags())
                 wctx[f0].remove()
             z += 1
             prog.value = (z, f)
@@ -1628,7 +1485,7 @@ def applyupdates(repo, actions, wctx, mctx, overwrite, labels=None, ancestors=No
             )
 
             writer = rustworker.writerworker(
-                repo.fileslog.contentstore, repo.wvfs.base, numworkers
+                repo.fileslog.filestore, repo.wvfs.base, numworkers
             )
             fctx = mctx.filectx
             slinkfix = pycompat.iswindows and repo.wvfs._cansymlink
@@ -1691,7 +1548,7 @@ def applyupdates(repo, actions, wctx, mctx, overwrite, labels=None, ancestors=No
             f0, flags = args
             repo.ui.note(_("moving %s to %s\n") % (f0, f))
             wctx[f].audit()
-            wctx[f].write(wctx.filectx(f0).data(), flags)
+            wctx[f].write(wctx.filectx(f0), flags)
             wctx[f0].remove()
             updated += 1
 
@@ -1702,7 +1559,7 @@ def applyupdates(repo, actions, wctx, mctx, overwrite, labels=None, ancestors=No
             prog.value = (z, f)
             f0, flags = args
             repo.ui.note(_("getting %s to %s\n") % (f0, f))
-            wctx[f].write(mctx.filectx(f0).data(), flags)
+            wctx[f].write(mctx.filectx(f0), flags)
             updated += 1
 
         # exec
@@ -1989,13 +1846,10 @@ def recordupdates(repo, actions, branchmerge):
             prog.value += 1
 
 
-def _logupdatedistance(ui, repo, node, branchmerge):
+def _logupdatedistance(ui, repo, node):
     """Logs the update distance, if configured"""
     # internal config: merge.recordupdatedistance
     if not ui.configbool("merge", "recordupdatedistance", default=True):
-        return
-
-    if branchmerge:
         return
 
     try:
@@ -2003,36 +1857,11 @@ def _logupdatedistance(ui, repo, node, branchmerge):
         # doesn't play nicely with revsets later because it resolve to the tip
         # commit.
         node = repo[node].node()
-        revdistance = abs(repo["."].rev() - repo[node].rev())
-        if revdistance == 0:
-            distance = 0
-        elif revdistance >= 100000:
-            # Calculating real distance is too slow.
-            # Use an approximate.
-            distance = ((revdistance + 500) / 1000) * 1000
-        else:
-            distance = len(repo.revs("(%n %% .) + (. %% %n)", node, node))
+        distance = len(repo.revs("(%n %% .) + (. %% %n)", node, node))
         repo.ui.log("update_size", update_distance=distance)
     except Exception:
         # error may happen like: RepoLookupError: unknown revision '-1'
         pass
-
-
-def querywatchmanrecrawls(repo):
-    try:
-        path = repo.root
-        x, x, x, p = util.popen4("watchman debug-status")
-        stdout, stderr = p.communicate()
-        data = json.loads(stdout)
-        for root in data["roots"]:
-            if root["path"] == path:
-                count = root["recrawl_info"]["count"]
-                if root["recrawl_info"]["should-recrawl"] is True:
-                    count += 1
-                return count
-        return 0
-    except Exception:
-        return 0
 
 
 def _prefetchlazychildren(repo, node):
@@ -2058,7 +1887,8 @@ def _prefetchlazychildren(repo, node):
                 )
             else:
                 tracing.debug(
-                    "children of %s: %s" % (hex(node), [hex(n) for n in childrennodes]),
+                    "children of %s: [%s]"
+                    % (hex(node), ", ".join(map(hex, childrennodes))),
                     target="checkout::prefetch",
                 )
         else:
@@ -2074,9 +1904,153 @@ def _prefetchlazychildren(repo, node):
         )
 
 
+def goto(
+    repo,
+    node,
+    force=False,
+    labels=None,
+    updatecheck=None,
+):
+    if not force:
+        # TODO: remove the default once all callers that pass force=False pass
+        # a value for updatecheck. We may want to allow updatecheck='abort' to
+        # better suppport some of these callers.
+        if updatecheck is None:
+            updatecheck = "none"
+        assert updatecheck in ("none", "noconflict")
+
+    if (
+        repo.ui.configbool("workingcopy", "rust-checkout")
+        and repo.ui.configbool("checkout", "use-rust")
+        and (force or updatecheck != "none")
+    ):
+        repo.ui.log("checkout_info", python_checkout="rust")
+        target = repo[node]
+        try:
+            with repo.dirstate.parentchange():
+                # Trigger lazy loading of Python's treestate. If the below repo.setparents
+                # triggers loading, there will be an apparent mismatch between the dirstate
+                # read from disk and the in-memory-modified treestate.
+                repo.dirstate._map
+                ret = repo._rsrepo.goto(
+                    ctx=repo.ui.rustcontext(),
+                    target=target.node(),
+                    bookmark={"action": "none"},
+                    mode="revert_conflicts" if force else "abort_if_conflicts",
+                    report_mode="quiet",
+                )
+                if git.isgitformat(repo):
+                    git.submodulecheckout(target, force=force)
+                repo.setparents(target.node())
+                return ret
+        except rusterror.CheckoutConflictsError as ex:
+            abort_on_conflicts(ex.args[0])
+
+    repo.ui.log("checkout_info", python_checkout="python")
+
+    _logupdatedistance(repo.ui, repo, node)
+    _prefetchlazychildren(repo, node)
+
+    if (
+        edenfs.requirement in repo.requirements
+        or git.DOTGIT_REQUIREMENT in repo.requirements
+    ):
+        from . import eden_update
+
+        return eden_update.update(
+            repo,
+            node,
+            force=force,
+            labels=labels,
+            updatecheck=updatecheck,
+        )
+
+    # If we're doing the initial checkout from null, let's use the new fancier
+    # nativecheckout, since it has more efficient fetch mechanics.
+    # git backend only supports nativecheckout at present.
+    isclonecheckout = repo["."].node() == nullid
+
+    if (
+        repo.ui.configbool("experimental", "nativecheckout")
+        or (repo.ui.configbool("clone", "nativecheckout") and isclonecheckout)
+        or git.isgitstore(repo)
+    ):
+        wc = repo[None]
+
+        if (
+            not isclonecheckout
+            and (force or updatecheck != "noconflict")
+            and (wc.dirty(missing=True) or mergestate.read(repo).active())
+        ):
+            fallbackcheckout = (
+                "Working copy is dirty and --clean specified - not supported yet"
+            )
+        elif not hasattr(repo.fileslog, "filestore"):
+            fallbackcheckout = "Repo does not have remotefilelog"
+        else:
+            fallbackcheckout = None
+
+        if fallbackcheckout:
+            repo.ui.debug("Not using native checkout: %s\n" % fallbackcheckout)
+        else:
+            # If the user is attempting to checkout for the first time, let's assume
+            # they don't have any pending changes and let's do a force checkout.
+            # This makes it much faster, by skipping the entire "check for unknown
+            # files" and "check for conflicts" code paths, and makes it so they
+            # aren't blocked by pending files and have to purge+clone over and over.
+            if isclonecheckout:
+                force = True
+
+            p1 = wc.parents()[0]
+            p2 = repo[node]
+
+            with repo.wlock():
+                ret = donativecheckout(
+                    repo,
+                    p1,
+                    p2,
+                    force,
+                    wc,
+                )
+                if git.isgitformat(repo):
+                    git.submodulecheckout(p2, force=force)
+                return ret
+
+    return _update(
+        repo,
+        node,
+        force=force,
+        labels=labels,
+        updatecheck=updatecheck,
+    )
+
+
+def merge(
+    repo,
+    node,
+    force=False,
+    ancestor=None,
+    mergeancestor=False,
+    labels=None,
+    wc=None,
+):
+    _prefetchlazychildren(repo, node)
+
+    return _update(
+        repo,
+        node,
+        branchmerge=True,
+        ancestor=ancestor,
+        mergeancestor=mergeancestor,
+        force=force,
+        labels=labels,
+        wc=wc,
+    )
+
+
 @perftrace.tracefunc("Update")
 @util.timefunction("mergeupdate", 0, "ui")
-def update(
+def _update(
     repo,
     node,
     branchmerge=False,
@@ -2105,7 +2079,7 @@ def update(
     dirty, whether a revision is specified, and the relationship of the parent
     rev to the target rev (linear or not). Match from top first. The -n
     option doesn't exist on the command line, but represents the
-    experimental.updatecheck=noconflict option.
+    commands.update.check=noconflict option.
 
     This logic is tested by test-update-branches.t.
 
@@ -2137,84 +2111,13 @@ def update(
     Return the same tuple as applyupdates().
     """
 
-    # This function used to find the default destination if node was None, but
-    # that's now in destutil.py.
     assert node is not None
 
-    _prefetchlazychildren(repo, node)
-    _logupdatedistance(repo.ui, repo, node, branchmerge)
-
+    # Positive indication we aren't using eden fastpath for eden integration tests.
     if edenfs.requirement in repo.requirements:
-        if branchmerge:
-            # TODO: We potentially should support handling this scenario ourself in
-            # the future.  For now we simply haven't investigated what the correct
-            # semantics are in this case.
-            why_not_eden = 'branchmerge is "truthy:" %s.' % branchmerge
-        elif ancestor is not None:
-            # TODO: We potentially should support handling this scenario ourself in
-            # the future.  For now we simply haven't investigated what the correct
-            # semantics are in this case.
-            why_not_eden = "ancestor is not None: %s." % ancestor
-        elif wc is not None and wc.isinmemory():
-            # In memory merges do not operate on the working directory,
-            # so we don't need to ask eden to change the working directory state
-            # at all, and can use the vanilla merge logic in this case.
-            why_not_eden = "merge is in-memory"
-        else:
-            # TODO: Figure out what's the other cases here.
-            why_not_eden = None
-
-        if why_not_eden:
-            repo.ui.debug(
-                "falling back to non-eden update code path: %s\n" % why_not_eden
-            )
-        else:
-            from . import eden_update
-
-            oldnode = repo["."].node()
-
-            result = eden_update.update(
-                repo,
-                node,
-                branchmerge,
-                force,
-                ancestor,
-                mergeancestor,
-                labels,
-                updatecheck,
-                wc,
-            )
-
-            prefetchprofiles = repo.ui.configlist("eden", "prefetchsparseprofiles")
-            if prefetchprofiles:
-                from sapling.ext import sparse
-
-                raw = ""
-                for profile in prefetchprofiles:
-                    raw += "%%include %s\n" % profile
-                rawconfig = sparse.readsparseconfig(
-                    repo, raw, filename="eden_checkout_prefetch"
-                )
-                prefetchmatcher = sparse.computesparsematcher(
-                    repo, ["."], rawconfig=rawconfig
-                )
-                repo.ui.status_err(
-                    _("prefetching %s sparse profiles\n") % len(prefetchprofiles)
-                )
-                repo.prefetch(["."], base=oldnode, matcher=prefetchmatcher)
-            return result
-
-    if not branchmerge and not force:
-        # TODO: remove the default once all callers that pass branchmerge=False
-        # and force=False pass a value for updatecheck. We may want to allow
-        # updatecheck='abort' to better suppport some of these callers.
-        if updatecheck is None:
-            updatecheck = "linear"
-        assert updatecheck in ("none", "linear", "noconflict")
+        repo.ui.debug("falling back to non-eden update code path: merge\n")
 
     with repo.wlock():
-        prerecrawls = querywatchmanrecrawls(repo)
-
         if wc is None:
             wc = repo[None]
         pl = wc.parents()
@@ -2228,66 +2131,6 @@ def update(
         p2 = repo[node]
 
         fp1, fp2, xp1, xp2 = p1.node(), p2.node(), str(p1), str(p2)
-
-        # A temporary escape hatch for clones, since they're notoriously flakey
-        # with http.
-        if repo.ui.configbool("clone", "nohttp") and repo["."].node() == nullid:
-            repo.ui.setconfig("remotefilelog", "http", "False")
-            repo.ui.setconfig("treemanifest", "http", "False")
-
-        # If we're doing the initial checkout from null, let's use the new fancier
-        # nativecheckout, since it has more efficient fetch mechanics.
-        # git backend only supports nativecheckout at present.
-        isclonecheckout = repo["."].node() == nullid
-
-        # If the user is attempting to checkout for the first time, let's assume
-        # they don't have any pending changes and let's do a force checkout.
-        # This makes it much faster, by skipping the entire "check for unknown
-        # files" and "check for conflicts" code paths, and makes it so they
-        # aren't blocked by pending files and have to purge+clone over and over.
-        if isclonecheckout:
-            force = True
-
-        if (
-            repo.ui.configbool("experimental", "nativecheckout")
-            or (repo.ui.configbool("clone", "nativecheckout") and isclonecheckout)
-            or git.isgitstore(repo)
-        ):
-            if branchmerge:
-                fallbackcheckout = "branchmerge is not supported: %s" % branchmerge
-            elif ancestor is not None:
-                fallbackcheckout = "ancestor is not supported: %s" % ancestor
-            elif wc is not None and wc.isinmemory():
-                fallbackcheckout = "Native checkout does not work inmemory"
-            elif (
-                not isclonecheckout
-                and (force or updatecheck != "noconflict")
-                and (wc.dirty(missing=True) or mergestate.read(repo).active())
-            ):
-                fallbackcheckout = (
-                    "Working copy is dirty and --clean specified - not supported yet"
-                )
-            elif not hasattr(repo.fileslog, "contentstore"):
-                fallbackcheckout = "Repo does not have remotefilelog"
-            else:
-                fallbackcheckout = None
-
-            if fallbackcheckout:
-                repo.ui.debug("Not using native checkout: %s\n" % fallbackcheckout)
-            else:
-                ret = donativecheckout(
-                    repo,
-                    p1,
-                    p2,
-                    xp1,
-                    xp2,
-                    force,
-                    wc,
-                    prerecrawls,
-                )
-                if git.isgitformat(repo) and not wc.isinmemory():
-                    git.submodulecheckout(p2, force=force)
-                return ret
 
         if pas[0] is None:
             if repo.ui.configlist("merge", "preferancestor") == ["*"]:
@@ -2327,28 +2170,6 @@ def update(
                 repo.hook("update", parent1=xp2, parent2="", error=0)
                 return 0, 0, 0, 0
 
-            if updatecheck == "linear" and pas not in ([p1], [p2]):  # nonlinear
-                dirty = wc.dirty(missing=True)
-                if dirty:
-                    # Branching is a bit strange to ensure we do the minimal
-                    # amount of call to mutation.foreground_contains.
-                    if mutation.enabled(repo):
-                        in_foreground = mutation.foreground_contains(
-                            repo, [p1.node()], repo[node].node()
-                        )
-                    else:
-                        in_foreground = False
-                    # note: the <node> variable contains a random identifier
-                    if in_foreground:
-                        pass  # allow updating to successors
-                    else:
-                        msg = _("uncommitted changes")
-                        hint = _("commit or goto --clean to discard changes")
-                        raise error.UpdateAbort(msg, hint=hint)
-                else:
-                    # Allow jumping branches if clean and specific rev given
-                    pass
-
         if overwrite:
             pas = [wc]
         elif not branchmerge:
@@ -2385,14 +2206,7 @@ def update(
 
             paths = sorted(paths)
             if len(paths) > 0:
-                msg = _("%d conflicting file changes:\n") % len(paths)
-                for path in i18n.limititems(paths):
-                    msg += " %s\n" % path
-                hint = _(
-                    "commit, shelve, goto --clean to discard all your changes"
-                    ", or update --merge to merge them"
-                )
-                raise error.Abort(msg.strip(), hint=hint)
+                abort_on_conflicts(paths)
 
         # Convert to dictionary-of-lists format
         actions = dict((m, []) for m in "a am f g cd dc r rg dm dg m e k p pr".split())
@@ -2498,14 +2312,28 @@ def update(
 
     # Log the number of files updated.
     repo.ui.log("update_size", update_filecount=sum(stats))
-    postrecrawls = querywatchmanrecrawls(repo)
-    repo.ui.log("watchman-recrawls", watchman_recrawls=postrecrawls - prerecrawls)
 
     return stats
 
 
+def abort_on_conflicts(paths):
+    msg = _("%d conflicting file changes:\n") % len(paths)
+    for path in i18n.limititems(paths):
+        msg += " %s\n" % path
+
+    hint = _(
+        "commit, shelve, goto --clean to discard all your changes"
+        ", or goto --merge to merge them"
+    )
+
+    raise error.Abort(msg.strip(), hint=hint)
+
+
 def getsparsematchers(repo, fp1, fp2):
-    sparsematch = getattr(repo, "sparsematch", None)
+    shouldsparsematch = hasattr(repo, "sparsematch") and (
+        "eden" not in repo.requirements or "edensparse" in repo.requirements
+    )
+    sparsematch = getattr(repo, "sparsematch", None) if shouldsparsematch else None
     if sparsematch is not None:
         from sapling.ext import sparse
 
@@ -2555,12 +2383,15 @@ def makenativecheckoutplan(repo, p1, p2, updateprogresspath=None):
 
 
 @util.timefunction("donativecheckout", 0, "ui")
-def donativecheckout(repo, p1, p2, xp1, xp2, force, wc, prerecrawls):
+def donativecheckout(repo, p1, p2, force, wc):
     repo.ui.debug("Using native checkout\n")
     repo.ui.log(
         "nativecheckout",
         using_nativecheckout=True,
     )
+
+    xp1 = str(p1)
+    xp2 = str(p2)
 
     updateprogresspath = None
     if repo.ui.configbool("checkout", "resumable"):
@@ -2572,15 +2403,10 @@ def donativecheckout(repo, p1, p2, xp1, xp2, force, wc, prerecrawls):
         repo.ui.debug("Native checkout plan:\n%s\n" % plan)
 
     if not force:
-        if git.isgitstore(repo):
-            store = repo.fileslog.contentstore
-        else:
-            store = repo.fileslog.filescmstore
-
         status = nativestatus.status(repo.status(unknown=True))
         unknown = plan.check_unknown_files(
             p2.manifest(),
-            store,
+            repo.fileslog.filestore,
             repo.dirstate._map._tree,
             status,
         )
@@ -2615,14 +2441,11 @@ def donativecheckout(repo, p1, p2, xp1, xp2, force, wc, prerecrawls):
     cwd = pycompat.getcwdsafe()
 
     repo.ui.debug("Applying to %s \n" % repo.wvfs.base)
-    if repo.ui.configbool("nativecheckout", "usescmstore"):
-        plan.apply(
-            repo.fileslog.filescmstore,
-        )
-    else:
-        plan.apply(
-            repo.fileslog.contentstore,
-        )
+    failed_removes = plan.apply(
+        repo.fileslog.filestore,
+    )
+    for path, err in failed_removes:
+        repo.ui.warn(_("update failed to remove %s: %s!\n") % (path, err))
     repo.ui.debug("Apply done\n")
     stats = plan.stats()
 
@@ -2656,8 +2479,6 @@ def donativecheckout(repo, p1, p2, xp1, xp2, force, wc, prerecrawls):
                 repo._persistprofileconfigs()
 
     repo.hook("update", parent1=xp1, parent2=xp2, error=stats[3])
-    postrecrawls = querywatchmanrecrawls(repo)
-    repo.ui.log("watchman-recrawls", watchman_recrawls=postrecrawls - prerecrawls)
     return stats
 
 
@@ -2684,10 +2505,9 @@ def graft(repo, ctx, pctx, labels, keepparent=False):
     # which local deleted".
     mergeancestor = repo.changelog.isancestor(repo["."].node(), ctx.node())
 
-    stats = update(
+    stats = merge(
         repo,
         ctx.node(),
-        branchmerge=True,
         force=True,
         ancestor=pctx.node(),
         mergeancestor=mergeancestor,

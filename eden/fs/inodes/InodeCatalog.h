@@ -9,13 +9,13 @@
 
 #include <optional>
 
+#include "eden/common/utils/Bug.h"
+#include "eden/common/utils/ImmediateFuture.h"
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/inodes/overlay/OverlayCheckerUtil.h"
 #include "eden/fs/inodes/overlay/gen-cpp2/overlay_types.h"
 #include "eden/fs/model/Tree.h"
-#include "eden/fs/utils/Bug.h"
-#include "eden/fs/utils/ImmediateFuture.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 #ifdef __APPLE__
 #include <sys/mount.h>
@@ -170,10 +170,10 @@ class InodeCatalog {
    * directory when EdenFS is not running.
    */
   virtual InodeNumber scanLocalChanges(
-      FOLLY_MAYBE_UNUSED std::shared_ptr<const EdenConfig> config,
-      FOLLY_MAYBE_UNUSED AbsolutePathPiece mountPath,
-      FOLLY_MAYBE_UNUSED bool windowsSymlinksEnabled,
-      FOLLY_MAYBE_UNUSED LookupCallback& callback) {
+      [[maybe_unused]] std::shared_ptr<const EdenConfig> config,
+      [[maybe_unused]] AbsolutePathPiece mountPath,
+      [[maybe_unused]] bool windowsSymlinksEnabled,
+      [[maybe_unused]] LookupCallback& callback) {
     EDEN_BUG() << "UNIMPLEMENTED";
   }
 

@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
 Setup:
@@ -66,7 +68,7 @@ Arbitraryfilectx.cmp does not follow symlinks:
   > +A
   > \ No newline at end of file
   > EOF
-  $ hg up -q
+  $ hg up -q tip
 #endif
 
 These files are different and should return True (different):

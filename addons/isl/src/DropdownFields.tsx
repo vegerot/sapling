@@ -5,8 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import {VSCodeDivider} from '@vscode/webview-ui-toolkit/react';
-import {Icon} from 'shared/Icon';
+import {Divider} from 'isl-components/Divider';
+import {Icon} from 'isl-components/Icon';
 
 import './DropdownFields.css';
 
@@ -29,7 +29,7 @@ export function DropdownFields({
         <Icon icon={icon} size="M" />
         <strong role="heading">{title}</strong>
       </div>
-      <VSCodeDivider />
+      <Divider />
       <div className="dropdown-fields-content">{children}</div>
     </div>
   );

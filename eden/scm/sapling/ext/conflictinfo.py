@@ -19,6 +19,10 @@ This commit adds `--tool=internal:dumpjson`. It prints, for each conflict, the
 flags), and where the user/tool should write a resolved version (i.e., the
 working copy) as JSON. The user will then resolve the conflicts at their leisure
 and run `hg resolve --mark`.
+
+It also supports `:merge3` style contents in the output, except for some
+sepcial cases. For instance, merge tools don't support symlinks, delete/update
+conflicts.
 """
 
 from __future__ import absolute_import
@@ -28,6 +32,7 @@ from typing import Any, Dict, Optional, Union
 
 from sapling import (
     commands,
+    context as contextmod,
     error,
     extensions,
     merge as mergemod,
@@ -38,14 +43,15 @@ from sapling import (
 from sapling.filemerge import absentfilectx
 from sapling.i18n import _
 from sapling.node import bin
+from sapling.simplemerge import Merge3Text, render_merge3
 
 
 testedwith = "ships-with-fb-ext"
 
-# `unfinishedstates` would be ideal for this except it does not include merge,
-# and doesn't expose the command to run to resume by itself (it instead exposes
-# a help string)
 # Note: order matters (consider rebase v. merge).
+#
+# TODO: Consolidate with state logic in repostate::command_state.
+#       Logic for merge/state2 will need to be tweaked to work here.
 CONFLICTSTATES = [
     [
         "graftstate",
@@ -115,6 +121,14 @@ def _findconflictcommand(repo) -> Union[None, Dict[str, str], str]:
     return None
 
 
+def _findconflicthashes(mergestate) -> Dict[str, str]:
+    ms = mergestate._rust_ms
+    return {
+        "local": ms.local().hex() if ms.local() else None,
+        "other": ms.other().hex() if ms.other() else None,
+    }
+
+
 # To become a block in commands.py/resolve().
 def _resolve(orig, ui, repo, *pats, **opts):
     # This block is duplicated from commands.py to maintain behavior.
@@ -162,6 +176,7 @@ def _resolve(orig, ui, repo, *pats, **opts):
             formatter.write("command_details", "%s\n", cmd)
         else:
             formatter.write("command", "%s\n", None)  # For BC
+        formatter.write("hashes", "%s\n", _findconflicthashes(mergestate))
         formatter.end()
         return 0
 
@@ -176,7 +191,7 @@ def _summarizefileconflicts(self, path, workingctx) -> Optional[Dict[str, Any]]:
     if self[path] in ("d", "r", "pr", "pu"):
         return None
 
-    stateentry = self._state[path]
+    stateentry = self._rust_ms.get(path)
     localnode = bin(stateentry[1])
     ancestorfile = stateentry[3]
     ancestornode = bin(stateentry[4])
@@ -201,7 +216,7 @@ def _summarizepathconflicts(self, path) -> Optional[Dict[str, Any]]:
     if self[path] != "pu":
         return None
 
-    stateentry = self._state[path]
+    stateentry = self._rust_ms.get(path)
     frename = stateentry[1]
     forigin = stateentry[2]
     return {
@@ -227,7 +242,9 @@ def _summarize(repo, workingfilectx, otherctx, basectx) -> Dict[str, Any]:
     )
 
     def flags(context):
-        if isinstance(context, absentfilectx):
+        if isinstance(context, absentfilectx) or (
+            isinstance(context, contextmod.workingfilectx) and not context.lexists()
+        ):
             return {
                 "contents": None,
                 "exists": False,
@@ -281,10 +298,41 @@ def _summarize(repo, workingfilectx, otherctx, basectx) -> Dict[str, Any]:
 
     output["path"] = repo.wjoin(workingfilectx.path())
 
+    base = flags(basectx)
+    other = flags(otherctx)
+
+    gen_contents_with_conflict_styles(repo, output, base, local, other)
+
     return {
-        "base": flags(basectx),
+        "base": base,
         "local": local,
-        "other": flags(otherctx),
+        "other": other,
         "output": output,
         "path": workingfilectx.path(),
     }
+
+
+def gen_contents_with_conflict_styles(repo, output, base, local, other):
+    if local["issymlink"] or other["issymlink"]:
+        # symlinks are not supported by merge tools
+        return
+    try:
+        basetext = base["contents"].encode("utf8")
+        desttext = local["contents"].encode("utf8")
+        srctext = other["contents"].encode("utf8")
+    except AttributeError:
+        # "contents" might be None for delete/update conflict
+        return
+
+    overrides = {("ui", "quiet"): True}
+    with repo.ui.configoverride(overrides):
+        m3 = Merge3Text(basetext, desttext, srctext, repo.ui)
+
+        # we can extend this to other conflict styles in the future
+        conflict_renders = [
+            ("merge3", render_merge3),
+        ]
+        for name, conflict_render in conflict_renders:
+            lines = conflict_render(m3, b"dest", b"source", b"base")[0]
+            contents = _decodeutf8ornone(b"".join(lines))
+            output[f"contents:{name}"] = contents

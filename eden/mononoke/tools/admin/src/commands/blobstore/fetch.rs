@@ -13,6 +13,7 @@ use anyhow::Result;
 use blobstore::Blobstore;
 use blobstore::BlobstoreGetData;
 use bytes::Bytes;
+use bytes::BytesMut;
 use changeset_info::ChangesetInfo;
 use chrono::Local;
 use chrono::TimeZone;
@@ -20,18 +21,26 @@ use clap::Args;
 use clap::ValueEnum;
 use cmdlib_displaying::hexdump;
 use context::CoreContext;
+use futures::TryStreamExt;
 use git_types::Tree as GitTree;
+use mercurial_types::HgAugmentedManifestEntry;
+use mercurial_types::HgAugmentedManifestEnvelope;
 use mercurial_types::HgChangesetEnvelope;
 use mercurial_types::HgFileEnvelope;
 use mercurial_types::HgManifestEnvelope;
-use mononoke_types::basename_suffix_skeleton_manifest::BasenameSuffixSkeletonManifest;
-use mononoke_types::basename_suffix_skeleton_manifest::BssmEntry;
+use mercurial_types::ShardedHgAugmentedManifest;
+use mononoke_types::basename_suffix_skeleton_manifest_v3::BssmV3Directory;
+use mononoke_types::basename_suffix_skeleton_manifest_v3::BssmV3Entry;
 use mononoke_types::blame_v2::BlameV2;
 use mononoke_types::deleted_manifest_v2::DeletedManifestV2;
 use mononoke_types::fastlog_batch::FastlogBatch;
 use mononoke_types::fsnode::Fsnode;
 use mononoke_types::sharded_map::ShardedMapNode;
+use mononoke_types::sharded_map_v2::ShardedMapV2Node;
 use mononoke_types::skeleton_manifest::SkeletonManifest;
+use mononoke_types::test_manifest::TestManifest;
+use mononoke_types::test_sharded_manifest::TestShardedManifest;
+use mononoke_types::test_sharded_manifest::TestShardedManifestEntry;
 use mononoke_types::typed_hash::DeletedManifestV2Id;
 use mononoke_types::unode::FileUnode;
 use mononoke_types::unode::ManifestUnode;
@@ -74,6 +83,9 @@ pub enum DecodeAs {
     HgChangeset,
     HgManifest,
     HgFilenode,
+    HgAugmentedManifest,
+    ShardedHgAugmentedManifestMapNode,
+    ShardedHgAugmentedManifest,
     GitTree,
     SkeletonManifest,
     Fsnode,
@@ -85,9 +97,12 @@ pub enum DecodeAs {
     DeletedManifestV2MapNode,
     DeletedManifestV2,
     BlameV2,
-    BasenameSuffixSkeletonManifestMapNode,
-    BasenameSuffixSkeletonManifest,
+    BasenameSuffixSkeletonManifestV3MapNode,
+    BasenameSuffixSkeletonManifestV3,
     ChangesetInfo,
+    TestManifest,
+    TestShardedManifest,
+    TestShardedManifestMapNode,
 }
 
 impl DecodeAs {
@@ -103,6 +118,11 @@ impl DecodeAs {
                 ("hgchangeset.", DecodeAs::HgChangeset),
                 ("hgmanifest.", DecodeAs::HgManifest),
                 ("hgfilenode.", DecodeAs::HgFilenode),
+                (
+                    "hgaugmentedmanifest.map2node.",
+                    DecodeAs::ShardedHgAugmentedManifestMapNode,
+                ),
+                ("hgaugmentedmanifest.", DecodeAs::HgAugmentedManifest),
                 ("git.tree.", DecodeAs::GitTree),
                 ("skeletonmanifest.", DecodeAs::SkeletonManifest),
                 ("fsnode.", DecodeAs::Fsnode),
@@ -118,10 +138,16 @@ impl DecodeAs {
                 ("deletedmanifest2.", DecodeAs::DeletedManifestV2),
                 ("blame_v2.", DecodeAs::BlameV2),
                 (
-                    "bssm.mapnode.",
-                    DecodeAs::BasenameSuffixSkeletonManifestMapNode,
+                    "bssm3.map2node.",
+                    DecodeAs::BasenameSuffixSkeletonManifestV3MapNode,
                 ),
-                ("bssm.", DecodeAs::BasenameSuffixSkeletonManifest),
+                ("bssm3.", DecodeAs::BasenameSuffixSkeletonManifestV3),
+                ("testmanifest.", DecodeAs::TestManifest),
+                (
+                    "testshardedmanifest.map2node.",
+                    DecodeAs::TestShardedManifestMapNode,
+                ),
+                ("testshardedmanifest.", DecodeAs::TestShardedManifest),
                 ("changeset_info.", DecodeAs::ChangesetInfo),
             ] {
                 if key[index..].starts_with(prefix) {
@@ -154,9 +180,22 @@ impl Decoded {
             Err(err) => Decoded::Fail(err.to_string()),
         }
     }
+
+    fn try_string<E: std::fmt::Display>(data: Result<String, E>) -> Decoded {
+        match data {
+            Ok(data) => Decoded::Display(data),
+            Err(err) => Decoded::Fail(err.to_string()),
+        }
+    }
 }
 
-fn decode(key: &str, data: BlobstoreGetData, mut decode_as: DecodeAs) -> Decoded {
+async fn decode(
+    ctx: &CoreContext,
+    blobstore: &dyn Blobstore,
+    key: &str,
+    data: BlobstoreGetData,
+    mut decode_as: DecodeAs,
+) -> Decoded {
     if decode_as == DecodeAs::Auto {
         if let Some(auto_decode_as) = DecodeAs::from_key_prefix(key) {
             decode_as = auto_decode_as;
@@ -177,6 +216,22 @@ fn decode(key: &str, data: BlobstoreGetData, mut decode_as: DecodeAs) -> Decoded
         DecodeAs::HgChangeset => Decoded::try_display(HgChangesetEnvelope::from_blob(data.into())),
         DecodeAs::HgManifest => Decoded::try_display(HgManifestEnvelope::from_blob(data.into())),
         DecodeAs::HgFilenode => Decoded::try_display(HgFileEnvelope::from_blob(data.into())),
+        DecodeAs::ShardedHgAugmentedManifest => Decoded::try_debug(
+            HgAugmentedManifestEnvelope::from_blob(data.into_raw_bytes()),
+        ),
+        DecodeAs::ShardedHgAugmentedManifestMapNode => {
+            Decoded::try_debug(ShardedMapV2Node::<HgAugmentedManifestEntry>::from_bytes(
+                &data.into_raw_bytes(),
+            ))
+        }
+        DecodeAs::HgAugmentedManifest => {
+            match HgAugmentedManifestEnvelope::from_blob(data.into_raw_bytes()) {
+                Ok(envelope) => Decoded::try_string(
+                    render_hg_augmented_manifest(ctx, blobstore, envelope.augmented_manifest).await,
+                ),
+                Err(e) => Decoded::Fail(e.to_string()),
+            }
+        }
         DecodeAs::GitTree => Decoded::try_display(GitTree::try_from(data)),
         DecodeAs::SkeletonManifest => {
             Decoded::try_debug(SkeletonManifest::from_bytes(data.into_raw_bytes().as_ref()))
@@ -206,16 +261,25 @@ fn decode(key: &str, data: BlobstoreGetData, mut decode_as: DecodeAs) -> Decoded
         DecodeAs::BlameV2 => {
             Decoded::try_debug(BlameV2::from_bytes(data.into_raw_bytes().as_ref()))
         }
-        DecodeAs::BasenameSuffixSkeletonManifest => Decoded::try_debug(
-            BasenameSuffixSkeletonManifest::from_bytes(&data.into_raw_bytes()),
-        ),
-        DecodeAs::BasenameSuffixSkeletonManifestMapNode => {
-            Decoded::try_debug(ShardedMapNode::<BssmEntry>::from_bytes(
-                &data.into_raw_bytes(),
-            ))
+        DecodeAs::BasenameSuffixSkeletonManifestV3 => {
+            Decoded::try_debug(BssmV3Directory::from_bytes(&data.into_raw_bytes()))
         }
+        DecodeAs::BasenameSuffixSkeletonManifestV3MapNode => Decoded::try_debug(
+            ShardedMapV2Node::<BssmV3Entry>::from_bytes(&data.into_raw_bytes()),
+        ),
         DecodeAs::ChangesetInfo => {
             Decoded::try_debug(ChangesetInfo::from_bytes(&data.into_raw_bytes()))
+        }
+        DecodeAs::TestManifest => {
+            Decoded::try_debug(TestManifest::from_bytes(&data.into_raw_bytes()))
+        }
+        DecodeAs::TestShardedManifest => {
+            Decoded::try_debug(TestShardedManifest::from_bytes(&data.into_raw_bytes()))
+        }
+        DecodeAs::TestShardedManifestMapNode => {
+            Decoded::try_debug(ShardedMapV2Node::<TestShardedManifestEntry>::from_bytes(
+                &data.into_raw_bytes(),
+            ))
         }
     }
 }
@@ -266,7 +330,7 @@ pub async fn fetch(
                 file.flush().await?;
             } else {
                 let bytes = value.as_raw_bytes().clone();
-                match decode(&fetch_args.key, value, fetch_args.decode_as) {
+                match decode(ctx, blobstore, &fetch_args.key, value, fetch_args.decode_as).await {
                     Decoded::Display(decoded) => {
                         writeln!(std::io::stdout(), "{}", decoded)?;
                     }
@@ -287,4 +351,16 @@ pub async fn fetch(
     }
 
     Ok(())
+}
+
+async fn render_hg_augmented_manifest(
+    ctx: &CoreContext,
+    blobstore: &dyn Blobstore,
+    mf: ShardedHgAugmentedManifest,
+) -> Result<String> {
+    let data = mf
+        .into_content_addressed_manifest_blob(ctx, &blobstore)
+        .try_collect::<BytesMut>()
+        .await?;
+    Ok(String::from_utf8_lossy(data.as_ref()).into_owned())
 }

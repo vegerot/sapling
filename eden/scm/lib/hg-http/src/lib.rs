@@ -70,11 +70,7 @@ pub fn http_config(
     url_for_auth: &Url,
 ) -> Result<http_client::Config, auth::MissingCerts> {
     let mut hc = http_client::Config {
-        convert_cert: config
-            .get_or("http", "convert-cert", || cfg!(windows))
-            .unwrap_or(cfg!(windows)),
-
-        client_info: ClientInfo::new().and_then(|i| i.into_json()).ok(),
+        client_info: ClientInfo::new().and_then(|i| i.to_json()).ok(),
         disable_tls_verification: INSECURE_MODE.load(Relaxed),
         unix_socket_path: config
             .get_nonempty_opt("auth_proxy", "unix_socket_path")
@@ -87,6 +83,10 @@ pub fn http_config(
         verbose: config.get_or_default("http", "verbose").unwrap_or(false),
         ..Default::default()
     };
+
+    if let Some(convert) = config.get_opt("http", "convert-cert").unwrap_or_default() {
+        hc.convert_cert = convert;
+    }
 
     let using_auth_proxy = hc.unix_socket_path.is_some()
         && url_for_auth
@@ -202,13 +202,13 @@ static PROGRESS_REPORTING_STATE: Lazy<Box<dyn Send + Sync>> = Lazy::new(|| {
 fn bump_counters(client_id: &str, stats: &Stats) {
     let n = |suffix: &'static str| -> String { format!("http.{}.{}", client_id, suffix) };
     // TODO: gauges: rx_bytes and tx_bytes; histograms: request_time_ms, response_delay_ms
-    increment_counter(n("total_rx_bytes"), stats.downloaded);
-    increment_counter(n("total_tx_bytes"), stats.uploaded);
-    increment_counter(n("num_requests"), stats.requests);
-    increment_counter(n("total_request_time_ms"), stats.time.as_millis() as usize);
+    increment_counter(n("total_rx_bytes"), stats.downloaded as u64);
+    increment_counter(n("total_tx_bytes"), stats.uploaded as u64);
+    increment_counter(n("num_requests"), stats.requests as u64);
+    increment_counter(n("total_request_time_ms"), stats.time.as_millis() as u64);
     increment_counter(
         n("total_response_delay_ms"),
-        stats.latency.as_millis() as usize,
+        stats.latency.as_millis() as u64,
     )
 }
 
@@ -223,11 +223,6 @@ mod tests {
         let mut hg_config = BTreeMap::<&str, &str>::new();
 
         let url: Url = "https://example.com".parse().unwrap();
-
-        assert_eq!(
-            cfg!(windows),
-            http_config(&hg_config, &url).unwrap().convert_cert
-        );
 
         hg_config.insert("http.convert-cert", "True");
         assert!(http_config(&hg_config, &url).unwrap().convert_cert);

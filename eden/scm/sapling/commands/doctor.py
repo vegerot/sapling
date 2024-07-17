@@ -21,6 +21,7 @@ from bindings import (
 )
 
 from .. import (
+    alerts,
     bookmarks as bookmod,
     edenapi,
     error,
@@ -55,6 +56,9 @@ def doctor(ui, **opts) -> typing.Optional[int]:
     from .. import dispatch  # avoid cycle
 
     origui = ui
+
+    # show alerts first so you don't need to wait
+    alerts.print_active_alerts(ui)
 
     # Minimal logic to get key repo objects without actually constructing
     # a real repo object.
@@ -99,7 +103,7 @@ def doctor(ui, **opts) -> typing.Optional[int]:
     # Construct the real repo object as shallowutil requires it.
     # User the original ui, so we don't load the repo on top of the ui we
     # manually loaded earlier. This caused unexpected side effects in the
-    # dynamicconfig validation layer.
+    # internalconfig validation layer.
     repo = hg.repository(origui, repopath)
     ui = repo.ui
     if "remotefilelog" in repo.requirements:
@@ -541,7 +545,7 @@ def fshash(path: str) -> int:
         paths = [
             os.path.join(path, dirpath, name)
             for name in filenames + dirnames
-            if name != "repair.log"
+            if name not in {"repair.log", "rlock"}
         ]
         value += len(paths)
         value += sum(

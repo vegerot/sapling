@@ -28,10 +28,15 @@ use bytes::Bytes;
 use changeset_fetcher::ChangesetFetcherRef;
 use changesets::ChangesetInsert;
 use changesets::ChangesetsRef;
+use commit_cloud::CommitCloudRef;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use edenapi_types::AnyId;
+use edenapi_types::GetReferencesParams;
+use edenapi_types::ReferencesData;
+use edenapi_types::UpdateReferencesParams;
 use edenapi_types::UploadToken;
+use edenapi_types::WorkspaceData;
 use ephemeral_blobstore::Bubble;
 use ephemeral_blobstore::BubbleId;
 use ephemeral_blobstore::RepoEphemeralStore;
@@ -39,7 +44,6 @@ use ephemeral_blobstore::StorageLocation;
 use filestore::FetchKey;
 use filestore::FilestoreConfigRef;
 use filestore::StoreRequest;
-use futures::compat::Future01CompatExt;
 use futures::compat::Stream01CompatExt;
 use futures::future;
 use futures::stream;
@@ -62,13 +66,12 @@ use mercurial_types::HgManifestId;
 use mercurial_types::HgNodeHash;
 use metaconfig_types::RepoConfig;
 use mononoke_api::errors::MononokeError;
-use mononoke_api::path::MononokePath;
 use mononoke_api::repo::RepoContext;
+use mononoke_types::path::MPath;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::ContentMetadataV2;
-use mononoke_types::NonRootMPath;
 use mononoke_types::RepoPath;
 use phases::PhasesRef;
 use repo_blobstore::RepoBlobstore;
@@ -136,7 +139,7 @@ impl HgRepoContext {
         Ok(self
             .repo()
             .repo_ephemeral_store_arc()
-            .create_bubble(custom_duration, labels)
+            .create_bubble(self.ctx(), custom_duration, labels)
             .await?)
     }
 
@@ -389,7 +392,7 @@ impl HgRepoContext {
             Arc::new(self.blob_repo().repo_blobstore().clone()),
         )?;
 
-        upload_future.compat().await.map_err(MononokeError::from)?;
+        upload_future.await.map_err(MononokeError::from)?;
 
         Ok(())
     }
@@ -489,15 +492,15 @@ impl HgRepoContext {
     /// command.
     pub fn trees_under_path(
         &self,
-        path: MononokePath,
+        path: MPath,
         root_versions: impl IntoIterator<Item = HgManifestId>,
         base_versions: impl IntoIterator<Item = HgManifestId>,
         depth: Option<usize>,
-    ) -> impl TryStream<Ok = (HgTreeContext, MononokePath), Error = MononokeError> {
+    ) -> impl TryStream<Ok = (HgTreeContext, MPath), Error = MononokeError> {
         let ctx = self.ctx().clone();
         let blob_repo = self.blob_repo();
         let args = GettreepackArgs {
-            rootdir: path.into_mpath(),
+            rootdir: path,
             mfnodes: root_versions.into_iter().collect(),
             basemfnodes: base_versions.into_iter().collect(),
             directories: vec![], // Not supported.
@@ -509,11 +512,10 @@ impl HgRepoContext {
             .map_err(MononokeError::from)
             .and_then({
                 let repo = self.clone();
-                move |(mfid, path): (HgManifestId, Option<NonRootMPath>)| {
+                move |(mfid, path): (HgManifestId, MPath)| {
                     let repo = repo.clone();
                     async move {
                         let tree = HgTreeContext::new(repo, mfid).await?;
-                        let path = MononokePath::new(path);
                         Ok((tree, path))
                     }
                 }
@@ -567,7 +569,7 @@ impl HgRepoContext {
     }
 
     /// This provides the same functionality as
-    /// `mononke_api::RepoContext::many_changeset_ids_to_locations`. It just translates to
+    /// `mononoke_api::RepoContext::many_changeset_ids_to_locations`. It just translates to
     /// and from Mercurial types.
     pub async fn many_changeset_ids_to_locations(
         &self,
@@ -819,10 +821,7 @@ impl HgRepoContext {
 
     /// Check if all changesets in the list are public.
     /// This may treat commits that "recently" became public as draft.
-    pub async fn is_all_public(
-        &self,
-        changesets: &Vec<HgChangesetId>,
-    ) -> Result<bool, MononokeError> {
+    pub async fn is_all_public(&self, changesets: &[HgChangesetId]) -> Result<bool, MononokeError> {
         let len = changesets.len();
         let public_phases = self
             .blob_repo()
@@ -839,7 +838,8 @@ impl HgRepoContext {
         &self,
         common: Vec<HgChangesetId>,
         heads: Vec<HgChangesetId>,
-    ) -> Result<Vec<HgChangesetSegment>, MononokeError> {
+    ) -> Result<impl Stream<Item = Result<HgChangesetSegment, MononokeError>> + '_, MononokeError>
+    {
         let bonsai_common = self.convert_changeset_ids(common).await?;
         let bonsai_heads = self.convert_changeset_ids(heads).await?;
 
@@ -850,77 +850,67 @@ impl HgRepoContext {
             .ancestors_difference_segments(self.ctx(), bonsai_heads, bonsai_common)
             .await?;
 
-        let bonsai_hg_mapping = stream::iter(segments.clone())
-            .flat_map(|segment| {
-                stream::iter([segment.head, segment.base])
-                    .chain(stream::iter(segment.parents).map(|parent| parent.cs_id))
-            })
-            .chunks(100)
-            .then(move |chunk| async move {
-                let mapping = self
+        Ok(stream::iter(segments.into_iter())
+            .chunks(25)
+            .map(move |segments| async move {
+                let mut ids = HashSet::with_capacity(segments.len() * 4);
+                for segment in segments.iter() {
+                    ids.insert(segment.head);
+                    ids.insert(segment.base);
+                    for parent in segment.parents.iter() {
+                        ids.insert(parent.cs_id);
+                        if let Some(location) = &parent.location {
+                            ids.insert(location.head);
+                        }
+                    }
+                }
+                let mapping: HashMap<ChangesetId, HgChangesetId> = self
                     .blob_repo()
-                    .get_hg_bonsai_mapping(self.ctx().clone(), chunk.to_vec())
+                    .get_hg_bonsai_mapping(self.ctx().clone(), ids.into_iter().collect::<Vec<_>>())
                     .await
-                    .context("error fetching hg bonsai mapping")?;
-                Ok::<_, Error>(mapping)
-            })
-            .try_collect::<Vec<Vec<(HgChangesetId, ChangesetId)>>>()
-            .await?
-            .into_iter()
-            .flatten()
-            .map(|(hgid, csid)| (csid, hgid))
-            .collect::<HashMap<_, _>>();
-
-        segments
-            .into_iter()
-            .map(|segment| {
-                Ok(HgChangesetSegment {
-                    head: *bonsai_hg_mapping.get(&segment.head).ok_or_else(|| {
-                        MononokeError::InvalidRequest(format!(
-                            "failed to find hg equivalent for segment head {}",
-                            segment.head
-                        ))
-                    })?,
-                    base: *bonsai_hg_mapping.get(&segment.base).ok_or_else(|| {
-                        MononokeError::InvalidRequest(format!(
-                            "failed to find hg equivalent for segment base {}",
-                            segment.base
-                        ))
-                    })?,
-                    length: segment.length,
-                    parents: segment
-                        .parents
-                        .into_iter()
-                        .map(|parent| {
-                            Ok(HgChangesetSegmentParent {
-                                hgid: *bonsai_hg_mapping.get(&parent.cs_id).ok_or_else(|| {
-                                    MononokeError::InvalidRequest(format!(
-                                        "failed to find hg equivalent for segment parent {}",
-                                        parent
-                                    ))
-                                })?,
-                                location: parent
-                                    .location
-                                    .map(|location| {
-                                        Ok::<_, Error>(Location {
-                                            descendant: *bonsai_hg_mapping.get(&location.head).ok_or_else(
-                                                || {
-                                                    MononokeError::InvalidRequest(format!(
-                                                        "failed to find hg equivalent for location head {}",
-                                                        location.head
-                                                    ))
-                                                },
-                                            )?,
-                                            distance: location.distance,
-                                        })
-                                    })
-                                    .transpose()?,
-                            })
+                    .context("error fetching hg bonsai mapping")?
+                    .into_iter()
+                    .map(|(hgid, csid)| (csid, hgid))
+                    .collect();
+                let map_id = move |name, csid| {
+                    mapping
+                        .get(&csid)
+                        .ok_or_else(|| {
+                            MononokeError::InvalidRequest(format!(
+                                "failed to find hg equivalent for {} {}",
+                                name, csid,
+                            ))
                         })
-                        .collect::<Result<_, MononokeError>>()?,
-                })
+                        .copied()
+                };
+                anyhow::Ok(stream::iter(segments.into_iter().map(move |segment| {
+                    Ok(HgChangesetSegment {
+                        head: map_id("segment head", segment.head)?,
+                        base: map_id("segment base", segment.base)?,
+                        length: segment.length,
+                        parents: segment
+                            .parents
+                            .into_iter()
+                            .map(|parent| {
+                                Ok(HgChangesetSegmentParent {
+                                    hgid: map_id("segment parent", parent.cs_id)?,
+                                    location: parent
+                                        .location
+                                        .map(|location| {
+                                            anyhow::Ok(Location::new(
+                                                map_id("location head", location.head)?,
+                                                location.distance,
+                                            ))
+                                        })
+                                        .transpose()?,
+                                })
+                            })
+                            .collect::<Result<_, MononokeError>>()?,
+                    })
+                })))
             })
-            .collect::<Result<_, MononokeError>>()
+            .buffered(25)
+            .try_flatten())
     }
 
     /// Return a mapping of commits to their parents that are in the segment of
@@ -948,7 +938,7 @@ impl HgRepoContext {
             .ancestors_difference_stream(&ctx, bonsai_heads, bonsai_common)
             .await?
             .map_err(MononokeError::from)
-            .and_then(move |bcs_id| {
+            .map_ok(move |bcs_id| {
                 let ctx = ctx.clone();
                 let blob_repo = blob_repo.clone();
                 async move {
@@ -957,7 +947,8 @@ impl HgRepoContext {
                         .await
                         .map_err(MononokeError::from)
                 }
-            });
+            })
+            .try_buffered(100);
         Ok(commit_graph_stream)
     }
 
@@ -1021,7 +1012,7 @@ impl HgRepoContext {
 
         let bonsai_hg_mapping = stream::iter(all_cs_ids)
             .chunks(map_chunk_size)
-            .then(move |chunk| async move {
+            .map(move |chunk| async move {
                 let mapping = self
                     .blob_repo()
                     .get_hg_bonsai_mapping(self.ctx().clone(), chunk.to_vec())
@@ -1029,6 +1020,7 @@ impl HgRepoContext {
                     .context("error fetching hg bonsai mapping")?;
                 Ok::<_, Error>(mapping)
             })
+            .buffered(25)
             .try_collect::<Vec<Vec<(HgChangesetId, ChangesetId)>>>()
             .await?
             .into_iter()
@@ -1058,6 +1050,40 @@ impl HgRepoContext {
             .collect::<Result<Vec<_>, MononokeError>>()?;
 
         Ok(hg_parent_mapping)
+    }
+
+    pub async fn cloud_workspace(
+        &self,
+        workspace: &str,
+        reponame: &str,
+    ) -> Result<WorkspaceData, MononokeError> {
+        Ok(self
+            .blob_repo()
+            .commit_cloud()
+            .get_workspace(workspace, reponame)
+            .await?)
+    }
+
+    pub async fn cloud_references(
+        &self,
+        params: &GetReferencesParams,
+    ) -> Result<ReferencesData, MononokeError> {
+        Ok(self
+            .blob_repo()
+            .commit_cloud()
+            .get_references(params)
+            .await?)
+    }
+
+    pub async fn cloud_update_references(
+        &self,
+        params: &UpdateReferencesParams,
+    ) -> Result<ReferencesData, MononokeError> {
+        Ok(self
+            .blob_repo()
+            .commit_cloud()
+            .update_references(params)
+            .await?)
     }
 }
 
@@ -1114,12 +1140,7 @@ mod tests {
         let hg = repo_ctx.hg();
 
         let trees = hg
-            .trees_under_path(
-                MononokePath::new(None),
-                vec![root_mfid_2],
-                vec![root_mfid_1],
-                Some(2),
-            )
+            .trees_under_path(MPath::ROOT, vec![root_mfid_2], vec![root_mfid_1], Some(2))
             .try_collect::<Vec<_>>()
             .await?;
 

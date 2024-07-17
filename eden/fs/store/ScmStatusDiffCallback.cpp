@@ -9,10 +9,10 @@
 #include <folly/Synchronized.h>
 #include <folly/futures/Future.h>
 #include <folly/logging/xlog.h>
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/model/Tree.h"
 #include "eden/fs/model/TreeEntry.h"
 #include "eden/fs/store/ObjectStore.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 namespace facebook::eden {
 
@@ -63,6 +63,14 @@ void ScmStatusDiffCallback::diffError(
 ScmStatus ScmStatusDiffCallback::extractStatus() {
   auto data = data_.wlock();
   return std::move(*data);
+}
+
+ScmStatus ScmStatusDiffCallback::peekStatus() const {
+  return data_.copy();
+}
+
+void ScmStatusDiffCallback::setStatus(ScmStatus status) {
+  data_ = std::move(status);
 }
 
 char scmStatusCodeChar(ScmFileStatus code) {

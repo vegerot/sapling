@@ -50,12 +50,11 @@ from __future__ import absolute_import
 import json
 import re
 import subprocess
-import sys
-import time
 from typing import List, Set, Tuple
 
 from sapling import (
     bookmarks,
+    cmdutil,
     commands,
     encoding,
     error,
@@ -72,8 +71,6 @@ from sapling import (
 )
 from sapling.i18n import _
 from sapling.node import short
-
-from . import rebase
 
 
 wrapcommand = extensions.wrapcommand
@@ -139,10 +136,13 @@ def extsetup(ui) -> None:
     wrapblame()
 
     entry = wrapcommand(commands.table, "commit", commitcmd)
-    wrapcommand(rebase.cmdtable, "rebase", _rebase)
     wrapfunction(scmutil, "cleanupnodes", cleanupnodeswrapper)
     entry = wrapcommand(commands.table, "pull", pull)
     options = entry[1]
+    options.append(
+        ("", "rebase", None, _("rebase current commit or current stack onto master"))
+    )
+    options.append(("t", "tool", "", _("specify merge tool for rebase")))
     options.append(("d", "dest", "", _("destination for rebase or update")))
 
     # anonymous function to pass ui object to _analyzewrapper
@@ -304,6 +304,14 @@ def pull(orig, ui, repo, *args, **opts):
 
     if (isrebase or update) and not dest:
         dest = ui.config("tweakdefaults", "defaultdest")
+        if dest not in repo:
+            dest = None
+
+    if isrebase and not dest:
+        # Not using main bookmark for non-rebase pull. See D38066104 and D38066103.
+        dest = bookmarks.mainbookmark(repo)
+        if dest not in repo:
+            raise error.Abort(_("missing rebase destination - supply --dest / -d"))
 
     if isrebase and update:
         mess = _("specify either rebase or update, not both")
@@ -335,6 +343,11 @@ def pull(orig, ui, repo, *args, **opts):
     if "dest" in opts and dest:
         del opts["dest"]
 
+    if rebase:
+        # Bail out before "pull" if we can't do the rebase.
+        cmdutil.checkunfinished(repo)
+        cmdutil.bailifchanged(repo)
+
     ret = orig(ui, repo, *args, **opts)
 
     # NB: we use rebase and not isrebase on the next line because
@@ -344,7 +357,7 @@ def pull(orig, ui, repo, *args, **opts):
             rebasemodule.rebase, ui, repo, dest=dest, tool=tool
         )
     if dest and update:
-        ret = ret or commands.update(ui, repo, node=dest, check=True)
+        ret = ret or commands.update(ui, repo, node=dest)
 
     return ret
 
@@ -373,8 +386,12 @@ def pullrebaseffwd(orig, rebasefunc, ui, repo, source: str = "default", **opts):
     # need to wrap the rebasemodule.rebase function that it calls to replace it
     # with our rebaseorfastforward method.
     rebasing = "rebase" in opts
+    rebasemodule = None
     if rebasing:
-        rebasemodule = extensions.find("rebase")
+        try:
+            rebasemodule = extensions.find("rebase")
+        except KeyError:
+            pass
         if rebasemodule:
             wrapfunction(rebasemodule, "rebase", rebaseorfastforward)
     ret = orig(rebasefunc, ui, repo, source, **opts)
@@ -411,20 +428,22 @@ def wrapblame() -> None:
         options[cind] = ("c", "changeset", None, _("list the changeset (default)"))
 
 
-def blame(orig, ui, repo, *pats, **opts):
-    @templater.templatefunc("blame_phabdiffid")
-    def phabdiff(context, mapping, args):
-        """Fetch the Phab Diff Id from the node in mapping"""
-        res = ""
-        try:
-            d = repo[mapping["rev"]].description()
-            pat = r"https://.*/(D\d+)"
-            m = re.search(pat, d)
-            res = m.group(1) if m else ""
-        except Exception:
-            pass
-        return res
+@templater.templatefunc("blame_phabdiffid")
+def phabdiff(context, mapping, args):
+    """Fetch the Phab Diff Id from the node in mapping"""
+    res = ""
+    try:
+        repo = mapping["ctx"].repo()
+        d = repo[mapping["rev"]].description()
+        pat = r"https://.*/(D\d+)"
+        m = re.search(pat, d)
+        res = m.group(1) if m else ""
+    except Exception:
+        pass
+    return res
 
+
+def blame(orig, ui, repo, *pats, **opts):
     if not ui.plain():
         # changeset is the new default
         if all(
@@ -499,36 +518,6 @@ def _analyzewrapper(orig, x, ui):
             ui.warn(_("warning: %s\n") % msg)
 
     return result
-
-
-def _rebase(orig, ui, repo, *pats, **opts):
-    if not opts.get("date") and not ui.configbool("tweakdefaults", "rebasekeepdate"):
-        opts["date"] = currentdate(ui)
-
-    if opts.get("continue") or opts.get("abort") or opts.get("restack"):
-        return orig(ui, repo, *pats, **opts)
-
-    # 'hg rebase' w/o args should do nothing
-    if not opts.get("dest"):
-        raise error.Abort("you must specify a destination (-d) for the rebase")
-
-    # 'hg rebase' can fast-forward bookmark
-    prev = repo["."]
-
-    # Only fast-forward the bookmark if no source nodes were explicitly
-    # specified.
-    if not (opts.get("base") or opts.get("source") or opts.get("rev")):
-        dest = scmutil.revsingle(repo, opts.get("dest"))
-        common = dest.ancestor(prev)
-        if prev == common:
-            activebookmark = repo._activebookmark
-            result = hg.updatetotally(ui, repo, dest.node(), activebookmark)
-            if activebookmark:
-                with repo.wlock():
-                    bookmarks.update(repo, [prev.node()], dest.node())
-            return result
-
-    return orig(ui, repo, *pats, **opts)
 
 
 # set of commands which define their own formatter and prints the hash changes
@@ -632,7 +621,11 @@ def histeditcommitfuncfor(orig, repo, src):
 def log(orig, ui, repo, *pats, **opts):
     # 'hg log' defaults to -f
     # All special uses of log (--date, --branch, etc) will also now do follow.
-    if not opts.get("rev") and not opts.get("all"):
+    if (
+        not opts.get("rev")
+        and not opts.get("all")
+        and ui.configbool("tweakdefaults", "logdefaultfollow", True)
+    ):
         opts["follow"] = True
 
     return orig(ui, repo, *pats, **opts)
@@ -654,8 +647,11 @@ def statuscmd(orig, ui, repo, *pats, **opts):
             message = _("--root-relative not supported with patterns")
             hint = _("run from the repo root instead")
             raise error.Abort(message, hint=hint)
-    elif ui.plain():
-        pass
+
+    # Only default rootrel if it wasn't specified by user.
+    if rootrel is None:
+        rootrel = ui.plain()
+
     # Here's an ugly hack! If users are passing "re:" to make status relative,
     # hgwatchman will never refresh the full state and status will become and
     # remain slow after a restart or 24 hours. Here, we check for this and
@@ -664,12 +660,10 @@ def statuscmd(orig, ui, repo, *pats, **opts):
     # only pattern passed.
     #
     # Also set pats to [''] if pats is empty because that makes status relative.
-    elif not pats or (len(pats) == 1 and pats[0] == "re:"):
+    if not rootrel and not pats or (len(pats) == 1 and pats[0] == "re:"):
         pats = [""]
 
-    with ui.configoverride(
-        {("commands", "status.relative"): "false"}
-    ) if rootrel else util.nullcontextmanager():
+    with ui.configoverride({("commands", "status.relative"): str(not rootrel)}):
         return orig(ui, repo, *pats, **opts)
 
 

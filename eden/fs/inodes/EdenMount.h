@@ -23,6 +23,9 @@
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
+
+#include "eden/common/telemetry/TraceBus.h"
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/config/CheckoutConfig.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/InodeCatalogOptions.h"
@@ -34,14 +37,15 @@
 #include "eden/fs/inodes/InodeTimestamps.h"
 #include "eden/fs/inodes/Overlay.h"
 #include "eden/fs/inodes/VirtualInode.h"
+#include "eden/fs/journal/JournalDelta.h"
 #include "eden/fs/model/RootId.h"
 #include "eden/fs/service/gen-cpp2/eden_types.h"
 #include "eden/fs/store/BlobAccess.h"
+#include "eden/fs/store/ScmStatusCache.h"
+#include "eden/fs/store/ScmStatusDiffCallback.h"
 #include "eden/fs/takeover/TakeoverData.h"
 #include "eden/fs/telemetry/ActivityBuffer.h"
 #include "eden/fs/telemetry/IActivityRecorder.h"
-#include "eden/fs/telemetry/TraceBus.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 #ifndef _WIN32
 #include "eden/fs/inodes/OverlayFileAccess.h"
@@ -251,11 +255,11 @@ struct SetPathObjectIdObjectAndPath {
         "path={}, objectId={}, type={}",
         path.value(),
         id.asString(),
-        convertTypeToString(type));
+        convertTypeToString());
   }
 
  private:
-  std::string_view convertTypeToString(ObjectType type) const {
+  std::string_view convertTypeToString() const {
     switch (type) {
       case ObjectType::TREE:
         return "tree";
@@ -351,7 +355,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    *
    * If takeover data is specified, it is used to initialize the inode map.
    */
-  FOLLY_NODISCARD folly::Future<folly::Unit> initialize(
+  FOLLY_NODISCARD ImmediateFuture<folly::Unit> initialize(
       OverlayChecker::ProgressCallback&& progressCallback = [](auto) {},
       const std::optional<SerializedInodeMap>& takeover = std::nullopt,
       const std::optional<MountProtocol>& takeoverMountProtocol = std::nullopt);
@@ -600,7 +604,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    *
    * The Journal is guaranteed to be valid for the lifetime of the EdenMount.
    */
-  Journal& getJournal() {
+  Journal& getJournal() const {
     return *journal_;
   }
 
@@ -757,10 +761,10 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    * This updates the checkedOutRootId as well as the workingCopyParentRootId to
    * the passed in snapshotHash.
    */
-  folly::Future<CheckoutResult> checkout(
+  ImmediateFuture<CheckoutResult> checkout(
       TreeInodePtr rootInode,
       const RootId& snapshotHash,
-      OptionalProcessId clientPid,
+      const ObjectFetchContextPtr& fetchContext,
       folly::StringPiece thriftMethodCaller,
       CheckoutMode checkoutMode = CheckoutMode::NORMAL);
 
@@ -795,6 +799,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
       TreeInodePtr rootInode,
       const RootId& commitHash,
       folly::CancellationToken cancellation,
+      const ObjectFetchContextPtr& fetchContext,
       bool listIgnored = false,
       bool enforceCurrentParent = true);
 
@@ -1195,6 +1200,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   std::unique_ptr<DiffContext> createDiffContext(
       DiffCallback* callback,
       folly::CancellationToken cancellation,
+      const ObjectFetchContextPtr& fetchContext,
       bool listIgnored = false) const;
 
   /**
@@ -1206,11 +1212,12 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    */
   FOLLY_NODISCARD ImmediateFuture<folly::Unit> diff(
       TreeInodePtr rootInode,
-      DiffCallback* callback,
+      ScmStatusDiffCallback* callback,
       const RootId& commitHash,
       bool listIgnored,
       bool enforceCurrentParent,
-      folly::CancellationToken cancellation) const;
+      folly::CancellationToken cancellation,
+      const ObjectFetchContextPtr& fetchContext) const;
 
   /**
    * Signal to unmount() that fsChannelMount() or takeoverFuse() has started.
@@ -1310,7 +1317,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    * Any operation that modifies an existing InodeBase's location_ data must
    * hold the rename lock.
    */
-  folly::SharedMutex renameMutex_;
+  mutable folly::SharedMutex renameMutex_;
 
   /**
    * The IDs of the parent commit of the working directory.
@@ -1440,6 +1447,8 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    * can be inline without having to include ServerState.h in this file.
    */
   std::shared_ptr<Clock> clock_;
+
+  mutable folly::Synchronized<std::shared_ptr<ScmStatusCache>> scmStatusCache_;
 };
 
 /**

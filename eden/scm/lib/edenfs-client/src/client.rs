@@ -6,9 +6,11 @@
  */
 
 use std::collections::BTreeMap;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use anyhow::Result;
@@ -17,32 +19,56 @@ use clientinfo::get_client_request_info;
 use fbthrift_socket::SocketTransport;
 use serde::Deserialize;
 use thrift_types::edenfs;
-use thrift_types::edenfs::client::EdenService;
+use thrift_types::edenfs_clients::EdenService;
 use thrift_types::fbthrift::binary_protocol::BinaryProtocol;
 use tokio_uds_compat::UnixStream;
+use tracing::error;
 use types::HgId;
 use types::RepoPathBuf;
 
+use crate::filter::FilterGenerator;
 use crate::types::CheckoutConflict;
 use crate::types::CheckoutMode;
 use crate::types::EdenError;
 use crate::types::FileStatus;
+use crate::types::LocalFrom;
+use crate::types::LocalTryFrom;
 
 /// EdenFS client for Sapling CLI integration.
 pub struct EdenFsClient {
     eden_config: EdenConfig,
+    filter_generator: Option<FilterGenerator>,
 }
 
 impl EdenFsClient {
-    /// Construct the client from the working directory root.
+    /// Construct a client and FilterGenerator using the supplied working dir
+    /// root. The latter is used to pass a FilterId to each thrift call.
     pub fn from_wdir(wdir_root: &Path) -> anyhow::Result<Self> {
+        let dot_dir = wdir_root.join(identity::must_sniff_dir(wdir_root)?.dot_dir());
         let eden_config = EdenConfig::from_root(wdir_root)?;
-        Ok(Self { eden_config })
+        let filter_generator = FilterGenerator::new(dot_dir);
+        Ok(Self {
+            eden_config,
+            filter_generator: Some(filter_generator),
+        })
+    }
+
+    pub fn get_active_filter_id(&self, commit: HgId) -> Result<Option<String>, anyhow::Error> {
+        match &self.filter_generator {
+            Some(gen) => gen.active_filter_id(commit),
+            None => Ok(None),
+        }
     }
 
     /// Get the EdenFS root path. This is usually the working directory root.
     pub fn root(&self) -> &str {
         self.eden_config.root.as_ref()
+    }
+
+    /// Get the EdenFS "client" path. This is different from the "root" path.
+    /// The client path contains files like `config.toml`.
+    pub fn client_path(&self) -> &Path {
+        self.eden_config.client.as_ref()
     }
 
     /// Construct a raw Thrift client from the given repo root.
@@ -68,21 +94,36 @@ impl EdenFsClient {
     }
 
     /// Get file status. Normalized to non-Thrift types.
+    #[tracing::instrument(skip(self))]
     pub fn get_status(
         &self,
         commit: HgId,
         list_ignored: bool,
     ) -> anyhow::Result<BTreeMap<RepoPathBuf, FileStatus>> {
         let thrift_client = block_on(self.get_thrift_client())?;
+        let filter_id = self.get_active_filter_id(commit.clone())?;
+
+        let start_time = Instant::now();
+
         let thrift_result = extract_error(block_on(thrift_client.getScmStatusV2(
             &edenfs::GetScmStatusParams {
                 mountPoint: self.root_vec(),
                 commit: commit.into_byte_array().into(),
                 listIgnored: list_ignored,
                 cri: Some(self.get_client_request_info()),
+                rootIdOptions: Some(edenfs::RootIdOptions {
+                    filterId: filter_id,
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )))?;
+
+        hg_metrics::increment_counter(
+            "edenclientstatus_time",
+            start_time.elapsed().as_millis() as u64,
+        );
+
         let mut result = BTreeMap::new();
         for (path_bytes, status) in thrift_result.status.entries {
             let path = match RepoPathBuf::from_utf8(path_bytes) {
@@ -92,13 +133,26 @@ impl EdenFsClient {
                 }
                 Ok(path) => path,
             };
-            let status = status.into();
+            let status = FileStatus::local_from(status);
             result.insert(path, status);
         }
         Ok(result)
     }
 
+    /// Get the raw journal position. Useful to check whether there are file changes.
+    #[tracing::instrument(skip(self))]
+    pub fn get_journal_position(&self) -> anyhow::Result<(i64, i64)> {
+        let thrift_client = block_on(self.get_thrift_client())?;
+        let position = extract_error(block_on(
+            thrift_client.getCurrentJournalPosition(&self.root_vec()),
+        ))?;
+        let position = (position.mountGeneration, position.sequenceNumber);
+        tracing::debug!("journal position {:?}", position);
+        Ok(position)
+    }
+
     /// Set the working copy (dirstate) parents.
+    #[tracing::instrument(skip(self))]
     pub fn set_parents(&self, p1: HgId, p2: Option<HgId>, p1_tree: HgId) -> anyhow::Result<()> {
         let thrift_client = block_on(self.get_thrift_client())?;
         let parents = edenfs::WorkingDirectoryParents {
@@ -106,10 +160,15 @@ impl EdenFsClient {
             parent2: p2.map(|n| n.into_byte_array().into()),
             ..Default::default()
         };
+        let filter_id: Option<String> = self.get_active_filter_id(p1.clone())?;
         let root_vec = self.root_vec();
         let params = edenfs::ResetParentCommitsParams {
             hgRootManifest: Some(p1_tree.into_byte_array().into()),
             cri: Some(self.get_client_request_info()),
+            rootIdOptions: Some(edenfs::RootIdOptions {
+                filterId: filter_id,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         extract_error(block_on(
@@ -122,6 +181,7 @@ impl EdenFsClient {
     /// The client might want to write pending draft changes to disk
     /// so edenfs can find the new files during checkout.
     /// Normalize to non-Thrift types.
+    #[tracing::instrument(skip(self))]
     pub fn checkout(
         &self,
         node: HgId,
@@ -130,37 +190,52 @@ impl EdenFsClient {
     ) -> anyhow::Result<Vec<CheckoutConflict>> {
         let tree_vec = tree.into_byte_array().into();
         let thrift_client = block_on(self.get_thrift_client())?;
+        let filter_id: Option<String> = self.get_active_filter_id(node.clone())?;
         let params = edenfs::CheckOutRevisionParams {
             hgRootManifest: Some(tree_vec),
             cri: Some(self.get_client_request_info()),
+            rootIdOptions: Some(edenfs::RootIdOptions {
+                filterId: filter_id,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let root_vec = self.root_vec();
         let node_vec = node.into_byte_array().into();
-        let thrift_mode: edenfs::CheckoutMode = mode.into();
+        let thrift_mode = edenfs::CheckoutMode::local_from(mode);
+
+        let start_time = Instant::now();
+
         let thrift_result = extract_error(block_on(thrift_client.checkOutRevision(
             &root_vec,
             &node_vec,
             &thrift_mode,
             &params,
         )))?;
+
+        hg_metrics::increment_counter(
+            "edenclientcheckout_time",
+            start_time.elapsed().as_millis() as u64,
+        );
+
         let result = thrift_result
             .into_iter()
-            .filter_map(|c| CheckoutConflict::try_from(c).ok())
-            .collect();
+            .filter_map(|c| CheckoutConflict::local_try_from(c).ok())
+            .collect::<Vec<_>>();
+        hg_metrics::increment_counter("eden_conflict_count", result.len() as u64);
         Ok(result)
     }
 }
 
 /// Extract EdenError from Thrift generated enums.
 /// For example, turn GetScmStatusV2Error::ex(EdenError) into this crate's EdenError.
-fn extract_error<V, E: std::error::Error + Send + Sync + 'static>(
+pub(crate) fn extract_error<V, E: std::error::Error + Send + Sync + 'static>(
     result: std::result::Result<V, E>,
 ) -> anyhow::Result<V> {
     match result {
         Err(err) => {
             if let Some(source) = err.source() {
-                if let Ok(err) = EdenError::try_from(source) {
+                if let Ok(err) = EdenError::local_try_from(source) {
                     return Err(err.into());
                 }
             }
@@ -172,13 +247,16 @@ fn extract_error<V, E: std::error::Error + Send + Sync + 'static>(
 
 async fn get_socket_transport(sock_path: &Path) -> Result<SocketTransport<UnixStream>> {
     let sock = UnixStream::connect(&sock_path).await?;
-    Ok(SocketTransport::new(sock))
+    Ok(SocketTransport::new_with_error_handler(sock, |error| {
+        error!(?error, "thrift transport error")
+    }))
 }
 
 #[derive(Deserialize)]
 struct EdenConfig {
     root: String,
     socket: PathBuf,
+    client: PathBuf,
 }
 
 impl EdenConfig {
@@ -194,7 +272,7 @@ impl EdenConfig {
         if cfg!(windows) {
             let toml_path = dot_eden.join("config");
 
-            match util::file::read_to_string(toml_path) {
+            match fs_err::read_to_string(toml_path) {
                 Ok(toml_contents) => {
                     #[derive(Deserialize)]
                     struct Outer {
@@ -206,18 +284,21 @@ impl EdenConfig {
                     return Ok(outer.config);
                 }
                 // Fallthrough and try symlinks just in case.
-                Err(err) if err.is_not_found() => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err.into()),
             }
         }
 
-        let root = util::file::read_link(dot_eden.join("root"))?
+        let root = fs_err::read_link(dot_eden.join("root"))?
             .into_os_string()
             .into_string()
             .map_err(|path| anyhow!("couldn't stringify path {:?}", path))?;
+        let socket = fs_err::read_link(dot_eden.join("socket"))?;
+        let client = fs_err::read_link(dot_eden.join("client"))?;
         Ok(Self {
             root,
-            socket: util::file::read_link(dot_eden.join("socket"))?,
+            socket,
+            client,
         })
     }
 }

@@ -28,7 +28,6 @@ use async_trait::async_trait;
 use blame::RootBlameV2;
 use blobrepo::BlobRepo;
 use blobrepo_override::DangerousOverride;
-use blobstore::StoreLoadable;
 use bookmarks::BookmarkCategory;
 use bookmarks::BookmarkKind;
 use bookmarks::BookmarkPagination;
@@ -62,7 +61,7 @@ use derived_data_utils::warmup;
 use derived_data_utils::DerivedUtils;
 use derived_data_utils::ThinOut;
 use derived_data_utils::DEFAULT_BACKFILLING_CONFIG_NAME;
-use derived_data_utils::POSSIBLE_DERIVED_TYPES;
+use derived_data_utils::POSSIBLE_DERIVED_TYPE_NAMES;
 use executor_lib::RepoShardedProcess;
 use executor_lib::RepoShardedProcessExecutor;
 use executor_lib::ShardedProcessExecutor;
@@ -77,10 +76,8 @@ use futures::stream::TryStreamExt;
 use futures_stats::TimedFutureExt;
 use futures_stats::TimedTryFutureExt;
 use mononoke_api_types::InnerRepo;
-use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
-use mononoke_types::DateTime;
-use repo_blobstore::RepoBlobstoreRef;
+use mononoke_types::DerivableType;
 use repo_derived_data::RepoDerivedDataArc;
 use repo_derived_data::RepoDerivedDataRef;
 use repo_factory::RepoFactoryBuilder;
@@ -92,8 +89,6 @@ use slog::Logger;
 use stats::prelude::*;
 use time_ext::DurationExt;
 use tokio::runtime::Runtime;
-use topo_sort::sort_topological;
-use tunables::tunables;
 use wait_for_replication::WaitForReplication;
 
 mod commit_discovery;
@@ -105,7 +100,6 @@ use commit_discovery::CommitDiscoveryOptions;
 
 define_stats! {
     prefix = "mononoke.derived_data";
-    oldest_underived_secs: dynamic_singleton_counter("{}.oldest_underived_secs", (reponame: String)),
     derivation_time_ms: dynamic_timeseries("{}.derivation_time_ms", (reponame: String); Average, Sum),
     derivation_idle_time_ms: dynamic_timeseries("{}.idle_time_ms", (reponame: String); Sum),
 }
@@ -121,11 +115,9 @@ const ARG_USE_SHARED_LEASES: &str = "use-shared-leases";
 const ARG_STOP_ON_IDLE: &str = "stop-on-idle";
 const ARG_BATCHED: &str = "batched";
 const ARG_BATCH_SIZE: &str = "batch-size";
-const ARG_PARALLEL: &str = "parallel";
 const ARG_SLICED: &str = "sliced";
 const ARG_SLICE_SIZE: &str = "slice-size";
 const ARG_BACKFILL: &str = "backfill";
-const ARG_GAP_SIZE: &str = "gap-size";
 const ARG_JSON: &str = "json";
 const ARG_VALIDATE_CHUNK_SIZE: &str = "validate-chunk-size";
 const ARG_BACKFILL_CONFIG_NAME: &str = "backfill-config-name";
@@ -209,7 +201,7 @@ impl DerivedDataProcess {
                         Arg::with_name(ARG_DERIVED_DATA_TYPE)
                             .required(true)
                             .index(1)
-                            .possible_values(POSSIBLE_DERIVED_TYPES)
+                            .possible_values(POSSIBLE_DERIVED_TYPE_NAMES)
                             .help("derived data type for which backfill will be run"),
                     )
                     .arg(
@@ -243,17 +235,6 @@ impl DerivedDataProcess {
                             .help("number of changesets in each derivation batch"),
                     )
                     .arg(
-                        Arg::with_name(ARG_PARALLEL)
-                            .long(ARG_PARALLEL)
-                            .help("derive commits within a batch in parallel"),
-                    )
-                    .arg(
-                        Arg::with_name(ARG_GAP_SIZE)
-                            .long(ARG_GAP_SIZE)
-                            .takes_value(true)
-                            .help("size of gap to leave in derived data types that support gaps"),
-                    )
-                    .arg(
                         Arg::with_name(ARG_BACKFILL_CONFIG_NAME)
                             .long(ARG_BACKFILL_CONFIG_NAME)
                             .help("sets the name for backfilling derived data types config")
@@ -263,15 +244,6 @@ impl DerivedDataProcess {
             .subcommand(
                 SubCommand::with_name(SUBCOMMAND_TAIL)
                     .about("tail public commits and fill derived data")
-                    .arg(
-                        Arg::with_name(ARG_DERIVED_DATA_TYPE)
-                            .required(false)
-                            .multiple(true)
-                            .index(1)
-                            .possible_values(POSSIBLE_DERIVED_TYPES)
-                            // TODO(stash): T66492899 remove unused value
-                            .help("Unused, will be deleted soon"),
-                    )
                     .arg(
                         Arg::with_name(ARG_USE_SHARED_LEASES)
                             .long(ARG_USE_SHARED_LEASES)
@@ -308,11 +280,6 @@ impl DerivedDataProcess {
                             .help("number of changesets in each derivation batch"),
                     )
                     .arg(
-                        Arg::with_name(ARG_PARALLEL)
-                            .long(ARG_PARALLEL)
-                            .help("derive commits within a batch in parallel"),
-                    )
-                    .arg(
                         Arg::with_name(ARG_BACKFILL)
                             .long(ARG_BACKFILL)
                             .help("also backfill derived data types configured for backfilling"),
@@ -327,12 +294,6 @@ impl DerivedDataProcess {
                             .long(ARG_SLICE_SIZE)
                             .default_value(DEFAULT_SLICE_SIZE_STR)
                             .help("number of generations to include in each generation slice"),
-                    )
-                    .arg(
-                        Arg::with_name(ARG_GAP_SIZE)
-                            .long(ARG_GAP_SIZE)
-                            .takes_value(true)
-                            .help("size of gap to leave in derived data types that support gaps"),
                     )
                     .arg(
                         Arg::with_name(ARG_BACKFILL_CONFIG_NAME)
@@ -363,7 +324,7 @@ impl DerivedDataProcess {
                             .index(2)
                             .multiple(true)
                             .conflicts_with(ARG_ALL_TYPES)
-                            .possible_values(POSSIBLE_DERIVED_TYPES)
+                            .possible_values(POSSIBLE_DERIVED_TYPE_NAMES)
                             .help("derived data type for which backfill will be run"),
                     ),
             )
@@ -373,7 +334,7 @@ impl DerivedDataProcess {
                     .arg(
                         Arg::with_name(ARG_DERIVED_DATA_TYPE)
                             .conflicts_with(ARG_ALL_TYPES)
-                            .possible_values(POSSIBLE_DERIVED_TYPES)
+                            .possible_values(POSSIBLE_DERIVED_TYPE_NAMES)
                             .required(false)
                             .takes_value(true)
                             .multiple(true)
@@ -395,11 +356,6 @@ impl DerivedDataProcess {
                             .default_value(DEFAULT_BATCH_SIZE_STR)
                             .help("number of changesets in each derivation batch"),
                     )
-                    .arg(
-                        Arg::with_name(ARG_PARALLEL)
-                            .long(ARG_PARALLEL)
-                            .help("derive commits within a batch in parallel"),
-                    )
                     .arg(Arg::with_name(ARG_SLICED).long(ARG_SLICED).help(
                         "pre-slice repository into generation slices",
                     ))
@@ -408,12 +364,6 @@ impl DerivedDataProcess {
                             .long(ARG_SLICE_SIZE)
                             .default_value(DEFAULT_SLICE_SIZE_STR)
                             .help("number of generations to include in each generation slice"),
-                    )
-                    .arg(
-                        Arg::with_name(ARG_GAP_SIZE)
-                            .long(ARG_GAP_SIZE)
-                            .takes_value(true)
-                            .help("size of gap to leave in derived data types that support gaps"),
                     )
                     .arg(
                         Arg::with_name(ARG_CHANGESET)
@@ -444,7 +394,7 @@ impl DerivedDataProcess {
                         .index(1)
                         .multiple(true)
                         .conflicts_with(ARG_ALL_TYPES)
-                        .possible_values(POSSIBLE_DERIVED_TYPES)
+                        .possible_values(POSSIBLE_DERIVED_TYPE_NAMES)
                         .help("derived data type for which backfill will be run"),
                 )
                 .arg(
@@ -478,7 +428,7 @@ impl DerivedDataProcess {
                         .index(1)
                         .multiple(true)
                         .conflicts_with(ARG_ALL_TYPES)
-                        .possible_values(POSSIBLE_DERIVED_TYPES)
+                        .possible_values(POSSIBLE_DERIVED_TYPE_NAMES)
                         .help("derived data type for which backfill will be run"),
                 )
                 .arg(
@@ -706,19 +656,18 @@ async fn run_subcmd<'a>(
                         .config()
                         .get_config(backfill_config_name)
                     {
-                        &active_config.types | &backfill_config.types
+                        Ok(&active_config.types | &backfill_config.types)
                     } else {
-                        active_config.types.clone()
+                        Ok(active_config.types.clone())
                     }
                 },
-                |names| names.map(ToString::to_string).collect(),
-            );
+                |names| names.map(DerivableType::from_name).collect::<Result<_>>(),
+            )?;
 
             let batch_size = sub_m
                 .value_of(ARG_BATCH_SIZE)
                 .expect("batch-size must be set")
                 .parse::<usize>()?;
-            let parallel = sub_m.is_present(ARG_PARALLEL);
             let slice_size = if sub_m.is_present(ARG_SLICED) {
                 Some(
                     sub_m
@@ -729,11 +678,6 @@ async fn run_subcmd<'a>(
             } else {
                 None
             };
-            let gap_size = sub_m
-                .value_of(ARG_GAP_SIZE)
-                .map(str::parse::<usize>)
-                .transpose()?;
-
             let csid = if let Some(cs) = sub_m.value_of_lossy(ARG_CHANGESET) {
                 Some(helpers::csid_resolve(ctx, repo.clone(), cs.to_string()).await?)
             } else {
@@ -745,8 +689,6 @@ async fn run_subcmd<'a>(
                 derived_data_types,
                 slice_size,
                 batch_size,
-                parallel,
-                gap_size,
                 backfill_config_name,
                 wait_for_replication,
                 csid,
@@ -756,10 +698,10 @@ async fn run_subcmd<'a>(
         (SUBCOMMAND_BACKFILL, Some(sub_m)) => {
             let wait_for_replication =
                 WaitForReplication::new(fb, config_store, storage_config, BACKFILLER_WAIT_CONFIG)?;
-            let derived_data_type = sub_m
-                .value_of(ARG_DERIVED_DATA_TYPE)
-                .ok_or_else(|| format_err!("missing required argument: {}", ARG_DERIVED_DATA_TYPE))?
-                .to_string();
+            let derived_data_type =
+                DerivableType::from_name(sub_m.value_of(ARG_DERIVED_DATA_TYPE).ok_or_else(
+                    || format_err!("missing required argument: {}", ARG_DERIVED_DATA_TYPE),
+                )?)?;
 
             let prefetched_commits_path = sub_m
                 .value_of(ARG_PREFETCHED_COMMITS_PATH)
@@ -799,15 +741,10 @@ async fn run_subcmd<'a>(
                 None => iter.map(|entry| entry.cs_id).collect(),
             };
 
-            let parallel = sub_m.is_present(ARG_PARALLEL);
             let batch_size = sub_m
                 .value_of(ARG_BATCH_SIZE)
                 .expect("batch-size must be set")
                 .parse::<usize>()?;
-            let gap_size = sub_m
-                .value_of(ARG_GAP_SIZE)
-                .map(str::parse::<usize>)
-                .transpose()?;
 
             let backfill_config_name = sub_m
                 .value_of(ARG_BACKFILL_CONFIG_NAME)
@@ -816,11 +753,9 @@ async fn run_subcmd<'a>(
             subcommand_backfill(
                 ctx,
                 &repo,
-                derived_data_type.as_str(),
+                derived_data_type,
                 regenerate,
-                parallel,
                 batch_size,
-                gap_size,
                 changesets,
                 backfill_config_name,
                 wait_for_replication,
@@ -834,7 +769,6 @@ async fn run_subcmd<'a>(
             let use_shared_leases = sub_m.is_present(ARG_USE_SHARED_LEASES);
             let stop_on_idle = sub_m.is_present(ARG_STOP_ON_IDLE);
             let batched = sub_m.is_present(ARG_BATCHED);
-            let parallel = sub_m.is_present(ARG_PARALLEL);
             let batch_size = if batched {
                 Some(
                     sub_m
@@ -856,11 +790,6 @@ async fn run_subcmd<'a>(
             } else {
                 None
             };
-            let gap_size = sub_m
-                .value_of(ARG_GAP_SIZE)
-                .map(str::parse::<usize>)
-                .transpose()?;
-
             let backfill_config_name = sub_m
                 .value_of(ARG_BACKFILL_CONFIG_NAME)
                 .unwrap_or(DEFAULT_BACKFILLING_CONFIG_NAME);
@@ -875,8 +804,6 @@ async fn run_subcmd<'a>(
                 use_shared_leases,
                 stop_on_idle,
                 batch_size,
-                parallel,
-                gap_size,
                 backfill,
                 slice_size,
                 backfill_config_name,
@@ -925,10 +852,10 @@ async fn parse_repo_and_derived_data_types(
     matches: &MononokeMatches<'_>,
     sub_m: &ArgMatches<'_>,
     repo_name: String,
-) -> Result<(BlobRepo, Vec<String>)> {
+) -> Result<(BlobRepo, Vec<DerivableType>)> {
     let all = sub_m.is_present(ARG_ALL_TYPES);
     let derived_data_types = sub_m.values_of(ARG_DERIVED_DATA_TYPE);
-    let (repo, types): (_, Vec<String>) = match (all, derived_data_types) {
+    let (repo, types): (_, Vec<DerivableType>) = match (all, derived_data_types) {
         (true, None) => {
             let repo: BlobRepo =
                 args::not_shardmanager_compatible::open_repo_unredacted(fb, logger, matches)
@@ -945,8 +872,8 @@ async fn parse_repo_and_derived_data_types(
         (false, Some(derived_data_types)) => {
             let derived_data_types = derived_data_types
                 .into_iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>();
+                .map(DerivableType::from_name)
+                .collect::<Result<Vec<_>>>()?;
             let repo: BlobRepo =
                 open_repo_maybe_unredacted(fb, logger, matches, &derived_data_types, repo_name)
                     .await?;
@@ -979,11 +906,9 @@ fn parse_serialized_commits<P: AsRef<Path>>(file: P) -> Result<Vec<ChangesetEntr
 async fn subcommand_backfill_all(
     ctx: &CoreContext,
     repo: &InnerRepo,
-    derived_data_types: HashSet<String>,
+    derived_data_types: HashSet<DerivableType>,
     slice_size: Option<u64>,
     batch_size: usize,
-    parallel: bool,
-    gap_size: Option<usize>,
     config_name: &str,
     wait_for_replication: WaitForReplication,
     csid: Option<ChangesetId>,
@@ -991,8 +916,8 @@ async fn subcommand_backfill_all(
     info!(ctx.logger(), "derived data types: {:?}", derived_data_types);
     let derivers = derived_data_types
         .iter()
-        .map(|name| {
-            derived_data_utils_for_config(ctx.fb, &repo.blob_repo, name.as_str(), config_name)
+        .map(|derivable_type| {
+            derived_data_utils_for_config(ctx.fb, &repo.blob_repo, *derivable_type, config_name)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1008,8 +933,6 @@ async fn subcommand_backfill_all(
         heads,
         slice_size,
         batch_size,
-        parallel,
-        gap_size,
         wait_for_replication,
     )
     .await
@@ -1022,8 +945,6 @@ async fn backfill_heads(
     heads: Vec<ChangesetId>,
     slice_size: Option<u64>,
     batch_size: usize,
-    parallel: bool,
-    gap_size: Option<usize>,
     wait_for_replication: WaitForReplication,
 ) -> Result<()> {
     if let Some(slice_size) = slice_size {
@@ -1044,25 +965,13 @@ async fn backfill_heads(
                 derivers,
                 slice_heads,
                 batch_size,
-                parallel,
-                gap_size,
                 wait_for_replication.clone(),
             )
             .await?;
         }
     } else {
         info!(ctx.logger(), "Deriving {} heads", heads.len());
-        tail_batch_iteration(
-            ctx,
-            repo,
-            derivers,
-            heads,
-            batch_size,
-            parallel,
-            gap_size,
-            wait_for_replication,
-        )
-        .await?;
+        tail_batch_iteration(ctx, repo, derivers, heads, batch_size, wait_for_replication).await?;
     }
     Ok(())
 }
@@ -1071,33 +980,12 @@ fn truncate_duration(duration: Duration) -> Duration {
     Duration::from_secs(duration.as_secs())
 }
 
-async fn get_batch_ctx(ctx: &CoreContext, limit_qps: bool) -> CoreContext {
-    if limit_qps {
-        // create new context so each derivation batch has its own trace
-        // and is rate-limited
-        let session = SessionContainer::builder(ctx.fb)
-            .blobstore_maybe_read_qps_limiter(tunables().backfill_read_qps().unwrap_or_default())
-            .await
-            .blobstore_maybe_write_qps_limiter(tunables().backfill_write_qps().unwrap_or_default())
-            .await
-            .build();
-        session.new_context(
-            ctx.logger().clone(),
-            MononokeScubaSampleBuilder::with_discard(),
-        )
-    } else {
-        ctx.clone()
-    }
-}
-
 async fn subcommand_backfill(
     ctx: &CoreContext,
     repo: &InnerRepo,
-    derived_data_type: &str,
+    derived_data_type: DerivableType,
     regenerate: bool,
-    parallel: bool,
     batch_size: usize,
-    gap_size: Option<usize>,
     changesets: Vec<ChangesetId>,
     config_name: &str,
     wait_for_replication: WaitForReplication,
@@ -1144,13 +1032,7 @@ async fn subcommand_backfill(
             info!(ctx.logger(), "warmup of {} changesets complete", chunk_size);
 
             derived_utils
-                .derive_exactly_batch(
-                    get_batch_ctx(ctx, parallel || gap_size.is_some()).await,
-                    repo.repo_derived_data_arc(),
-                    chunk,
-                    parallel,
-                    gap_size,
-                )
+                .derive_exactly_batch(ctx.clone(), repo.repo_derived_data_arc(), chunk)
                 .await?;
             Result::<_>::Ok(chunk_size)
         }
@@ -1197,8 +1079,6 @@ async fn subcommand_tail(
     use_shared_leases: bool,
     stop_on_idle: bool,
     batch_size: Option<usize>,
-    parallel: bool,
-    gap_size: Option<usize>,
     mut backfill: bool,
     slice_size: Option<u64>,
     config_name: &str,
@@ -1228,7 +1108,7 @@ async fn subcommand_tail(
     let tail_derivers: Vec<Arc<dyn DerivedUtils>> = active_derived_data_config
         .types
         .iter()
-        .map(|name| derived_data_utils(ctx.fb, repo, name))
+        .map(|derivable_type| derived_data_utils(ctx.fb, repo, *derivable_type))
         .collect::<Result<_>>()?;
     slog::info!(
         ctx.logger(),
@@ -1236,7 +1116,7 @@ async fn subcommand_tail(
         repo.repo_identity().name(),
         tail_derivers
             .iter()
-            .map(|d| d.name())
+            .map(|d| d.variant())
             .collect::<BTreeSet<_>>(),
     );
 
@@ -1260,7 +1140,7 @@ async fn subcommand_tail(
             active_derived_data_config
                 .types
                 .union(&named_derived_data_config.types)
-                .map(|name| derived_data_utils_for_config(ctx.fb, repo, name, config_name))
+                .map(|ty| derived_data_utils_for_config(ctx.fb, repo, *ty, config_name))
                 .collect::<Result<_>>()?
         } else {
             Vec::new()
@@ -1276,7 +1156,7 @@ async fn subcommand_tail(
             repo.repo_identity().name(),
             backfill_derivers
                 .iter()
-                .map(|d| d.name())
+                .map(|d| d.variant())
                 .collect::<BTreeSet<_>>(),
         );
     }
@@ -1320,8 +1200,6 @@ async fn subcommand_tail(
                             &tail_derivers,
                             underived_heads,
                             batch_size,
-                            parallel,
-                            gap_size,
                             wait_for_replication.clone(),
                         )
                         .await?;
@@ -1358,8 +1236,6 @@ async fn subcommand_tail(
                                 underived_heads,
                                 slice_size,
                                 batch_size,
-                                parallel,
-                                gap_size,
                                 wait_for_replication.clone(),
                             )
                             .await?;
@@ -1398,7 +1274,7 @@ async fn get_most_recent_heads(ctx: &CoreContext, repo: &BlobRepo) -> Result<Vec
             BookmarkCategory::ALL,
             BookmarkKind::ALL_PUBLISHING,
             &BookmarkPagination::FromStart,
-            std::u64::MAX,
+            u64::MAX,
         )
         .map_ok(|(_name, csid)| csid)
         .try_collect::<Vec<_>>()
@@ -1411,8 +1287,6 @@ async fn tail_batch_iteration<'a>(
     derive_utils: &'a [Arc<dyn DerivedUtils>],
     heads: Vec<ChangesetId>,
     batch_size: usize,
-    parallel: bool,
-    gap_size: Option<usize>,
     wait_for_replication: WaitForReplication,
 ) -> Result<()> {
     let derive_graph = derived_data_utils::build_derive_graph(
@@ -1472,21 +1346,23 @@ async fn tail_batch_iteration<'a>(
                         wait_for_replication
                             .wait_for_replication(ctx.logger())
                             .await?;
-                        let mut scuba =
-                            create_derive_graph_scuba_sample(&ctx, &node.csids, deriver.name());
-                        let (stats, _) = warmup::warmup(&ctx, &repo, deriver.name(), &node.csids)
-                            .try_timed()
-                            .await?;
+                        let mut scuba = create_derive_graph_scuba_sample(
+                            &ctx,
+                            &node.csids,
+                            Some(deriver.variant()),
+                        );
+                        let (stats, _) =
+                            warmup::warmup(&ctx, &repo, deriver.variant(), &node.csids)
+                                .try_timed()
+                                .await?;
                         scuba.add_future_stats(&stats).log_with_msg("Warmup", None);
                         let timestamp = Instant::now();
 
                         let job = deriver
                             .derive_exactly_batch(
-                                get_batch_ctx(&ctx, parallel || gap_size.is_some()).await,
+                                ctx.clone(),
                                 repo.repo_derived_data_arc(),
                                 node.csids.clone(),
-                                parallel,
-                                gap_size,
                             )
                             .try_timed();
                         let (stats, _) = tokio::spawn(job).await??;
@@ -1500,7 +1376,7 @@ async fn tail_batch_iteration<'a>(
                             slog::info!(
                                 ctx.logger(),
                                 "[{}:{}] count:{} time:{:.2?} batch estimation:{} start:{} end:{}",
-                                deriver.name(),
+                                deriver.variant().name(),
                                 node.id,
                                 node.csids.len(),
                                 timestamp.elapsed(),
@@ -1525,45 +1401,13 @@ async fn tail_batch_iteration<'a>(
         // Log how long it took to derive all the data for all the commits
         commits.sort_by_key(|(_, gen)| *gen);
         let commits: Vec<_> = commits.into_iter().map(|(cs_id, _)| cs_id).collect();
-        let mut scuba = create_derive_graph_scuba_sample(ctx, &commits, "all");
+        let mut scuba = create_derive_graph_scuba_sample(ctx, &commits, None);
         scuba
             .add_future_stats(&stats)
             .log_with_msg("Derived stack", None);
     }
 
     Ok(())
-}
-
-async fn find_oldest_underived(
-    ctx: &CoreContext,
-    repo: &BlobRepo,
-    derive: &dyn DerivedUtils,
-    csids: Vec<ChangesetId>,
-) -> Result<Option<BonsaiChangeset>> {
-    let underived_ancestors = stream::iter(csids)
-        .map(|csid| {
-            Ok(async move {
-                let underived = derive
-                    .find_underived(ctx, repo.repo_derived_data(), csid)
-                    .await?;
-                let underived = sort_topological(&underived)
-                    .ok_or_else(|| anyhow!("commit graph has cycles!"))?;
-                // The first element is the first underived ancestor in
-                // toposorted order.  Let's use it as a proxy for the oldest
-                // underived commit.
-                match underived.first() {
-                    Some(csid) => Ok(Some(csid.load(ctx, repo.repo_blobstore()).await?)),
-                    None => Ok::<_, Error>(None),
-                }
-            })
-        })
-        .try_buffer_unordered(100)
-        .try_collect::<Vec<_>>()
-        .await?;
-    Ok(underived_ancestors
-        .into_iter()
-        .flatten()
-        .min_by_key(|bcs| *bcs.author_date()))
 }
 
 async fn tail_one_iteration(
@@ -1593,14 +1437,7 @@ async fn tail_one_iteration(
                         .pending(ctx.clone(), (*repo).repo_derived_data_arc(), heads)
                         .await?;
 
-                    let oldest_underived =
-                        find_oldest_underived(ctx, repo, derive.as_ref(), pending.clone()).await?;
-                    let now = DateTime::now();
-                    let oldest_underived_age = oldest_underived.map_or(0, |oldest_underived| {
-                        now.timestamp_secs() - oldest_underived.author_date().timestamp_secs()
-                    });
-
-                    Result::<_>::Ok((derive, pending, oldest_underived_age))
+                    Result::<_>::Ok((derive, pending))
                 }
             }
         })
@@ -1608,18 +1445,7 @@ async fn tail_one_iteration(
 
     let pending = future::try_join_all(find_pending_futs).await?;
 
-    // Log oldest underived ancestor to ods
-    let mut oldest_underived_age = 0;
-    for (_, _, cur_oldest_underived_age) in &pending {
-        oldest_underived_age = ::std::cmp::max(oldest_underived_age, *cur_oldest_underived_age);
-    }
-    STATS::oldest_underived_secs.set_value(
-        ctx.fb,
-        oldest_underived_age,
-        (repo.repo_identity().name().to_string(),),
-    );
-
-    let pending_futs = pending.into_iter().map(|(derive, pending, _)| {
+    let pending_futs = pending.into_iter().map(|(derive, pending)| {
         pending
             .into_iter()
             .map(|csid| derive.derive(ctx.clone(), (*repo).repo_derived_data_arc(), csid))
@@ -1662,7 +1488,7 @@ async fn subcommand_single(
     ctx: &CoreContext,
     repo: &BlobRepo,
     csid: ChangesetId,
-    derived_data_types: Vec<String>,
+    derived_data_types: Vec<DerivableType>,
 ) -> Result<()> {
     let repo = repo.dangerous_override(|_| Arc::new(DummyLease {}) as Arc<dyn LeaseOps>);
     let mut derived_utils = vec![];
@@ -1683,7 +1509,7 @@ async fn subcommand_single(
                 info!(
                     ctx.logger(),
                     "derived {} in {:?}: {:?}",
-                    derived_utils.name(),
+                    derived_utils.variant().name(),
                     stats.completion_time,
                     result
                 );
@@ -1725,7 +1551,7 @@ mod tests {
             .await
             .context("Error creating bookmarks subscription")?;
 
-        let derived_utils = derived_data_utils(fb, &repo, RootUnodeManifestId::NAME)?;
+        let derived_utils = derived_data_utils(fb, &repo, RootUnodeManifestId::VARIANT)?;
         let master = resolve_cs_id(&ctx, &repo, "master").await?;
         assert!(!RootUnodeManifestId::is_derived(&ctx, &repo, &master).await?);
         tail_one_iteration(&ctx, &repo, &[derived_utils], &mut bookmarks_subscription).await?;
@@ -1747,22 +1573,10 @@ mod tests {
         let counting_blobstore = counting_blobstore.unwrap();
 
         let master = resolve_cs_id(&ctx, &repo, "master").await?;
-        subcommand_single(
-            &ctx,
-            &repo,
-            master,
-            vec![RootUnodeManifestId::NAME.to_string()],
-        )
-        .await?;
+        subcommand_single(&ctx, &repo, master, vec![RootUnodeManifestId::VARIANT]).await?;
 
         let writes_count = counting_blobstore.writes_count();
-        subcommand_single(
-            &ctx,
-            &repo,
-            master,
-            vec![RootUnodeManifestId::NAME.to_string()],
-        )
-        .await?;
+        subcommand_single(&ctx, &repo, master, vec![RootUnodeManifestId::VARIANT]).await?;
         assert!(counting_blobstore.writes_count() > writes_count);
         Ok(())
     }
@@ -1779,18 +1593,12 @@ mod tests {
             .await?
             .unwrap();
 
-        let derived_utils = derived_data_utils(fb, &repo, RootUnodeManifestId::NAME)?;
+        let derived_utils = derived_data_utils(fb, &repo, RootUnodeManifestId::VARIANT)?;
         // The dependencies haven't been derived yet, so this should be an
         // error.
         assert!(
             derived_utils
-                .derive_exactly_batch(
-                    ctx.clone(),
-                    repo.repo_derived_data_arc(),
-                    vec![bcs_id],
-                    false,
-                    None
-                )
+                .derive_exactly_batch(ctx.clone(), repo.repo_derived_data_arc(), vec![bcs_id],)
                 .await
                 .is_err()
         );
@@ -1807,13 +1615,7 @@ mod tests {
 
         // Now the parent is derived, we can backfill a batch.
         derived_utils
-            .derive_exactly_batch(
-                ctx.clone(),
-                repo.repo_derived_data_arc(),
-                vec![bcs_id],
-                false,
-                None,
-            )
+            .derive_exactly_batch(ctx.clone(), repo.repo_derived_data_arc(), vec![bcs_id])
             .await?;
 
         Ok(())
@@ -1847,19 +1649,13 @@ mod tests {
             batch.push(maybe_bcs_id.unwrap());
         }
 
-        let derived_utils = derived_data_utils(fb, &repo, RootUnodeManifestId::NAME)?;
+        let derived_utils = derived_data_utils(fb, &repo, RootUnodeManifestId::VARIANT)?;
         let pending = derived_utils
             .pending(ctx.clone(), repo.repo_derived_data_arc(), batch.clone())
             .await?;
         assert_eq!(pending.len(), hg_cs_ids.len());
         derived_utils
-            .derive_exactly_batch(
-                ctx.clone(),
-                repo.repo_derived_data_arc(),
-                batch.clone(),
-                false,
-                None,
-            )
+            .derive_exactly_batch(ctx.clone(), repo.repo_derived_data_arc(), batch.clone())
             .await?;
         let pending = derived_utils
             .pending(ctx, repo.repo_derived_data_arc(), batch)
@@ -1888,14 +1684,12 @@ mod tests {
             .await?
             .unwrap();
 
-        let derived_utils = derived_data_utils(fb, &repo, RootUnodeManifestId::NAME)?;
+        let derived_utils = derived_data_utils(fb, &repo, RootUnodeManifestId::VARIANT)?;
         let res = derived_utils
             .derive_exactly_batch(
                 ctx.clone(),
                 repo.repo_derived_data_arc(),
                 vec![first_bcs_id],
-                false,
-                None,
             )
             .await;
         // Deriving should fail because blobstore writes fail
@@ -1912,7 +1706,7 @@ mod tests {
             .await?
             .unwrap();
         let batch = vec![first_bcs_id, second_bcs_id];
-        let derived_utils = derived_data_utils(fb, &repo, RootUnodeManifestId::NAME)?;
+        let derived_utils = derived_data_utils(fb, &repo, RootUnodeManifestId::VARIANT)?;
         assert_eq!(
             derived_utils
                 .pending(ctx.clone(), repo.repo_derived_data_arc(), batch.clone())
@@ -1920,7 +1714,7 @@ mod tests {
             batch,
         );
         derived_utils
-            .derive_exactly_batch(ctx, repo.repo_derived_data_arc(), batch, false, None)
+            .derive_exactly_batch(ctx, repo.repo_derived_data_arc(), batch)
             .await?;
 
         Ok(())

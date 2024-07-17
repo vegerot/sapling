@@ -1,5 +1,6 @@
-#debugruntest-compatible
-  $ configure modernclient
+
+#require no-eden
+
 
   $ setconfig format.usegeneraldelta=yes
 We're bundling local clones here

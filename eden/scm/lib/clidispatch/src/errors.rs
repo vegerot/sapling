@@ -7,11 +7,11 @@
 
 use std::borrow::Cow;
 
-use configloader::config::ConfigSet;
+use configmodel::Config;
 use configmodel::ConfigExt;
 use thiserror::Error;
 #[cfg(feature = "eden")]
-use thrift_types::edenfs as eden;
+use thrift_types::edenfs_clients as eden_clients;
 
 #[derive(Debug, Error)]
 #[error("cannot decode arguments")]
@@ -45,9 +45,16 @@ pub struct RepoRequired(pub String);
 #[error("malformed --config option: '{0}' (use --config section.name=value)")]
 pub struct MalformedConfigOption(pub String);
 
-#[derive(Debug, Error)]
-#[error("{0}")]
+#[derive(Debug)]
 pub struct Abort(pub Cow<'static, str>);
+
+impl std::error::Error for Abort {}
+
+impl std::fmt::Display for Abort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", identity::default().punch(&self.0))
+    }
+}
 
 /// Print an error suitable for end-user consumption.
 ///
@@ -72,9 +79,7 @@ pub fn print_error(err: &anyhow::Error, io: &crate::io::IO, _args: &[String]) {
     } else {
         #[cfg(feature = "eden")]
         {
-            if let Some(eden::errors::eden_service::GetScmStatusV2Error::ex(e)) =
-                err.downcast_ref::<eden::errors::eden_service::GetScmStatusV2Error>()
-            {
+            if let Some(eden_clients::errors::GetScmStatusV2Error::ex(e)) = err.downcast_ref() {
                 let _ = io.write_err(format!("abort: {}\n", e.message));
                 let _ = io.flush();
                 return;
@@ -88,9 +93,36 @@ pub fn print_error(err: &anyhow::Error, io: &crate::io::IO, _args: &[String]) {
     }
 }
 
+/// Get the traceback from anyhow and upload it
+pub fn upload_traceback(err: &anyhow::Error, start_time_epoch_ms: u64) {
+    if !tracing::enabled!(target: "errortrace", tracing::Level::INFO)
+        || !tracing::enabled!(target: "errortracekey", tracing::Level::INFO)
+    {
+        return;
+    }
+    let hostname = match hostname::get_hostname() {
+        Ok(s) => s,
+        Err(_) => {
+            return;
+        }
+    };
+    let pid = std::process::id();
+    let trace_key = format!(
+        "flat/errortrace-{}-{}-{}{}",
+        hostname,
+        pid,
+        start_time_epoch_ms / 1000,
+        (start_time_epoch_ms % 1000) * 1000, // this is microseconds on python
+    );
+    let traceback = format!("abort: {:?}\n", err);
+    let tk = trace_key.as_str();
+    tracing::info!(target: "errortracekey", errortracekey=tk);
+    tracing::info!(target: "errortrace", key=tk, payload=traceback);
+}
+
 /// Optionally transform an error into something more friendly to the user.
 pub fn triage_error(
-    config: &ConfigSet,
+    config: &dyn Config,
     cmd_err: anyhow::Error,
     command_name: Option<&str>,
 ) -> anyhow::Error {
@@ -130,6 +162,9 @@ pub fn triage_error(
 mod tests {
     use std::io::Cursor;
 
+    #[cfg(feature = "eden")]
+    use thrift_types::edenfs as eden;
+
     use super::*;
 
     #[test]
@@ -138,14 +173,13 @@ mod tests {
         let error_msg = "cannot compute status while a checkout is currently in progress";
         let expected_error = format!("abort: {}\n", error_msg);
 
-        let error: anyhow::Error =
-            eden::errors::eden_service::GetScmStatusV2Error::ex(eden::EdenError {
-                message: error_msg.to_string(),
-                errorCode: Some(255),
-                errorType: eden::EdenErrorType::CHECKOUT_IN_PROGRESS,
-                ..Default::default()
-            })
-            .into();
+        let error: anyhow::Error = eden_clients::errors::GetScmStatusV2Error::ex(eden::EdenError {
+            message: error_msg.to_string(),
+            errorCode: Some(255),
+            errorType: eden::EdenErrorType::CHECKOUT_IN_PROGRESS,
+            ..Default::default()
+        })
+        .into();
 
         let tin = Cursor::new(Vec::new());
         let tout = Cursor::new(Vec::new());

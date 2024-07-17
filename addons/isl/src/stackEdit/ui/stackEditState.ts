@@ -8,22 +8,23 @@
 import type {Hash} from '../../types';
 import type {CommitState} from '../commitStackState';
 import type {RecordOf} from 'immutable';
-import type {SetterOrUpdater} from 'recoil';
 import type {ExportStack} from 'shared/types/stack';
 
-import {globalRecoil} from '../../AccessGlobalRecoil';
 import clientToServerAPI from '../../ClientToServerAPI';
-import {editedCommitMessages} from '../../CommitInfoView/CommitInfoState';
+import {latestCommitMessageFieldsWithEdits} from '../../CommitInfoView/CommitInfoState';
 import {
   commitMessageFieldsSchema,
   commitMessageFieldsToString,
 } from '../../CommitInfoView/CommitMessageFields';
 import {getTracker} from '../../analytics/globalTracker';
+import {t} from '../../i18n';
+import {readAtom, writeAtom} from '../../jotaiUtils';
+import {waitForNothingRunning} from '../../operationsState';
 import {CommitStackState} from '../../stackEdit/commitStackState';
-import {assert} from '../../utils';
+import {assert, registerDisposable} from '../../utils';
 import {List, Record} from 'immutable';
-import {atom, DefaultValue, selector, useRecoilState} from 'recoil';
-import {unwrap} from 'shared/utils';
+import {atom, useAtom} from 'jotai';
+import {nullthrows} from 'shared/utils';
 
 type StackStateWithOperationProps = {
   op: StackEditOpDescription;
@@ -84,7 +85,7 @@ type HistoryRecord = RecordOf<HistoryProps>;
 
 class History extends HistoryRecord {
   get current(): StackStateWithOperation {
-    return unwrap(this.history.get(this.currentIndex));
+    return nullthrows(this.history.get(this.currentIndex));
   }
 
   push(
@@ -162,74 +163,85 @@ export type Loading<T> =
       exportedStack:
         | ExportStack /* Got the exported stack. Analyzing. */
         | undefined /* Haven't got the exported stack. */;
+      message?: string;
     }
   | {state: 'hasValue'; value: T}
   | {state: 'hasError'; error: string};
 
-// This is private so we can maintain state consistency
-// (ex. stack and requested hashes cannot be out of sync)
-// via selectors.
-const stackEditState = atom<StackEditState>({
-  key: 'stackEditState',
-  default: {
+/**
+ * Meant to be private. Exported for debugging purpose.
+ *
+ * You probably want to use `useStackEditState` and other atoms instead,
+ * which ensures consistency (ex. stack and requested hashes cannot be
+ * out of sync).
+ */
+export const stackEditState = (() => {
+  const inner = atom<StackEditState>({
     hashes: new Set<Hash>(),
     intention: 'general',
     history: {state: 'loading', exportedStack: undefined},
-  },
-  effects: [
-    // Subscribe to server exportedStack events.
-    ({setSelf}) => {
-      const disposable = clientToServerAPI.onMessageOfType('exportedStack', event => {
-        setSelf(prev => {
-          const {hashes, intention} =
-            prev instanceof DefaultValue
-              ? {hashes: new Set<Hash>(), intention: 'general' as Intention}
-              : prev;
-          const revs = getRevs(hashes);
-          if (revs !== event.revs) {
-            // Wrong stack. Ignore it.
-            return prev;
-          }
-          if (event.error != null) {
-            return {hashes, intention, history: {state: 'hasError', error: event.error}};
-          } else {
-            return {
-              hashes,
-              intention,
-              history: {state: 'loading', exportedStack: rewriteCommitMessagesInStack(event.stack)},
-            };
-          }
-        });
-      });
-      return () => disposable.dispose();
-    },
+  });
+  return atom<StackEditState, [StackEditState | ((s: StackEditState) => StackEditState)], void>(
+    get => get(inner),
     // Kick off stack analysis on receiving an exported stack.
-    ({setSelf, onSet}) => {
-      onSet(newValue => {
-        const {hashes, intention, history} = newValue;
-        if (hashes.size > 0 && history.state === 'loading' && history.exportedStack !== undefined) {
-          try {
-            const stack = new CommitStackState(history.exportedStack).buildFileStacks();
-            const historyValue = new History({
-              history: List([StackStateWithOperation({state: stack})]),
-              currentIndex: 0,
-            });
-            currentMetrics = {
-              commits: hashes.size,
-              fileStacks: stack.fileStacks.size,
-              fileStackRevs: stack.fileStacks.reduce((acc, f) => acc + f.source.revLength, 0),
-            };
-            currentMetricsStartTime = Date.now();
-            setSelf({hashes, intention, history: {state: 'hasValue', value: historyValue}});
-          } catch (err) {
-            const msg = `Cannot construct stack ${err}`;
-            setSelf({hashes, intention, history: {state: 'hasError', error: msg}});
-          }
+    (get, set, newValue) => {
+      const {hashes, intention, history} =
+        typeof newValue === 'function' ? newValue(get(inner)) : newValue;
+      if (hashes.size > 0 && history.state === 'loading' && history.exportedStack !== undefined) {
+        try {
+          const stack = new CommitStackState(history.exportedStack).buildFileStacks();
+          const historyValue = new History({
+            history: List([StackStateWithOperation({state: stack})]),
+            currentIndex: 0,
+          });
+          currentMetrics = {
+            commits: hashes.size,
+            fileStacks: stack.fileStacks.size,
+            fileStackRevs: stack.fileStacks.reduce((acc, f) => acc + f.source.revLength, 0),
+            splitFromSuggestion: currentMetrics.splitFromSuggestion,
+          };
+          currentMetricsStartTime = Date.now();
+          // Cannot write to self (`stackEditState`) here.
+          set(inner, {
+            hashes,
+            intention,
+            history: {state: 'hasValue', value: historyValue},
+          });
+        } catch (err) {
+          const msg = `Cannot construct stack ${err}`;
+          set(inner, {hashes, intention, history: {state: 'hasError', error: msg}});
         }
-      });
+      } else {
+        set(inner, newValue);
+      }
     },
-  ],
-});
+  );
+})();
+
+// Subscribe to server exportedStack events.
+registerDisposable(
+  stackEditState,
+  clientToServerAPI.onMessageOfType('exportedStack', event => {
+    writeAtom(stackEditState, (prev): StackEditState => {
+      const {hashes, intention} = prev;
+      const revs = getRevs(hashes);
+      if (revs !== event.revs) {
+        // Wrong stack. Ignore it.
+        return prev;
+      }
+      if (event.error != null) {
+        return {hashes, intention, history: {state: 'hasError', error: event.error}};
+      } else {
+        return {
+          hashes,
+          intention,
+          history: {state: 'loading', exportedStack: rewriteCommitMessagesInStack(event.stack)},
+        };
+      }
+    });
+  }),
+  import.meta.hot,
+);
 
 /**
  * Update commits messages in an exported stack to include:
@@ -237,13 +249,13 @@ const stackEditState = atom<StackEditState>({
  * 2. Any remote message changes from the server (which allows the titles in the edit stack UI to be up to date)
  */
 function rewriteCommitMessagesInStack(stack: ExportStack): ExportStack {
-  const schema = globalRecoil().getLoadable(commitMessageFieldsSchema).valueMaybe();
+  const schema = readAtom(commitMessageFieldsSchema);
   return stack.map(c => {
     let text = c.text;
     if (schema) {
-      const latestMessage = globalRecoil().getLoadable(editedCommitMessages(c.node)).valueMaybe();
-      if (latestMessage != null && latestMessage.type !== 'optimistic') {
-        text = commitMessageFieldsToString(schema, latestMessage.fields);
+      const editedMessage = readAtom(latestCommitMessageFieldsWithEdits(c.node));
+      if (editedMessage != null) {
+        text = commitMessageFieldsToString(schema, editedMessage);
       }
     }
     return {...c, text};
@@ -254,15 +266,30 @@ function rewriteCommitMessagesInStack(stack: ExportStack): ExportStack {
  * Commit hashes being stack edited for general purpose.
  * Setting to a non-empty value triggers server-side loading.
  */
-export const editingStackIntentionHashes = selector<[Intention, Set<Hash>]>({
-  key: 'editingStackIntentionHashes',
-  get: ({get}) => {
+export const editingStackIntentionHashes = atom<
+  [Intention, Set<Hash>],
+  [[Intention, Set<Hash>]],
+  void
+>(
+  get => {
     const state = get(stackEditState);
     return [state.intention, state.hashes];
   },
-  set: ({set}, newValue) => {
-    const [intention, hashes] =
-      newValue instanceof DefaultValue ? ['general' as Intention, new Set<Hash>()] : newValue;
+  async (_get, set, newValue) => {
+    const [intention, hashes] = newValue;
+    const waiter = waitForNothingRunning();
+    if (waiter != null) {
+      set(stackEditState, {
+        hashes,
+        intention,
+        history: {
+          state: 'loading',
+          exportedStack: undefined,
+          message: t('Waiting for other commands to finish'),
+        },
+      });
+      await waiter;
+    }
     if (hashes.size > 0) {
       const revs = getRevs(hashes);
       clientToServerAPI.postMessage({type: 'exportStack', revs});
@@ -273,7 +300,7 @@ export const editingStackIntentionHashes = selector<[Intention, Set<Hash>]>({
       history: {state: 'loading', exportedStack: undefined},
     });
   },
-});
+);
 
 /**
  * State for check whether the stack is loaded or not.
@@ -282,28 +309,26 @@ export const editingStackIntentionHashes = selector<[Intention, Set<Hash>]>({
  * This is not `Loading<CommitStackState>` so `hasValue`
  * states do not trigger re-render.
  */
-export const loadingStackState = selector<Loading<null>>({
-  key: 'loadingStackState',
-  get: ({get}) => {
-    const history = get(stackEditState).history;
-    if (history.state === 'hasValue') {
-      return hasValueState;
-    } else {
-      return history;
-    }
-  },
+export const loadingStackState = atom<Loading<null>>(get => {
+  const history = get(stackEditState).history;
+  if (history.state === 'hasValue') {
+    return hasValueState;
+  } else {
+    return history;
+  }
 });
+
 const hasValueState: Loading<null> = {state: 'hasValue', value: null};
 
 /** APIs exposed via useStackEditState() */
 class UseStackEditState {
   state: StackEditState;
-  setState: SetterOrUpdater<StackEditState>;
+  setState: (_state: StackEditState) => void;
 
   // derived properties.
   private history: History;
 
-  constructor(state: StackEditState, setState: SetterOrUpdater<StackEditState>) {
+  constructor(state: StackEditState, setState: (_state: StackEditState) => void) {
     this.state = state;
     this.setState = setState;
     assert(
@@ -391,7 +416,7 @@ export type {UseStackEditState};
 // This is not a recoil selector for flexibility.
 // See https://github.com/facebookexperimental/Recoil/issues/673
 export function useStackEditState() {
-  const [state, setState] = useRecoilState(stackEditState);
+  const [state, setState] = useAtom(stackEditState);
   return new UseStackEditState(state, setState);
 }
 
@@ -417,6 +442,7 @@ type StackEditMetrics = {
   splitMoveLine?: number;
   splitInsertBlank?: number;
   splitChangeRange?: number;
+  splitFromSuggestion?: number;
 };
 
 // Not atoms. They do not trigger re-render.
@@ -431,4 +457,5 @@ export function sendStackEditMetrics(save = true) {
   const tracker = getTracker();
   const duration = Date.now() - currentMetricsStartTime;
   tracker?.track('StackEditMetrics', {duration, extras: {...currentMetrics, save}});
+  currentMetrics.splitFromSuggestion = 0; // Reset for next time.
 }

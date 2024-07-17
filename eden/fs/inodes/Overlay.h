@@ -16,17 +16,18 @@
 #include <condition_variable>
 #include <optional>
 #include <thread>
+
+#include "eden/common/telemetry/StructuredLogger.h"
+#include "eden/common/utils/CaseSensitivity.h"
+#include "eden/common/utils/DirType.h"
+#include "eden/common/utils/ImmediateFuture.h"
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/RefPtr.h"
 #include "eden/fs/config/InodeCatalogOptions.h"
 #include "eden/fs/config/InodeCatalogType.h"
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/inodes/overlay/OverlayChecker.h"
 #include "eden/fs/inodes/overlay/gen-cpp2/overlay_types.h"
-#include "eden/fs/telemetry/StructuredLogger.h"
-#include "eden/fs/utils/CaseSensitivity.h"
-#include "eden/fs/utils/DirType.h"
-#include "eden/fs/utils/ImmediateFuture.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/RefPtr.h"
 
 #ifndef _WIN32
 #include "eden/fs/inodes/fscatalog/FsInodeCatalog.h"
@@ -42,7 +43,7 @@ struct DirContents;
 class InodeMap;
 class SerializedInodeMap;
 class InodeCatalog;
-class IFileContentStore;
+class FileContentStore;
 class DirEntry;
 class EdenConfig;
 class EdenStats;
@@ -288,6 +289,14 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
     return inodeCatalog_.get();
   }
 
+  FileContentStore* getRawFileContentStore() {
+    return fileContentStore_.get();
+  }
+
+  InodeCatalogType getInodeCatalogType() const {
+    return inodeCatalogType_;
+  }
+
   overlay::OverlayDir serializeOverlayDir(
       InodeNumber inodeNumber,
       const DirContents& dir);
@@ -361,7 +370,7 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
    */
   std::atomic<uint64_t> nextInodeNumber_{0};
 
-  std::unique_ptr<IFileContentStore> fileContentStore_;
+  std::unique_ptr<FileContentStore> fileContentStore_;
   std::unique_ptr<InodeCatalog> inodeCatalog_;
   InodeCatalogType inodeCatalogType_;
   InodeCatalogOptions inodeCatalogOptions_;

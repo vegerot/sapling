@@ -9,73 +9,133 @@ import type {ThemeColor} from './theme';
 import type {PreferredSubmitCommand} from './types';
 import type {ReactNode} from 'react';
 
+import {splitSuggestionEnabled} from './CommitInfoView/SplitSuggestion';
+import {condenseObsoleteStacks} from './CommitTreeList';
+import {Column, Row} from './ComponentUtils';
 import {confirmShouldSubmitEnabledAtom} from './ConfirmSubmitStack';
 import {DropdownField, DropdownFields} from './DropdownFields';
-import {Tooltip} from './Tooltip';
+import {useShowKeyboardShortcutsHelp} from './ISLShortcuts';
+import {Internal} from './Internal';
+import {Link} from './Link';
+import {RestackBehaviorSetting} from './RestackBehavior';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {showDiffNumberConfig} from './codeReview/DiffBadge';
 import {SubmitAsDraftCheckbox} from './codeReview/DraftCheckbox';
+import {overrideDisabledSubmitModes} from './codeReview/github/branchPrState';
+import GatedComponent from './components/GatedComponent';
 import {debugToolsEnabledState} from './debug/DebugToolsState';
+import {externalMergeToolAtom} from './externalMergeTool';
 import {t, T} from './i18n';
+import {configBackedAtom} from './jotaiUtils';
+import {AutoResolveSettingCheckbox} from './mergeConflicts/state';
 import {SetConfigOperation} from './operations/SetConfigOperation';
+import {useRunOperation} from './operationsState';
 import platform from './platform';
-import {repositoryInfo, useRunOperation} from './serverAPIState';
-import {themeState} from './theme';
-import {
-  VSCodeButton,
-  VSCodeCheckbox,
-  VSCodeDropdown,
-  VSCodeLink,
-  VSCodeOption,
-} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilState, useRecoilValue} from 'recoil';
-import {Icon} from 'shared/Icon';
-import {unwrap} from 'shared/utils';
+import {renderCompactAtom, useZoomShortcut, zoomUISettingAtom} from './responsive';
+import {repositoryInfo} from './serverAPIState';
+import {useThemeShortcut, themeState} from './theme';
+import {Button} from 'isl-components/Button';
+import {Checkbox} from 'isl-components/Checkbox';
+import {Dropdown} from 'isl-components/Dropdown';
+import {Icon} from 'isl-components/Icon';
+import {Kbd} from 'isl-components/Kbd';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
+import {useAtom, useAtomValue} from 'jotai';
+import {KeyCode, Modifier} from 'shared/KeyboardShortcuts';
+import {tryJsonParse, nullthrows} from 'shared/utils';
 
 import './SettingsTooltip.css';
 
 export function SettingsGearButton() {
+  useThemeShortcut();
+  useZoomShortcut();
+  const showShortcutsHelp = useShowKeyboardShortcutsHelp();
   return (
-    <Tooltip trigger="click" component={() => <SettingsDropdown />} placement="bottom">
-      <VSCodeButton appearance="icon" data-testid="settings-gear-button">
+    <Tooltip
+      trigger="click"
+      component={dismiss => (
+        <SettingsDropdown dismiss={dismiss} showShortcutsHelp={showShortcutsHelp} />
+      )}
+      group="topbar"
+      placement="bottom">
+      <Button icon data-testid="settings-gear-button">
         <Icon icon="gear" />
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }
 
-function SettingsDropdown() {
-  const [theme, setTheme] = useRecoilState(themeState);
-  const [repoInfo, setRepoInfo] = useRecoilState(repositoryInfo);
+function SettingsDropdown({
+  dismiss,
+  showShortcutsHelp,
+}: {
+  dismiss: () => unknown;
+  showShortcutsHelp: () => unknown;
+}) {
+  const [theme, setTheme] = useAtom(themeState);
+  const [repoInfo, setRepoInfo] = useAtom(repositoryInfo);
   const runOperation = useRunOperation();
-  const [showDiffNumber, setShowDiffNumber] = useRecoilState(showDiffNumberConfig);
+  const [showDiffNumber, setShowDiffNumber] = useAtom(showDiffNumberConfig);
   return (
     <DropdownFields title={<T>Settings</T>} icon="gear" data-testid="settings-dropdown">
+      <Button
+        style={{justifyContent: 'center', gap: 0}}
+        icon
+        onClick={() => {
+          dismiss();
+          showShortcutsHelp();
+        }}>
+        <T
+          replace={{
+            $shortcut: <Kbd keycode={KeyCode.QuestionMark} modifiers={[Modifier.SHIFT]} />,
+          }}>
+          View Keyboard Shortcuts - $shortcut
+        </T>
+      </Button>
       {platform.theme != null ? null : (
         <Setting title={<T>Theme</T>}>
-          <VSCodeDropdown
+          <Dropdown
+            options={
+              [
+                {value: 'light', name: 'Light'},
+                {value: 'dark', name: 'Dark'},
+              ] as Array<{value: ThemeColor; name: string}>
+            }
             value={theme}
-            onChange={event =>
-              setTheme(
-                (event as React.FormEvent<HTMLSelectElement>).currentTarget.value as ThemeColor,
-              )
-            }>
-            <VSCodeOption value="dark">
-              <T>Dark</T>
-            </VSCodeOption>
-            <VSCodeOption value="light">
-              <T>Light</T>
-            </VSCodeOption>
-          </VSCodeDropdown>
+            onChange={event => setTheme(event.currentTarget.value as ThemeColor)}
+          />
+          <div style={{marginTop: 'var(--pad)'}}>
+            <Subtle>
+              <T>Toggle: </T>
+              <Kbd keycode={KeyCode.T} modifiers={[Modifier.ALT]} />
+            </Subtle>
+          </div>
         </Setting>
       )}
-      <Setting
+
+      <Setting title={<T>UI Scale</T>}>
+        <ZoomUISetting />
+      </Setting>
+      <Setting title={<T>Commits</T>}>
+        <Column alignStart>
+          <RenderCompactSetting />
+          <CondenseObsoleteSetting />
+          <GatedComponent featureFlag={Internal.featureFlags?.ShowSplitSuggestion}>
+            <SplitSuggestionSetting />
+          </GatedComponent>
+        </Column>
+      </Setting>
+      <Setting title={<T>Conflicts</T>}>
+        <AutoResolveSettingCheckbox />
+        <RestackBehaviorSetting />
+      </Setting>
+      {/* TODO: enable this setting when there is actually a chocie to be made here. */}
+      {/* <Setting
         title={<T>Language</T>}
         description={<T>Locale for translations used in the UI. Currently only en supported.</T>}>
-        <VSCodeDropdown value="en" disabled>
-          <VSCodeOption value="en">en</VSCodeOption>
-        </VSCodeDropdown>
-      </Setting>
+        <Dropdown value="en" options=['en'] />
+      </Setting> */}
       {repoInfo?.type !== 'success' ? (
         <Icon icon="loading" />
       ) : repoInfo?.codeReviewSystem.type === 'github' ? (
@@ -84,15 +144,20 @@ function SettingsDropdown() {
           description={
             <>
               <T>Which command to use to submit code for code review on GitHub.</T>{' '}
-              <VSCodeLink
-                href="https://sapling-scm.com/docs/git/intro#pull-requests"
-                target="_blank">
-                <T>Learn More.</T>
-              </VSCodeLink>
+              <Link href="https://sapling-scm.com/docs/git/intro#pull-requests">
+                <T>Learn More</T>
+              </Link>
             </>
           }>
-          <VSCodeDropdown
+          <Dropdown
             value={repoInfo.preferredSubmitCommand ?? 'not set'}
+            options={(repoInfo.preferredSubmitCommand == null
+              ? [{value: 'not set', name: '(not set)'}]
+              : []
+            ).concat([
+              {value: 'ghstack', name: 'sl ghstack'},
+              {value: 'pr', name: 'sl pr'},
+            ])}
             onChange={event => {
               const value = (event as React.FormEvent<HTMLSelectElement>).currentTarget.value as
                 | PreferredSubmitCommand
@@ -104,37 +169,40 @@ function SettingsDropdown() {
               runOperation(
                 new SetConfigOperation('local', 'github.preferred_submit_command', value),
               );
-              setRepoInfo(info => ({...unwrap(info), preferredSubmitCommand: value}));
-            }}>
-            {repoInfo.preferredSubmitCommand == null ? (
-              <VSCodeOption value={'not set'}>(not set)</VSCodeOption>
-            ) : null}
-            <VSCodeOption value="ghstack">sl ghstack</VSCodeOption>
-            <VSCodeOption value="pr">sl pr</VSCodeOption>
-          </VSCodeDropdown>
+              setRepoInfo(info => ({...nullthrows(info), preferredSubmitCommand: value}));
+            }}
+          />
         </Setting>
       ) : null}
       <Setting title={<T>Code Review</T>}>
         <div className="multiple-settings">
-          <VSCodeCheckbox
+          <Checkbox
             checked={showDiffNumber}
-            onChange={e => {
-              setShowDiffNumber((e.target as HTMLInputElement).checked);
+            onChange={checked => {
+              setShowDiffNumber(checked);
             }}>
             <T>Show copyable Diff / Pull Request numbers inline for each commit</T>
-          </VSCodeCheckbox>
+          </Checkbox>
           <ConfirmSubmitStackSetting />
           <SubmitAsDraftCheckbox forceShow />
         </div>
       </Setting>
+      {platform.canCustomizeFileOpener && (
+        <Setting title={<T>Environment</T>}>
+          <Column alignStart>
+            <OpenFilesCmdSetting />
+            <ExternalMergeToolSetting />
+          </Column>
+        </Setting>
+      )}
       <DebugToolsField />
     </DropdownFields>
   );
 }
 
 function ConfirmSubmitStackSetting() {
-  const [value, setValue] = useRecoilState(confirmShouldSubmitEnabledAtom);
-  const provider = useRecoilValue(codeReviewProvider);
+  const [value, setValue] = useAtom(confirmShouldSubmitEnabledAtom);
+  const provider = useAtomValue(codeReviewProvider);
   if (provider == null || !provider.supportSubmittingAsDraft) {
     return null;
   }
@@ -145,29 +213,236 @@ function ConfirmSubmitStackSetting() {
           'If false, no confirmation is shown and it will submit as draft if you previously ' +
           'checked the submit as draft checkbox.',
       )}>
-      <VSCodeCheckbox
+      <Checkbox
         checked={value}
-        onChange={e => {
-          setValue((e.target as HTMLInputElement).checked);
+        onChange={checked => {
+          setValue(checked);
         }}>
         <T>Show confirmation when submitting a stack</T>
-      </VSCodeCheckbox>
+      </Checkbox>
     </Tooltip>
   );
 }
 
+function RenderCompactSetting() {
+  const [value, setValue] = useAtom(renderCompactAtom);
+  return (
+    <Tooltip
+      title={t(
+        'Render commits in the tree more compactly, by reducing spacing and not wrapping Diff info to multiple lines. ' +
+          'May require more horizontal scrolling.',
+      )}>
+      <Checkbox
+        checked={value}
+        onChange={checked => {
+          setValue(checked);
+        }}>
+        <T>Compact Mode</T>
+      </Checkbox>
+    </Tooltip>
+  );
+}
+
+function CondenseObsoleteSetting() {
+  const [value, setValue] = useAtom(condenseObsoleteStacks);
+  return (
+    <Tooltip
+      title={t(
+        'Visually condense a continuous stack of obsolete commits into just the top and bottom commits.',
+      )}>
+      <Checkbox
+        data-testid="condense-obsolete-stacks"
+        checked={value !== false}
+        onChange={checked => {
+          setValue(checked);
+        }}>
+        <T>Condense Obsolete Stacks</T>
+      </Checkbox>
+    </Tooltip>
+  );
+}
+
+function SplitSuggestionSetting() {
+  const [value, setValue] = useAtom(splitSuggestionEnabled);
+  return (
+    <Tooltip title={t('Suggest splitting up large commits with a banner')}>
+      <Checkbox
+        data-testid="split-suggestion-enabled"
+        checked={value}
+        onChange={checked => {
+          setValue(checked);
+        }}>
+        <T>Show Split Suggestion</T>
+      </Checkbox>
+    </Tooltip>
+  );
+}
+
+export const openFileCmdAtom = configBackedAtom<string | null>(
+  'isl.open-file-cmd',
+  null,
+  /* readonly */ true,
+  /* use raw value */ true,
+);
+
+function OpenFilesCmdSetting() {
+  const cmdRaw = useAtomValue(openFileCmdAtom);
+  const cmd = cmdRaw == null ? null : (tryJsonParse(cmdRaw) as string | Array<string>) ?? cmdRaw;
+  const cmdEl =
+    cmd == null ? (
+      <T>OS Default Program</T>
+    ) : (
+      <code>{Array.isArray(cmd) ? cmd.join(' ') : cmd}</code>
+    );
+  return (
+    <Tooltip
+      component={() => (
+        <div>
+          <div>
+            <T>You can configure how to open files from ISL via</T>
+          </div>
+          <pre>sl config --user isl.open-file-cmd "/path/to/command"</pre>
+          <div>
+            <T>or</T>
+          </div>
+          <pre>sl config --user isl.open-file-cmd '["cmd", "with", "args"]'</pre>
+        </div>
+      )}>
+      <Row>
+        <T replace={{$cmd: cmdEl}}>Open files in: $cmd</T>
+        <Subtle>
+          <T>How to configure?</T>
+        </Subtle>
+        <Icon icon="question" />
+      </Row>
+    </Tooltip>
+  );
+}
+
+function ExternalMergeToolSetting() {
+  const mergeTool = useAtomValue(externalMergeToolAtom);
+  const cmdEl = mergeTool == null ? <T>None</T> : <code>{mergeTool}</code>;
+  return (
+    <Tooltip
+      component={() => (
+        <div>
+          <div style={{alignItems: 'flex-start', maxWidth: 400}}>
+            <T
+              replace={{
+                $help: <code>sl help config.merge-tools</code>,
+                $configedit: <code>sl config --edit</code>,
+                $mymergetool: <code>merge-tools.mymergetool</code>,
+                $uimerge: <code>ui.merge = mymergetool</code>,
+                $gui: <code>merge-tools.mymergetool.gui</code>,
+                $local: <code>--local</code>,
+                $br: (
+                  <>
+                    <br />
+                    <br />
+                  </>
+                ),
+              }}>
+              You can configure Sapling and ISL to use a custom external merge tool, which is used
+              when a merge conflict is detected.$br Define your tool with $configedit (or with
+              $local to configure only for the current repository), by setting $mymergetool and
+              $uimerge$brCLI merge tools like vimdiff won't be used from ISL. Ensure $gui is set to
+              True.$br For more information, see: $help
+            </T>
+          </div>
+        </div>
+      )}>
+      <Row>
+        <T replace={{$cmd: cmdEl}}>External Merge Tool: $cmd</T>
+        <Subtle>
+          <T>How to configure?</T>
+        </Subtle>
+        <Icon icon="question" />
+      </Row>
+    </Tooltip>
+  );
+}
+
+function ZoomUISetting() {
+  const [zoom, setZoom] = useAtom(zoomUISettingAtom);
+  function roundToPercent(n: number): number {
+    return Math.round(n * 100) / 100;
+  }
+  return (
+    <div className="zoom-setting">
+      <Tooltip title={t('Decrease UI Zoom')}>
+        <Button
+          icon
+          onClick={() => {
+            setZoom(roundToPercent(zoom - 0.1));
+          }}>
+          <Icon icon="zoom-out" />
+        </Button>
+      </Tooltip>
+      <span>{`${Math.round(100 * zoom)}%`}</span>
+      <Tooltip title={t('Increase UI Zoom')}>
+        <Button
+          icon
+          onClick={() => {
+            setZoom(roundToPercent(zoom + 0.1));
+          }}>
+          <Icon icon="zoom-in" />
+        </Button>
+      </Tooltip>
+      <div style={{width: '20px'}} />
+      <label>
+        <T>Presets:</T>
+      </label>
+      <Button
+        style={{fontSize: '80%'}}
+        icon
+        onClick={() => {
+          setZoom(0.8);
+        }}>
+        <T>Small</T>
+      </Button>
+      <Button
+        icon
+        onClick={() => {
+          setZoom(1.0);
+        }}>
+        <T>Normal</T>
+      </Button>
+      <Button
+        style={{fontSize: '120%'}}
+        icon
+        onClick={() => {
+          setZoom(1.2);
+        }}>
+        <T>Large</T>
+      </Button>
+    </div>
+  );
+}
+
 function DebugToolsField() {
-  const [isDebug, setIsDebug] = useRecoilState(debugToolsEnabledState);
+  const [isDebug, setIsDebug] = useAtom(debugToolsEnabledState);
+  const [overrideDisabledSubmit, setOverrideDisabledSubmit] = useAtom(overrideDisabledSubmitModes);
+  const provider = useAtomValue(codeReviewProvider);
 
   return (
-    <DropdownField title={t('Debug Tools')}>
-      <VSCodeCheckbox
-        checked={isDebug}
-        onChange={e => {
-          setIsDebug((e.target as HTMLInputElement).checked);
-        }}>
-        <T>Enable Debug Tools</T>
-      </VSCodeCheckbox>
+    <DropdownField title={t('Debug Tools & Experimental')}>
+      <Column alignStart>
+        <Checkbox
+          checked={isDebug}
+          onChange={checked => {
+            setIsDebug(checked);
+          }}>
+          <T>Enable Debug Tools</T>
+        </Checkbox>
+        {provider?.submitDisabledReason?.() != null && (
+          <Checkbox
+            checked={overrideDisabledSubmit}
+            onChange={setOverrideDisabledSubmit}
+            data-testid="force-enable-github-submit">
+            <T>Force enable `sl pr submit` and `sl ghstack submit`</T>
+          </Checkbox>
+        )}
+      </Column>
     </DropdownField>
   );
 }

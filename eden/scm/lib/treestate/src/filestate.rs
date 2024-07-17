@@ -53,6 +53,7 @@ bitflags! {
     /// | untracked | no       | no       | no         | no      |
     /// | ignored   | no       | no       | no         | yes     |
     #[cfg_attr(test, derive(Default))]
+    #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
     pub struct StateFlags: u16 {
         /// Exist in the first working parent.
         const EXIST_P1 = 1;
@@ -83,8 +84,16 @@ bitflags! {
 }
 
 impl StateFlags {
+    /// Convenience mask representing whether a file is tracked in either parent
+    /// commit or next commit.
+    pub const TRACKED: Self = Self::EXIST_P1.union(Self::EXIST_P2).union(Self::EXIST_NEXT);
+
     pub fn to_bits(self) -> u16 {
-        self.bits
+        self.bits()
+    }
+
+    pub fn is_tracked(&self) -> bool {
+        self.intersects(Self::TRACKED)
     }
 }
 

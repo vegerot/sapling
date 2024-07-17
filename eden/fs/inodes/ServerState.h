@@ -9,18 +9,19 @@
 
 #include <memory>
 
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/RefPtr.h"
+#include "eden/common/utils/UserInfo.h"
 #include "eden/fs/config/CachedParsedFileMonitor.h"
 #include "eden/fs/model/git/GitIgnoreFileParser.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/RefPtr.h"
-#include "eden/fs/utils/UserInfo.h"
 
 // For ConfigReloadBehavior
 #include "eden/fs/config/gen-cpp2/eden_config_types.h"
 
 namespace folly {
 class EventBase;
-}
+class Executor;
+} // namespace folly
 
 namespace facebook::eden {
 
@@ -42,7 +43,7 @@ class UnboundedQueueExecutor;
 using EdenStatsPtr = RefPtr<EdenStats>;
 
 /**
- * ServerState is the testabl, dependency injection seam for the inode
+ * ServerState is the testable, dependency injection seam for the inode
  * layer. It includes some platform abstractions like Clock, loggers,
  * and configuration, and state shared across multiple mounts.
  *
@@ -59,6 +60,7 @@ class ServerState {
       EdenStatsPtr edenStats,
       std::shared_ptr<PrivHelper> privHelper,
       std::shared_ptr<UnboundedQueueExecutor> threadPool,
+      std::shared_ptr<folly::Executor> fsChannelThreadPool,
       std::shared_ptr<Clock> clock,
       std::shared_ptr<ProcessInfoCache> processInfoCache,
       std::shared_ptr<StructuredLogger> structuredLogger,
@@ -140,6 +142,15 @@ class ServerState {
   }
 
   /**
+   * Get the FS channel thread pool.
+   *
+   * FS channel requests are intended to run on this thread pool.
+   */
+  const std::shared_ptr<folly::Executor>& getFsChannelThreadPool() const {
+    return fsChannelThreadPool_;
+  }
+
+  /**
    * Get the Clock.
    */
   const std::shared_ptr<Clock>& getClock() const {
@@ -191,6 +202,7 @@ class ServerState {
   EdenStatsPtr edenStats_;
   std::shared_ptr<PrivHelper> privHelper_;
   std::shared_ptr<UnboundedQueueExecutor> threadPool_;
+  std::shared_ptr<folly::Executor> fsChannelThreadPool_;
   std::shared_ptr<Clock> clock_;
   std::shared_ptr<ProcessInfoCache> processInfoCache_;
   std::shared_ptr<StructuredLogger> structuredLogger_;

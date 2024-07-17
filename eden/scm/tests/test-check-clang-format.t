@@ -1,6 +1,6 @@
 #chg-compatible
 
-#require clang-format test-repo
+#require clang-format test-repo no-eden
 
   $ . "$TESTDIR/helpers-testrepo.sh"
 

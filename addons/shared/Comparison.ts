@@ -10,11 +10,20 @@ export enum ComparisonType {
   HeadChanges = 'HEAD',
   StackChanges = 'STACK',
   Committed = 'InCommit',
+  SinceLastCodeReviewSubmit = 'SinceLastCodeReviewSubmit',
 }
 
 export type Comparison =
   | {
       type: ComparisonType.Committed;
+      hash: string;
+    }
+  | {
+      /**
+       * Compare this hash against the version last submit for code review.
+       * Only valid if supported by the UICodeReviewProvider
+       */
+      type: ComparisonType.SinceLastCodeReviewSubmit;
       hash: string;
     }
   | {
@@ -30,8 +39,23 @@ export function comparisonIsAgainstHead(comparison: Comparison): boolean {
     case ComparisonType.HeadChanges:
     case ComparisonType.StackChanges:
       return true;
+    case ComparisonType.SinceLastCodeReviewSubmit:
+      return false;
     case ComparisonType.Committed:
       return false;
+  }
+}
+
+/** Give a stable string key to uniquely represent a Comparison */
+export function comparisonStringKey(comparison: Comparison): string {
+  switch (comparison.type) {
+    case ComparisonType.UncommittedChanges:
+    case ComparisonType.HeadChanges:
+    case ComparisonType.StackChanges:
+      return comparison.type;
+    case ComparisonType.SinceLastCodeReviewSubmit:
+    case ComparisonType.Committed:
+      return `${comparison.type}:${comparison.hash}`;
   }
 }
 
@@ -44,6 +68,8 @@ export function revsetArgsForComparison(comparison: Comparison): Array<string> {
       return ['--rev', '.^'];
     case ComparisonType.StackChanges:
       return ['--rev', 'ancestor(.,interestingmaster())'];
+    case ComparisonType.SinceLastCodeReviewSubmit:
+      return ['--rev', comparison.hash, '--since-last-submit'];
     case ComparisonType.Committed:
       return ['--change', comparison.hash];
   }
@@ -59,6 +85,8 @@ export function revsetForComparison(comparison: Comparison): string {
     case ComparisonType.StackChanges:
       return 'ancestor(.,interestingmaster())';
     case ComparisonType.Committed:
+      return comparison.hash;
+    case ComparisonType.SinceLastCodeReviewSubmit:
       return comparison.hash;
   }
 }
@@ -77,5 +105,7 @@ export function labelForComparison(comparison: Comparison): string {
       return 'Stack Changes';
     case ComparisonType.Committed:
       return `In ${comparison.hash.slice(0, 12)}`;
+    case ComparisonType.SinceLastCodeReviewSubmit:
+      return `Since last submit of ${comparison.hash.slice(0, 12)}`;
   }
 }

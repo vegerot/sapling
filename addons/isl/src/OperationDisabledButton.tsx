@@ -6,12 +6,15 @@
  */
 
 import type {Operation} from './operations/Operation';
+import type {PrimitiveAtom} from 'jotai';
+import type {ComponentProps} from 'react';
 
+import {atomFamilyWeak} from './jotaiUtils';
+import {useRunOperation} from './operationsState';
 import {useMostRecentPendingOperation} from './previews';
-import {useRunOperation} from './serverAPIState';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {atomFamily, useRecoilState} from 'recoil';
-import {Icon} from 'shared/Icon';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {atom, useAtom} from 'jotai';
 import {isPromise} from 'shared/utils';
 
 /**
@@ -38,28 +41,27 @@ export function OperationDisabledButton({
   icon,
   ...rest
 }: {
-  appearance?: 'primary' | 'secondary' | 'icon';
   contextKey: string;
   runOperation: () =>
     | Operation
     | Array<Operation>
     | undefined
     | Promise<Operation | Array<Operation> | undefined>;
-  children: React.ReactNode;
+  children?: React.ReactNode;
   disabled?: boolean;
   icon?: React.ReactNode;
   className?: string;
-}) {
+} & (Omit<ComponentProps<typeof Button>, 'icon' | 'primary'> & {kind?: string})) {
   const actuallyRunOperation = useRunOperation();
   const pendingOperation = useMostRecentPendingOperation();
-  const [triggeredOperationId, setTriggeredOperationId] = useRecoilState(
+  const [triggeredOperationId, setTriggeredOperationId] = useAtom(
     operationButtonDisableState(contextKey),
   );
   const isRunningThisOperation =
     pendingOperation != null && triggeredOperationId?.includes(pendingOperation.id);
 
   return (
-    <VSCodeButton
+    <Button
       {...rest}
       disabled={isRunningThisOperation || disabled}
       onClick={async () => {
@@ -81,11 +83,11 @@ export function OperationDisabledButton({
       }}>
       {isRunningThisOperation ? <Icon icon="loading" slot="start" /> : icon ?? null}
       {children}
-    </VSCodeButton>
+    </Button>
   );
 }
 
-const operationButtonDisableState = atomFamily<Array<string>, string | undefined>({
-  key: 'operationButtonDisableState',
-  default: undefined,
-});
+const operationButtonDisableState = atomFamilyWeak<
+  string,
+  PrimitiveAtom<Array<string> | undefined>
+>((_param: string | undefined) => atom<Array<string> | undefined>(undefined));

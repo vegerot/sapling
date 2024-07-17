@@ -9,15 +9,23 @@ use std::collections::BTreeMap;
 
 use anyhow::anyhow;
 use anyhow::bail;
+use anyhow::Context;
 use anyhow::Result;
+use async_runtime::block_on;
 use configmodel::Config;
+use configmodel::ConfigExt;
 use dag::ops::IdConvert;
+use dag::DagAlgorithm;
+use dag::Id;
 use dag::Vertex;
-use edenapi::EdenApi;
+use edenapi::SaplingRemoteApi;
 use metalog::MetaLog;
 use refencode::decode_bookmarks;
 use refencode::decode_remotenames;
 use treestate::treestate::TreeState;
+use types::hgid::NULL_ID;
+use types::hgid::WDIR_ID;
+use types::hgid::WDIR_REV;
 use types::HgId;
 
 use crate::errors::RevsetLookupError;
@@ -25,24 +33,27 @@ use crate::errors::RevsetLookupError;
 struct LookupArgs<'a> {
     change_id: &'a str,
     id_map: &'a dyn IdConvert,
+    dag: &'a dyn DagAlgorithm,
     metalog: &'a MetaLog,
     treestate: Option<&'a TreeState>,
     config: &'a dyn Config,
-    edenapi: Option<&'a dyn EdenApi>,
+    edenapi: Option<&'a dyn SaplingRemoteApi>,
 }
 
 pub fn resolve_single(
     config: &dyn Config,
     change_id: &str,
     id_map: &dyn IdConvert,
+    dag: &dyn DagAlgorithm,
     metalog: &MetaLog,
     treestate: Option<&TreeState>,
-    edenapi: Option<&dyn EdenApi>,
+    edenapi: Option<&dyn SaplingRemoteApi>,
 ) -> Result<HgId> {
     let args = LookupArgs {
         config,
         change_id,
         id_map,
+        dag,
         metalog,
         treestate,
         edenapi,
@@ -50,6 +61,7 @@ pub fn resolve_single(
     let fns = [
         resolve_special,
         resolve_dot,
+        resolve_revnum,
         resolve_bookmark,
         resolve_hash_prefix,
     ];
@@ -70,19 +82,17 @@ fn resolve_special(args: &LookupArgs) -> Result<Option<HgId>> {
     if args.change_id != "tip" {
         return Ok(None);
     }
-    args.metalog
-        .get(args.change_id)?
-        .map(|tip| {
-            if tip.is_empty() {
-                Ok(HgId::null_id().clone())
-            } else {
-                HgId::from_slice(&tip).map_err(|err| {
-                    let tip = String::from_utf8_lossy(&tip).to_string();
-                    RevsetLookupError::CommitHexParseError(tip, err.into()).into()
-                })
-            }
-        })
-        .transpose()
+
+    if let Some(tip) = args.metalog.get(args.change_id)? {
+        if block_on(async { args.id_map.contains_vertex_name(&tip.clone().into()).await })? {
+            return Ok(Some(HgId::from_slice(&tip).context("metalog tip")?));
+        }
+    }
+
+    Ok(Some(
+        block_on(async { args.dag.all().await?.first().await })?
+            .map_or_else(|| Ok(NULL_ID), |v| HgId::from_slice(v.as_ref()))?,
+    ))
 }
 
 fn resolve_dot(args: &LookupArgs) -> Result<Option<HgId>> {
@@ -111,7 +121,7 @@ fn resolve_hash_prefix(args: &LookupArgs) -> Result<Option<HgId>> {
 
     let hgid = match change_id.len() {
         l if l > 40 => return Ok(None),
-        l if l == 40 => HgId::from_hex(change_id.as_bytes())?,
+        40 => HgId::from_hex(change_id.as_bytes())?,
         _ => {
             if let Some(id) = local_hash_prefix_lookup(args)? {
                 // We found it locally - no need to do any more work.
@@ -125,7 +135,7 @@ fn resolve_hash_prefix(args: &LookupArgs) -> Result<Option<HgId>> {
         }
     };
 
-    if async_runtime::block_on(async {
+    if block_on(async {
         args.id_map
             .contains_vertex_name(&Vertex::copy_from(hgid.as_ref()))
             .await
@@ -137,7 +147,7 @@ fn resolve_hash_prefix(args: &LookupArgs) -> Result<Option<HgId>> {
 }
 
 fn local_hash_prefix_lookup(args: &LookupArgs) -> Result<Option<HgId>> {
-    let hgids = async_runtime::block_on(async {
+    let hgids = block_on(async {
         args.id_map
             .vertexes_by_hex_prefix(args.change_id.as_bytes(), 5)
             .await
@@ -159,7 +169,7 @@ fn remote_hash_prefix_lookup(args: &LookupArgs) -> Result<Option<HgId>> {
         None => return Ok(None),
     };
 
-    let mut response = async_runtime::block_on(async {
+    let mut response = block_on(async {
         edenapi
             .hash_prefixes_lookup(vec![args.change_id.to_string()])
             .await
@@ -226,4 +236,35 @@ fn metalog_bookmarks(
 
     Ok(decoder(raw_bookmarks.as_slice())
         .map_err(|err| RevsetLookupError::BookmarkDecodeError(bookmark_type.to_owned(), err))?)
+}
+
+fn resolve_revnum(args: &LookupArgs) -> Result<Option<HgId>> {
+    if !hgplain::is_plain(None) && args.config.get_or_default("ui", "ignorerevnum")? {
+        return Ok(None);
+    }
+
+    let rev: i64 = match args.change_id.parse() {
+        Err(_) => return Ok(None),
+        Ok(rev) => rev,
+    };
+
+    let id = match rev {
+        -1 => NULL_ID,
+        WDIR_REV => WDIR_ID,
+        rev => {
+            let name = block_on(async { args.id_map.vertex_name(Id(rev as u64)).await })?;
+            HgId::from_byte_array(
+                name.0
+                    .into_vec()
+                    .try_into()
+                    .map_err(|v| anyhow!("unexpected vertex name length: {:?}", v))?,
+            )
+        }
+    };
+
+    if args.config.get("devel", "legacy.revnum").as_deref() == Some("abort") {
+        bail!("local revision number is disabled in this repo");
+    }
+
+    Ok(Some(id))
 }

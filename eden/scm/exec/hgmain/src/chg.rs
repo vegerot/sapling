@@ -44,7 +44,7 @@ fn chg_main_wrapper(args: Vec<CString>, envs: Vec<CString>) -> i32 {
 }
 
 /// Turn `OsString` args into `CString` for ffi
-/// For now, this is just copied from the `hgcommands`
+/// For now, this is just copied from the `commands`
 /// crate, but in future this should be a part
 /// of `argparse` crate
 fn args_to_local_cstrings() -> Vec<CString> {
@@ -86,6 +86,9 @@ fn should_call_chg(args: &[String]) -> (bool, &'static str) {
     if cfg!(target_os = "windows") {
         return (false, "windows");
     }
+    if !cfg!(feature = "fb") && cfg!(target_os = "macos") {
+        return (false, "macos");
+    }
     // This means we're already inside the chg call chain
     if std::env::var_os("CHGINTERNALMARK").is_some() {
         return (false, "CHGINTERNALMARK");
@@ -120,7 +123,8 @@ fn should_call_chg(args: &[String]) -> (bool, &'static str) {
     if let Some(val) = std::env::var_os("CHGDISABLE") {
         if val == "never" {
             return (true, "CHGDISABLE=never");
-        } else if val == "1" {
+        }
+        if val == "1" {
             return (false, "CHGDISABLE=1");
         }
     }

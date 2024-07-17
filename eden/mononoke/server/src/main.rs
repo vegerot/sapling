@@ -16,10 +16,13 @@ use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
 use cache_warmup::cache_warmup;
+use cache_warmup::CacheWarmupKind;
 use clap::Parser;
 use cloned::cloned;
 use cmdlib_logging::ScribeLoggingArgs;
-use environment::WarmBookmarksCacheDerivedData;
+use environment::BookmarkCacheDerivedData;
+use environment::BookmarkCacheKind;
+use environment::BookmarkCacheOptions;
 use executor_lib::args::ShardedExecutorArgs;
 use executor_lib::RepoShardedProcess;
 use executor_lib::RepoShardedProcessExecutor;
@@ -36,6 +39,7 @@ use mononoke_app::args::McrouterAppExtension;
 use mononoke_app::args::ReadonlyArgs;
 use mononoke_app::args::RepoFilterAppExtension;
 use mononoke_app::args::ShutdownTimeoutArgs;
+use mononoke_app::args::TLSArgs;
 use mononoke_app::args::WarmBookmarksCacheExtension;
 use mononoke_app::fb303::Fb303AppExtension;
 use mononoke_app::fb303::ReadyFlagService;
@@ -43,10 +47,12 @@ use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
 use mononoke_app::MononokeReposManager;
 use openssl::ssl::AlpnError;
+use scuba_ext::MononokeScubaSampleBuilder;
 use sharding_ext::RepoShard;
 use slog::error;
 use slog::info;
 use slog::o;
+use slog::warn;
 use slog::Logger;
 
 const SM_CLEANUP_TIMEOUT_SECS: u64 = 120;
@@ -71,18 +77,9 @@ struct MononokeServerArgs {
     /// If provided the thrift server will start on this port
     #[clap(long, short = 'p')]
     thrift_port: Option<String>,
-    /// Path to a file with server certificate
-    #[clap(long)]
-    cert: String,
-    /// Path to a file with server private key
-    #[clap(long)]
-    private_key: String,
-    /// Path to a file with CA certificate
-    #[clap(long)]
-    ca_pem: String,
-    /// Path to a file with encryption keys for SSL tickets
-    #[clap(long)]
-    ssl_ticket_seeds: Option<String>,
+    /// TLS parameters for this service
+    #[clap(flatten)]
+    tls_args: TLSArgs,
     /// Top level Mononoke tier where CSLB publishes routing table
     #[clap(long)]
     cslb_config: Option<String>,
@@ -101,16 +98,30 @@ struct MononokeServerArgs {
 /// Struct representing the Mononoke server process when sharding by repo.
 pub struct MononokeServerProcess {
     fb: FacebookInit,
+    scuba: MononokeScubaSampleBuilder,
     repos_mgr: Arc<MononokeReposManager<Repo>>,
 }
 
 impl MononokeServerProcess {
-    fn new(fb: FacebookInit, repos_mgr: MononokeReposManager<Repo>) -> Self {
+    fn new(
+        fb: FacebookInit,
+        repos_mgr: MononokeReposManager<Repo>,
+        scuba: MononokeScubaSampleBuilder,
+    ) -> Self {
         let repos_mgr = Arc::new(repos_mgr);
-        Self { fb, repos_mgr }
+        Self {
+            fb,
+            repos_mgr,
+            scuba,
+        }
     }
 
-    async fn add_repo(&self, repo_name: &str, logger: &Logger) -> Result<()> {
+    async fn add_repo(
+        &self,
+        repo_name: &str,
+        logger: &Logger,
+        scuba: &MononokeScubaSampleBuilder,
+    ) -> Result<()> {
         // Check if the input repo is already initialized. This can happen if the repo is a
         // shallow-sharded repo, in which case it would already be initialized during service startup.
         if self.repos_mgr.repos().get_by_name(repo_name).is_none() {
@@ -118,10 +129,16 @@ impl MononokeServerProcess {
             let repo = self.repos_mgr.add_repo(repo_name).await?;
             let blob_repo = repo.blob_repo().clone();
             let cache_warmup_params = repo.config().cache_warmup.clone();
-            let ctx = CoreContext::new_with_logger(self.fb, logger.clone());
-            cache_warmup(&ctx, &blob_repo, cache_warmup_params)
-                .await
-                .with_context(|| format!("Error while warming up cache for repo {}", repo_name))?;
+            let ctx =
+                CoreContext::new_with_logger_and_scuba(self.fb, logger.clone(), scuba.clone());
+            cache_warmup(
+                &ctx,
+                &blob_repo,
+                cache_warmup_params,
+                CacheWarmupKind::MononokeServer,
+            )
+            .await
+            .with_context(|| format!("Error while warming up cache for repo {}", repo_name))?;
             info!(
                 &logger,
                 "Completed repo {} setup in Mononoke service", repo_name
@@ -142,12 +159,14 @@ impl RepoShardedProcess for MononokeServerProcess {
         let repo_name = repo.repo_name.as_str();
         let logger = self.repos_mgr.repo_logger(repo_name);
         info!(&logger, "Setting up repo {} in Mononoke service", repo_name);
-        self.add_repo(repo_name, &logger).await.with_context(|| {
-            format!(
-                "Failure in setting up repo {} in Mononoke service",
-                repo_name
-            )
-        })?;
+        self.add_repo(repo_name, &logger, &self.scuba)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failure in setting up repo {} in Mononoke service",
+                    repo_name
+                )
+            })?;
         Ok(Arc::new(MononokeServerProcessExecutor {
             repo_name: repo_name.to_string(),
             repos_mgr: self.repos_mgr.clone(),
@@ -176,7 +195,7 @@ impl MononokeServerProcessExecutor {
         // sharded repos need to be present on each host.
         let is_deep_sharded = config
             .deep_sharding_config
-            .and_then(|c| c.status.get(&ShardedService::EdenApi).copied())
+            .and_then(|c| c.status.get(&ShardedService::SaplingRemoteApi).copied())
             .unwrap_or(false);
         if is_deep_sharded {
             self.repos_mgr.remove_repo(repo_name);
@@ -215,7 +234,10 @@ impl RepoShardedProcessExecutor for MononokeServerProcessExecutor {
 fn main(fb: FacebookInit) -> Result<()> {
     let app = MononokeAppBuilder::new(fb)
         .with_default_scuba_dataset("mononoke_test_perf")
-        .with_warm_bookmarks_cache(WarmBookmarksCacheDerivedData::HgOnly)
+        .with_bookmarks_cache(BookmarkCacheOptions {
+            cache_kind: BookmarkCacheKind::Local,
+            derived_data: BookmarkCacheDerivedData::HgOnly,
+        })
         .with_app_extension(WarmBookmarksCacheExtension {})
         .with_app_extension(McrouterAppExtension {})
         .with_app_extension(Fb303AppExtension {})
@@ -238,7 +260,7 @@ fn main(fb: FacebookInit) -> Result<()> {
         pushrebase_client::land_service_override_certificate_paths(
             land_service_cert_path,
             land_service_key_path,
-            &args.ca_pem,
+            &args.tls_args.tls_ca,
         );
     }
 
@@ -246,10 +268,10 @@ fn main(fb: FacebookInit) -> Result<()> {
 
     let acceptor = {
         let mut builder = secure_utils::SslConfig::new(
-            args.ca_pem,
-            args.cert,
-            args.private_key,
-            args.ssl_ticket_seeds,
+            &args.tls_args.tls_ca,
+            &args.tls_args.tls_certificate,
+            &args.tls_args.tls_private_key,
+            args.tls_args.tls_ticket_seeds,
         )
         .tls_acceptor_builder(root_log.clone())
         .context("Failed to instantiate TLS Acceptor builder")?;
@@ -259,6 +281,11 @@ fn main(fb: FacebookInit) -> Result<()> {
             openssl::ssl::select_next_proto(ALPN_MONONOKE_PROTOS_OFFERS, list)
                 .ok_or(AlpnError::NOACK)
         });
+
+        if args.tls_args.disable_mtls {
+            warn!(root_log, "MTLS has been disabled!");
+            builder.set_verify(openssl::ssl::SslVerifyMode::NONE)
+        }
 
         builder.build()
     };
@@ -281,7 +308,7 @@ fn main(fb: FacebookInit) -> Result<()> {
         .sharded_executor_args
         .sharded_service_name
         .as_ref()
-        .map(|_| ShardedService::EdenApi);
+        .map(|_| ShardedService::SaplingRemoteApi);
     app.start_monitoring("mononoke_server", service.clone())?;
     app.start_stats_aggregation()?;
 
@@ -300,14 +327,20 @@ fn main(fb: FacebookInit) -> Result<()> {
                     let blob_repo = repo.blob_repo().clone();
                     let root_log = root_log.clone();
                     let cache_warmup_params = repo.config().cache_warmup.clone();
+                    cloned!(scuba);
                     async move {
                         let logger = root_log.new(o!("repo" => repo_name.clone()));
-                        let ctx = CoreContext::new_with_logger(fb, logger);
-                        cache_warmup(&ctx, &blob_repo, cache_warmup_params)
-                            .await
-                            .with_context(|| {
-                                format!("Error while warming up cache for repo {}", repo_name)
-                            })
+                        let ctx = CoreContext::new_with_logger_and_scuba(fb, logger, scuba);
+                        cache_warmup(
+                            &ctx,
+                            &blob_repo,
+                            cache_warmup_params,
+                            CacheWarmupKind::MononokeServer,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("Error while warming up cache for repo {}", repo_name)
+                        })
                     }
                 })
                 // Repo cache warmup can be quite expensive, let's limit to 40
@@ -320,7 +353,7 @@ fn main(fb: FacebookInit) -> Result<()> {
                 app.fb,
                 runtime.clone(),
                 app.logger(),
-                || Arc::new(MononokeServerProcess::new(app.fb, repos_mgr)),
+                || Arc::new(MononokeServerProcess::new(app.fb, repos_mgr, scuba.clone())),
                 false, // disable shard (repo) level healing
                 SM_CLEANUP_TIMEOUT_SECS,
             )? {
@@ -336,6 +369,7 @@ fn main(fb: FacebookInit) -> Result<()> {
             }
             repo_listener::create_repo_listeners(
                 fb,
+                app.configs(),
                 common,
                 mononoke.clone(),
                 root_log,
@@ -351,6 +385,7 @@ fn main(fb: FacebookInit) -> Result<()> {
                 bound_addr_file,
                 env.acl_provider.as_ref(),
                 args.readonly.readonly,
+                args.tls_args.disable_mtls,
             )
             .await
         }

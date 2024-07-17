@@ -18,18 +18,20 @@ use cloned::cloned;
 use context::CoreContext;
 use derived_data_manager::DerivationContext;
 use futures::channel::mpsc;
+use futures::future;
 use futures::future::try_join_all;
 use futures::future::BoxFuture;
-use futures::future::FutureExt as NewFutureExt;
+use futures::future::FutureExt;
 use futures::future::TryFutureExt;
-use futures::future::{self as new_future};
 use manifest::derive_manifest_with_io_sender;
 use manifest::derive_manifests_for_simple_stack_of_commits;
 use manifest::flatten_subentries;
 use manifest::Entry;
 use manifest::LeafInfo;
 use manifest::ManifestChanges;
+use manifest::SortedVectorTrieMap;
 use manifest::TreeInfo;
+use mononoke_types::path::MPath;
 use mononoke_types::unode::FileUnode;
 use mononoke_types::unode::ManifestUnode;
 use mononoke_types::unode::UnodeEntry;
@@ -43,7 +45,6 @@ use mononoke_types::MPathElement;
 use mononoke_types::MPathHash;
 use mononoke_types::ManifestUnodeId;
 use mononoke_types::NonRootMPath;
-use mononoke_types::TrieMap;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::ErrorKind;
@@ -141,7 +142,7 @@ pub(crate) async fn derive_unode_manifest(
         None => {
             // All files have been deleted, generate empty **root** manifest
             let tree_info = TreeInfo {
-                path: None,
+                path: MPath::ROOT,
                 parents,
                 subentries: Default::default(),
             };
@@ -178,7 +179,7 @@ async fn create_unode_manifest(
         ManifestUnodeId,
         FileUnodeId,
         (),
-        TrieMap<Entry<ManifestUnodeId, FileUnodeId>>,
+        SortedVectorTrieMap<Entry<ManifestUnodeId, FileUnodeId>>,
     >,
 ) -> Result<((), ManifestUnodeId), Error> {
     let mut subentries = SortedVectorMap::new();
@@ -388,7 +389,7 @@ async fn reuse_manifest_parent(
     parents: &[ManifestUnodeId],
     subentries: &SortedVectorMap<MPathElement, UnodeEntry>,
 ) -> Result<Option<ManifestUnodeId>, Error> {
-    let parents = new_future::try_join_all(
+    let parents = future::try_join_all(
         parents
             .iter()
             .map(|id| id.load(ctx, blobstore).map_err(Error::from)),
@@ -409,7 +410,7 @@ async fn reuse_file_parent(
     content_id: &ContentId,
     file_type: FileType,
 ) -> Result<Option<FileUnodeId>, Error> {
-    let parents = new_future::try_join_all(
+    let parents = future::try_join_all(
         parents
             .iter()
             .map(|id| id.load(ctx, blobstore).map_err(Error::from)),
@@ -471,6 +472,7 @@ mod tests {
     use mononoke_types::DateTime;
     use mononoke_types::FileChange;
     use mononoke_types::FileContents;
+    use mononoke_types::GitLfs;
     use mononoke_types::RepoPath;
     use repo_derived_data::RepoDerivedDataRef;
     use test_repo_factory::TestRepoFactory;
@@ -515,9 +517,9 @@ mod tests {
             assert_eq!(
                 paths,
                 vec![
-                    None,
-                    Some(NonRootMPath::new("1").unwrap()),
-                    Some(NonRootMPath::new("files").unwrap())
+                    MPath::ROOT,
+                    MPath::new("1").unwrap(),
+                    MPath::new("files").unwrap()
                 ]
             );
             unode_id
@@ -555,10 +557,10 @@ mod tests {
             assert_eq!(
                 paths,
                 vec![
-                    None,
-                    Some(NonRootMPath::new("1").unwrap()),
-                    Some(NonRootMPath::new("2").unwrap()),
-                    Some(NonRootMPath::new("files").unwrap())
+                    MPath::ROOT,
+                    MPath::new("1").unwrap(),
+                    MPath::new("2").unwrap(),
+                    MPath::new("files").unwrap()
                 ]
             );
         }
@@ -592,7 +594,7 @@ mod tests {
             // Unodes should be unique even if content is the same. Check it
             let vals: Vec<_> = unode_mf.list().collect();
             assert_eq!(vals.len(), 2);
-            assert_ne!(vals.get(0), vals.get(1));
+            assert_ne!(vals.first(), vals.get(1));
             Ok(())
         }
 
@@ -954,7 +956,13 @@ mod tests {
                     let content =
                         FileContents::Bytes(Bytes::copy_from_slice(content.as_bytes())).into_blob();
                     let content_id = content.store(&ctx, &repo.repo_blobstore).await?;
-                    let file_change = FileChange::tracked(content_id, file_type, size as u64, None);
+                    let file_change = FileChange::tracked(
+                        content_id,
+                        file_type,
+                        size as u64,
+                        None,
+                        GitLfs::FullContent,
+                    );
                     res.insert(path, file_change);
                 }
                 None => {

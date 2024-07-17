@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use anyhow::Context;
 use anyhow::Result;
 use bonsai_git_mapping::BonsaiGitMapping;
 use bonsai_hg_mapping::BonsaiHgMapping;
@@ -16,7 +15,9 @@ use changesets::Changesets;
 use commit_graph::CommitGraph;
 use context::CoreContext;
 use derived_data_remote::DerivationClient;
+use ephemeral_blobstore::BubbleId;
 use filenodes::Filenodes;
+use filestore::FilestoreConfig;
 use metaconfig_types::DerivedDataTypesConfig;
 use mononoke_types::ChangesetId;
 use mononoke_types::RepositoryId;
@@ -24,6 +25,7 @@ use repo_blobstore::RepoBlobstore;
 use scuba_ext::MononokeScubaSampleBuilder;
 
 use crate::lease::DerivedDataLease;
+use crate::DerivationContext;
 
 pub mod bubble;
 pub mod derive;
@@ -44,16 +46,12 @@ pub struct DerivedDataManager {
 pub struct DerivedDataManagerInner {
     repo_id: RepositoryId,
     repo_name: String,
+    bubble_id: Option<BubbleId>,
     changesets: Arc<dyn Changesets>,
     commit_graph: Arc<CommitGraph>,
-    bonsai_hg_mapping: Option<Arc<dyn BonsaiHgMapping>>,
-    bonsai_git_mapping: Option<Arc<dyn BonsaiGitMapping>>,
-    filenodes: Option<Arc<dyn Filenodes>>,
     repo_blobstore: RepoBlobstore,
     lease: DerivedDataLease,
     scuba: MononokeScubaSampleBuilder,
-    config_name: String,
-    config: DerivedDataTypesConfig,
     /// If a (primary) manager has a secondary manager, that means some of the
     /// changesets should be derived using the primary manager, and some the secondary,
     /// in that order. For example, bubble managers are secondary, as all the data in
@@ -61,6 +59,7 @@ pub struct DerivedDataManagerInner {
     secondary: Option<SecondaryManagerData>,
     /// If this client is set, then derivation will be done remotely on derived data service
     derivation_service_client: Option<Arc<dyn DerivationClient>>,
+    derivation_context: DerivationContext,
 }
 
 pub struct DerivationAssignment {
@@ -95,6 +94,7 @@ impl DerivedDataManager {
         bonsai_git_mapping: Arc<dyn BonsaiGitMapping>,
         filenodes: Arc<dyn Filenodes>,
         repo_blobstore: RepoBlobstore,
+        filestore_config: FilestoreConfig,
         lease: Arc<dyn LeaseOps>,
         scuba: MononokeScubaSampleBuilder,
         config_name: String,
@@ -106,18 +106,23 @@ impl DerivedDataManager {
             inner: Arc::new(DerivedDataManagerInner {
                 repo_id,
                 repo_name,
-                config_name,
-                config,
+                bubble_id: None,
                 changesets,
                 commit_graph,
-                bonsai_hg_mapping: Some(bonsai_hg_mapping),
-                bonsai_git_mapping: Some(bonsai_git_mapping),
-                filenodes: Some(filenodes),
-                repo_blobstore,
+                repo_blobstore: repo_blobstore.clone(),
                 lease,
                 scuba,
                 secondary: None,
                 derivation_service_client,
+                derivation_context: DerivationContext::new(
+                    bonsai_hg_mapping,
+                    bonsai_git_mapping,
+                    filenodes,
+                    config_name,
+                    config,
+                    repo_blobstore.boxed(),
+                    filestore_config,
+                ),
             }),
         }
     }
@@ -136,7 +141,11 @@ impl DerivedDataManager {
     pub fn with_replaced_blobstore(&self, repo_blobstore: RepoBlobstore) -> Self {
         Self {
             inner: Arc::new(DerivedDataManagerInner {
-                repo_blobstore,
+                repo_blobstore: repo_blobstore.clone(),
+                derivation_context: self
+                    .inner
+                    .derivation_context
+                    .with_replaced_blobstore(repo_blobstore.boxed()),
                 ..self.inner.as_ref().clone()
             }),
         }
@@ -152,6 +161,16 @@ impl DerivedDataManager {
         }
     }
 
+    // For dangerous-override: allow replacement of commit graph
+    pub fn with_replaced_commit_graph(&self, commit_graph: Arc<CommitGraph>) -> Self {
+        Self {
+            inner: Arc::new(DerivedDataManagerInner {
+                commit_graph,
+                ..self.inner.as_ref().clone()
+            }),
+        }
+    }
+
     // For dangerous-override: allow replacement of bonsai-hg-mapping
     pub fn with_replaced_bonsai_hg_mapping(
         &self,
@@ -159,7 +178,10 @@ impl DerivedDataManager {
     ) -> Self {
         Self {
             inner: Arc::new(DerivedDataManagerInner {
-                bonsai_hg_mapping: Some(bonsai_hg_mapping),
+                derivation_context: self
+                    .inner
+                    .derivation_context
+                    .with_replaced_bonsai_hg_mapping(bonsai_hg_mapping),
                 ..self.inner.as_ref().clone()
             }),
         }
@@ -169,7 +191,10 @@ impl DerivedDataManager {
     pub fn with_replaced_filenodes(&self, filenodes: Arc<dyn Filenodes>) -> Self {
         Self {
             inner: Arc::new(DerivedDataManagerInner {
-                filenodes: Some(filenodes),
+                derivation_context: self
+                    .inner
+                    .derivation_context
+                    .with_replaced_filenodes(filenodes),
                 ..self.inner.as_ref().clone()
             }),
         }
@@ -182,8 +207,10 @@ impl DerivedDataManager {
     ) -> Self {
         Self {
             inner: Arc::new(DerivedDataManagerInner {
-                config_name,
-                config,
+                derivation_context: self
+                    .inner
+                    .derivation_context
+                    .with_replaced_config(config_name, config),
                 ..self.inner.as_ref().clone()
             }),
         }
@@ -195,6 +222,10 @@ impl DerivedDataManager {
 
     pub fn repo_name(&self) -> &str {
         self.inner.repo_name.as_str()
+    }
+
+    pub fn bubble_id(&self) -> Option<BubbleId> {
+        self.inner.bubble_id
     }
 
     pub fn changesets(&self) -> &dyn Changesets {
@@ -226,29 +257,23 @@ impl DerivedDataManager {
     }
 
     pub fn config(&self) -> &DerivedDataTypesConfig {
-        &self.inner.config
+        self.inner.derivation_context.config()
     }
 
     pub fn config_name(&self) -> String {
-        self.inner.config_name.clone()
+        self.inner.derivation_context.config_name()
     }
 
     pub fn bonsai_hg_mapping(&self) -> Result<&dyn BonsaiHgMapping> {
-        self.inner
-            .bonsai_hg_mapping
-            .as_deref()
-            .context("Missing BonsaiHgMapping")
+        self.inner.derivation_context.bonsai_hg_mapping()
     }
 
     pub fn bonsai_git_mapping(&self) -> Result<&dyn BonsaiGitMapping> {
-        self.inner
-            .bonsai_git_mapping
-            .as_deref()
-            .context("Missing BonsaiGitMapping")
+        self.inner.derivation_context.bonsai_git_mapping()
     }
 
     pub fn filenodes(&self) -> Result<&dyn Filenodes> {
-        self.inner.filenodes.as_deref().context("Missing filenodes")
+        self.inner.derivation_context.filenodes()
     }
 
     pub fn derivation_service_client(&self) -> Option<&dyn DerivationClient> {

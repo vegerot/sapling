@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 #inprocess-hg-incompatible
 
   $ eagerepo
@@ -28,8 +30,8 @@ Test the extensions.afterloaded() function
   $ hg commit -m 'add file'
 
   $ echo '[extensions]' >> .hg/hgrc
-  $ echo "foo = $basepath/foo.py" >> .hg/hgrc
-  $ echo "bar = $basepath/bar.py" >> .hg/hgrc
+  $ printf "%s\n" "foo = $basepath/foo.py" >> .hg/hgrc
+  $ printf "%s\n" "bar = $basepath/bar.py" >> .hg/hgrc
   $ hg log -r. -T'{node}\n'
   foo.uisetup
   foo: bar loaded: True
@@ -46,8 +48,8 @@ Test afterloaded with the opposite extension load order
   $ hg commit -m 'add file'
 
   $ echo '[extensions]' >> .hg/hgrc
-  $ echo "bar = $basepath/bar.py" >> .hg/hgrc
-  $ echo "foo = $basepath/foo.py" >> .hg/hgrc
+  $ printf "%s\n" "bar = $basepath/bar.py" >> .hg/hgrc
+  $ printf "%s\n" "foo = $basepath/foo.py" >> .hg/hgrc
   $ hg log -r. -T'{node}\n'
   bar.uisetup
   foo.uisetup
@@ -65,53 +67,8 @@ loaded
   $ hg commit -m 'add file'
 
   $ echo '[extensions]' >> .hg/hgrc
-  $ echo "foo = $basepath/foo.py" >> .hg/hgrc
+  $ printf "%s\n" "foo = $basepath/foo.py" >> .hg/hgrc
   $ hg log -r. -T'{node}\n'
-  foo.uisetup
-  foo: bar loaded: False
-  c24b9ac61126c9cd86d5d684f8408cdc717005a4
-
-Test the extensions.afterloaded() function when the requested extension is not
-configured but fails the minimum version check
-
-  $ cd ..
-  $ cat > minvers.py <<EOF
-  > minimumhgversion = '9999.9999'
-  > def uisetup(ui):
-  >     ui.write("minvers.uisetup\\n")
-  >     ui.flush()
-  > EOF
-  $ hg init minversion
-  $ cd minversion
-  $ echo foo > file
-  $ hg add file
-  $ hg commit -m 'add file'
-
-  $ echo '[extensions]' >> .hg/hgrc
-  $ echo "foo = $basepath/foo.py" >> .hg/hgrc
-  $ echo "bar = $basepath/minvers.py" >> .hg/hgrc
-  $ hg log -r. -T'{node}\n'
-  (third party extension bar requires version 9999.9999 or newer of Mercurial; disabling)
-  foo.uisetup
-  foo: bar loaded: False
-  c24b9ac61126c9cd86d5d684f8408cdc717005a4
-
-Test the extensions.afterloaded() function when the requested extension is not
-configured but fails the minimum version check, using the opposite load order
-for the two extensions.
-
-  $ cd ..
-  $ hg init minversion_reverse
-  $ cd minversion_reverse
-  $ echo foo > file
-  $ hg add file
-  $ hg commit -m 'add file'
-
-  $ echo '[extensions]' >> .hg/hgrc
-  $ echo "bar = $basepath/minvers.py" >> .hg/hgrc
-  $ echo "foo = $basepath/foo.py" >> .hg/hgrc
-  $ hg log -r. -T'{node}\n'
-  (third party extension bar requires version 9999.9999 or newer of Mercurial; disabling)
   foo.uisetup
   foo: bar loaded: False
   c24b9ac61126c9cd86d5d684f8408cdc717005a4
