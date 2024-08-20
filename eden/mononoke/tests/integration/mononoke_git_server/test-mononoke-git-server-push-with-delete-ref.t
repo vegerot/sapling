@@ -6,11 +6,9 @@
 
   $ . "${TEST_FIXTURES}/library.sh"
   $ REPOTYPE="blob_files"
-  $ ENABLED_DERIVED_DATA='["git_commits", "git_trees", "git_delta_manifests", "unodes", "filenodes", "hgchangesets"]' setup_common_config $REPOTYPE
+  $ setup_common_config $REPOTYPE
   $ GIT_REPO_ORIGIN="${TESTTMP}/origin/repo-git"
   $ GIT_REPO="${TESTTMP}/repo-git"
-  $ HG_REPO="${TESTTMP}/repo-hg"
-  $ BUNDLE_PATH="${TESTTMP}/repo_bundle.bundle"
   $ cat >> repos/repo/server.toml <<EOF
   > [source_control_service]
   > permit_writes = true
@@ -23,7 +21,6 @@
   $ echo "this is file1" > file1
   $ git add file1
   $ git commit -qam "Add file1"
-  $ old_head=$(git rev-parse HEAD)
   $ git tag -a -m "new tag" first_tag
   $ echo "this is file2" > file2
   $ git add file2
@@ -45,13 +42,16 @@
   Switched to branch 'master'
 
   $ cd "$TESTTMP"
-  $ git clone "$GIT_REPO_ORIGIN"
-  Cloning into 'repo-git'...
+  $ git clone --mirror "$GIT_REPO_ORIGIN" repo-git
+  Cloning into bare repository 'repo-git'...
   done.
 
 # Import it into Mononoke
   $ cd "$TESTTMP"
   $ quiet gitimport "$GIT_REPO" --derive-hg --generate-bookmarks full-repo
+
+# Set Mononoke as the Source of Truth
+  $ set_mononoke_as_source_of_truth_for_git
 
 # Start up the Mononoke Git Service
   $ mononoke_git_service

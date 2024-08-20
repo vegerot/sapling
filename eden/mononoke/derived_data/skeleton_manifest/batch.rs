@@ -138,9 +138,9 @@ pub async fn new_batch_derivation(
 mod test {
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::Bookmarks;
-    use changesets::Changesets;
     use commit_graph::CommitGraph;
     use commit_graph::CommitGraphRef;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use fixtures::Linear;
@@ -158,31 +158,23 @@ mod test {
 
     #[facet::container]
     #[derive(Clone)]
-    struct TestRepo {
-        #[facet]
-        bonsai_hg_mapping: dyn BonsaiHgMapping,
-        #[facet]
-        bookmarks: dyn Bookmarks,
-        #[facet]
-        changesets: dyn Changesets,
-        #[facet]
-        commit_graph: CommitGraph,
-        #[facet]
-        repo_derived_data: RepoDerivedData,
-        #[facet]
-        filestore_config: FilestoreConfig,
-        #[facet]
-        repo_blobstore: RepoBlobstore,
-        #[facet]
-        repo_identity: RepoIdentity,
-    }
+    struct TestRepo(
+        dyn BonsaiHgMapping,
+        dyn Bookmarks,
+        CommitGraph,
+        dyn CommitGraphWriter,
+        RepoDerivedData,
+        RepoBlobstore,
+        FilestoreConfig,
+        RepoIdentity,
+    );
 
     #[fbinit::test]
     async fn batch_derive(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
 
         let new_batch = {
-            let repo = Linear::getrepo(fb).await;
+            let repo: TestRepo = Linear::get_repo(fb).await;
             let master_cs_id = resolve_cs_id(&ctx, &repo, "master").await?;
 
             let mut cs_ids = repo
@@ -203,7 +195,7 @@ mod test {
         };
 
         let sequential = {
-            let repo = Linear::getrepo(fb).await;
+            let repo: TestRepo = Linear::get_repo(fb).await;
             let master_cs_id = resolve_cs_id(&ctx, &repo, "master").await?;
             repo.repo_derived_data()
                 .manager()

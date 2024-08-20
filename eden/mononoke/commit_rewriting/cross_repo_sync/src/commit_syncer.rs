@@ -40,6 +40,7 @@ use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::RepositoryId;
 use movers::Mover;
+use movers::Movers;
 use pushrebase::do_pushrebase_bonsai;
 use pushrebase_hooks::get_pushrebase_hooks;
 use repo_blobstore::RepoBlobstoreRef;
@@ -65,7 +66,7 @@ use crate::commit_sync_outcome::CandidateSelectionHint;
 use crate::commit_sync_outcome::CommitSyncOutcome;
 use crate::commit_sync_outcome::PluralCommitSyncOutcome;
 use crate::commit_syncers_lib::find_toposorted_unsynced_ancestors;
-use crate::commit_syncers_lib::get_mover_by_version;
+use crate::commit_syncers_lib::get_movers_by_version;
 use crate::commit_syncers_lib::remap_parents;
 use crate::commit_syncers_lib::rewrite_commit;
 use crate::commit_syncers_lib::run_with_lease;
@@ -83,7 +84,6 @@ use crate::reporting::CommitSyncContext;
 use crate::sync_config_version_utils::get_version;
 use crate::sync_config_version_utils::set_mapping_change_version;
 use crate::types::ErrorKind;
-use crate::types::Large;
 use crate::types::PushrebaseRewriteDates;
 use crate::types::Repo;
 use crate::types::Source;
@@ -417,11 +417,11 @@ where
         &self.mapping
     }
 
-    pub async fn get_mover_by_version(
+    pub async fn get_movers_by_version(
         &self,
         version: &CommitSyncConfigVersion,
-    ) -> Result<Mover, Error> {
-        get_mover_by_version(
+    ) -> Result<Movers, Error> {
+        get_movers_by_version(
             version,
             Arc::clone(&self.live_commit_sync_config),
             Source(self.repos.get_source_repo().repo_identity().id()),
@@ -838,8 +838,8 @@ where
             .into_iter()
             .chain(submodule_deps.repos())
             .collect::<Vec<_>>();
-        let target_repo = self.get_target_repo();
-        let large_in_memory_repo = InMemoryRepo::from_repo(target_repo, fallback_repos)?;
+        let large_repo = self.get_large_repo();
+        let large_in_memory_repo = InMemoryRepo::from_repo(large_repo, fallback_repos)?;
 
         CommitInMemorySyncer {
             ctx,
@@ -867,7 +867,7 @@ where
         let (source_repo, target_repo) = self.get_source_target();
 
         let submodule_deps = self.get_submodule_deps();
-        let mover = self.get_mover_by_version(sync_config_version).await?;
+        let movers = self.get_movers_by_version(sync_config_version).await?;
 
         let git_submodules_action = get_git_submodule_action_by_version(
             ctx,
@@ -894,19 +894,19 @@ where
             )
             .await?;
         let large_repo = self.get_large_repo();
-        let large_repo_id = Large(large_repo.repo_identity().id());
+        let small_repo_id = small_repo.repo_identity().id();
         let fallback_repos = vec![Arc::new(source_repo.clone())]
             .into_iter()
             .chain(submodule_deps.repos())
             .collect::<Vec<_>>();
-        let large_in_memory_repo = InMemoryRepo::from_repo(&target_repo, fallback_repos)?;
+        let large_in_memory_repo = InMemoryRepo::from_repo(large_repo, fallback_repos)?;
         let submodule_expansion_data = match submodule_deps {
             SubmoduleDeps::ForSync(deps) => Some(SubmoduleExpansionData {
                 submodule_deps: deps,
                 large_repo: large_in_memory_repo,
                 x_repo_submodule_metadata_file_prefix: x_repo_submodule_metadata_file_prefix
                     .as_str(),
-                large_repo_id,
+                small_repo_id,
                 dangling_submodule_pointers,
             }),
             SubmoduleDeps::NotNeeded | SubmoduleDeps::NotAvailable => None,
@@ -916,7 +916,7 @@ where
             ctx,
             source_cs,
             &remapped_parents,
-            mover,
+            movers,
             &source_repo,
             Default::default(),
             git_submodules_action,
@@ -994,7 +994,7 @@ where
             remapped_parents_outcome.push(commit_sync_outcome);
         }
 
-        let mover = self.get_mover_by_version(&version).await?;
+        let movers = self.get_movers_by_version(&version).await?;
 
         let git_submodules_action = get_git_submodule_action_by_version(
             ctx,
@@ -1032,12 +1032,12 @@ where
             .await?;
 
         let large_repo = self.get_large_repo();
-        let large_repo_id = Large(large_repo.repo_identity().id());
+        let small_repo_id = small_repo.repo_identity().id();
         let fallback_repos = vec![Arc::new(source_repo.clone())]
             .into_iter()
             .chain(source_repo_deps.repos())
             .collect::<Vec<_>>();
-        let large_in_memory_repo = InMemoryRepo::from_repo(&target_repo, fallback_repos)?;
+        let large_in_memory_repo = InMemoryRepo::from_repo(large_repo, fallback_repos)?;
 
         let submodule_expansion_data = match &source_repo_deps {
             SubmoduleDeps::ForSync(deps) => Some(SubmoduleExpansionData {
@@ -1045,7 +1045,7 @@ where
                 large_repo: large_in_memory_repo,
                 x_repo_submodule_metadata_file_prefix: x_repo_submodule_metadata_file_prefix
                     .as_str(),
-                large_repo_id,
+                small_repo_id,
                 dangling_submodule_pointers,
             }),
             SubmoduleDeps::NotNeeded | SubmoduleDeps::NotAvailable => None,
@@ -1055,7 +1055,7 @@ where
             ctx,
             source_cs_mut,
             &remapped_parents,
-            mover,
+            movers,
             &source_repo,
             Default::default(),
             git_submodules_action,

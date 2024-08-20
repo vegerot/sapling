@@ -527,7 +527,6 @@
   [255]
   $ hg graft to-backout --force
   grafting b2fde3ce6adf "to-backout" (to-backout)
-  merging A
   $ cat A
   abc
 

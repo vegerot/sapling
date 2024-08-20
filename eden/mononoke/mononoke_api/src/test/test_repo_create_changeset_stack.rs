@@ -26,16 +26,16 @@ use crate::CreateChange;
 use crate::CreateChangeFile;
 use crate::CreateCopyInfo;
 use crate::CreateInfo;
-use crate::FileType;
 use crate::Mononoke;
 use crate::MononokeError;
+use crate::MononokeRepo;
 use crate::RepoContext;
 
-async fn create_changeset_stack(
-    repo: &RepoContext,
+async fn create_changeset_stack<R: MononokeRepo>(
+    repo: &RepoContext<R>,
     changes_stack: Vec<BTreeMap<MPath, CreateChange>>,
     stack_parents: Vec<ChangesetId>,
-) -> Result<Vec<ChangesetContext>, MononokeError> {
+) -> Result<Vec<ChangesetContext<R>>, MononokeError> {
     let author = String::from("Test Author <test@example.com>");
     let author_date = FixedOffset::east_opt(0)
         .unwrap()
@@ -57,15 +57,19 @@ async fn create_changeset_stack(
             git_extra_headers: git_extra_headers.clone(),
         })
         .collect::<Vec<_>>();
-    repo.create_changeset_stack(stack_parents, info_stack, changes_stack, bubble)
-        .await
+    Ok(repo
+        .create_changeset_stack(stack_parents, info_stack, changes_stack, bubble)
+        .await?
+        .into_iter()
+        .map(|(_hg_extra, cs)| cs)
+        .collect())
 }
 
-async fn create_changesets_sequentially(
-    repo: &RepoContext,
+async fn create_changesets_sequentially<R: MononokeRepo>(
+    repo: &RepoContext<R>,
     changes_stack: Vec<BTreeMap<MPath, CreateChange>>,
     stack_parents: Vec<ChangesetId>,
-) -> Result<Vec<ChangesetContext>, MononokeError> {
+) -> Result<Vec<ChangesetContext<R>>, MononokeError> {
     let author = String::from("Test Author <test@example.com>");
     let author_date = FixedOffset::east_opt(0)
         .unwrap()
@@ -89,7 +93,7 @@ async fn create_changesets_sequentially(
             extra: extra.clone(),
             git_extra_headers: git_extra_headers.clone(),
         };
-        let commit = repo
+        let (_hg_extra, commit) = repo
             .create_changeset(parents, info, changes, bubble)
             .await?;
         parents = vec![commit.id()];
@@ -99,12 +103,12 @@ async fn create_changesets_sequentially(
     Ok(result)
 }
 
-async fn compare_create_stack(
-    stack_repo: &RepoContext,
-    seq_repo: &RepoContext,
+async fn compare_create_stack<R: MononokeRepo>(
+    stack_repo: &RepoContext<R>,
+    seq_repo: &RepoContext<R>,
     changes_stack: Vec<BTreeMap<MPath, CreateChange>>,
     stack_parents: Vec<ChangesetId>,
-) -> Result<Option<Vec<ChangesetContext>>, Error> {
+) -> Result<Option<Vec<ChangesetContext<R>>>, Error> {
     let stack =
         create_changeset_stack(stack_repo, changes_stack.clone(), stack_parents.clone()).await;
     let seq = create_changesets_sequentially(seq_repo, changes_stack, stack_parents).await;
@@ -129,14 +133,8 @@ async fn compare_create_stack(
 async fn test_create_commit_stack(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mononoke = Mononoke::new_test(vec![
-        (
-            "test_stack".to_string(),
-            Linear::get_custom_test_repo(fb).await,
-        ),
-        (
-            "test_seq".to_string(),
-            Linear::get_custom_test_repo(fb).await,
-        ),
+        ("test_stack".to_string(), Linear::get_repo(fb).await),
+        ("test_seq".to_string(), Linear::get_repo(fb).await),
     ])
     .await?;
     let stack_repo = mononoke
@@ -159,38 +157,26 @@ async fn test_create_commit_stack(fb: FacebookInit) -> Result<(), Error> {
         btreemap! {
             MPath::try_from("TEST_FILE")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CREATE 1\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CREATE 1\n"),
                 None,
             ),
         },
         btreemap! {
             MPath::try_from("TEST_FILE")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CHANGE 1\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CHANGE 1\n"),
                 None,
             ),
             MPath::try_from("TEST_DIR/TEST_FILE")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CREATE 2\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CREATE 2\n"),
                 None,
             ),
         },
         btreemap! {
             MPath::try_from("TEST_DIR/TEST_FILE")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CHANGE 2\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CHANGE 2\n"),
                 None,
             ),
         },
@@ -233,14 +219,8 @@ async fn test_create_commit_stack(fb: FacebookInit) -> Result<(), Error> {
 async fn test_create_commit_stack_delete_files(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mononoke = Mononoke::new_test(vec![
-        (
-            "test_stack".to_string(),
-            Linear::get_custom_test_repo(fb).await,
-        ),
-        (
-            "test_seq".to_string(),
-            Linear::get_custom_test_repo(fb).await,
-        ),
+        ("test_stack".to_string(), Linear::get_repo(fb).await),
+        ("test_seq".to_string(), Linear::get_repo(fb).await),
     ])
     .await?;
     let stack_repo = mononoke
@@ -264,10 +244,7 @@ async fn test_create_commit_stack_delete_files(fb: FacebookInit) -> Result<(), E
         btreemap! {
             MPath::try_from("TEST_FILE")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CREATE 1\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CREATE 1\n"),
                 None,
             ),
         },
@@ -287,10 +264,7 @@ async fn test_create_commit_stack_delete_files(fb: FacebookInit) -> Result<(), E
         btreemap! {
             MPath::try_from("TEST_NEW_FILE")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CREATE 1\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CREATE 1\n"),
                 None,
             ),
         },
@@ -308,10 +282,7 @@ async fn test_create_commit_stack_delete_files(fb: FacebookInit) -> Result<(), E
         btreemap! {
             MPath::try_from("TEST_FILE")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CREATE 2\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CREATE 1\n"),
                 None,
             ),
         },
@@ -335,20 +306,14 @@ async fn test_create_commit_stack_delete_files(fb: FacebookInit) -> Result<(), E
         btreemap! {
             MPath::try_from("TEST_PATH/SUBDIR/TEST_FILE")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CREATE 3\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CREATE 3\n"),
                 None,
             ),
         },
         btreemap! {
             MPath::try_from("TEST_PATH")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CREATE 3\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CREATE 3\n"),
                 None,
             ),
         },
@@ -370,14 +335,8 @@ async fn test_create_commit_stack_delete_files(fb: FacebookInit) -> Result<(), E
 async fn test_create_commit_stack_path_conflicts(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mononoke = Mononoke::new_test(vec![
-        (
-            "test_stack".to_string(),
-            Linear::get_custom_test_repo(fb).await,
-        ),
-        (
-            "test_seq".to_string(),
-            Linear::get_custom_test_repo(fb).await,
-        ),
+        ("test_stack".to_string(), Linear::get_repo(fb).await),
+        ("test_seq".to_string(), Linear::get_repo(fb).await),
     ])
     .await?;
     let stack_repo = mononoke
@@ -401,20 +360,14 @@ async fn test_create_commit_stack_path_conflicts(fb: FacebookInit) -> Result<(),
         btreemap! {
             MPath::try_from("TEST_PATH")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CREATE 1\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CREATE 1\n"),
                 None,
             ),
         },
         btreemap! {
             MPath::try_from("TEST_PATH/SUBDIR/TEST_FILE")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CREATE 1\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CREATE 1\n"),
                 None,
             ),
         },
@@ -430,10 +383,7 @@ async fn test_create_commit_stack_path_conflicts(fb: FacebookInit) -> Result<(),
         btreemap! {
             MPath::try_from("TEST_PATH")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CREATE 1\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CREATE 1\n"),
                 None,
             ),
         },
@@ -442,10 +392,7 @@ async fn test_create_commit_stack_path_conflicts(fb: FacebookInit) -> Result<(),
             CreateChange::Deletion,
             MPath::try_from("TEST_PATH/SUBDIR/TEST_FILE")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CREATE 1\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CREATE 1\n"),
                 None,
             ),
         },
@@ -461,14 +408,8 @@ async fn test_create_commit_stack_path_conflicts(fb: FacebookInit) -> Result<(),
 async fn test_create_commit_stack_copy_from(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mononoke = Mononoke::new_test(vec![
-        (
-            "test_stack".to_string(),
-            Linear::get_custom_test_repo(fb).await,
-        ),
-        (
-            "test_seq".to_string(),
-            Linear::get_custom_test_repo(fb).await,
-        ),
+        ("test_stack".to_string(), Linear::get_repo(fb).await),
+        ("test_seq".to_string(), Linear::get_repo(fb).await),
     ])
     .await?;
     let stack_repo = mononoke
@@ -492,20 +433,14 @@ async fn test_create_commit_stack_copy_from(fb: FacebookInit) -> Result<(), Erro
         btreemap! {
             MPath::try_from("TEST_FILE")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CREATE 1\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CREATE 1\n"),
                 None,
             ),
         },
         btreemap! {
             MPath::try_from("TEST_FILE2")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CREATE 1\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CREATE 1\n"),
                 Some(CreateCopyInfo::new(MPath::try_from("OTHER_FILE")?, 0)),
             ),
         },
@@ -527,10 +462,7 @@ async fn test_create_commit_stack_copy_from(fb: FacebookInit) -> Result<(), Erro
         btreemap! {
             MPath::try_from("OTHER_FILE")? =>
             CreateChange::Tracked(
-                CreateChangeFile::New {
-                    bytes: Bytes::from("TEST CREATE 2\n"),
-                    file_type: FileType::Regular,
-                },
+                CreateChangeFile::new_regular("TEST CREATE 2\n"),
                 None,
             ),
         },

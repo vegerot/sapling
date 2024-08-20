@@ -15,24 +15,66 @@
 use std::collections::BTreeSet;
 
 use anyhow::Result;
-use blobrepo::BlobRepo;
+use blobstore::Loadable;
+use bonsai_hg_mapping::BonsaiHgMapping;
+use bookmarks::Bookmarks;
+use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use context::CoreContext;
+use deleted_manifest::DeletedManifestOps;
 use deleted_manifest::RootDeletedManifestIdCommon;
 use deleted_manifest::RootDeletedManifestV2Id;
-use derived_data::BonsaiDerived;
 use derived_data_manager::BonsaiDerivable as NewBonsaiDerivable;
 use fbinit::FacebookInit;
+use filestore::FilestoreConfig;
 use fsnodes::RootFsnodeId;
+use futures::future;
+use futures::stream::TryStreamExt;
 use futures_stats::TimedFutureExt;
+use manifest::ManifestOps;
 use mercurial_derivation::MappedHgChangesetId;
+use mercurial_derivation::RootHgAugmentedManifestId;
 use mononoke_types::ChangesetId;
 use rand::distributions::Alphanumeric;
 use rand::distributions::Uniform;
 use rand::thread_rng;
 use rand::Rng;
+use repo_blobstore::RepoBlobstore;
+use repo_blobstore::RepoBlobstoreRef;
+use repo_derived_data::RepoDerivedData;
+use repo_derived_data::RepoDerivedDataRef;
+use repo_identity::RepoIdentity;
 use skeleton_manifest::RootSkeletonManifestId;
 use tests_utils::CreateCommitContext;
 use unodes::RootUnodeManifestId;
+
+#[facet::container]
+#[derive(Clone)]
+struct Repo {
+    #[facet]
+    repo_identity: RepoIdentity,
+
+    #[facet]
+    repo_blobstore: RepoBlobstore,
+
+    #[facet]
+    repo_derived_data: RepoDerivedData,
+
+    #[facet]
+    bonsai_hg_mapping: dyn BonsaiHgMapping,
+
+    #[facet]
+    bookmarks: dyn Bookmarks,
+
+    #[facet]
+    commit_graph: CommitGraph,
+
+    #[facet]
+    commit_graph_writer: dyn CommitGraphWriter,
+
+    #[facet]
+    filestore_config: FilestoreConfig,
+}
 
 fn gen_filename(rng: &mut impl Rng, len: usize) -> String {
     std::iter::repeat_with(|| rng.sample(Alphanumeric))
@@ -43,7 +85,7 @@ fn gen_filename(rng: &mut impl Rng, len: usize) -> String {
 
 async fn make_initial_large_directory(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     count: usize,
 ) -> Result<(ChangesetId, BTreeSet<String>)> {
     let mut filenames = BTreeSet::new();
@@ -69,7 +111,7 @@ async fn make_initial_large_directory(
 
 async fn modify_large_directory(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     filenames: &mut BTreeSet<String>,
     csid: ChangesetId,
     index: usize,
@@ -129,33 +171,119 @@ async fn modify_large_directory(
     Ok(csid)
 }
 
-async fn derive(ctx: &CoreContext, repo: &BlobRepo, data: &str, csid: ChangesetId) -> String {
+async fn derive(ctx: &CoreContext, repo: &Repo, data: &str, csid: ChangesetId) -> String {
     match data {
-        MappedHgChangesetId::NAME => MappedHgChangesetId::derive(ctx, repo, csid)
+        MappedHgChangesetId::NAME => repo
+            .repo_derived_data()
+            .derive::<MappedHgChangesetId>(ctx, csid)
             .await
             .unwrap()
             .hg_changeset_id()
             .to_string(),
-        RootSkeletonManifestId::NAME => RootSkeletonManifestId::derive(ctx, repo, csid)
+        RootSkeletonManifestId::NAME => repo
+            .repo_derived_data()
+            .derive::<RootSkeletonManifestId>(ctx, csid)
             .await
             .unwrap()
             .skeleton_manifest_id()
             .to_string(),
-        RootUnodeManifestId::NAME => RootUnodeManifestId::derive(ctx, repo, csid)
+        RootUnodeManifestId::NAME => repo
+            .repo_derived_data()
+            .derive::<RootUnodeManifestId>(ctx, csid)
             .await
             .unwrap()
             .manifest_unode_id()
             .to_string(),
-        RootDeletedManifestV2Id::NAME => RootDeletedManifestV2Id::derive(ctx, repo, csid)
+        RootDeletedManifestV2Id::NAME => repo
+            .repo_derived_data()
+            .derive::<RootDeletedManifestV2Id>(ctx, csid)
             .await
             .unwrap()
             .id()
             .to_string(),
-        RootFsnodeId::NAME => RootFsnodeId::derive(ctx, repo, csid)
+        RootFsnodeId::NAME => repo
+            .repo_derived_data()
+            .derive::<RootFsnodeId>(ctx, csid)
             .await
             .unwrap()
             .fsnode_id()
             .to_string(),
+        RootHgAugmentedManifestId::NAME => repo
+            .repo_derived_data()
+            .derive::<RootHgAugmentedManifestId>(ctx, csid)
+            .await
+            .unwrap()
+            .hg_augmented_manifest_id()
+            .to_string(),
+        _ => panic!("invalid derived data type: {}", data),
+    }
+}
+
+async fn iterate(ctx: &CoreContext, repo: &Repo, data: &str, csid: ChangesetId) -> u64 {
+    match data {
+        MappedHgChangesetId::NAME => repo
+            .repo_derived_data()
+            .derive::<MappedHgChangesetId>(ctx, csid)
+            .await
+            .unwrap()
+            .hg_changeset_id()
+            .load(ctx, repo.repo_blobstore())
+            .await
+            .unwrap()
+            .manifestid()
+            .list_all_entries(ctx.clone(), repo.repo_blobstore().clone())
+            .try_fold(0u64, |acc, _| future::ok(acc + 1))
+            .await
+            .unwrap(),
+        RootSkeletonManifestId::NAME => repo
+            .repo_derived_data()
+            .derive::<RootSkeletonManifestId>(ctx, csid)
+            .await
+            .unwrap()
+            .skeleton_manifest_id()
+            .list_all_entries(ctx.clone(), repo.repo_blobstore().clone())
+            .try_fold(0u64, |acc, _| future::ok(acc + 1))
+            .await
+            .unwrap(),
+        RootUnodeManifestId::NAME => repo
+            .repo_derived_data()
+            .derive::<RootUnodeManifestId>(ctx, csid)
+            .await
+            .unwrap()
+            .manifest_unode_id()
+            .list_all_entries(ctx.clone(), repo.repo_blobstore().clone())
+            .try_fold(0u64, |acc, _| future::ok(acc + 1))
+            .await
+            .unwrap(),
+        RootDeletedManifestV2Id::NAME => repo
+            .repo_derived_data()
+            .derive::<RootDeletedManifestV2Id>(ctx, csid)
+            .await
+            .unwrap()
+            .list_all_entries(ctx, repo.repo_blobstore())
+            .try_fold(0u64, |acc, _| future::ok(acc + 1))
+            .await
+            .unwrap(),
+        RootFsnodeId::NAME => repo
+            .repo_derived_data()
+            .derive::<RootFsnodeId>(ctx, csid)
+            .await
+            .unwrap()
+            .fsnode_id()
+            .list_all_entries(ctx.clone(), repo.repo_blobstore().clone())
+            .try_fold(0u64, |acc, _| future::ok(acc + 1))
+            .await
+            .unwrap(),
+        RootHgAugmentedManifestId::NAME => repo
+            .repo_derived_data()
+            .derive::<RootHgAugmentedManifestId>(ctx, csid)
+            .await
+            .unwrap()
+            .hg_augmented_manifest_id()
+            .list_all_entries(ctx.clone(), repo.repo_blobstore().clone())
+            .try_fold(0u64, |acc, _| future::ok(acc + 1))
+            .await
+            .unwrap(),
         _ => panic!("invalid derived data type: {}", data),
     }
 }
@@ -169,7 +297,7 @@ async fn main(fb: FacebookInit) -> Result<()> {
     let data = args.next().unwrap_or_else(|| String::from("fsnodes"));
     println!("Deriving: {}", data);
 
-    let repo: BlobRepo = test_repo_factory::build_empty(ctx.fb).await?;
+    let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
 
     let (mut csid, mut filenames) = make_initial_large_directory(&ctx, &repo, 100_000).await?;
 
@@ -187,6 +315,9 @@ async fn main(fb: FacebookInit) -> Result<()> {
     println!("Last commit: {}", csid);
     let (stats, derived_id) = derive(&ctx, &repo, &data, csid).timed().await;
     println!("Derived id: {}  stats: {:?}", derived_id, stats);
+
+    let (stats, count) = iterate(&ctx, &repo, &data, csid).timed().await;
+    println!("Iterated count: {}  stats: {:?}", count, stats);
 
     Ok(())
 }

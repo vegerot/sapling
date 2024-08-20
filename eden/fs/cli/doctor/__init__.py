@@ -40,6 +40,7 @@ from . import (
     check_filesystems,
     check_hg,
     check_kerberos,
+    check_network,
     check_os,
     check_recent_writes,
     check_redirections,
@@ -75,6 +76,14 @@ except ImportError:
             self, *_args: Any, **_kwargs: Any
         ) -> None:
             pass
+
+
+try:
+    from .facebook.internal_consts import get_doctor_link
+except ImportError:
+
+    def get_doctor_link() -> str:
+        return ""
 
 
 # working_directory_was_stale may be set to True by the CLI main module
@@ -273,6 +282,7 @@ class EdenDoctorChecker:
                 checkouts[path] = checkout
 
         # Get information about the checkouts listed in the config file
+        missing_checkouts = []
         for configured_checkout in self.instance.get_checkouts():
             checkout_info = checkouts.get(configured_checkout.path, None)
             if checkout_info is None:
@@ -281,10 +291,21 @@ class EdenDoctorChecker:
                 checkouts[checkout_info.path] = checkout_info
 
             if checkout_info.backing_repo is None:
-                checkout_info.backing_repo = (
-                    configured_checkout.get_config().backing_repo
-                )
+                try:
+                    checkout_info.backing_repo = (
+                        configured_checkout.get_config().backing_repo
+                    )
+                except Exception as ex:
+                    # Config file is missing or invalid. The string here is formatted to make sense with the remediation message for EdenCheckoutInfosCorruption
+                    missing_checkouts.append(
+                        f"{configured_checkout.path} (error: {ex})"
+                    )
+                    continue
+
             checkout_info.configured_state_dir = configured_checkout.state_dir
+        if missing_checkouts:
+            errmsg = "\n".join(missing_checkouts)
+            raise RuntimeError(errmsg)
 
         return checkouts
 
@@ -323,7 +344,12 @@ class EdenDoctorChecker:
 
     def run_normal_checks(self) -> None:
         check_edenfs_version(self.tracker, self.instance)
-        checkouts = self._get_checkouts_info()
+        try:
+            checkouts = self._get_checkouts_info()
+            print(checkouts)
+        except RuntimeError as ex:
+            self.tracker.add_problem(EdenCheckoutInfosCorruption(ex))
+            return
         checked_backing_repos = set()
 
         if sys.platform == "win32":
@@ -439,6 +465,24 @@ class EdenDoctor(EdenDoctorChecker):
                 num_no_fixes=fixer.num_no_fixes,
                 num_advisory_fixes=fixer.num_advisory_fixes,
                 problem_failed_fixes=fixer.problem_failed_fixes,
+                problem_manual_fixes=fixer.problem_manual_fixes,
+                problem_no_fixes=fixer.problem_no_fixes,
+                problem_advisory_fixes=fixer.problem_advisory_fixes,
+                exception=fixer.problem_failed_fixes_exceptions,
+            )
+        elif sys.platform == "win32":
+            # dry run doesn't run fixes so we count the number of fixable problems rather
+            # than the number of failed fixes
+            self.instance.log_sample(
+                "eden_doctor_dry_run",
+                num_problems=fixer.num_problems,
+                problems=fixer.problem_types.union(fixer.ignored_problem_types),
+                problem_description=fixer.problem_description,
+                num_fixable=fixer.num_fixable,
+                num_manual_fixes=fixer.num_manual_fixes,
+                num_no_fixes=fixer.num_no_fixes,
+                num_advisory_fixes=fixer.num_advisory_fixes,
+                problem_fixable=fixer.problem_fixable,
                 problem_manual_fixes=fixer.problem_manual_fixes,
                 problem_no_fixes=fixer.problem_no_fixes,
                 problem_advisory_fixes=fixer.problem_advisory_fixes,
@@ -620,9 +664,38 @@ Checkouts inside backing repo are usually not intended and can cause spurious be
         )
 
 
-class ConfigurationParsingProblem(Problem):
+class EdenCheckoutCorruption(Problem):
     def __init__(self, checkout: CheckoutInfo, ex: Exception) -> None:
-        super().__init__(f"error parsing the configuration for {checkout.path}: {ex}")
+        remediation = f"""\
+To recover, you will need to remove and reclone the repo.
+You will lose uncommitted work or shelves, but all your local
+commits are safe.
+
+To remove the corrupted repo, run: `eden rm {checkout.path}`"""
+        if get_doctor_link():
+            remediation += f"\nFor additional info see the wiki at {get_doctor_link()}"
+
+        super().__init__(
+            f"Eden's checkout state for {checkout.path} has been corrupted: {ex}",
+            remediation=remediation,
+        )
+
+
+class EdenCheckoutInfosCorruption(Problem):
+    def __init__(self, ex: Exception) -> None:
+        remediation = """\
+To recover, you will need to remove and reclone the repo.
+You will lose uncommitted work or shelves, but all your local
+commits are safe.
+
+To reclone the corrupted repo, run: `fbclone $REPO --reclone --eden`"""
+        if get_doctor_link():
+            remediation += f"\nFor additional info see the wiki at {get_doctor_link()}"
+
+        super().__init__(
+            f"Encountered errors reading Eden's checkout info for the following checkouts:\n{ex}",
+            remediation=remediation,
+        )
 
 
 def check_mount(
@@ -714,7 +787,13 @@ def check_running_mount(
     try:
         config = checkout.get_config()
     except Exception as ex:
-        tracker.add_problem(ConfigurationParsingProblem(checkout_info, ex))
+        # Config file is missing or invalid
+        tracker.add_problem(
+            EdenCheckoutCorruption(
+                checkout_info,
+                ex,
+            )
+        )
         # Just skip the remaining checks.
         # Most of them rely on values from the configuration.
         return
@@ -766,6 +845,10 @@ def check_running_mount(
     if config.scm_type in ["hg", "filteredhg"]:
         try:
             check_hg.check_hg(tracker, checkout)
+        except RuntimeError as ex:
+            tracker.add_problem(EdenCheckoutCorruption(checkout_info, ex))
+            # Exit here but don't reraise since we're already reporting a problem.
+            return
         except Exception as ex:
             raise RuntimeError("Failed to check Mercurial status") from ex
 
@@ -773,6 +856,12 @@ def check_running_mount(
             check_filesystems.check_hg_status_match_hg_diff(tracker, instance, checkout)
         except Exception as ex:
             raise RuntimeError("Failed to compare `hg status` with `hg diff`") from ex
+
+        try:
+            if not fast:
+                check_network.check_network(tracker, checkout)
+        except Exception as ex:
+            raise RuntimeError("Failed to check network for mount") from ex
 
 
 class CheckoutNotConfigured(Problem):
@@ -888,6 +977,32 @@ Failed to remount this mount with error:
                 )
             else:
                 raise
+
+    def check_fix(self) -> bool:
+        """
+        Check that mount return value is 1(already mounted) when rerunning command
+        """
+        try:
+            mount_value = self._instance.mount(str(self._mount_path), False)
+        except Exception as ex:
+            """
+            This should only happen if the mount becomes corrupted
+            between the time of the remount and the time of the check.
+            """
+            self._out.write(
+                f"\nAttempt to fix missing mount failed: {ex}.\n",
+                flush=True,
+            )
+            return False
+        if mount_value == 1:
+            return True
+        elif mount_value == 0:
+            """
+            This should only happen if the mount somehow gets unmounted
+            between the time of the remount and the time of the check.
+            """
+            return True
+        return False
 
 
 class StaleWorkingDirectory(Problem):

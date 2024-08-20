@@ -26,22 +26,21 @@ use bulk_derivation::BulkDerivation;
 use cacheblob::InProcessLease;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
-use cross_repo_sync::submodule_metadata_file_prefix_and_dangling_pointers;
-use cross_repo_sync::validate_all_submodule_expansions;
 use cross_repo_sync::CommitSyncRepos;
 use cross_repo_sync::CommitSyncer;
-use cross_repo_sync::InMemoryRepo;
-use cross_repo_sync::Large;
 use cross_repo_sync::SubmoduleDeps;
-use cross_repo_sync::SubmoduleExpansionData;
 use cross_repo_sync_test_utils::rebase_root_on_master;
 use cross_repo_sync_test_utils::TestRepo;
 use fbinit::FacebookInit;
+use fn_error_context::context;
 use fsnodes::RootFsnodeId;
 use futures::stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use git_types::MappedGitCommitId;
+use justknobs::test_helpers::override_just_knobs;
+use justknobs::test_helpers::JustKnobsInMemory;
+use justknobs::test_helpers::KnobVal;
 use live_commit_sync_config::LiveCommitSyncConfig;
 use live_commit_sync_config::TestLiveCommitSyncConfigSource;
 use manifest::ManifestOps;
@@ -53,12 +52,10 @@ use metaconfig_types::CommonCommitSyncConfig;
 use metaconfig_types::DefaultSmallToLargeCommitSyncPathAction;
 use metaconfig_types::DerivedDataTypesConfig;
 use metaconfig_types::GitSubmodulesChangesAction;
-use metaconfig_types::RepoConfig;
 use metaconfig_types::SmallRepoCommitSyncConfig;
 use metaconfig_types::SmallRepoGitSubmoduleConfig;
 use metaconfig_types::SmallRepoPermanentConfig;
 use mononoke_types::hash::GitSha1;
-use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::DerivableType;
 use mononoke_types::FileChange;
@@ -71,12 +68,13 @@ use repo_identity::RepoIdentityRef;
 use sorted_vector_map::SortedVectorMap;
 use strum::IntoEnumIterator;
 use synced_commit_mapping::SqlSyncedCommitMapping;
+use test_repo_factory::default_test_repo_derived_data_types_config;
 use test_repo_factory::TestRepoFactory;
 use tests_utils::bookmark;
 use tests_utils::drawdag::extend_from_dag_with_actions;
 use tests_utils::CreateCommitContext;
 
-use crate::prepare_repos_mapping_and_config;
+use crate::prepare_repos_mapping_and_config_with_repo_config_overrides;
 use crate::sync_to_master;
 
 pub const MASTER_BOOKMARK_NAME: &str = "master";
@@ -85,7 +83,7 @@ pub const REPO_B_DANGLING_GIT_COMMIT_HASH: &str = "e957dda44445098cfbaea99e4771e
 pub const REPO_C_DANGLING_GIT_COMMIT_HASH: &str = "408dc1a8d40f13a0b8eee162411dba2b8830b1f0";
 
 pub(crate) struct SubmoduleSyncTestData {
-    pub(crate) repo_a_info: (TestRepo, BTreeMap<String, ChangesetId>),
+    pub(crate) small_repo_info: (TestRepo, BTreeMap<String, ChangesetId>),
     pub(crate) large_repo_info: (TestRepo, ChangesetId),
     pub(crate) commit_syncer: CommitSyncer<SqlSyncedCommitMapping, TestRepo>,
     pub(crate) live_commit_sync_config: Arc<dyn LiveCommitSyncConfig>,
@@ -120,26 +118,66 @@ pub(crate) struct ExpectedChangeset {
 }
 
 impl ExpectedChangeset {
-    /// Quickly create `ExpectedChangeset` by providing a changeset message and
-    /// the paths that you expect to be added/modified or deleted.
-    pub(crate) fn new_by_file_change<S: Into<String> + std::cmp::Ord>(
-        message: S,
-        regular_changes: Vec<S>,
-        deletions: Vec<S>,
-    ) -> Self {
-        let mut reg_changes_map = regular_changes
+    pub(crate) fn new<S: Into<String> + std::cmp::Ord>(message: S) -> Self {
+        Self {
+            message: message.into(),
+            file_changes: SortedVectorMap::new(),
+        }
+    }
+
+    /// Adds Regular file changes on the given paths to ExpectedChangesets
+    pub(crate) fn with_regular_changes<S, I>(self, regular_changes: I) -> Self
+    where
+        S: Into<String> + std::cmp::Ord,
+        I: IntoIterator<Item = S>,
+    {
+        let reg_changes_map = regular_changes
             .into_iter()
             .map(|p| (p.into(), FileChangeSummary::Change(FileType::Regular)))
             .collect::<SortedVectorMap<_, _>>();
+        self.extend_file_changes(reg_changes_map)
+    }
+
+    /// Adds Deletion file changes on the given paths to ExpectedChangesets
+    pub(crate) fn with_deletions<S, I>(self, deletions: I) -> Self
+    where
+        S: Into<String> + std::cmp::Ord,
+        I: IntoIterator<Item = S>,
+    {
         let deletions_map = deletions
             .into_iter()
             .map(|p| (p.into(), FileChangeSummary::Deletion))
             .collect::<SortedVectorMap<_, _>>();
-        reg_changes_map.extend(deletions_map);
+        self.extend_file_changes(deletions_map)
+    }
+
+    /// Adds GitSubmodules file changes on the given paths to ExpectedChangesets
+    pub(crate) fn with_git_submodules<S, I>(self, paths: I) -> Self
+    where
+        S: Into<String> + std::cmp::Ord,
+        I: IntoIterator<Item = S>,
+    {
+        let file_changes = paths
+            .into_iter()
+            .map(|p| (p.into(), FileChangeSummary::Change(FileType::GitSubmodule)))
+            .collect::<SortedVectorMap<_, _>>();
+        self.extend_file_changes(file_changes)
+    }
+
+    fn extend_file_changes(
+        self,
+        new_file_changes: SortedVectorMap<String, FileChangeSummary>,
+    ) -> Self {
+        let ExpectedChangeset {
+            message,
+            mut file_changes,
+        } = self;
+
+        file_changes.extend(new_file_changes);
 
         Self {
-            message: message.into(),
-            file_changes: reg_changes_map,
+            message,
+            file_changes,
         }
     }
 }
@@ -156,8 +194,22 @@ pub(crate) async fn build_submodule_sync_test_data(
     submodule_deps: Vec<(NonRootMPath, TestRepo)>,
 ) -> Result<SubmoduleSyncTestData> {
     let ctx = CoreContext::test_mock(fb.clone());
+    let test_jk = JustKnobsInMemory::new(hashmap! {
+        "scm/mononoke:backsync_submodule_expansion_changes".to_string() => KnobVal::Bool(true),
+    });
+    override_just_knobs(Some(test_jk));
+
+    let small_repo_ddt_cfg = submodule_repo_derived_data_types_config();
+
     let (small_repo, large_repo, mapping, live_commit_sync_config, test_sync_config_source) =
-        prepare_repos_mapping_and_config(fb).await?;
+        prepare_repos_mapping_and_config_with_repo_config_overrides(
+            fb,
+            |cfg| {
+                cfg.derived_data_config.available_configs = small_repo_ddt_cfg;
+            },
+            |_| (),
+        )
+        .await?;
 
     println!("Got small/large repos, mapping and config stores");
     let large_repo_root = CreateCommitContext::new(&ctx, &large_repo, Vec::<String>::new())
@@ -179,17 +231,18 @@ pub(crate) async fn build_submodule_sync_test_data(
         .derive::<MappedGitCommitId>(&ctx, b_master_cs)
         .await?;
 
-    let (repo_a, repo_a_cs_map) = build_repo_a(fb, small_repo, *b_master_git_sha1.oid()).await?;
-    println!("Build repo_a");
-    let repo_a_root = repo_a_cs_map
+    let (small_repo, small_repo_cs_map) =
+        build_small_repo(fb, small_repo, *b_master_git_sha1.oid()).await?;
+    println!("Build small_repo");
+    let small_repo_root = small_repo_cs_map
         .get("A_A")
         .expect("Failed to get root changeset id in repo A");
 
-    let commit_syncer = create_repo_a_to_large_repo_commit_syncer(
+    let commit_syncer = create_small_repo_to_large_repo_commit_syncer(
         &ctx,
-        repo_a.clone(),
+        small_repo.clone(),
         large_repo.clone(),
-        "repo_a",
+        "small_repo",
         mapping.clone(),
         live_commit_sync_config.clone(),
         test_sync_config_source.clone(),
@@ -198,14 +251,14 @@ pub(crate) async fn build_submodule_sync_test_data(
 
     println!("Created commit syncer");
 
-    rebase_root_on_master(ctx.clone(), &commit_syncer, *repo_a_root).await?;
+    rebase_root_on_master(ctx.clone(), &commit_syncer, *small_repo_root).await?;
 
     println!("Synced A_A to large repo's master");
 
     let _ = sync_to_master(
         ctx.clone(),
         &commit_syncer,
-        *repo_a_cs_map.get("A_B").unwrap(),
+        *small_repo_cs_map.get("A_B").unwrap(),
     )
     .await
     .context("Failed to sync commit A_B")?
@@ -214,14 +267,14 @@ pub(crate) async fn build_submodule_sync_test_data(
     let large_repo_master = sync_to_master(
         ctx.clone(),
         &commit_syncer,
-        *repo_a_cs_map.get("A_C").unwrap(),
+        *small_repo_cs_map.get("A_C").unwrap(),
     )
     .await
     .context("Failed to sync commit A_C")?
     .ok_or(anyhow!("Commit A_C wasn't synced"))?;
 
     Ok(SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (large_repo, large_repo_master),
         commit_syncer,
         mapping,
@@ -232,20 +285,12 @@ pub(crate) async fn build_submodule_sync_test_data(
 
 /// Builds repo A, which will be the small repo synced to the large repo.
 /// It will depend on repo B as a submodule.
-pub(crate) async fn build_repo_a(
+pub(crate) async fn build_small_repo(
     fb: FacebookInit,
-    mut repo_a: TestRepo,
+    small_repo: TestRepo,
     submodule_b_git_hash: GitSha1,
 ) -> Result<(TestRepo, BTreeMap<String, ChangesetId>)> {
     let ctx = CoreContext::test_mock(fb);
-
-    let available_configs = derived_data_available_config();
-
-    let repo_config_arc = repo_a.repo_config.clone();
-    let mut repo_config: RepoConfig = (*repo_config_arc).clone();
-    repo_config.derived_data_config.available_configs = available_configs;
-
-    repo_a.repo_config = Arc::new(repo_config);
 
     let dag = format!(
         r#"
@@ -259,9 +304,9 @@ pub(crate) async fn build_repo_a(
     "#
     );
 
-    let (cs_map, _) = extend_from_dag_with_actions(&ctx, &repo_a, dag.as_str()).await?;
+    let (cs_map, _) = extend_from_dag_with_actions(&ctx, &small_repo, dag.as_str()).await?;
 
-    Ok((repo_a, cs_map))
+    Ok((small_repo, cs_map))
 }
 
 /// Builds repo B, which will be used as a submodule dependency of repo A.
@@ -334,7 +379,7 @@ async fn build_mononoke_git_mirror_repo(
     repo_name: &str,
     id: i32,
 ) -> Result<TestRepo> {
-    let available_configs = derived_data_available_config();
+    let available_configs = submodule_repo_derived_data_types_config();
 
     let repo = TestRepoFactory::new(fb)?
         .with_name(repo_name)
@@ -352,7 +397,7 @@ async fn build_mononoke_git_mirror_repo(
     Ok(repo)
 }
 
-pub(crate) fn create_repo_a_to_large_repo_commit_syncer(
+pub(crate) fn create_small_repo_to_large_repo_commit_syncer(
     ctx: &CoreContext,
     small_repo: TestRepo,
     large_repo: TestRepo,
@@ -408,7 +453,7 @@ pub(crate) fn create_repo_a_to_large_repo_commit_syncer(
 /// expanding all of its submodules.
 pub(crate) fn create_commit_sync_config(
     large_repo_id: RepositoryId,
-    repo_a_id: RepositoryId,
+    small_repo_id: RepositoryId,
     prefix: &str,
     submodule_deps: Vec<(NonRootMPath, TestRepo)>,
 ) -> Result<CommitSyncConfig, Error> {
@@ -417,7 +462,7 @@ pub(crate) fn create_commit_sync_config(
         large_repo_id,
         common_pushrebase_bookmarks: vec![],
         small_repos: hashmap! {
-            repo_a_id => small_repo_config,
+            small_repo_id => small_repo_config,
         },
         version_name: base_commit_sync_version_name(),
     })
@@ -455,7 +500,7 @@ pub(crate) fn create_small_repo_sync_config(
 
 pub(crate) fn add_new_commit_sync_config_version_with_submodule_deps(
     ctx: &CoreContext,
-    repo_a: &TestRepo,
+    small_repo: &TestRepo,
     large_repo: &TestRepo,
     prefix: &str,
     submodule_deps: Vec<(NonRootMPath, TestRepo)>,
@@ -465,16 +510,16 @@ pub(crate) fn add_new_commit_sync_config_version_with_submodule_deps(
 ) -> Result<CommitSyncer<SqlSyncedCommitMapping, TestRepo>, Error> {
     let commit_sync_config = create_commit_sync_config(
         large_repo.repo_identity().id(),
-        repo_a.repo_identity().id(),
+        small_repo.repo_identity().id(),
         prefix,
         submodule_deps.clone(),
     )?;
     test_sync_config_source.add_config(commit_sync_config);
-    let commit_syncer = create_repo_a_to_large_repo_commit_syncer(
+    let commit_syncer = create_small_repo_to_large_repo_commit_syncer(
         ctx,
-        repo_a.clone(),
+        small_repo.clone(),
         large_repo.clone(),
-        "repo_a",
+        "small_repo",
         mapping.clone(),
         live_commit_sync_config.clone(),
         test_sync_config_source.clone(),
@@ -487,10 +532,23 @@ pub(crate) fn add_new_commit_sync_config_version_with_submodule_deps(
 // Test data
 
 /// Derived data types that should be enabled in all test repos
-pub(crate) fn derived_data_available_config() -> HashMap<String, DerivedDataTypesConfig> {
+pub(crate) fn submodule_repo_derived_data_types_config() -> HashMap<String, DerivedDataTypesConfig>
+{
+    let types = DerivableType::iter()
+        .filter(|t| {
+            ![
+                DerivableType::HgChangesets,
+                DerivableType::HgAugmentedManifests,
+                DerivableType::FileNodes,
+            ]
+            .contains(t)
+        })
+        .collect();
+
+    let default_test_repo_config = default_test_repo_derived_data_types_config();
     let derived_data_types_config = DerivedDataTypesConfig {
-        types: DerivableType::iter().collect(),
-        ..Default::default()
+        types,
+        ..default_test_repo_config
     };
 
     hashmap! {
@@ -505,27 +563,17 @@ pub(crate) fn base_commit_sync_version_name() -> CommitSyncConfigVersion {
 
 pub(crate) fn expected_changesets_from_basic_setup() -> Vec<ExpectedChangeset> {
     vec![
-        ExpectedChangeset::new_by_file_change(
-            "First commit in large repo",
-            vec!["large_repo_root"],
-            vec![],
-        ),
-        ExpectedChangeset::new_by_file_change("first commit in A", vec!["repo_a/A_A"], vec![]),
-        ExpectedChangeset::new_by_file_change(
-            "add B submodule",
-            vec![
-                "repo_a/A_B",
-                "repo_a/submodules/.x-repo-submodule-repo_b",
-                "repo_a/submodules/repo_b/B_A",
-                "repo_a/submodules/repo_b/B_B",
-            ],
-            vec![],
-        ),
-        ExpectedChangeset::new_by_file_change(
-            "change A after adding submodule B",
-            vec!["repo_a/A_C"],
-            vec![],
-        ),
+        ExpectedChangeset::new("First commit in large repo")
+            .with_regular_changes(vec!["large_repo_root"]),
+        ExpectedChangeset::new("first commit in A").with_regular_changes(vec!["small_repo/A_A"]),
+        ExpectedChangeset::new("add B submodule").with_regular_changes(vec![
+            "small_repo/A_B",
+            "small_repo/submodules/.x-repo-submodule-repo_b",
+            "small_repo/submodules/repo_b/B_A",
+            "small_repo/submodules/repo_b/B_B",
+        ]),
+        ExpectedChangeset::new("change A after adding submodule B")
+            .with_regular_changes(vec!["small_repo/A_C"]),
     ]
 }
 
@@ -686,6 +734,7 @@ pub(crate) async fn derive_all_enabled_types_for_repo(
         .iter()
         .copied()
         .collect::<Vec<_>>();
+
     let _ = repo
         .repo_derived_data()
         .manager()
@@ -737,50 +786,47 @@ pub(crate) async fn assert_working_copy_matches_expected(
     Ok(())
 }
 
-/// Test validation of submodule expansion in large repo's bonsai
-pub(crate) async fn test_submodule_expansion_validation_in_large_repo_bonsai(
+// Helper to easily get GitSha1 from a bonsai changeset
+#[context("Failed to compute GitSha1 from changeset {cs_id} in repo {}", repo.repo_identity().name())]
+pub(crate) async fn git_sha1_from_changeset(
+    ctx: &CoreContext,
+    repo: &TestRepo,
+    cs_id: ChangesetId,
+) -> Result<GitSha1> {
+    let c_master_mapped_git_commit = repo
+        .repo_derived_data()
+        .derive::<MappedGitCommitId>(ctx, cs_id)
+        .await
+        .with_context(|| format!("Failed to derive MappedGitCommitId for changeset {cs_id}"))?;
+
+    Ok(*c_master_mapped_git_commit.oid())
+}
+
+/// Sync a changeset to the target repo and derive all data types for it.
+/// Also print a few things to debug test failures.
+#[context("Failed to sync changeset {cs_id} to repo {}", target_repo.repo_identity().name())]
+pub(crate) async fn sync_changeset_and_derive_all_types(
     ctx: CoreContext,
-    bonsai: BonsaiChangeset,
-    large_repo: TestRepo,
-    repo_a: TestRepo,
-    commit_syncer: CommitSyncer<SqlSyncedCommitMapping, TestRepo>,
-    live_commit_sync_config: Arc<dyn LiveCommitSyncConfig>,
-) -> Result<BonsaiChangeset> {
-    println!("Validating expansion of bonsai: {0:#?}", bonsai.message());
+    cs_id: ChangesetId,
+    target_repo: &TestRepo,
+    commit_syncer: &CommitSyncer<SqlSyncedCommitMapping, TestRepo>,
+) -> Result<(ChangesetId, Vec<ChangesetData>)> {
+    let target_repo_cs_id = sync_to_master(ctx.clone(), commit_syncer, cs_id)
+        .await
+        .with_context(|| format!("Failed to sync commit {cs_id}"))?
+        .ok_or(anyhow!("No commit was synced"))?;
 
-    let large_repo_id = Large(large_repo.repo_identity().id());
-    let sync_config_version = base_commit_sync_version_name();
-    let mover = commit_syncer
-        .get_mover_by_version(&sync_config_version)
-        .await?;
+    println!("Changeset {cs_id} successfully synced as {target_repo_cs_id}");
 
-    let submodule_deps = commit_syncer.get_submodule_deps();
-    let fallback_repos = vec![Arc::new(repo_a.clone())]
-        .into_iter()
-        .chain(submodule_deps.repos())
-        .collect::<Vec<_>>();
-    let large_in_memory_repo = InMemoryRepo::from_repo(&large_repo, fallback_repos)?;
-    let (x_repo_submodule_metadata_file_prefix, dangling_submodule_pointers) =
-        submodule_metadata_file_prefix_and_dangling_pointers(
-            repo_a.repo_identity().id(),
-            &sync_config_version,
-            live_commit_sync_config.clone(),
-        )
-        .await?;
+    let target_repo_changesets = get_all_changeset_data_from_repo(&ctx, target_repo).await?;
 
-    let submodule_deps = match submodule_deps {
-        SubmoduleDeps::ForSync(deps) => deps,
-        SubmoduleDeps::NotNeeded | SubmoduleDeps::NotAvailable => {
-            return Err(anyhow!("Submodule deps should have been set!"));
-        }
-    };
+    // Print all target repo changesets for debugging, if the test fails
+    println!(
+        "All target repo changesets: {0:#?}",
+        &target_repo_changesets
+    );
 
-    let sm_exp_data = SubmoduleExpansionData {
-        submodule_deps,
-        large_repo: large_in_memory_repo,
-        x_repo_submodule_metadata_file_prefix: x_repo_submodule_metadata_file_prefix.as_str(),
-        large_repo_id,
-        dangling_submodule_pointers,
-    };
-    validate_all_submodule_expansions(&ctx, sm_exp_data, bonsai, mover).await
+    derive_all_enabled_types_for_repo(&ctx, target_repo, &target_repo_changesets).await?;
+
+    Ok((target_repo_cs_id, target_repo_changesets.to_vec()))
 }

@@ -410,6 +410,10 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
 
   int64_t getPid() override;
 
+  void getCheckoutProgressInfo(
+      CheckoutProgressInfoResponse& ret,
+      std::unique_ptr<CheckoutProgressInfoRequest> params) override;
+
   /**
    * A thrift client has requested that we shutdown.
    */
@@ -460,13 +464,17 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
       const EdenMount& edenMount,
       const std::vector<std::string>& paths,
       EntryAttributeFlags reqBitmask,
+      AttributesRequestScope reqScope,
       SyncBehavior sync,
-      const ObjectFetchContextPtr& fetchContext);
+      const ObjectFetchContextPtr& fetchContext,
+      bool getEntryAttributesForPath);
   ImmediateFuture<EntryAttributes> getEntryAttributesForPath(
       const EdenMount& edenMount,
       EntryAttributeFlags reqBitmask,
+      AttributesRequestScope reqScope,
       std::string_view path,
-      const ObjectFetchContextPtr& fetchContext);
+      const ObjectFetchContextPtr& fetchContext,
+      bool getEntryAttributesForPath);
 
   folly::Synchronized<std::unordered_map<uint64_t, ThriftRequestTraceEvent>>
       outstandingThriftRequests_;

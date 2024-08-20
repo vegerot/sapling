@@ -17,10 +17,6 @@ use anyhow::bail;
 use anyhow::Error;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bonsai_hg_mapping::BonsaiOrHgChangesetIds;
-use bulkops::ChangesetBulkFetcher;
-use bulkops::Direction;
-use bulkops::MAX_FETCH_STEP;
-use changesets::ChangesetsArc;
 use clientinfo::ClientEntryPoint;
 use clientinfo::ClientInfo;
 use cloned::cloned;
@@ -38,10 +34,10 @@ use mercurial_derivation::MappedHgChangesetId;
 use mononoke_types::ChangesetId;
 use mononoke_types::RepositoryId;
 use mononoke_types::Timestamp;
-use phases::PhasesArc;
 use repo_identity::RepoIdentityRef;
 use slog::info;
 use slog::Logger;
+use sql_commit_graph_storage::CommitGraphBulkFetcherArc;
 use strum::IntoEnumIterator;
 use tokio::time::Duration;
 use tokio::time::Instant;
@@ -49,6 +45,8 @@ use tokio::time::Instant;
 use crate::commands::JobWalkParams;
 use crate::detail::checkpoint::Checkpoint;
 use crate::detail::checkpoint::CheckpointsByName;
+use crate::detail::fetcher::BulkFetcherOps;
+use crate::detail::fetcher::Direction;
 use crate::detail::graph::ChangesetKey;
 use crate::detail::graph::Node;
 use crate::detail::graph::NodeType;
@@ -265,20 +263,15 @@ where
         let fetcher_params = tail_params
             .chunking
             .as_ref()
-            .map(|chunking| {
-                let heads_fetcher = ChangesetBulkFetcher::new(
-                    repo_params.repo.changesets_arc(),
-                    repo_params.repo.phases_arc(),
-                )
-                .with_read_from_master(false)
-                .with_step(MAX_FETCH_STEP);
-                heads_fetcher.map(|v| (chunking, v))
+            .map(|chunking| -> Result<(_, Arc<dyn BulkFetcherOps>), Error> {
+                let heads_fetcher: Arc<dyn BulkFetcherOps> =
+                    repo_params.repo.commit_graph_bulk_fetcher_arc();
+                Ok((chunking, heads_fetcher))
             })
             .transpose()?;
 
         let is_chunking = fetcher_params.is_some();
         let mut run_start = Timestamp::now();
-        let mut chunk_smaller_than_fetch = None;
 
         // Get the chunk stream and whether the bounds it covers are contiguous
         let (contiguous_bounds, mut best_bounds, chunk_stream) = if let Some((
@@ -286,16 +279,14 @@ where
             heads_fetcher,
         )) = &fetcher_params
         {
-            if chunking.chunk_size < MAX_FETCH_STEP as usize {
-                chunk_smaller_than_fetch = Some(chunking.direction);
-            }
-            let (mut lower, mut upper) = heads_fetcher.get_repo_bounds(&ctx).await?;
-            if let Some(lower_override) = chunking.repo_lower_bound_override {
-                lower = lower_override;
-            }
-            if let Some(upper_override) = chunking.repo_upper_bound_override {
-                upper = upper_override;
-            }
+            let repo_bounds = heads_fetcher.repo_bounds(&ctx).await?;
+
+            let lower = chunking
+                .repo_lower_bound_override
+                .unwrap_or(repo_bounds.start);
+            let upper = chunking
+                .repo_upper_bound_override
+                .unwrap_or(repo_bounds.end);
 
             info!(repo_params.logger, #log::CHUNKING, "Repo bounds: ({}, {})", lower, upper);
 
@@ -353,11 +344,7 @@ where
 
             let load_ids = |(lower, upper)| {
                 heads_fetcher
-                    .fetch_ids_for_both_public_and_draft_commits(
-                        &ctx,
-                        chunking.direction,
-                        Some((lower, upper)),
-                    )
+                    .changesets_stream(&ctx, chunking.direction, lower..upper)
                     .chunks(chunking.chunk_size)
                     .map(move |v| v.into_iter().collect::<Result<HashSet<_>, Error>>())
             };
@@ -412,28 +399,10 @@ where
             let mut chunk_upper: u64 = 0;
             let chunk_members: HashSet<ChangesetId> = chunk_members
                 .into_iter()
-                .map(|((cs_id, id), (fetch_low, fetch_upper))| {
-                    if let Some(direction) = chunk_smaller_than_fetch {
-                        // Adjust the bounds so it doesn't exceed previous chunk
-                        if direction == Direction::NewestFirst {
-                            chunk_low = min(chunk_low, id);
-                            chunk_upper = max(chunk_upper, fetch_upper);
-                            if let Some(last_chunk_low) = last_chunk_low {
-                                chunk_upper = min(last_chunk_low, chunk_upper)
-                            }
-                        } else {
-                            chunk_low = min(chunk_low, fetch_low);
-                            if let Some(last_chunk_upper) = last_chunk_upper {
-                                chunk_low = max(last_chunk_upper, chunk_low)
-                            }
-                            // Top of range is exclusive, so add one to the found id
-                            chunk_upper = max(chunk_upper, id + 1);
-                        }
-                    } else {
-                        // no need to adjust
-                        chunk_low = min(chunk_low, fetch_low);
-                        chunk_upper = max(chunk_upper, fetch_upper);
-                    }
+                .map(|(cs_id, id)| {
+                    chunk_low = min(chunk_low, id);
+                    chunk_upper = max(chunk_upper, id + 1);
+
                     cs_id
                 })
                 .collect();

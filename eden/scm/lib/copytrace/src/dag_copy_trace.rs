@@ -14,13 +14,13 @@ use async_trait::async_trait;
 use configmodel::Config;
 use configmodel::ConfigExt;
 use dag::DagAlgorithm;
-use dag::NameSet;
+use dag::Set;
 use dag::Vertex;
 use hg_metrics::increment_counter;
 use manifest::Manifest;
 use manifest_tree::TreeManifest;
 use manifest_tree::TreeStore;
-use pathhistory::RenameTracer;
+use pathhistory::PathHistory;
 use pathmatcher::Matcher;
 use storemodel::ReadRootTreeIds;
 use types::HgId;
@@ -95,7 +95,7 @@ impl DagCopyTrace {
         path: RepoPathBuf,
     ) -> Result<Option<Vertex>> {
         let set = self.dag.range(src.into(), dst.into()).await?;
-        let mut rename_tracer = RenameTracer::new(
+        let mut rename_tracer = PathHistory::new_existence_tracer(
             set,
             path,
             self.root_tree_reader.clone(),
@@ -149,8 +149,8 @@ impl DagCopyTrace {
     }
 
     async fn compute_distance(&self, src: Vertex, dst: Vertex) -> Result<u64> {
-        let src: NameSet = src.into();
-        let dst: NameSet = dst.into();
+        let src: Set = src.into();
+        let dst: Set = dst.into();
         let distance = self
             .dag
             .only(src.clone(), dst.clone())
@@ -171,6 +171,13 @@ impl CopyTrace for DagCopyTrace {
         src_path: RepoPathBuf,
     ) -> Result<TraceResult> {
         tracing::debug!(?src, ?dst, ?src_path, "trace_reanme");
+
+        let msrc = self.vertex_to_tree_manifest(&src).await?;
+        if msrc.get(&src_path)?.is_none() {
+            tracing::debug!("src_path not found in src commit");
+            return Ok(TraceResult::NotFound);
+        }
+
         if self.dag.is_ancestor(src.clone(), dst.clone()).await? {
             return self
                 .trace_rename_forward(src.clone(), dst.clone(), src_path)
@@ -266,7 +273,10 @@ impl CopyTrace for DagCopyTrace {
                 .await?
             {
                 Some(rename_commit) => rename_commit,
-                None => return self.check_path(&target, curr_path).await,
+                None => {
+                    tracing::trace!(" no rename commit found");
+                    return self.check_path(&target, curr_path).await;
+                }
             };
             tracing::trace!(?rename_commit, " found");
 

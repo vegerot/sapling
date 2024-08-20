@@ -295,7 +295,8 @@ EdenMount::EdenMount(
       clock_{serverState_->getClock()},
       scmStatusCache_{ScmStatusCache::create(
           serverState_->getReloadableConfig()->getEdenConfig().get(),
-          serverState_->getStats().copy())} {
+          serverState_->getStats().copy(),
+          journal_)} {
   subscribeInodeActivityBuffer();
 }
 
@@ -799,6 +800,7 @@ ImmediateFuture<SetPathObjectIdResultAndTimes> EdenMount::setPathsToObjectIds(
         checkoutMode,
         context->getClientPid(),
         "setPathObjectId",
+        nullptr,
         context->getRequestInfo());
 
     /**
@@ -1069,6 +1071,21 @@ const shared_ptr<UnboundedQueueExecutor>& EdenMount::getInvalidationThreadPool()
 
 std::shared_ptr<const EdenConfig> EdenMount::getEdenConfig() const {
   return serverState_->getReloadableConfig()->getEdenConfig();
+}
+
+std::optional<int64_t> EdenMount::getCheckoutProgress() const {
+  auto parentLock = parentState_.rlock();
+  if (!std::holds_alternative<ParentCommitState::CheckoutInProgress>(
+          parentLock->checkoutState)) {
+    return std::nullopt;
+  }
+  auto checkout = std::get<ParentCommitState::CheckoutInProgress>(
+      parentLock->checkoutState);
+  auto progress = checkout.checkoutProgress.get();
+  if (progress == nullptr) {
+    return std::nullopt;
+  }
+  return progress->load(std::memory_order_relaxed);
 }
 
 #ifndef _WIN32
@@ -1357,6 +1374,7 @@ ImmediateFuture<CheckoutResult> EdenMount::checkout(
 
   ParentCommitState::CheckoutState oldState =
       ParentCommitState::NoOngoingCheckout{};
+  std::shared_ptr<CheckoutContext> ctx;
   RootId oldParent;
   {
     auto parentLock = parentState_.wlock();
@@ -1391,15 +1409,18 @@ ImmediateFuture<CheckoutResult> EdenMount::checkout(
     // achieving the same would be to hold the lock during the checkout
     // operation, but this might lead to deadlocks on Windows due to callbacks
     // needing to access the parent commit to service callbacks.
-    parentLock->checkoutState = ParentCommitState::CheckoutInProgress{};
+    auto progressTracker = std::make_shared<std::atomic<uint64_t>>(0);
+    parentLock->checkoutState =
+        ParentCommitState::CheckoutInProgress{progressTracker};
+    ctx = std::make_shared<CheckoutContext>(
+        this,
+        checkoutMode,
+        fetchContext->getClientPid(),
+        thriftMethodCaller,
+        progressTracker,
+        fetchContext->getRequestInfo());
   }
 
-  auto ctx = std::make_shared<CheckoutContext>(
-      this,
-      checkoutMode,
-      fetchContext->getClientPid(),
-      thriftMethodCaller,
-      fetchContext->getRequestInfo());
   XLOG(DBG1) << "starting checkout for " << this->getPath() << ": " << oldParent
              << " to " << snapshotHash;
 
@@ -1741,6 +1762,11 @@ ImmediateFuture<Unit> EdenMount::diff(
     TreeInodePtr rootInode,
     DiffContext* ctxPtr,
     const RootId& commitHash) const {
+  auto faultTry = this->serverState_->getFaultInjector().checkTry(
+      "EdenMount::diff", commitHash.value());
+  if (faultTry.hasException()) {
+    return folly::Try<folly::Unit>{faultTry.exception()};
+  }
   return objectStore_->getRootTree(commitHash, ctxPtr->getFetchContext())
       .thenValue([this](ObjectStore::GetRootTreeResult rootTree) {
         return waitForPendingWrites().thenValue(
@@ -1765,47 +1791,51 @@ ImmediateFuture<Unit> EdenMount::diff(
     bool enforceCurrentParent,
     folly::CancellationToken cancellation,
     const ObjectFetchContextPtr& fetchContext) const {
-  if (enforceCurrentParent) {
+  RootId currentWorkingCopyParentRootId;
+  {
     auto parentInfo = parentState_.rlock();
+    currentWorkingCopyParentRootId = parentInfo->workingCopyParentRootId;
+    if (enforceCurrentParent) {
+      if (std::holds_alternative<ParentCommitState::CheckoutInProgress>(
+              parentInfo->checkoutState)) {
+        return makeImmediateFuture<Unit>(newEdenError(
+            EdenErrorType::CHECKOUT_IN_PROGRESS,
+            "cannot compute status while a checkout is currently in progress"));
+      } else if (
+          auto* interrupted =
+              std::get_if<ParentCommitState::InterruptedCheckout>(
+                  &parentInfo->checkoutState)) {
+        return makeImmediateFuture<Unit>(newEdenError(
+            EdenErrorType::CHECKOUT_IN_PROGRESS,
+            fmt::format(
+                "cannot compute status while a checkout is in progress - please run 'hg update --clean {}' to resume it",
+                interrupted->toCommit)));
+      }
 
-    if (std::holds_alternative<ParentCommitState::CheckoutInProgress>(
-            parentInfo->checkoutState)) {
-      return makeImmediateFuture<Unit>(newEdenError(
-          EdenErrorType::CHECKOUT_IN_PROGRESS,
-          "cannot compute status while a checkout is currently in progress"));
-    } else if (
-        auto* interrupted = std::get_if<ParentCommitState::InterruptedCheckout>(
-            &parentInfo->checkoutState)) {
-      return makeImmediateFuture<Unit>(newEdenError(
-          EdenErrorType::CHECKOUT_IN_PROGRESS,
-          fmt::format(
-              "cannot compute status while a checkout is in progress - please run 'hg update --clean {}' to resume it",
-              interrupted->toCommit)));
+      if (currentWorkingCopyParentRootId != commitHash) {
+        // TODO: We should really add a method to FilteredBackingStore that
+        // allows us to render a FOID as the underlying ObjectId. This would
+        // avoid the round trip we're doing here.
+        auto renderedParentRootId =
+            objectStore_->renderRootId(currentWorkingCopyParentRootId);
+        auto renderedCommitHash = objectStore_->renderRootId(commitHash);
+
+        // Log this occurrence to Scuba
+        getServerState()->getStructuredLogger()->logEvent(ParentMismatch{
+            commitHash.value(), currentWorkingCopyParentRootId.value()});
+        return makeImmediateFuture<Unit>(newEdenError(
+            EdenErrorType::OUT_OF_DATE_PARENT,
+            "error computing status: requested parent commit is out-of-date: requested ",
+            folly::hexlify(renderedCommitHash),
+            ", but current parent commit is ",
+            folly::hexlify(renderedParentRootId),
+            ".\nTry running `eden doctor` to remediate"));
+      }
+
+      // TODO: Should we perhaps hold the parentInfo read-lock for the duration
+      // of the status operation?  This would block new checkout operations from
+      // starting until we have finished computing this status call.
     }
-
-    if (parentInfo->workingCopyParentRootId != commitHash) {
-      // TODO: We should really add a method to FilteredBackingStore that
-      // allows us to render a FOID as the underlying ObjectId. This would
-      // avoid the round trip we're doing here.
-      auto renderedParentRootId =
-          objectStore_->renderRootId(parentInfo->workingCopyParentRootId);
-      auto renderedCommitHash = objectStore_->renderRootId(commitHash);
-
-      // Log this occurrence to Scuba
-      getServerState()->getStructuredLogger()->logEvent(ParentMismatch{
-          commitHash.value(), parentInfo->workingCopyParentRootId.value()});
-      return makeImmediateFuture<Unit>(newEdenError(
-          EdenErrorType::OUT_OF_DATE_PARENT,
-          "error computing status: requested parent commit is out-of-date: requested ",
-          folly::hexlify(renderedCommitHash),
-          ", but current parent commit is ",
-          folly::hexlify(renderedParentRootId),
-          ".\nTry running `eden doctor` to remediate"));
-    }
-
-    // TODO: Should we perhaps hold the parentInfo read-lock for the duration
-    // of the status operation?  This would block new checkout operations from
-    // starting until we have finished computing this status call.
   }
 
   // Create a DiffContext object for this diff operation.
@@ -1823,39 +1853,115 @@ ImmediateFuture<Unit> EdenMount::diff(
     if (latestInfo.has_value()) {
       auto key = ScmStatusCache::makeKey(commitHash, listIgnored);
       auto curSequenceID = latestInfo.value().sequenceID;
+      std::variant<StatusResultFuture, StatusResultPromise> getResult{nullptr};
       {
-        auto lockedCachePtr = scmStatusCache_.rlock();
-        if ((*lockedCachePtr)->contains(key)) {
-          auto cachedStatusPtr = (*lockedCachePtr)->get(key);
-          if (cachedStatusPtr->seq == curSequenceID) {
-            getStats()->increment(&JournalStats::journalStatusCacheHit);
-            callback->setStatus(cachedStatusPtr->status);
-            return folly::unit;
-          }
+        auto lockedCachePtr = scmStatusCache_.wlock();
+        auto& cache = *lockedCachePtr;
+
+        // if there is a root update, we can invalidate the cache as a whole
+        // so we don't need to invalidate each entry item individually as we
+        // fetch them.
+        if (!cache->isCachedWorkingDirValid(currentWorkingCopyParentRootId)) {
+          cache->clear();
+          cache->resetCachedWorkingDir(currentWorkingCopyParentRootId);
         }
-        getStats()->increment(&JournalStats::journalStatusCacheMiss);
+        getResult = cache->get(key, curSequenceID);
       }
 
-      return diff(rootInode, ctxPtr, commitHash)
-          .thenValue([this, curSequenceID, callback, key = std::move(key)](
-                         auto&&) mutable {
-            auto lockedCachePtr = scmStatusCache_.wlock();
-            ScmStatus newStatus = callback->peekStatus();
-            if (newStatus.entries_ref().value().size() >
-                getEdenConfig()->scmStatusCacheMaxEntriesPerItem.getValue()) {
-              // we don't have a good way to invalidate a single cache entry but
-              // as long as we cap the total size it should be fine if we leave
-              // some expired entries behind.
-              getStats()->increment(&JournalStats::journalStatusCacheSkip);
-              return;
-            }
-            (*lockedCachePtr)
-                ->insert(
-                    std::move(key),
-                    std::make_shared<const SeqStatusPair>(
-                        curSequenceID, std::move(newStatus)));
-          })
-          .ensure(std::move(stateHolder));
+      if (std::holds_alternative<StatusResultFuture>(getResult)) {
+        auto future = std::move(std::get<StatusResultFuture>(getResult));
+        getStats()->increment(&JournalStats::journalStatusCacheHit);
+        if (future.isReady()) {
+          callback->setStatus(std::move(future).get());
+          return folly::unit;
+        }
+        getStats()->increment(&JournalStats::journalStatusCachePend);
+        return std::move(future)
+            .thenValue(
+                [callback](auto&& status) { callback->setStatus(status); })
+            .ensure(std::move(stateHolder));
+      }
+
+      getStats()->increment(&JournalStats::journalStatusCacheMiss);
+
+      auto promise = std::get<StatusResultPromise>(getResult);
+
+      // we fall back to the no-cache flow if somehow the promise is nullptr
+      if (promise.get() != nullptr) {
+        return diff(rootInode, ctxPtr, commitHash)
+            .thenTry([this,
+                      curSequenceID,
+                      callback,
+                      promise,
+                      key = std::move(key)](folly::Try<Unit>&& result) mutable {
+              // handling exceptions from the future chain
+              if (result.hasException()) {
+                promise->setTry(folly::Try<ScmStatus>{result.exception()});
+                // remove the promise from cache so future requests can retry
+                {
+                  // this operations should be performaned with the lock held
+                  auto lockedCachePtr = scmStatusCache_.wlock();
+                  (*lockedCachePtr)->dropPromise(key, curSequenceID);
+                  return makeImmediateFuture<folly::Unit>(result.exception());
+                }
+              }
+
+              bool shouldInsert = true;
+
+              ScmStatus newStatus = callback->peekStatus();
+
+              // no need to insert a status result which contains exceptions
+              if (newStatus.errors_ref()->size() > 0) {
+                shouldInsert = false;
+              }
+
+              // don't cache a status if it's too large so the cache size does
+              // not explode easily
+              if (newStatus.entries_ref().value().size() >
+                  getEdenConfig()->scmStatusCacheMaxEntriesPerItem.getValue()) {
+                getStats()->increment(&JournalStats::journalStatusCacheSkip);
+                shouldInsert = false;
+              }
+
+              // FaultInjector check point: for testing only
+              this->serverState_->getFaultInjector().check(
+                  "scmStatusCache", "blocking setValue");
+
+              // set value for the shared promise so the pending requests get
+              // notified
+              // we do this without holding the lock for security concerns
+              promise->setValue(newStatus);
+
+              // FaultInjector check point: for testing only
+              this->serverState_->getFaultInjector().check(
+                  "scmStatusCache", "blocking insert");
+              {
+                // this operations should be performaned with the lock held
+                auto lockedCachePtr = scmStatusCache_.wlock();
+                if (shouldInsert) {
+                  (*lockedCachePtr)
+                      ->insert(
+                          key,
+                          std::make_shared<SeqStatusPair>(
+                              curSequenceID, std::move(newStatus)));
+                }
+
+                // FaultInjector check point: for testing only
+                this->serverState_->getFaultInjector().check(
+                    "scmStatusCache", "blocking dropPromise");
+
+                // remove the promise from cache
+                (*lockedCachePtr)->dropPromise(key, curSequenceID);
+              }
+              return ImmediateFuture<Unit>(folly::unit);
+            })
+            .ensure(std::move(stateHolder));
+      }
+      XLOG(ERR) << "ScmStatusCache returned nullptr for promise: key=" << key
+                << ", commitHash=" << commitHash
+                << ", listIgnored=" << listIgnored
+                << ", curSequenceID=" << curSequenceID
+                << ". Falling back to no-cache path for this request";
     }
   }
 

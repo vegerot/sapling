@@ -304,6 +304,28 @@ class EdenConfig : private ConfigSettingManager {
       true,
       this};
 
+  /**
+   * Whether Eden should use resource pools
+   */
+  ConfigSetting<bool> thriftUseResourcePools{
+      "thrift:use-resource-pools",
+      false,
+      this};
+
+  /**
+   * Whether Eden should use serial execution for each request. Resource pools
+   * must be enabled for this to take effect
+   */
+  ConfigSetting<bool> thriftUseSerialExecution{
+      "thrift:use-serial-execution",
+      false,
+      this};
+
+  ConfigSetting<bool> shouldFetchTreeMetadata{
+      "thrift:request-tree-metadata",
+      false,
+      this};
+
   // [ssl]
 
   ConfigSetting<AbsolutePath> clientCertificate{
@@ -449,6 +471,17 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<uint64_t> metadataCacheSize{
       "store:metadata-cache-size",
       1'000'000,
+      this};
+
+  /**
+   * Controls if RocksDbLocalStore operations should run asynchronously or
+   * synchronously.
+   *
+   * This is a temporary option to help us mitigate S433447.
+   */
+  ConfigSetting<bool> asyncRocksDbLocalStore{
+      "store:async-rocksdb-local-store",
+      false,
       this};
 
   // [fuse]
@@ -791,6 +824,15 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Controls the max number of tree metadata import requests we batch in
+   * SaplingBackingStore
+   */
+  ConfigSetting<uint32_t> importBatchSizeTreeMeta{
+      "hg:import-batch-size-treemeta",
+      1024,
+      this};
+
+  /**
    * Whether fetching objects should fall back to hg importer process.
    */
   ConfigSetting<bool> hgImporterFetchFallback{
@@ -808,6 +850,15 @@ class EdenConfig : private ConfigSettingManager {
       true,
       this};
 
+  ConfigSetting<bool> hgEnableTreeLocalStoreCaching{
+      "hg:cache-trees-in-localstore",
+      true,
+      this};
+
+  ConfigSetting<bool> hgEnableBlobLocalStoreCaching{
+      "hg:cache-blobs-in-localstore",
+      false,
+      this};
   /**
    * List of paths to filter out when importing Mercurial trees.
    *

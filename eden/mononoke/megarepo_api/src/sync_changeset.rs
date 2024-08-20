@@ -13,9 +13,8 @@ use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
-use blobrepo::save_bonsai_changesets;
 use blobstore::Loadable;
-use changeset_fetcher::ChangesetFetcherRef;
+use changesets_creation::save_changesets;
 use commit_graph::CommitGraphRef;
 use commit_transformation::create_directory_source_to_target_multi_mover;
 use commit_transformation::create_source_to_target_multi_mover;
@@ -37,6 +36,7 @@ use megarepo_mapping::MegarepoMapping;
 use megarepo_mapping::SourceName;
 use mononoke_api::ChangesetContext;
 use mononoke_api::Mononoke;
+use mononoke_api::MononokeRepo;
 use mononoke_api::RepoContext;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
@@ -48,25 +48,24 @@ use crate::common::find_target_bookmark_and_value;
 use crate::common::find_target_sync_config;
 use crate::common::MegarepoOp;
 use crate::common::SourceAndMovedChangesets;
-use crate::Repo;
 
-pub(crate) struct SyncChangeset<'a> {
+pub(crate) struct SyncChangeset<'a, R> {
     megarepo_configs: &'a Arc<dyn MononokeMegarepoConfigs>,
-    mononoke: &'a Arc<Mononoke>,
+    mononoke: &'a Arc<Mononoke<R>>,
     target_megarepo_mapping: &'a Arc<MegarepoMapping>,
     mutable_renames: &'a Arc<MutableRenames>,
 }
 
 #[async_trait]
-impl<'a> MegarepoOp for SyncChangeset<'a> {
-    fn mononoke(&self) -> &Arc<Mononoke> {
+impl<'a, R> MegarepoOp<R> for SyncChangeset<'a, R> {
+    fn mononoke(&self) -> &Arc<Mononoke<R>> {
         self.mononoke
     }
 }
 
-pub enum MergeMode {
+pub enum MergeMode<R> {
     Squashed {
-        side_commits: Vec<ChangesetContext>,
+        side_commits: Vec<ChangesetContext<R>>,
     },
     ExtraMoveCommits {
         side_parents_move_commits: Vec<SourceAndMovedChangesets>,
@@ -103,10 +102,10 @@ pub struct SquashingConfig {
 
 const MERGE_COMMIT_MOVES_CONCURRENCY: usize = 10;
 
-impl<'a> SyncChangeset<'a> {
+impl<'a, R: MononokeRepo> SyncChangeset<'a, R> {
     pub(crate) fn new(
         megarepo_configs: &'a Arc<dyn MononokeMegarepoConfigs>,
-        mononoke: &'a Arc<Mononoke>,
+        mononoke: &'a Arc<Mononoke<R>>,
         target_megarepo_mapping: &'a Arc<MegarepoMapping>,
         mutable_renames: &'a Arc<MutableRenames>,
     ) -> Self {
@@ -148,7 +147,7 @@ impl<'a> SyncChangeset<'a> {
 
         let (commit_remapping_state, target_config) = find_target_sync_config(
             ctx,
-            target_repo.inner_repo(),
+            target_repo.repo(),
             target_location,
             target,
             self.megarepo_configs,
@@ -162,7 +161,7 @@ impl<'a> SyncChangeset<'a> {
         // Find source repo and changeset that we need to sync
         let source_repo = self.find_repo_by_id(ctx, source_config.repo_id).await?;
         let source_cs = source_cs_id
-            .load(ctx, source_repo.inner_repo().repo_blobstore())
+            .load(ctx, source_repo.repo().repo_blobstore())
             .await?;
 
         validate_can_sync_changeset(
@@ -233,9 +232,9 @@ impl<'a> SyncChangeset<'a> {
             ctx,
             &source_config.mapping,
             source_name,
-            source_repo.inner_repo(),
+            source_repo.repo(),
             source_cs,
-            target_repo.inner_repo(),
+            target_repo.repo(),
             target_location,
             target,
             commit_remapping_state,
@@ -257,7 +256,7 @@ impl<'a> SyncChangeset<'a> {
         // Move the bookmark and record latest synced source changeset
         self.move_bookmark_conditionally(
             ctx,
-            target_repo.inner_repo(),
+            target_repo.repo(),
             target.bookmark.clone(),
             (target_location, new_target_cs_id),
         )
@@ -272,9 +271,9 @@ impl<'a> SyncChangeset<'a> {
         source_cs_id: ChangesetId,
         commit_remapping_state: &CommitRemappingState,
         source_name: &SourceName,
-        source_repo: &RepoContext,
+        source_repo: &RepoContext<R>,
         squashing_config: &SquashingConfig,
-    ) -> Result<(bool, Vec<ChangesetContext>)> {
+    ) -> Result<(bool, Vec<ChangesetContext<R>>)> {
         if squashing_config.squash_limit == 0 {
             return Ok((false, vec![]));
         }
@@ -333,7 +332,7 @@ impl<'a> SyncChangeset<'a> {
         target: &Target,
         source_cs: &BonsaiChangeset,
         commit_remapping_state: &CommitRemappingState,
-        target_repo: &RepoContext,
+        target_repo: &RepoContext<R>,
         source_name: &SourceName,
         source: &Source,
     ) -> Result<Vec<SourceAndMovedChangesets>, MegarepoError> {
@@ -350,7 +349,7 @@ impl<'a> SyncChangeset<'a> {
             .map(|parent| {
                 self.create_single_move_commit(
                     ctx,
-                    target_repo.inner_repo(),
+                    target_repo.repo(),
                     parent.clone(),
                     &mover,
                     &directory_mover,
@@ -362,10 +361,10 @@ impl<'a> SyncChangeset<'a> {
             .try_collect::<Vec<_>>()
             .await?;
 
-        save_bonsai_changesets(
+        save_changesets(
+            ctx,
+            target_repo.repo(),
             moved_commits.iter().map(|css| css.moved.clone()).collect(),
-            ctx.clone(),
-            target_repo.inner_repo(),
         )
         .await?;
 
@@ -378,7 +377,7 @@ impl<'a> SyncChangeset<'a> {
         scuba.log_with_msg("Started saving mutable renames", None);
         self.save_mutable_renames(
             ctx,
-            target_repo.inner_repo().commit_graph(),
+            target_repo.repo().commit_graph(),
             self.mutable_renames,
             moved_commits.iter().map(|css| &css.mutable_renames),
         )
@@ -398,16 +397,15 @@ impl<'a> SyncChangeset<'a> {
         source_cs_id: ChangesetId,
         source_name: &SourceName,
         (expected_target_location, actual_target_location): (ChangesetId, ChangesetId),
-        repo: &RepoContext,
+        repo: &RepoContext<R>,
     ) -> Result<ChangesetId, MegarepoError> {
         // Bookmark points a non-expected commit - let's see if changeset it points to was created
         // by a previous sync_changeset call
 
         // Check that first parent is a target location
         let parents = repo
-            .inner_repo()
-            .changeset_fetcher()
-            .get_parents(ctx, actual_target_location)
+            .commit_graph()
+            .changeset_parents(ctx, actual_target_location)
             .await?;
         if parents.first() != Some(&expected_target_location) {
             return Err(MegarepoError::request(anyhow!(
@@ -438,12 +436,12 @@ impl<'a> SyncChangeset<'a> {
 
 // We allow syncing changeset from a source if one of its parents was the latest synced changeset
 // from this source into this target.
-async fn validate_can_sync_changeset(
+async fn validate_can_sync_changeset<R: MononokeRepo>(
     _ctx: &CoreContext,
     target: &Target,
     source_cs: &BonsaiChangeset,
     commit_remapping_state: &CommitRemappingState,
-    _source_repo: &RepoContext,
+    _source_repo: &RepoContext<R>,
     source: &Source,
 ) -> Result<(), MegarepoError> {
     match &source.revision {
@@ -483,7 +481,7 @@ async fn validate_can_sync_changeset(
     Ok(())
 }
 
-async fn sync_changeset_to_target<R: Repo>(
+async fn sync_changeset_to_target<R: MononokeRepo>(
     ctx: &CoreContext,
     mapping: &SourceMappingRules,
     source: &SourceName,
@@ -493,7 +491,7 @@ async fn sync_changeset_to_target<R: Repo>(
     target_cs_id: ChangesetId,
     target: &Target,
     mut state: CommitRemappingState,
-    merge_mode: MergeMode,
+    merge_mode: MergeMode<R>,
 ) -> Result<ChangesetId, MegarepoError> {
     let mover =
         create_source_to_target_multi_mover(mapping.clone()).map_err(MegarepoError::internal)?;
@@ -642,12 +640,12 @@ mod test {
             .build(&mut test.configs_storage);
 
         println!("Create initial source commit and bookmark");
-        let init_source_cs_id = CreateCommitContext::new_root(&ctx, &test.blobrepo)
+        let init_source_cs_id = CreateCommitContext::new_root(&ctx, &test.repo)
             .add_file("file", "content")
             .commit()
             .await?;
 
-        bookmark(&ctx, &test.blobrepo, source_name.to_string())
+        bookmark(&ctx, &test.repo, source_name.to_string())
             .set_to(init_source_cs_id)
             .await?;
 
@@ -674,12 +672,12 @@ mod test {
             .await;
         assert!(res.is_err());
 
-        let source_cs_id = CreateCommitContext::new(&ctx, &test.blobrepo, vec![init_source_cs_id])
+        let source_cs_id = CreateCommitContext::new(&ctx, &test.repo, vec![init_source_cs_id])
             .add_file("anotherfile", "anothercontent")
             .commit()
             .await?;
 
-        bookmark(&ctx, &test.blobrepo, source_name.to_string())
+        bookmark(&ctx, &test.repo, source_name.to_string())
             .set_to(source_cs_id)
             .await?;
 
@@ -694,8 +692,8 @@ mod test {
             )
             .await?;
 
-        let cs_id = resolve_cs_id(&ctx, &test.blobrepo, "target").await?;
-        let mut wc = list_working_copy_utf8(&ctx, &test.blobrepo, cs_id).await?;
+        let cs_id = resolve_cs_id(&ctx, &test.repo, "target").await?;
+        let mut wc = list_working_copy_utf8(&ctx, &test.repo, cs_id).await?;
 
         // Remove file with commit remapping state because it's never present in source
         wc.remove(&NonRootMPath::new(REMAPPING_STATE_FILE)?);
@@ -727,12 +725,12 @@ mod test {
             .build(&mut test.configs_storage);
 
         println!("Create initial source commit and bookmark");
-        let init_source_cs_id = CreateCommitContext::new_root(&ctx, &test.blobrepo)
+        let init_source_cs_id = CreateCommitContext::new_root(&ctx, &test.repo)
             .add_file("file", "content")
             .commit()
             .await?;
 
-        bookmark(&ctx, &test.blobrepo, source_name.to_string())
+        bookmark(&ctx, &test.repo, source_name.to_string())
             .set_to(init_source_cs_id)
             .await?;
 
@@ -749,21 +747,21 @@ mod test {
         );
 
         let merge_parent_1_source =
-            CreateCommitContext::new(&ctx, &test.blobrepo, vec![init_source_cs_id])
+            CreateCommitContext::new(&ctx, &test.repo, vec![init_source_cs_id])
                 .add_file("file", "anothercontent")
                 .add_file("file_from_parent_1", "parent_1")
                 .commit()
                 .await?;
 
         let merge_parent_2_source =
-            CreateCommitContext::new(&ctx, &test.blobrepo, vec![init_source_cs_id])
+            CreateCommitContext::new(&ctx, &test.repo, vec![init_source_cs_id])
                 .add_file("file", "totallydifferentcontent")
                 .add_file("file_from_parent_2", "parent_2")
                 .commit()
                 .await?;
 
         let merge_parent_3_source =
-            CreateCommitContext::new(&ctx, &test.blobrepo, vec![init_source_cs_id])
+            CreateCommitContext::new(&ctx, &test.repo, vec![init_source_cs_id])
                 .add_file("file", "contentfromthirdparent")
                 .add_file("file_from_parent_3", "parent_3")
                 .commit()
@@ -771,7 +769,7 @@ mod test {
 
         let merge_source = CreateCommitContext::new(
             &ctx,
-            &test.blobrepo,
+            &test.repo,
             vec![
                 merge_parent_2_source,
                 merge_parent_3_source,
@@ -789,7 +787,7 @@ mod test {
         .commit()
         .await?;
 
-        bookmark(&ctx, &test.blobrepo, source_name.to_string())
+        bookmark(&ctx, &test.repo, source_name.to_string())
             .set_to(merge_parent_1_source)
             .await?;
         println!("Syncing first merge parent");
@@ -803,7 +801,7 @@ mod test {
             )
             .await?;
 
-        bookmark(&ctx, &test.blobrepo, source_name.to_string())
+        bookmark(&ctx, &test.repo, source_name.to_string())
             .set_to(merge_source)
             .await?;
         println!("Syncing merge commit parent");
@@ -817,7 +815,7 @@ mod test {
             )
             .await?;
 
-        let mut wc = list_working_copy_utf8(&ctx, &test.blobrepo, merge_target).await?;
+        let mut wc = list_working_copy_utf8(&ctx, &test.repo, merge_target).await?;
 
         // Remove file with commit remapping state because it's never present in source
         wc.remove(&NonRootMPath::new(REMAPPING_STATE_FILE)?);
@@ -834,9 +832,7 @@ mod test {
             }
         );
 
-        let merge_target_cs = merge_target
-            .load(&ctx, &test.blobrepo.repo_blobstore())
-            .await?;
+        let merge_target_cs = merge_target.load(&ctx, &test.repo.repo_blobstore()).await?;
 
         let copied_file_change_from_bonsai = match merge_target_cs
             .file_changes()
@@ -884,22 +880,22 @@ mod test {
             .build(&mut test.configs_storage);
 
         println!("Create initial first source commit and bookmark");
-        let init_source1_cs_id = CreateCommitContext::new_root(&ctx, &test.blobrepo)
+        let init_source1_cs_id = CreateCommitContext::new_root(&ctx, &test.repo)
             .add_file("file1", "content1")
             .commit()
             .await?;
 
-        bookmark(&ctx, &test.blobrepo, source1_name.to_string())
+        bookmark(&ctx, &test.repo, source1_name.to_string())
             .set_to(init_source1_cs_id)
             .await?;
 
         println!("Create initial second source commit and bookmark");
-        let init_source2_cs_id = CreateCommitContext::new_root(&ctx, &test.blobrepo)
+        let init_source2_cs_id = CreateCommitContext::new_root(&ctx, &test.repo)
             .add_file("file2", "content2")
             .commit()
             .await?;
 
-        bookmark(&ctx, &test.blobrepo, source2_name.to_string())
+        bookmark(&ctx, &test.repo, source2_name.to_string())
             .set_to(init_source2_cs_id)
             .await?;
 
@@ -915,12 +911,11 @@ mod test {
             &test.megarepo_mapping,
             &test.mutable_renames,
         );
-        let source1_cs_id =
-            CreateCommitContext::new(&ctx, &test.blobrepo, vec![init_source1_cs_id])
-                .add_file("anotherfile1", "anothercontent")
-                .commit()
-                .await?;
-        bookmark(&ctx, &test.blobrepo, source1_name.to_string())
+        let source1_cs_id = CreateCommitContext::new(&ctx, &test.repo, vec![init_source1_cs_id])
+            .add_file("anotherfile1", "anothercontent")
+            .commit()
+            .await?;
+        bookmark(&ctx, &test.repo, source1_name.to_string())
             .set_to(source1_cs_id)
             .await?;
         latest_target_cs_id = sync_changeset
@@ -934,12 +929,11 @@ mod test {
             .await?;
         println!(", 2");
 
-        let source2_cs_id =
-            CreateCommitContext::new(&ctx, &test.blobrepo, vec![init_source2_cs_id])
-                .add_file("anotherfile2", "anothercontent")
-                .commit()
-                .await?;
-        bookmark(&ctx, &test.blobrepo, source2_name.to_string())
+        let source2_cs_id = CreateCommitContext::new(&ctx, &test.repo, vec![init_source2_cs_id])
+            .add_file("anotherfile2", "anothercontent")
+            .commit()
+            .await?;
+        bookmark(&ctx, &test.repo, source2_name.to_string())
             .set_to(source2_cs_id)
             .await?;
         latest_target_cs_id = sync_changeset
@@ -965,15 +959,12 @@ mod test {
         assert!(res.is_err());
         println!("Trying to sync a diamond merge commit");
 
-        let source1_diamond_merge_cs_id = CreateCommitContext::new(
-            &ctx,
-            &test.blobrepo,
-            vec![source1_cs_id, init_source1_cs_id],
-        )
-        .add_file("anotherfile1", "content_from_diamond_merge")
-        .commit()
-        .await?;
-        bookmark(&ctx, &test.blobrepo, source1_name.to_string())
+        let source1_diamond_merge_cs_id =
+            CreateCommitContext::new(&ctx, &test.repo, vec![source1_cs_id, init_source1_cs_id])
+                .add_file("anotherfile1", "content_from_diamond_merge")
+                .commit()
+                .await?;
+        bookmark(&ctx, &test.repo, source1_name.to_string())
             .set_to(source1_diamond_merge_cs_id)
             .await?;
         let _diamond_merge_synced = sync_changeset
@@ -986,8 +977,8 @@ mod test {
             )
             .await?;
 
-        let target_cs_id = resolve_cs_id(&ctx, &test.blobrepo, "target").await?;
-        let mut wc = list_working_copy_utf8(&ctx, &test.blobrepo, target_cs_id).await?;
+        let target_cs_id = resolve_cs_id(&ctx, &test.repo, "target").await?;
+        let mut wc = list_working_copy_utf8(&ctx, &test.repo, target_cs_id).await?;
 
         // Remove file with commit remapping state because it's never present in source
         wc.remove(&NonRootMPath::new(REMAPPING_STATE_FILE)?);
@@ -1002,9 +993,7 @@ mod test {
             }
         );
 
-        let target_cs = target_cs_id
-            .load(&ctx, &test.blobrepo.repo_blobstore())
-            .await?;
+        let target_cs = target_cs_id.load(&ctx, &test.repo.repo_blobstore()).await?;
         // All parents are preserved.
         assert_eq!(target_cs.parents().count(), 2);
 
@@ -1026,12 +1015,12 @@ mod test {
             .build(&mut test.configs_storage);
 
         println!("Create initial source commit and bookmark");
-        let init_source_cs_id = CreateCommitContext::new_root(&ctx, &test.blobrepo)
+        let init_source_cs_id = CreateCommitContext::new_root(&ctx, &test.repo)
             .add_file("file", "content")
             .commit()
             .await?;
 
-        bookmark(&ctx, &test.blobrepo, source_name.to_string())
+        bookmark(&ctx, &test.repo, source_name.to_string())
             .set_to(init_source_cs_id)
             .await?;
 
@@ -1047,12 +1036,12 @@ mod test {
             &test.mutable_renames,
         );
 
-        let source_cs_id = CreateCommitContext::new(&ctx, &test.blobrepo, vec![init_source_cs_id])
+        let source_cs_id = CreateCommitContext::new(&ctx, &test.repo, vec![init_source_cs_id])
             .add_file("anotherfile", "anothercontent")
             .commit()
             .await?;
 
-        bookmark(&ctx, &test.blobrepo, source_name.to_string())
+        bookmark(&ctx, &test.repo, source_name.to_string())
             .set_to(source_cs_id)
             .await?;
 
@@ -1101,12 +1090,12 @@ mod test {
             .build(&mut test.configs_storage);
 
         println!("Create initial source commit and bookmark");
-        let init_source_cs_id = CreateCommitContext::new_root(&ctx, &test.blobrepo)
+        let init_source_cs_id = CreateCommitContext::new_root(&ctx, &test.repo)
             .add_file("file", "content")
             .commit()
             .await?;
 
-        bookmark(&ctx, &test.blobrepo, source_name.to_string())
+        bookmark(&ctx, &test.repo, source_name.to_string())
             .set_to(init_source_cs_id)
             .await?;
 
@@ -1122,53 +1111,53 @@ mod test {
             &test.mutable_renames,
         );
 
-        let main_line = CreateCommitContext::new(&ctx, &test.blobrepo, vec![init_source_cs_id])
+        let main_line = CreateCommitContext::new(&ctx, &test.repo, vec![init_source_cs_id])
             .add_file("file_in_mainline", "mainline1")
             .commit()
             .await?;
 
-        bookmark(&ctx, &test.blobrepo, source_name.to_string())
+        bookmark(&ctx, &test.repo, source_name.to_string())
             .set_to(main_line)
             .await?;
         let main_line_target = sync_changeset
             .sync(&ctx, main_line, &source_name, &target, latest_target_cs_id)
             .await?;
 
-        let side_branch_1 = CreateCommitContext::new(&ctx, &test.blobrepo, vec![init_source_cs_id])
+        let side_branch_1 = CreateCommitContext::new(&ctx, &test.repo, vec![init_source_cs_id])
             .add_file("file", "totallydifferentcontent")
             .add_file("file_in_sidebranch_1", "sidebranch1")
             .commit()
             .await?;
 
-        let side_branch_2 = CreateCommitContext::new(&ctx, &test.blobrepo, vec![side_branch_1])
+        let side_branch_2 = CreateCommitContext::new(&ctx, &test.repo, vec![side_branch_1])
             .add_file("file", "amended")
             .add_file("file_in_sidebranch_2", "sidebranch2")
             .commit()
             .await?;
 
-        let merge = CreateCommitContext::new(&ctx, &test.blobrepo, vec![side_branch_2, main_line])
+        let merge = CreateCommitContext::new(&ctx, &test.repo, vec![side_branch_2, main_line])
             .add_file("file", "mergeresolution")
             .commit()
             .await?;
         println!("Syncing merge");
-        bookmark(&ctx, &test.blobrepo, source_name.to_string())
+        bookmark(&ctx, &test.repo, source_name.to_string())
             .set_to(merge)
             .await?;
         let merge_target = sync_changeset
             .sync(&ctx, merge, &source_name, &target, main_line_target)
             .await?;
 
-        let _mcs = merge.load(&ctx, test.blobrepo.repo_blobstore()).await?;
+        let _mcs = merge.load(&ctx, test.repo.repo_blobstore()).await?;
 
         // Find source repo and changeset that we need to sync
         let target_repo = sync_changeset.find_repo_by_id(&ctx, target.repo_id).await?;
         let merge_cs = merge_target
-            .load(&ctx, target_repo.inner_repo().repo_blobstore())
+            .load(&ctx, target_repo.repo().repo_blobstore())
             .await?;
 
         let parents: Vec<_> = merge_cs.parents().collect();
 
-        let mut wc = list_working_copy_utf8(&ctx, &test.blobrepo, merge_target).await?;
+        let mut wc = list_working_copy_utf8(&ctx, &test.repo, merge_target).await?;
 
         // Remove file with commit remapping state because it's never present in source
         wc.remove(&NonRootMPath::new(REMAPPING_STATE_FILE)?);

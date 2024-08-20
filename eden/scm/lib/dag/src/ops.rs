@@ -13,16 +13,17 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 
 use crate::clone::CloneData;
+use crate::dag::MemDag;
 use crate::default_impl;
 use crate::errors::NotFoundError;
 use crate::id::Group;
 use crate::id::Id;
-use crate::id::VertexName;
+use crate::id::Vertex;
 pub use crate::iddag::IdDagAlgorithm;
-use crate::namedag::MemNameDag;
-use crate::nameset::id_lazy::IdLazySet;
-use crate::nameset::id_static::IdStaticSet;
-use crate::nameset::NameSet;
+use crate::set::id_lazy::IdLazySet;
+use crate::set::id_static::IdStaticSet;
+use crate::set::Set;
+use crate::IdList;
 use crate::IdSet;
 use crate::Result;
 use crate::VerLink;
@@ -31,7 +32,7 @@ use crate::VertexListWithOptions;
 /// DAG related read-only algorithms.
 #[async_trait::async_trait]
 pub trait DagAlgorithm: Send + Sync {
-    /// Sort a `NameSet` topologically in descending order.
+    /// Sort a `Set` topologically in descending order.
     ///
     /// The returned set should have `dag` and `id_map` hints set to associated
     /// with this dag or its previous compatible version. For example, if a
@@ -39,65 +40,68 @@ pub trait DagAlgorithm: Send + Sync {
     /// using this dag.  If a `set` is empty and not associated to the current
     /// `dag` in its hints, the return value should be a different empty `set`
     /// that has the `dag` and `id_map` hints set to this dag.
-    async fn sort(&self, set: &NameSet) -> Result<NameSet>;
+    async fn sort(&self, set: &Set) -> Result<Set>;
 
     /// Re-create the graph so it looks better when rendered.
-    async fn beautify(&self, main_branch: Option<NameSet>) -> Result<MemNameDag> {
+    async fn beautify(&self, main_branch: Option<Set>) -> Result<MemDag> {
         default_impl::beautify(self, main_branch).await
     }
 
     /// Extract a sub graph containing only specified vertexes.
-    async fn subdag(&self, set: NameSet) -> Result<MemNameDag> {
+    async fn subdag(&self, set: Set) -> Result<MemDag> {
         default_impl::subdag(self, set).await
     }
 
     /// Get ordered parent vertexes.
-    async fn parent_names(&self, name: VertexName) -> Result<Vec<VertexName>>;
+    async fn parent_names(&self, name: Vertex) -> Result<Vec<Vertex>>;
 
     /// Returns a set that covers all vertexes tracked by this DAG.
     ///
     /// Does not include VIRTUAL vertexes.
-    async fn all(&self) -> Result<NameSet>;
+    async fn all(&self) -> Result<Set>;
 
     /// Returns a set that covers all vertexes in the master group.
-    async fn master_group(&self) -> Result<NameSet>;
+    async fn master_group(&self) -> Result<Set>;
+
+    /// Returns a set that covers all vertexes in the virtual group.
+    async fn virtual_group(&self) -> Result<Set>;
 
     /// Calculates all ancestors reachable from any name from the given set.
-    async fn ancestors(&self, set: NameSet) -> Result<NameSet>;
+    async fn ancestors(&self, set: Set) -> Result<Set>;
 
     /// Calculates parents of the given set.
     ///
-    /// Note: Parent order is not preserved. Use [`NameDag::parent_names`]
+    /// Note: Parent order is not preserved. Use [`Dag::parent_names`]
     /// to preserve order.
-    async fn parents(&self, set: NameSet) -> Result<NameSet> {
+    async fn parents(&self, set: Set) -> Result<Set> {
         default_impl::parents(self, set).await
     }
 
     /// Calculates the n-th first ancestor.
-    async fn first_ancestor_nth(&self, name: VertexName, n: u64) -> Result<Option<VertexName>> {
+    async fn first_ancestor_nth(&self, name: Vertex, n: u64) -> Result<Option<Vertex>> {
         default_impl::first_ancestor_nth(self, name, n).await
     }
 
     /// Calculates ancestors but only follows the first parent.
-    async fn first_ancestors(&self, set: NameSet) -> Result<NameSet> {
+    async fn first_ancestors(&self, set: Set) -> Result<Set> {
         default_impl::first_ancestors(self, set).await
     }
 
     /// Calculates heads of the given set.
-    async fn heads(&self, set: NameSet) -> Result<NameSet> {
+    async fn heads(&self, set: Set) -> Result<Set> {
         default_impl::heads(self, set).await
     }
 
     /// Calculates children of the given set.
-    async fn children(&self, set: NameSet) -> Result<NameSet>;
+    async fn children(&self, set: Set) -> Result<Set>;
 
     /// Calculates roots of the given set.
-    async fn roots(&self, set: NameSet) -> Result<NameSet> {
+    async fn roots(&self, set: Set) -> Result<Set> {
         default_impl::roots(self, set).await
     }
 
     /// Calculates merges of the selected set (vertexes with >=2 parents).
-    async fn merges(&self, set: NameSet) -> Result<NameSet> {
+    async fn merges(&self, set: Set) -> Result<Set> {
         default_impl::merges(self, set).await
     }
 
@@ -106,23 +110,23 @@ pub trait DagAlgorithm: Send + Sync {
     /// If there are no common ancestors, return None.
     /// If there are multiple greatest common ancestors, pick one arbitrarily.
     /// Use `gca_all` to get all of them.
-    async fn gca_one(&self, set: NameSet) -> Result<Option<VertexName>> {
+    async fn gca_one(&self, set: Set) -> Result<Option<Vertex>> {
         default_impl::gca_one(self, set).await
     }
 
     /// Calculates all "greatest common ancestor"s of the given set.
     /// `gca_one` is faster if an arbitrary answer is ok.
-    async fn gca_all(&self, set: NameSet) -> Result<NameSet> {
+    async fn gca_all(&self, set: Set) -> Result<Set> {
         default_impl::gca_all(self, set).await
     }
 
     /// Calculates all common ancestors of the given set.
-    async fn common_ancestors(&self, set: NameSet) -> Result<NameSet> {
+    async fn common_ancestors(&self, set: Set) -> Result<Set> {
         default_impl::common_ancestors(self, set).await
     }
 
     /// Tests if `ancestor` is an ancestor of `descendant`.
-    async fn is_ancestor(&self, ancestor: VertexName, descendant: VertexName) -> Result<bool> {
+    async fn is_ancestor(&self, ancestor: Vertex, descendant: Vertex) -> Result<bool> {
         default_impl::is_ancestor(self, ancestor, descendant).await
     }
 
@@ -136,15 +140,15 @@ pub trait DagAlgorithm: Send + Sync {
     /// This is different from `heads`. In case set contains X and Y, and Y is
     /// an ancestor of X, but not the immediate ancestor, `heads` will include
     /// Y while this function won't.
-    async fn heads_ancestors(&self, set: NameSet) -> Result<NameSet> {
+    async fn heads_ancestors(&self, set: Set) -> Result<Set> {
         default_impl::heads_ancestors(self, set).await
     }
 
     /// Calculates the "dag range" - vertexes reachable from both sides.
-    async fn range(&self, roots: NameSet, heads: NameSet) -> Result<NameSet>;
+    async fn range(&self, roots: Set, heads: Set) -> Result<Set>;
 
     /// Calculates `ancestors(reachable) - ancestors(unreachable)`.
-    async fn only(&self, reachable: NameSet, unreachable: NameSet) -> Result<NameSet> {
+    async fn only(&self, reachable: Set, unreachable: Set) -> Result<Set> {
         default_impl::only(self, reachable, unreachable).await
     }
 
@@ -152,16 +156,12 @@ pub trait DagAlgorithm: Send + Sync {
     /// `ancestors(unreachable)`.
     /// This might be faster in some implementations than calculating `only` and
     /// `ancestors` separately.
-    async fn only_both(
-        &self,
-        reachable: NameSet,
-        unreachable: NameSet,
-    ) -> Result<(NameSet, NameSet)> {
+    async fn only_both(&self, reachable: Set, unreachable: Set) -> Result<(Set, Set)> {
         default_impl::only_both(self, reachable, unreachable).await
     }
 
     /// Calculates the descendants of the given set.
-    async fn descendants(&self, set: NameSet) -> Result<NameSet>;
+    async fn descendants(&self, set: Set) -> Result<Set>;
 
     /// Calculates `roots` that are reachable from `heads` without going
     /// through other `roots`. For example, given the following graph:
@@ -189,7 +189,7 @@ pub trait DagAlgorithm: Send + Sync {
     /// The `roots & ancestors(heads)` portion filters out bogus roots for
     /// compatibility, if the callsite does not provide bogus roots, it
     /// could be simplified to just `roots`.
-    async fn reachable_roots(&self, roots: NameSet, heads: NameSet) -> Result<NameSet> {
+    async fn reachable_roots(&self, roots: Set, heads: Set) -> Result<Set> {
         default_impl::reachable_roots(self, roots, heads).await
     }
 
@@ -205,15 +205,15 @@ pub trait DagAlgorithm: Send + Sync {
     /// is usually empty, or a subset of `skip`.
     async fn suggest_bisect(
         &self,
-        roots: NameSet,
-        heads: NameSet,
-        skip: NameSet,
-    ) -> Result<(Option<VertexName>, NameSet, NameSet)>;
+        roots: Set,
+        heads: Set,
+        skip: Set,
+    ) -> Result<(Option<Vertex>, Set, Set)>;
 
     /// Vertexes buffered in memory, not yet written to disk.
     ///
     /// Does not include VIRTUAL vertexes.
-    async fn dirty(&self) -> Result<NameSet>;
+    async fn dirty(&self) -> Result<Set>;
 
     /// Returns true if the vertex names might need to be resolved remotely.
     fn is_vertex_lazy(&self) -> bool;
@@ -247,7 +247,7 @@ pub trait DagAlgorithm: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait Parents: Send + Sync {
-    async fn parent_names(&self, name: VertexName) -> Result<Vec<VertexName>>;
+    async fn parent_names(&self, name: Vertex) -> Result<Vec<Vertex>>;
 
     /// A hint of a sub-graph for inserting `heads`.
     ///
@@ -263,16 +263,16 @@ pub trait Parents: Send + Sync {
     /// returning an empty or "incorrect" graph does not hurt correctness. But
     /// might hurt performance. Returning a set that contains vertexes that do
     /// overlap in the existing graph is incorrect.
-    async fn hint_subdag_for_insertion(&self, _heads: &[VertexName]) -> Result<MemNameDag>;
+    async fn hint_subdag_for_insertion(&self, _heads: &[Vertex]) -> Result<MemDag>;
 }
 
 #[async_trait::async_trait]
 impl Parents for Arc<dyn DagAlgorithm + Send + Sync> {
-    async fn parent_names(&self, name: VertexName) -> Result<Vec<VertexName>> {
+    async fn parent_names(&self, name: Vertex) -> Result<Vec<Vertex>> {
         DagAlgorithm::parent_names(self, name).await
     }
 
-    async fn hint_subdag_for_insertion(&self, heads: &[VertexName]) -> Result<MemNameDag> {
+    async fn hint_subdag_for_insertion(&self, heads: &[Vertex]) -> Result<MemDag> {
         let scope = self.dirty().await?;
         default_impl::hint_subdag_for_insertion(self, &scope, heads).await
     }
@@ -280,41 +280,41 @@ impl Parents for Arc<dyn DagAlgorithm + Send + Sync> {
 
 #[async_trait::async_trait]
 impl Parents for &(dyn DagAlgorithm + Send + Sync) {
-    async fn parent_names(&self, name: VertexName) -> Result<Vec<VertexName>> {
+    async fn parent_names(&self, name: Vertex) -> Result<Vec<Vertex>> {
         DagAlgorithm::parent_names(*self, name).await
     }
 
-    async fn hint_subdag_for_insertion(&self, heads: &[VertexName]) -> Result<MemNameDag> {
+    async fn hint_subdag_for_insertion(&self, heads: &[Vertex]) -> Result<MemDag> {
         let scope = self.dirty().await?;
         default_impl::hint_subdag_for_insertion(self, &scope, heads).await
     }
 }
 
 #[async_trait::async_trait]
-impl<'a> Parents for Box<dyn Fn(VertexName) -> Result<Vec<VertexName>> + Send + Sync + 'a> {
-    async fn parent_names(&self, name: VertexName) -> Result<Vec<VertexName>> {
+impl<'a> Parents for Box<dyn Fn(Vertex) -> Result<Vec<Vertex>> + Send + Sync + 'a> {
+    async fn parent_names(&self, name: Vertex) -> Result<Vec<Vertex>> {
         (self)(name)
     }
 
-    async fn hint_subdag_for_insertion(&self, _heads: &[VertexName]) -> Result<MemNameDag> {
+    async fn hint_subdag_for_insertion(&self, _heads: &[Vertex]) -> Result<MemDag> {
         // No clear way to detect the "dirty" scope.
-        Ok(MemNameDag::new())
+        Ok(MemDag::new())
     }
 }
 
 #[async_trait::async_trait]
-impl Parents for std::collections::HashMap<VertexName, Vec<VertexName>> {
-    async fn parent_names(&self, name: VertexName) -> Result<Vec<VertexName>> {
+impl Parents for std::collections::HashMap<Vertex, Vec<Vertex>> {
+    async fn parent_names(&self, name: Vertex) -> Result<Vec<Vertex>> {
         match self.get(&name) {
             Some(v) => Ok(v.clone()),
             None => name.not_found(),
         }
     }
 
-    async fn hint_subdag_for_insertion(&self, heads: &[VertexName]) -> Result<MemNameDag> {
-        let mut keys: Vec<VertexName> = self.keys().cloned().collect();
+    async fn hint_subdag_for_insertion(&self, heads: &[Vertex]) -> Result<MemDag> {
+        let mut keys: Vec<Vertex> = self.keys().cloned().collect();
         keys.sort_unstable();
-        let scope = NameSet::from_static_names(keys);
+        let scope = Set::from_static_names(keys);
         default_impl::hint_subdag_for_insertion(self, &scope, heads).await
     }
 }
@@ -356,7 +356,7 @@ pub trait DagStrip {
     ///
     /// After strip, the `self` graph might contain new vertexes because of
     /// the reload.
-    async fn strip(&mut self, set: &NameSet) -> Result<()>;
+    async fn strip(&mut self, set: &Set) -> Result<()>;
 }
 
 /// Import a generated `CloneData` object into an empty DAG.
@@ -367,7 +367,7 @@ pub trait DagImportCloneData {
     /// This predates `import_pull_data`. New logic should use the general
     /// purpose `import_pull_data` instead. Clone is just a special case of
     /// pull.
-    async fn import_clone_data(&mut self, clone_data: CloneData<VertexName>) -> Result<()>;
+    async fn import_clone_data(&mut self, clone_data: CloneData<Vertex>) -> Result<()>;
 }
 
 /// Import a generated incremental `CloneData` object into an existing DAG.
@@ -393,7 +393,7 @@ pub trait DagImportPullData {
     /// ancestors, those parts will be ignored.
     async fn import_pull_data(
         &mut self,
-        clone_data: CloneData<VertexName>,
+        clone_data: CloneData<Vertex>,
         heads: &VertexListWithOptions,
     ) -> Result<()>;
 }
@@ -401,14 +401,14 @@ pub trait DagImportPullData {
 #[async_trait::async_trait]
 pub trait DagExportCloneData {
     /// Export `CloneData` for vertexes in the master group.
-    async fn export_clone_data(&self) -> Result<CloneData<VertexName>>;
+    async fn export_clone_data(&self) -> Result<CloneData<Vertex>>;
 }
 
 #[async_trait::async_trait]
 pub trait DagExportPullData {
     /// Export `CloneData` for vertexes in the given set.
     /// The set is typically calculated by `only(heads, common)`.
-    async fn export_pull_data(&self, set: &NameSet) -> Result<CloneData<VertexName>>;
+    async fn export_pull_data(&self, set: &Set) -> Result<CloneData<Vertex>>;
 }
 
 /// Persistent the DAG on disk.
@@ -452,16 +452,11 @@ pub trait DagPersistent {
     ) -> Result<()>;
 
     /// Import from another (potentially large) DAG. Write to disk immediately.
-    async fn import_and_flush(
-        &mut self,
-        dag: &dyn DagAlgorithm,
-        master_heads: NameSet,
-    ) -> Result<()> {
+    async fn import_and_flush(&mut self, dag: &dyn DagAlgorithm, master_heads: Set) -> Result<()> {
         let heads = dag.heads(dag.all().await?).await?;
         let non_master_heads = heads - master_heads.clone();
-        let master_heads: Vec<VertexName> =
-            master_heads.iter().await?.try_collect::<Vec<_>>().await?;
-        let non_master_heads: Vec<VertexName> = non_master_heads
+        let master_heads: Vec<Vertex> = master_heads.iter().await?.try_collect::<Vec<_>>().await?;
+        let non_master_heads: Vec<Vertex> = non_master_heads
             .iter()
             .await?
             .try_collect::<Vec<_>>()
@@ -497,7 +492,7 @@ pub trait ImportAscii {
     fn import_ascii_with_vertex_fn(
         &mut self,
         text: &str,
-        vertex_fn: fn(&str) -> VertexName,
+        vertex_fn: fn(&str) -> Vertex,
     ) -> Result<()> {
         self.import_ascii_with_heads_and_vertex_fn(text, <Option<&[&str]>>::None, Some(vertex_fn))
     }
@@ -511,7 +506,7 @@ pub trait ImportAscii {
         &mut self,
         text: &str,
         heads: Option<&[impl AsRef<str>]>,
-        vertex_fn: Option<fn(&str) -> VertexName>,
+        vertex_fn: Option<fn(&str) -> Vertex>,
     ) -> Result<()>;
 }
 
@@ -519,37 +514,30 @@ pub trait ImportAscii {
 #[async_trait::async_trait]
 pub trait PrefixLookup {
     /// Lookup vertexes by hex prefix.
-    async fn vertexes_by_hex_prefix(
-        &self,
-        hex_prefix: &[u8],
-        limit: usize,
-    ) -> Result<Vec<VertexName>>;
+    async fn vertexes_by_hex_prefix(&self, hex_prefix: &[u8], limit: usize) -> Result<Vec<Vertex>>;
 }
 
 /// Convert between `Vertex` and `Id`.
 #[async_trait::async_trait]
 pub trait IdConvert: PrefixLookup + Sync {
-    async fn vertex_id(&self, name: VertexName) -> Result<Id>;
-    async fn vertex_id_with_max_group(
-        &self,
-        name: &VertexName,
-        max_group: Group,
-    ) -> Result<Option<Id>>;
-    async fn vertex_name(&self, id: Id) -> Result<VertexName>;
-    async fn contains_vertex_name(&self, name: &VertexName) -> Result<bool>;
+    async fn vertex_id(&self, name: Vertex) -> Result<Id>;
+    async fn vertex_id_with_max_group(&self, name: &Vertex, max_group: Group)
+    -> Result<Option<Id>>;
+    async fn vertex_name(&self, id: Id) -> Result<Vertex>;
+    async fn contains_vertex_name(&self, name: &Vertex) -> Result<bool>;
 
     /// Test if an `id` is present locally. Do not trigger remote fetching.
     async fn contains_vertex_id_locally(&self, id: &[Id]) -> Result<Vec<bool>>;
 
     /// Test if an `name` is present locally. Do not trigger remote fetching.
-    async fn contains_vertex_name_locally(&self, name: &[VertexName]) -> Result<Vec<bool>>;
+    async fn contains_vertex_name_locally(&self, name: &[Vertex]) -> Result<Vec<bool>>;
 
-    async fn vertex_id_optional(&self, name: &VertexName) -> Result<Option<Id>> {
+    async fn vertex_id_optional(&self, name: &Vertex) -> Result<Option<Id>> {
         self.vertex_id_with_max_group(name, Group::MAX).await
     }
 
-    /// Convert [`Id`]s to [`VertexName`]s in batch.
-    async fn vertex_name_batch(&self, ids: &[Id]) -> Result<Vec<Result<VertexName>>> {
+    /// Convert [`Id`]s to [`Vertex`]s in batch.
+    async fn vertex_name_batch(&self, ids: &[Id]) -> Result<Vec<Result<Vertex>>> {
         // This is not an efficient implementation in an async context.
         let mut names = Vec::with_capacity(ids.len());
         for &id in ids {
@@ -558,8 +546,8 @@ pub trait IdConvert: PrefixLookup + Sync {
         Ok(names)
     }
 
-    /// Convert [`VertexName`]s to [`Id`]s in batch.
-    async fn vertex_id_batch(&self, names: &[VertexName]) -> Result<Vec<Result<Id>>> {
+    /// Convert [`Vertex`]s to [`Id`]s in batch.
+    async fn vertex_id_batch(&self, names: &[Vertex]) -> Result<Vec<Result<Id>>> {
         // This is not an efficient implementation in an async context.
         let mut ids = Vec::with_capacity(names.len());
         for name in names {
@@ -609,7 +597,7 @@ pub trait CheckIntegrity {
     async fn check_isomorphic_graph(
         &self,
         other: &dyn DagAlgorithm,
-        heads: NameSet,
+        heads: Set,
     ) -> Result<Vec<String>>;
 }
 
@@ -621,11 +609,11 @@ where
         &mut self,
         text: &str,
         heads: Option<&[impl AsRef<str>]>,
-        vertex_fn: Option<fn(&str) -> VertexName>,
+        vertex_fn: Option<fn(&str) -> Vertex>,
     ) -> Result<()> {
         let vertex_fn = match vertex_fn {
             Some(vertex_fn) => vertex_fn,
-            None => |s: &str| VertexName::copy_from(s.as_bytes()),
+            None => |s: &str| Vertex::copy_from(s.as_bytes()),
         };
         let parents = drawdag::parse(text);
         let heads: Vec<_> = match heads {
@@ -637,7 +625,7 @@ where
             }
         };
 
-        let parents: std::collections::HashMap<VertexName, Vec<VertexName>> = parents
+        let parents: std::collections::HashMap<Vertex, Vec<Vertex>> = parents
             .iter()
             .map(|(k, vs)| (vertex_fn(k), vs.iter().map(|v| vertex_fn(v)).collect()))
             .collect();
@@ -648,13 +636,16 @@ where
 
 #[async_trait::async_trait]
 pub trait ToIdSet {
-    /// Converts [`NameSet`] to [`IdSet`].
-    async fn to_id_set(&self, set: &NameSet) -> Result<IdSet>;
+    /// Converts [`Set`] to [`IdSet`].
+    async fn to_id_set(&self, set: &Set) -> Result<IdSet>;
 }
 
 pub trait ToSet {
-    /// Converts [`IdSet`] to [`NameSet`].
-    fn to_set(&self, set: &IdSet) -> Result<NameSet>;
+    /// Converts [`IdSet`] to [`Set`].
+    fn to_set(&self, set: &IdSet) -> Result<Set>;
+
+    /// Converts [`IdList`] to [`Set`].
+    fn id_list_to_set(&self, list: &IdList) -> Result<Set>;
 }
 
 pub trait IdMapSnapshot {
@@ -720,22 +711,22 @@ impl<T: Clone> TryClone for T {
 
 #[async_trait::async_trait]
 impl<T: IdConvert + IdMapSnapshot> ToIdSet for T {
-    /// Converts [`NameSet`] to [`IdSet`].
-    async fn to_id_set(&self, set: &NameSet) -> Result<IdSet> {
+    /// Converts [`Set`] to [`IdSet`], which no longer preserves iteration order.
+    async fn to_id_set(&self, set: &Set) -> Result<IdSet> {
         let version = set.hints().id_map_version();
 
         // Fast path: extract IdSet from IdStaticSet.
         if let Some(set) = set.as_any().downcast_ref::<IdStaticSet>() {
             if None < version && version <= Some(self.map_version()) {
                 tracing::debug!(target: "dag::algo::to_id_set", "{:6?} (fast path)", set);
-                return Ok(set.spans.clone());
+                return Ok(set.id_set_losing_order().clone());
             }
         }
 
         // Fast path: flatten to IdStaticSet. This works for UnionSet(...) cases.
         if let Some(set) = set.specialized_flatten_id() {
             tracing::debug!(target: "dag::algo::to_id_set", "{:6?} (fast path 2)", set);
-            return Ok(set.spans.clone());
+            return Ok(set.id_set_losing_order().clone());
         }
 
         // Convert IdLazySet to IdStaticSet. Bypass hash lookups.
@@ -743,7 +734,7 @@ impl<T: IdConvert + IdMapSnapshot> ToIdSet for T {
             if None < version && version <= Some(self.map_version()) {
                 tracing::warn!(target: "dag::algo::to_id_set", "{:6?} (slow path 1)", set);
                 let set: IdStaticSet = set.to_static()?;
-                return Ok(set.spans);
+                return Ok(set.id_set_losing_order().clone());
             }
         }
 
@@ -770,8 +761,12 @@ impl IdMapSnapshot for Arc<dyn IdConvert + Send + Sync> {
 }
 
 impl<T: IdMapSnapshot + DagAlgorithm> ToSet for T {
-    /// Converts [`IdSet`] to [`NameSet`].
-    fn to_set(&self, set: &IdSet) -> Result<NameSet> {
-        NameSet::from_spans_dag(set.clone(), self)
+    /// Converts [`IdSet`] to [`Set`].
+    fn to_set(&self, set: &IdSet) -> Result<Set> {
+        Set::from_id_set_dag(set.clone(), self)
+    }
+
+    fn id_list_to_set(&self, list: &IdList) -> Result<Set> {
+        Set::from_id_list_dag(list.clone(), self)
     }
 }

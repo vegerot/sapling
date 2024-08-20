@@ -19,7 +19,6 @@ use anyhow::Error;
 use blobstore::Loadable;
 use blobstore::LoadableError;
 use context::CoreContext;
-use derived_data::BonsaiDerived;
 use derived_data::SharedDerivationError;
 pub use fetch::fetch_content_for_blame;
 pub use fetch::FetchOutcome;
@@ -73,11 +72,15 @@ pub enum BlameError {
 /// Fetch the blame for a file.  Blame will be derived if necessary.
 pub async fn fetch_blame_v2(
     ctx: &CoreContext,
-    repo: impl RepoBlobstoreArc + RepoDerivedDataRef + Sync + Send + Copy,
+    repo: &(impl RepoBlobstoreArc + RepoDerivedDataRef + Sync + Send),
     csid: ChangesetId,
     path: NonRootMPath,
 ) -> Result<(BlameV2, FileUnodeId), BlameError> {
-    let root_unode = RootBlameV2::derive(ctx, &repo, csid).await?.root_manifest();
+    let root_unode = repo
+        .repo_derived_data()
+        .derive::<RootBlameV2>(ctx, csid)
+        .await?
+        .root_manifest();
     let blobstore = repo.repo_blobstore();
     let file_unode_id = root_unode
         .manifest_unode_id()

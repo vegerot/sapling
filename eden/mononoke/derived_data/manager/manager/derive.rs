@@ -27,8 +27,6 @@ use derived_data_service_if::DeriveRequest;
 use derived_data_service_if::DeriveResponse;
 use derived_data_service_if::DeriveUnderived;
 use derived_data_service_if::DerivedDataType;
-use derived_data_service_if::RequestError;
-use derived_data_service_if::RequestErrorReason;
 use derived_data_service_if::RequestStatus;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
@@ -40,6 +38,7 @@ use futures::stream::TryStreamExt;
 use futures::Future;
 use futures_stats::TimedFutureExt;
 use futures_stats::TimedTryFutureExt;
+use lock_ext::LockExt;
 use mononoke_types::ChangesetId;
 use mononoke_types::DerivableType;
 use slog::debug;
@@ -65,6 +64,20 @@ pub trait Rederivation: Send + Sync + 'static {
     /// is called, `needs_rederive` should not return `true` for
     /// this changeset.
     fn mark_derived(&self, derivable_type: DerivableType, csid: ChangesetId);
+}
+
+impl Rederivation for Mutex<HashSet<ChangesetId>> {
+    fn needs_rederive(&self, _derivable_type: DerivableType, csid: ChangesetId) -> Option<bool> {
+        if self.with(|rederive| rederive.contains(&csid)) {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    fn mark_derived(&self, _derivable_type: DerivableType, csid: ChangesetId) {
+        self.with(|rederive| rederive.remove(&csid));
+    }
 }
 
 pub type VisitedDerivableTypesMap<'a, OkType, ErrType> =
@@ -141,18 +154,19 @@ impl DerivedDataManager {
     where
         Derivable: BonsaiDerivable,
     {
-        self.derive_heads_with_visited::<Derivable>(
-            ctx,
-            heads,
-            override_batch_size,
-            rederivation,
-            Default::default(),
-        )
-        .await
+        self.clone()
+            .derive_heads_with_visited::<Derivable>(
+                ctx,
+                heads,
+                override_batch_size,
+                rederivation,
+                Default::default(),
+            )
+            .await
     }
 
     pub fn derive_heads_with_visited<'a, Derivable>(
-        &'a self,
+        self,
         ctx: &'a CoreContext,
         heads: &'a [ChangesetId],
         override_batch_size: Option<u64>,
@@ -166,7 +180,7 @@ impl DerivedDataManager {
             cloned!(visited);
             async move {
                 Derivable::Dependencies::derive_heads(
-                    self,
+                    self.clone(),
                     ctx,
                     heads,
                     override_batch_size,
@@ -364,8 +378,7 @@ impl DerivedDataManager {
             return Ok(value);
         }
 
-        let mut derivation_ctx = self.derivation_context(rederivation.clone());
-        derivation_ctx.enable_write_batching();
+        let derivation_ctx = self.derivation_context(rederivation.clone());
 
         let bonsai = csid
             .load(ctx, derivation_ctx.blobstore())
@@ -451,9 +464,6 @@ impl DerivedDataManager {
     where
         Derivable: BonsaiDerivable,
     {
-        let mut debugging_scuba = ctx.scuba().clone();
-        debugging_scuba.log_with_msg("debugging", format!("bubble id is {:?}", self.bubble_id()));
-
         if let Some(client) = self.derivation_service_client() {
             let mut attempt = 0;
             let started = Instant::now();
@@ -560,28 +570,6 @@ impl DerivedDataManager {
                         }
                     },
                     Err(e) => {
-                        // Remote derivation is expected to fail for ephemeral changesets.
-                        // Currently, this is not supported. Let's fallback to local derivation to
-                        // unblock derivation of, for example, "changeset_info" DDT required for most SCS
-                        // methods to work.
-                        for cause in e.chain() {
-                            if let Some(req_err) = cause.downcast_ref::<RequestError>() {
-                                if matches!(req_err.reason, RequestErrorReason::commit_not_found(_))
-                                {
-                                    if justknobs::eval(
-                                        "scm/mononoke:derived_data_enable_local_fallback_for_ephemeral_bubbles",
-                                        None,
-                                        Some(self.repo_name()),
-                                    )? {
-                                        derived_data_scuba.log_remote_derivation_end(
-                                            ctx,
-                                            Some(String::from("Commit Not Found Response")),
-                                        );
-                                        return Ok(None);
-                                    }
-                                }
-                            }
-                        }
                         if attempt >= RETRY_ATTEMPTS_LIMIT {
                             derived_data_scuba
                                 .log_remote_derivation_end(ctx, Some(format!("{:#}", e)));
@@ -650,6 +638,33 @@ impl DerivedDataManager {
         Ok(res?.derived)
     }
 
+    /// Derive data for exactly all underived changesets in a batch.
+    ///
+    /// The provided batch of changesets must be in topological
+    /// order. The caller must have arranged for the dependencies
+    /// and ancestors of the batch to have already been derived. If
+    /// any dependency or ancestor is not already derived, an error
+    /// will be returned.
+    pub async fn derive_exactly_underived_batch<Derivable>(
+        &self,
+        ctx: &CoreContext,
+        csids: Vec<ChangesetId>,
+        rederivation: Option<Arc<dyn Rederivation>>,
+    ) -> Result<Duration, DerivationError>
+    where
+        Derivable: BonsaiDerivable,
+    {
+        let derived = self
+            .fetch_derived_batch::<Derivable>(ctx, csids.clone(), rederivation.clone())
+            .await?;
+        let underived = csids
+            .into_iter()
+            .filter(|csid| !derived.contains_key(csid))
+            .collect();
+        self.derive_exactly_batch::<Derivable>(ctx, underived, rederivation)
+            .await
+    }
+
     #[async_recursion]
     /// Derive data for exactly a batch of changesets.
     ///
@@ -658,12 +673,9 @@ impl DerivedDataManager {
     ///
     /// The difference between "derive_exactly" and "derive", is that for
     /// deriving exactly, the caller must have arranged for the dependencies
-    /// and ancestors of the batch to have already been derived.  If
+    /// and ancestors of the batch to have already been derived. If
     /// any dependency or ancestor is not already derived, an error
     /// will be returned.
-    /// If a dependent derived data type has not been derived for the batch of changesets prior to
-    /// this, it will be derived first. The same pre-conditions apply on the dependent derived data
-    /// type.
     pub async fn derive_exactly_batch<Derivable>(
         &self,
         ctx: &CoreContext,
@@ -755,19 +767,21 @@ impl DerivedDataManager {
             ))?;
 
         // All heads should have their dependent data types derived.
-        // Let's make sure that's the case
-        let (dependent_types_stats, _) = Derivable::Dependencies::derive_heads(
-            self,
-            ctx,
-            &heads.into_iter().collect::<Vec<_>>(),
-            None,
-            rederivation.clone(),
-            Default::default(),
-        )
-        .try_timed()
-        .await
-        .context("failed to derive batch dependencies")?;
-        let dependent_types_duration = dependent_types_stats.completion_time;
+        // Let's check if that's the case
+        stream::iter(heads)
+            .map(|csid| async move {
+                Derivable::Dependencies::check_dependencies(
+                    ctx,
+                    derivation_ctx_ref,
+                    csid,
+                    &mut HashSet::new(),
+                )
+                .await
+            })
+            .buffered(100)
+            .try_for_each(|_| async { Ok(()) })
+            .await
+            .context("a batch dependency has not been derived")?;
 
         let ctx = ctx.clone_and_reset();
         let ctx = self.set_derivation_session_class(ctx.clone());
@@ -868,7 +882,7 @@ impl DerivedDataManager {
 
         let batch_duration = result?;
 
-        Ok(batch_duration + secondary_derivation.await? + dependent_types_duration)
+        Ok(batch_duration + secondary_derivation.await?)
     }
 
     /// Fetch derived data for a changeset if it has previously been derived.

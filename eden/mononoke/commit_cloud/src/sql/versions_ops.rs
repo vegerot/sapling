@@ -11,17 +11,25 @@ use clientinfo::ClientRequestInfo;
 use mononoke_types::Timestamp;
 use sql::Connection;
 use sql::Transaction;
+use sql_ext::SqlConnections;
 
+use crate::ctx::CommitCloudContext;
 use crate::references::versions::WorkspaceVersion;
 use crate::sql::ops::Get;
 use crate::sql::ops::Insert;
 use crate::sql::ops::SqlCommitCloud;
 use crate::sql::ops::Update;
+use crate::sql::utils::prepare_prefix;
 
 mononoke_queries! {
     read GetVersion(reponame: String, workspace: String) -> (String, u64, bool, Timestamp){
         mysql("SELECT `workspace`, `version`, `archived`, UNIX_TIMESTAMP(`timestamp`) FROM `versions` WHERE `reponame`={reponame} AND `workspace`={workspace}")
         sqlite("SELECT `workspace`, `version`, `archived`, `timestamp` FROM `versions` WHERE `reponame`={reponame} AND `workspace`={workspace}")
+    }
+
+    read GetVersionByPrefix(reponame: String, prefix: String) -> (String,  u64, bool, Timestamp){
+        mysql("SELECT `workspace`, `version`, `archived`, UNIX_TIMESTAMP(`timestamp`) FROM `versions` WHERE `reponame`={reponame} AND `workspace` LIKE {prefix}")
+        sqlite("SELECT `workspace`,  `version`, `archived`, `timestamp` FROM `versions` WHERE `reponame`={reponame} AND `workspace` LIKE {prefix}")
     }
 
     // We have to check the version again inside the transaction because in rare case
@@ -45,6 +53,16 @@ mononoke_queries! {
                 /* hack: the query below always generates runtime error this is a way to raise an exception (err 1242) */
                 (SELECT name FROM sqlite_master WHERE type='table' LIMIT 2)
             END")
+    }
+
+    write UpdateArchive(reponame: String, workspace: String, archived: bool) {
+        none,
+        "UPDATE versions SET archived={archived} WHERE reponame={reponame} AND workspace={workspace}"
+    }
+
+    write UpdateWorkspaceName( reponame: String, workspace: String, new_workspace: String) {
+        none,
+        "UPDATE versions SET workspace = {new_workspace} WHERE workspace = {workspace} and reponame = {reponame}"
     }
 
 }
@@ -95,16 +113,67 @@ impl Insert<WorkspaceVersion> for SqlCommitCloud {
     }
 }
 
+pub enum UpdateVersionArgs {
+    Archive(bool),
+    WorkspaceName(String),
+}
+
 #[async_trait]
 impl Update<WorkspaceVersion> for SqlCommitCloud {
-    type UpdateArgs = ();
+    type UpdateArgs = UpdateVersionArgs;
     async fn update(
         &self,
-        _reponame: String,
-        _workspace: String,
-        _args: Self::UpdateArgs,
-    ) -> anyhow::Result<()> {
-        //To be implemented among other Update queries
-        return Err(anyhow::anyhow!("Not implemented yet"));
+        txn: Transaction,
+        cri: Option<&ClientRequestInfo>,
+        cc_ctx: CommitCloudContext,
+        args: Self::UpdateArgs,
+    ) -> anyhow::Result<(Transaction, u64)> {
+        match args {
+            UpdateVersionArgs::Archive(archived) => {
+                let (txn, result) = UpdateArchive::maybe_traced_query_with_transaction(
+                    txn,
+                    cri,
+                    &cc_ctx.reponame,
+                    &cc_ctx.workspace,
+                    &archived,
+                )
+                .await?;
+                Ok((txn, result.affected_rows()))
+            }
+            UpdateVersionArgs::WorkspaceName(new_workspace) => {
+                let (txn, result) = UpdateWorkspaceName::maybe_traced_query_with_transaction(
+                    txn,
+                    cri,
+                    &cc_ctx.reponame,
+                    &cc_ctx.workspace,
+                    &new_workspace,
+                )
+                .await?;
+                return Ok((txn, result.affected_rows()));
+            }
+        }
     }
+}
+
+pub async fn get_version_by_prefix(
+    connections: &SqlConnections,
+    reponame: String,
+    prefix: String,
+) -> anyhow::Result<Vec<WorkspaceVersion>> {
+    let rows = GetVersionByPrefix::query(
+        &connections.read_connection,
+        &reponame,
+        &prepare_prefix(&prefix),
+    )
+    .await?;
+    rows.into_iter()
+        .map(|(workspace, version, archived, timestamp)| {
+            Ok(WorkspaceVersion {
+                workspace,
+                version,
+                archived,
+                timestamp,
+            })
+        })
+        .collect::<anyhow::Result<Vec<WorkspaceVersion>>>()
 }

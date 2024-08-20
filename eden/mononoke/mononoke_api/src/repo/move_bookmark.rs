@@ -10,8 +10,11 @@ use std::collections::HashMap;
 use anyhow::format_err;
 use anyhow::Context;
 use bookmarks::BookmarkKey;
+use bookmarks::BookmarkTransaction;
+use bookmarks::BookmarkTransactionHook;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
+use bookmarks_movement::BookmarkInfoTransaction;
 use bookmarks_movement::BookmarkUpdatePolicy;
 use bookmarks_movement::BookmarkUpdateTargets;
 use bookmarks_movement::UpdateBookmarkOp;
@@ -22,19 +25,21 @@ use hook_manager::manager::HookManagerRef;
 use mononoke_types::ChangesetId;
 
 use crate::errors::MononokeError;
+use crate::invalid_push_redirected_request;
 use crate::repo::RepoContext;
+use crate::MononokeRepo;
 
-impl RepoContext {
-    /// Move a bookmark.
-    pub async fn move_bookmark(
+impl<R: MononokeRepo> RepoContext<R> {
+    /// Create operation for moving a bookmark
+    async fn move_bookmark_op<'a>(
         &self,
-        bookmark: &BookmarkKey,
+        bookmark: &'_ BookmarkKey,
         target: ChangesetId,
         old_target: Option<ChangesetId>,
         allow_non_fast_forward: bool,
-        pushvars: Option<&HashMap<String, Bytes>>,
+        pushvars: Option<&'a HashMap<String, Bytes>>,
         affected_changesets_limit: Option<usize>,
-    ) -> Result<(), MononokeError> {
+    ) -> Result<UpdateBookmarkOp<'a>, MononokeError> {
         self.start_write()?;
 
         // We need to find out where the bookmark currently points to in order
@@ -42,7 +47,7 @@ impl RepoContext {
         let old_target = match old_target {
             Some(old_target) => old_target,
             None => self
-                .blob_repo()
+                .repo()
                 .bookmarks()
                 .get(self.ctx().clone(), bookmark)
                 .await
@@ -53,7 +58,7 @@ impl RepoContext {
         };
 
         fn make_move_op<'a>(
-            bookmark: &'a BookmarkKey,
+            bookmark: &'_ BookmarkKey,
             target: ChangesetId,
             old_target: ChangesetId,
             allow_non_fast_forward: bool,
@@ -61,7 +66,7 @@ impl RepoContext {
             affected_changesets_limit: Option<usize>,
         ) -> UpdateBookmarkOp<'a> {
             let op = UpdateBookmarkOp::new(
-                bookmark,
+                bookmark.clone(),
                 BookmarkUpdateTargets {
                     old: old_target,
                     new: target,
@@ -77,7 +82,7 @@ impl RepoContext {
             .with_pushvars(pushvars);
             op.log_new_public_commits_to_scribe()
         }
-        if let Some(redirector) = self.push_redirector.as_ref() {
+        let op = if let Some(redirector) = self.push_redirector.as_ref() {
             let large_bookmark = redirector.small_to_large_bookmark(bookmark).await?;
             if &large_bookmark == bookmark {
                 return Err(MononokeError::InvalidRequest(format!(
@@ -105,7 +110,7 @@ impl RepoContext {
             let old_target = redirector
                 .get_small_to_large_commit_equivalent(ctx, old_target)
                 .await?;
-            let log_id = make_move_op(
+            make_move_op(
                 &large_bookmark,
                 target,
                 old_target,
@@ -113,15 +118,6 @@ impl RepoContext {
                 pushvars,
                 affected_changesets_limit,
             )
-            .run(
-                self.ctx(),
-                self.authorization_context(),
-                redirector.repo.inner_repo(),
-                redirector.repo.hook_manager(),
-            )
-            .await?;
-            // Wait for bookmark to catch up on small repo
-            redirector.ensure_backsynced(ctx, log_id).await?;
         } else {
             make_move_op(
                 bookmark,
@@ -131,15 +127,92 @@ impl RepoContext {
                 pushvars,
                 affected_changesets_limit,
             )
-            .run(
-                self.ctx(),
-                self.authorization_context(),
-                self.inner_repo(),
-                self.hook_manager().as_ref(),
+        };
+        Ok(op)
+    }
+
+    /// Move a bookmark.
+    pub async fn move_bookmark(
+        &self,
+        bookmark: &BookmarkKey,
+        target: ChangesetId,
+        old_target: Option<ChangesetId>,
+        allow_non_fast_forward: bool,
+        pushvars: Option<&HashMap<String, Bytes>>,
+        affected_changesets_limit: Option<usize>,
+    ) -> Result<(), MononokeError> {
+        let update_op = self
+            .move_bookmark_op(
+                bookmark,
+                target,
+                old_target,
+                allow_non_fast_forward,
+                pushvars,
+                affected_changesets_limit,
             )
             .await?;
+        if let Some(redirector) = self.push_redirector.as_ref() {
+            let ctx = self.ctx();
+            let log_id = update_op
+                .run(
+                    self.ctx(),
+                    self.authorization_context(),
+                    &redirector.repo,
+                    redirector.repo.hook_manager(),
+                )
+                .await?;
+            // Wait for bookmark to catch up on small repo
+            redirector.ensure_backsynced(ctx, log_id).await?;
+        } else {
+            update_op
+                .run(
+                    self.ctx(),
+                    self.authorization_context(),
+                    self.repo(),
+                    self.hook_manager().as_ref(),
+                )
+                .await?;
         }
-
         Ok(())
+    }
+
+    /// Move a bookmark with provided transaction
+    pub async fn move_bookmark_with_transaction(
+        &self,
+        bookmark: &BookmarkKey,
+        target: ChangesetId,
+        old_target: Option<ChangesetId>,
+        allow_non_fast_forward: bool,
+        pushvars: Option<&HashMap<String, Bytes>>,
+        affected_changesets_limit: Option<usize>,
+        txn: Option<Box<dyn BookmarkTransaction>>,
+        txn_hooks: Vec<BookmarkTransactionHook>,
+    ) -> Result<BookmarkInfoTransaction, MononokeError> {
+        if self.push_redirector.is_some() {
+            return Err(invalid_push_redirected_request(
+                "move_bookmark_with_transaction",
+            ));
+        }
+        let update_op = self
+            .move_bookmark_op(
+                bookmark,
+                target,
+                old_target,
+                allow_non_fast_forward,
+                pushvars,
+                affected_changesets_limit,
+            )
+            .await?;
+        let bookmark_info_transaction = update_op
+            .run_with_transaction(
+                self.ctx(),
+                self.authorization_context(),
+                self.repo(),
+                self.hook_manager().as_ref(),
+                txn,
+                txn_hooks,
+            )
+            .await?;
+        Ok(bookmark_info_transaction)
     }
 }

@@ -8,11 +8,20 @@
 use std::str::FromStr;
 
 pub(crate) use proc_macro2::TokenStream;
+pub(crate) use proc_macro2::TokenTree;
+pub(crate) use quote::format_ident;
+pub(crate) use quote::quote;
+pub(crate) use tree_pattern_match::Match;
+pub(crate) use tree_pattern_match::PlaceholderExt as _;
 
 pub(crate) use crate::token::TokenInfo;
+pub(crate) use crate::token_stream_ext::AngleBracket;
 pub(crate) use crate::token_stream_ext::FindReplace;
+pub(crate) use crate::token_stream_ext::MatchExt;
+pub(crate) use crate::token_stream_ext::PlaceholderExt as _;
 pub(crate) use crate::token_stream_ext::ToItems;
 pub(crate) use crate::token_stream_ext::ToTokens;
+
 pub(crate) type Item = tree_pattern_match::Item<TokenInfo>;
 
 pub(crate) fn parse(code: &str) -> TokenStream {
@@ -40,7 +49,7 @@ pub(crate) fn unparse(stream: impl ToTokens) -> String {
         }
 
         std::thread_local! {
-            static DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(0);
+            static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
 
         DEPTH.set(DEPTH.get() + 1);
@@ -88,4 +97,12 @@ pub(crate) fn unparse(stream: impl ToTokens) -> String {
     } else {
         tokens.to_string()
     }
+}
+
+pub(crate) fn pick_unique_name(body: Vec<Item>, preferred_name: &str) -> TokenStream {
+    let mut name = preferred_name.to_string();
+    while !body.find_all(name.as_str()).is_empty() {
+        name.push('_');
+    }
+    parse(&name)
 }

@@ -67,8 +67,8 @@ use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLogId;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
-use changesets::ChangesetsRef;
 use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
 use filenodes_derivation::FilenodesOnlyPublic;
 use futures::future;
@@ -94,8 +94,8 @@ use mononoke_types::check_case_conflicts;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
+use mononoke_types::DerivableType;
 use mononoke_types::FileChange;
-use mononoke_types::Generation;
 use mononoke_types::GitLfs;
 use mononoke_types::Timestamp;
 use pushrebase_hook::PushrebaseCommitHook;
@@ -239,11 +239,11 @@ pub struct PushrebaseOutcome {
 
 pub trait Repo = BonsaiHgMappingRef
     + BookmarksRef
-    + ChangesetsRef
     + RepoBlobstoreArc
     + RepoDerivedDataRef
     + RepoIdentityRef
     + CommitGraphRef
+    + CommitGraphWriterRef
     + Send
     + Sync;
 
@@ -297,6 +297,18 @@ async fn check_filenodes_backfilled<'a>(
     head: &ChangesetId,
     limit: u64,
 ) -> Result<(), Error> {
+    let derives_filenodes = repo
+        .repo_derived_data()
+        .active_config()
+        .types
+        .contains(&DerivableType::FileNodes);
+
+    if !derives_filenodes {
+        // Repo doesn't have filenodes derivation enabled, so no need to check
+        // if they're backfilled
+        return Ok(());
+    }
+
     let underived = repo
         .repo_derived_data()
         .count_underived::<FilenodesOnlyPublic>(ctx, *head, Some(limit))
@@ -578,11 +590,13 @@ async fn find_closest_root(
         let repo = &repo;
 
         async move {
-            let entry = repo.changesets().get(ctx, *root).await?.ok_or_else(|| {
-                PushrebaseError::from(PushrebaseInternalError::RootNotFound(*root))
-            })?;
+            let root_gen = repo
+                .commit_graph()
+                .changeset_generation(ctx, *root)
+                .await
+                .map_err(|_| PushrebaseError::from(PushrebaseInternalError::RootNotFound(*root)))?;
 
-            Result::<_, PushrebaseError>::Ok((*root, Generation::new(entry.gen)))
+            Result::<_, PushrebaseError>::Ok((*root, root_gen))
         }
     });
 
@@ -612,7 +626,7 @@ async fn find_closest_ancestor_root(
 
     loop {
         if depth > 0 && depth % 1000 == 0 {
-            info!(ctx.logger(), "pushrebase recursion depth: {}", depth);
+            info!(ctx.logger(), "pushrebase depth: {}", depth);
         }
 
         if let Some(recursion_limit) = config.recursion_limit {
@@ -644,12 +658,7 @@ async fn find_closest_ancestor_root(
             return Ok(id);
         }
 
-        let parents = repo
-            .changesets()
-            .get(ctx, id)
-            .await?
-            .ok_or_else(|| format_err!("Commit {} does not exist in the repo", id))?
-            .parents;
+        let parents = repo.commit_graph().changeset_parents(ctx, id).await?;
 
         queue.extend(parents.into_iter().filter(|p| queued.insert(*p)));
     }
@@ -1235,7 +1244,7 @@ async fn try_move_bookmark(
     };
 
     let maybe_log_id = txn
-        .commit_with_hook(Arc::new(sql_txn_hook))
+        .commit_with_hooks(vec![Arc::new(sql_txn_hook)])
         .await?
         .map(BookmarkUpdateLogId::from);
 
@@ -1261,9 +1270,9 @@ mod tests {
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::BookmarkTransactionError;
     use bookmarks::Bookmarks;
-    use changesets::Changesets;
     use cloned::cloned;
     use commit_graph::CommitGraph;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use filestore::FilestoreConfigRef;
@@ -1306,9 +1315,6 @@ mod tests {
     #[derive(Clone)]
     struct PushrebaseTestRepo {
         #[facet]
-        changesets: dyn Changesets,
-
-        #[facet]
         bonsai_hg_mapping: dyn BonsaiHgMapping,
 
         #[facet]
@@ -1331,6 +1337,9 @@ mod tests {
 
         #[facet]
         commit_graph: CommitGraph,
+
+        #[facet]
+        commit_graph_writer: dyn CommitGraphWriter,
     }
 
     async fn fetch_bonsai_changesets(
@@ -1444,7 +1453,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             // Bottom commit of the repo
             let parents = vec!["2d7d4ba9ce0a6ffd222de7785b249ead9c51c536"];
             let bcs_id = CreateCommitContext::new(&ctx, &repo, parents)
@@ -1597,7 +1606,7 @@ mod tests {
 
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             // Bottom commit of the repo
             let root = HgChangesetId::from_str("2d7d4ba9ce0a6ffd222de7785b249ead9c51c536")?;
             let p = repo
@@ -1648,7 +1657,7 @@ mod tests {
 
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             // Bottom commit of the repo
             let root = HgChangesetId::from_str("2d7d4ba9ce0a6ffd222de7785b249ead9c51c536")?;
             let p = repo
@@ -1714,7 +1723,7 @@ mod tests {
 
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             let config = PushrebaseFlags::default();
 
             let root0 = repo
@@ -1823,7 +1832,7 @@ mod tests {
 
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             let root = repo
                 .bonsai_hg_mapping()
                 .get_bonsai_from_hg(
@@ -1887,7 +1896,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             let root = repo
                 .bonsai_hg_mapping()
                 .get_bonsai_from_hg(
@@ -1936,7 +1945,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             let root = repo
                 .bonsai_hg_mapping()
                 .get_bonsai_from_hg(
@@ -1982,7 +1991,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             let root = repo
                 .bonsai_hg_mapping()
                 .get_bonsai_from_hg(
@@ -2062,7 +2071,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             let root = repo
                 .bonsai_hg_mapping()
                 .get_bonsai_from_hg(
@@ -2123,7 +2132,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = ManyFilesDirs::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = ManyFilesDirs::get_repo(fb).await;
             let root = repo
                 .bonsai_hg_mapping()
                 .get_bonsai_from_hg(
@@ -2179,7 +2188,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = ManyFilesDirs::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = ManyFilesDirs::get_repo(fb).await;
             let root = repo
                 .bonsai_hg_mapping()
                 .get_bonsai_from_hg(
@@ -2303,7 +2312,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             let path_1 = NonRootMPath::new("1")?;
 
             let root_hg = HgChangesetId::from_str("2d7d4ba9ce0a6ffd222de7785b249ead9c51c536")?;
@@ -2480,7 +2489,7 @@ mod tests {
 
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             // Bottom commit of the repo
             let root = HgChangesetId::from_str("2d7d4ba9ce0a6ffd222de7785b249ead9c51c536")?;
             let p = repo
@@ -2555,7 +2564,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             // Bottom commit of the repo
             let root = HgChangesetId::from_str("2d7d4ba9ce0a6ffd222de7785b249ead9c51c536")?;
             let p = repo
@@ -2583,7 +2592,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             // Bottom commit of the repo
             let root = HgChangesetId::from_str("2d7d4ba9ce0a6ffd222de7785b249ead9c51c536")?;
             let p = repo
@@ -2648,7 +2657,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             // Bottom commit of the repo
             let root = HgChangesetId::from_str("2d7d4ba9ce0a6ffd222de7785b249ead9c51c536")?;
             let p = repo
@@ -2686,7 +2695,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
             // Bottom commit of the repo
             let root = HgChangesetId::from_str("2d7d4ba9ce0a6ffd222de7785b249ead9c51c536")?;
             let p = repo
@@ -2739,7 +2748,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
 
             let root = repo
                 .bonsai_hg_mapping()
@@ -2879,7 +2888,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let ctx = CoreContext::test_mock(fb);
-            let repo: PushrebaseTestRepo = MergeEven::get_custom_test_repo(fb).await;
+            let repo: PushrebaseTestRepo = MergeEven::get_repo(fb).await;
 
             // 4dcf230cd2f20577cb3e88ba52b73b376a2b3f69 - is a merge commit,
             // 3cda5c78aa35f0f5b09780d971197b51cad4613a is one of the ancestors
@@ -3167,7 +3176,7 @@ mod tests {
         fb: FacebookInit,
     ) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
-        let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+        let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
 
         // First commit in the new repo
         let other_first_commit = CreateCommitContext::new_root(&ctx, &repo)
@@ -3332,7 +3341,7 @@ mod tests {
     #[fbinit::test]
     async fn pushrebase_test_failpushrebase_extra(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
-        let repo: PushrebaseTestRepo = Linear::get_custom_test_repo(fb).await;
+        let repo: PushrebaseTestRepo = Linear::get_repo(fb).await;
 
         // Create one commit on top of latest commit in the linear repo
         let before_head_commit = "79a13814c5ce7330173ec04d279bf95ab3f652fb";

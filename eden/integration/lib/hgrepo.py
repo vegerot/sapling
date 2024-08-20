@@ -34,6 +34,7 @@ class HgRepository(repobase.Repository):
     temp_mgr: TempFileManager
     staged_files: List[str]
     filtered: bool = False
+    eagerepo: Optional[Path] = None
 
     def __init__(
         self,
@@ -279,6 +280,9 @@ class HgRepository(repobase.Repository):
         except FileExistsError:
             pass
 
+        # Eagerepo allows us to fake remote fetches from the server
+        eagerepo = self.temp_mgr.make_temp_dir(prefix="eagerepo")
+
         hgrc.setdefault("extensions", {})
         hgrc["extensions"]["treemanifest"] = ""
         hgrc["extensions"]["remotefilelog"] = ""
@@ -289,6 +293,15 @@ class HgRepository(repobase.Repository):
         hgrc["remotefilelog"]["reponame"] = "test"
         hgrc["remotefilelog"]["cachepath"] = cachepath
 
+        # We should allow fetching tree aux data along with trees
+        hgrc.add_section("scmstore")
+        hgrc["scmstore"]["fetch-tree-aux-data"] = "true"
+
+        # Some tests set these configs on their own. We shouldn't overwrite them.
+        if not hgrc.has_section("paths"):
+            hgrc.add_section("paths")
+            hgrc["paths"]["default"] = f"eager://{eagerepo}"
+
         # Use Rust status.
         hgrc.setdefault("status", {})
         hgrc["status"]["use-rust"] = "true"
@@ -296,6 +309,10 @@ class HgRepository(repobase.Repository):
         # Use (native) Rust checkout whenever possible
         hgrc.setdefault("checkout", {})
         hgrc["checkout"]["use-rust"] = "true"
+
+        # It's safe to use EdenAPI push for testing purposes
+        hgrc.add_section("push")
+        hgrc["push"]["edenapi"] = "true"
 
         self.write_hgrc(hgrc)
 
@@ -463,3 +480,10 @@ class HgRepository(repobase.Repository):
         else:
             args = ["reset", rev]
         self.run_hg(*args, stdout=None, stderr=None)
+
+    def push(self, rev: str, target: str, create: bool = False) -> str:
+        args = ["push", "-r", rev, "--to", target]
+        if create:
+            args.append("--create")
+
+        return self.hg(*args)

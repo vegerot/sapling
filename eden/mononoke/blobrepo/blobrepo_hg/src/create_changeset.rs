@@ -14,15 +14,12 @@ use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
-use blobrepo::BlobRepo;
 use blobstore::Loadable;
 use bonsai_hg_mapping::BonsaiHgMappingArc;
 use bonsai_hg_mapping::BonsaiHgMappingEntry;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
-use changesets::ChangesetInsert;
-use changesets::Changesets;
-use changesets::ChangesetsArc;
 use cloned::cloned;
+use commit_graph::CommitGraphWriterArc;
 use context::CoreContext;
 use futures::channel::oneshot;
 use futures::future;
@@ -42,6 +39,7 @@ use mononoke_types::BlobstoreValue;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::NonRootMPath;
+use repo_blobstore::ArcRepoBlobstore;
 use repo_blobstore::RepoBlobstoreArc;
 use repo_blobstore::RepoBlobstoreRef;
 use scuba_ext::MononokeScubaSampleBuilder;
@@ -59,7 +57,7 @@ type BonsaiChangesetHook = dyn Fn(
         HgBlobChangeset,
         Vec<HgManifestId>,
         Vec<ChangesetId>,
-        BlobRepo,
+        ArcRepoBlobstore,
     ) -> BoxFuture<'static, Result<BonsaiChangeset>>
     + Send
     + Sync;
@@ -108,7 +106,7 @@ pub fn create_bonsai_changeset_hook(
               hg_cs: HgBlobChangeset,
               parent_manifest_hashes: Vec<HgManifestId>,
               bonsai_parents: Vec<ChangesetId>,
-              repo: BlobRepo| {
+              repo_blobstore: ArcRepoBlobstore| {
             cloned!(origin_repo);
             async move {
                 let bonsai_cs = create_bonsai_changeset_object(
@@ -116,7 +114,7 @@ pub fn create_bonsai_changeset_hook(
                     hg_cs.clone(),
                     parent_manifest_hashes,
                     bonsai_parents,
-                    repo.repo_blobstore(),
+                    &repo_blobstore,
                 )
                 .await?;
                 verify_bonsai_changeset_with_origin(ctx, bonsai_cs, hg_cs, origin_repo).await
@@ -147,7 +145,7 @@ impl CreateChangeset {
     pub fn create(
         self,
         ctx: CoreContext,
-        repo: &BlobRepo,
+        repo: &(impl RepoBlobstoreArc + CommitGraphWriterArc + BonsaiHgMappingArc + Send + Sync),
         mut scuba_logger: MononokeScubaSampleBuilder,
     ) -> ChangesetHandle {
         STATS::create_changeset.add_value(1);
@@ -197,14 +195,14 @@ impl CreateChangeset {
                  hg_cs: HgBlobChangeset,
                  parent_manifest_hashes: Vec<HgManifestId>,
                  bonsai_parents: Vec<ChangesetId>,
-                 repo: BlobRepo| {
+                 repo_blobstore: ArcRepoBlobstore| {
                     async move {
                         create_bonsai_changeset_object(
                             &ctx,
                             hg_cs,
                             parent_manifest_hashes,
                             bonsai_parents,
-                            repo.repo_blobstore(),
+                            &repo_blobstore,
                         )
                         .await
                     }
@@ -214,10 +212,10 @@ impl CreateChangeset {
         };
 
         let changeset = {
-            cloned!(ctx, repo, signal_parent_ready, mut scuba_logger);
+            cloned!(ctx, signal_parent_ready, mut scuba_logger);
             let expected_files = self.expected_files;
             let cs_metadata = self.cs_metadata;
-            let blobstore = repo.repo_blobstore().clone();
+            let blobstore = repo.repo_blobstore_arc();
 
             async move {
                 let (root_mf_id, (parents, parent_manifest_hashes, bonsai_parents)) =
@@ -231,7 +229,7 @@ impl CreateChangeset {
                     STATS::create_changeset_compute_cf.add_value(1);
                     compute_changed_files(
                         ctx.clone(),
-                        repo.repo_blobstore_arc(),
+                        blobstore.clone(),
                         root_mf_id,
                         parent_manifest_hashes.first().cloned(),
                         parent_manifest_hashes.get(1).cloned(),
@@ -246,7 +244,7 @@ impl CreateChangeset {
                     hg_cs.clone(),
                     parent_manifest_hashes.clone(),
                     bonsai_parents,
-                    repo.clone(),
+                    blobstore.clone(),
                 )
                 .await?;
 
@@ -324,19 +322,19 @@ impl CreateChangeset {
             }
         });
 
-        let complete_changesets = repo.changesets_arc();
+        let commit_graph_writer = repo.commit_graph_writer_arc();
         let bonsai_hg_mapping = repo.bonsai_hg_mapping_arc();
         let changeset_complete_fut = async move {
             let ((hg_cs, bonsai_cs), _) = future::try_join(changeset, parents_complete).await?;
 
             if !self.upload_to_blobstore_only {
                 // update changeset mapping
-                let completion_record = ChangesetInsert {
-                    cs_id: bonsai_cs.get_changeset_id(),
-                    parents: bonsai_cs.parents().collect(),
-                };
-                complete_changesets
-                    .add(&ctx, completion_record)
+                commit_graph_writer
+                    .add(
+                        &ctx,
+                        bonsai_cs.get_changeset_id(),
+                        bonsai_cs.parents().collect(),
+                    )
                     .await
                     .context("While inserting into changeset table")?;
 

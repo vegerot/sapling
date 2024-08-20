@@ -591,10 +591,7 @@ class localrepository:
         if self.ui.configbool("devel", "all-warnings") or self.ui.configbool(
             "devel", "check-locks"
         ):
-            if hasattr(self.svfs, "vfs"):  # this is filtervfs
-                self.svfs.vfs.audit = self._getsvfsward(self.svfs.vfs.audit)
-            else:  # standard vfs
-                self.svfs.audit = self._getsvfsward(self.svfs.audit)
+            self.svfs.audit = self._getsvfsward(self.svfs.audit)
         if "store" in self.requirements:
             try:
                 self.storerequirements = scmutil.readrequires(
@@ -1681,6 +1678,16 @@ class localrepository:
         )
         return hist
 
+    def pathcreation(self, path, nodes):
+        """Return the most recent commit where path was added.
+
+        path can be either a file or a directory.
+        nodes decides the search range (ex. "::." or "_firstancestors(.)")
+        """
+        return bindings.pathhistory.lastcreation(
+            nodes, path, self.changelog.inner, self.manifestlog.datastore
+        )
+
     def publishing(self):
         # narrow-heads repos are NOT publishing. This ensures pushing to a
         # narrow-heads repo would cause visible heads changes to make the
@@ -2010,11 +2017,6 @@ class localrepository:
         # them before opening the new transaction.
         commitnotransaction(None)
 
-        # note: writing the fncache only during finalize mean that the file is
-        # outdated when running hooks. As fncache is used for streaming clone,
-        # this is not expected to break anything that happen during the hooks.
-        tr.addfinalize("flush-fncache", self.store.write)
-
         def txnclosehook(tr2):
             """To be run if transaction is successful, will schedule a hook run"""
             # Don't reference tr2 in hook() so we don't hold a reference.
@@ -2064,6 +2066,12 @@ class localrepository:
         tr.addpostclose("refresh-filecachestats", self._refreshfilecachestats)
         self._transref = weakref.ref(tr)
         return tr
+
+    # Flush pending changelog/store writes. Used to make unflushed
+    # changes visible to EdenFS.
+    def flushpendingtransaction(self):
+        if tx := self.currenttransaction():
+            tx.writepending()
 
     def _journalfiles(self):
         return (
@@ -2345,10 +2353,14 @@ class localrepository:
         """Fully invalidates both store and non-store parts, causing the
         subsequent operation to reread any outside changes."""
         # extension should hook this to invalidate its caches
+        # Order matters. Invalidate changelog first so loading dirstate will
+        # pick up new commits in the changelog.
+        self.invalidatechangelog()
+        # Trigger _rsrepo.invalidatechangelog()
+        self.changelog
         self.invalidate()
         self.invalidatedirstate()
         self.invalidatemetalog()
-        self.invalidatechangelog()
 
     def _refreshfilecachestats(self, tr):
         """Reload stats of cached files so that they are flagged as valid"""
@@ -2814,67 +2826,19 @@ class localrepository:
         finally:
             lockmod.release(tr, lock, wlock)
 
-        def commithook(node=hex(ret), parent1=hookp1, parent2=hookp2):
-            # hack for command that use a temporary commit (eg: histedit)
-            # temporary commit got stripped before hook release
-            if self.changelog.hasnode(ret):
-                self.hook("commit", node=node, parent1=parent1, parent2=parent2)
+        self.hook("commit", node=hex(ret), parent1=hookp1, parent2=hookp2)
 
-        self._afterlock(commithook)
         return ret
 
     def commitctx(self, ctx, error=False):
         """Add a new revision to current repository.
         Revision information is passed via the context argument.
         """
+        _validate_committable_ctx(self.ui, ctx)
 
         tr = None
         p1, p2 = ctx.p1(), ctx.p2()
         user = ctx.user()
-
-        if (
-            not self.ui.configbool("commit", "allow-non-printable")
-            and not self.ui.plain()
-        ):
-            _check_non_printable(self.ui, ctx.description())
-
-        descriptionlimit = self.ui.configbytes("commit", "description-size-limit")
-        if descriptionlimit:
-            descriptionlen = len(ctx.description())
-            if descriptionlen > descriptionlimit:
-                raise errormod.Abort(
-                    _("commit message length (%s) exceeds configured limit (%s)")
-                    % (descriptionlen, descriptionlimit)
-                )
-
-        extraslimit = self.ui.configbytes("commit", "extras-size-limit")
-        if extraslimit:
-            extraslen = sum(len(k) + len(v) for k, v in pycompat.iteritems(ctx.extra()))
-            if extraslen > extraslimit:
-                raise errormod.Abort(
-                    _("commit extras total size (%s) exceeds configured limit (%s)")
-                    % (extraslen, extraslimit)
-                )
-
-        file_count_limit = self.ui.configint("commit", "file-count-limit")
-        if file_count_limit and file_count_limit < len(ctx.files()):
-            support = self.ui.config("ui", "supportcontact")
-            if support:
-                hint = (
-                    _(
-                        "contact %s for help or use '--config commit.file-count-limit=N' cautiously to override"
-                    )
-                    % support
-                )
-            else:
-                hint = _(
-                    "use '--config commit.file-count-limit=N' cautiously to override"
-                )
-            raise errormod.Abort(
-                _("commit file count (%d) exceeds configured limit (%d)")
-                % (len(ctx.files()), file_count_limit),
-                hint=hint,
-            )
 
         isgit = git.isgitformat(self)
         lock = self.lock()
@@ -2882,115 +2846,7 @@ class localrepository:
             tr = self.transaction("commit")
             trp = weakref.proxy(tr)
 
-            if ctx.manifestnode():
-                # reuse an existing manifest revision
-                mn = ctx.manifestnode()
-                files = ctx.files()
-            elif ctx.files():
-                m1ctx = p1.manifestctx()
-                m2ctx = p2.manifestctx()
-                mctx = m1ctx.copy()
-
-                m = mctx.read()
-                m1 = m1ctx.read()
-                m2 = m2ctx.read()
-
-                # Validate that the files that are checked in can be interpreted
-                # as utf8. This is to protect against potential crashes as we
-                # move to utf8 file paths. Changing encoding is a beast on top
-                # of storage format.
-                try:
-                    for f in ctx.added():
-                        if isinstance(f, bytes):
-                            f.decode("utf-8")
-                except UnicodeDecodeError as inst:
-                    raise errormod.Abort(
-                        _("invalid file name encoding: %s!") % inst.object
-                    )
-
-                # check in files
-                added = []
-                changed = []
-
-                removed = []
-                drop = []
-
-                def handleremove(f):
-                    if f in m1 or f in m2:
-                        removed.append(f)
-                        if f in m:
-                            del m[f]
-                            drop.append(f)
-
-                for f in ctx.removed():
-                    handleremove(f)
-                for f in sorted(ctx.modified() + ctx.added()):
-                    if ctx[f] is None:
-                        # in memctx this means removal
-                        handleremove(f)
-                    else:
-                        added.append(f)
-
-                linkrev = len(self)
-                self.ui.note(_("committing files:\n"))
-
-                if not isgit:
-                    # Prefetch rename data, since _filecommit will look for it.
-                    # (git does not need this step)
-                    if hasattr(self.fileslog, "metadatastore"):
-                        keys = []
-                        for f in added:
-                            fctx = ctx[f]
-                            if fctx.filenode() is not None:
-                                keys.append((fctx.path(), fctx.filenode()))
-                        self.fileslog.metadatastore.prefetch(keys)
-                for f in progress.each(self.ui, added, _("committing"), _("files")):
-                    self.ui.note(f + "\n")
-                    try:
-                        fctx = ctx[f]
-                        if isgit:
-                            filenode = self._filecommitgit(fctx)
-                        else:
-                            filenode = self._filecommit(
-                                fctx, m1, m2, linkrev, trp, changed
-                            )
-                        assert filenode != nullid, "manifest should not have nullid"
-                        m[f] = filenode
-                        m.setflag(f, fctx.flags())
-                    except OSError:
-                        self.ui.warn(_("trouble committing %s!\n") % f)
-                        raise
-                    except IOError as inst:
-                        errcode = getattr(inst, "errno", errno.ENOENT)
-                        if error or errcode and errcode != errno.ENOENT:
-                            self.ui.warn(_("trouble committing %s!\n") % f)
-                        raise
-
-                # update manifest
-                self.ui.note(_("committing manifest\n"))
-                removed = sorted(removed)
-                drop = sorted(drop)
-                if added or drop:
-                    if isgit:
-                        mn = mctx.writegit()
-                    else:
-                        mn = (
-                            mctx.write(
-                                trp,
-                                linkrev,
-                                p1.manifestnode(),
-                                p2.manifestnode(),
-                                added,
-                                drop,
-                            )
-                            or p1.manifestnode()
-                        )
-                else:
-                    mn = p1.manifestnode()
-                files = changed + removed
-            else:
-                mn = p1.manifestnode()
-                files = []
+            mn, files = ctx.write_manifest_and_compute_files(trp)
 
             # update changelog
             self.ui.note(_("committing changelog\n"))
@@ -3425,8 +3281,6 @@ def newreporequirements(repo) -> Set[str]:
     ui = repo.ui
     requirements = {"revlogv1"}
     requirements.add("store")
-    requirements.add("fncache")
-    requirements.add("dotencode")
 
     compengine = ui.config("experimental", "format.compression")
     if compengine not in util.compengines:
@@ -3449,35 +3303,6 @@ def newreporequirements(repo) -> Set[str]:
         requirements.add("generaldelta")
     if ui.configbool("experimental", "treemanifest"):
         requirements.add("treemanifest")
-
-    return requirements
-
-
-def newrepostorerequirements(repo):
-    ui = repo.ui
-    requirements = set()
-
-    # hgsql wants stable legacy revlog access, bypassing visibleheads,
-    # narrow-heads, and zstore-commit-data.
-    if "hgsql" in repo.requirements:
-        return requirements
-
-    if ui.configbool("visibility", "enabled"):
-        requirements.add("visibleheads")
-
-    # See also self._narrowheadsmigration()
-    if (
-        ui.configbool("experimental", "narrow-heads")
-        and ui.configbool("visibility", "enabled")
-        and extensions.isenabled(ui, "remotenames")
-    ):
-        requirements.add("narrowheads")
-
-    if ui.configbool("format", "use-segmented-changelog"):
-        requirements.add("segmentedchangelog")
-        # linkrev are not going to work with segmented changelog,
-        # because the numbers might get rewritten.
-        requirements.add("invalidatelinkrev")
 
     return requirements
 
@@ -3566,3 +3391,44 @@ def _openchangelog(repo):
     repo._rsrepo.invalidatechangelog()
     inner = repo._rsrepo.changelog()
     return changelog2.changelog(repo, inner, repo.ui.uiconfig())
+
+
+def _validate_committable_ctx(ui, ctx):
+    if not ui.configbool("commit", "allow-non-printable") and not ui.plain():
+        _check_non_printable(ui, ctx.description())
+
+    descriptionlimit = ui.configbytes("commit", "description-size-limit")
+    if descriptionlimit:
+        descriptionlen = len(ctx.description())
+        if descriptionlen > descriptionlimit:
+            raise errormod.Abort(
+                _("commit message length (%s) exceeds configured limit (%s)")
+                % (descriptionlen, descriptionlimit)
+            )
+
+    extraslimit = ui.configbytes("commit", "extras-size-limit")
+    if extraslimit:
+        extraslen = sum(len(k) + len(v) for k, v in pycompat.iteritems(ctx.extra()))
+        if extraslen > extraslimit:
+            raise errormod.Abort(
+                _("commit extras total size (%s) exceeds configured limit (%s)")
+                % (extraslen, extraslimit)
+            )
+
+    file_count_limit = ui.configint("commit", "file-count-limit")
+    if file_count_limit and file_count_limit < len(ctx.files()):
+        support = ui.config("ui", "supportcontact")
+        if support:
+            hint = (
+                _(
+                    "contact %s for help or use '--config commit.file-count-limit=N' cautiously to override"
+                )
+                % support
+            )
+        else:
+            hint = _("use '--config commit.file-count-limit=N' cautiously to override")
+        raise errormod.Abort(
+            _("commit file count (%d) exceeds configured limit (%d)")
+            % (len(ctx.files()), file_count_limit),
+            hint=hint,
+        )

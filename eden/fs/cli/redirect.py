@@ -25,7 +25,7 @@ from thrift.Thrift import TApplicationException
 
 from . import cmd_util, mtab, subcmd as subcmd_mod, tabulate
 
-from .buck import is_buckd_running_for_path, stop_buckd_for_path, stop_buckd_for_repo
+from .buck import stop_buckd_for_repo
 from .config import CheckoutConfig, EdenCheckout, EdenInstance, load_toml_config
 from .prompt import prompt_confirmation
 from .subcmd import Subcmd
@@ -92,6 +92,82 @@ def is_bind_mount(path: Path) -> bool:
         return parent_stat.st_dev != stat.st_dev
     except FileNotFoundError:
         return False
+
+
+def is_valid_symlink(expected_target: Optional[Path], mount_path: Path) -> bool:
+    """Detect symlink usage and checks if the symlink is valid
+    Symlinks can be used on any system but are the only redirect on Windows"""
+    try:
+        # Resolve to remove all symlinks in the path
+        if expected_target:
+            expected_target = expected_target.resolve()
+        symlink_path = os.fsdecode(mount_path)
+        target = Path(symlink_path).readlink()
+        if target != expected_target:
+            print(
+                f"EXPECTED redirect to resolve to {expected_target}, got {target}",
+                file=sys.stderr,
+            )
+            return False
+        return True
+    except OSError as exc:
+        # We're considering a variety of errors that might
+        # manifest around trying to read the symlink as meaning
+        # that the symlink is effectively missing, even if it
+        # isn't literally missing.  eg: EPERM means we can't
+        # resolve it, so it is effectively no good.
+        # Throw Exception for logging
+        errMsg = f"EXPECTED redirect to resolve to {expected_target}, got {exc}"
+        print(
+            errMsg,
+            file=sys.stderr,
+        )
+        raise Exception(errMsg)
+
+
+def is_valid_windows_symlink(expected_target: Optional[Path], mount_path: Path) -> bool:
+    """Detect symlink usage and checks if the symlink is valid
+    Symlinks can be used on any system but are the only redirect on Windows
+    Windows symlinks need some extra handling for path formatting and return values"""
+    try:
+        # Resolve to normalize extended-length path on Windows and remove all symlinks in the path
+        if expected_target:
+            expected_target = expected_target.resolve()
+        symlink_path = os.fsdecode(mount_path)
+        try:
+            target = Path(symlink_path).readlink()
+            if sys.platform == "win32":
+                # readlink returns a UNC path on Windows, so strip the
+                # prefix to be able to normalize
+                target = remove_unc_prefix(target)
+        except ValueError as exc:
+            # Windows throws ValueError when the target is not a symlink
+            # while NIX throws OSError
+            print(
+                f"EXPECTED redirect to resolve to {expected_target}, got {exc}",
+                file=sys.stderr,
+            )
+            return False
+        if target != expected_target:
+            print(
+                f"EXPECTED redirect to resolve to {expected_target}, got {target}",
+                file=sys.stderr,
+            )
+            return False
+        return True
+    except OSError as exc:
+        # We're considering a variety of errors that might
+        # manifest around trying to read the symlink as meaning
+        # that the symlink is effectively missing, even if it
+        # isn't literally missing.  eg: EPERM means we can't
+        # resolve it, so it is effectively no good.
+        # Throw Exception for logging
+        errMsg = (f"EXPECTED redirect to resolve to {expected_target}, got {exc}",)
+        print(
+            errMsg,
+            file=sys.stderr,
+        )
+        raise Exception(errMsg)
 
 
 def make_scratch_dir(checkout: EdenCheckout, subdir: Path) -> Path:
@@ -429,19 +505,6 @@ class Redirection:
         if disposition == RepoPathDisposition.DOES_NOT_EXIST:
             return disposition
 
-        # If this redirect was setup by buck, we should stop buck
-        # prior to unmounting it, as it doesn't currently have a
-        # great way to detect that the directories have gone away.
-        maybe_buck_project = str(repo_path.parent)
-        if is_buckd_running_for_path(maybe_buck_project):
-            stop_buckd_for_path(maybe_buck_project)
-
-        # We have encountered issues with buck daemons holding references to files underneath the
-        # redirection we're trying to remove. We should kill all buck instances for the repo to
-        # guard against these cases and avoid `redirect fixup` failures.
-        checkout_path = str(checkout.path)
-        stop_buckd_for_repo(checkout_path)
-
         if disposition == RepoPathDisposition.IS_SYMLINK:
             repo_path.unlink()
             return RepoPathDisposition.DOES_NOT_EXIST
@@ -690,7 +753,8 @@ def get_effective_redirections(
                         raise OSError(errno.EINVAL) from exc
                     if target != expected_target:
                         print(
-                            f"EXPECTED {expected_target}, got {target}", file=sys.stderr
+                            f"EXPECTED redirect to resolve to {expected_target}, got {target}",
+                            file=sys.stderr,
                         )
                         redir.state = RedirectionState.SYMLINK_INCORRECT
                 except OSError:
@@ -703,6 +767,38 @@ def get_effective_redirections(
         redirs[rel_path] = redir
 
     return redirs
+
+
+def check_redirection(redir: Redirection, checkout: EdenCheckout) -> bool:
+    """
+    Get the redirection for a path.
+    """
+    mount_path = redir.expand_repo_path(checkout)
+    if redir.state == RedirectionState.UNKNOWN_MOUNT:
+        # If the redir was in an unknown state before,
+        # that means it existed but was not configured.
+        # it should have been removed in the remidation step
+        # Bind mounts technically aren't used on windows but we're
+        # looking for the file not existing here.
+        return not is_bind_mount(mount_path)
+
+    if sys.platform == "win32":
+        """Special casing for windows projFS since it treats bind mounts as symlinks"""
+        if redir.type != RedirectionType.SYMLINK:
+            return False
+        expected_target = redir.expand_target_abspath(checkout)
+        return is_valid_windows_symlink(expected_target, mount_path)
+    else:
+        # There should now be a symlink or bind mount at this point
+        if redir.type == RedirectionType.BIND:
+            return is_bind_mount(mount_path)
+        elif redir.type == RedirectionType.SYMLINK:
+            expected_target = redir.expand_target_abspath(checkout)
+            return is_valid_symlink(expected_target, mount_path)
+        else:
+            # Unknown type
+            return False
+    return False
 
 
 def file_size(path: Path) -> int:

@@ -15,7 +15,6 @@ use blobstore::Blobstore;
 use blobstore::BlobstoreGetData;
 use bytes::Bytes;
 use context::CoreContext;
-use derived_data::impl_bonsai_derived_via_manager;
 use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
@@ -153,8 +152,6 @@ impl BonsaiDerivable for RootFsnodeId {
     }
 }
 
-impl_bonsai_derived_via_manager!(RootFsnodeId);
-
 pub(crate) fn get_file_changes(
     bcs: &BonsaiChangeset,
 ) -> Vec<(NonRootMPath, Option<(ContentId, FileType)>)> {
@@ -173,13 +170,18 @@ pub(crate) fn get_file_changes(
 #[cfg(test)]
 mod test {
     use blobstore::Loadable;
+    use bonsai_git_mapping::BonsaiGitMapping;
+    use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::BookmarkKey;
+    use bookmarks::Bookmarks;
     use bookmarks::BookmarksRef;
     use borrowed::borrowed;
+    use commit_graph::CommitGraph;
     use commit_graph::CommitGraphRef;
-    use derived_data::BonsaiDerived;
+    use commit_graph::CommitGraphWriter;
     use derived_data_test_utils::iterate_all_manifest_entries;
     use fbinit::FacebookInit;
+    use filestore::FilestoreConfig;
     use fixtures::BranchEven;
     use fixtures::BranchUneven;
     use fixtures::BranchWide;
@@ -199,11 +201,27 @@ mod test {
     use mercurial_derivation::DeriveHgChangeset;
     use mercurial_types::HgChangesetId;
     use mercurial_types::HgManifestId;
+    use repo_blobstore::RepoBlobstore;
     use repo_blobstore::RepoBlobstoreRef;
+    use repo_derived_data::RepoDerivedData;
     use repo_derived_data::RepoDerivedDataRef;
+    use repo_identity::RepoIdentity;
     use tokio::runtime::Runtime;
 
     use super::*;
+
+    #[facet::container]
+    struct Repo(
+        dyn BonsaiGitMapping,
+        dyn BonsaiHgMapping,
+        dyn Bookmarks,
+        RepoBlobstore,
+        RepoDerivedData,
+        RepoIdentity,
+        CommitGraph,
+        dyn CommitGraphWriter,
+        FilestoreConfig,
+    );
 
     async fn fetch_manifest_by_cs_id(
         ctx: &CoreContext,
@@ -222,7 +240,9 @@ mod test {
         bcs_id: ChangesetId,
         hg_cs_id: HgChangesetId,
     ) -> Result<()> {
-        let root_fsnode_id = RootFsnodeId::derive(ctx, repo, bcs_id)
+        let root_fsnode_id = repo
+            .repo_derived_data()
+            .derive::<RootFsnodeId>(ctx, bcs_id)
             .await?
             .into_fsnode_id();
 
@@ -265,10 +285,9 @@ mod test {
             }))
     }
 
-    fn verify_repo<F, R>(fb: FacebookInit, repo: F, runtime: &Runtime)
+    fn verify_repo<F>(fb: FacebookInit, repo: F, runtime: &Runtime)
     where
-        F: Future<Output = R>,
-        R: BookmarksRef + RepoBlobstoreRef + RepoDerivedDataRef + CommitGraphRef + Send + Sync,
+        F: Future<Output = Repo>,
     {
         let ctx = CoreContext::test_mock(fb);
         let repo = runtime.block_on(repo);
@@ -290,15 +309,15 @@ mod test {
     #[fbinit::test]
     fn test_derive_data(fb: FacebookInit) {
         let runtime = Runtime::new().unwrap();
-        verify_repo(fb, Linear::getrepo(fb), &runtime);
-        verify_repo(fb, BranchEven::getrepo(fb), &runtime);
-        verify_repo(fb, BranchUneven::getrepo(fb), &runtime);
-        verify_repo(fb, BranchWide::getrepo(fb), &runtime);
-        verify_repo(fb, ManyDiamonds::getrepo(fb), &runtime);
-        verify_repo(fb, ManyFilesDirs::getrepo(fb), &runtime);
-        verify_repo(fb, MergeEven::getrepo(fb), &runtime);
-        verify_repo(fb, MergeUneven::getrepo(fb), &runtime);
-        verify_repo(fb, UnsharedMergeEven::getrepo(fb), &runtime);
-        verify_repo(fb, UnsharedMergeUneven::getrepo(fb), &runtime);
+        verify_repo(fb, Linear::get_repo(fb), &runtime);
+        verify_repo(fb, BranchEven::get_repo(fb), &runtime);
+        verify_repo(fb, BranchUneven::get_repo(fb), &runtime);
+        verify_repo(fb, BranchWide::get_repo(fb), &runtime);
+        verify_repo(fb, ManyDiamonds::get_repo(fb), &runtime);
+        verify_repo(fb, ManyFilesDirs::get_repo(fb), &runtime);
+        verify_repo(fb, MergeEven::get_repo(fb), &runtime);
+        verify_repo(fb, MergeUneven::get_repo(fb), &runtime);
+        verify_repo(fb, UnsharedMergeEven::get_repo(fb), &runtime);
+        verify_repo(fb, UnsharedMergeUneven::get_repo(fb), &runtime);
     }
 }

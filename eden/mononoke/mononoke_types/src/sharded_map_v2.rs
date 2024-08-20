@@ -27,7 +27,10 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use itertools::Either;
 use nonzero_ext::nonzero;
+use quickcheck::Arbitrary;
+use quickcheck::Gen;
 use smallvec::SmallVec;
+use sorted_vector_map::sorted_vector_map;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::blob::Blob;
@@ -118,6 +121,13 @@ impl<Value: ShardedMapV2Value> ShardedMapV2StoredNode<Value> {
             rollup_data: self.rollup_data.into_bytes(),
         }
     }
+}
+
+/// Returns longest common prefix of a and b.
+fn common_prefix<'a>(a: &'a [u8], b: &'a [u8]) -> &'a [u8] {
+    let lcp = a.iter().zip(b.iter()).take_while(|(a, b)| a == b).count();
+    // Panic safety: lcp is at most a.len()
+    &a[..lcp]
 }
 
 impl<Value: ShardedMapV2Value> LoadableShardedMapV2Node<Value> {
@@ -241,6 +251,26 @@ impl<Value: ShardedMapV2Value> LoadableShardedMapV2Node<Value> {
                 thrift::sharded_map::LoadableShardedMapV2Node::stored(stored.into_thrift())
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+/// The kind of lookup to perform on when using get_entries_and_partial_maps method.
+pub enum LookupKind {
+    Entry,
+    PartialMap,
+}
+
+impl Arbitrary for LookupKind {
+    fn arbitrary(g: &mut Gen) -> Self {
+        if bool::arbitrary(g) {
+            LookupKind::Entry
+        } else {
+            LookupKind::PartialMap
+        }
+    }
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        Box::new(std::iter::empty())
     }
 }
 
@@ -440,35 +470,37 @@ impl<Value: ShardedMapV2Value> ShardedMapV2Node<Value> {
         }
     }
 
-    /// Returns the value corresponding to the given key, or None if there's no value
-    /// corresponding to it.
+    /// Returns a map containing all key-value pairs in this map for which the key
+    /// starts with the given key_prefix, with key_prefix stripped from the keys.
+    ///
+    /// Returns None if no key in the map starts with the given key_prefix.
     #[async_recursion]
     pub async fn get_partial_map(
         &self,
         ctx: &CoreContext,
         blobstore: &impl Blobstore,
-        key: &[u8],
+        key_prefix: &[u8],
     ) -> Result<Option<LoadableShardedMapV2Node<Value>>> {
-        if let Some(remaining_prefix) = self.prefix.strip_prefix(key) {
-            // If the key is a prefix of this node, then the partial map corresponding
-            // to the key is this node itself (possibly with the prefix adjusted).
+        if let Some(remaining_prefix) = self.prefix.strip_prefix(key_prefix) {
+            // If key_prefix is a prefix of this node, then the partial map corresponding
+            // to the key_prefix is this node itself (possibly with the prefix adjusted).
             let mut node = self.clone();
             node.prefix = remaining_prefix.into();
             return Ok(Some(LoadableShardedMapV2Node::Inlined(node)));
         }
 
-        // If the key starts with the prefix of this node then strip it, otherwise
-        // there's no value corresponding to this key.
-        let key = match key.strip_prefix(self.prefix.as_ref()) {
+        // If key_prefix starts with the prefix of this node then strip it, otherwise
+        // there's no value corresponding to this key_prefix.
+        let key_prefix = match key_prefix.strip_prefix(self.prefix.as_ref()) {
             None => {
                 return Ok(None);
             }
-            Some(key) => key,
+            Some(stripped_key_prefix) => stripped_key_prefix,
         };
 
-        // The key should not be empty, as we would have returned an exact match above.
-        debug_assert!(!key.is_empty());
-        let (first, rest) = key.split_first().expect("No exact match possible");
+        // The key_prefix should not be empty, as we would have returned an exact match above.
+        debug_assert!(!key_prefix.is_empty());
+        let (first, rest) = key_prefix.split_first().expect("No exact match possible");
 
         let child = match self.children.get(first) {
             None => {
@@ -488,6 +520,98 @@ impl<Value: ShardedMapV2Value> ShardedMapV2Node<Value> {
                     .await
             }
         }
+    }
+
+    /// Returns the entries and partial maps corresponding to the given TrieMap.
+    /// See documentation of `lookup` and `get_partial_map` for the semantics of looking up entries and
+    /// partial maps.
+    ///
+    /// This is more efficient than calling `lookup` and `get_partial_map` separately for each
+    /// key and prefix.
+    pub async fn get_entries_and_partial_maps(
+        self,
+        ctx: &CoreContext,
+        blobstore: &impl Blobstore,
+        lookup_keys: TrieMap<LookupKind>,
+        concurrency: usize,
+    ) -> Result<TrieMap<Either<Value, LoadableShardedMapV2Node<Value>>>> {
+        bounded_traversal::bounded_traversal_stream(
+            concurrency,
+            vec![(LoadableShardedMapV2Node::Inlined(self), lookup_keys, SmallBinary::new())],
+            |(loadable_node, lookup_keys, mut accumulated_prefix)| {
+                async move {
+                    let node = loadable_node.load(ctx, blobstore).await?;
+
+                    // Find the longest common prefix between all lookup keys and the current node,
+                    // and strip it from the lookup keys and node prefix.
+                    let keys_prefix = lookup_keys.longest_common_prefix();
+                    let lcp = common_prefix(keys_prefix.as_ref(), node.prefix.as_ref());
+
+                    let lookup_keys = lookup_keys.extract_prefix(lcp).expect("lcp should be a prefix of lookup_keys");
+                    let node_prefix: SmallBinary = node.prefix.strip_prefix(lcp).expect("lcp should be a prefix of node.prefix").into();
+
+                    accumulated_prefix.extend_from_slice(lcp);
+
+                    let item = match lookup_keys.value.as_ref().map(|v| **v) {
+                        // If the lookup kind is Entry, then we're looking for a value that
+                        // corresponds to exactly accumulated_prefix.
+                        Some(LookupKind::Entry) => {
+                            if node_prefix.is_empty() {
+                                node.value.clone().map(|v| Either::Left(*v))
+                            } else {
+                                None
+                            }
+                        }
+                        // If the lookup kind is PartialMap, then we return the current node
+                        // after adjusting its prefix.
+                        Some(LookupKind::PartialMap) => {
+                            let mut partial_map = node.clone();
+                            partial_map.prefix = node_prefix.clone();
+                            Some(Either::Right(LoadableShardedMapV2Node::Inlined(
+                                partial_map,
+                            )))
+                        }
+                        _ => None,
+                    };
+
+                    // Expand the sharded map on the first byte.
+                    let mut child_nodes: SortedVectorMap<u8, LoadableShardedMapV2Node<Value>> =
+                        match node_prefix.split_first() {
+                            None => node.children,
+                            Some((first, rest)) => {
+                                let mut node = node;
+                                node.prefix = rest.into();
+                                sorted_vector_map! { *first => LoadableShardedMapV2Node::Inlined(node) }
+                            }
+                        };
+
+                    // Expand the lookup keys on the first byte.
+                    let (_, child_lookup_keys) = lookup_keys.expand();
+
+                    // Group the sharded map children and lookup keys by the first byte.
+                    let children = child_lookup_keys
+                        .into_iter()
+                        .flat_map({
+                            |(byte, lookup_keys)| {
+                                let mut accumulated_prefix = accumulated_prefix.clone();
+                                accumulated_prefix.push(byte);
+                                child_nodes.remove(&byte).map(|node| (node, lookup_keys, accumulated_prefix))
+                            }
+                        })
+                        .collect::<Vec<_>>();
+
+                    // Return the current item and recurse on the grouped node children and lookup keys.
+                    anyhow::Ok((
+                        item.map(|item| (accumulated_prefix, item)),
+                        children,
+                    ))
+                }
+                .boxed()
+            },
+        )
+        .try_filter_map(futures::future::ok)
+        .try_collect()
+        .await
     }
 
     /// Returns an ordered stream over all key-value pairs in the map.
@@ -531,6 +655,177 @@ impl<Value: ShardedMapV2Value> ShardedMapV2Node<Value> {
         self.into_prefix_entries_impl(ctx, blobstore, prefix, Some(after), 0)
     }
 
+    /// Traverse all inlined nodes that match the target filter, and add them as
+    /// ordered traversal items to `out`.  Non-inlined nodes are added as recursion steps.
+    fn into_prefix_entries_traverse<'a, 'b>(
+        self,
+        mut accumulated_prefix: SmallBinary,
+        target_prefix: &'a [u8],
+        target_after: Option<&'a [u8]>,
+        mut target_skip: usize,
+        out: &'b mut Vec<
+            OrderedTraversal<
+                (SmallBinary, Value),
+                (
+                    SmallBinary,
+                    &'a [u8],
+                    Option<&'a [u8]>,
+                    usize,
+                    LoadableShardedMapV2Node<Value>,
+                ),
+            >,
+        >,
+    ) -> Result<()> {
+        let Self {
+            prefix: current_prefix,
+            mut value,
+            mut children,
+            ..
+        } = self;
+        if target_prefix.len() <= current_prefix.len() {
+            // Exit early if the current prefix doesn't start with the target prefix,
+            // as this means all keys in this node and its descendants don't start with
+            // the target prefix.
+            if !current_prefix.starts_with(target_prefix) {
+                return Ok(());
+            }
+
+            // Trim the current prefix from the resume point and work out if we need to filter
+            // the children of this node.
+            if target_after.is_some_and(|after| after.starts_with(current_prefix.as_slice())) {
+                // The value at this point is before the resume point, so it should
+                // not be output.
+                value = None;
+            }
+            if target_skip > 0 && value.is_some() {
+                target_skip -= 1;
+                value = None;
+            }
+
+            let (byte_after, child_after) = match target_after
+                .and_then(|after| after.strip_prefix(current_prefix.as_slice()))
+                .and_then(|after| after.split_first())
+            {
+                None if Some(current_prefix.as_slice()) < target_after => {
+                    // The target prefix is after the current prefix, so we should
+                    // not recurse into any children.
+                    return Ok(());
+                }
+                None => (None, None),
+                Some((byte, rest)) => (Some(*byte), Some(rest)),
+            };
+
+            // If target_prefix is a prefix of the current node, then
+            // we should output all the values included in this node and
+            // its descendants, after any resume point.
+
+            accumulated_prefix.extend(current_prefix);
+
+            if let Some(value) = value {
+                out.push(OrderedTraversal::Output((
+                    accumulated_prefix.clone(),
+                    *value,
+                )))
+            }
+
+            for (byte, child) in children {
+                let mut accumulated_prefix = accumulated_prefix.clone();
+                accumulated_prefix.push(byte);
+                if Some(byte) >= byte_after {
+                    let child_after = if Some(byte) == byte_after {
+                        child_after
+                    } else {
+                        None
+                    };
+                    let child_skip = target_skip.min(child.size());
+                    target_skip = target_skip.saturating_sub(child_skip);
+                    if child_skip != child.size() {
+                        if let LoadableShardedMapV2Node::Inlined(child) = child {
+                            child.into_prefix_entries_traverse(
+                                accumulated_prefix,
+                                b"".as_slice(),
+                                child_after,
+                                child_skip,
+                                out,
+                            )?;
+                        } else {
+                            out.push(OrderedTraversal::Recurse(
+                                child.size(),
+                                (
+                                    accumulated_prefix,
+                                    b"".as_slice(),
+                                    child_after,
+                                    child_skip,
+                                    child,
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            // target_prefix is longer than the prefix of the current node. This
+            // means that there's at most one child we should recurse to while
+            // ignoring the value of the current node and all other children.
+
+            let target_prefix = match target_prefix.strip_prefix(current_prefix.as_slice()) {
+                Some(remaining_prefix) => remaining_prefix,
+                // The target prefix doesn't start with current node's prefix. Exit early
+                // as none of the keys in the map can start with the target prefix.
+                None => return Ok(()),
+            };
+            let target_after = match target_after
+                .and_then(|after| after.strip_prefix(current_prefix.as_slice()))
+            {
+                Some(remaining_after) => Some(remaining_after),
+                None if Some(current_prefix.as_slice()) < target_after => {
+                    return Ok(());
+                }
+                None => None,
+            };
+
+            let (byte_prefix, child_prefix) = target_prefix.split_first().unwrap();
+            let child_after = match target_after.and_then(|after| after.split_first()) {
+                Some((byte_after, _)) if byte_prefix < byte_after => return Ok(()),
+                Some((byte_after, child_after)) if byte_prefix == byte_after => Some(child_after),
+                None | Some(_) => None,
+            };
+
+            let child = match children.remove(byte_prefix) {
+                Some(child) => child,
+                // Exit early if we can't find the child corresponding to the first byte of
+                // the remainder of target prefix, as that's the only child whose keys can
+                // start with the target prefix.
+                None => return Ok(()),
+            };
+
+            accumulated_prefix.extend(current_prefix);
+            accumulated_prefix.push(*byte_prefix);
+
+            if let LoadableShardedMapV2Node::Inlined(child) = child {
+                child.into_prefix_entries_traverse(
+                    accumulated_prefix,
+                    child_prefix,
+                    child_after,
+                    target_skip,
+                    out,
+                )?;
+            } else {
+                out.push(OrderedTraversal::Recurse(
+                    child.size(),
+                    (
+                        accumulated_prefix,
+                        child_prefix,
+                        child_after,
+                        target_skip,
+                        child,
+                    ),
+                ))
+            }
+        }
+        Ok(())
+    }
+
     /// Internal implementation of all `into_*_entries_*` methods.
     ///
     /// Returns an ordered stream over all key-value pairs in the map for which
@@ -549,7 +844,8 @@ impl<Value: ShardedMapV2Value> ShardedMapV2Node<Value> {
         skip: usize,
     ) -> impl Stream<Item = Result<(SmallBinary, Value)>> + 'a {
         const BOUNDED_TRAVERSAL_SCHEDULED_MAX: NonZeroUsize = nonzero!(256usize);
-        const BOUNDED_TRAVERSAL_QUEUED_MAX: NonZeroUsize = nonzero!(256usize);
+        let queued_max =
+            NonZeroUsize::new(Value::WEIGHT_LIMIT * 2).unwrap_or(BOUNDED_TRAVERSAL_SCHEDULED_MAX);
         debug_assert!(
             after.is_none() || skip == 0,
             "programming error: only one of after or skip should be set"
@@ -557,7 +853,7 @@ impl<Value: ShardedMapV2Value> ShardedMapV2Node<Value> {
 
         bounded_traversal::bounded_traversal_ordered_stream(
             BOUNDED_TRAVERSAL_SCHEDULED_MAX,
-            BOUNDED_TRAVERSAL_QUEUED_MAX,
+            queued_max,
             vec![(
                 self.size(),
                 (
@@ -569,10 +865,10 @@ impl<Value: ShardedMapV2Value> ShardedMapV2Node<Value> {
                 ),
             )],
             move |(
-                mut accumulated_prefix,
+                accumulated_prefix,
                 target_prefix,
                 target_after,
-                mut target_skip,
+                target_skip,
                 current_node,
             ): (
                 SmallBinary,
@@ -582,136 +878,15 @@ impl<Value: ShardedMapV2Value> ShardedMapV2Node<Value> {
                 LoadableShardedMapV2Node<Value>,
             )| {
                 async move {
-                    let Self {
-                        prefix: current_prefix,
-                        mut value,
-                        mut children,
-                        ..
-                    } = current_node.load(ctx, blobstore).await?;
-
-                    if target_prefix.len() <= current_prefix.len() {
-                        // Exit early if the current prefix doesn't start with the target prefix,
-                        // as this means all keys in this node and its descendants don't start with
-                        // the target prefix.
-                        if !current_prefix.starts_with(target_prefix) {
-                            return Ok(vec![]);
-                        }
-
-                        // Trim the current prefix from the resume point and work out if we need to filter
-                        // the children of this node.
-                        if target_after
-                            .is_some_and(|after| after.starts_with(current_prefix.as_slice()))
-                        {
-                            // The value at this point is before the resume point, so it should
-                            // not be output.
-                            value = None;
-                        }
-                        if target_skip > 0 && value.is_some() {
-                            target_skip -= 1;
-                            value = None;
-                        }
-
-                        let (byte_after, child_after) = match target_after
-                            .and_then(|after| after.strip_prefix(current_prefix.as_slice()))
-                            .and_then(|after| after.split_first())
-                        {
-                            None if Some(current_prefix.as_slice()) < target_after => {
-                                // The target prefix is after the current prefix, so we should
-                                // not recurse into any children.
-                                return Ok(vec![]);
-                            }
-                            None => (None, None),
-                            Some((byte, rest)) => (Some(*byte), Some(rest)),
-                        };
-
-                        // If target_prefix is a prefix of the current node, then
-                        // we should output all the values included in this node and
-                        // its descendants, after any resume point.
-
-                        accumulated_prefix.extend(current_prefix);
-
-                        Ok(value
-                            .into_iter()
-                            .map(|value| {
-                                OrderedTraversal::Output((accumulated_prefix.clone(), *value))
-                            })
-                            .chain(children.into_iter().filter_map(|(byte, child)| {
-                                let mut accumulated_prefix = accumulated_prefix.clone();
-                                accumulated_prefix.push(byte);
-                                if Some(byte) < byte_after {
-                                    None
-                                } else {
-                                    let child_after = if Some(byte) == byte_after {
-                                        child_after
-                                    } else {
-                                        None
-                                    };
-                                    let child_skip = target_skip.min(child.size());
-                                    target_skip = target_skip.saturating_sub(child_skip);
-                                    if child_skip == child.size() {
-                                        None
-                                    } else {
-                                        Some(OrderedTraversal::Recurse(
-                                            child.size(),
-                                            (
-                                                accumulated_prefix,
-                                                b"".as_slice(),
-                                                child_after,
-                                                child_skip,
-                                                child,
-                                            ),
-                                        ))
-                                    }
-                                }
-                            }))
-                            .collect::<Vec<_>>())
-                    } else {
-                        // target_prefix is longer than the prefix of the current node. This
-                        // means that there's at most one child we should recurse to while
-                        // ignoring the value of the current node and all other children.
-
-                        let target_prefix =
-                            match target_prefix.strip_prefix(current_prefix.as_slice()) {
-                                Some(remaining_prefix) => remaining_prefix,
-                                // The target prefix doesn't start with current node's prefix. Exit early
-                                // as none of the keys in the map can start with the target prefix.
-                                None => return Ok(vec![]),
-                            };
-                        let target_after = match target_after
-                            .and_then(|after| after.strip_prefix(current_prefix.as_slice()))
-                        {
-                            Some(remaining_after) => Some(remaining_after),
-                            None if Some(current_prefix.as_slice()) < target_after => {
-                                return Ok(vec![]);
-                            }
-                            None => None,
-                        };
-
-                        let (first, rest) = target_prefix.split_first().unwrap();
-                        let child_after = match target_after.and_then(|after| after.split_first()) {
-                            Some((after_first, _)) if first < after_first => return Ok(vec![]),
-                            Some((after_first, after_rest)) if first == after_first => {
-                                Some(after_rest)
-                            }
-                            None | Some(_) => None,
-                        };
-
-                        let child = match children.remove(first) {
-                            Some(child) => child,
-                            // Exit early if we can't find the child corresponding to the first byte of
-                            // the remainder of target prefix, as that's the only child whose keys can
-                            // start with the target prefix.
-                            None => return Ok(vec![]),
-                        };
-
-                        accumulated_prefix.extend(current_prefix);
-                        accumulated_prefix.push(*first);
-
-                        Ok(vec![OrderedTraversal::Recurse(
-                            child.size(),
-                            (accumulated_prefix, rest, child_after, target_skip, child),
-                        )])
-                    }
+                    let mut out = Vec::new();
+                    current_node.load(ctx, blobstore).await?.into_prefix_entries_traverse(
+                        accumulated_prefix,
+                        target_prefix,
+                        target_after,
+                        target_skip,
+                        &mut out,
+                    )?;
+                    Ok(out)
                 }
                 .boxed()
             },
@@ -824,11 +999,6 @@ mod test {
     use context::CoreContext;
     use fbinit::FacebookInit;
     use memblob::Memblob;
-    use quickcheck::Arbitrary;
-    use quickcheck::Gen;
-    use quickcheck::QuickCheck;
-    use quickcheck::TestResult;
-    use quickcheck::Testable;
 
     use super::*;
     use crate::impl_typed_hash;
@@ -994,9 +1164,51 @@ mod test {
         async fn lookup(
             &self,
             map: &ShardedMapV2Node<TestValue>,
-            key: &str,
+            key: impl AsRef<[u8]>,
         ) -> Result<Option<TestValue>> {
-            map.lookup(&self.0, &self.1, key.as_bytes()).await
+            map.lookup(&self.0, &self.1, key.as_ref()).await
+        }
+
+        async fn get_partial_map(
+            &self,
+            map: &ShardedMapV2Node<TestValue>,
+            key: impl AsRef<[u8]>,
+        ) -> Result<Option<ShardedMapV2Node<TestValue>>> {
+            let partial_map = map.get_partial_map(&self.0, &self.1, key.as_ref()).await?;
+
+            match partial_map {
+                Some(partial_map) => Ok(Some(partial_map.load(&self.0, &self.1).await?)),
+                None => Ok(None),
+            }
+        }
+
+        async fn load(
+            &self,
+            map: LoadableShardedMapV2Node<TestValue>,
+        ) -> Result<ShardedMapV2Node<TestValue>> {
+            map.load(&self.0, &self.1).await
+        }
+
+        async fn get_entries_and_partial_maps(
+            &self,
+            map: &ShardedMapV2Node<TestValue>,
+            lookup_keys: TrieMap<LookupKind>,
+        ) -> Result<TrieMap<Either<TestValue, ShardedMapV2Node<TestValue>>>> {
+            let trie_map = map
+                .clone()
+                .get_entries_and_partial_maps(&self.0, &self.1, lookup_keys, 10)
+                .await?;
+
+            let mut loaded_trie_map = TrieMap::default();
+            for (key, entry) in trie_map {
+                let entry = match entry {
+                    Either::Left(value) => Either::Left(value),
+                    Either::Right(partial_map) => Either::Right(self.load(partial_map).await?),
+                };
+                loaded_trie_map.insert(key, entry);
+            }
+
+            Ok(loaded_trie_map)
         }
 
         async fn into_entries(
@@ -1292,11 +1504,25 @@ mod test {
 
         helper.check_example_map(from_entries_map.clone()).await?;
 
+        assert!(
+            helper
+                .get_partial_map(&from_entries_map, "test")
+                .await?
+                .is_none()
+        );
+
         // map_abacab:
         //     *=7
         //     |
         //     a=8
         let map_abacab = inlined_node("", Some(7), vec![(b'a', inlined_node("", Some(8), vec![]))]);
+        assert_eq!(
+            helper.load(map_abacab.clone()).await?,
+            helper
+                .get_partial_map(&from_entries_map, "abacab")
+                .await?
+                .unwrap()
+        );
         // map_abac:
         //     *
         //     |
@@ -1324,6 +1550,13 @@ mod test {
                 "test.map2node.blake2.d40e11f4f3f08ad21b5eb6bab17e0916d449bffde464048dfb27efa3f9c19cee",
             )
             .await?;
+        assert_eq!(
+            helper.load(map_abac.clone()).await?,
+            helper
+                .get_partial_map(&from_entries_map, "abac")
+                .await?
+                .unwrap()
+        );
         // map_abal:
         //      *
         //      |
@@ -1338,6 +1571,13 @@ mod test {
                 (b'b', inlined_node("a", Some(5), vec![])),
                 (b'd', inlined_node("a", Some(6), vec![])),
             ],
+        );
+        assert_eq!(
+            helper.load(map_abal.clone()).await?,
+            helper
+                .get_partial_map(&from_entries_map, "abal")
+                .await?
+                .unwrap()
         );
         // map_a:
         //     *
@@ -1356,6 +1596,13 @@ mod test {
             Some(12),
             vec![(b'c', map_abac.clone()), (b'l', map_abal)],
         );
+        assert_eq!(
+            helper.load(map_a.clone()).await?,
+            helper
+                .get_partial_map(&from_entries_map, "a")
+                .await?
+                .unwrap()
+        );
         // map_omi:
         //     *
         //     |______
@@ -1368,6 +1615,13 @@ mod test {
                 (b'o', inlined_node("jo", Some(1), vec![])),
                 (b'u', inlined_node("x", Some(2), vec![])),
             ],
+        );
+        assert_eq!(
+            helper.load(map_omi.clone()).await?,
+            helper
+                .get_partial_map(&from_entries_map, "omi")
+                .await?
+                .unwrap()
         );
         // map_omu:
         //     *
@@ -1383,6 +1637,13 @@ mod test {
                 (b'd', inlined_node("o", Some(3), vec![])),
                 (b'g', inlined_node("al", Some(4), vec![])),
             ],
+        );
+        assert_eq!(
+            helper.load(map_omu.clone()).await?,
+            helper
+                .get_partial_map(&from_entries_map, "omu")
+                .await?
+                .unwrap()
         );
         // map_o:
         //     *
@@ -1403,6 +1664,13 @@ mod test {
                 "test.map2node.blake2.6f7dc1a2ad07d16eb4d3e586e2f7361c0990dcf4a29b0bb06fa5d04e69710a64"
             )
             .await?;
+        assert_eq!(
+            helper.load(map_o.clone()).await?,
+            helper
+                .get_partial_map(&from_entries_map, "o")
+                .await?
+                .unwrap()
+        );
         // map:
         //     *
         //     |_______________________________________________
@@ -1418,7 +1686,135 @@ mod test {
         //     a=8
         let map = test_node("", None, vec![(b'a', map_a), (b'o', map_o)]);
 
-        assert_eq!(from_entries_map, map);
+        assert_eq!(from_entries_map.clone(), map.clone());
+        assert_eq!(
+            map,
+            helper
+                .get_partial_map(&from_entries_map, "")
+                .await?
+                .unwrap()
+        );
+
+        assert_eq!(
+            helper
+                .from_entries_removed_prefix(&EXAMPLE_ENTRIES[0..8], 2)
+                .await?,
+            helper
+                .get_partial_map(&from_entries_map, "ab")
+                .await?
+                .unwrap()
+        );
+        assert_eq!(
+            helper
+                .from_entries_removed_prefix(&EXAMPLE_ENTRIES[0..8], 3)
+                .await?,
+            helper
+                .get_partial_map(&from_entries_map, "aba")
+                .await?
+                .unwrap()
+        );
+        assert_eq!(
+            helper
+                .from_entries_removed_prefix(&EXAMPLE_ENTRIES[8..12], 2)
+                .await?,
+            helper
+                .get_partial_map(&from_entries_map, "om")
+                .await?
+                .unwrap()
+        );
+        assert_eq!(
+            helper
+                .from_entries_removed_prefix(&EXAMPLE_ENTRIES[10..12], 4)
+                .await?,
+            helper
+                .get_partial_map(&from_entries_map, "omun")
+                .await?
+                .unwrap()
+        );
+
+        assert_eq!(
+            [
+                (
+                    "omun",
+                    Either::Right(
+                        helper
+                            .from_entries_removed_prefix(&EXAMPLE_ENTRIES[10..12], 4)
+                            .await?
+                    )
+                ),
+                ("abacaxi", Either::Left(TestValue(11))),
+                ("abalaba", Either::Left(TestValue(5))),
+                ("omiojo", Either::Left(TestValue(1))),
+                ("omungal", Either::Left(TestValue(4))),
+                (
+                    "om",
+                    Either::Right(
+                        helper
+                            .from_entries_removed_prefix(&EXAMPLE_ENTRIES[8..12], 2)
+                            .await?
+                    )
+                ),
+                (
+                    "aba",
+                    Either::Right(
+                        helper
+                            .from_entries_removed_prefix(&EXAMPLE_ENTRIES[0..8], 3)
+                            .await?
+                    )
+                ),
+                (
+                    "o",
+                    Either::Right(
+                        helper
+                            .from_entries_removed_prefix(&EXAMPLE_ENTRIES[8..12], 1)
+                            .await?
+                    )
+                ),
+                (
+                    "ab",
+                    Either::Right(
+                        helper
+                            .from_entries_removed_prefix(&EXAMPLE_ENTRIES[0..8], 2)
+                            .await?
+                    )
+                ),
+                (
+                    "",
+                    Either::Right(helper.from_entries(EXAMPLE_ENTRIES).await?)
+                ),
+                (
+                    "abacab",
+                    Either::Right(
+                        helper
+                            .from_entries_removed_prefix(&EXAMPLE_ENTRIES[1..3], 6)
+                            .await?
+                    )
+                ),
+            ]
+            .into_iter()
+            .collect::<TrieMap<_>>(),
+            helper
+                .get_entries_and_partial_maps(
+                    &from_entries_map,
+                    [
+                        ("omun", LookupKind::PartialMap),
+                        ("om", LookupKind::PartialMap),
+                        ("aba", LookupKind::PartialMap),
+                        ("o", LookupKind::PartialMap),
+                        ("ab", LookupKind::PartialMap),
+                        ("", LookupKind::PartialMap),
+                        ("abacab", LookupKind::PartialMap),
+                        ("abacaxi", LookupKind::Entry),
+                        ("abalaba", LookupKind::Entry),
+                        ("omiojo", LookupKind::Entry),
+                        ("omungal", LookupKind::Entry),
+                        ("test", LookupKind::Entry),
+                    ]
+                    .into_iter()
+                    .collect()
+                )
+                .await?
+        );
 
         Ok(())
     }
@@ -1564,85 +1960,124 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
-    fn test_sharded_map_v2_quickcheck(fb: FacebookInit) {
+    #[quickcheck_async::tokio]
+    async fn test_sharded_map_v2_quickcheck(
+        fb: FacebookInit,
+        values: BTreeMap<String, u32>,
+        queries: Vec<String>,
+    ) -> bool {
         let ctx = CoreContext::test_mock(fb);
         let blobstore = Memblob::default();
-        use tokio::runtime::Runtime;
 
-        struct TestHelper(Runtime, CoreContext, Memblob);
-        impl Testable for TestHelper {
-            fn result(&self, gen: &mut Gen) -> TestResult {
-                let res = self.0.block_on(async {
-                    let values: BTreeMap<String, u32> = Arbitrary::arbitrary(gen);
-                    let helper = MapHelper(self.1.clone(), self.2.clone());
+        let helper = MapHelper(ctx, blobstore);
 
-                    let map = helper
-                        .from_entries(
-                            &values
-                                .iter()
-                                .map(|(k, v)| (k.as_str(), *v))
-                                .collect::<Vec<_>>(),
-                        )
-                        .await?;
+        let map = helper
+            .from_entries(
+                &values
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), *v))
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
 
-                    helper.check_sharded_map(map.clone()).await?;
+        helper.check_sharded_map(map.clone()).await.unwrap();
 
-                    let mut queries: Vec<String> = Arbitrary::arbitrary(gen);
-                    let keys: Vec<&String> = values.keys().collect();
-                    for _ in 0..values.len() / 2 {
-                        queries.push(gen.choose(&keys).unwrap().to_string());
+        let queries = queries
+            .into_iter()
+            .chain(
+                values
+                    .keys()
+                    .take(values.len() / 2)
+                    .map(|key| key.to_string()),
+            )
+            .collect::<Vec<String>>();
+
+        for key in queries {
+            let correct_v = values.get(&key).cloned().map(TestValue);
+            let test_v = helper.lookup(&map, &key).await.unwrap();
+            if correct_v != test_v {
+                return false;
+            }
+        }
+
+        let roundtrip_map = helper
+            .into_entries(map.clone())
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        if roundtrip_map != values {
+            return false;
+        }
+
+        let rountrip_unordered_map = helper
+            .into_entries_unordered(map.clone())
+            .await
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        if rountrip_unordered_map != values {
+            return false;
+        }
+
+        let max_value = values.values().max().copied().unwrap_or_default();
+        let rollup_data = map.rollup_data();
+
+        if rollup_data != MaxTestValue(max_value) {
+            return false;
+        }
+
+        true
+    }
+
+    #[quickcheck_async::tokio]
+    async fn test_sharded_map_v2_quickcheck_batch_lookup(
+        fb: FacebookInit,
+        values: Vec<(String, u32)>,
+        lookup_keys: TrieMap<LookupKind>,
+    ) -> bool {
+        let ctx = CoreContext::test_mock(fb);
+        let blobstore = Memblob::default();
+
+        let helper = MapHelper(ctx, blobstore);
+
+        let map = helper
+            .from_entries(
+                &values
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), *v))
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+
+        let batched_outputs = helper
+            .get_entries_and_partial_maps(&map, lookup_keys.clone())
+            .await
+            .unwrap();
+
+        for (key, kind) in lookup_keys {
+            match kind {
+                LookupKind::Entry => {
+                    let unbatched_lookup = helper.lookup(&map, &key).await.unwrap();
+                    let batched_lookup = batched_outputs.get(&key).cloned();
+
+                    if unbatched_lookup.map(Either::Left) != batched_lookup {
+                        return false;
                     }
+                }
+                LookupKind::PartialMap => {
+                    let unbatched_lookup = helper.get_partial_map(&map, &key).await.unwrap();
+                    let batched_lookup = batched_outputs.get(&key).cloned();
 
-                    for k in queries {
-                        let correct_v = values.get(&k).cloned().map(TestValue);
-                        let test_v = helper.lookup(&map, &k).await?;
-                        if correct_v != test_v {
-                            return Err(anyhow!("sharded map lookup returns incorrect value"));
-                        }
+                    if unbatched_lookup.map(Either::Right) != batched_lookup {
+                        return false;
                     }
-
-                    let roundtrip_map = helper
-                        .into_entries(map.clone())
-                        .await?
-                        .into_iter()
-                        .collect::<BTreeMap<_, _>>();
-                    if roundtrip_map != values {
-                        return Err(anyhow!(
-                            "sharded map entries do not round trip back to original values (using into_entries)"
-                        ));
-                    }
-
-                    let rountrip_unordered_map = helper
-                        .into_entries_unordered(map.clone())
-                        .await?
-                        .into_iter()
-                        .collect::<BTreeMap<_, _>>();
-                    if rountrip_unordered_map != values {
-                        return Err(anyhow!(
-                            "sharded map entries do not round trip back to original values (using into_entries_unordered)"
-                        ));
-                    }
-
-                    let max_value = values.values().max().copied().unwrap_or_default();
-                    let rollup_data = map.rollup_data();
-
-                    if rollup_data != MaxTestValue(max_value) {
-                        return Err(anyhow!(
-                            "sharded map rollup data does not match expected value"
-                        ));
-                    }
-
-                    anyhow::Ok(())
-                });
-
-                match res {
-                    Ok(()) => TestResult::passed(),
-                    Err(e) => TestResult::error(format!("{}", e)),
                 }
             }
         }
 
-        QuickCheck::new().quickcheck(TestHelper(Runtime::new().unwrap(), ctx, blobstore));
+        true
     }
 }

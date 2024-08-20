@@ -14,13 +14,13 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use anyhow::Error;
 use ascii::AsciiString;
-use blobrepo::save_bonsai_changesets;
 use blobstore::Loadable;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
 use cacheblob::InProcessLease;
+use changesets_creation::save_changesets;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use cross_repo_sync::find_toposorted_unsynced_ancestors;
@@ -59,6 +59,7 @@ use metaconfig_types::CommitSyncConfig;
 use metaconfig_types::CommitSyncConfigVersion;
 use metaconfig_types::CommonCommitSyncConfig;
 use metaconfig_types::DefaultSmallToLargeCommitSyncPathAction;
+use metaconfig_types::RepoConfig;
 use metaconfig_types::SmallRepoCommitSyncConfig;
 use metaconfig_types::SmallRepoGitSubmoduleConfig;
 use metaconfig_types::SmallRepoPermanentConfig;
@@ -154,9 +155,7 @@ async fn create_empty_commit(ctx: CoreContext, repo: &TestRepo) -> ChangesetId {
     .unwrap();
 
     let bcs_id = bcs.get_changeset_id();
-    save_bonsai_changesets(vec![bcs], ctx.clone(), repo)
-        .await
-        .unwrap();
+    save_changesets(&ctx, repo, vec![bcs]).await.unwrap();
 
     let mut txn = repo.bookmarks().create_transaction(ctx.clone());
     txn.force_set(&bookmark, bcs_id, BookmarkUpdateReason::TestMove)
@@ -475,7 +474,7 @@ async fn test_sync_causes_conflict(fb: FacebookInit) -> Result<(), Error> {
         .await?;
 
     let mapping = SqlSyncedCommitMapping::with_sqlite_in_memory()?;
-    let linear: TestRepo = Linear::get_custom_test_repo(fb).await;
+    let linear: TestRepo = Linear::get_repo(fb).await;
     let (live_commit_sync_config, source) = TestLiveCommitSyncConfig::new_with_source();
     populate_config(&linear, &megarepo, "linear", &source)?;
     let linear_config = create_small_to_large_commit_syncer(
@@ -538,6 +537,22 @@ async fn prepare_repos_mapping_and_config(
     ),
     Error,
 > {
+    prepare_repos_mapping_and_config_with_repo_config_overrides(fb, |_| (), |_| ()).await
+}
+async fn prepare_repos_mapping_and_config_with_repo_config_overrides(
+    fb: FacebookInit,
+    small_repo_override: impl FnOnce(&mut RepoConfig),
+    large_repo_override: impl FnOnce(&mut RepoConfig),
+) -> Result<
+    (
+        TestRepo,
+        TestRepo,
+        SqlSyncedCommitMapping,
+        Arc<dyn LiveCommitSyncConfig>,
+        TestLiveCommitSyncConfigSource,
+    ),
+    Error,
+> {
     let metadata_con = SqliteConnection::open_in_memory()?;
     metadata_con.execute_batch(SqlSyncedCommitMapping::CREATION_QUERY)?;
     let hg_mutation_con = SqliteConnection::open_in_memory()?;
@@ -545,11 +560,14 @@ async fn prepare_repos_mapping_and_config(
     let (live_commit_sync_config, source) = TestLiveCommitSyncConfig::new_with_source();
     let live_commit_sync_config = Arc::new(live_commit_sync_config);
     let megarepo = factory
+        .with_config_override(large_repo_override)
         .with_live_commit_sync_config(live_commit_sync_config.clone())
         .with_id(RepositoryId::new(1))
         .build()
         .await?;
+
     let small_repo = factory
+        .with_config_override(small_repo_override)
         .with_live_commit_sync_config(live_commit_sync_config.clone())
         .with_id(RepositoryId::new(0))
         .build()
@@ -1965,9 +1983,7 @@ async fn create_merge(
     .unwrap();
 
     let bcs_id = bcs.get_changeset_id();
-    save_bonsai_changesets(vec![bcs], ctx.clone(), repo)
-        .await
-        .unwrap();
+    save_changesets(ctx, repo, vec![bcs]).await.unwrap();
 
     bcs_id
 }

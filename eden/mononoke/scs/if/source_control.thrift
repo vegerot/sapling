@@ -217,6 +217,13 @@ struct CommitInfo {
 
   /// The identity of the person who committed this commit, as opposed to authored it (if available - commit comes from Git).
   12: optional string committer;
+
+  /// The linear depth of the commit. It's calculated as the number of ancestors of the commit if the commit
+  /// graph consisted only of the first parents (i.e. if merges were ignored).
+  ///
+  /// This can be useful when using the commit_linear_history method. For example commit_linear_history(commit.id, skip=commit.linear_depth, limit=1)
+  /// will return the root commit of the repository.
+  13: optional i64 linear_depth;
 }
 
 struct BookmarkInfo {
@@ -870,6 +877,15 @@ struct RepoCreateCommitParamsFileCopyInfo {
   2: i32 parent_index;
 }
 
+union RepoCreateCommitParamsGitLfs {
+  // File should be served as full text (bool val is ignored)
+  1: bool full_content;
+  // A canonical LFS pointer should be generated (bool val is ignored)
+  2: bool lfs_pointer;
+  // A non-canonical LFS pointer is provided
+  3: RepoCreateCommitParamsFileContent non_canonical_lfs_pointer;
+}
+
 struct RepoCreateCommitParamsFileChanged {
   /// The new type of the file.
   1: RepoCreateCommitParamsFileType type;
@@ -879,6 +895,10 @@ struct RepoCreateCommitParamsFileChanged {
 
   /// The file was copied from another file.
   3: optional RepoCreateCommitParamsFileCopyInfo copy_info;
+
+  /// Controls Git LFS representation of change in Git clones of this repo.
+  /// (omitting this field lets server make the decision)
+  4: optional RepoCreateCommitParamsGitLfs git_lfs;
 }
 
 struct RepoCreateCommitParamsFileDeleted {}
@@ -1100,6 +1120,39 @@ struct RepoUploadFileContentParams {
 
   /// The identity of the service making the upload file content request.
   5: optional string service_identity;
+}
+
+/// Optional metadata for the commit that will be created
+struct RepoUpdateSubmoduleExpansionCommitInfo {
+  /// The commit message.
+  1: optional string message;
+
+  /// The author of the commit.
+  2: optional string author;
+
+  /// The date the commit was authored. If omitted, the server will use the
+  /// current time in its default timezone.
+  3: optional DateTime author_date;
+}
+
+/// Params for repo_update_submodule_expansion method
+struct RepoUpdateSubmoduleExpansionParams {
+  /// Large repo containing the expansion being updated
+  1: RepoSpecifier large_repo;
+  /// Large repo commit that will be the base commit for the generated commit
+  /// updating the submodule expansion.
+  2: CommitId base_commit_id;
+  /// Path of the submodule expansion in the large repo
+  3: Path submodule_expansion_path;
+  /// New submodule commit to expand.
+  /// NOTE: if this is set to null, the submodule expansion will be DELETED!
+  /// This means deleting the submodule from the Git repo when backsyncing the
+  /// commit.
+  4: optional CommitId new_submodule_commit_or_delete;
+  /// Commit identity schemes to return.
+  5: set<CommitIdentityScheme> identity_schemes;
+  /// Optional metadata for the commit that will be generated
+  6: optional RepoUpdateSubmoduleExpansionCommitInfo commit_info;
 }
 
 struct CommitLookupParams {
@@ -1809,6 +1862,17 @@ struct RepoUploadFileContentResponse {
   /// The id of the uploaded file, which can be used in subsequent
   /// repo_create_commit requests.
   1: binary id;
+}
+
+struct RepoUpdateSubmoduleExpansionResponse {
+  /// IDs of the commit updating the submodule expansion in the provided
+  /// repo in all the requested schemes.
+  1: map<CommitIdentityScheme, CommitId> ids;
+}
+
+union RepoUpdateSubmoduleExpansionResult {
+  1: RepoUpdateSubmoduleExpansionResponse success;
+  2: MegarepoAsynchronousRequestError error;
 }
 
 struct CommitCompareResponse {
@@ -2775,6 +2839,14 @@ service SourceControlService extends fb303_core.BaseService {
   /// Poll the execution of megarepo_re_merge_source request
   MegarepoRemergeSourcePollResponse megarepo_remerge_source_poll(
     1: MegarepoRemergeSourceToken token,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
+  RepoUpdateSubmoduleExpansionResponse repo_update_submodule_expansion(
+    1: RepoUpdateSubmoduleExpansionParams params,
   ) throws (
     1: RequestError request_error,
     2: InternalError internal_error,

@@ -8,11 +8,15 @@
 //! For Facebook hooks check the src/facebook/ folder
 
 mod always_fail_changeset;
+pub(crate) mod block_accidental_new_bookmark_creation;
 mod block_commit_message_pattern;
 mod block_content_pattern;
 mod block_empty_commit;
 mod block_files;
+pub(crate) mod block_invalid_symlinks;
 pub(crate) mod block_merge_commits;
+pub(crate) mod block_new_bookmark_creations_by_name;
+pub(crate) mod block_unannotated_tags;
 pub(crate) mod block_unclean_merge_commits;
 pub(crate) mod deny_files;
 mod limit_commit_message_length;
@@ -20,8 +24,11 @@ pub(crate) mod limit_commit_size;
 mod limit_directory_size;
 pub(crate) mod limit_filesize;
 mod limit_path_length;
+pub(crate) mod limit_submodule_edits;
+pub(crate) mod limit_tag_updates;
 pub(crate) mod no_bad_extensions;
 pub(crate) mod no_bad_filenames;
+mod no_executable_binaries;
 mod no_insecure_filenames;
 pub(crate) mod no_questionable_filenames;
 pub(crate) mod no_windows_filenames;
@@ -55,6 +62,23 @@ pub async fn make_changeset_hook(
         "block_unclean_merge_commits" => Some(b(
             block_unclean_merge_commits::BlockUncleanMergeCommitsHook::new(&params.config)?,
         )),
+        "limit_submodule_edits" => Some(b(limit_submodule_edits::LimitSubmoduleEditsHook::new(
+            &params.config,
+        )?)),
+        "limit_tag_updates" => Some(b(limit_tag_updates::LimitTagUpdatesHook::new())),
+        "block_unannotated_tags" => {
+            Some(b(block_unannotated_tags::BlockUnannotatedTagsHook::new()))
+        }
+        "block_accidental_new_bookmark_creation" => Some(b(
+            block_accidental_new_bookmark_creation::BlockAccidentalNewBookmarkCreationHook::new(
+                &params.config,
+            )?,
+        )),
+        "block_new_bookmark_creations_by_name" => Some(b(
+            block_new_bookmark_creations_by_name::BlockNewBookmarkCreationsByNameHook::new(
+                &params.config,
+            )?,
+        )),
         "block_commit_message_pattern" => Some(b(
             block_commit_message_pattern::BlockCommitMessagePatternHook::new(&params.config)?,
         )),
@@ -86,6 +110,9 @@ pub fn make_file_hook(
             block_content_pattern::BlockContentPatternHook::new(&params.config)?,
         )),
         "block_files" => Some(Box::new(block_files::BlockFilesHook::new(&params.config)?)),
+        "block_invalid_symlinks" => Some(Box::new(
+            block_invalid_symlinks::BlockInvalidSymlinksHook::new(&params.config)?,
+        )),
         "deny_files" => Some(Box::new(
             deny_files::DenyFiles::builder()
                 .set_from_config(&params.config)
@@ -107,6 +134,9 @@ pub fn make_file_hook(
             no_bad_extensions::NoBadExtensions::builder()
                 .set_from_config(&params.config)
                 .build()?,
+        )),
+        "no_executable_binaries" => Some(Box::new(
+            no_executable_binaries::NoExecutableBinariesHook::new(&params.config)?,
         )),
         "no_insecure_filenames" => {
             Some(Box::new(no_insecure_filenames::NoInsecureFilenames::new()?))

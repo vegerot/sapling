@@ -13,6 +13,7 @@ import type {Comparison} from 'shared/Comparison';
 
 import {encodeDeletedFileUri} from './DeletedFileContentProvider';
 import {encodeSaplingDiffUri} from './DiffContentProvider';
+import {shouldOpenBeside} from './config';
 import {t} from './i18n';
 import {repoRelativePathForAbsolutePath} from 'isl-server/src/Repository';
 import {repositoryCache} from 'isl-server/src/RepositoryCache';
@@ -70,7 +71,12 @@ type surveyMetaData = {
 
 /** Type definitions for built-in or third-party VS Code commands we want to execute programatically. */
 type ExternalVSCodeCommands = {
-  'vscode.diff': (left: vscode.Uri, right: vscode.Uri, title: string) => Thenable<unknown>;
+  'vscode.diff': (
+    left: vscode.Uri,
+    right: vscode.Uri,
+    title: string,
+    opts?: vscode.TextDocumentShowOptions,
+  ) => Thenable<unknown>;
   'workbench.action.closeSidebar': () => Thenable<void>;
   'fb.survey.initStateUIByNamespace': (
     surveyID: string,
@@ -80,6 +86,7 @@ type ExternalVSCodeCommands = {
   'sapling.open-isl': () => Thenable<void>;
   'sapling.close-isl': () => Thenable<void>;
   'sapling.isl.focus': () => Thenable<void>;
+  'sapling.open-comparison-view': (comparison: Comparison) => Thenable<void>;
   setContext: (key: string, value: unknown) => Thenable<void>;
   'fb-hg.open-or-focus-interactive-smartlog': (
     _: unknown,
@@ -156,6 +163,7 @@ async function openDiffView(uri: vscode.Uri, comparison: Comparison): Promise<un
       uriForComparison,
       (await fileExists(uri)) ? uri : encodeDeletedFileUri(uri),
       title,
+      {viewColumn: shouldOpenBeside() ? vscode.ViewColumn.Beside : undefined},
     );
   }
   const uriForComparisonParent = encodeSaplingDiffUri(uri, {

@@ -16,8 +16,8 @@ use std::marker::Unpin;
 use anyhow::Result;
 use futures::stream::BoxStream;
 use git_types::DeltaObjectKind;
-use git_types::GitDeltaManifestEntry;
-use git_types::ObjectEntry;
+use git_types::GDMV2Entry;
+use git_types::GDMV2ObjectEntry;
 use gix_hash::ObjectId;
 use mononoke_types::hash::RichGitSha1;
 use mononoke_types::path::MPath;
@@ -224,6 +224,18 @@ pub enum PackfileItemInclusion {
     FetchAndStore,
 }
 
+/// Enum defining the source to be used to fetch the refs
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefsSource {
+    /// Fetch the refs from the in-memory WBC. Note due to very nature of WBC
+    /// these bookmarks can be stale
+    #[default]
+    WarmBookmarksCache,
+    /// Fetch refs from the master instance of the bookmarks DB. This will always
+    /// show the latest state of refs
+    DatabaseMaster,
+}
+
 /// The request parameters used to specify the constraints that need to be
 /// honored while generating the input PackfileItem stream
 #[derive(Debug, Clone)]
@@ -242,6 +254,8 @@ pub struct PackItemStreamRequest {
     pub packfile_item_inclusion: PackfileItemInclusion,
     /// The concurrency setting to be used while generating the packfile
     pub concurrency: PackfileConcurrency,
+    /// The source to be used to fetch the refs
+    pub refs_source: RefsSource,
 }
 
 impl PackItemStreamRequest {
@@ -261,6 +275,8 @@ impl PackItemStreamRequest {
             tag_inclusion,
             packfile_item_inclusion,
             concurrency: PackfileConcurrency::standard(),
+            // Packfile generation should always use the latest state of refs
+            refs_source: RefsSource::DatabaseMaster,
         }
     }
 
@@ -277,6 +293,8 @@ impl PackItemStreamRequest {
             tag_inclusion,
             packfile_item_inclusion,
             concurrency: PackfileConcurrency::standard(),
+            // Packfile generation should always use the latest state of refs
+            refs_source: RefsSource::DatabaseMaster,
         }
     }
 }
@@ -292,6 +310,8 @@ pub struct LsRefsRequest {
     pub requested_refs: RequestedRefs,
     /// How annotated tags should be included in the output
     pub tag_inclusion: TagInclusion,
+    /// The source to be used to fetch the refs
+    pub refs_source: RefsSource,
 }
 
 impl LsRefsRequest {
@@ -304,14 +324,17 @@ impl LsRefsRequest {
             requested_symrefs,
             requested_refs,
             tag_inclusion,
+            refs_source: RefsSource::WarmBookmarksCache,
         }
     }
 
-    pub fn advertisement() -> Self {
+    pub fn write_advertisement() -> Self {
         Self {
             requested_symrefs: RequestedSymrefs::ExcludeAll,
             requested_refs: RequestedRefs::all(),
             tag_inclusion: TagInclusion::Peeled,
+            // For write advertisement, we need to use the latest state of refs
+            refs_source: RefsSource::DatabaseMaster,
         }
     }
 }
@@ -553,19 +576,19 @@ impl FullObjectEntry {
         })
     }
 
-    pub fn into_delta_manifest_entry(self) -> GitDeltaManifestEntry {
+    pub fn into_delta_manifest_entry(self) -> GDMV2Entry {
         let size = self.rich_git_sha.size();
         let kind = if self.rich_git_sha.is_blob() {
             DeltaObjectKind::Blob
         } else {
             DeltaObjectKind::Tree
         };
-        GitDeltaManifestEntry {
-            full: ObjectEntry {
+        GDMV2Entry {
+            full_object: GDMV2ObjectEntry {
                 size,
                 kind,
                 oid: self.oid,
-                path: self.path,
+                inlined_bytes: None,
             },
             deltas: vec![],
         }

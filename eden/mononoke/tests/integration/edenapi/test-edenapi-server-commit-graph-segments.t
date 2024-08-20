@@ -37,26 +37,16 @@
   P=a050a5556469b55ca00d97899b06995b44569989
   Q=4e9f8e556b01de1ac058397e86387d37778808d2
 
-Since hash-to-location and location-to-hash work via segmented changelog, we must still build one.
-  $ quiet segmented_changelog_tailer_reseed --repo repo --head=master_bookmark
-
-Enable Segmented Changelog
-  $ cat >> "$TESTTMP/mononoke-config/repos/repo/server.toml" <<CONFIG
-  > [segmented_changelog_config]
-  > enabled=true
-  > heads_to_include = [{ bookmark = "master_bookmark" }]
-  > CONFIG
-
   $ start_and_wait_for_mononoke_server
 
 Ensure we can clone the repo using the commit graph segments endpoint
   $ cd $TESTTMP
-  $ hgedenapi clone "mononoke://$(mononoke_address)/repo" repo-hg --config clone.use-rust=true --config clone.use-commit-graph=true
+  $ sl clone "mononoke://$(mononoke_address)/repo" repo-hg --config clone.use-rust=true --config clone.use-commit-graph=true
   Cloning repo into $TESTTMP/repo-hg
   Checking out 'master_bookmark'
   17 files updated
   $ cd repo-hg
-  $ hgedenapi log -G -T '{node|short} {desc}'
+  $ sl log -G -T '{node|short} {desc}'
   @  4e9f8e556b01 Q
   │
   o  a050a5556469 P
@@ -91,7 +81,7 @@ Ensure we can clone the repo using the commit graph segments endpoint
   │
   o  20ca2a4749a4 A
   
-  $ hgedenapi log -r tip
+  $ sl log -r tip
   commit:      4e9f8e556b01
   bookmark:    remote/master_bookmark
   hoistedname: master_bookmark
@@ -100,7 +90,7 @@ Ensure we can clone the repo using the commit graph segments endpoint
   summary:     Q
   
 
-  $ hgedenapi debugapi -e commitgraphsegments -i "[\"$Q\"]" -i "[]"
+  $ sl debugapi -e commitgraphsegments -i "[\"$Q\"]" -i "[]"
   [{"base": bin("705906cc9558bdb08dc5847424b6125c00a01c0f"),
     "head": bin("4e9f8e556b01de1ac058397e86387d37778808d2"),
     "length": 3,
@@ -145,7 +135,7 @@ Ensure we can clone the repo using the commit graph segments endpoint
     "length": 6,
     "parents": []}]
 
-  $ hgedenapi debugapi -e commitgraphsegments -i "[\"$Q\"]" -i "[\"$G\"]"
+  $ sl debugapi -e commitgraphsegments -i "[\"$Q\"]" -i "[\"$G\"]"
   [{"base": bin("705906cc9558bdb08dc5847424b6125c00a01c0f"),
     "head": bin("4e9f8e556b01de1ac058397e86387d37778808d2"),
     "length": 3,
@@ -200,17 +190,14 @@ Add some new commits, move the master bookmark and do a pull
   $ mononoke_newadmin bookmarks -R repo set master_bookmark "$X"
   Updating publishing bookmark master_bookmark from 2f7f5cd90b7b58f14d6b20b83b95478d5b0ab8c1e5bf429bc317256813516895 to e4b2425dd7affae8fd14348623eb66fa78e9a7ead9330b203d828dae0ec19f79
 
-Since hash-to-location is still using the server-side segmented changelog, we must make sure it's up-to-date.
-  $ quiet segmented_changelog_tailer_once --repo repo
-
   $ flush_mononoke_bookmarks
   $ sleep 1
 
-  $ hgedenapi pull --config pull.use-commit-graph=true
+  $ sl pull --config pull.use-commit-graph=true
   pulling from mononoke://$LOCALIP:$LOCAL_PORT/repo
   imported commit graph for 7 commits (3 segments)
 
-  $ hgedenapi log -G -T '{node|short} {desc}'
+  $ sl log -G -T '{node|short} {desc}'
   o  262080717826 X
   │
   o    d728ac072e76 W
@@ -260,14 +247,14 @@ Since hash-to-location is still using the server-side segmented changelog, we mu
   o  20ca2a4749a4 A
   
 
-  $ hgedenapi log -r tip
+  $ sl log -r tip
   commit:      4e9f8e556b01
   user:        author
   date:        Thu Jan 01 00:00:00 1970 +0000
   summary:     Q
   
 
-  $ hgedenapi debugapi -e commitgraphsegments -i "[\"$X\"]" -i "[\"$Q\"]"
+  $ sl debugapi -e commitgraphsegments -i "[\"$X\"]" -i "[\"$Q\"]"
   [{"base": bin("d728ac072e7662d3ce354b3a13dbd7d3ca853591"),
     "head": bin("262080717826d7e3df89d22278d80710f78457e6"),
     "length": 2,
@@ -288,5 +275,3 @@ Since hash-to-location is still using the server-side segmented changelog, we mu
     "length": 3,
     "parents": [{"hgid": bin("4e9f8e556b01de1ac058397e86387d37778808d2"),
                  "location": None}]}]
-
-

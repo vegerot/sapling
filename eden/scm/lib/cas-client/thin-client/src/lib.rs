@@ -29,8 +29,18 @@ pub struct ThinCasClient {
     metadata: RemoteExecutionMetadata,
 }
 
-pub fn construct(config: &dyn Config) -> Result<Arc<dyn CasClient>> {
-    ThinCasClient::from_config(config).map(|c| Arc::new(c) as Arc<dyn CasClient>)
+pub fn init() {
+    fn construct(config: &dyn Config) -> Result<Option<Arc<dyn CasClient>>> {
+        // Kill switch in case something unexpected happens during construction of client.
+        if config.get_or_default("cas", "disable")? {
+            tracing::warn!(target: "cas", "disabled (cas.disable=true)");
+            return Ok(None);
+        }
+
+        tracing::debug!(target: "cas", "creating thin client");
+        ThinCasClient::from_config(config).map(|c| Some(Arc::new(c) as Arc<dyn CasClient>))
+    }
+    factory::register_constructor("thin-client", construct);
 }
 
 impl ThinCasClient {
@@ -39,8 +49,7 @@ impl ThinCasClient {
 
         re_config.client_name = Some("sapling".to_string());
         re_config.quiet_mode = !config.get_or_default("cas", "verbose")?;
-        re_config.features_config_path =
-            "remote_execution/features/client_source_control".to_string();
+        re_config.features_config_path = "remote_execution/features/client_sapling".to_string();
 
         let mut builder = REClientBuilder::new(fbinit::expect_init()).with_config(re_config);
 
@@ -94,7 +103,12 @@ fn from_re_digest(d: &TDigest) -> Result<CasDigest> {
 
 #[async_trait::async_trait]
 impl CasClient for ThinCasClient {
-    async fn fetch(&self, digests: &[CasDigest]) -> Result<Vec<(CasDigest, Result<Vec<u8>>)>> {
+    async fn fetch(
+        &self,
+        digests: &[CasDigest],
+    ) -> Result<Vec<(CasDigest, Result<Option<Vec<u8>>>)>> {
+        tracing::debug!(target: "cas", "thin client fetching {} digest(s)", digests.len());
+
         let request = DownloadRequest {
             inlined_digests: Some(digests.iter().map(to_re_digest).collect()),
             ..Default::default()
@@ -108,10 +122,10 @@ impl CasClient for ThinCasClient {
             .into_iter()
             .map(|blob| {
                 let digest = from_re_digest(&blob.digest)?;
-                if blob.status.code == TCode::OK {
-                    Ok((digest, Ok(blob.blob)))
-                } else {
-                    Ok((
+                match blob.status.code {
+                    TCode::OK => Ok((digest, Ok(Some(blob.blob)))),
+                    TCode::NOT_FOUND => Ok((digest, Ok(None))),
+                    _ => Ok((
                         digest,
                         Err(anyhow!(
                             "bad status (code={}, message={}, group={})",
@@ -119,7 +133,7 @@ impl CasClient for ThinCasClient {
                             blob.status.message,
                             blob.status.group
                         )),
-                    ))
+                    )),
                 }
             })
             .collect::<Result<Vec<_>>>()

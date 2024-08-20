@@ -10,16 +10,16 @@ use anyhow::Context;
 use anyhow::Error;
 use async_trait::async_trait;
 use auto_impl::auto_impl;
-use blobrepo::save_bonsai_changesets;
 use bonsai_git_mapping::BonsaiGitMappingEntry;
 use bonsai_git_mapping::BonsaiGitMappingRef;
 use bonsai_git_mapping::BonsaisOrGitShas;
 use bonsai_tag_mapping::BonsaiTagMappingRef;
 use bulk_derivation::BulkDerivation;
 use bytes::Bytes;
-use changesets::ChangesetsRef;
+use changesets_creation::save_changesets;
 use cloned::cloned;
 use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
 use filestore::FilestoreConfigRef;
 use filestore::StoreRequest;
@@ -162,8 +162,8 @@ pub trait GitUploader: Clone + Send + Sync + 'static {
     ) -> Result<Vec<(hash::GitSha1, ChangesetId)>, Error>;
 }
 
-pub trait Repo = ChangesetsRef
-    + CommitGraphRef
+pub trait Repo = CommitGraphRef
+    + CommitGraphWriterRef
     + RepoBlobstoreRef
     + BonsaiGitMappingRef
     + BonsaiTagMappingRef
@@ -230,11 +230,11 @@ pub async fn upload_file(
     oid: ObjectId,
     git_bytes: Bytes,
 ) -> Result<FileChange, Error> {
-    let meta = if ty == FileType::GitSubmodule {
+    let (meta, git_lfs) = if ty == FileType::GitSubmodule {
         // The file is a git submodule.  In Mononoke, we store the commit
         // id of the submodule as the content of the file.
         let oid_bytes = Bytes::copy_from_slice(oid.as_slice());
-        filestore::store(
+        let meta = filestore::store(
             repo.repo_blobstore(),
             *repo.filestore_config(),
             ctx,
@@ -242,31 +242,62 @@ pub async fn upload_file(
             stream::once(async move { Ok(oid_bytes) }),
         )
         .await
-        .context("filestore (upload submodule)")?
-    } else if let Some(lfs_meta) = lfs.is_lfs_file(&git_bytes, oid) {
+        .context("filestore (upload submodule)")?;
+        (meta, GitLfs::FullContent)
+    } else if let Some(lfs_pointer_data) = lfs.is_lfs_file(&git_bytes, oid) {
         let blobstore = repo.repo_blobstore();
         let filestore_config = *repo.filestore_config();
-        cloned!(ctx, lfs, blobstore, path);
-        lfs.with(
-            ctx,
-            lfs_meta,
-            move |ctx, lfs_meta, req, bstream| async move {
-                info!(
-                    ctx.logger(),
-                    "Uploading LFS {} sha256:{} size:{}",
-                    path,
-                    lfs_meta.sha256.to_brief(),
-                    lfs_meta.size,
-                );
-                filestore::store(&blobstore, filestore_config, &ctx, &req, bstream)
-                    .await
-                    .context("filestore (lfs)")
-            },
-        )
-        .await?
+        cloned!(lfs, blobstore, path);
+        // We want to store both:
+        // 1. actual file the pointer is pointing at
+        let (meta, fetch_result) = lfs
+            .with(ctx.clone(), lfs_pointer_data.clone(), {
+                move |ctx, lfs_pointer_data, req, bstream, fetch_result| async move {
+                    info!(
+                        ctx.logger(),
+                        "Uploading LFS {} sha256:{} size:{}",
+                        path,
+                        lfs_pointer_data.sha256.to_brief(),
+                        lfs_pointer_data.size,
+                    );
+                    Ok((
+                        filestore::store(&blobstore, filestore_config, &ctx, &req, bstream)
+                            .await
+                            .context("filestore (lfs contents)")?,
+                        fetch_result,
+                    ))
+                }
+            })
+            .await?;
+
+        if fetch_result.is_not_found() {
+            // In case the pointer wasn't found (and we allow that), mark the pointer as full
+            // content.
+            (meta, GitLfs::FullContent)
+        } else {
+            // 3. Upload the Git LFS pointer itself
+            let (req, bstream) =
+                git_store_request(ctx, oid, git_bytes).context("git_store_request")?;
+            let pointer_meta = filestore::store(
+                repo.repo_blobstore(),
+                *repo.filestore_config(),
+                ctx,
+                &req,
+                bstream,
+            )
+            .await
+            .context("filestore (lfs pointer)")?;
+            // and return the contents of the actual file
+            let pointer = if lfs_pointer_data.is_canonical {
+                GitLfs::canonical_pointer()
+            } else {
+                GitLfs::non_canonical_pointer(pointer_meta.content_id)
+            };
+            (meta, pointer)
+        }
     } else {
         let (req, bstream) = git_store_request(ctx, oid, git_bytes).context("git_store_request")?;
-        filestore::store(
+        let meta = filestore::store(
             repo.repo_blobstore(),
             *repo.filestore_config(),
             ctx,
@@ -274,7 +305,8 @@ pub async fn upload_file(
             bstream,
         )
         .await
-        .context("filestore (upload regular)")?
+        .context("filestore (upload regular)")?;
+        (meta, GitLfs::FullContent)
     };
     debug!(
         ctx.logger(),
@@ -287,7 +319,7 @@ pub async fn upload_file(
         ty,
         meta.total_size,
         None,
-        GitLfs::FullContent,
+        git_lfs,
     ))
 }
 
@@ -345,12 +377,10 @@ pub async fn finalize_batch(
 
     // We know that the commits are in order (this is guaranteed by the Walk), so we
     // can insert them as-is, one by one, without extra dependency / ordering checks.
-    let (stats, ()) = save_bonsai_changesets(vbcs, ctx.clone(), repo)
-        .try_timed()
-        .await?;
+    let (stats, ()) = save_changesets(ctx, repo, vbcs).try_timed().await?;
     debug!(
         ctx.logger(),
-        "save_bonsai_changesets for {} commits in {:?}",
+        "save_changesets for {} commits in {:?}",
         oid_to_bcsid.len(),
         stats.completion_time
     );
@@ -372,7 +402,7 @@ pub async fn finalize_batch(
         .types(&config.types)
         .into_iter()
         .filter(|dt| match dt {
-            DerivableType::GitCommits | DerivableType::GitDeltaManifests => false,
+            DerivableType::GitCommits | DerivableType::GitDeltaManifestsV2 => false,
             _ => true,
         })
         .collect::<Vec<_>>();
@@ -398,7 +428,6 @@ pub async fn finalize_batch(
         .types(&config.types)
         .into_iter()
         .filter(|dt| match dt {
-            DerivableType::GitDeltaManifests => true,
             DerivableType::GitDeltaManifestsV2 => true,
             _ => false,
         })

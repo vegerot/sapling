@@ -111,6 +111,13 @@ impl RemoteIdConvertProtocol for SaplingRemoteApiProtocol {
                     );
                     return Err(dag::errors::BackendError::Generic(msg).into());
                 }
+                if name.as_ref() == Id20::wdir_id().as_ref()
+                    || name.as_ref() == Id20::null_id().as_ref()
+                {
+                    // Do not borther asking server about virtual nodes.
+                    // Check resolve_names_to_relative_paths API docstring.
+                    continue;
+                }
                 if let Some(threshold) = self.remote_name_threshold {
                     let current = self.remote_name_current.fetch_add(1, SeqCst);
                     if current >= threshold {
@@ -351,6 +358,10 @@ impl AppendCommits for HybridCommits {
         self.commits.dag.import_pull_data(clone_data, heads).await?;
         Ok(())
     }
+
+    async fn update_virtual_nodes(&mut self, wdir_parents: Vec<Vertex>) -> Result<()> {
+        self.commits.update_virtual_nodes(wdir_parents).await
+    }
 }
 
 /// Subset of HybridCommits useful to read commit text.
@@ -440,6 +451,10 @@ impl Drop for Resolver {
 impl HybridResolver<Vertex, Bytes, anyhow::Error> for Resolver {
     fn resolve_local(&mut self, vertex: &Vertex) -> anyhow::Result<Option<Bytes>> {
         let id = Id20::from_slice(vertex.as_ref())?;
+        if &id == Id20::wdir_id() || &id == Id20::null_id() {
+            // Do not borther asking server about virtual nodes.
+            return Ok(Some(Bytes::new()));
+        }
         match self.zstore.read().get(id)? {
             Some(bytes) => Ok(Some(bytes.slice(Id20::len() * 2..))),
             None => Ok(crate::revlog::get_hard_coded_commit_text(vertex)),

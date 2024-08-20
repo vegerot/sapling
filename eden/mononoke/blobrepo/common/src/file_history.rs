@@ -11,12 +11,11 @@ use std::collections::VecDeque;
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Error;
-use blobrepo::BlobRepo;
 use blobstore::Blobstore;
 use blobstore::Loadable;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
-use changesets::ChangesetsRef;
 use cloned::cloned;
+use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use context::PerfCounterType;
 use filenodes::FilenodeInfo;
@@ -71,9 +70,18 @@ define_stats! {
     too_big: dynamic_timeseries("{}.too_big", (repo: String); Rate, Sum),
 }
 
+pub trait Repo = RepoIdentityRef
+    + RepoBlobstoreRef
+    + FilenodesRef
+    + BonsaiHgMappingRef
+    + CommitGraphRef
+    + Clone
+    + Send
+    + Sync;
+
 async fn get_filenode_generation(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &impl Repo,
     repo_path: &RepoPath,
     filenode: HgFileNodeId,
 ) -> Result<Option<u64>, Error> {
@@ -95,14 +103,18 @@ async fn get_filenode_generation(
         Some(a) => a,
         None => return Ok(None),
     };
-    let bonsai = repo.changesets().get(ctx, bcs_id).await?;
-    Ok(bonsai.map(|b| b.gen))
+    Ok(Some(
+        repo.commit_graph()
+            .changeset_generation(ctx, bcs_id)
+            .await?
+            .value(),
+    ))
 }
 
 /// Checks if one filenode is ancestor of another
 pub async fn check_if_related(
     ctx: CoreContext,
-    repo: BlobRepo,
+    repo: impl Repo,
     filenode_a: HgFileNodeId,
     filenode_b: HgFileNodeId,
     path: NonRootMPath,
@@ -180,7 +192,7 @@ pub async fn check_if_related(
 /// are disabled
 pub fn get_file_history_maybe_incomplete(
     ctx: CoreContext,
-    repo: BlobRepo,
+    repo: impl Repo,
     filenode: HgFileNodeId,
     path: NonRootMPath,
     max_length: Option<u64>,
@@ -223,7 +235,7 @@ pub fn get_file_history_maybe_incomplete(
 /// Get the history of the file corresponding to the given filenode and path.
 pub async fn get_file_history(
     ctx: CoreContext,
-    repo: BlobRepo,
+    repo: impl Repo,
     filenode: HgFileNodeId,
     path: NonRootMPath,
     max_length: Option<u64>,
@@ -275,7 +287,7 @@ pub async fn get_file_history(
 /// i.e. get_file_history_using_prefetched().take(max_length)
 fn get_file_history_using_prefetched(
     ctx: CoreContext,
-    repo: BlobRepo,
+    repo: impl Repo,
     startnode: HgFileNodeId,
     path: NonRootMPath,
     max_length: Option<u64>,
@@ -290,9 +302,9 @@ fn get_file_history_using_prefetched(
     let seen_nodes = hashset! {startnode};
     let path = RepoPath::FilePath(path);
 
-    struct BfsContext {
+    struct BfsContext<R> {
         ctx: CoreContext,
-        repo: BlobRepo,
+        repo: R,
         path: RepoPath,
         prefetched_history: HashMap<HgFileNodeId, FilenodeInfo>,
     }
@@ -376,7 +388,7 @@ pub fn filenode_to_history_entry(
 
 async fn get_maybe_missing_filenode(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &impl Repo,
     path: &RepoPath,
     node: HgFileNodeId,
 ) -> Result<FilenodeInfo, Error> {

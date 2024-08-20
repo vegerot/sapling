@@ -45,6 +45,16 @@ pub struct CloudWorkspaceRequest {
 #[auto_wire]
 #[derive(Clone, Default, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct CloudWorkspacesRequest {
+    #[id(0)]
+    pub prefix: String,
+    #[id(1)]
+    pub reponame: String,
+}
+
+#[auto_wire]
+#[derive(Clone, Default, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
 pub struct UpdateReferencesParams {
     #[id(0)]
     pub workspace: String,
@@ -149,6 +159,15 @@ pub struct WorkspaceDataResponse {
 }
 
 #[auto_wire]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct WorkspacesDataResponse {
+    #[id(0)]
+    #[no_default]
+    pub data: Result<Vec<WorkspaceData>, ServerError>,
+}
+
+#[auto_wire]
 #[derive(Clone, Default, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
 pub struct GetSmartlogParams {
@@ -208,9 +227,89 @@ pub struct SmartlogData {
     #[id(0)]
     pub nodes: Vec<SmartlogNode>,
     #[id(1)]
-    pub version: i64,
+    pub version: Option<i64>,
     #[id(2)]
-    pub timestamp: i64,
+    pub timestamp: Option<i64>,
+}
+
+#[auto_wire]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct SmartlogDataResponse {
+    #[id(0)]
+    #[no_default]
+    pub data: Result<SmartlogData, ServerError>,
+}
+
+#[auto_wire]
+#[derive(Clone, Default, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct CloudShareWorkspaceRequest {
+    #[id(0)]
+    pub workspace: String,
+    #[id(1)]
+    pub reponame: String,
+}
+
+#[auto_wire]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct CloudShareWorkspaceResponse {
+    #[id(0)]
+    #[no_default]
+    pub data: Result<WorkspaceSharingData, ServerError>,
+}
+
+#[auto_wire]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct WorkspaceSharingData {
+    #[id(0)]
+    pub acl_name: String,
+    #[id(1)]
+    pub sharing_message: String,
+}
+
+#[auto_wire]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct UpdateArchiveParams {
+    #[id(0)]
+    pub workspace: String,
+    #[id(1)]
+    pub reponame: String,
+    #[id(2)]
+    pub archived: bool,
+}
+
+#[auto_wire]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct UpdateArchiveResponse {
+    #[id(0)]
+    #[no_default]
+    pub data: Result<String, ServerError>,
+}
+
+#[auto_wire]
+#[derive(Clone, Default, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct RenameWorkspaceRequest {
+    #[id(0)]
+    pub workspace: String,
+    #[id(1)]
+    pub reponame: String,
+    #[id(2)]
+    pub new_workspace: String,
+}
+
+#[auto_wire]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct RenameWorkspaceResponse {
+    #[id(0)]
+    #[no_default]
+    pub data: Result<String, ServerError>,
 }
 
 impl RemoteBookmark {

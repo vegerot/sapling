@@ -21,7 +21,6 @@ use blobstore::BlobstoreGetData;
 use blobstore::Storable;
 use bytes::Bytes;
 use context::CoreContext;
-use derived_data::impl_bonsai_derived_via_manager;
 use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
@@ -414,8 +413,6 @@ impl BonsaiDerivable for RootGitDeltaManifestV2Id {
     }
 }
 
-impl_bonsai_derived_via_manager!(RootGitDeltaManifestV2Id);
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -426,35 +423,46 @@ mod tests {
     use anyhow::Result;
     use async_compression::tokio::write::ZlibDecoder;
     use blobstore::Loadable;
+    use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::BookmarkKey;
+    use bookmarks::Bookmarks;
     use bookmarks::BookmarksRef;
+    use commit_graph::CommitGraph;
     use commit_graph::CommitGraphRef;
-    use derived_data::BonsaiDerived;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
+    use filestore::FilestoreConfig;
     use fixtures::TestRepoFixture;
     use futures::future;
     use futures_util::stream::TryStreamExt;
     use mononoke_types::ChangesetIdPrefix;
+    use repo_blobstore::RepoBlobstore;
     use repo_blobstore::RepoBlobstoreRef;
+    use repo_derived_data::RepoDerivedData;
     use repo_derived_data::RepoDerivedDataRef;
+    use repo_identity::RepoIdentity;
     use repo_identity::RepoIdentityRef;
     use tokio::io::AsyncWriteExt;
 
     use super::*;
 
+    #[facet::container]
+    struct Repo(
+        dyn BonsaiHgMapping,
+        dyn Bookmarks,
+        RepoBlobstore,
+        RepoDerivedData,
+        RepoIdentity,
+        CommitGraph,
+        dyn CommitGraphWriter,
+        FilestoreConfig,
+    );
+
     /// This function generates GitDeltaManifestV2 for each bonsai commit in the fixture starting from
     /// the fixture's master Bonsai bookmark. It validates that the derivation is successful and returns
     /// the GitDeltaManifestV2 and Bonsai Changeset ID corresponding to the master bookmark
     async fn common_gdm_v2_validation(
-        repo: &(
-             impl BookmarksRef
-             + RepoBlobstoreRef
-             + RepoDerivedDataRef
-             + RepoIdentityRef
-             + CommitGraphRef
-             + Send
-             + Sync
-         ),
+        repo: &Repo,
         ctx: &CoreContext,
     ) -> Result<(RootGitDeltaManifestV2Id, ChangesetId)> {
         let cs_id = repo
@@ -463,7 +471,10 @@ mod tests {
             .await?
             .ok_or_else(|| format_err!("no master"))?;
         // Validate that the derivation of the GitDeltaManifestV2 for the head commit succeeds
-        let root_mf_id = RootGitDeltaManifestV2Id::derive(ctx, repo, cs_id).await?;
+        let root_mf_id = repo
+            .repo_derived_data()
+            .derive::<RootGitDeltaManifestV2Id>(ctx, cs_id)
+            .await?;
         // Validate the derivation of all the commits in this repo succeeds
         let all_cs_ids = repo
             .commit_graph()
@@ -472,7 +483,9 @@ mod tests {
             .to_vec();
         repo.commit_graph()
             .process_topologically(ctx, all_cs_ids, |cs_id| async move {
-                RootGitDeltaManifestV2Id::derive(ctx, repo, cs_id).await?;
+                repo.repo_derived_data()
+                    .derive::<RootGitDeltaManifestV2Id>(ctx, cs_id)
+                    .await?;
                 Ok(())
             })
             .await
@@ -488,7 +501,7 @@ mod tests {
 
     #[fbinit::test]
     async fn delta_manifest_v2_linear(fb: FacebookInit) -> Result<()> {
-        let repo = fixtures::Linear::getrepo(fb).await;
+        let repo: Repo = fixtures::Linear::get_repo(fb).await;
         let ctx = CoreContext::test_mock(fb);
         let blobstore = repo.repo_blobstore();
         let (master_mf_id, _) = common_gdm_v2_validation(&repo, &ctx).await?;
@@ -511,7 +524,7 @@ mod tests {
 
     #[fbinit::test]
     async fn delta_manifest_v2_branch_even(fb: FacebookInit) -> Result<()> {
-        let repo = fixtures::BranchEven::getrepo(fb).await;
+        let repo: Repo = fixtures::BranchEven::get_repo(fb).await;
         let ctx = CoreContext::test_mock(fb);
         let blobstore = repo.repo_blobstore();
         let (master_mf_id, _) = common_gdm_v2_validation(&repo, &ctx).await?;
@@ -540,7 +553,7 @@ mod tests {
 
     #[fbinit::test]
     async fn delta_manifest_v2_branch_uneven(fb: FacebookInit) -> Result<()> {
-        let repo = fixtures::BranchUneven::getrepo(fb).await;
+        let repo: Repo = fixtures::BranchUneven::get_repo(fb).await;
         let ctx = CoreContext::test_mock(fb);
         let blobstore = repo.repo_blobstore();
         let (master_mf_id, _) = common_gdm_v2_validation(&repo, &ctx).await?;
@@ -574,7 +587,7 @@ mod tests {
 
     #[fbinit::test]
     async fn delta_manifest_v2_branch_wide(fb: FacebookInit) -> Result<()> {
-        let repo = fixtures::BranchWide::getrepo(fb).await;
+        let repo: Repo = fixtures::BranchWide::get_repo(fb).await;
         let ctx = CoreContext::test_mock(fb);
         let blobstore = repo.repo_blobstore();
         let (master_mf_id, _) = common_gdm_v2_validation(&repo, &ctx).await?;
@@ -608,7 +621,7 @@ mod tests {
 
     #[fbinit::test]
     async fn delta_manifest_v2_merge_even(fb: FacebookInit) -> Result<()> {
-        let repo = fixtures::MergeEven::getrepo(fb).await;
+        let repo: Repo = fixtures::MergeEven::get_repo(fb).await;
         let ctx = CoreContext::test_mock(fb);
         let blobstore = repo.repo_blobstore();
         let (master_mf_id, _) = common_gdm_v2_validation(&repo, &ctx).await?;
@@ -634,7 +647,7 @@ mod tests {
 
     #[fbinit::test]
     async fn delta_manifest_v2_many_files_dirs(fb: FacebookInit) -> Result<()> {
-        let repo = fixtures::ManyFilesDirs::getrepo(fb).await;
+        let repo: Repo = fixtures::ManyFilesDirs::get_repo(fb).await;
         let ctx = CoreContext::test_mock(fb);
         let blobstore = repo.repo_blobstore();
         let (master_mf_id, _) = common_gdm_v2_validation(&repo, &ctx).await?;
@@ -657,7 +670,7 @@ mod tests {
 
     #[fbinit::test]
     async fn delta_manifest_v2_merge_uneven(fb: FacebookInit) -> Result<()> {
-        let repo = fixtures::MergeUneven::getrepo(fb).await;
+        let repo: Repo = fixtures::MergeUneven::get_repo(fb).await;
         let ctx = CoreContext::test_mock(fb);
         let blobstore = repo.repo_blobstore();
         let (master_mf_id, _) = common_gdm_v2_validation(&repo, &ctx).await?;
@@ -679,7 +692,7 @@ mod tests {
 
     #[fbinit::test]
     async fn delta_manifest_v2_merge_multiple_files(fb: FacebookInit) -> Result<()> {
-        let repo = fixtures::MergeMultipleFiles::getrepo(fb).await;
+        let repo: Repo = fixtures::MergeMultipleFiles::get_repo(fb).await;
         let ctx = CoreContext::test_mock(fb);
         let blobstore = repo.repo_blobstore();
         let (master_mf_id, _) = common_gdm_v2_validation(&repo, &ctx).await?;
@@ -728,7 +741,7 @@ mod tests {
 
     #[fbinit::test]
     async fn delta_manifest_v2_instructions_encoding(fb: FacebookInit) -> Result<()> {
-        let repo = fixtures::Linear::getrepo(fb).await;
+        let repo: Repo = fixtures::Linear::get_repo(fb).await;
         let ctx = CoreContext::test_mock(fb);
         let blobstore = repo.repo_blobstore();
         let (master_mf_id, _) = common_gdm_v2_validation(&repo, &ctx).await?;

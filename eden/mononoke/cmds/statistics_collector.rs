@@ -6,10 +6,10 @@
  */
 
 use std::collections::HashMap;
-use std::fs;
 use std::ops::Add;
 use std::ops::Sub;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -25,12 +25,9 @@ use blobstore::Loadable;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bookmarks::BookmarkKey;
 use bookmarks::Bookmarks;
-use bytes::Bytes;
-use changesets::deserialize_cs_entries;
-use changesets::ChangesetEntry;
-use changesets::Changesets;
 use clap::Parser;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use context::CoreContext;
 use executor_lib::RepoShardedProcess;
 use executor_lib::RepoShardedProcessExecutor;
@@ -59,6 +56,7 @@ use mononoke_app::fb303::AliveService;
 use mononoke_app::fb303::Fb303AppExtension;
 use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
+use mononoke_types::ChangesetId;
 use mononoke_types::FileType;
 use mononoke_types::RepositoryId;
 use redactedblobstore::ErrorKind as RedactedBlobstoreError;
@@ -67,12 +65,14 @@ use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedData;
 use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentity;
+use repo_identity::RepoIdentityRef;
 use scuba_ext::MononokeScubaSampleBuilder;
 use sharding_ext::RepoShard;
 use slog::error;
 use slog::info;
 use slog::Logger;
 use stats::prelude::*;
+use tokio::io::AsyncReadExt;
 use tokio::time::sleep;
 
 const SM_SERVICE_SCOPE: &str = "global";
@@ -85,13 +85,13 @@ pub struct Repo {
     #[facet]
     repo_derived_data: RepoDerivedData,
     #[facet]
-    changesets: dyn Changesets,
-    #[facet]
     bookmarks: dyn Bookmarks,
     #[facet]
     bonsai_hg_mapping: dyn BonsaiHgMapping,
     #[facet]
     commit_graph: CommitGraph,
+    #[facet]
+    commit_graph_writer: dyn CommitGraphWriter,
     #[facet]
     filestore_config: FilestoreConfig,
     #[facet]
@@ -111,10 +111,10 @@ struct RepoStatisticsArgs {
     /// If set, then statistics are logged to scuba
     #[clap(long)]
     log_to_scuba: bool,
-    /// A file with a list of bonsai changesets to calculate stats for. If this
+    /// A file containing a json array of bonsai changeset ids to calculate stats for. If this
     /// argument is provided, then the statistics will be calculated for file based commit only.
     #[clap(long)]
-    in_filename: Option<String>,
+    in_filename: Option<PathBuf>,
     /// The name of ShardManager service to be used when running statistics collector in sharded setting.
     #[clap(long, conflicts_with_all = &["repo-name", "repo-id"])]
     pub sharded_service_name: Option<String>,
@@ -463,9 +463,19 @@ pub fn log_statistics(
         .log_with_time(cs_timestamp as u64);
 }
 
-fn parse_serialized_commits<P: AsRef<Path>>(file: P) -> Result<Vec<ChangesetEntry>, Error> {
-    let data = fs::read(file).map_err(Error::from)?;
-    deserialize_cs_entries(&Bytes::from(data))
+async fn parse_json_serialized_changesets<P: AsRef<Path>>(
+    file: P,
+) -> Result<Vec<ChangesetId>, Error> {
+    let mut file = tokio::fs::File::open(&file)
+        .await
+        .context("Failed to open boundaries file")?;
+
+    let mut contents = vec![];
+    file.read_to_end(&mut contents)
+        .await
+        .context("Failed to read boundaries file")?;
+
+    serde_json::from_slice(&contents).context("Failed to parse json serialized changesets")
 }
 
 pub async fn generate_statistics_from_file<P: AsRef<Path>>(
@@ -480,19 +490,22 @@ pub async fn generate_statistics_from_file<P: AsRef<Path>>(
     // e.g. serde deserialize. To avoid saving fields separately it may be necessary to add new
     // fields to RepoStatistics struct, like cs_timestamp, hg_cs_id, repo_id and refactor code.
     println!("repo_id,hg_cs_id,cs_timestamp,num_files,total_file_size,num_lines");
-    let changesets = parse_serialized_commits(in_path)?;
+    let changesets = parse_json_serialized_changesets(in_path).await?;
     info!(ctx.logger(), "Started calculating changesets timestamps");
 
     let mut changeset_info_vec = stream::iter(changesets)
         .map({
-            move |changeset| async move {
-                let ChangesetEntry { repo_id, cs_id, .. } = changeset;
+            move |cs_id| async move {
                 let hg_cs_id = derive_hg_changeset(ctx, repo.repo_derived_data(), cs_id).await?;
                 let cs_timestamp =
                     get_changeset_timestamp_from_changeset(ctx, repo, &hg_cs_id).await?;
                 // the error type annotation in principle should be inferred,
                 // but the compiler currently needs it. See https://fburl.com/n1s2ujjb
-                Ok::<(HgChangesetId, i64, RepositoryId), Error>((hg_cs_id, cs_timestamp, repo_id))
+                Ok::<(HgChangesetId, i64, RepositoryId), Error>((
+                    hg_cs_id,
+                    cs_timestamp,
+                    repo.repo_identity().id(),
+                ))
             }
         })
         .buffered(100)
@@ -810,7 +823,7 @@ mod tests {
     fn linear_test_get_statistics_from_changeset(fb: FacebookInit) {
         let runtime = Runtime::new().unwrap();
         runtime.block_on(async move {
-            let repo: MyRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: MyRepo = Linear::get_repo(fb).await;
 
             let ctx = CoreContext::test_mock(fb);
             let blobstore = repo.repo_blobstore().clone();
@@ -862,7 +875,7 @@ mod tests {
     fn linear_test_get_statistics_from_entry_tree(fb: FacebookInit) {
         let runtime = Runtime::new().unwrap();
         runtime.block_on(async move {
-            let repo: MyRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: MyRepo = Linear::get_repo(fb).await;
 
             let ctx = CoreContext::test_mock(fb);
             let blobstore = repo.repo_blobstore().clone();
@@ -929,7 +942,7 @@ mod tests {
     fn linear_test_update_statistics(fb: FacebookInit) {
         let runtime = Runtime::new().unwrap();
         runtime.block_on(async move {
-            let repo: MyRepo = Linear::get_custom_test_repo(fb).await;
+            let repo: MyRepo = Linear::get_repo(fb).await;
 
             let ctx = CoreContext::test_mock(fb);
             let blobstore = repo.repo_blobstore().clone();

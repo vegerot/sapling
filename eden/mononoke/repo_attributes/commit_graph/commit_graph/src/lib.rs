@@ -16,8 +16,11 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use anyhow::bail;
+use anyhow::Context;
 use anyhow::Result;
 use borrowed::borrowed;
+use buffered_commit_graph_storage::BufferedCommitGraphStorage;
+use commit_graph_types::edges::ChangesetEdges;
 use commit_graph_types::edges::ChangesetNode;
 pub use commit_graph_types::edges::ChangesetParents;
 use commit_graph_types::frontier::AncestorsWithinDistance;
@@ -46,6 +49,7 @@ use mononoke_types::ChangesetIdsResolvedFromPrefix;
 use mononoke_types::Generation;
 use mononoke_types::FIRST_GENERATION;
 use smallvec::smallvec;
+use vec1::Vec1;
 
 pub use crate::ancestors_stream::AncestorsStreamBuilder;
 pub use crate::compat::ParentsFetcher;
@@ -55,6 +59,7 @@ pub use crate::writer::BaseCommitGraphWriter;
 pub use crate::writer::CommitGraphWriter;
 pub use crate::writer::CommitGraphWriterArc;
 pub use crate::writer::CommitGraphWriterRef;
+pub use crate::writer::CompatCommitGraphWriter;
 pub use crate::writer::LoggingCommitGraphWriter;
 
 mod ancestors_stream;
@@ -124,6 +129,47 @@ impl CommitGraph {
             .await
     }
 
+    /// Add many new changesets to the commit graph. Changesets should
+    /// be sorted in topological order.
+    ///
+    /// Returns the number of newly added changesets to the commit graph.
+    pub(crate) async fn add_many(
+        &self,
+        ctx: &CoreContext,
+        changesets: Vec1<(ChangesetId, ChangesetParents)>,
+    ) -> Result<usize> {
+        // Find all parents that should already exist in the commit graph
+        // and fetch their edges.
+        let changesets_set: HashSet<ChangesetId> =
+            changesets.iter().map(|(cs_id, _)| cs_id).cloned().collect();
+        let parents_to_fetch = changesets
+            .iter()
+            .flat_map(|(_, parents)| parents)
+            .filter(|cs_id| !changesets_set.contains(cs_id))
+            .copied()
+            .collect::<Vec<_>>();
+        let mut edges_map: HashMap<ChangesetId, ChangesetEdges> = self
+            .storage
+            .fetch_many_edges(ctx, &parents_to_fetch, Prefetch::None)
+            .await
+            .with_context(|| "during commit_graph::add_many (fetch_many_edges)")?
+            .into_iter()
+            .map(|(k, v)| (k, v.into()))
+            .collect();
+
+        // We use buffered storage here to be able to do all the writes in parallel.
+        // We need to create a new CommitGraph wrapper to work with the buffered storage.
+        let buffered_storage =
+            Arc::new(BufferedCommitGraphStorage::new(self.storage.clone(), 10000));
+        let graph = CommitGraph::new(buffered_storage.clone());
+        for (cs_id, parents) in changesets {
+            let edges = graph.build_edges(ctx, cs_id, parents, &edges_map).await?;
+            edges_map.insert(cs_id, edges.clone());
+            buffered_storage.add(ctx, edges).await?;
+        }
+        buffered_storage.flush(ctx).await
+    }
+
     /// Find all changeset ids with a given prefix.
     pub async fn find_by_prefix(
         &self,
@@ -154,6 +200,32 @@ impl CommitGraph {
             .collect())
     }
 
+    /// Returns the parents of many changesets.
+    pub async fn many_changeset_parents(
+        &self,
+        ctx: &CoreContext,
+        cs_ids: &[ChangesetId],
+    ) -> Result<HashMap<ChangesetId, ChangesetParents>> {
+        let fetched_edges = self
+            .storage
+            .fetch_many_edges(ctx, cs_ids, Prefetch::None)
+            .await?;
+        Ok(fetched_edges
+            .into_iter()
+            .map(|(cs_id, fetched_edges)| {
+                (
+                    cs_id,
+                    fetched_edges
+                        .edges()
+                        .parents
+                        .into_iter()
+                        .map(|parents| parents.cs_id)
+                        .collect(),
+                )
+            })
+            .collect())
+    }
+
     /// Returns the generation number of a single changeset.
     pub async fn changeset_generation(
         &self,
@@ -162,6 +234,52 @@ impl CommitGraph {
     ) -> Result<Generation> {
         let edges = self.storage.fetch_edges(ctx, cs_id).await?;
         Ok(edges.node.generation)
+    }
+
+    /// Returns the generation number of many changesets.
+    pub async fn many_changeset_generations(
+        &self,
+        ctx: &CoreContext,
+        cs_ids: &[ChangesetId],
+    ) -> Result<HashMap<ChangesetId, Generation>> {
+        let fetched_edges = self
+            .storage
+            .fetch_many_edges(ctx, cs_ids, Prefetch::None)
+            .await?;
+        Ok(fetched_edges
+            .into_iter()
+            .map(|(cs_id, fetched_edges)| (cs_id, fetched_edges.node.generation))
+            .collect())
+    }
+
+    /// Returns the linear depth of a single changeset. Linear depth is calculated as the
+    /// number of ancestors of the commit if the commit graph consisted only of the first
+    /// parents (i.e. if merges were ignored).
+    pub async fn changeset_linear_depth(
+        &self,
+        ctx: &CoreContext,
+        cs_id: ChangesetId,
+    ) -> Result<u64> {
+        let edges = self.storage.fetch_edges(ctx, cs_id).await?;
+        Ok(edges.node.p1_linear_depth)
+    }
+
+    /// Returns the linear depth of many changesets. Linear depth is calculated as the
+    /// number of ancestors of the commit if the commit graph consisted only of the first
+    /// parents (i.e. if merges were ignored).
+    pub async fn many_changeset_linear_depths(
+        &self,
+        ctx: &CoreContext,
+        cs_ids: &[ChangesetId],
+    ) -> Result<HashMap<ChangesetId, u64>> {
+        let fetched_edges = self
+            .storage
+            .fetch_many_edges(ctx, cs_ids, Prefetch::None)
+            .await?;
+        Ok(fetched_edges
+            .into_iter()
+            .map(|(cs_id, fetched_edges)| (cs_id, fetched_edges.node.p1_linear_depth))
+            .collect())
     }
 
     /// Return only the changesets that are found in the commit graph.

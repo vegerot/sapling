@@ -612,6 +612,9 @@ impl AddScubaParams for thrift::MegarepoReadConfigParams {
     }
 }
 
+// TODO(T179531912): Log params to scuba
+impl AddScubaParams for thrift::RepoUpdateSubmoduleExpansionParams {}
+
 impl AddScubaParams for thrift::RepoUploadNonBlobGitObjectParams {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
         scuba.add("param_git_object_id", hex(&self.git_hash));
@@ -626,14 +629,14 @@ impl AddScubaParams for thrift::CreateGitTreeParams {
 
 impl AddScubaParams for thrift::CreateGitTagParams {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
-        scuba.add("tagged_changeset_id", hex(&self.target_changeset));
+        scuba.add("param_tagged_changeset_id", hex(&self.target_changeset));
     }
 }
 
 impl AddScubaParams for thrift::RepoStackGitBundleStoreParams {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
-        scuba.add("head", self.head.to_string());
-        scuba.add("base", self.base.to_string());
+        scuba.add("param_head", self.head.to_string());
+        scuba.add("param_base", self.base.to_string());
     }
 }
 

@@ -16,7 +16,6 @@ use anyhow::Error;
 use async_trait::async_trait;
 use auto_impl::auto_impl;
 use blame::RootBlameV2;
-use blobrepo::BlobRepo;
 use blobrepo_hg::BlobRepoHg;
 use blobstore::Loadable;
 use blobstore::LoadableError;
@@ -36,8 +35,7 @@ use cloned::cloned;
 use context::CoreContext;
 use deleted_manifest::RootDeletedManifestIdCommon;
 use deleted_manifest::RootDeletedManifestV2Id;
-use derived_data::BonsaiDerived;
-use derived_data_manager::BonsaiDerivable as NewBonsaiDerivable;
+use derived_data_manager::BonsaiDerivable;
 use fastlog::fetch_fastlog_batch_by_unode_id;
 use fastlog::RootFastlog;
 use filenodes::FilenodeInfo;
@@ -77,6 +75,7 @@ use phases::Phase;
 use phases::Phases;
 use phases::PhasesRef;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
 use scuba_ext::MononokeScubaSampleBuilder;
 use skeleton_manifest::RootSkeletonManifestId;
@@ -104,6 +103,7 @@ use crate::detail::graph::UnodeKey;
 use crate::detail::graph::UnodeManifestEntry;
 use crate::detail::graph::WrappedPath;
 use crate::detail::log;
+use crate::detail::repo::Repo;
 use crate::detail::state::InternedType;
 use crate::detail::validate::add_node_to_scuba;
 use crate::detail::validate::CHECK_FAIL;
@@ -285,7 +285,7 @@ impl From<LoadableError> for StepError {
 
 async fn bookmark_step<V: VisitOne>(
     ctx: CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     b: BookmarkKey,
     published_bookmarks: Arc<HashMap<BookmarkKey, ChangesetId>>,
@@ -370,7 +370,7 @@ async fn bonsai_phase_step<V: VisitOne>(
 
 async fn blame_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     blame_id: BlameV2Id,
 ) -> Result<StepOutput, StepError> {
@@ -396,7 +396,7 @@ async fn blame_step<V: VisitOne>(
 
 async fn fastlog_batch_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     id: &FastlogBatchId,
     path: Option<&WrappedPath>,
@@ -427,7 +427,7 @@ async fn fastlog_batch_step<V: VisitOne>(
 
 async fn fastlog_dir_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     id: &FastlogKey<ManifestUnodeId>,
     path: Option<&WrappedPath>,
@@ -474,7 +474,7 @@ async fn fastlog_dir_step<V: VisitOne>(
 
 async fn fastlog_file_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     id: &FastlogKey<FileUnodeId>,
     path: Option<&WrappedPath>,
@@ -521,7 +521,7 @@ async fn fastlog_file_step<V: VisitOne>(
 
 async fn bonsai_changeset_info_mapping_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     bcs_id: ChangesetId,
     enable_derive: bool,
@@ -551,7 +551,7 @@ async fn bonsai_changeset_info_mapping_step<V: VisitOne>(
 
 async fn changeset_info_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     bcs_id: ChangesetId,
     enable_derive: bool,
@@ -583,7 +583,7 @@ async fn changeset_info_step<V: VisitOne>(
 
 async fn bonsai_changeset_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     key: &ChangesetKey<ChangesetId>,
 ) -> Result<StepOutput, StepError> {
@@ -664,7 +664,7 @@ async fn bonsai_changeset_step<V: VisitOne>(
 
 async fn file_content_step<V: VisitOne>(
     ctx: CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     id: ContentId,
 ) -> Result<StepOutput, StepError> {
@@ -687,7 +687,7 @@ async fn file_content_step<V: VisitOne>(
 
 async fn file_content_metadata_v2_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     id: ContentId,
     enable_derive: bool,
@@ -741,7 +741,7 @@ async fn file_content_metadata_v2_step<V: VisitOne>(
 
 async fn evolve_filenode_flag<'a, V: 'a + VisitOne>(
     ctx: &'a CoreContext,
-    repo: &'a BlobRepo,
+    repo: &'a Repo,
     checker: &'a Checker<V>,
     key: ChangesetKey<ChangesetId>,
     enable_derive: bool,
@@ -752,7 +752,9 @@ async fn evolve_filenode_flag<'a, V: 'a + VisitOne>(
         let bcs_id = key.inner;
         let derived_filenode = if enable_derive {
             if checker.is_public(ctx, &bcs_id).await? {
-                let _ = FilenodesOnlyPublic::derive(ctx, repo, bcs_id)
+                let _ = repo
+                    .repo_derived_data()
+                    .derive::<FilenodesOnlyPublic>(ctx, bcs_id)
                     .await
                     .map_err(Error::from)?;
                 Some(true)
@@ -766,9 +768,12 @@ async fn evolve_filenode_flag<'a, V: 'a + VisitOne>(
         // We only want to walk to Hg step if filenode is present
         filenode_known_derived = match derived_filenode {
             Some(v) => v,
-            None => FilenodesOnlyPublic::is_derived(ctx, repo, &bcs_id)
+            None => repo
+                .repo_derived_data()
+                .fetch_derived::<FilenodesOnlyPublic>(ctx, bcs_id)
                 .await
-                .map_err(Error::from)?,
+                .map_err(Error::from)?
+                .is_some(),
         };
     }
 
@@ -777,7 +782,7 @@ async fn evolve_filenode_flag<'a, V: 'a + VisitOne>(
 
 async fn bonsai_to_hg_key<'a, V: 'a + VisitOne>(
     ctx: &'a CoreContext,
-    repo: &'a BlobRepo,
+    repo: &'a Repo,
     checker: &'a Checker<V>,
     key: ChangesetKey<ChangesetId>,
     enable_derive: bool,
@@ -809,7 +814,7 @@ async fn bonsai_to_hg_key<'a, V: 'a + VisitOne>(
 
 async fn bonsai_to_hg_mapping_step<'a, V: 'a + VisitOne>(
     ctx: &'a CoreContext,
-    repo: &'a BlobRepo,
+    repo: &'a Repo,
     checker: &'a Checker<V>,
     key: ChangesetKey<ChangesetId>,
     enable_derive: bool,
@@ -865,7 +870,7 @@ async fn hg_to_bonsai_mapping_step<V: VisitOne>(
 
 async fn hg_changeset_via_bonsai_step<'a, V: VisitOne>(
     ctx: &'a CoreContext,
-    repo: &'a BlobRepo,
+    repo: &'a Repo,
     checker: &'a Checker<V>,
     input_key: ChangesetKey<HgChangesetId>,
     enable_derive: bool,
@@ -904,7 +909,7 @@ async fn hg_changeset_via_bonsai_step<'a, V: VisitOne>(
 
 async fn hg_changeset_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     key: ChangesetKey<HgChangesetId>,
 ) -> Result<StepOutput, StepError> {
@@ -945,7 +950,7 @@ async fn hg_changeset_step<V: VisitOne>(
 
 async fn hg_file_envelope_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     hg_file_node_id: HgFileNodeId,
     path: Option<&WrappedPath>,
@@ -968,7 +973,7 @@ async fn hg_file_envelope_step<V: VisitOne>(
 
 async fn file_node_step_impl<V: VisitOne, F, D>(
     ctx: CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     repo_path: RepoPath,
     path: WrappedPath,
@@ -1025,7 +1030,7 @@ where
         }
 
         // Copyfrom is like another parent
-        for (repo_path, file_node_id) in &file_node_info.copyfrom {
+        if let Some((repo_path, file_node_id)) = &file_node_info.copyfrom {
             checker.add_edge(&mut edges, copyfrom_edge, || {
                 build_file_node(PathKey::new(
                     *file_node_id,
@@ -1043,7 +1048,7 @@ where
 
 async fn hg_file_node_step<V: VisitOne>(
     ctx: CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     path: WrappedPath,
     hg_file_node_id: HgFileNodeId,
@@ -1071,7 +1076,7 @@ async fn hg_file_node_step<V: VisitOne>(
 
 async fn hg_manifest_file_node_step<V: VisitOne>(
     ctx: CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     path: WrappedPath,
     hg_file_node_id: HgFileNodeId,
@@ -1099,7 +1104,7 @@ async fn hg_manifest_file_node_step<V: VisitOne>(
 
 async fn hg_manifest_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     path: WrappedPath,
     hg_manifest_id: HgManifestId,
@@ -1164,7 +1169,7 @@ async fn hg_manifest_step<V: VisitOne>(
 
 async fn alias_content_mapping_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     alias: Alias,
 ) -> Result<StepOutput, StepError> {
@@ -1184,37 +1189,51 @@ async fn alias_content_mapping_step<V: VisitOne>(
 }
 
 // Only fetch if already derived unless enable_derive is set
-async fn maybe_derived<Derived: BonsaiDerived>(
+async fn maybe_derived<Derivable: BonsaiDerivable>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     bcs_id: ChangesetId,
     enable_derive: bool,
-) -> Result<Option<Derived>, Error> {
+) -> Result<Option<Derivable>, Error> {
     if enable_derive {
-        Ok(Some(Derived::derive(ctx, repo, bcs_id).await?))
+        Ok(Some(
+            repo.repo_derived_data()
+                .derive::<Derivable>(ctx, bcs_id)
+                .await?,
+        ))
     } else {
-        Derived::fetch_derived(ctx, repo, &bcs_id).await
+        Ok(repo
+            .repo_derived_data()
+            .fetch_derived::<Derivable>(ctx, bcs_id)
+            .await?)
     }
 }
 
 // Variant of is_derived that will still trigger derivation if enable_derive is set
-async fn is_derived<Derived: BonsaiDerived>(
+async fn is_derived<Derivable: BonsaiDerivable>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     bcs_id: ChangesetId,
     enable_derive: bool,
 ) -> Result<bool, Error> {
     if enable_derive {
-        let _ = Derived::derive(ctx, repo, bcs_id).await?;
+        let _ = repo
+            .repo_derived_data()
+            .derive::<Derivable>(ctx, bcs_id)
+            .await?;
         Ok(true)
     } else {
-        Ok(Derived::is_derived(ctx, repo, &bcs_id).await?)
+        Ok(repo
+            .repo_derived_data()
+            .fetch_derived::<Derivable>(ctx, bcs_id)
+            .await?
+            .is_some())
     }
 }
 
 async fn bonsai_to_fsnode_mapping_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     bcs_id: ChangesetId,
     enable_derive: bool,
@@ -1245,7 +1264,7 @@ async fn bonsai_to_fsnode_mapping_step<V: VisitOne>(
 
 async fn fsnode_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     fsnode_id: &FsnodeId,
     path: Option<&WrappedPath>,
@@ -1302,7 +1321,7 @@ async fn fsnode_step<V: VisitOne>(
 
 async fn bonsai_to_unode_mapping_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     bcs_id: ChangesetId,
     enable_derive: bool,
@@ -1374,7 +1393,7 @@ async fn bonsai_to_unode_mapping_step<V: VisitOne>(
 
 async fn unode_file_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     key: &UnodeKey<FileUnodeId>,
     path: Option<&WrappedPath>,
@@ -1444,7 +1463,7 @@ async fn unode_file_step<V: VisitOne>(
 
 async fn unode_manifest_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     key: &UnodeKey<ManifestUnodeId>,
     path: Option<&WrappedPath>,
@@ -1541,7 +1560,7 @@ async fn unode_manifest_step<V: VisitOne>(
 
 async fn deleted_manifest_v2_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     id: &DeletedManifestV2Id,
     path: Option<&WrappedPath>,
@@ -1595,7 +1614,7 @@ async fn deleted_manifest_v2_step<V: VisitOne>(
 
 async fn deleted_manifest_v2_mapping_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     bcs_id: ChangesetId,
     enable_derive: bool,
@@ -1629,7 +1648,7 @@ async fn deleted_manifest_v2_mapping_step<V: VisitOne>(
 
 async fn skeleton_manifest_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     manifest_id: &SkeletonManifestId,
     path: Option<&WrappedPath>,
@@ -1670,7 +1689,7 @@ async fn skeleton_manifest_step<V: VisitOne>(
 
 async fn skeleton_manifest_mapping_step<V: VisitOne>(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     checker: &Checker<V>,
     bcs_id: ChangesetId,
     enable_derive: bool,
@@ -1863,7 +1882,7 @@ impl<V: VisitOne> Checker<V> {
 // Parameters that vary per repo but can be setup in common conde
 #[derive(Clone)]
 pub struct RepoWalkParams {
-    pub repo: BlobRepo,
+    pub repo: Repo,
     pub logger: Logger,
     pub scuba_builder: MononokeScubaSampleBuilder,
     pub scheduled_max: usize,
@@ -2025,7 +2044,7 @@ async fn walk_one<V, VOut, Route>(
     ctx: CoreContext,
     via: Option<Route>,
     walk_item: OutgoingEdge,
-    repo: BlobRepo,
+    repo: Repo,
     enable_derive: bool,
     visitor: V,
     error_as_data_node_types: HashSet<NodeType>,

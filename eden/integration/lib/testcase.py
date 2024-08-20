@@ -110,6 +110,9 @@ class EdenTestCase(EdenTestCaseBase):
         # during integration tests
         self.setenv("INTEGRATION_TEST", "1")
 
+        # Set this environment variable to enable Sl tracing during the test
+        # self.setenv("SL_LOG", "trace")
+
         self.setup_eden_test()
         self.report_time("test setup done")
 
@@ -257,7 +260,8 @@ class EdenTestCase(EdenTestCaseBase):
         {"namespace": ["key1=value1", "key2=value2"}
         """
         configs = {
-            "experimental": ["enable-nfs-server = true\nwindows-symlinks = false"]
+            "experimental": ["enable-nfs-server = true\nwindows-symlinks = false"],
+            "thrift": ["request-tree-metadata = true"],
         }
         if self.use_nfs():
             configs["clone"] = ['default-mount-protocol = "NFS"']
@@ -269,6 +273,8 @@ class EdenTestCase(EdenTestCaseBase):
             configs["nfs"] = ["allow-apple-double = false"]
             if "SANDCASTLE" in os.environ:
                 configs["redirections"] = ['darwin-redirection-type = "symlink"']
+        elif sys.platform == "win32":
+            configs["notifications"] = ['enable-eden-menu = "false"']
         return configs
 
     def create_hg_repo(
@@ -396,6 +402,11 @@ class EdenTestCase(EdenTestCaseBase):
         with open(self.eden.system_rollout_path, "w") as edenfsctl_rollout:
             edenfsctl_rollout.write(json.dumps(config))
 
+    def stat(self, path: str) -> os.stat_result:
+        """Stat the file at the specified path relative to the clone."""
+        fullpath = self.get_path(path)
+        return os.lstat(fullpath)
+
     @staticmethod
     def unix_only(fn):
         """
@@ -517,7 +528,6 @@ class EdenTestCase(EdenTestCaseBase):
                 )
 
 
-# pyre-ignore[13]: T62487924
 class EdenRepoTest(EdenTestCase):
     """
     Base class for EdenHgTest and EdenGitTest.
@@ -529,9 +539,13 @@ class EdenRepoTest(EdenTestCase):
     your tests once per supported repository type.
     """
 
+    # pyre-fixme[13]: Attribute `repo` is never initialized.
     repo: repobase.Repository
+    # pyre-fixme[13]: Attribute `repo_name` is never initialized.
     repo_name: str
+    # pyre-fixme[13]: Attribute `repo_type` is never initialized.
     repo_type: str
+    # pyre-fixme[13]: Attribute `inode_catalog_type` is never initialized.
     inode_catalog_type: str
 
     enable_logview: bool = False
@@ -794,7 +808,9 @@ class HgRepoTestMixin:
         # breaking resolution of create_repo().
         # pyre-fixme[16]: `HgRepoTestMixin` has no attribute `create_hg_repo`.
         return self.create_hg_repo(
-            name, init_configs=["experimental.windows-symlinks=True"], filtered=filtered
+            name,
+            init_configs=["experimental.windows-symlinks=True"],
+            filtered=filtered,
         )
 
 

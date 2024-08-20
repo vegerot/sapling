@@ -88,6 +88,7 @@ By using a script, default files and bookmarks are disabled.
 
 import base64
 import collections
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -338,7 +339,11 @@ class simplecommitctx(context.committablectx):
             renamed = m.group(2)
         else:
             renamed = None
-        if data.startswith("base85:"):
+
+        if data.startswith("random:"):
+            file_size = int(data.split(":", 1)[-1].strip())
+            bdata = os.urandom(file_size)
+        elif data.startswith("base85:"):
             bdata = base64.b85decode(data.split(":", 1)[-1].strip())
         else:
             bdata = data.encode("utf-8")
@@ -436,7 +441,7 @@ def _drawdagintransaction(repo, text: str, tr, **opts) -> None:
     files = collections.defaultdict(dict)  # {(name, path): content}
     comments = list(_getcomments(text))
     commenttext = "\n".join(comments)
-    filere = re.compile(r"^(\w+)/([.\w/]+)\s*=\s*(.*)$", re.M)
+    filere = re.compile(r"^(\w+)/([.\w/-]+)\s*=\s*(.*)$", re.M)
     for name, path, content in filere.findall(commenttext):
         content = content.replace(r"\n", "\n").replace(r"\1", "\1")
         files[name][path] = content
@@ -448,8 +453,12 @@ def _drawdagintransaction(repo, text: str, tr, **opts) -> None:
         dates[name] = date
 
     # do not create default files? (ex. commit A has file "A")
-    defaultfiles = opts.get("files") and (
-        not any("drawdag.defaultfiles=false" in c for c in comments) and not script
+    defaultfiles = (
+        opts.get("files")
+        and (
+            not any("drawdag.defaultfiles=false" in c for c in comments) and not script
+        )
+        and repo.ui.configbool("drawdag", "defaultfiles", True)
     )
 
     committed = {None: nullid}  # {name: node}
@@ -579,7 +588,7 @@ def _drawdagintransaction(repo, text: str, tr, **opts) -> None:
                 if defaultfiles:
                     added[name] = name
             # add extra file contents in comments
-            for path, content in files.get(name, {}).items():
+            for path, content in files.pop(name, {}).items():
                 added[path] = content
             commitmutations = None
             if name in mutations:
@@ -595,6 +604,12 @@ def _drawdagintransaction(repo, text: str, tr, **opts) -> None:
         committed[name] = n
         if name not in mutationpreds and opts.get("bookmarks") and not script:
             bookmarks.addbookmarks(repo, tr, [name], hex(n), True, True)
+
+    if files:
+        raise error.Abort(
+            _("unused files: %s")
+            % ["/".join([name, path]) for name, fns in files.items() for path in fns]
+        )
 
     # parse comments like "bookmark book_A=A" to specify bookmarks
     dates = {}

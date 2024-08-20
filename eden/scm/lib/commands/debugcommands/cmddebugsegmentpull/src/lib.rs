@@ -10,14 +10,14 @@ use async_runtime::block_unless_interrupted as block_on;
 use clidispatch::ReqCtx;
 use cliparser::define_flags;
 use cmdutil::Result;
-use dag::namedag::IndexedLogNameDagPath;
+use dag::dag::IndexedLogDagPath;
 use dag::ops::DagImportPullData;
 use dag::ops::DagPersistent;
 use dag::ops::Open;
 use dag::CloneData;
 use dag::Group;
+use dag::Vertex;
 use dag::VertexListWithOptions;
-use dag::VertexName;
 use repo::repo::Repo;
 use types::HgId;
 
@@ -31,7 +31,7 @@ define_flags! {
     }
 }
 
-pub fn run(ctx: ReqCtx<StatusOpts>, repo: &mut Repo) -> Result<u8> {
+pub fn run(ctx: ReqCtx<StatusOpts>, repo: &Repo) -> Result<u8> {
     let config = repo.config();
 
     let edenapi_client = edenapi::Builder::from_config(config)?.build()?;
@@ -40,7 +40,7 @@ pub fn run(ctx: ReqCtx<StatusOpts>, repo: &mut Repo) -> Result<u8> {
     segments_path.push("store");
     segments_path.push("segments");
     segments_path.push("v1");
-    let namedag_path = IndexedLogNameDagPath(segments_path);
+    let namedag_path = IndexedLogDagPath(segments_path);
     let mut namedag = namedag_path
         .open()
         .context("error opening segmented changelog")?;
@@ -59,20 +59,20 @@ pub fn run(ctx: ReqCtx<StatusOpts>, repo: &mut Repo) -> Result<u8> {
     let idmap = pull_data
         .idmap
         .into_iter()
-        .map(|(k, v)| (k, VertexName::copy_from(&v.into_byte_array())))
+        .map(|(k, v)| (k, Vertex::copy_from(&v.into_byte_array())))
         .collect();
 
     let vertex_pull_data = CloneData {
         flat_segments: pull_data.flat_segments,
         idmap,
     };
-    let heads = VertexListWithOptions::from(vec![VertexName::copy_from(ctx.opts.to.as_bytes())])
+    let heads = VertexListWithOptions::from(vec![Vertex::copy_from(ctx.opts.to.as_bytes())])
         .with_desired_group(Group::MASTER);
 
     block_on(namedag.import_pull_data(vertex_pull_data, &heads))
         .context("error importing segmented changelog")??;
 
-    let master = VertexName::copy_from(&to.into_byte_array());
+    let master = Vertex::copy_from(&to.into_byte_array());
     let heads = VertexListWithOptions::from(vec![master]).with_desired_group(Group::MASTER);
     block_on(namedag.flush(&heads)).context("error writing segmented changelog to disk")??;
 

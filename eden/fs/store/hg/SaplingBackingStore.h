@@ -55,6 +55,7 @@ struct HgImportTraceEvent : TraceEventBase {
     BLOB,
     TREE,
     BLOBMETA,
+    TREEMETA,
   };
 
   static HgImportTraceEvent queue(
@@ -192,18 +193,22 @@ class SaplingBackingStore final : public BackingStore {
     BLOB,
     TREE,
     BLOBMETA,
+    TREEMETA,
     BATCHED_BLOB,
     BATCHED_TREE,
     BATCHED_BLOBMETA,
+    BATCHED_TREEMETA,
     PREFETCH
   };
-  constexpr static std::array<SaplingImportObject, 7> saplingImportObjects{
+  constexpr static std::array<SaplingImportObject, 9> saplingImportObjects{
       SaplingImportObject::BLOB,
       SaplingImportObject::TREE,
       SaplingImportObject::BLOBMETA,
+      SaplingImportObject::TREEMETA,
       SaplingImportObject::BATCHED_BLOB,
       SaplingImportObject::BATCHED_TREE,
       SaplingImportObject::BATCHED_BLOBMETA,
+      SaplingImportObject::BATCHED_TREEMETA,
       SaplingImportObject::PREFETCH};
 
   static folly::StringPiece stringOfSaplingImportObject(
@@ -288,6 +293,9 @@ class SaplingBackingStore final : public BackingStore {
   int64_t dropAllPendingRequestsFromQueue() override;
 
  private:
+  FRIEND_TEST(
+      SaplingBackingStoreNoFaultInjectorTest,
+      cachingPolicyConstruction);
   FRIEND_TEST(SaplingBackingStoreNoFaultInjectorTest, getTree);
   FRIEND_TEST(SaplingBackingStoreWithFaultInjectorTest, getTree);
   FRIEND_TEST(SaplingBackingStoreNoFaultInjectorTest, getBlob);
@@ -305,6 +313,13 @@ class SaplingBackingStore final : public BackingStore {
   // Forbidden copy constructor and assignment operator
   SaplingBackingStore(const SaplingBackingStore&) = delete;
   SaplingBackingStore& operator=(const SaplingBackingStore&) = delete;
+
+  /**
+   * Meant to be called by the constructor to determine the local store caching
+   * policy based on configurable options. To inspect the caching policy, call
+   * BackingStore::getLocalStoreCachingPolicy()
+   */
+  LocalStoreCachingPolicy constructLocalStoreCachingPolicy();
 
   /**
    * Import the manifest for the specified revision using mercurial
@@ -391,8 +406,35 @@ class SaplingBackingStore final : public BackingStore {
       const ObjectFetchContextPtr& context);
 
   folly::SemiFuture<GetTreeMetaResult> getTreeMetadata(
-      const ObjectId& /*id*/,
-      const ObjectFetchContextPtr& /*context*/) override;
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
+
+  /**
+   * Create a tree metadata fetch request and enqueue it to the
+   * SaplingImportRequestQueue
+   *
+   * For latency sensitive context, the caller is responsible for checking if
+   * the tree metadata is present locally, as this function will always push
+   * the request at the end of the queue.
+   */
+  ImmediateFuture<GetTreeMetaResult> getTreeMetadataEnqueue(
+      const ObjectId& id,
+      const HgProxyHash& proxyHash,
+      const ObjectFetchContextPtr& context);
+
+  /**
+   * Fetch multiple aux data at once.
+   *
+   * This function returns when all the aux data have been fetched.
+   */
+  void getTreeMetadataBatch(
+      const ImportRequestsList& requests,
+      sapling::FetchMode fetch_mode);
+
+  /**
+   * Reads tree metadata from hg cache.
+   */
+  folly::Try<TreeMetadataPtr> getLocalTreeMetadata(const HgProxyHash& id);
 
   folly::SemiFuture<GetBlobResult> getBlob(
       const ObjectId& id,
@@ -494,6 +536,8 @@ class SaplingBackingStore final : public BackingStore {
   void processTreeImportRequests(
       std::vector<std::shared_ptr<SaplingImportRequest>>&& requests);
   void processBlobMetaImportRequests(
+      std::vector<std::shared_ptr<SaplingImportRequest>>&& requests);
+  void processTreeMetaImportRequests(
       std::vector<std::shared_ptr<SaplingImportRequest>>&& requests);
 
   ImmediateFuture<GetGlobFilesResult> getGlobFiles(
@@ -628,6 +672,8 @@ class SaplingBackingStore final : public BackingStore {
       pendingImportBlobMetaWatches_;
   mutable RequestMetricsScope::LockedRequestWatchList pendingImportTreeWatches_;
   mutable RequestMetricsScope::LockedRequestWatchList
+      pendingImportTreeMetaWatches_;
+  mutable RequestMetricsScope::LockedRequestWatchList
       pendingImportPrefetchWatches_;
 
   // Track metrics for imports currently fetching data from hg
@@ -636,6 +682,8 @@ class SaplingBackingStore final : public BackingStore {
   mutable RequestMetricsScope::LockedRequestWatchList
       liveImportBlobMetaWatches_;
   mutable RequestMetricsScope::LockedRequestWatchList
+      liveImportTreeMetaWatches_;
+  mutable RequestMetricsScope::LockedRequestWatchList
       liveImportPrefetchWatches_;
 
   // Track metrics for the number of live batches
@@ -643,6 +691,8 @@ class SaplingBackingStore final : public BackingStore {
   mutable RequestMetricsScope::LockedRequestWatchList liveBatchedTreeWatches_;
   mutable RequestMetricsScope::LockedRequestWatchList
       liveBatchedBlobMetaWatches_;
+  mutable RequestMetricsScope::LockedRequestWatchList
+      liveBatchedTreeMetaWatches_;
 
   std::unique_ptr<SaplingBackingStoreOptions> runtimeOptions_;
 

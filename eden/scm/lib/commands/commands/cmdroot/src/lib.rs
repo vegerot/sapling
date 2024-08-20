@@ -20,7 +20,7 @@ define_flags! {
     }
 }
 
-pub fn run(ctx: ReqCtx<RootOpts>, repo: &mut Repo) -> Result<u8> {
+pub fn run(ctx: ReqCtx<RootOpts>, repo: &Repo) -> Result<u8> {
     let path = match (ctx.opts.shared, ctx.opts.dotdir) {
         (false, false) => repo.path(),
         (false, true) => repo.dot_hg_path(),
@@ -46,7 +46,7 @@ pub fn doc() -> &'static str {
 
     Frequently useful in shells scripts and automation to run commands like::
 
-       $  ./$(sl root)/bin/script.py
+       $ $(@prog@ root)/bin/script.py
 
     Returns 0 on success."#
 }

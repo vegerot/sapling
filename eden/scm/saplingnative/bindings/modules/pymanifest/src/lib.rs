@@ -20,6 +20,7 @@ use cpython_ext::convert::ImplInto;
 use cpython_ext::pyset_add;
 use cpython_ext::pyset_new;
 use cpython_ext::PyNone;
+use cpython_ext::PyPath;
 use cpython_ext::PyPathBuf;
 use cpython_ext::ResultPyErrExt;
 use manifest::DiffType;
@@ -28,6 +29,7 @@ use manifest::FileMetadata;
 use manifest::FileType;
 use manifest::FsNodeMetadata;
 use manifest::Manifest;
+use manifest_tree::apply_diff_grafts;
 use manifest_tree::TreeManifest;
 use manifest_tree::TreeStore;
 use parking_lot::RwLock;
@@ -115,7 +117,7 @@ py_class!(pub class treemanifest |py| {
             }
         };
         let tree = self.underlying(py).read();
-        match tree.get_file(&repo_path).map_pyerr(py)? {
+        match tree.get_file(repo_path).map_pyerr(py)? {
             None => {
                 let msg = format!("cannot find file '{}' in manifest", repo_path);
                 Err(PyErr::new::<exc::KeyError, _>(py, msg))
@@ -127,27 +129,27 @@ py_class!(pub class treemanifest |py| {
     def get(&self, path: PyPathBuf, default: Option<PyBytes> = None) -> PyResult<Option<PyBytes>> {
         let repo_path = path.to_repo_path().map_pyerr(py)?;
         let tree = self.underlying(py).read();
-        let result = match tree.get_file(&repo_path).map_pyerr(py)? {
-            None => None,
-            Some(file_metadata) => Some(node_to_pybytes(py, file_metadata.hgid)),
-        };
+        let result = tree
+            .get_file(repo_path)
+            .map_pyerr(py)?
+            .map(|file_metadata| node_to_pybytes(py, file_metadata.hgid));
         Ok(result.or(default))
     }
 
     def flags(&self, path: PyPathBuf, default: Option<PyString> = None) -> PyResult<PyString> {
         let repo_path = path.to_repo_path().map_pyerr(py)?;
         let tree = self.underlying(py).read();
-        let result = match tree.get_file(&repo_path).map_pyerr(py)? {
-            None => None,
-            Some(file_metadata) => Some(file_type_to_pystring(py, file_metadata.file_type)),
-        };
+        let result = tree
+            .get_file(repo_path)
+            .map_pyerr(py)?
+            .map(|file_metadata| file_type_to_pystring(py, file_metadata.file_type));
         Ok(result.or(default).unwrap_or_else(|| PyString::new(py, "")))
     }
 
     def hasdir(&self, path: PyPathBuf) -> PyResult<bool> {
         let repo_path = path.to_repo_path().map_pyerr(py)?;
         let tree = self.underlying(py).read();
-        let result = match tree.get(&repo_path).map_pyerr(py)? {
+        let result = match tree.get(repo_path).map_pyerr(py)? {
             Some(FsNodeMetadata::Directory(_)) => true,
             _ => false
         };
@@ -294,6 +296,9 @@ py_class!(pub class treemanifest |py| {
         Ok(Python::None(py))
     }
 
+    /// Diff between two treemanifests.
+    ///
+    /// Return a dict of {path: (left, right)}, where left and right are (file_hgid, file_type) tuple.
     def diff(&self, other: &treemanifest, matcher: Option<PyObject> = None) -> PyResult<PyDict> {
         fn convert_side_diff(
             py: Python,
@@ -323,6 +328,79 @@ py_class!(pub class treemanifest |py| {
             result.set_item(py, path, (diff_left, diff_right))?;
         }
         Ok(result)
+    }
+
+    /// Insert `other[other_path]` into `self[path]`.
+    ///
+    /// See more details in `TreeManifest::graft`.
+    def graft(&self, path: &PyPath, other: &treemanifest, other_path: &PyPath, ) -> PyResult<PyNone> {
+        let this_tree = self.underlying(py);
+        let other_tree = other.underlying(py);
+        let other_path = other_path.to_repo_path().map_pyerr(py)?;
+        let path = path.to_repo_path().map_pyerr(py)?;
+
+        let other_tree_guard = other_tree.read();
+        this_tree.write().graft(path, other_tree_guard.borrow(), other_path).map_pyerr(py)?;
+
+        Ok(PyNone)
+    }
+
+    /// Register a graft to take effect during `diff` operations.
+    /// This allows temporarily moving tree nodes around just for the diff.
+    /// See `ungraftedpath` for mapping the diff result back to the original path.
+    def registerdiffgraft(&self, from: &PyPath, to: &PyPath) -> PyResult<PyNone> {
+        self.underlying(py)
+            .write()
+            .register_diff_graft(
+                from.to_repo_path().map_pyerr(py)?,
+                to.to_repo_path().map_pyerr(py)?,
+            ).map_pyerr(py)?;
+        Ok(PyNone)
+    }
+
+    /// Map a grafted path back to this manifest's original path.
+    /// This is used in conjunction with `graftfordiff` to translate a grafted path in the
+    /// diff result back to the original path, if any.
+    def ungraftedpath(&self, path: &PyPath) -> PyResult<Option<PyPathBuf>> {
+        Ok(self.underlying(py)
+           .read()
+           .ungrafted_path(path.to_repo_path().map_pyerr(py)?)
+           .map(|p| p.into()))
+    }
+
+    /// Report whether this manifest has any registered diff grafts.
+    def hasgrafts(&self) -> PyResult<bool> {
+        Ok(self.underlying(py).read().has_grafts())
+    }
+
+    /// Turn a regular path into the equivalent paths after applying registered grafts.
+    /// This is the inverse of ungraftedpath, but is one-to-many in this direction.
+    def graftedpaths(&self, path: &PyPath) -> PyResult<Vec<PyPathBuf>> {
+        Ok(self.underlying(py)
+           .read()
+           .grafted_paths(path.to_repo_path().map_pyerr(py)?)
+           .into_iter()
+           .map(|p| p.into())
+           .collect())
+    }
+
+    /// Turn the regular local_path into the equivalent grafted path, inferring which
+    /// graft to use based on dest_path.
+    def graftedpath(&self, local_path: &PyPath, dest_path: &PyPath) -> PyResult<Option<PyPathBuf>> {
+        Ok(self.underlying(py)
+           .read()
+           .grafted_path(local_path.to_repo_path().map_pyerr(py)?, dest_path.to_repo_path().map_pyerr(py)?)
+           .map(|p| p.into()))
+    }
+
+    /// Turn a regular path into the containing grafts after applying registered grafts.
+    def grafteddests(&self, path: &PyPath) -> PyResult<Vec<PyPathBuf>> {
+        Ok(self.underlying(py)
+           .read()
+           .grafted_dests(path.to_repo_path().map_pyerr(py)?)
+           .into_iter()
+           .map(|p| p.into())
+           .collect())
     }
 
     /// Find modified directories. Return [(path: str, exist_left: bool, exist_right: bool)].
@@ -399,7 +477,7 @@ py_class!(pub class treemanifest |py| {
     def __delitem__(&self, path: PyPathBuf) -> PyResult<()> {
         let mut tree = self.underlying(py).write();
         let repo_path = path.to_repo_path().map_pyerr(py)?;
-        tree.remove(&repo_path).map_pyerr(py)?;
+        tree.remove(repo_path).map_pyerr(py)?;
         let mut pending_delete = self.pending_delete(py).borrow_mut();
         pending_delete.remove(repo_path);
         Ok(())
@@ -408,7 +486,7 @@ py_class!(pub class treemanifest |py| {
     def __getitem__(&self, path: PyPathBuf) -> PyResult<PyBytes> {
         let repo_path = path.to_repo_path().map_pyerr(py)?;
         let tree = self.underlying(py).read();
-        match tree.get_file(&repo_path).map_pyerr(py)? {
+        match tree.get_file(repo_path).map_pyerr(py)? {
             Some(file_metadata) => Ok(node_to_pybytes(py, file_metadata.hgid)),
             None => Err(PyErr::new::<exc::KeyError, _>(py, format!("file {} not found", path))),
         }
@@ -428,12 +506,17 @@ py_class!(pub class treemanifest |py| {
         Ok(result)
     }
 
+    /// Report whether this manifest has been modified (in-memory).
+    def dirty(&self) -> PyResult<bool> {
+        Ok(self.underlying(py).read().is_dirty())
+    }
+
     // iterator stuff
 
     def __contains__(&self, path: PyPathBuf) -> PyResult<bool> {
         let repo_path = path.to_repo_path().map_pyerr(py)?;
         let tree = self.underlying(py).read();
-        match tree.get_file(&repo_path).map_pyerr(py)? {
+        match tree.get_file(repo_path).map_pyerr(py)? {
             Some(_) => Ok(true),
             None => Ok(false),
         }
@@ -542,6 +625,17 @@ py_class!(pub class treemanifest |py| {
         let mut tree = self.underlying(py).write();
         let hgid = tree.flush().map_pyerr(py)?;
         Ok(PyBytes::new(py, hgid.as_ref()))
+    }
+
+    @classmethod def applydiffgrafts(_cls, m1: &treemanifest, m2: &treemanifest) -> PyResult<(Self, Self)> {
+        let (m1, m2) = apply_diff_grafts(
+            &m1.underlying(py).read(),
+            &m2.underlying(py).read(),
+        ).map_pyerr(py)?;
+        Ok((
+            Self::create_instance(py, Arc::new(RwLock::new(m1)), Default::default())?,
+            Self::create_instance(py, Arc::new(RwLock::new(m2)), Default::default())?,
+        ))
     }
 
 });

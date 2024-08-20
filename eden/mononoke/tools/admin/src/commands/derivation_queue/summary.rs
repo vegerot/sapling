@@ -21,6 +21,10 @@ pub struct SummaryArgs {
     /// Display the client info for each item in the queue
     #[clap(short, long)]
     client_info: bool,
+
+    /// Limit the number of items to display.
+    #[clap(short, long, default_value_t = 20)]
+    limit: usize,
 }
 
 pub async fn summary(
@@ -38,14 +42,23 @@ pub async fn summary(
 
     let mut table = Table::new();
 
-    let mut titles = row!["type", "bubble", "head", "root"];
+    let mut titles = row!["time in queue", "type", "bubble", "head", "root"];
     if args.client_info {
         titles.add_cell(cell!["client info"]);
     }
     table.set_titles(titles);
 
-    for item in summary.items {
+    println!("Number of items in the queue: {}", summary.items.len());
+    for item in summary.items.into_iter().take(args.limit) {
+        let timestamp = item
+            .enqueue_timestamp()
+            .ok_or_else(|| anyhow!("Missing enqueue timestamp"))?;
         let mut row = row![
+            format!(
+                "{}s{}ms",
+                timestamp.since_seconds(),
+                timestamp.since_millis() % 1000
+            ),
             item.derived_data_type(),
             format!("{:?}", item.bubble_id()),
             item.head_cs_id(),

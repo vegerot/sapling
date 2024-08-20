@@ -2,7 +2,6 @@
 #require no-eden
 
 
-  $ setconfig format.use-segmented-changelog=true
   $ configure modern
 
   $ reinit () {
@@ -472,3 +471,22 @@ for documentation:
   diff --git a/0 b/3
   copy from 0
   copy to 3
+
+
+Give errors for invalid commit names for files:
+  $ newrepo
+  $ drawdag <<EOS
+  > A  # B/oops = oops
+  > EOS
+  abort: unused files: ['B/oops']
+  [255]
+
+
+Support file names with dashes:
+  $ newrepo
+  $ drawdag <<EOS
+  > A  # A/hi-there = foo
+  > EOS
+  $ hg st --change $A
+  A A
+  A hi-there

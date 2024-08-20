@@ -16,16 +16,11 @@ use anyhow::Result;
 use bonsai_git_mapping::BonsaisOrGitShas;
 use bonsai_tag_mapping::BonsaiTagMappingEntry;
 use bookmarks::BookmarkKey;
-use bookmarks::BookmarkPagination;
-use bookmarks::BookmarkPrefix;
 use buffered_weighted::MemoryBound;
-use buffered_weighted::StreamExt as _;
 use bytes::Bytes;
 use cloned::cloned;
 use commit_graph_types::frontier::AncestorsWithinDistance;
 use context::CoreContext;
-use futures::future;
-use futures::future::Either;
 use futures::stream;
 use futures::stream::BoxStream;
 use futures::stream::FuturesOrdered;
@@ -60,6 +55,8 @@ use repo_derived_data::RepoDerivedData;
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 
+use crate::bookmarks_provider::bookmarks;
+use crate::bookmarks_provider::list_tags;
 use crate::types::DeltaInclusion;
 use crate::types::FetchFilter;
 use crate::types::FetchRequest;
@@ -72,6 +69,7 @@ use crate::types::PackItemStreamResponse;
 use crate::types::PackfileConcurrency;
 use crate::types::PackfileItemInclusion;
 use crate::types::RefTarget;
+use crate::types::RefsSource;
 use crate::types::RequestedRefs;
 use crate::types::RequestedSymrefs;
 use crate::types::ShallowInfoRequest;
@@ -82,8 +80,6 @@ use crate::types::TagInclusion;
 use crate::Repo;
 use crate::HEAD_REF;
 use crate::REF_PREFIX;
-use crate::TAGS_PREFIX;
-use crate::THRESHOLD_BYTES;
 
 /// Set of parameters that are needed by the generators used for constructing
 /// response for fetch request
@@ -130,62 +126,6 @@ impl FetchContainer {
     }
 }
 
-/// Get the bookmarks (branches, tags) and their corresponding commits
-/// for the given repo based on the request parameters. If the request
-/// specifies a predefined mapping of an existing or new bookmark to a
-/// commit, include that in the output as well
-async fn bookmarks(
-    ctx: &CoreContext,
-    repo: &impl Repo,
-    requested_refs: &RequestedRefs,
-) -> Result<FxHashMap<BookmarkKey, ChangesetId>> {
-    let mut bookmarks = repo
-        .bookmarks_cache()
-        .list(
-            ctx,
-            &BookmarkPrefix::empty(),
-            &BookmarkPagination::FromStart,
-            None, // Limit
-        )
-        .await?
-        .into_iter()
-        .filter_map(|(bookmark, (cs_id, _))| {
-            let refs = requested_refs.clone();
-            let name = bookmark.name().to_string();
-            match refs {
-                RequestedRefs::Included(refs) if refs.contains(&name) => Some((bookmark, cs_id)),
-                RequestedRefs::IncludedWithPrefix(ref_prefixes) => {
-                    let ref_name = format!("{}{}", REF_PREFIX, name);
-                    if ref_prefixes
-                        .iter()
-                        .any(|ref_prefix| ref_name.starts_with(ref_prefix))
-                    {
-                        Some((bookmark, cs_id))
-                    } else {
-                        None
-                    }
-                }
-                RequestedRefs::Excluded(refs) if !refs.contains(&name) => Some((bookmark, cs_id)),
-                RequestedRefs::IncludedWithValue(refs) => {
-                    refs.get(&name).map(|cs_id| (bookmark, cs_id.clone()))
-                }
-                _ => None,
-            }
-        })
-        .collect::<FxHashMap<_, _>>();
-    // In case the requested refs include specified refs with value and those refs are not
-    // bookmarks known at the server, we need to manually include them in the output
-    if let RequestedRefs::IncludedWithValue(ref ref_value_map) = requested_refs {
-        for (ref_name, ref_value) in ref_value_map {
-            bookmarks.insert(
-                BookmarkKey::with_name(ref_name.as_str().try_into()?),
-                ref_value.clone(),
-            );
-        }
-    }
-    Ok(bookmarks)
-}
-
 /// Get the refs (branches, tags) and their corresponding object ids
 /// The input refs should be of the form `refs/<ref_name>`
 pub async fn ref_oid_mapping(
@@ -199,7 +139,8 @@ pub async fn ref_oid_mapping(
             .map(|want_ref| want_ref.trim_start_matches(REF_PREFIX).to_owned())
             .collect(),
     );
-    let wanted_refs = bookmarks(ctx, repo, &requested_refs)
+    // Fetch the bookmarks from the WBC since this is Git read path and we are fine with some staleness
+    let wanted_refs = bookmarks(ctx, repo, &requested_refs, RefsSource::WarmBookmarksCache)
         .await
         .context("Error while fetching bookmarks for ref_oid_mapping")?;
     let bonsai_git_mappings =
@@ -465,17 +406,6 @@ fn entry_weight(
     weight as usize
 }
 
-fn scaled_entry_weight(
-    entry: &(dyn GitDeltaManifestEntryOps + Send),
-    delta_inclusion: DeltaInclusion,
-    filter: Arc<Option<FetchFilter>>,
-) -> usize {
-    std::cmp::max(
-        entry_weight(entry, delta_inclusion, filter) / THRESHOLD_BYTES,
-        1,
-    )
-}
-
 fn to_commit_stream(commits: Vec<ChangesetId>) -> BoxStream<'static, Result<ChangesetId>> {
     stream::iter(commits.into_iter().map(Ok)).boxed()
 }
@@ -534,15 +464,8 @@ async fn tagged_commits(
         .collect::<FxHashSet<String>>();
     let tag_names = Arc::new(tag_names);
     // Fetch the commits pointed to by those tags
-    // TODO: We can probably do the filtering on the DB instead of on the server
-    let tagged_commits = repo
-        .bookmarks_cache()
-        .list(
-            ctx,
-            &BookmarkPrefix::new(TAGS_PREFIX)?,
-            &BookmarkPagination::FromStart,
-            None, // Limit
-        )
+    // Use WBC for fetching bookmarks since this is Git read path
+    let tagged_commits = list_tags(ctx, repo, RefsSource::WarmBookmarksCache)
         .await
         .map(|entries| {
             entries
@@ -1113,10 +1036,17 @@ fn packfile_stream_from_changesets<'a>(
             }
         }
 
-        while let Poll::Ready(Some(entries)) = delta_manifest_entries_futures.poll_next_unpin(cx) {
-            let entries = entries?;
-            for entry in entries {
-                delta_manifest_entries_buffer.push_back(entry);
+        // Ensure that we don't poll `delta_manifest_entries_futures` if it's empty. Technically this
+        // might not be necessary, but streams are not supposed to be polled again if they ever return
+        // Poll::Ready(None) so let's be safe.
+        if !delta_manifest_entries_futures.is_empty() {
+            while let Poll::Ready(Some(entries)) =
+                delta_manifest_entries_futures.poll_next_unpin(cx)
+            {
+                let entries = entries?;
+                for entry in entries {
+                    delta_manifest_entries_buffer.push_back(entry);
+                }
             }
         }
 
@@ -1148,108 +1078,17 @@ fn packfile_stream_from_changesets<'a>(
                 break;
             }
         }
-
-        packfile_items_futures.poll_next_unpin(cx)
+        // If none of the delta_manifest_entries_futures have completed, then its possible that packfile_item_futures is empty. If we return
+        // packfile_items_futures.poll_next_unpin() in that case then we will end up returning Poll::Ready(None) and the stream will never get
+        // polled again even though there are still items to be processed.
+        if packfile_items_futures.is_empty() {
+            Poll::Pending
+        } else {
+            packfile_items_futures.poll_next_unpin(cx)
+        }
     })
     .try_filter_map(futures::future::ok)
     .boxed()
-}
-
-async fn packfile_stream_from_objects<'a>(
-    fetch_container: FetchContainer,
-    base_set: Arc<FxHashSet<ObjectId>>,
-    object_stream: BoxStream<
-        'a,
-        Result<(ChangesetId, MPath, Box<dyn GitDeltaManifestEntryOps + Send>)>,
-    >,
-) -> BoxStream<'a, Result<PackfileItem>> {
-    let FetchContainer {
-        ctx,
-        blobstore,
-        delta_inclusion,
-        filter,
-        concurrency,
-        packfile_item_inclusion,
-        ..
-    } = fetch_container;
-    let delta_filter = filter.clone();
-    object_stream
-        .try_filter_map(move |(cs_id, path, entry)| {
-            let base_set = base_set.clone();
-            let filter = filter.clone();
-            async move {
-                let object_id = entry.full_object_oid();
-                let (kind, size) = (entry.full_object_kind(), entry.full_object_size());
-                if base_set.contains(&object_id) {
-                    // This object is already present at the client, so do not include it in the packfile
-                    Ok(None)
-                } else if !filter_object(filter, &path, kind, size) {
-                    // This object does not pass the filter specified by the client, so do not include it in the packfile
-                    Ok(None)
-                } else {
-                    Ok(Some((cs_id, path, entry)))
-                }
-            }
-        })
-        // We use map + buffered instead of map_ok + try_buffered since weighted buffering for futures
-        // currently exists only for Stream and not for TryStream
-        .map(move |result| {
-            match result {
-                Err(err) => (0, Either::Left(future::err(err))),
-                std::result::Result::Ok((changeset_id, path, entry)) => {
-                    cloned!(ctx, blobstore, delta_filter as filter);
-                    let weight = scaled_entry_weight(entry.as_ref(), delta_inclusion, filter.clone());
-                    let fetch_future = async move {
-                        let delta = delta_base(entry.as_ref(), delta_inclusion, filter);
-                        match delta {
-                            Some(delta) => {
-                                let instruction_bytes = delta
-                                    .instruction_bytes(&ctx, &blobstore.boxed(), changeset_id, path)
-                                    .await?;
-
-                                let packfile_item = PackfileItem::new_delta(
-                                    entry.full_object_oid(),
-                                    delta.base_object_oid(),
-                                    delta.instructions_uncompressed_size(),
-                                    instruction_bytes,
-                                );
-                                Ok(packfile_item)
-                            }
-                            None => {
-                                // Use the full object instead
-                                if let Some(inlined_bytes) =
-                                    entry.full_object_inlined_bytes()
-                                {
-                                    Ok(PackfileItem::new_encoded_base(
-                                        GitPackfileBaseItem::from_encoded_bytes(inlined_bytes)
-                                            .with_context(|| {
-                                                format!(
-                                                    "Error in creating GitPackfileBaseItem from encoded bytes for {:?}",
-                                                    entry.full_object_oid(),
-                                                )
-                                            })?
-                                            .try_into()?,
-                                    ))
-                                } else {
-                                    base_packfile_item(
-                                        ctx.clone(),
-                                        blobstore.clone(),
-                                        ObjectIdentifierType::AllObjects(GitIdentifier::Rich(
-                                            entry.full_object_rich_git_sha1()?,
-                                        )),
-                                        packfile_item_inclusion,
-                                    )
-                                    .await
-                                }
-                            }
-                        }
-                    };
-                    (weight, Either::Right(fetch_future))
-                }
-            }
-        })
-        .buffered_weighted_bounded(concurrency.trees_and_blobs, concurrency.memory_bound)
-        .boxed()
 }
 
 /// Create a stream of packfile items containing blob and tree objects that need to be included in the packfile/bundle.
@@ -1265,7 +1104,6 @@ async fn tree_and_blob_packfile_stream<'a>(
     let FetchContainer {
         ctx,
         blobstore,
-        derived_data,
         concurrency,
         packfile_item_inclusion,
         ..
@@ -1294,41 +1132,7 @@ async fn tree_and_blob_packfile_stream<'a>(
         .boxed();
 
     let packfile_item_stream =
-        if justknobs::eval("scm/mononoke:use_optimized_git_packfile_stream", None, None)? {
-            packfile_stream_from_changesets(fetch_container, base_set, target_commits)
-        } else {
-            let packfile_item_stream = stream::iter(target_commits)
-                .map(Ok)
-                .map_ok({
-                    cloned!(ctx, blobstore, derived_data);
-                    move |changeset_id| {
-                        cloned!(ctx, blobstore, derived_data);
-                        async move {
-                            Ok(stream::iter(
-                                changeset_delta_manifest_entries(
-                                    ctx,
-                                    blobstore,
-                                    derived_data,
-                                    fetch_container.git_delta_manifest_version,
-                                    changeset_id,
-                                )
-                                .await?,
-                            )
-                            .map(Ok))
-                        }
-                    }
-                })
-                .try_buffered(concurrency.trees_and_blobs * 2)
-                .try_flatten()
-                .boxed();
-            packfile_stream_from_objects(
-                fetch_container.clone(),
-                base_set.clone(),
-                packfile_item_stream,
-            )
-            .await
-            .boxed()
-        };
+        packfile_stream_from_changesets(fetch_container, base_set, target_commits);
 
     let requested_trees_and_blobs = stream::iter(tree_and_blob_shas.into_iter().map(Ok))
         .map_ok(move |oid| {
@@ -1496,29 +1300,21 @@ async fn tags_packfile_stream<'a>(
     // NOTE: Fun git trick. If the client says it doesn't want tags, then instead of excluding all tags (like regular systems)
     // we still send the tags that were explicitly part of the client's WANT request :)
     let required_tag_names = match include_tags {
-        true => {
-            repo.bookmarks_cache()
-                .list(
-                    &ctx,
-                    &BookmarkPrefix::new(TAGS_PREFIX)?,
-                    &BookmarkPagination::FromStart,
-                    None, // Limit
-                )
-                .await
-                .map(|entries| {
-                    entries
-                        .into_iter()
-                        .filter_map(|(bookmark, (cs_id, _))| {
-                            if requested_commits.contains(&cs_id) {
-                                Some(bookmark.name().to_string())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<FxHashSet<_>>()
-                })
-                .context("Error in getting tags pointing to input set of commits")?
-        }
+        true => list_tags(&ctx, repo, RefsSource::WarmBookmarksCache) // Use WBC for read path
+            .await
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter_map(|(bookmark, (cs_id, _))| {
+                        if requested_commits.contains(&cs_id) {
+                            Some(bookmark.name().to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<FxHashSet<_>>()
+            })
+            .context("Error in getting tags pointing to input set of commits")?,
         false => FxHashSet::default(),
     };
     // Fetch entries corresponding to annotated tags in the repo or with names
@@ -1547,7 +1343,7 @@ pub async fn generate_pack_item_stream<'a>(
     request: PackItemStreamRequest,
 ) -> Result<PackItemStreamResponse<'a>> {
     // We need to include the bookmarks (i.e. branches, tags) in the pack based on the request parameters
-    let bookmarks = bookmarks(&ctx, repo, &request.requested_refs)
+    let bookmarks = bookmarks(&ctx, repo, &request.requested_refs, request.refs_source)
         .await
         .with_context(|| {
             format!(
@@ -1646,7 +1442,7 @@ pub async fn ls_refs_response(
     request: LsRefsRequest,
 ) -> Result<LsRefsResponse> {
     // We need to include the bookmarks (i.e. branches, tags) based on the request parameters
-    let bookmarks = bookmarks(ctx, repo, &request.requested_refs)
+    let bookmarks = bookmarks(ctx, repo, &request.requested_refs, request.refs_source)
         .await
         .with_context(|| {
             format!(

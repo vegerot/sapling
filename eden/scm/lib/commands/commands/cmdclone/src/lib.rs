@@ -516,6 +516,15 @@ fn clone_metadata(
         return eager_clone(ctx, config, source, destination);
     }
 
+    // Enabling segmented changelog too early breaks the revlog_clone that is needed below
+    // in some cases, so make sure it isn't on.
+    config.set(
+        "format",
+        "use-segmented-changelog",
+        Some("false"),
+        &"clone cmd".into(),
+    );
+
     let mut repo = Repo::init(
         destination,
         config,
@@ -718,7 +727,7 @@ fn get_selective_bookmarks(repo: &Repo) -> Result<Vec<String>> {
 #[instrument(skip_all, err, ret)]
 fn get_update_target(
     logger: &TermLogger,
-    repo: &mut Repo,
+    repo: &Repo,
     clone_opts: &CloneOpts,
 ) -> Result<Option<(HgId, String)>> {
     if clone_opts.noupdate {

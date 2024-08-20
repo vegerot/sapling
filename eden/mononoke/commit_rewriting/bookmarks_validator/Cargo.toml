@@ -12,15 +12,17 @@ anyhow = "1.0.75"
 async-trait = "0.1.71"
 bookmarks = { version = "0.1.0", path = "../../bookmarks" }
 cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+clientinfo = { version = "0.1.0", path = "../../../scm/lib/clientinfo" }
 cmdlib = { version = "0.1.0", path = "../../cmdlib" }
 cmdlib_x_repo = { version = "0.1.0", path = "../../cmdlib/x_repo" }
 context = { version = "0.1.0", path = "../../server/context" }
 cross_repo_sync = { version = "0.1.0", path = "../cross_repo_sync" }
 executor_lib = { version = "0.1.0", path = "../../cmdlib/sharding" }
-fbinit = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures = { version = "0.3.30", features = ["async-await", "compat"] }
 justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 live_commit_sync_config = { version = "0.1.0", path = "../live_commit_sync_config" }
+metadata = { version = "0.1.0", path = "../../server/metadata" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
 pushredirect_enable = { version = "0.1.0", path = "../../../../configerator/structs/scm/mononoke/pushredirect" }
 scuba_ext = { version = "0.1.0", path = "../../common/scuba_ext" }

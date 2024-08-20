@@ -10,6 +10,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
+use changesets::ArcChangesets;
+use changesets::ChangesetInsert;
 use commit_graph_types::edges::ChangesetParents;
 use context::CoreContext;
 use futures_stats::TimedTryFutureExt;
@@ -34,6 +36,16 @@ pub trait CommitGraphWriter {
         cs_id: ChangesetId,
         parents: ChangesetParents,
     ) -> Result<bool>;
+
+    /// Add many new changesets to the commit graph. Changesets should
+    /// be sorted in topological order.
+    ///
+    /// Returns the number of newly added changesets to the commit graph.
+    async fn add_many(
+        &self,
+        ctx: &CoreContext,
+        changesets: Vec1<(ChangesetId, ChangesetParents)>,
+    ) -> Result<usize>;
 
     /// Same as add but fetches parent edges using the changeset fetcher
     /// if not found in the storage, and recursively tries to add them.
@@ -71,6 +83,18 @@ impl CommitGraphWriter for BaseCommitGraphWriter {
             .await
             .with_context(|| "during BaseCommitGraphWriter::add")
     }
+
+    async fn add_many(
+        &self,
+        ctx: &CoreContext,
+        changesets: Vec1<(ChangesetId, ChangesetParents)>,
+    ) -> Result<usize> {
+        self.commit_graph
+            .add_many(ctx, changesets)
+            .await
+            .with_context(|| "during BaseCommitGraphWriter::add_many")
+    }
+
     async fn add_recursive(
         &self,
         ctx: &CoreContext,
@@ -81,6 +105,111 @@ impl CommitGraphWriter for BaseCommitGraphWriter {
             .add_recursive(ctx, parents_fetcher, changesets)
             .await
             .with_context(|| "during BaseCommitGraphWriter::add_recursive")
+    }
+}
+
+/// A wrapper around a commit graph writer that writes to both
+/// the wrapped writer and the changesets facet.
+pub struct CompatCommitGraphWriter {
+    inner_writer: ArcCommitGraphWriter,
+    changesets: ArcChangesets,
+}
+
+impl CompatCommitGraphWriter {
+    pub fn new(inner_writer: ArcCommitGraphWriter, changesets: ArcChangesets) -> Self {
+        Self {
+            inner_writer,
+            changesets,
+        }
+    }
+}
+
+#[async_trait]
+impl CommitGraphWriter for CompatCommitGraphWriter {
+    async fn add(
+        &self,
+        ctx: &CoreContext,
+        cs_id: ChangesetId,
+        parents: ChangesetParents,
+    ) -> Result<bool> {
+        let added_to_commit_graph = {
+            if justknobs::eval(
+                "scm/mononoke:disable_double_writing_to_changesets_table",
+                None,
+                None,
+            )? {
+                self.inner_writer.add(ctx, cs_id, parents).await?
+            } else {
+                let cs_insert = ChangesetInsert {
+                    cs_id,
+                    parents: parents.to_vec(),
+                };
+                let (added_to_commit_graph, _added_to_changesets) = futures::try_join!(
+                    self.inner_writer.add(ctx, cs_id, parents),
+                    self.changesets.add(ctx, cs_insert)
+                )?;
+                added_to_commit_graph
+            }
+        };
+        Ok(added_to_commit_graph)
+    }
+
+    async fn add_many(
+        &self,
+        ctx: &CoreContext,
+        changesets: Vec1<(ChangesetId, ChangesetParents)>,
+    ) -> Result<usize> {
+        let added_to_commit_graph = {
+            if justknobs::eval(
+                "scm/mononoke:disable_double_writing_to_changesets_table",
+                None,
+                None,
+            )? {
+                self.inner_writer.add_many(ctx, changesets).await?
+            } else {
+                let cs_inserts = changesets.mapped_ref(|(cs_id, parents)| ChangesetInsert {
+                    cs_id: *cs_id,
+                    parents: parents.to_vec(),
+                });
+                let (added_to_commit_graph, _added_to_changesets) = futures::try_join!(
+                    self.inner_writer.add_many(ctx, changesets),
+                    self.changesets.add_many(ctx, cs_inserts)
+                )?;
+                added_to_commit_graph
+            }
+        };
+        Ok(added_to_commit_graph)
+    }
+
+    async fn add_recursive(
+        &self,
+        ctx: &CoreContext,
+        parents_fetcher: Arc<dyn ParentsFetcher>,
+        changesets: Vec1<(ChangesetId, ChangesetParents)>,
+    ) -> Result<usize> {
+        let added_to_commit_graph = {
+            if justknobs::eval(
+                "scm/mononoke:disable_double_writing_to_changesets_table",
+                None,
+                None,
+            )? {
+                self.inner_writer
+                    .add_recursive(ctx, parents_fetcher, changesets)
+                    .await?
+            } else {
+                let cs_inserts = changesets.mapped_ref(|(cs_id, parents)| ChangesetInsert {
+                    cs_id: *cs_id,
+                    parents: parents.to_vec(),
+                });
+                let (added_to_commit_graph, _added_to_changesets) = futures::try_join!(
+                    self.inner_writer
+                        .add_recursive(ctx, parents_fetcher, changesets),
+                    self.changesets.add_many(ctx, cs_inserts)
+                )?;
+                added_to_commit_graph
+            }
+        };
+        Ok(added_to_commit_graph)
     }
 }
 
@@ -135,6 +264,49 @@ impl CommitGraphWriter for LoggingCommitGraphWriter {
                 scuba.add("num_added", added_to_commit_graph);
 
                 if added_to_commit_graph {
+                    scuba.log_with_msg("Insertion succeeded", None);
+                } else {
+                    scuba.log_with_msg("Changesets already stored", None);
+                }
+
+                Ok(added_to_commit_graph)
+            }
+        }
+    }
+
+    async fn add_many(
+        &self,
+        ctx: &CoreContext,
+        changesets: Vec1<(ChangesetId, ChangesetParents)>,
+    ) -> Result<usize> {
+        let mut scuba = self.scuba.clone();
+
+        scuba.add_common_server_data();
+        if let Some(client_info) = ctx.client_request_info() {
+            scuba.add_client_request_info(client_info);
+        }
+        // Only the last id, which is good enough for logging.
+        scuba.add("changeset_id", changesets.last().0.to_string());
+        scuba.add("changeset_count", changesets.len());
+        scuba.add("repo_name", self.repo_name.as_str());
+
+        match self
+            .inner_writer
+            .add_many(ctx, changesets)
+            .try_timed()
+            .await
+        {
+            Err(err) => {
+                scuba.add("error", err.to_string());
+                scuba.log_with_msg("Insertion failed", None);
+
+                Err(err)
+            }
+            Ok((stats, added_to_commit_graph)) => {
+                scuba.add("time_s", stats.completion_time.as_secs_f64());
+                scuba.add("num_added", added_to_commit_graph);
+
+                if added_to_commit_graph > 0 {
                     scuba.log_with_msg("Insertion succeeded", None);
                 } else {
                     scuba.log_with_msg("Changesets already stored", None);

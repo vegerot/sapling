@@ -130,7 +130,7 @@ class StartTest(testcase.EdenTestCase):
         self.eden.run_cmd("stop")
 
     def edenfsctl_args(self) -> List[str]:
-        return ["--daemon-binary", FindExe.EDEN_DAEMON]
+        return ["-d", FindExe.EDEN_DAEMON]
 
     def edenfs_args(self) -> List[str]:
         args = []
@@ -400,6 +400,7 @@ class StartFakeEdenFSTest(StartFakeEdenFSTestBase):
             index = argv.index("--edenDir")
         except ValueError:
             self.fail(f"--edenDir not present in arguments: {argv}")
+        # pyre-fixme[61]: `index` is undefined, or not always defined.
         actual_config_dir = argv[index + 1]
         self.assertEqual(str(expected), actual_config_dir, f"bad config dir: {argv}")
 

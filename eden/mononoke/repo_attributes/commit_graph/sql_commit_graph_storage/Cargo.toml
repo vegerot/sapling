@@ -12,6 +12,9 @@ anyhow = "1.0.75"
 async-trait = "0.1.71"
 commit_graph_types = { version = "0.1.0", path = "../commit_graph_types" }
 context = { version = "0.1.0", path = "../../../server/context" }
+facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+futures = { version = "0.3.30", features = ["async-await", "compat"] }
+itertools = "0.11.0"
 justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 mononoke_types = { version = "0.1.0", path = "../../../mononoke_types" }
 rendezvous = { version = "0.1.0", path = "../../../common/rendezvous" }
@@ -22,5 +25,5 @@ vec1 = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
 commit_graph_testlib = { version = "0.1.0", path = "../commit_graph_testlib" }
-fbinit = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }

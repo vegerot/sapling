@@ -15,7 +15,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bonsai_git_mapping::BonsaiGitMappingEntry;
 use context::CoreContext;
-use derived_data::impl_bonsai_derived_via_manager;
 use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
@@ -186,8 +185,6 @@ impl BonsaiDerivable for MappedGitCommitId {
     }
 }
 
-impl_bonsai_derived_via_manager!(MappedGitCommitId);
-
 #[cfg(test)]
 mod test {
     use std::collections::HashSet;
@@ -195,12 +192,17 @@ mod test {
 
     use anyhow::format_err;
     use blobstore::Loadable;
+    use bonsai_git_mapping::BonsaiGitMapping;
     use bonsai_git_mapping::BonsaiGitMappingRef;
+    use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::BookmarkKey;
+    use bookmarks::Bookmarks;
     use bookmarks::BookmarksRef;
+    use commit_graph::CommitGraph;
     use commit_graph::CommitGraphRef;
-    use derived_data::BonsaiDerived;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
+    use filestore::FilestoreConfig;
     use fixtures::TestRepoFixture;
     use futures::stream;
     use futures::StreamExt;
@@ -208,11 +210,27 @@ mod test {
     use maplit::hashmap;
     use mononoke_types::hash::GitSha1;
     use mononoke_types::ChangesetIdPrefix;
+    use repo_blobstore::RepoBlobstore;
     use repo_blobstore::RepoBlobstoreArc;
+    use repo_derived_data::RepoDerivedData;
     use repo_derived_data::RepoDerivedDataRef;
+    use repo_identity::RepoIdentity;
 
     use super::*;
     use crate::fetch_non_blob_git_object;
+
+    #[facet::container]
+    struct Repo(
+        dyn BonsaiGitMapping,
+        dyn BonsaiHgMapping,
+        dyn Bookmarks,
+        RepoBlobstore,
+        RepoDerivedData,
+        RepoIdentity,
+        CommitGraph,
+        dyn CommitGraphWriter,
+        FilestoreConfig,
+    );
 
     async fn compare_commits(
         repo: &(impl RepoBlobstoreArc + BonsaiGitMappingRef),
@@ -278,13 +296,7 @@ mod test {
     /// represent the same data.
     async fn run_commit_derivation_for_fixture(
         fb: FacebookInit,
-        repo: impl BookmarksRef
-        + RepoBlobstoreArc
-        + RepoDerivedDataRef
-        + CommitGraphRef
-        + BonsaiGitMappingRef
-        + Send
-        + Sync,
+        repo: Repo,
     ) -> Result<(), anyhow::Error> {
         let ctx = CoreContext::test_mock(fb);
 
@@ -295,7 +307,9 @@ mod test {
             .ok_or_else(|| format_err!("no master"))?;
 
         // Validate that the derivation of the Git commit was successful
-        MappedGitCommitId::derive(&ctx, &repo, bcs_id).await?;
+        repo.repo_derived_data()
+            .derive::<MappedGitCommitId>(&ctx, bcs_id)
+            .await?;
         // All the generated git commit IDs would be stored in BonsaiGitMapping. For all such commits, validate
         // parity with its Bonsai counterpart.
         let all_changesets = repo
@@ -336,7 +350,7 @@ mod test {
             fn $test_name(fb: FacebookInit) -> Result<(), anyhow::Error> {
                 let runtime = tokio::runtime::Runtime::new()?;
                 runtime.block_on(async move {
-                    let repo = fixtures::$fixture::getrepo(fb).await;
+                    let repo: Repo = fixtures::$fixture::get_repo(fb).await;
                     run_commit_derivation_for_fixture(fb, repo).await
                 })
             }

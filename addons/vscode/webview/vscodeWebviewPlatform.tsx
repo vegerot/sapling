@@ -14,7 +14,11 @@ import type {Json} from 'shared/typeUtils';
 import {Internal} from './Internal';
 import {logger} from 'isl/src/logger';
 import {browserPlatformImpl} from 'isl/src/platform/browerPlatformImpl';
+import {registerCleanup} from 'isl/src/utils';
+import {lazy} from 'react';
 import {tryJsonParse} from 'shared/utils';
+
+const VSCodeSettings = lazy(() => import('./VSCodeSettings'));
 
 declare global {
   interface Window {
@@ -101,6 +105,20 @@ export const vscodeWebviewPlatform: Platform = {
   },
   upsellExternalMergeTool: false,
 
+  openDedicatedComparison: async (comparison: Comparison): Promise<boolean> => {
+    const {getComparisonPanelMode} = await import('./state');
+    const mode = getComparisonPanelMode();
+    if (mode === 'Auto') {
+      return false;
+    }
+    window.clientToServerAPI?.postMessage({
+      type: 'platform/executeVSCodeCommand',
+      command: 'sapling.open-comparison-view',
+      args: [comparison],
+    });
+    return true;
+  },
+
   clipboardCopy: browserPlatformImpl.clipboardCopy,
 
   getPersistedState<T extends Json>(key: string): T | null {
@@ -146,9 +164,44 @@ export const vscodeWebviewPlatform: Platform = {
 
   AdditionalDebugContent: Internal.AdditionalDebugContent,
   GettingStartedContent: Internal.GettingStartedContent,
-  GettingStartedBugNuxContent: Internal.GettingStartedBugNuxContent,
+  Settings: VSCodeSettings,
 };
 
 function getTheme(): ThemeColor {
   return document.body.className.includes('vscode-light') ? 'light' : 'dark';
 }
+
+/**
+ * VS Code has a bug where it will lose focus on webview elements (notably text areas) when tabbing out and back in.
+ * To mitigate, we save the currently focused element on window blur, and refocus it on window focus.
+ */
+let lastTextAreaBeforeBlur: HTMLElement | null = null;
+
+const handleWindowFocus = () => {
+  const lastTextArea = lastTextAreaBeforeBlur;
+  lastTextArea?.focus?.();
+};
+const handleWindowBlur = () => {
+  if (document.activeElement == document.body) {
+    // Blur can get called with document.body as document.activeElement after focusing an inner element.
+    // Ignore these, as refocusing document.body is not useful.
+    return;
+  }
+  // Save the last thing that had focus, which is focusable
+  if (
+    document.activeElement == null ||
+    (document.activeElement as HTMLElement | null)?.focus != null
+  ) {
+    lastTextAreaBeforeBlur = document.activeElement as HTMLElement | null;
+  }
+};
+window.addEventListener('focus', handleWindowFocus);
+window.addEventListener('blur', handleWindowBlur);
+registerCleanup(
+  vscodeWebviewPlatform,
+  () => {
+    window.removeEventListener('focus', handleWindowFocus);
+    window.removeEventListener('blur', handleWindowBlur);
+  },
+  import.meta.hot,
+);

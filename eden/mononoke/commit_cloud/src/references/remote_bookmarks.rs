@@ -5,6 +5,10 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashMap;
+use std::str::FromStr;
+
+use anyhow::ensure;
 use clientinfo::ClientRequestInfo;
 use mercurial_types::HgChangesetId;
 use serde::Deserialize;
@@ -17,11 +21,78 @@ use crate::sql::ops::Insert;
 use crate::sql::ops::SqlCommitCloud;
 use crate::sql::remote_bookmarks_ops::DeleteArgs;
 use crate::CommitCloudContext;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceRemoteBookmark {
-    pub name: String,
-    pub commit: HgChangesetId,
-    pub remote: String,
+    name: String,
+    commit: HgChangesetId,
+    remote: String,
+}
+
+impl WorkspaceRemoteBookmark {
+    pub fn new(remote: String, name: String, commit: HgChangesetId) -> anyhow::Result<Self> {
+        ensure!(
+            !name.is_empty(),
+            "'commit cloud' failed: remote bookmark name cannot be empty"
+        );
+        ensure!(
+            !remote.is_empty(),
+            "'commit cloud' failed: remote bookmark 'remote' part cannot be empty"
+        );
+        Ok(Self {
+            name,
+            commit,
+            remote,
+        })
+    }
+
+    pub fn name(&self) -> &String {
+        &self.name
+    }
+
+    pub fn commit(&self) -> &HgChangesetId {
+        &self.commit
+    }
+
+    pub fn remote(&self) -> &String {
+        &self.remote
+    }
+}
+
+pub type RemoteBookmarksMap = HashMap<HgChangesetId, Vec<RemoteBookmark>>;
+
+impl From<RemoteBookmark> for WorkspaceRemoteBookmark {
+    fn from(bookmark: RemoteBookmark) -> Self {
+        Self {
+            name: bookmark.name,
+            commit: bookmark.node.unwrap_or_default().into(),
+            remote: bookmark.remote,
+        }
+    }
+}
+
+pub fn rbs_from_list(bookmarks: &Vec<Vec<String>>) -> anyhow::Result<Vec<WorkspaceRemoteBookmark>> {
+    bookmarks
+        .iter()
+        .map(|bookmark| {
+            ensure!(
+                bookmark.len() == 3,
+                "'commit cloud' failed: Invalid remote bookmark format for {}",
+                bookmark.join(" ")
+            );
+            HgChangesetId::from_str(&bookmark[2]).map(|commit_id| WorkspaceRemoteBookmark {
+                remote: bookmark[0].clone(),
+                name: bookmark[1].clone(),
+                commit: commit_id,
+            })
+        })
+        .collect()
+}
+
+pub fn rbs_to_list(lbs: Vec<WorkspaceRemoteBookmark>) -> Vec<Vec<String>> {
+    lbs.into_iter()
+        .map(|lb| vec![lb.remote, lb.name, lb.commit.to_string()])
+        .collect()
 }
 
 pub async fn update_remote_bookmarks(

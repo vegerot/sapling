@@ -621,17 +621,13 @@ effect and style see :prog:`help color`.
 In addition to pre-defined template keywords, commit log specific one
 below can be used for customization:
 
-``extramsg``
-    String: Extra message (typically 'Leave message empty to abort
-    commit.'). This may be changed by some commands or extensions.
-
 For example, the template configuration below shows as same text as
 one shown by default::
 
     [committemplate]
     changeset = {desc}\n\n
         @PROG@: Enter commit message.  Lines beginning with '@PROG@:' are removed.
-        @PROG@: {extramsg}
+        @PROG@: Leave message empty to abort commit.
         @PROG@: --
         @PROG@: user: {author}\n{ifeq(p2rev, "-1", "",
        "@PROG@: branch merge\n")
@@ -658,7 +654,7 @@ extra message::
     [committemplate]
     changeset = {desc}\n\n
         @PROG@: Enter commit message.  Lines beginning with '@PROG@:' are removed.
-        @PROG@: {extramsg}
+        @PROG@: Leave message empty to abort commit.
         @PROG@: ------------------------ >8 ------------------------
         @PROG@: Do not touch the line above.
         @PROG@: Everything below will be removed.
@@ -4651,4 +4647,70 @@ sort-inserts
           import a
           import b
           import c
+"""
+
+directorybranching = r"""@Product@ supports a form of branching reminiscent of Subversion where each branch is a separate directory.
+Unlike Subversion, the branched directories live side-by-side as normal directories in the working copy.
+
+.. note::
+
+    Despite the "directory" nomenclature, individual files can also be branched using the same operations.
+
+
+Branch Creation
+===============
+
+To create a branch, simply copy the directory::
+
+    $ @prog@ cp my-project my-branch
+    $ @prog@ commit -m "branch my-project"
+
+
+Grafting Between Branches (AKA Cherry Picking)
+==============================================
+
+Use the ``graft`` command to copy a commit from one branch to another::
+
+    $ touch my-project/file
+    $ @prog@ commit -m "add file"
+    $ @prog@ graft -r . --from-path my-project --to-path my-branch
+
+Files in the grafted commit(s) outside of ``--from-path`` are ignored,
+and files in the destination commit outside of ``--to-path`` are
+ignored.
+
+
+Comparing Branches
+==================
+
+The ``diff`` command supports cross-directory comparisons::
+
+    $ echo a > my-project/file
+    $ echo b > my-branch/file
+    $ @prog@ diff --from-path my-project --to-path my-branch
+
+Files outside ``--from-path`` in the left side are ignored, and files
+outside ``--to-path`` on the right side are ignored.
+
+
+Multiple Branches
+=================
+
+Directory branching aware operations support multiple ``--from-path``/``--to-path`` mappings::
+
+    # Create two directory branches:
+    $ @prog@ cp my-project my-branch1
+    $ @prog@ cp my-project my-branch2
+    $ @prog@ commit -m "add branches"
+
+    $ touch my-project/file
+    $ @prog@ commit -m "add file"
+
+    # Copy working parent commit "." onto both my-branch1 and my-branch2 directories:
+    $ @prog@ graft -r . --from-path my-project --to-path my-branch1 --from-path my-project --to-path my-branch2
+
+    # Modify "file" in both branches and then diff both branches against "my-project":
+    $ echo branch1 > my-branch1/file
+    $ echo branch2 > my-branch2/file
+    $ @prog@ diff --from-path my-project --to-path my-branch1 --from-path my-project --to-path my-branch2
 """

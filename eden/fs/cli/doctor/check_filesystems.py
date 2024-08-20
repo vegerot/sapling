@@ -15,8 +15,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
-from typing import Callable, List, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 from eden.fs.cli import hg_util
 from eden.fs.cli.config import EdenCheckout, EdenInstance, InProgressCheckoutError
@@ -27,17 +28,19 @@ from eden.fs.cli.doctor.problem import (
     ProblemTracker,
     RemediationError,
 )
-from eden.fs.cli.doctor.util import CheckoutInfo
+from eden.fs.cli.doctor.util import CheckoutInfo, get_mount_inode_info
 from eden.fs.cli.filesystem import FsUtil
 from eden.fs.cli.prjfs import PRJ_FILE_STATE
 from facebook.eden.constants import DIS_REQUIRE_LOADED, DIS_REQUIRE_MATERIALIZED
 from facebook.eden.ttypes import (
     DebugInvalidateRequest,
+    DebugInvalidateResponse,
     EdenError,
     GetCurrentSnapshotInfoRequest,
     GetScmStatusParams,
     MatchFileSystemRequest,
     MountId,
+    MountInodeInfo,
     RootIdOptions,
     ScmFileStatus,
     SyncBehavior,
@@ -47,6 +50,14 @@ from facebook.eden.ttypes import (
 
 def check_using_nfs_path(tracker: ProblemTracker, mount_path: Path) -> None:
     check_shared_path(tracker, mount_path)
+
+
+def total_inode_count(inode_info: MountInodeInfo) -> int:
+    return (
+        inode_info.loadedFileCount
+        + inode_info.loadedTreeCount
+        + inode_info.unloadedInodeCount
+    )
 
 
 class StateDirOnNFS(Problem):
@@ -306,18 +317,27 @@ def mode_to_str(mode: int) -> str:
 
 
 class MaterializedInodesHaveDifferentModeOnDisk(PathsProblem, FixableProblem):
-    def __init__(self, mount: Path, errors: List[Tuple[Path, int, int]]) -> None:
+    def __init__(
+        self,
+        instance: EdenInstance,
+        mount: Path,
+        errors: Dict[Path, Tuple[int, int]],
+        case_sensitive: bool,
+    ) -> None:
+        self._instance = instance
         self._mount = mount
         self._errors = errors
+        self._case_sensitive = case_sensitive
 
-        formatted_error = [
-            (
-                error[0],
-                f"known to EdenFS as a {mode_to_str(error[2])}, "
-                f"but is a {mode_to_str(error[1])} on disk",
+        formatted_error = []
+        for error, (local_file_mode, eden_mode) in errors.items():
+            formatted_error.append(
+                (
+                    error,
+                    f"known to EdenFS as a {mode_to_str(eden_mode)}, "
+                    f"but is a {mode_to_str(local_file_mode)} on disk",
+                )
             )
-            for error in errors
-        ]
         super().__init__(
             self.omitPathsDescriptionWithException(
                 formatted_error, " has an unexpected file type"
@@ -350,7 +370,7 @@ class MaterializedInodesHaveDifferentModeOnDisk(PathsProblem, FixableProblem):
                 new_path.rename(path)
 
         failed = []
-        for path, _, _ in self._errors:
+        for path in self._errors.keys():
             try:
                 tries = 0
                 while True:
@@ -373,6 +393,49 @@ class MaterializedInodesHaveDifferentModeOnDisk(PathsProblem, FixableProblem):
 """
             )
 
+    def check_fix(self) -> bool:
+        mismatched_modes = []
+        with self._instance.get_thrift_client_legacy() as client:
+            try:
+                materialized = client.debugInodeStatus(
+                    bytes(self._mount),
+                    b"",
+                    flags=DIS_REQUIRE_MATERIALIZED,
+                    sync=SyncBehavior(),
+                )
+                for materialized_dir in materialized:
+                    materialized_name = os.fsdecode(materialized_dir.path)
+                    path = Path(materialized_name)
+                    for dirent in materialized_dir.entries:
+                        name = os.fsdecode(dirent.name)
+                        if not self._case_sensitive:
+                            name = name.lower()
+                        dirent_path = path / Path(name)
+                        if dirent_path in self._errors:
+                            target_dirent_mode = self._errors[dirent_path][0]
+                            if stat.S_IFMT(dirent.mode) != stat.S_IFMT(
+                                target_dirent_mode
+                            ):
+                                mismatched_modes.append(
+                                    (dirent_path, target_dirent_mode, dirent.mode)
+                                )
+            except Exception as ex:
+                raise RemediationError(
+                    f"Unexpected error trying to validate fix for mismatched inode modes in {self._errors}: {ex}"
+                )
+        if mismatched_modes:
+            errorMsg = "\n".join(
+                [
+                    f"Path {path} is a {mode_to_str(disk_mode)} on disk but {mode_to_str(eden_mode)} in eden"
+                    for path, disk_mode, eden_mode in mismatched_modes
+                ]
+            )
+
+            raise RemediationError(
+                f"Failed check for {self.__class__.__name__} failed:\n{errorMsg}"
+            )
+        return True
+
 
 class MaterializedInodesAreInaccessible(PathsProblem):
     def __init__(self, paths: List[Tuple[Path, str]]) -> None:
@@ -385,7 +448,12 @@ class MaterializedInodesAreInaccessible(PathsProblem):
 
 
 class MissingInodesForFiles(PathsProblem, FixableProblem):
-    def __init__(self, instance: EdenInstance, mount: Path, paths: List[Path]) -> None:
+    def __init__(
+        self,
+        instance: EdenInstance,
+        mount: Path,
+        paths: List[Path],
+    ) -> None:
         self._instance = instance
         self._mount = mount
         self._paths = paths
@@ -404,43 +472,65 @@ class MissingInodesForFiles(PathsProblem, FixableProblem):
     def start_msg(self) -> str:
         return f"Fixing files present on disk but not known to EdenFS in {self._mount}"
 
+    def run_match_filesystem(self) -> List[str]:
+        """
+        Execute a thrift call to EdenFS to force sync the eden state with the filesystem
+        Don't catch errors here, handle them in the caller
+        """
+        with self._instance.get_thrift_client_legacy() as client:
+            result = client.matchFilesystem(
+                MatchFileSystemRequest(
+                    MountId(str(self._mount).encode()),
+                    [str(path).encode() for path in self._paths],
+                )
+            )
+            return [
+                f"{path}: {path_result.error}"
+                for path, path_result in zip(self._paths, result.results)
+                if path_result.error is not None
+            ]
+
     def perform_fix(self) -> None:
         """Attempt to fix files not known to EdenFS.
 
         For some reason, EdenFS isn't aware of these files. We poke Eden to
         notice the files exist with the thrift call matchFileSystem.
         """
-        with self._instance.get_thrift_client_legacy() as client:
-            try:
-                result = client.matchFilesystem(
-                    MatchFileSystemRequest(
-                        MountId(str(self._mount).encode()),
-                        [str(path).encode() for path in self._paths],
-                    )
-                )
-                failed = [
-                    f"{path}: {path_result.error}"
-                    for path, path_result in zip(self._paths, result.results)
-                    if path_result.error is not None
-                ]
-                if failed:
-                    errors = "\n".join(failed)
-                    print(f"Failed to remediate:\n{errors}")
+        try:
+            failed = self.run_match_filesystem()
+            if failed:
+                errors = "\n".join(failed)
+                raise RemediationError(f"Failed to remediate missing inodes: {errors}")
 
-            except EdenError as ex:
-                print(f"Failed to remediate {self._paths}: {ex}")
+        except EdenError as ex:
+            raise RemediationError(
+                f"Failed to remediate missing inodes {self._paths}: {ex}"
+            )
+
+    def check_fix(self) -> bool:
+        """
+        This one is difficult to check independently since it requires checking
+        the internal eden state.
+        Instead we rely on the thrift call reporting success
+        """
+        failed = self.run_match_filesystem()
+        return failed == []
 
 
 class MissingFilesForInodes(PathsProblem, FixableProblem):
-    def __init__(self, mount: Path, paths: List[Path]) -> None:
+    def __init__(
+        self, mount: Path, paths: List[Path], get_fn: Callable[[Path], int]
+    ) -> None:
         self._mount = mount
         self._paths = paths
+        self._get_fn: Callable[[Path], int] = get_fn
         super().__init__(
             self.omitPathsDescription(
                 paths, " is not present on disk despite EdenFS believing it should be"
             ),
             severity=ProblemSeverity.ERROR,
         )
+        self.EDEN_FILE_RECREATE_TIME = 1
 
     def dry_run_msg(self) -> str:
         return (
@@ -473,6 +563,30 @@ class MissingFilesForInodes(PathsProblem, FixableProblem):
 {errors}
 """
             )
+        # wait a little bit for eden to recreate the path
+        time.sleep(self.EDEN_FILE_RECREATE_TIME)
+
+    def check_fix(self) -> bool:
+        failed_fixed_paths = []
+        missing_path = False
+        for dirent_path in self._paths:
+            try:
+                self._get_fn(self._mount / dirent_path)
+            except FileNotFoundError as ex:
+                failed_fixed_paths.append(
+                    f"Path still missing: {self._mount / dirent_path}: {ex}"
+                )
+                missing_path = True
+            except Exception as ex:
+                failed_fixed_paths.append(
+                    f"Unexpected error trying to remediate missing file {self._mount / dirent_path}: {ex}"
+                )
+        if failed_fixed_paths:
+            errorMsg = "\n".join(failed_fixed_paths)
+            if missing_path:
+                errorMsg += "\nPaths may take some time to be recreated, verify that the files are still missing"
+            raise RemediationError(f"Failed to fix paths for: \n{errorMsg}")
+        return True
 
 
 class DuplicateInodes(PathsProblem):
@@ -498,7 +612,7 @@ def check_materialized_are_accessible(
     get_mode: Callable[[Path], int],
 ) -> None:
     # {path | path is a materialized directory or one of its entries whose mode does not match on the filesystem}
-    mismatched_mode = []
+    mismatched_mode = {}
     # {path | path is a materialized file or directory inside EdenFS, and can not be read on the filesystem}
     inaccessible_inodes = []
     # {path | path is a materialized file or directory inside EdenFS, and does not exist on the filesystem}
@@ -537,7 +651,7 @@ def check_materialized_are_accessible(
             continue
 
         if not stat.S_ISDIR(mode):
-            mismatched_mode += [(path, stat.S_IFDIR, mode)]
+            mismatched_mode[path] = (stat.S_IFDIR, mode)
 
         # A None missing_path_names avoids the listdir and missing inodes check
         missing_path_names = None
@@ -600,7 +714,7 @@ def check_materialized_are_accessible(
                 dirent_mode = stat.S_IFMT(dirent_mode)
 
                 if dirent_mode != stat.S_IFMT(dirent.mode):
-                    mismatched_mode += [(dirent_path, dirent_mode, dirent.mode)]
+                    mismatched_mode[dirent_path] = (dirent_mode, dirent.mode)
 
         if missing_path_names:
             missing_inodes += [path / name for name in missing_path_names]
@@ -614,14 +728,18 @@ def check_materialized_are_accessible(
         )
 
     if nonexistent_inodes:
-        tracker.add_problem(MissingFilesForInodes(checkout.path, nonexistent_inodes))
+        tracker.add_problem(
+            MissingFilesForInodes(checkout.path, nonexistent_inodes, get_mode)
+        )
 
     if inaccessible_inodes:
         tracker.add_problem(MaterializedInodesAreInaccessible(inaccessible_inodes))
 
     if mismatched_mode:
         tracker.add_problem(
-            MaterializedInodesHaveDifferentModeOnDisk(checkout.path, mismatched_mode)
+            MaterializedInodesHaveDifferentModeOnDisk(
+                instance, checkout.path, mismatched_mode, case_sensitive
+            )
         )
 
 
@@ -760,7 +878,9 @@ def check_loaded_content(
         )
 
     if not_found:
-        tracker.add_problem(MissingFilesForInodes(checkout.path, not_found))
+        tracker.add_problem(
+            MissingFilesForInodes(checkout.path, not_found, query_prjfs_file)
+        )
 
     if inaccessible:
         tracker.add_problem(LoadedInodesAreInaccessible(inaccessible))
@@ -770,8 +890,10 @@ def check_loaded_content(
 
 
 class HighInodeCountProblem(Problem, FixableProblem):
-    def __init__(self, info: CheckoutInfo, inode_count: int) -> None:
+    def __init__(self, info: CheckoutInfo, inode_count: int, threshold: int) -> None:
         self._info = info
+        self._threshold = threshold
+        self.fix_result: Optional[DebugInvalidateResponse] = None
         super().__init__(
             description=f"Mount point {self._info.path} has {inode_count} files on disk, which may impact EdenFS performance",
             severity=ProblemSeverity.ADVICE,
@@ -787,7 +909,7 @@ class HighInodeCountProblem(Problem, FixableProblem):
         """Invalidate all non-materialized inodes."""
         with self._info.instance.get_thrift_client_legacy() as client:
             try:
-                client.debugInvalidateNonMaterialized(
+                self.fix_result = client.debugInvalidateNonMaterialized(
                     DebugInvalidateRequest(
                         mount=MountId(mountPoint=bytes(self._info.path)),
                         path=b"",
@@ -799,6 +921,20 @@ class HighInodeCountProblem(Problem, FixableProblem):
                 raise RemediationError(
                     f"Failed to invalidate non-materialized files: {ex}"
                 )
+
+    def check_fix(self) -> bool:
+        newInodeInfo = get_mount_inode_info(self._info)
+        if newInodeInfo is None:
+            print(f"Failed to get inode info for {self._info.path}")
+            return False
+        inode_count = total_inode_count(newInodeInfo)
+        if inode_count > self._threshold:
+            if self.fix_result:
+                print(
+                    f"Invalidated {self.fix_result.numInvalidated} inodes. {inode_count} inodes is still greater than the threshold of {self._threshold} inodes. "
+                )
+            return False
+        return True
 
 
 class UnknownInodeCountProblem(Problem):
@@ -825,13 +961,9 @@ def check_inode_counts(
         tracker.add_problem(UnknownInodeCountProblem(checkout.path))
         return
 
-    inode_count = (
-        inode_info.loadedFileCount
-        + inode_info.loadedTreeCount
-        + inode_info.unloadedInodeCount
-    )
+    inode_count = total_inode_count(inode_info)
     if inode_count > threshold:
-        tracker.add_problem(HighInodeCountProblem(checkout, inode_count))
+        tracker.add_problem(HighInodeCountProblem(checkout, inode_count, threshold))
 
 
 class HgStatusAndDiffMismatch(PathsProblem):

@@ -9,7 +9,10 @@ use std::collections::HashMap;
 
 use anyhow::format_err;
 use bookmarks::BookmarkKey;
+use bookmarks::BookmarkTransaction;
+use bookmarks::BookmarkTransactionHook;
 use bookmarks::BookmarkUpdateReason;
+use bookmarks_movement::BookmarkInfoTransaction;
 use bookmarks_movement::CreateBookmarkOp;
 use bytes::Bytes;
 use cross_repo_sync::CandidateSelectionHint;
@@ -18,27 +21,28 @@ use hook_manager::manager::HookManagerRef;
 use mononoke_types::ChangesetId;
 
 use crate::errors::MononokeError;
+use crate::invalid_push_redirected_request;
 use crate::repo::RepoContext;
+use crate::MononokeRepo;
 
-impl RepoContext {
-    /// Create a bookmark.
-    pub async fn create_bookmark(
+impl<R: MononokeRepo> RepoContext<R> {
+    async fn create_bookmark_op<'a>(
         &self,
-        bookmark: &BookmarkKey,
+        bookmark: &'_ BookmarkKey,
         target: ChangesetId,
-        pushvars: Option<&HashMap<String, Bytes>>,
+        pushvars: Option<&'a HashMap<String, Bytes>>,
         affected_changesets_limit: Option<usize>,
-    ) -> Result<(), MononokeError> {
+    ) -> Result<CreateBookmarkOp<'a>, MononokeError> {
         self.start_write()?;
 
         fn make_create_op<'a>(
-            bookmark: &'a BookmarkKey,
+            bookmark: &'_ BookmarkKey,
             target: ChangesetId,
             pushvars: Option<&'a HashMap<String, Bytes>>,
             affected_changesets_limit: Option<usize>,
         ) -> CreateBookmarkOp<'a> {
             let op = CreateBookmarkOp::new(
-                bookmark,
+                bookmark.clone(),
                 target,
                 BookmarkUpdateReason::ApiRequest,
                 affected_changesets_limit,
@@ -46,7 +50,7 @@ impl RepoContext {
             .with_pushvars(pushvars);
             op.log_new_public_commits_to_scribe()
         }
-        if let Some(redirector) = self.push_redirector.as_ref() {
+        let create_op = if let Some(redirector) = self.push_redirector.as_ref() {
             let large_bookmark = redirector.small_to_large_bookmark(bookmark).await?;
             if &large_bookmark == bookmark {
                 return Err(MononokeError::InvalidRequest(format!(
@@ -71,27 +75,77 @@ impl RepoContext {
                         target,
                     )
                 })?;
-            let log_id =
-                make_create_op(&large_bookmark, target, pushvars, affected_changesets_limit)
-                    .run(
-                        self.ctx(),
-                        self.authorization_context(),
-                        redirector.repo.inner_repo(),
-                        redirector.repo.hook_manager(),
-                    )
-                    .await?;
-            // Wait for bookmark to catch up on small repo
-            redirector.ensure_backsynced(ctx, log_id).await?;
+            make_create_op(&large_bookmark, target, pushvars, affected_changesets_limit)
         } else {
             make_create_op(bookmark, target, pushvars, affected_changesets_limit)
+        };
+        Ok(create_op)
+    }
+
+    /// Create a bookmark.
+    pub async fn create_bookmark(
+        &self,
+        bookmark: &BookmarkKey,
+        target: ChangesetId,
+        pushvars: Option<&HashMap<String, Bytes>>,
+        affected_changesets_limit: Option<usize>,
+    ) -> Result<(), MononokeError> {
+        let create_op = self
+            .create_bookmark_op(bookmark, target, pushvars, affected_changesets_limit)
+            .await?;
+        if let Some(redirector) = self.push_redirector.as_ref() {
+            let ctx = self.ctx();
+            let log_id = create_op
                 .run(
                     self.ctx(),
                     self.authorization_context(),
-                    self.inner_repo(),
+                    &redirector.repo,
+                    redirector.repo.hook_manager(),
+                )
+                .await?;
+            // Wait for bookmark to catch up on small repo
+            redirector.ensure_backsynced(ctx, log_id).await?;
+        } else {
+            create_op
+                .run(
+                    self.ctx(),
+                    self.authorization_context(),
+                    self.repo(),
                     self.hook_manager().as_ref(),
                 )
                 .await?;
         }
         Ok(())
+    }
+
+    /// Create a bookmark with provided transaction.
+    pub async fn create_bookmark_with_transaction(
+        &self,
+        bookmark: &BookmarkKey,
+        target: ChangesetId,
+        pushvars: Option<&HashMap<String, Bytes>>,
+        affected_changesets_limit: Option<usize>,
+        txn: Option<Box<dyn BookmarkTransaction>>,
+        txn_hooks: Vec<BookmarkTransactionHook>,
+    ) -> Result<BookmarkInfoTransaction, MononokeError> {
+        if self.push_redirector.is_some() {
+            return Err(invalid_push_redirected_request(
+                "create_bookmark_with_transaction",
+            ));
+        }
+        let create_op = self
+            .create_bookmark_op(bookmark, target, pushvars, affected_changesets_limit)
+            .await?;
+        let bookmark_info_transaction = create_op
+            .run_with_transaction(
+                self.ctx(),
+                self.authorization_context(),
+                self.repo(),
+                self.hook_manager().as_ref(),
+                txn,
+                txn_hooks,
+            )
+            .await?;
+        Ok(bookmark_info_transaction)
     }
 }

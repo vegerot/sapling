@@ -19,6 +19,8 @@ use clientinfo::get_client_request_info;
 use fbthrift_socket::SocketTransport;
 use serde::Deserialize;
 use thrift_types::edenfs;
+use thrift_types::edenfs::CheckoutProgressInfoRequest;
+use thrift_types::edenfs::CheckoutProgressInfoResponse;
 use thrift_types::edenfs_clients::EdenService;
 use thrift_types::fbthrift::binary_protocol::BinaryProtocol;
 use tokio_uds_compat::UnixStream;
@@ -177,6 +179,28 @@ impl EdenFsClient {
         Ok(())
     }
 
+    /// Returns the current progress checkout counter(s) for the current mount.
+    /// When a checkout is not ongoing it returns None.
+    #[tracing::instrument(skip(self))]
+    pub fn checkout_progress(&self) -> anyhow::Result<Option<u64>> {
+        let thrift_client = block_on(self.get_thrift_client())?;
+        let root_vec = self.root_vec();
+        let thrift_params = CheckoutProgressInfoRequest {
+            mountPoint: root_vec,
+            ..Default::default()
+        };
+        let thrift_result = extract_error(block_on(
+            thrift_client.getCheckoutProgressInfo(&thrift_params),
+        ))?;
+        Ok(
+            if let CheckoutProgressInfoResponse::checkoutProgressInfo(info) = thrift_result {
+                Some(info.updatedInodes as u64)
+            } else {
+                None
+            },
+        )
+    }
+
     /// Check out the given commit.
     /// The client might want to write pending draft changes to disk
     /// so edenfs can find the new files during checkout.
@@ -247,9 +271,10 @@ pub(crate) fn extract_error<V, E: std::error::Error + Send + Sync + 'static>(
 
 async fn get_socket_transport(sock_path: &Path) -> Result<SocketTransport<UnixStream>> {
     let sock = UnixStream::connect(&sock_path).await?;
-    Ok(SocketTransport::new_with_error_handler(sock, |error| {
-        error!(?error, "thrift transport error")
-    }))
+    Ok(SocketTransport::new_with_error_handler(
+        sock,
+        |error| error!(target: "transport_errors", thrift_transport_error=?error),
+    ))
 }
 
 #[derive(Deserialize)]

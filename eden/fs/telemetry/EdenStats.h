@@ -428,8 +428,19 @@ struct PrjfsStats : StatsGroup<PrjfsStats> {
  */
 struct ObjectStoreStats : StatsGroup<ObjectStoreStats> {
   Duration getTree{"store.get_tree_us"};
+  Duration getTreeMemoryDuration{"store.get_tree.memory_us"};
+  Duration getTreeLocalstoreDuration{"store.get_tree.localstore_us"};
+  Duration getTreeBackingstoreDuration{"store.get_tree.backingstore_us"};
+  Duration getTreeMetadata{"store.get_tree_metadata_us"};
   Duration getBlob{"store.get_blob_us"};
   Duration getBlobMetadata{"store.get_blob_metadata_us"};
+  Duration getBlobMetadataMemoryDuration{"store.get_blob_metadata.memory_us"};
+  Duration getBlobMetadataLocalstoreDuration{
+      "store.get_blob_metadata.localstore_us"};
+  Duration getBlobMetadataBackingstoreDuration{
+      "store.get_blob_metadata.backingstore_us"};
+  Duration getBlobMetadataFromBlobDuration{
+      "store.get_blob_metadata.from_blob_us"};
   Duration getRootTree{"store.get_root_tree_us"};
 
   Counter getBlobFromMemory{"object_store.get_blob.memory"};
@@ -441,6 +452,11 @@ struct ObjectStoreStats : StatsGroup<ObjectStoreStats> {
   Counter getTreeFromLocalStore{"object_store.get_tree.local_store"};
   Counter getTreeFromBackingStore{"object_store.get_tree.backing_store"};
   Counter getTreeFailed{"object_store.get_tree_failed"};
+
+  Counter getTreeMetadataFromMemory{"object_store.get_tree_metadata.memory"};
+  Counter getTreeMetadataFromBackingStore{
+      "object_store.get_tree_metadata.backing_store"};
+  Counter getTreeMetadataFailed{"object_store.get_tree_metadata_failed"};
 
   Counter getRootTreeFromBackingStore{
       "object_store.get_root_tree.backing_store"};
@@ -488,6 +504,12 @@ struct SaplingBackingStoreStats : StatsGroup<SaplingBackingStoreStats> {
   Counter fetchTreeFailure{"store.sapling.fetch_tree_failure"};
   Counter fetchTreeRetrySuccess{"store.sapling.fetch_tree_retry_success"};
   Counter fetchTreeRetryFailure{"store.sapling.fetch_tree_retry_failure"};
+  Duration getTreeMetadata{"store.sapling.get_tree_metadata_us"};
+  Duration fetchTreeMetadata{"store.sapling.fetch_tree_metadata_us"};
+  Counter fetchTreeMetadataLocal{"store.sapling.fetch_tree_metadata_local"};
+  Counter fetchTreeMetadataRemote{"store.sapling.fetch_tree_metadata_remote"};
+  Counter fetchTreeMetadataSuccess{"store.sapling.fetch_tree_metadata_success"};
+  Counter fetchTreeMetadataFailure{"store.sapling.fetch_tree_metadata_failure"};
   Counter getRootTreeLocal{"store.sapling.get_root_tree_local"};
   Counter getRootTreeRemote{"store.sapling.get_root_tree_remote"};
   Counter getRootTreeSuccess{"store.sapling.get_root_tree_success"};
@@ -537,6 +559,7 @@ struct JournalStats : StatsGroup<JournalStats> {
   Counter truncatedReads{"journal.truncated_reads"};
   Counter filesAccumulated{"journal.files_accumulated"};
   Counter journalStatusCacheHit{"journal.status_cache_hit"};
+  Counter journalStatusCachePend{"journal.status_cache_pend"};
   Counter journalStatusCacheMiss{"journal.status_cache_miss"};
   Counter journalStatusCacheSkip{"journal.status_cache_skip"};
   Duration accumulateRange{"journal.accumulate_range_us"};

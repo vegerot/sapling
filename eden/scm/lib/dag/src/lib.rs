@@ -14,6 +14,7 @@
 
 mod bsearch;
 pub mod config;
+pub mod dag;
 pub mod default_impl;
 mod delegate;
 pub mod errors;
@@ -21,63 +22,60 @@ mod fmt;
 pub mod iddag;
 pub mod iddagstore;
 pub mod idmap;
+mod idset;
 mod integrity;
-pub mod namedag;
-pub mod nameset;
+pub(crate) mod lifecycle;
 pub mod ops;
 pub mod protocol;
 #[cfg(any(test, feature = "render"))]
 pub mod render;
 pub mod segment;
-mod spanset;
+pub mod set;
 pub(crate) mod types_ext;
 pub mod utils;
 mod verlink;
 mod vertex_options;
 
+#[cfg(any(test, feature = "indexedlog-backend"))]
+pub use dag::Dag;
+pub use dag::DagBuilder;
 pub use dag_types::clone;
 pub use dag_types::id;
 pub use dag_types::CloneData;
 pub use dag_types::Group;
 pub use dag_types::Id;
 pub use dag_types::Location;
-pub use dag_types::VertexName;
+pub use dag_types::Vertex;
 pub use iddag::FirstAncestorConstraint;
 pub use iddag::IdDag;
 pub use iddag::IdDagAlgorithm;
 pub use iddagstore::IdDagStore;
 #[cfg(any(test, feature = "indexedlog-backend"))]
 pub use idmap::IdMap;
-#[cfg(any(test, feature = "indexedlog-backend"))]
-pub use namedag::NameDag;
-pub use namedag::NameDagBuilder;
-pub use nameset::NameSet;
+pub use idset::IdList;
+pub use idset::IdSet;
+pub use idset::OrderedSpan;
 pub use ops::DagAlgorithm;
 pub use segment::FlatSegment;
 pub use segment::IdSegment;
 pub use segment::PreparedFlatSegments;
+pub use set::Set;
 pub use verlink::VerLink;
 pub use vertex_options::VertexListWithOptions;
 pub use vertex_options::VertexOptions;
 
 pub type Level = u8;
-pub type InProcessIdDag = IdDag<iddagstore::InProcessStore>;
+pub type MemIdDag = IdDag<iddagstore::MemStore>;
 #[cfg(any(test, feature = "indexedlog-backend"))]
 pub type OnDiskIdDag = IdDag<iddagstore::IndexedLogStore>;
 
 // Short aliases for main public types.
-#[cfg(any(test, feature = "indexedlog-backend"))]
-pub type Dag = NameDag;
-pub type Set = NameSet;
-pub type IdSet = spanset::SpanSet;
-pub type IdSetIter<T> = spanset::SpanSetIter<T>;
-pub type IdSpan = spanset::Span;
-pub use namedag::MemNameDag as MemDag;
-pub use nameset::NameIter as SetIter;
-pub type Vertex = VertexName;
-
+pub type IdSetIter<T> = idset::IdSetIter<T>;
+pub type IdSpan = idset::Span;
+pub use dag::MemDag;
 #[cfg(feature = "indexedlog-backend")]
 pub use iddagstore::indexedlog_store::describe_indexedlog_entry;
+pub use set::NameIter as SetIter;
 
 #[cfg(any(test, feature = "indexedlog-backend"))]
 pub mod tests;

@@ -240,6 +240,9 @@ impl AddScubaResponse for thrift::MegarepoSyncChangesetToken {
     }
 }
 
+// TODO(T179531912): Log responses to scuba
+impl AddScubaResponse for thrift::RepoUpdateSubmoduleExpansionResponse {}
+
 impl AddScubaResponse for thrift::RepoUploadNonBlobGitObjectResponse {}
 impl AddScubaResponse for thrift::CreateGitTreeResponse {}
 impl AddScubaResponse for thrift::CreateGitTagResponse {}
@@ -247,6 +250,6 @@ impl AddScubaResponse for thrift::RepoUploadPackfileBaseItemResponse {}
 
 impl AddScubaResponse for thrift::RepoStackGitBundleStoreResponse {
     fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
-        scuba.add("bundle_handle", self.everstore_handle.as_ref());
+        scuba.add("response_bundle_handle", self.everstore_handle.as_ref());
     }
 }

@@ -14,13 +14,13 @@ mod tests {
 
     use anyhow::Result;
     use ascii::AsciiString;
-    use blobrepo::AsBlobRepo;
     use blobstore::Loadable;
     use bookmarks::BookmarkKey;
     use bookmarks::BookmarkUpdateLogRef;
     use bookmarks::BookmarkUpdateReason;
     use bookmarks::BookmarksRef;
     use bookmarks::Freshness;
+    use bulk_derivation::BulkDerivation;
     use cacheblob::InProcessLease;
     use cached_config::ConfigStore;
     use cached_config::ModificationTime;
@@ -30,11 +30,9 @@ mod tests {
     use cross_repo_sync::CommitSyncContext;
     use cross_repo_sync::SubmoduleDeps;
     use derived_data_manager::BonsaiDerivable;
-    use derived_data_utils::derived_data_utils;
     use fbinit::FacebookInit;
     use futures::stream::TryStreamExt;
     use git_types::MappedGitCommitId;
-    use git_types::RootGitDeltaManifestId;
     use git_types::RootGitDeltaManifestV2Id;
     use git_types::TreeHandle;
     use live_commit_sync_config::CfgrLiveCommitSyncConfig;
@@ -65,10 +63,11 @@ mod tests {
     use mononoke_types_mocks::changesetid::TWOS_CSID;
     use movers::DefaultAction;
     use movers::Mover;
+    use movers::Movers;
     use mutable_counters::MutableCountersRef;
-    use pushredirect::PushRedirectionConfigArc;
+    use pushredirect::PushRedirectionConfig;
+    use pushredirect::TestPushRedirectionConfig;
     use repo_blobstore::RepoBlobstoreRef;
-    use repo_derived_data::RepoDerivedDataArc;
     use repo_derived_data::RepoDerivedDataRef;
     use sql_construct::SqlConstruct;
     use synced_commit_mapping::SqlSyncedCommitMapping;
@@ -85,6 +84,7 @@ mod tests {
     use crate::find_mapping_version;
     use crate::get_large_repo_config_if_pushredirected;
     use crate::get_large_repo_setting;
+    use crate::get_reverse_mover;
     use crate::merge_imported_commit;
     use crate::move_bookmark;
     use crate::push_merge_commit;
@@ -114,7 +114,6 @@ mod tests {
                 // Repo import has no need of these derived data types
                 config.types.remove(&TreeHandle::VARIANT);
                 config.types.remove(&MappedGitCommitId::VARIANT);
-                config.types.remove(&RootGitDeltaManifestId::VARIANT);
                 config.types.remove(&RootGitDeltaManifestV2Id::VARIANT);
             })
             .with_id(RepositoryId::new(id))
@@ -170,7 +169,7 @@ mod tests {
         };
         let changesets = create_from_dag(
             &ctx,
-            repo.as_blob_repo(),
+            &repo,
             r##"
                 A-B-C-D-E-F-G
             "##,
@@ -229,7 +228,7 @@ mod tests {
         };
         let changesets = create_from_dag(
             &ctx,
-            repo.as_blob_repo(),
+            &repo,
             r##"
                 A-B-C-D-E-F-G
             "##,
@@ -357,18 +356,16 @@ mod tests {
         let ctx = CoreContext::test_mock(fb);
         let repo = create_repo(fb, 1).await?;
 
-        let master_cs_id = CreateCommitContext::new_root(&ctx, repo.as_blob_repo())
+        let master_cs_id = CreateCommitContext::new_root(&ctx, &repo)
             .add_file("a", "a")
             .commit()
             .await?;
-        let imported_cs_id = CreateCommitContext::new_root(&ctx, repo.as_blob_repo())
+        let imported_cs_id = CreateCommitContext::new_root(&ctx, &repo)
             .add_file("b", "b")
             .commit()
             .await?;
 
-        let dest_bookmark = bookmark(&ctx, repo.as_blob_repo(), "master")
-            .set_to(master_cs_id)
-            .await?;
+        let dest_bookmark = bookmark(&ctx, &repo, "master").set_to(master_cs_id).await?;
 
         let changeset_args = ChangesetArgs {
             author: "user".to_string(),
@@ -384,7 +381,7 @@ mod tests {
             pushrebase: PushrebaseParams {
                 globalrev_config: Some(GlobalrevConfig {
                     publishing_bookmark: BookmarkKey::new("master")?,
-                    small_repo_id: None,
+                    globalrevs_small_repo_id: None,
                 }),
                 ..Default::default()
             },
@@ -493,14 +490,19 @@ mod tests {
         test_source.insert_to_refresh(CONFIGERATOR_PUSHREDIRECT_ENABLE.to_string());
         test_source.insert_to_refresh(CONFIGERATOR_ALL_COMMIT_SYNC_CONFIGS.to_string());
 
+        let test_push_redirection_config = Arc::new(TestPushRedirectionConfig::new());
+        test_push_redirection_config
+            .set(&ctx, RepositoryId::new(1), false, true)
+            .await?;
+        test_push_redirection_config
+            .set(&ctx, RepositoryId::new(2), true, false)
+            .await?;
+
         let repo0 = create_repo(fb, 0).await?;
 
         let config_store = ConfigStore::new(test_source.clone(), Duration::from_millis(2), None);
-        let live_commit_sync_config = CfgrLiveCommitSyncConfig::new_with_xdb(
-            ctx.logger(),
-            &config_store,
-            repo0.push_redirection_config_arc(),
-        )?;
+        let live_commit_sync_config =
+            CfgrLiveCommitSyncConfig::new(&config_store, test_push_redirection_config)?;
 
         insert_repo_config(0, &mut repos);
         assert!(
@@ -709,7 +711,7 @@ mod tests {
         let small_repo = create_repo(fb, 1).await?;
         let changesets = create_from_dag(
             &ctx,
-            large_repo.as_blob_repo(),
+            &large_repo,
             r##"
                 A-B
             "##,
@@ -739,8 +741,9 @@ mod tests {
         movers.push(
             syncers
                 .small_to_large
-                .get_mover_by_version(&CommitSyncConfigVersion("TEST_VERSION".to_string()))
-                .await?,
+                .get_movers_by_version(&CommitSyncConfigVersion("TEST_VERSION".to_string()))
+                .await?
+                .mover,
         );
 
         let combined_mover: Mover = Arc::new(move |source_path: &NonRootMPath| {
@@ -755,13 +758,17 @@ mod tests {
             Ok(Some(mutable_path))
         });
 
+        let combined_movers = Movers {
+            mover: combined_mover.clone(),
+            reverse_mover: get_reverse_mover(),
+        };
+
         let (shifted_bcs_ids, _git_merge_shifted_bcs_id) = rewrite_file_paths(
             &ctx,
             &large_repo,
-            &combined_mover,
+            &combined_movers,
             &cs_ids,
             cs_ids.last().unwrap(),
-            SubmoduleDeps::ForSync(HashMap::new()),
         )
         .await?;
 
@@ -810,12 +817,12 @@ mod tests {
         cs_ids: &[ChangesetId],
     ) -> Result<()> {
         let derived_data_types = &repo.repo_derived_data().active_config().types;
-        let blob_repo = repo.as_blob_repo();
 
         for derived_data_type in derived_data_types {
-            let derived_utils = derived_data_utils(ctx.fb, blob_repo, *derived_data_type)?;
-            let pending = derived_utils
-                .pending(ctx.clone(), repo.repo_derived_data_arc(), cs_ids.to_vec())
+            let pending = repo
+                .repo_derived_data()
+                .manager()
+                .pending(ctx, cs_ids, None, *derived_data_type)
                 .await?;
             assert!(pending.is_empty());
         }
@@ -834,7 +841,7 @@ mod tests {
 
         let repo_0_commits = create_from_dag(
             &ctx,
-            repo_0.as_blob_repo(),
+            &repo_0,
             r##"
                 A-B
             "##,
@@ -846,7 +853,7 @@ mod tests {
         let repo_1 = create_repo(fb, 1).await?;
         let repo_1_commits = create_from_dag(
             &ctx,
-            repo_1.as_blob_repo(),
+            &repo_1,
             r##"
                 C-D
             "##,
@@ -875,7 +882,7 @@ mod tests {
         let small_repo = create_repo(fb, 1).await?;
         let changesets = create_from_dag(
             &ctx,
-            large_repo.as_blob_repo(),
+            &large_repo,
             r##"
                 A-B
             "##,
@@ -906,8 +913,9 @@ mod tests {
         movers.push(
             syncers
                 .small_to_large
-                .get_mover_by_version(&CommitSyncConfigVersion("TEST_VERSION".to_string()))
-                .await?,
+                .get_movers_by_version(&CommitSyncConfigVersion("TEST_VERSION".to_string()))
+                .await?
+                .mover,
         );
 
         let combined_mover: Mover = Arc::new(move |source_path: &NonRootMPath| {
@@ -921,14 +929,17 @@ mod tests {
             }
             Ok(Some(mutable_path))
         });
+        let combined_movers = Movers {
+            mover: combined_mover.clone(),
+            reverse_mover: get_reverse_mover(),
+        };
 
         let (large_repo_cs_ids, _) = rewrite_file_paths(
             &ctx,
             &large_repo,
-            &combined_mover,
+            &combined_movers,
             &cs_ids,
             cs_ids.last().unwrap(),
-            SubmoduleDeps::ForSync(HashMap::new()),
         )
         .await?;
         let small_repo_cs_ids = back_sync_commits_to_small_repo(
@@ -954,17 +965,17 @@ mod tests {
         let large_repo = create_repo(fb, 0).await?;
         let small_repo = create_repo(fb, 1).await?;
 
-        let root = CreateCommitContext::new_root(&ctx, large_repo.as_blob_repo())
+        let root = CreateCommitContext::new_root(&ctx, &large_repo)
             .add_file("random_dir/B/file", "text")
             .commit()
             .await?;
 
-        let first_commit = CreateCommitContext::new(&ctx, large_repo.as_blob_repo(), vec![root])
+        let first_commit = CreateCommitContext::new(&ctx, &large_repo, vec![root])
             .add_file("large_repo/justfile", "justtext")
             .commit()
             .await?;
 
-        bookmark(&ctx, large_repo.as_blob_repo(), "before_mapping_change")
+        bookmark(&ctx, &large_repo, "before_mapping_change")
             .set_to(first_commit)
             .await?;
 
@@ -991,8 +1002,7 @@ mod tests {
         )
         .await?;
 
-        let wc =
-            list_working_copy_utf8(&ctx, small_repo.as_blob_repo(), small_repo_cs_ids[0]).await?;
+        let wc = list_working_copy_utf8(&ctx, &small_repo, small_repo_cs_ids[0]).await?;
         assert_eq!(
             wc,
             hashmap! {
@@ -1000,8 +1010,7 @@ mod tests {
             }
         );
 
-        let wc =
-            list_working_copy_utf8(&ctx, small_repo.as_blob_repo(), small_repo_cs_ids[1]).await?;
+        let wc = list_working_copy_utf8(&ctx, &small_repo, small_repo_cs_ids[1]).await?;
         assert_eq!(
             wc,
             hashmap! {
@@ -1011,11 +1020,10 @@ mod tests {
         );
 
         // Change mapping
-        let change_mapping_cs_id =
-            CreateCommitContext::new(&ctx, large_repo.as_blob_repo(), vec![first_commit])
-                .commit()
-                .await?;
-        bookmark(&ctx, large_repo.as_blob_repo(), "after_mapping_change")
+        let change_mapping_cs_id = CreateCommitContext::new(&ctx, &large_repo, vec![first_commit])
+            .commit()
+            .await?;
+        bookmark(&ctx, &large_repo, "after_mapping_change")
             .set_to(change_mapping_cs_id)
             .await?;
 

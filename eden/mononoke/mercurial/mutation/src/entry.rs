@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Read;
 
+use abomonable_string::AbomonableString;
 use abomonation_derive::Abomonation;
 use anyhow::anyhow;
 use anyhow::Error;
@@ -19,35 +20,40 @@ use edenapi_types::HgMutationEntryContent;
 use hg_mutation_entry_thrift as thrift;
 use mercurial_types::HgChangesetId;
 use mercurial_types::HgNodeHash;
+#[cfg(test)]
+use quickcheck_arbitrary_derive::Arbitrary;
 use types::mutation::MutationEntry;
 use types::HgId;
 
+use crate::aligned_hg_changeset_id::AlignedHgChangesetId;
 use crate::grouper::Grouper;
 
 /// Record of a Mercurial mutation operation (e.g. amend or rebase).
 #[derive(Abomonation, Clone, Debug, Hash, Eq, PartialEq)]
+#[cfg_attr(test, derive(Arbitrary))]
+#[repr(align(8))]
 pub struct HgMutationEntry {
     /// The commit that resulted from the mutation operation.
     successor: HgChangesetId,
     /// The commits that were mutated to create the successor.
     ///
     /// There may be multiple predecessors, e.g. if the commits were folded.
-    predecessors: Vec<HgChangesetId>,
+    predecessors: Vec<AlignedHgChangesetId>,
     /// Other commits that were created by the mutation operation splitting the predecessors.
     ///
     /// Where a commit is split into two or more commits, the successor will be the final commit,
     /// and this list will contain the other commits.
-    split: Vec<HgChangesetId>,
+    split: Vec<AlignedHgChangesetId>,
     /// The name of the operation.
-    op: String,
+    op: AbomonableString<8>,
     /// The user who performed the mutation operation.  This may differ from the commit author.
-    user: String,
+    user: AbomonableString<8>,
     /// The timestamp of the mutation operation.  This may differ from the commit time.
     timestamp: i64,
     /// The timezone offset of the mutation operation.  This may differ from the commit time.
     timezone: i32,
     /// Extra information about this mutation operation.
-    extra: Vec<(String, String)>,
+    extra: Vec<(AbomonableString<8>, AbomonableString<8>)>,
 }
 
 impl HgMutationEntry {
@@ -61,6 +67,17 @@ impl HgMutationEntry {
         timezone: i32,
         extra: Vec<(String, String)>,
     ) -> Self {
+        let predecessors = predecessors
+            .into_iter()
+            .map(AlignedHgChangesetId::from)
+            .collect();
+        let split = split.into_iter().map(AlignedHgChangesetId::from).collect();
+        let op = op.into();
+        let user = user.into();
+        let extra = extra
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
         Self {
             successor,
             predecessors,
@@ -81,12 +98,18 @@ impl HgMutationEntry {
         &self.successor
     }
 
-    pub fn predecessors(&self) -> &[HgChangesetId] {
-        self.predecessors.as_slice()
+    pub fn predecessors(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &HgChangesetId> + DoubleEndedIterator<Item = &HgChangesetId>
+    {
+        self.predecessors.iter().map(AlignedHgChangesetId::as_ref)
     }
 
-    pub fn split(&self) -> &[HgChangesetId] {
-        self.split.as_slice()
+    pub fn split(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &HgChangesetId> + DoubleEndedIterator<Item = &HgChangesetId>
+    {
+        self.split.iter().map(AlignedHgChangesetId::as_ref)
     }
 
     pub fn op(&self) -> &str {
@@ -105,8 +128,14 @@ impl HgMutationEntry {
         self.timezone
     }
 
-    pub fn extra(&self) -> &[(String, String)] {
-        self.extra.as_slice()
+    pub fn extra(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.extra.iter().map(|(k, v)| (k.as_ref(), v.as_ref()))
+    }
+
+    /// Returns `extra` encoded with JSON.
+    pub fn extra_json(&self) -> Result<String> {
+        let extra = self.extra().collect::<Vec<_>>();
+        Ok(serde_json::to_string(&extra)?)
     }
 
     /// Add the next predecessor to the entry.
@@ -129,7 +158,7 @@ impl HgMutationEntry {
             ));
         }
         if index == expected_index {
-            self.predecessors.push(pred);
+            self.predecessors.push(pred.into());
         }
         Ok(())
     }
@@ -154,7 +183,7 @@ impl HgMutationEntry {
             ));
         }
         if index == expected_index {
-            self.split.push(split);
+            self.split.push(split.into());
         }
         Ok(())
     }
@@ -193,21 +222,26 @@ impl HgMutationEntry {
             predecessors: self
                 .predecessors
                 .into_iter()
+                .map(AlignedHgChangesetId::into_inner)
                 .map(HgChangesetId::into_thrift)
                 .collect(),
             split: self
                 .split
                 .into_iter()
+                .map(AlignedHgChangesetId::into_inner)
                 .map(HgChangesetId::into_thrift)
                 .collect(),
-            op: self.op,
-            user: self.user,
+            op: self.op.into_inner(),
+            user: self.user.into_inner(),
             timestamp: self.timestamp,
             timezone: self.timezone,
             extra: self
                 .extra
                 .into_iter()
-                .map(|(key, value)| thrift::ExtraProperty { key, value })
+                .map(|(key, value)| thrift::ExtraProperty {
+                    key: key.into_inner(),
+                    value: value.into_inner(),
+                })
                 .collect(),
         }
     }
@@ -225,26 +259,30 @@ impl TryFrom<MutationEntry> for HgMutationEntry {
                 .into_iter()
                 .map(HgNodeHash::from)
                 .map(HgChangesetId::new)
+                .map(AlignedHgChangesetId::from)
                 .collect(),
             split: entry
                 .split
                 .into_iter()
                 .map(HgNodeHash::from)
                 .map(HgChangesetId::new)
+                .map(AlignedHgChangesetId::from)
                 .collect(),
-            op: entry.op,
-            user: entry.user,
+            op: entry.op.into(),
+            user: entry.user.into(),
             timestamp: entry.time,
             timezone: entry.tz,
             extra: entry
                 .extra
                 .into_iter()
-                .map(|(key, value)| -> Result<(String, String), Error> {
-                    Ok((
-                        String::from_utf8(key.into())?,
-                        String::from_utf8(value.into())?,
-                    ))
-                })
+                .map(
+                    |(key, value)| -> Result<(AbomonableString<8>, AbomonableString<8>), Error> {
+                        Ok((
+                            String::from_utf8(key.into())?.into(),
+                            String::from_utf8(value.into())?.into(),
+                        ))
+                    },
+                )
                 .collect::<Result<_>>()?,
         };
         Ok(entry)
@@ -258,17 +296,19 @@ impl From<HgMutationEntry> for MutationEntry {
             preds: m
                 .predecessors
                 .into_iter()
+                .map(AlignedHgChangesetId::into_inner)
                 .map(HgChangesetId::into_nodehash)
                 .map(HgId::from)
                 .collect(),
             split: m
                 .split
                 .into_iter()
+                .map(AlignedHgChangesetId::into_inner)
                 .map(HgChangesetId::into_nodehash)
                 .map(HgId::from)
                 .collect(),
-            op: m.op,
-            user: m.user,
+            op: m.op.into_inner(),
+            user: m.user.into_inner(),
             time: m.timestamp,
             tz: m.timezone,
             extra: m
@@ -276,8 +316,8 @@ impl From<HgMutationEntry> for MutationEntry {
                 .into_iter()
                 .map(|(key, value)| {
                     (
-                        key.into_bytes().into_boxed_slice(),
-                        value.into_bytes().into_boxed_slice(),
+                        key.into_inner().into_bytes().into_boxed_slice(),
+                        value.into_inner().into_bytes().into_boxed_slice(),
                     )
                 })
                 .collect(),
@@ -334,23 +374,25 @@ impl From<HgMutationEntry> for HgMutationEntryContent {
         let predecessors = mutation
             .predecessors
             .into_iter()
+            .map(AlignedHgChangesetId::into_inner)
             .map(Into::into)
             .collect::<Vec<_>>();
         let split = mutation
             .split
             .into_iter()
+            .map(AlignedHgChangesetId::into_inner)
             .map(Into::into)
             .collect::<Vec<_>>();
-        let op = mutation.op;
-        let user = mutation.user.into_bytes();
+        let op = mutation.op.into_inner();
+        let user = mutation.user.into_inner().into_bytes();
         let time = mutation.timestamp;
         let tz = mutation.timezone;
         let extras = mutation
             .extra
             .into_iter()
             .map(|(key, value)| Extra {
-                key: key.into_bytes(),
-                value: value.into_bytes(),
+                key: key.into_inner().into_bytes(),
+                value: value.into_inner().into_bytes(),
             })
             .collect();
 
@@ -428,20 +470,19 @@ impl HgMutationEntrySet {
                 hash_map::Entry::Occupied(entry) => {
                     // This changeset has a new entry to store.  See if all its
                     // predecessors' primordials are known.
-                    for predecessor_id in entry.get().predecessors().iter() {
+                    for predecessor_id in entry.get().predecessors() {
                         if !self.changeset_primordials.contains_key(predecessor_id) {
                             missing_primordials.push(*predecessor_id);
                         }
                     }
                     // The first predecessor's primordial should be
                     // propagated to this changeset.
-                    let predecessor_id =
-                        entry.get().predecessors().iter().next().ok_or_else(|| {
-                            anyhow!(
-                                "Mutation entry for {} has no predecessors",
-                                entry.get().successor()
-                            )
-                        })?;
+                    let predecessor_id = entry.get().predecessors().next().ok_or_else(|| {
+                        anyhow!(
+                            "Mutation entry for {} has no predecessors",
+                            entry.get().successor()
+                        )
+                    })?;
                     match self.changeset_primordials.get(predecessor_id) {
                         Some(&primordial_id) => {
                             // The entry's first predecessor's primordial is known.
@@ -518,8 +559,7 @@ impl HgMutationEntrySet {
             } else if let Some(entry) = new_entries.get(&candidate) {
                 // This is not the primordial commit, we must look at its
                 // predecessors.
-                let predecessors = entry.predecessors();
-                if let Some(first) = predecessors.first() {
+                if let Some(first) = entry.predecessors().next() {
                     // Merge this candidate's group with the group of its
                     // first predecessor: they will have the same primordial.
                     grouper.merge(candidate, *first);
@@ -529,7 +569,7 @@ impl HgMutationEntrySet {
                         entry.successor()
                     ));
                 }
-                for &predecessor in predecessors.iter() {
+                for &predecessor in entry.predecessors() {
                     if seen.insert(predecessor) {
                         candidates.push(predecessor);
                     }
@@ -565,7 +605,6 @@ impl HgMutationEntrySet {
             if let Some(new_entry) = new_entries.remove(&changeset_id) {
                 if new_entry
                     .predecessors()
-                    .iter()
                     .all(|predecessor| self.changeset_primordials.contains_key(predecessor))
                 {
                     // We have found primordials for all predecessors of this
@@ -596,7 +635,7 @@ impl HgMutationEntrySet {
                     // additional changesets we will need to process.  Push
                     // predecessors in reverse order so that we process them in
                     // forwards order.
-                    for predecessor_id in entry.predecessors().iter().rev() {
+                    for predecessor_id in entry.predecessors().rev() {
                         // Only enqueue the predecessor if:
                         // 1. There is an entry for it
                         if self.entries.contains_key(predecessor_id)

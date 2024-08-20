@@ -119,8 +119,7 @@ fn write_requirements_file(path: &Path, requirements: HashSet<&str>) -> Result<(
 }
 
 fn write_requirements(path: &Path, config: &ConfigSet) -> Result<(), InitError> {
-    let mut requirements =
-        HashSet::from(["revlogv1", "store", "fncache", "dotencode", "treestate"]);
+    let mut requirements = HashSet::from(["revlogv1", "store", "treestate"]);
 
     if config
         .get_or_default("format", "generaldelta")
@@ -162,18 +161,12 @@ fn write_store_requirements(path: &Path, config: &ConfigSet) -> Result<(), InitE
     let store_path = store_path.as_path();
     create_dir(store_path)?;
     let mut requirements = HashSet::from(["visibleheads"]);
-    if config
-        .get_or("format", "use-segmented-changelog", is_test)
-        .unwrap_or(false)
-    {
+    if config.get_or("format", "use-segmented-changelog", || true)? {
         requirements.insert("invalidatelinkrev");
         requirements.insert("segmentedchangelog");
     }
 
-    if config
-        .get_or("experimental", "narrow-heads", || true)
-        .unwrap_or(true)
-    {
+    if config.get_or("experimental", "narrow-heads", || true)? {
         requirements.insert("narrowheads");
     }
 
@@ -228,9 +221,7 @@ mod tests {
         write_requirements(tmp.path(), &config).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            r#"dotencode
-fncache
-revlogv1
+            r#"revlogv1
 store
 treestate
 "#
@@ -240,9 +231,7 @@ treestate
         write_requirements(tmp.path(), &config).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            r#"dotencode
-fncache
-generaldelta
+            r#"generaldelta
 revlogv1
 store
 treestate
@@ -260,6 +249,7 @@ treestate
         let path = path.as_path();
         let mut expected = vec!["narrowheads", "visibleheads", ""];
 
+        config.set("format", "use-segmented-changelog", Some("false"), &options);
         write_store_requirements(tmp.path(), &config).unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), expected.join("\n"));
         fs::remove_dir_all(storepath.as_path()).unwrap();

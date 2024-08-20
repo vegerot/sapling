@@ -400,9 +400,15 @@ impl RepoPath {
 
     /// Return whether base's components prefix self's components.
     pub fn starts_with(&self, base: &Self, case_sensitive: bool) -> bool {
+        self.strip_prefix(base, case_sensitive).is_some()
+    }
+
+    /// If `base` is a prefix of `self`, return suffix of `self`.
+    pub fn strip_prefix(&self, base: &Self, case_sensitive: bool) -> Option<&Self> {
         let mut self_components = self.components();
         let mut base_components = base.components();
         loop {
+            let self_pos = self_components.position;
             match (self_components.next(), base_components.next()) {
                 (Some(s), Some(b)) => {
                     if s == b {
@@ -416,10 +422,31 @@ impl RepoPath {
                         continue;
                     }
 
-                    return false;
+                    return None;
                 }
-                (Some(_) | None, None) => return true,
-                (None, Some(_)) => return false,
+                (Some(_) | None, None) => {
+                    return Some(Self::from_str_unchecked(&self.0[self_pos..]));
+                }
+                (None, Some(_)) => return None,
+            }
+        }
+    }
+
+    /// Return common prefix of `self` and `other`.
+    pub fn common_prefix<'a>(&'a self, other: &'a Self) -> &'a Self {
+        let mut parts = self.components();
+        let mut other_parts = other.components();
+
+        loop {
+            let position = parts.position;
+            match (parts.next(), other_parts.next()) {
+                (None, _) => return self,
+                (_, None) => return other,
+                (l, r) => {
+                    if l != r {
+                        return Self::from_str_unchecked(&self.0[..position.saturating_sub(1)]);
+                    }
+                }
             }
         }
     }
@@ -1336,5 +1363,120 @@ mod tests {
 
         assert!(!repo_path("foo/bar/baz").starts_with(repo_path("foo/bar/baz/qux"), true));
         assert!(!repo_path("foo/bar/baz").starts_with(repo_path("foo/bar/baz/qux"), false));
+    }
+
+    #[test]
+    fn test_strip_prefix() {
+        assert_eq!(
+            repo_path("").strip_prefix(repo_path(""), true),
+            Some(repo_path(""))
+        );
+        assert_eq!(
+            repo_path("").strip_prefix(repo_path(""), false),
+            Some(repo_path(""))
+        );
+
+        assert!(repo_path("").strip_prefix(repo_path("foo"), true).is_none());
+        assert!(
+            repo_path("")
+                .strip_prefix(repo_path("foo"), false)
+                .is_none()
+        );
+
+        assert_eq!(
+            repo_path("foo").strip_prefix(repo_path(""), true),
+            Some(repo_path("foo"))
+        );
+        assert_eq!(
+            repo_path("foo").strip_prefix(repo_path(""), false),
+            Some(repo_path("foo"))
+        );
+
+        assert_eq!(
+            repo_path("foo").strip_prefix(repo_path("foo"), true),
+            Some(repo_path(""))
+        );
+        assert_eq!(
+            repo_path("foo").strip_prefix(repo_path("foo"), false),
+            Some(repo_path(""))
+        );
+
+        assert!(
+            repo_path("foobar")
+                .strip_prefix(repo_path("foo"), true)
+                .is_none()
+        );
+        assert!(
+            repo_path("foobar")
+                .strip_prefix(repo_path("foo"), false)
+                .is_none()
+        );
+
+        assert_eq!(
+            repo_path("foo/bar/baz").strip_prefix(repo_path("foo/bar"), true),
+            Some(repo_path("baz"))
+        );
+        assert!(
+            repo_path("foo/bAr/baz")
+                .strip_prefix(repo_path("foo/bar"), true)
+                .is_none()
+        );
+        assert_eq!(
+            repo_path("foo/bAr/baz").strip_prefix(repo_path("foo/bar"), false),
+            Some(repo_path("baz"))
+        );
+        assert_eq!(
+            repo_path("foo/bÄr/baz").strip_prefix(repo_path("foo/bär"), false),
+            Some(repo_path("baz"))
+        );
+
+        assert!(
+            repo_path("foo/bar/baz")
+                .strip_prefix(repo_path("foo/bar/baz/qux"), true)
+                .is_none()
+        );
+        assert!(
+            repo_path("foo/bar/baz")
+                .strip_prefix(repo_path("foo/bar/baz/qux"), false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_common_prefix() {
+        assert_eq!(repo_path("").common_prefix(repo_path("foo")), repo_path(""));
+        assert_eq!(repo_path("foo").common_prefix(repo_path("")), repo_path(""));
+        assert_eq!(
+            repo_path("foo").common_prefix(repo_path("foobar")),
+            repo_path("")
+        );
+        assert_eq!(
+            repo_path("foo").common_prefix(repo_path("foo")),
+            repo_path("foo")
+        );
+        assert_eq!(
+            repo_path("foo/bar").common_prefix(repo_path("foo")),
+            repo_path("foo")
+        );
+        assert_eq!(
+            repo_path("foo").common_prefix(repo_path("foo/bar")),
+            repo_path("foo")
+        );
+        assert_eq!(
+            repo_path("foo/bar").common_prefix(repo_path("foo/bar")),
+            repo_path("foo/bar")
+        );
+        assert_eq!(
+            repo_path("foo/bar/baz/qux").common_prefix(repo_path("bar")),
+            repo_path("")
+        );
+        assert_eq!(
+            repo_path("foo/bar/baz/qux").common_prefix(repo_path("foo/bar")),
+            repo_path("foo/bar")
+        );
+        assert_eq!(
+            repo_path("foo/bar").common_prefix(repo_path("foo/bar/baz/qux")),
+            repo_path("foo/bar")
+        );
     }
 }

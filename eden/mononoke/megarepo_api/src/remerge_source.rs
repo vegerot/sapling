@@ -8,13 +8,13 @@
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use changeset_fetcher::ChangesetFetcherRef;
 use context::CoreContext;
 use megarepo_config::MononokeMegarepoConfigs;
 use megarepo_config::Target;
 use megarepo_error::MegarepoError;
 use megarepo_mapping::SourceName;
 use mononoke_api::Mononoke;
+use mononoke_api::MononokeRepo;
 use mononoke_api::RepoContext;
 use mononoke_types::ChangesetId;
 use mutable_renames::MutableRenames;
@@ -27,22 +27,22 @@ use crate::common::MegarepoOp;
 // remerge_source resets source in a given target to a specified commit.
 // This is normally used for the cases where a bookmark had a non-fast
 // forward move.
-pub struct RemergeSource<'a> {
+pub struct RemergeSource<'a, R> {
     pub megarepo_configs: &'a Arc<dyn MononokeMegarepoConfigs>,
-    pub mononoke: &'a Arc<Mononoke>,
+    pub mononoke: &'a Arc<Mononoke<R>>,
     pub mutable_renames: &'a Arc<MutableRenames>,
 }
 
-impl<'a> MegarepoOp for RemergeSource<'a> {
-    fn mononoke(&self) -> &Arc<Mononoke> {
+impl<'a, R> MegarepoOp<R> for RemergeSource<'a, R> {
+    fn mononoke(&self) -> &Arc<Mononoke<R>> {
         self.mononoke
     }
 }
 
-impl<'a> RemergeSource<'a> {
+impl<'a, R: MononokeRepo> RemergeSource<'a, R> {
     pub fn new(
         megarepo_configs: &'a Arc<dyn MononokeMegarepoConfigs>,
-        mononoke: &'a Arc<Mononoke>,
+        mononoke: &'a Arc<Mononoke<R>>,
         mutable_renames: &'a Arc<MutableRenames>,
     ) -> Self {
         Self {
@@ -91,7 +91,7 @@ impl<'a> RemergeSource<'a> {
             })?;
         let (old_remapping_state, config) = find_target_sync_config(
             ctx,
-            target_repo.inner_repo(),
+            target_repo.repo(),
             target_location,
             target,
             self.megarepo_configs,
@@ -107,7 +107,7 @@ impl<'a> RemergeSource<'a> {
         let moved_commits = self
             .create_move_commits(
                 ctx,
-                target_repo.inner_repo(),
+                target_repo.repo(),
                 &[source_config.clone()],
                 new_remapping_state.get_all_latest_synced_changesets(),
                 self.mutable_renames,
@@ -153,7 +153,7 @@ impl<'a> RemergeSource<'a> {
 
         self.move_bookmark_conditionally(
             ctx,
-            target_repo.inner_repo(),
+            target_repo.repo(),
             target.bookmark.clone(),
             (target_location, remerged),
         )
@@ -168,12 +168,11 @@ impl<'a> RemergeSource<'a> {
         (expected_target_location, actual_target_location): (ChangesetId, ChangesetId),
         source_name: &SourceName,
         remerge_cs_id: ChangesetId,
-        repo: &RepoContext,
+        repo: &RepoContext<R>,
     ) -> Result<ChangesetId, MegarepoError> {
         let parents = repo
-            .inner_repo()
-            .changeset_fetcher()
-            .get_parents(ctx, actual_target_location)
+            .commit_graph()
+            .changeset_parents(ctx, actual_target_location)
             .await?;
         if parents.len() != 2 || parents[0] != expected_target_location {
             return Err(MegarepoError::request(anyhow!(

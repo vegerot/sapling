@@ -12,24 +12,24 @@ use std::collections::BTreeSet;
 use futures::StreamExt;
 use futures::TryStreamExt;
 
+use crate::dag::AbstractDag;
 use crate::iddag::IdDag;
 use crate::iddagstore::IdDagStore;
 use crate::idmap::IdMapAssignHead;
-use crate::namedag::AbstractNameDag;
-use crate::nameset::NameSet;
 use crate::ops::CheckIntegrity;
 use crate::ops::DagAlgorithm;
 use crate::ops::IdConvert;
 use crate::ops::Persist;
 use crate::ops::TryClone;
 use crate::segment::SegmentFlags;
+use crate::set::Set;
 use crate::Group;
 use crate::Id;
 use crate::Result;
-use crate::VertexName;
+use crate::Vertex;
 
 #[async_trait::async_trait]
-impl<IS, M, P, S> CheckIntegrity for AbstractNameDag<IdDag<IS>, M, P, S>
+impl<IS, M, P, S> CheckIntegrity for AbstractDag<IdDag<IS>, M, P, S>
 where
     IS: IdDagStore + Persist + 'static,
     IdDag<IS>: TryClone,
@@ -171,7 +171,7 @@ where
     async fn check_isomorphic_graph(
         &self,
         other: &dyn DagAlgorithm,
-        heads: NameSet,
+        heads: Set,
     ) -> Result<Vec<String>> {
         let mut problems = Vec::new();
 
@@ -206,8 +206,8 @@ where
         // 3. Remove the head (E) from "to_check", insert root (C)'s parents
         //    to "to_check".
         // 4. Repeat from 1 until "to_check" is empty.
-        let mut to_check: Vec<VertexName> = heads.iter().await?.try_collect().await?;
-        let mut visited: BTreeSet<VertexName> = Default::default();
+        let mut to_check: Vec<Vertex> = heads.iter().await?.try_collect().await?;
+        let mut visited: BTreeSet<Vertex> = Default::default();
         while let Some(head) = to_check.pop() {
             if !visited.insert(head.clone()) {
                 continue;

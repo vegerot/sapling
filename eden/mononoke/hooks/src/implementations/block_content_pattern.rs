@@ -19,8 +19,8 @@ use crate::CrossRepoPushSource;
 use crate::FileHook;
 use crate::HookConfig;
 use crate::HookExecution;
-use crate::HookFileContentProvider;
 use crate::HookRejectionInfo;
+use crate::HookStateProvider;
 use crate::PushAuthoredBy;
 
 #[derive(Deserialize, Clone, Debug)]
@@ -65,7 +65,7 @@ impl FileHook for BlockContentPatternHook {
     async fn run<'this: 'change, 'ctx: 'this, 'change, 'fetcher: 'change, 'path: 'change>(
         &'this self,
         ctx: &'ctx CoreContext,
-        content_manager: &'fetcher dyn HookFileContentProvider,
+        content_manager: &'fetcher dyn HookStateProvider,
         change: Option<&'change BasicFileChange>,
         path: &'path NonRootMPath,
         _cross_repo_push_source: CrossRepoPushSource,
@@ -128,12 +128,13 @@ mod tests {
             &ctx,
             &repo,
             r##"
-                Z-A-B-C-D-E
+                Z-A-B-C-D-E-F
             "##,
             changes! {
                 "B" => |c| c.add_file("file", "contains\n%block_commit%\ninside\n"),
                 "C" => |c| c.add_file("file", "contains %PREVENT_COMMIT% inside\n"),
                 "E" => |c| c.add_file("allowed_file", "contains %PREVENT_COMMIT% inside\n"),
+                "F" => |c| c.add_file("file", "non-binary crlf\r\nline\r\nendings\r\n"),
             },
         )
         .await?;
@@ -142,7 +143,7 @@ mod tests {
             .await?;
 
         let hook = BlockContentPatternHook::with_config(BlockContentPatternConfig {
-            pattern: Regex::new(r"(?i)(%(block_commit|prevent_commit)%)")?,
+            pattern: Regex::new(r"(?i)((%(block_commit|prevent_commit)%)|\r\n)")?,
             ignore_path_regexes: vec![Regex::new(r"^allowed.*")?],
             message: String::from("disallowed marker: $1"),
         })?;
@@ -198,6 +199,28 @@ mod tests {
                     HookExecution::Rejected(HookRejectionInfo {
                         description: "File contains blocked pattern".into(),
                         long_description: "disallowed marker: %PREVENT_COMMIT%: file".into(),
+                    })
+                )
+            ],
+        );
+
+        assert_eq!(
+            test_file_hook(
+                &ctx,
+                &repo,
+                &hook,
+                changesets["F"],
+                CrossRepoPushSource::NativeToThisRepo,
+                PushAuthoredBy::User,
+            )
+            .await?,
+            vec![
+                ("F".try_into()?, HookExecution::Accepted),
+                (
+                    "file".try_into()?,
+                    HookExecution::Rejected(HookRejectionInfo {
+                        description: "File contains blocked pattern".into(),
+                        long_description: "disallowed marker: \r\n: file".into(),
                     })
                 )
             ],

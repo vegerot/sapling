@@ -57,7 +57,7 @@ struct Adapter {
 
   // Fully qualified name the above implementation adapts to
   2: string typeClassName;
-} (thrift.uri = "facebook.com/thrift/annotation/java/Adapter")
+}
 
 @scope.Field
 struct Wrapper {
@@ -66,7 +66,7 @@ struct Wrapper {
 
   // Fully qualified name the above implementation wraps to
   2: string typeClassName;
-} (thrift.uri = "facebook.com/thrift/annotation/java/Wrapper")
+}
 
 @scope.Field
 struct Recursive {}
@@ -78,3 +78,10 @@ struct Recursive {}
 // behavior is correct to begin with.
 @scope.Field
 struct FieldUseUnmangledName {}
+
+//In some case, due to client and server's thrift definitions out of sync,
+//when thrift runtime deserialize a message it encountered a value not definded in definitions, and it
+//returns null which cause some confusions.
+//We set an annotation named UseIntrinsicDefault here to offer an option to use a default value when the null is received.
+@scope.Enum
+struct UseIntrinsicDefault {}

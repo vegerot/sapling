@@ -12,7 +12,6 @@ use std::str::FromStr;
 use anyhow::Error;
 use anyhow::Result;
 use async_trait::async_trait;
-use blobrepo::BlobRepo;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bytes::Bytes;
@@ -23,7 +22,6 @@ use futures::stream;
 use mercurial_derivation::DeriveHgChangeset;
 use mercurial_types::HgChangesetId;
 use mercurial_types::NonRootMPath;
-use mononoke_api_types::InnerRepo;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::BonsaiChangesetMut;
 use mononoke_types::ChangesetId;
@@ -141,15 +139,15 @@ pub trait TestRepoFixture {
         repo
     }
 
-    async fn get_custom_test_repo<
+    async fn get_repo<
         R: Repo + for<'builder> facet::AsyncBuildable<'builder, TestRepoFactoryBuilder<'builder>>,
     >(
         fb: FacebookInit,
     ) -> R {
-        Self::get_custom_test_repo_with_id(fb, RepositoryId::new(0)).await
+        Self::get_repo_with_id(fb, RepositoryId::new(0)).await
     }
 
-    async fn get_custom_test_repo_with_id<
+    async fn get_repo_with_id<
         R: Repo + for<'builder> facet::AsyncBuildable<'builder, TestRepoFactoryBuilder<'builder>>,
     >(
         fb: FacebookInit,
@@ -163,32 +161,6 @@ pub trait TestRepoFixture {
             .await
             .unwrap();
         Self::init_repo(fb, &repo).await.unwrap();
-        repo
-    }
-
-    // This method should be considered as deprecated. For new tests, please use `get_test_repo`
-    // instead.
-    async fn getrepo(fb: FacebookInit) -> BlobRepo {
-        Self::get_inner_repo(fb).await.blob_repo
-    }
-
-    async fn get_inner_repo(fb: FacebookInit) -> InnerRepo {
-        Self::get_inner_repo_with_id(fb, RepositoryId::new(0)).await
-    }
-
-    async fn getrepo_with_id(fb: FacebookInit, id: RepositoryId) -> BlobRepo {
-        Self::get_inner_repo_with_id(fb, id).await.blob_repo
-    }
-
-    async fn get_inner_repo_with_id(fb: FacebookInit, id: RepositoryId) -> InnerRepo {
-        let repo: InnerRepo = TestRepoFactory::new(fb)
-            .unwrap()
-            .with_id(id)
-            .with_name(Self::REPO_NAME.to_string())
-            .build()
-            .await
-            .unwrap();
-        Self::init_repo(fb, &repo.blob_repo).await.unwrap();
         repo
     }
 }
@@ -985,7 +957,7 @@ pub fn json_config_small() -> String {
 
 #[cfg(test)]
 mod test {
-    use changesets::ChangesetsRef;
+    use commit_graph::CommitGraphRef;
 
     use super::*;
 
@@ -1006,12 +978,16 @@ mod test {
                 .iter()
                 .map(|name| commits[name])
                 .collect::<BTreeSet<_>>();
-            let cs = repo.changesets().get(&ctx, cs_id).await.unwrap().unwrap();
+            let cs_parents = repo
+                .commit_graph()
+                .changeset_parents(&ctx, cs_id)
+                .await
+                .unwrap();
             assert_eq!(
-                cs.parents.iter().copied().collect::<BTreeSet<_>>(),
+                cs_parents.iter().copied().collect::<BTreeSet<_>>(),
                 parents,
                 "{name} ({cs_id}) parents mismatch: {:?} != {:?}",
-                cs.parents,
+                cs_parents,
                 parents
             );
         }

@@ -15,22 +15,17 @@ use blobstore::Blobstore;
 use blobstore::Storable;
 use cloned::cloned;
 use context::CoreContext;
-use derived_data::impl_bonsai_derived_via_manager;
 use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
 use derived_data_manager::DerivationContext;
 use derived_data_service_if as thrift;
-use filestore::FetchKey;
 use filestore::FilestoreConfig;
 use futures::future::ready;
 use futures::stream::FuturesUnordered;
 use futures::stream::TryStreamExt;
 use manifest::derive_manifest;
 use manifest::flatten_subentries;
-use mononoke_types::hash::RichGitSha1;
-use mononoke_types::hash::Sha256;
-use mononoke_types::BasicFileChange;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::GitLfs;
@@ -38,6 +33,7 @@ use mononoke_types::NonRootMPath;
 
 use crate::errors::MononokeGitError;
 use crate::fetch_non_blob_git_object;
+use crate::git_lfs::generate_and_store_git_lfs_pointer;
 use crate::upload_non_blob_git_object;
 use crate::BlobHandle;
 use crate::Tree;
@@ -127,8 +123,6 @@ impl BonsaiDerivable for TreeHandle {
     }
 }
 
-impl_bonsai_derived_via_manager!(TreeHandle);
-
 async fn derive_git_manifest<B: Blobstore + Clone + 'static>(
     ctx: &CoreContext,
     blobstore: B,
@@ -212,41 +206,6 @@ async fn derive_git_manifest<B: Blobstore + Clone + 'static>(
     }
 }
 
-// in line with https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md
-fn format_lfs_pointer(sha256: Sha256, size: u64) -> String {
-    format!(
-        "version https://git-lfs.github.com/spec/v1\noid sha256:{sha256}\nsize {size}",
-        sha256 = sha256,
-        size = size
-    )
-}
-
-/// Given a file change generates a Git LFS pointer that points to acctual file contents
-/// and stores it in the blobstore. Returns oid of the LFS pointer.
-async fn generate_and_store_git_pointer<B: Blobstore + Clone + 'static>(
-    blobstore: &B,
-    filestore_config: FilestoreConfig,
-    ctx: &CoreContext,
-    basic_file_change: &BasicFileChange,
-) -> Result<RichGitSha1> {
-    let metadata = filestore::get_metadata(
-        blobstore,
-        ctx,
-        &FetchKey::Canonical(basic_file_change.content_id()),
-    )
-    .await?
-    .ok_or_else(|| anyhow!("Missing metadata for {}", basic_file_change.content_id()))?;
-    let lfs_pointer = format_lfs_pointer(metadata.sha256, basic_file_change.size());
-    let ((content_id, _size), fut) =
-        filestore::store_bytes(blobstore, filestore_config, ctx, lfs_pointer.into());
-    fut.await?;
-    let oid = filestore::get_metadata(blobstore, ctx, &FetchKey::Canonical(content_id))
-        .await?
-        .ok_or_else(|| anyhow!("Missing metadata for {}", basic_file_change.content_id()))?
-        .git_sha1;
-    Ok(oid)
-}
-
 pub async fn get_file_changes<B: Blobstore + Clone + 'static>(
     blobstore: &B,
     filestore_config: FilestoreConfig,
@@ -259,12 +218,17 @@ pub async fn get_file_changes<B: Blobstore + Clone + 'static>(
         .map(|(mpath, file_change)| async move {
             match file_change.simplify() {
                 Some(basic_file_change) => match basic_file_change.git_lfs() {
+                    // File is not LFS file
                     GitLfs::FullContent => Ok((
                         mpath,
                         Some(BlobHandle::new(ctx, blobstore, basic_file_change).await?),
                     )),
-                    GitLfs::GitLfsPointer => {
-                        let oid = generate_and_store_git_pointer(
+                    // No pointer content provided: we're generatic spec conformant canonical
+                    // pointer
+                    GitLfs::GitLfsPointer {
+                        non_canonical_pointer: None,
+                    } => {
+                        let oid = generate_and_store_git_lfs_pointer(
                             blobstore,
                             filestore_config,
                             ctx,
@@ -279,6 +243,21 @@ pub async fn get_file_changes<B: Blobstore + Clone + 'static>(
                             )),
                         ))
                     }
+                    // Non canonical LFS pointer provided - let's use it as is
+                    GitLfs::GitLfsPointer {
+                        non_canonical_pointer: Some(non_canonical_pointer),
+                    } => Ok((
+                        mpath,
+                        Some(
+                            BlobHandle::from_content_id_and_file_type(
+                                ctx,
+                                blobstore,
+                                non_canonical_pointer,
+                                basic_file_change.file_type(),
+                            )
+                            .await?,
+                        ),
+                    )),
                 },
                 None => Ok((mpath, None)),
             }
@@ -296,22 +275,42 @@ mod test {
     use std::str::FromStr;
 
     use anyhow::format_err;
+    use bonsai_git_mapping::BonsaiGitMapping;
+    use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::BookmarkKey;
+    use bookmarks::Bookmarks;
     use bookmarks::BookmarksRef;
-    use derived_data::BonsaiDerived;
+    use commit_graph::CommitGraph;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
     use filestore::Alias;
     use filestore::FetchKey;
+    use filestore::FilestoreConfig;
     use fixtures::TestRepoFixture;
-    use futures_util::stream::TryStreamExt;
     use git2::Oid;
     use git2::Repository;
     use manifest::ManifestOps;
+    use repo_blobstore::RepoBlobstore;
     use repo_blobstore::RepoBlobstoreArc;
+    use repo_derived_data::RepoDerivedData;
     use repo_derived_data::RepoDerivedDataRef;
+    use repo_identity::RepoIdentity;
     use tempfile::TempDir;
 
     use super::*;
+
+    #[facet::container]
+    struct Repo(
+        dyn BonsaiGitMapping,
+        dyn BonsaiHgMapping,
+        dyn Bookmarks,
+        RepoBlobstore,
+        RepoDerivedData,
+        RepoIdentity,
+        CommitGraph,
+        dyn CommitGraphWriter,
+        FilestoreConfig,
+    );
 
     /// This function creates a new Git tree from the fixture's master Bonsai bookmark,
     /// materializes it to disk, then verifies that libgit produces the same Git tree for it.
@@ -327,7 +326,10 @@ mod test {
             .await?
             .ok_or_else(|| format_err!("no master"))?;
 
-        let tree = TreeHandle::derive(&ctx, &repo, bcs_id).await?;
+        let tree = repo
+            .repo_derived_data()
+            .derive::<TreeHandle>(&ctx, bcs_id)
+            .await?;
 
         let leaves = tree
             .list_leaf_entries(ctx.clone(), repo.repo_blobstore_arc())
@@ -369,7 +371,7 @@ mod test {
             fn $test_name(fb: FacebookInit) -> Result<(), Error> {
                 let runtime = tokio::runtime::Runtime::new()?;
                 runtime.block_on(async move {
-                    let repo = fixtures::$fixture::getrepo(fb).await;
+                    let repo: Repo = fixtures::$fixture::get_repo(fb).await;
                     run_tree_derivation_for_fixture(fb, repo).await
                 })
             }

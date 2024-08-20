@@ -53,7 +53,7 @@ macro_rules! delegate {
             {
                 self.$($t)*.contains_vertex_id_locally(ids)
             }
-            fn contains_vertex_name_locally<'a: 's, 'b: 's, 's>(&'a self, names: &'b [$crate::VertexName])
+            fn contains_vertex_name_locally<'a: 's, 'b: 's, 's>(&'a self, names: &'b [$crate::Vertex])
                 -> std::pin::Pin<Box<dyn std::future::Future<Output=
                         $crate::Result<Vec<bool>>
                     > + Send + 's>> where Self: 's
@@ -62,12 +62,12 @@ macro_rules! delegate {
             }
             fn vertex_name_batch<'a: 's, 'b: 's, 's>(&'a self, ids: &'b [$crate::Id])
                 -> std::pin::Pin<Box<dyn std::future::Future<Output=
-                        $crate::Result<Vec<$crate::Result<$crate::VertexName>>>
+                        $crate::Result<Vec<$crate::Result<$crate::Vertex>>>
                     > + Send + 's>> where Self: 's
             {
                 self.$($t)*.vertex_name_batch(ids)
             }
-            fn vertex_id_batch<'a: 's, 'b: 's, 's>(&'a self, names: &'b [$crate::VertexName])
+            fn vertex_id_batch<'a: 's, 'b: 's, 's>(&'a self, names: &'b [$crate::Vertex])
                 -> std::pin::Pin<Box<dyn std::future::Future<Output=
                         $crate::Result<Vec<$crate::Result<$crate::Id>>>
                     > + Send + 's>> where Self: 's
@@ -112,6 +112,9 @@ macro_rules! delegate {
             fn to_set(&self, set: &$crate::IdSet) -> $crate::Result<$crate::Set> {
                 self.$($t)*.to_set(set)
             }
+            fn id_list_to_set(&self, list: &$crate::IdList) -> $crate::Result<$crate::Set> {
+                self.$($t)*.id_list_to_set(list)
+            }
         }
     };
 
@@ -144,6 +147,13 @@ macro_rules! delegate {
                     > + Send + 's>> where Self: 's
             {
                 self.$($t)*.master_group()
+            }
+            fn virtual_group<'a: 's, 's>(&'a self)
+                -> std::pin::Pin<Box<dyn std::future::Future<Output=
+                        $crate::Result<$crate::Set>
+                    > + Send + 's>> where Self: 's
+            {
+                self.$($t)*.virtual_group()
             }
             fn ancestors<'a: 's, 's>(&'a self, set: $crate::Set)
                 -> std::pin::Pin<Box<dyn std::future::Future<Output=
@@ -338,7 +348,7 @@ macro_rules! delegate {
             fn check_isomorphic_graph<'a: 's, 'b: 's, 's> (
                 &'a self,
                 other: &'b dyn $crate::ops::DagAlgorithm,
-                heads: $crate::NameSet,
+                heads: $crate::Set,
             )
                 -> std::pin::Pin<Box<dyn std::future::Future<Output=
                         $crate::Result<Vec<String>>

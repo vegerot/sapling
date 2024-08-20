@@ -27,16 +27,23 @@
 #include <folly/SocketAddress.h>
 #include <folly/String.h>
 #include <folly/chrono/Conv.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/thread_factory/NamedThreadFactory.h>
 #include <folly/io/async/AsyncSignalHandler.h>
 #include <folly/io/async/HHWheelTimer.h>
 #include <folly/logging/xlog.h>
 #include <folly/portability/GFlags.h>
+#include <folly/portability/SysTypes.h>
 #include <folly/stop_watch.h>
 #include <thrift/lib/cpp/concurrency/ThreadManager.h>
 #include <thrift/lib/cpp2/async/ServerPublisherStream.h>
 #include <thrift/lib/cpp2/async/ServerStream.h>
+#include <thrift/lib/cpp2/server/ParallelConcurrencyController.h>
+#include <thrift/lib/cpp2/server/RoundRobinRequestPile.h>
+#include <thrift/lib/cpp2/server/SEParallelConcurrencyController.h>
 #include <thrift/lib/cpp2/server/ThriftProcessor.h>
 #include <thrift/lib/cpp2/server/ThriftServer.h>
+
 #include <csignal>
 
 #include "eden/common/telemetry/RequestMetricsScope.h"
@@ -98,6 +105,7 @@
 #endif
 
 #ifndef _WIN32
+#include <sys/wait.h>
 #include "eden/fs/fuse/FuseChannel.h"
 #include "eden/fs/inodes/Overlay.h"
 #include "eden/fs/notifications/CommandNotifier.h"
@@ -164,7 +172,7 @@ using namespace facebook::eden;
 
 std::shared_ptr<Notifier> getPlatformNotifier(
     std::shared_ptr<ReloadableConfig> config,
-    const std::shared_ptr<StructuredLogger>& logger,
+    std::shared_ptr<StructuredLogger> logger,
     std::string version) {
 #if defined(_WIN32)
   /*
@@ -181,7 +189,7 @@ std::shared_ptr<Notifier> getPlatformNotifier(
      */
     try {
       auto notifier = std::make_shared<WindowsNotifier>(
-          config, version, std::chrono::steady_clock::now());
+          config, logger, version, std::chrono::steady_clock::now());
       notifier->initialize();
       return notifier;
     } catch (const std::exception& ex) {
@@ -329,19 +337,39 @@ class EdenServer::ThriftServerEventHandler
     attachEventBase(eventBase);
     registerSignalHandler(SIGINT);
     registerSignalHandler(SIGTERM);
+#ifndef _WIN32
+    registerSignalHandler(SIGCHLD);
+#endif
     runningPromise_.setValue();
   }
 
   void signalReceived(int sig) noexcept override {
-    // Stop the server.
-    // Unregister for this signal first, so that we will be terminated
-    // immediately if the signal is sent again before we finish stopping.
-    // This makes it easier to kill the daemon if graceful shutdown hangs or
-    // takes longer than expected for some reason.  (For instance, if we
-    // unmounting the mount points hangs for some reason.)
-    XLOG(INFO) << "stopping due to signal " << sig;
-    unregisterSignalHandler(sig);
-    edenServer_->stop();
+    switch (sig) {
+#ifndef _WIN32
+      case SIGCHLD:
+        XLOG(DBG4) << "got SIGCHLD";
+        {
+          // Clean up zombie processes (ex. `sl debugrefreshconfig`).
+          int status;
+          pid_t pid;
+          while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            XLOG(DBG5) << "waited pid " << pid << " status " << status;
+          }
+        }
+        return;
+#endif
+      case SIGINT:
+      case SIGTERM:
+        // Stop the server.
+        // Unregister for this signal first, so that we will be terminated
+        // immediately if the signal is sent again before we finish stopping.
+        // This makes it easier to kill the daemon if graceful shutdown hangs or
+        // takes longer than expected for some reason.  (For instance, if we
+        // unmounting the mount points hangs for some reason.)
+        XLOG(INFO) << "stopping due to signal " << sig;
+        unregisterSignalHandler(sig);
+        edenServer_->stop();
+    }
   }
 
   /**
@@ -416,6 +444,9 @@ EdenServer::EdenServer(
           serverState_->getReloadableConfig(),
           serverState_->getStats().copy())},
       version_{std::move(version)},
+      thriftUseResourcePools_{edenConfig->thriftUseResourcePools.getValue()},
+      thriftUseSerialExecution_{
+          edenConfig->thriftUseSerialExecution.getValue()},
       progressManager_{
           std::make_unique<folly::Synchronized<EdenServer::ProgressManager>>()},
       startupStatusChannel_{std::move(startupStatusChannel)} {
@@ -1127,7 +1158,8 @@ bool EdenServer::createStorageEngine(cpptoml::table& config) {
         rocksPath,
         getStats().copy(),
         serverState_->getStructuredLogger(),
-        &serverState_->getFaultInjector());
+        &serverState_->getFaultInjector(),
+        config_);
     XLOG(DBG2) << "Created RocksDB store in "
                << watch.elapsed().count() / 1000.0 << " seconds.";
   } else {
@@ -2021,8 +2053,43 @@ folly::SemiFuture<Unit> EdenServer::createThriftServer() {
   auto edenConfig = config_->getEdenConfig();
   server_ = make_shared<ThriftServer>();
   server_->setMaxRequests(edenConfig->thriftMaxRequests.getValue());
-  server_->setNumCPUWorkerThreads(edenConfig->thriftNumWorkers.getValue());
-  server_->setCPUWorkerThreadName("Thrift");
+
+  // Set up the CPU worker threads
+  size_t thriftCpuThreads = edenConfig->thriftNumWorkers.getValue();
+  if (!thriftUseResourcePools_) {
+    server_->setNumCPUWorkerThreads(thriftCpuThreads);
+  } else {
+    server_->requireResourcePools();
+    auto executor = std::make_shared<folly::CPUThreadPoolExecutor>(
+        std::make_pair(thriftCpuThreads, thriftCpuThreads),
+        folly::CPUThreadPoolExecutor::makeThrottledLifoSemQueue(
+            std::chrono::microseconds{0}),
+        std::make_shared<folly::NamedThreadFactory>("EdenThrift"));
+    auto requestPile = std::make_unique<apache::thrift::RoundRobinRequestPile>(
+        apache::thrift::RoundRobinRequestPile::Options{});
+    std::unique_ptr<apache::thrift::ConcurrencyControllerInterface>
+        concurrencyController;
+    if (thriftUseSerialExecution_) {
+      XLOG(INFO, "Using Serial Execution for Thrift Server");
+      concurrencyController =
+          std::make_unique<apache::thrift::SEParallelConcurrencyController>(
+              *requestPile, *executor);
+    } else {
+      XLOG(INFO, "Using Resource Pools for Thrift Server");
+      concurrencyController =
+          std::make_unique<apache::thrift::ParallelConcurrencyController>(
+              *requestPile, *executor);
+    }
+
+    server_->resourcePoolSet().setResourcePool(
+        apache::thrift::ResourcePoolHandle::defaultAsync(),
+        std::move(requestPile),
+        std::move(executor),
+        std::move(concurrencyController),
+        apache::thrift::concurrency::NORMAL);
+  }
+  server_->setCPUWorkerThreadName("EdenThrift");
+
   server_->setQueueTimeout(std::chrono::floor<std::chrono::milliseconds>(
       edenConfig->thriftQueueTimeout.getValue()));
   server_->setAllowCheckUnimplementedExtraInterfaces(false);

@@ -31,7 +31,6 @@ use manifest::derive_manifests_for_simple_stack_of_commits;
 use manifest::flatten_subentries;
 use manifest::Entry;
 use manifest::ManifestChanges;
-use manifest::SortedVectorTrieMap;
 use manifest::TreeInfo;
 use mononoke_types::path::MPath;
 use mononoke_types::skeleton_manifest::SkeletonManifest;
@@ -46,6 +45,7 @@ use mononoke_types::FileType;
 use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
 use mononoke_types::SkeletonManifestId;
+use mononoke_types::SortedVectorTrieMap;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::SkeletonManifestDerivationError;
@@ -340,8 +340,8 @@ mod test {
     use anyhow::anyhow;
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::Bookmarks;
-    use changesets::Changesets;
     use commit_graph::CommitGraph;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use mononoke_types::ChangesetId;
@@ -360,24 +360,16 @@ mod test {
     use crate::mapping::get_file_changes;
 
     #[facet::container]
-    struct TestRepo {
-        #[facet]
-        bonsai_hg_mapping: dyn BonsaiHgMapping,
-        #[facet]
-        bookmarks: dyn Bookmarks,
-        #[facet]
-        changesets: dyn Changesets,
-        #[facet]
-        commit_graph: CommitGraph,
-        #[facet]
-        repo_derived_data: RepoDerivedData,
-        #[facet]
-        repo_blobstore: RepoBlobstore,
-        #[facet]
-        filestore_config: FilestoreConfig,
-        #[facet]
-        repo_identity: RepoIdentity,
-    }
+    struct TestRepo(
+        dyn BonsaiHgMapping,
+        dyn Bookmarks,
+        CommitGraph,
+        dyn CommitGraphWriter,
+        RepoDerivedData,
+        RepoBlobstore,
+        FilestoreConfig,
+        RepoIdentity,
+    );
 
     const B_FILES: &[&str] = &[
         "dir1/subdir1/subsubdir1/file1",

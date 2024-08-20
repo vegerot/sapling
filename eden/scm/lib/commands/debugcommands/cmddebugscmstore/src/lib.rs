@@ -47,6 +47,9 @@ define_flags! {
         /// Only fetch AUX data (don't request file/tree content).
         aux_only: bool,
 
+        /// Only fetch pure file content (allows request to go to CAS).
+        pure_content: bool,
+
         /// Request tree parents.
         tree_parents: bool,
 
@@ -66,7 +69,7 @@ enum FetchType {
     Tree,
 }
 
-pub fn run(ctx: ReqCtx<DebugScmStoreOpts>, repo: &mut Repo) -> Result<u8> {
+pub fn run(ctx: ReqCtx<DebugScmStoreOpts>, repo: &Repo) -> Result<u8> {
     let mode = match ctx.opts.mode.as_ref() {
         "file" => FetchType::File,
         "tree" => FetchType::Tree,
@@ -82,7 +85,8 @@ pub fn run(ctx: ReqCtx<DebugScmStoreOpts>, repo: &mut Repo) -> Result<u8> {
         block_on_stream(block_on(file_to_async_key_stream(path.into()))?).collect()
     } else {
         let wc = repo.working_copy()?;
-        let commit = repo.resolve_commit(Some(&wc.treestate().lock()), &ctx.opts.rev.unwrap())?;
+        let commit =
+            repo.resolve_commit(Some(&wc.read().treestate().lock()), &ctx.opts.rev.unwrap())?;
         let manifest = repo.tree_resolver()?.get(&commit)?;
         ctx.opts
             .args
@@ -125,6 +129,7 @@ pub fn run(ctx: ReqCtx<DebugScmStoreOpts>, repo: &mut Repo) -> Result<u8> {
             keys,
             fetch_mode,
             ctx.opts.aux_only,
+            ctx.opts.pure_content,
         )?,
         FetchType::Tree => fetch_trees(
             &ctx.core.io,
@@ -145,6 +150,7 @@ fn fetch_files(
     keys: Vec<Key>,
     fetch_mode: FetchMode,
     aux_only: bool,
+    pure_content: bool,
 ) -> Result<()> {
     repo.file_store()?;
     let store = repo.file_scm_store().unwrap();
@@ -166,7 +172,8 @@ fn fetch_files(
     let mut missing = fetch_and_display_successes(
         keys,
         FileAttributes {
-            content: !aux_only,
+            pure_content: !aux_only,
+            content_header: !aux_only && !pure_content,
             aux_data: true,
         },
     );
@@ -177,14 +184,16 @@ fn fetch_files(
         missing = fetch_and_display_successes(
             missing.into_keys().collect(),
             FileAttributes {
-                content: true,
+                pure_content: true,
+                content_header: !pure_content,
                 aux_data: false,
             },
         );
         missing = fetch_and_display_successes(
             missing.into_keys().collect(),
             FileAttributes {
-                content: false,
+                pure_content: false,
+                content_header: false,
                 aux_data: true,
             },
         );

@@ -1708,6 +1708,9 @@ void convertHgImportTraceEventToHgEvent(
     case HgImportTraceEvent::BLOBMETA:
       te.resourceType_ref() = HgResourceType::BLOBMETA;
       break;
+    case HgImportTraceEvent::TREEMETA:
+      te.resourceType_ref() = HgResourceType::TREEMETA;
+      break;
   }
 
   switch (event.importPriority) {
@@ -2522,15 +2525,16 @@ getAllEntryAttributes(
     EntryAttributeFlags requestedAttributes,
     const EdenMount& edenMount,
     std::string path,
-    const ObjectFetchContextPtr& fetchContext) {
+    const ObjectFetchContextPtr& fetchContext,
+    bool shouldFetchTreeMetadata) {
   auto virtualInode =
       edenMount.getVirtualInode(RelativePathPiece{path}, fetchContext);
   return std::move(virtualInode)
       .thenValue([path = std::move(path),
                   requestedAttributes,
                   objectStore = edenMount.getObjectStore(),
-                  fetchContext =
-                      fetchContext.copy()](VirtualInode tree) mutable {
+                  fetchContext = fetchContext.copy(),
+                  shouldFetchTreeMetadata](VirtualInode tree) mutable {
         if (!tree.isDirectory()) {
           return ImmediateFuture<std::vector<
               std::pair<PathComponent, folly::Try<EntryAttributes>>>>(
@@ -2540,7 +2544,11 @@ getAllEntryAttributes(
                   fmt::format("{}: path must be a directory", path)));
         }
         return tree.getChildrenAttributes(
-            requestedAttributes, RelativePath{path}, objectStore, fetchContext);
+            requestedAttributes,
+            RelativePath{path},
+            objectStore,
+            fetchContext,
+            shouldFetchTreeMetadata);
       });
 }
 
@@ -2669,6 +2677,9 @@ EdenServiceHandler::semifuture_readdir(std::unique_ptr<ReaddirParams> params) {
   auto& fetchContext = helper->getFetchContext();
   auto requestedAttributes =
       EntryAttributeFlags::raw(*params->requestedAttributes());
+  auto shouldFetchTreeMetadata = server_->getServerState()
+                                     ->getEdenConfig()
+                                     ->shouldFetchTreeMetadata.getValue();
   return wrapImmediateFuture(
              std::move(helper),
              waitForPendingWrites(mountHandle.getEdenMount(), *params->sync())
@@ -2676,7 +2687,8 @@ EdenServiceHandler::semifuture_readdir(std::unique_ptr<ReaddirParams> params) {
                      [mountHandle,
                       requestedAttributes,
                       paths = std::move(paths),
-                      fetchContext = fetchContext.copy()](auto&&) mutable
+                      fetchContext = fetchContext.copy(),
+                      shouldFetchTreeMetadata](auto&&) mutable
                      -> ImmediateFuture<
                          std::vector<DirListAttributeDataOrError>> {
                        std::vector<ImmediateFuture<DirListAttributeDataOrError>>
@@ -2688,7 +2700,8 @@ EdenServiceHandler::semifuture_readdir(std::unique_ptr<ReaddirParams> params) {
                                  requestedAttributes,
                                  mountHandle.getEdenMount(),
                                  std::move(path),
-                                 fetchContext)
+                                 fetchContext,
+                                 shouldFetchTreeMetadata)
                                  .thenTry([requestedAttributes, mountHandle](
                                               folly::Try<std::vector<std::pair<
                                                   PathComponent,
@@ -2723,18 +2736,27 @@ EdenServiceHandler::getEntryAttributes(
     const EdenMount& edenMount,
     const std::vector<std::string>& paths,
     EntryAttributeFlags reqBitmask,
+    AttributesRequestScope reqScope,
     SyncBehavior sync,
-    const ObjectFetchContextPtr& fetchContext) {
+    const ObjectFetchContextPtr& fetchContext,
+    bool shouldFetchTreeMetadata) {
   return waitForPendingWrites(edenMount, sync)
       .thenValue([this,
                   &edenMount,
                   &paths,
                   fetchContext = fetchContext.copy(),
-                  reqBitmask](auto&&) mutable {
+                  reqBitmask,
+                  reqScope,
+                  shouldFetchTreeMetadata](auto&&) mutable {
         vector<ImmediateFuture<EntryAttributes>> futures;
         for (const auto& path : paths) {
           futures.emplace_back(getEntryAttributesForPath(
-              edenMount, reqBitmask, path, fetchContext));
+              edenMount,
+              reqBitmask,
+              reqScope,
+              path,
+              fetchContext,
+              shouldFetchTreeMetadata));
         }
 
         // Collect all futures into a single tuple
@@ -2742,11 +2764,29 @@ EdenServiceHandler::getEntryAttributes(
       });
 }
 
+namespace {
+bool dtypeMatchesRequestScope(
+    VirtualInode inode,
+    AttributesRequestScope reqScope) {
+  if (reqScope == AttributesRequestScope::TREES_AND_FILES) {
+    return true;
+  }
+
+  if (inode.isDirectory()) {
+    return reqScope == AttributesRequestScope::TREES;
+  } else {
+    return reqScope == AttributesRequestScope::FILES;
+  }
+}
+} // namespace
+
 ImmediateFuture<EntryAttributes> EdenServiceHandler::getEntryAttributesForPath(
     const EdenMount& edenMount,
     EntryAttributeFlags reqBitmask,
+    AttributesRequestScope reqScope,
     std::string_view path,
-    const ObjectFetchContextPtr& fetchContext) {
+    const ObjectFetchContextPtr& fetchContext,
+    bool shouldFetchTreeMetadata) {
   if (path.empty()) {
     return ImmediateFuture<EntryAttributes>(newEdenError(
         EINVAL,
@@ -2760,14 +2800,21 @@ ImmediateFuture<EntryAttributes> EdenServiceHandler::getEntryAttributesForPath(
     return edenMount.getVirtualInode(relativePath, fetchContext)
         .thenValue([&edenMount,
                     reqBitmask,
+                    reqScope,
                     relativePath = relativePath.copy(),
-                    fetchContext =
-                        fetchContext.copy()](const VirtualInode& virtualInode) {
-          return virtualInode.getEntryAttributes(
-              reqBitmask,
-              relativePath,
-              edenMount.getObjectStore(),
-              fetchContext);
+                    fetchContext = fetchContext.copy(),
+                    shouldFetchTreeMetadata](const VirtualInode& virtualInode) {
+          if (dtypeMatchesRequestScope(virtualInode, reqScope)) {
+            return virtualInode.getEntryAttributes(
+                reqBitmask,
+                relativePath,
+                edenMount.getObjectStore(),
+                fetchContext,
+                shouldFetchTreeMetadata);
+          }
+          return makeImmediateFuture<EntryAttributes>(PathError(
+              reqScope == AttributesRequestScope::TREES ? ENOTDIR : EISDIR,
+              relativePath));
         });
   } catch (const std::exception& e) {
     return ImmediateFuture<EntryAttributes>(
@@ -2783,6 +2830,13 @@ constexpr EntryAttributeFlags kAllEntryAttributes = ENTRY_ATTRIBUTE_SIZE |
 folly::SemiFuture<std::unique_ptr<GetAttributesFromFilesResult>>
 EdenServiceHandler::semifuture_getAttributesFromFiles(
     std::unique_ptr<GetAttributesFromFilesParams> params) {
+  if (params->scope_ref().has_value()) {
+    return folly::SemiFuture<
+        std::unique_ptr<GetAttributesFromFilesResult>>(newEdenError(
+        EINVAL,
+        EdenErrorType::ARGUMENT_ERROR,
+        "scope is not supported by legacy getAttributesFromFiles endpoint"));
+  }
   auto mountPoint = *params->mountPoint();
   auto mountPath = absolutePathFromThrift(mountPoint);
   auto mountHandle = server_->getMount(mountPath);
@@ -2800,12 +2854,15 @@ EdenServiceHandler::semifuture_getAttributesFromFiles(
   // TODO(kmancini): When Buck2 migrates to our
   // explicit type information, we can get shape up
   // this API better.
+  auto config = server_->getServerState()->getEdenConfig();
   auto entryAttributesFuture = getEntryAttributes(
       mountHandle.getEdenMount(),
       paths,
       kAllEntryAttributes,
+      AttributesRequestScope::FILES,
       *params->sync(),
-      fetchContext);
+      fetchContext,
+      config->shouldFetchTreeMetadata.getValue());
 
   return wrapImmediateFuture(
              std::move(helper),
@@ -2894,6 +2951,8 @@ folly::SemiFuture<std::unique_ptr<GetAttributesFromFilesResultV2>>
 EdenServiceHandler::semifuture_getAttributesFromFilesV2(
     std::unique_ptr<GetAttributesFromFilesParams> params) {
   auto mountHandle = lookupMount(params->mountPoint());
+  auto reqScope =
+      params->scope().value_or(AttributesRequestScope::TREES_AND_FILES);
   auto reqBitmask = EntryAttributeFlags::raw(*params->requestedAttributes());
   std::vector<std::string>& paths = params->paths().value();
   auto helper = INSTRUMENT_THRIFT_CALL(
@@ -2903,12 +2962,15 @@ EdenServiceHandler::semifuture_getAttributesFromFilesV2(
       toLogArg(paths));
   auto& fetchContext = helper->getFetchContext();
 
+  auto config = server_->getServerState()->getEdenConfig();
   auto entryAttributesFuture = getEntryAttributes(
       mountHandle.getEdenMount(),
       paths,
       reqBitmask,
+      reqScope,
       *params->sync(),
-      fetchContext);
+      fetchContext,
+      config->shouldFetchTreeMetadata.getValue());
 
   return wrapImmediateFuture(
              std::move(helper),
@@ -3046,16 +3108,25 @@ ImmediateFuture<std::unique_ptr<ReturnType>> detachIfBackgrounded(
 template <typename ReturnType>
 folly::SemiFuture<std::unique_ptr<ReturnType>> serialDetachIfBackgrounded(
     ImmediateFuture<std::unique_ptr<ReturnType>> future,
-    const std::shared_ptr<apache::thrift::ThriftServer>& thriftServer,
-    const std::shared_ptr<const EdenConfig>& edenConfig,
+    EdenServer* const server,
     bool background) {
+  // If we're already using serial execution across the board, just do a normal
+  // detachIfBackgrounded
+  if (server->usingThriftSerialExecution()) {
+    return detachIfBackgrounded(
+               std::move(future), server->getServerState(), background)
+        .semi();
+  }
+
   folly::Executor::KeepAlive<> serial;
-  if (edenConfig->thriftUseSmallSerialExecutor.getValue()) {
+  if (server->getServerState()
+          ->getEdenConfig()
+          ->thriftUseSmallSerialExecutor.getValue()) {
     serial = folly::SmallSerialExecutor::create(
-        thriftServer->getThreadManager().get());
+        server->getServer()->getThreadManager().get());
   } else {
-    serial =
-        folly::SerialExecutor::create(thriftServer->getThreadManager().get());
+    serial = folly::SerialExecutor::create(
+        server->getServer()->getThreadManager().get());
   }
 
   if (background) {
@@ -3086,16 +3157,25 @@ ImmediateFuture<folly::Unit> detachIfBackgrounded(
 
 folly::SemiFuture<folly::Unit> serialDetachIfBackgrounded(
     ImmediateFuture<folly::Unit> future,
-    const std::shared_ptr<apache::thrift::ThriftServer>& thriftServer,
-    const std::shared_ptr<const EdenConfig>& edenConfig,
+    EdenServer* const server,
     bool background) {
+  // If we're already using serial execution across the board, just do a normal
+  // detachIfBackgrounded
+  if (server->usingThriftSerialExecution()) {
+    return detachIfBackgrounded(
+               std::move(future), server->getServerState(), background)
+        .semi();
+  }
+
   folly::Executor::KeepAlive<> serial;
-  if (edenConfig->thriftUseSmallSerialExecutor.getValue()) {
+  if (server->getServerState()
+          ->getEdenConfig()
+          ->thriftUseSmallSerialExecutor.getValue()) {
     serial = folly::SmallSerialExecutor::create(
-        thriftServer->getThreadManager().get());
+        server->getServer()->getThreadManager().get());
   } else {
-    serial =
-        folly::SerialExecutor::create(thriftServer->getThreadManager().get());
+    serial = folly::SerialExecutor::create(
+        server->getServer()->getThreadManager().get());
   }
 
   if (background) {
@@ -3330,10 +3410,7 @@ EdenServiceHandler::semifuture_predictiveGlobFiles(
     // single thread by using `folly::SerialExecutor` so the glob queries will
     // not overload the executor.
     return serialDetachIfBackgrounded<Glob>(
-        std::move(future),
-        server_->getServer(),
-        server_->getServerState()->getEdenConfig(),
-        isBackground);
+        std::move(future), server_, isBackground);
   } else {
     return detachIfBackgrounded<Glob>(
                std::move(future), serverState, isBackground)
@@ -3661,10 +3738,7 @@ EdenServiceHandler::semifuture_globFiles(std::unique_ptr<GlobParams> params) {
   // thread by using `folly::SerialExecutor` so the glob queries will not
   // overload the executor.
   return serialDetachIfBackgrounded<Glob>(
-      std::move(globFut),
-      server_->getServer(),
-      server_->getServerState()->getEdenConfig(),
-      isBackground);
+      std::move(globFut), server_, isBackground);
 }
 
 // DEPRECATED. Use semifuture_prefetchFilesV2 instead.
@@ -3723,10 +3797,7 @@ folly::SemiFuture<folly::Unit> EdenServiceHandler::semifuture_prefetchFiles(
     // single thread by using `folly::SerialExecutor` so the glob queries will
     // not overload the executor.
     return serialDetachIfBackgrounded(
-        std::move(globFut),
-        server_->getServer(),
-        server_->getServerState()->getEdenConfig(),
-        isBackground);
+        std::move(globFut), server_, isBackground);
   } else {
     return detachIfBackgrounded(
                std::move(globFut), server_->getServerState(), isBackground)
@@ -3803,10 +3874,7 @@ EdenServiceHandler::semifuture_prefetchFilesV2(
     // single thread by using `folly::SerialExecutor` so the glob queries will
     // not overload the executor.
     return serialDetachIfBackgrounded<PrefetchResult>(
-        std::move(prefetchResult),
-        server_->getServer(),
-        server_->getServerState()->getEdenConfig(),
-        isBackground);
+        std::move(prefetchResult), server_, isBackground);
   } else {
     return detachIfBackgrounded<PrefetchResult>(
                std::move(prefetchResult),
@@ -5407,6 +5475,21 @@ void EdenServiceHandler::checkPrivHelper(PrivHelperInfo& result) {
 
 int64_t EdenServiceHandler::getPid() {
   return ProcessId::current().get();
+}
+
+void EdenServiceHandler::getCheckoutProgressInfo(
+    CheckoutProgressInfoResponse& ret,
+    unique_ptr<CheckoutProgressInfoRequest> params) {
+  auto mountPath = absolutePathFromThrift(*params->mountPoint());
+  auto mountHandle = server_->getMount(mountPath);
+  auto checkoutProgress = mountHandle.getEdenMount().getCheckoutProgress();
+  if (checkoutProgress.has_value()) {
+    CheckoutProgressInfo progressInfoRet;
+    progressInfoRet.updatedInodes_ref() = std::move(checkoutProgress.value());
+    ret.checkoutProgressInfo_ref() = std::move(progressInfoRet);
+  } else {
+    ret.set_noProgress();
+  }
 }
 
 void EdenServiceHandler::initiateShutdown(std::unique_ptr<std::string> reason) {

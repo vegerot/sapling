@@ -22,31 +22,26 @@ use anyhow::Error;
 use backsyncer::backsync_latest;
 use backsyncer::open_backsyncer_dbs;
 use backsyncer::BacksyncLimit;
-use blobrepo::save_bonsai_changesets;
-use blobrepo::AsBlobRepo;
 use blobstore::Loadable;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
 use borrowed::borrowed;
-use cmdlib_cross_repo::get_all_possible_small_repo_submodule_deps;
+use bulk_derivation::BulkDerivation;
+use changesets_creation::save_changesets;
 use cmdlib_cross_repo::repo_provider_from_mononoke_app;
 use context::CoreContext;
 use cross_repo_sync::create_commit_syncer_lease;
 use cross_repo_sync::create_commit_syncers;
 use cross_repo_sync::find_toposorted_unsynced_ancestors;
+use cross_repo_sync::get_all_submodule_deps;
 use cross_repo_sync::rewrite_commit;
 use cross_repo_sync::CandidateSelectionHint;
 use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncOutcome;
 use cross_repo_sync::CommitSyncer;
-use cross_repo_sync::InMemoryRepo;
-use cross_repo_sync::Large;
 use cross_repo_sync::Repo as CrossRepo;
-use cross_repo_sync::SubmoduleDeps;
-use cross_repo_sync::SubmoduleExpansionData;
 use cross_repo_sync::Syncers;
-use derived_data_utils::derived_data_utils;
 use environment::MononokeEnvironment;
 use fbinit::FacebookInit;
 use futures::future;
@@ -68,10 +63,7 @@ use mercurial_types::NonRootMPath;
 use metaconfig_parser::RepoConfigs;
 use metaconfig_types::CommitSyncConfigVersion;
 use metaconfig_types::DefaultSmallToLargeCommitSyncPathAction;
-use metaconfig_types::MetadataDatabaseConfig;
 use metaconfig_types::RepoConfig;
-use metaconfig_types::SegmentedChangelogConfig;
-use metaconfig_types::DEFAULT_GIT_SUBMODULE_METADATA_FILE_PREFIX;
 use mononoke_app::args::RepoArgs;
 use mononoke_app::fb303::AliveService;
 use mononoke_app::fb303::Fb303AppExtension;
@@ -85,16 +77,13 @@ use mononoke_types::DateTime;
 use mononoke_types::RepositoryId;
 use movers::DefaultAction;
 use movers::Mover;
+use movers::Movers;
 use pushrebase::do_pushrebase_bonsai;
 use pushredirect::PushRedirectionConfigArc;
-use segmented_changelog::seedheads_from_config;
-use segmented_changelog::SeedHead;
-use segmented_changelog::SegmentedChangelogTailer;
 use serde::Deserialize;
 use serde::Serialize;
 use slog::info;
 use sql_construct::SqlConstructFromMetadataDatabaseConfig;
-use sql_ext::facebook::MysqlOptions;
 use synced_commit_mapping::SqlSyncedCommitMapping;
 use synced_commit_mapping::SyncedCommitMapping;
 use synced_commit_mapping::SyncedCommitMappingRef;
@@ -173,7 +162,6 @@ enum ImportStage {
     GitImport,
     RewritePaths,
     DeriveBonsais,
-    TailSegmentedChangelog,
     MoveBookmark,
     MergeCommits,
     PushCommit,
@@ -216,10 +204,9 @@ pub struct RecoveryFields {
 async fn rewrite_file_paths(
     ctx: &CoreContext,
     repo: &Repo,
-    mover: &Mover,
+    movers: &Movers,
     gitimport_bcs_ids: &[ChangesetId],
     git_merge_bcs_id: &ChangesetId,
-    submodule_deps: SubmoduleDeps<Repo>,
 ) -> Result<(Vec<ChangesetId>, Option<ChangesetId>), Error> {
     let mut remapped_parents: HashMap<ChangesetId, ChangesetId> = HashMap::new();
     let mut bonsai_changesets = vec![];
@@ -238,25 +225,14 @@ async fn rewrite_file_paths(
     for (index, bcs) in gitimport_changesets.iter().enumerate() {
         let bcs_id = bcs.get_changeset_id();
 
-        let large_repo_id = Large(repo.repo_identity().id());
-        let fallback_repos = vec![];
-        let large_in_memory_repo = InMemoryRepo::from_repo(repo, fallback_repos)?;
-        let submodule_expansion_data = match submodule_deps {
-            SubmoduleDeps::ForSync(ref deps) => Some(SubmoduleExpansionData {
-                submodule_deps: deps,
-                x_repo_submodule_metadata_file_prefix: DEFAULT_GIT_SUBMODULE_METADATA_FILE_PREFIX,
-                large_repo_id,
-                large_repo: large_in_memory_repo,
-                dangling_submodule_pointers: vec![],
-            }),
-            SubmoduleDeps::NotNeeded | SubmoduleDeps::NotAvailable => None,
-        };
+        // repo_import doesn't support submodule expansion
+        let submodule_expansion_data = None;
 
         let rewritten_bcs_opt = rewrite_commit(
             ctx,
             bcs.clone().into_mut(),
             &remapped_parents,
-            mover.clone(),
+            movers.clone(),
             repo,
             Default::default(),
             Default::default(),
@@ -286,7 +262,7 @@ async fn rewrite_file_paths(
     bonsai_changesets = sort_bcs(&bonsai_changesets)?;
     let bcs_ids = get_cs_ids(&bonsai_changesets);
     info!(ctx.logger(), "Saving shifted bonsai changesets");
-    save_bonsai_changesets(bonsai_changesets, ctx.clone(), repo).await?;
+    save_changesets(ctx, repo, bonsai_changesets).await?;
     info!(ctx.logger(), "Saved shifted bonsai changesets");
     Ok((bcs_ids, git_merge_shifted_bcs_id))
 }
@@ -407,24 +383,17 @@ async fn derive_bonsais_single_repo(
     repo: &Repo,
     bcs_ids: &[ChangesetId],
 ) -> Result<(), Error> {
-    let derived_data_types = &repo.repo_derived_data().active_config().types;
-
-    let derived_utils: Vec<_> = derived_data_types
+    let derived_data_types = &repo
+        .repo_derived_data()
+        .active_config()
+        .types
         .iter()
-        .map(|ty| derived_data_utils(ctx.fb, repo.as_blob_repo(), *ty))
-        .collect::<Result<_, _>>()?;
-
-    stream::iter(derived_utils)
-        .map(Ok)
-        .try_for_each_concurrent(derived_data_types.len(), |derived_util| async move {
-            for csid in bcs_ids {
-                derived_util
-                    .derive(ctx.clone(), repo.repo_derived_data_arc(), csid.clone())
-                    .map_ok(|_| ())
-                    .await?;
-            }
-            Result::<(), Error>::Ok(())
-        })
+        .copied()
+        .collect::<Vec<_>>();
+    repo.repo_derived_data()
+        .manager()
+        .derive_bulk(ctx, bcs_ids, None, derived_data_types, None)
+        .map_err(|e| e.into())
         .await
 }
 
@@ -507,10 +476,7 @@ async fn move_bookmark(
         recovery_fields.move_bookmark_commits_done = commits_done + shifted_index;
 
         let check_repo = async move {
-            let hg_csid = repo
-                .as_blob_repo()
-                .derive_hg_changeset(ctx, curr_csid.clone())
-                .await?;
+            let hg_csid = repo.derive_hg_changeset(ctx, curr_csid.clone()).await?;
             check_dependent_systems(
                 ctx,
                 repo,
@@ -556,7 +522,6 @@ async fn move_bookmark(
 
             let small_repo_hg_csid = small_repo_back_sync_vars
                 .small_repo
-                .as_blob_repo()
                 .derive_hg_changeset(ctx, small_repo_cs_id)
                 .await?;
 
@@ -656,7 +621,7 @@ async fn merge_imported_commit(
         "Created merge bonsai: {} and changeset: {:?}", merged_cs_id, merged_cs
     );
 
-    save_bonsai_changesets(vec![merged_cs], ctx.clone(), repo).await?;
+    save_changesets(ctx, repo, vec![merged_cs]).await?;
     info!(ctx.logger(), "Finished merging");
     Ok(merged_cs_id)
 }
@@ -683,7 +648,7 @@ async fn push_merge_commit(
 
     let pushrebase_res = do_pushrebase_bonsai(
         ctx,
-        repo.as_blob_repo(),
+        repo,
         pushrebase_flags,
         bookmark_to_merge_into,
         &hashset![merged_cs],
@@ -704,7 +669,7 @@ async fn get_leaf_entries(
     repo: &Repo,
     cs_id: ChangesetId,
 ) -> Result<HashSet<NonRootMPath>, Error> {
-    let hg_cs_id = repo.as_blob_repo().derive_hg_changeset(ctx, cs_id).await?;
+    let hg_cs_id = repo.derive_hg_changeset(ctx, cs_id).await?;
     let hg_cs = hg_cs_id.load(ctx, repo.repo_blobstore()).await?;
     hg_cs
         .manifestid()
@@ -993,10 +958,16 @@ async fn get_pushredirected_vars(
     let live_commit_sync_config = Arc::new(live_commit_sync_config);
 
     let repo_provider = repo_provider_from_mononoke_app(app);
-    let submodule_deps = get_all_possible_small_repo_submodule_deps(
-        repo.clone(),
-        live_commit_sync_config.clone(),
+
+    let repo_arc = Arc::new(repo.clone());
+    let large_repo_arc = Arc::new(large_repo.clone());
+
+    let submodule_deps = get_all_submodule_deps(
+        ctx,
+        repo_arc,
+        large_repo_arc,
         repo_provider,
+        live_commit_sync_config.clone(),
     )
     .await?;
 
@@ -1090,11 +1061,8 @@ async fn repo_import(
         hg_sync_check_disabled: recovery_fields.hg_sync_check_disabled,
     };
 
-    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new_with_xdb(
-        ctx.logger(),
-        &env.config_store,
-        repo.push_redirection_config_arc(),
-    )?;
+    let live_commit_sync_config =
+        CfgrLiveCommitSyncConfig::new(&env.config_store, repo.push_redirection_config_arc())?;
 
     check_megarepo_large_repo_import_requirements(
         &ctx,
@@ -1117,10 +1085,15 @@ async fn repo_import(
     )
     .await?;
     let mut maybe_small_repo_back_sync_vars = None;
-    let mut movers = vec![movers::mover_factory(
+    let mover = movers::mover_factory(
         HashMap::new(),
         DefaultAction::PrependPrefix(dest_path_prefix),
-    )?];
+    )?;
+
+    let mut movers = vec![Movers {
+        mover: mover.clone(),
+        reverse_mover: get_reverse_mover(),
+    }];
 
     if let Some(large_repo_config) = maybe_large_repo_config {
         let (large_repo, large_repo_import_setting, syncers) = get_pushredirected_vars(
@@ -1154,7 +1127,7 @@ async fn repo_import(
         movers.push(
             syncers
                 .small_to_large
-                .get_mover_by_version(&version)
+                .get_movers_by_version(&version)
                 .await?,
         );
 
@@ -1183,8 +1156,8 @@ async fn repo_import(
 
     let combined_mover: Mover = Arc::new(move |source_path: &NonRootMPath| {
         let mut mutable_path = source_path.clone();
-        for mover in movers.clone() {
-            let maybe_path = mover(&mutable_path)?;
+        for mover_pair in movers.clone() {
+            let maybe_path = (mover_pair.mover)(&mutable_path)?;
             mutable_path = match maybe_path {
                 Some(moved_path) => moved_path,
                 None => return Ok(None),
@@ -1192,6 +1165,10 @@ async fn repo_import(
         }
         Ok(Some(mutable_path))
     });
+    let combined_movers = Movers {
+        mover: combined_mover.clone(),
+        reverse_mover: get_reverse_mover(),
+    };
 
     // Importing process starts here
     if recovery_fields.import_stage == ImportStage::GitImport {
@@ -1202,8 +1179,7 @@ async fn repo_import(
         };
         let target = GitimportTarget::full();
         info!(ctx.logger(), "Started importing git commits to Mononoke");
-        let uploader =
-            import_direct::DirectUploader::new(repo.as_blob_repo().clone(), ReuploadCommits::Never);
+        let uploader = import_direct::DirectUploader::new(repo.clone(), ReuploadCommits::Never);
         let import_map =
             import_tools::gitimport(&ctx, path, Arc::new(uploader), &target, &prefs).await?;
         info!(ctx.logger(), "Added commits to Mononoke");
@@ -1253,20 +1229,12 @@ async fn repo_import(
             .as_ref()
             .ok_or_else(|| format_err!("gitimported changeset ids are not found"))?;
 
-        let repo_provider = repo_provider_from_mononoke_app(app);
-        let submodule_deps = get_all_possible_small_repo_submodule_deps(
-            repo.clone(),
-            Arc::new(live_commit_sync_config),
-            repo_provider,
-        )
-        .await?;
         let (shifted_bcs_ids, git_merge_shifted_bcs_id) = rewrite_file_paths(
             &ctx,
             &repo,
-            &combined_mover,
+            &combined_movers,
             gitimport_bcs_ids,
             git_merge_bcs_id,
-            submodule_deps,
         )
         .await?;
 
@@ -1350,30 +1318,13 @@ async fn repo_import(
         .await?;
         info!(ctx.logger(), "Finished deriving data types");
 
-        recovery_fields.import_stage = ImportStage::TailSegmentedChangelog;
+        recovery_fields.import_stage = ImportStage::MoveBookmark;
         save_importing_state(recovery_fields).await?;
     }
 
     let imported_cs_id = recovery_fields
         .imported_cs_id
         .ok_or_else(|| format_err!("Imported changeset id is not found"))?;
-
-    if recovery_fields.import_stage == ImportStage::TailSegmentedChangelog {
-        info!(ctx.logger(), "Start tailing segmented changelog");
-        tail_segmented_changelog(
-            &ctx,
-            &repo,
-            &imported_cs_id,
-            &repo_config.storage_config.metadata,
-            &env.mysql_options,
-            &repo_config.segmented_changelog_config,
-        )
-        .await?;
-        info!(ctx.logger(), "Finished tailing segmented changelog");
-
-        recovery_fields.import_stage = ImportStage::MoveBookmark;
-        save_importing_state(recovery_fields).await?;
-    }
 
     if recovery_fields.import_stage == ImportStage::MoveBookmark {
         move_bookmark(
@@ -1458,50 +1409,6 @@ async fn repo_import(
     Ok(())
 }
 
-async fn tail_segmented_changelog(
-    ctx: &CoreContext,
-    repo: &Repo,
-    imported_cs_id: &ChangesetId,
-    storage_config_metadata: &MetadataDatabaseConfig,
-    mysql_options: &MysqlOptions,
-    segmented_changelog_config: &SegmentedChangelogConfig,
-) -> Result<(), Error> {
-    let mut seed_heads = seedheads_from_config(
-        ctx,
-        segmented_changelog_config,
-        segmented_changelog::JobType::Background,
-    )?;
-    seed_heads.push(SeedHead::from(imported_cs_id));
-
-    let segmented_changelog_tailer = SegmentedChangelogTailer::build_from(
-        ctx,
-        repo.as_blob_repo(),
-        storage_config_metadata,
-        mysql_options,
-        seed_heads,
-        stream::empty(), // no prefetched commits
-        None,            // no caching
-    )
-    .await?;
-
-    let repo_id = repo.repo_id();
-
-    info!(
-        ctx.logger(),
-        "repo {}: SegmentedChangelogTailer initialized", repo_id
-    );
-
-    segmented_changelog_tailer
-        .once(ctx, false)
-        .await
-        .with_context(|| format!("repo {}: incrementally building repo", repo_id))?;
-    info!(
-        ctx.logger(),
-        "repo {}: SegmentedChangelogTailer is done", repo_id,
-    );
-    Ok(())
-}
-
 async fn check_additional_setup_steps(
     app: &MononokeApp,
     ctx: CoreContext,
@@ -1551,11 +1458,8 @@ async fn check_additional_setup_steps(
         ));
     }
 
-    let live_commit_sync_config = CfgrLiveCommitSyncConfig::new_with_xdb(
-        ctx.logger(),
-        &env.config_store,
-        repo.push_redirection_config_arc(),
-    )?;
+    let live_commit_sync_config =
+        CfgrLiveCommitSyncConfig::new(&env.config_store, repo.push_redirection_config_arc())?;
 
     let maybe_large_repo_config = get_large_repo_config_if_pushredirected(
         &ctx,
@@ -1752,4 +1656,18 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
             Err(e)
         }
     }
+}
+
+/// The reverse_mover is used to backsync changes to submodule expansion, so it
+/// shouldn't ever be needed by repo_import, since it should only perform
+/// forward sync (i.e. small to large).
+///
+/// This mover will satisfy the type system and will crash if the assumption
+/// from above doesn't hold anymore.
+pub(crate) fn get_reverse_mover() -> Mover {
+    Arc::new(move |_source_path: &NonRootMPath| {
+        Err(anyhow!(
+            "Reverse mover should never be called for repo_import tool"
+        ))
+    })
 }

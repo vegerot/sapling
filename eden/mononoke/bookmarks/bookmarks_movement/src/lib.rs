@@ -8,16 +8,22 @@
 #![feature(trait_alias)]
 
 use ::repo_lock::RepoLockRef;
-use blobrepo::AsBlobRepo;
 use bonsai_git_mapping::BonsaiGitMappingArc;
+use bonsai_git_mapping::BonsaiGitMappingRef;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMappingArc;
+use bonsai_globalrev_mapping::BonsaiGlobalrevMappingRef;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
+use bookmarks::BookmarkTransaction;
+use bookmarks::BookmarkTransactionHook;
+use bookmarks::BookmarkUpdateLogId;
 use bookmarks::BookmarksRef;
 use bookmarks_types::BookmarkKey;
-use changesets::ChangesetsRef;
 use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriterRef;
+use context::CoreContext;
 use itertools::Itertools;
 use metaconfig_types::RepoConfigRef;
+use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::NonRootMPath;
 use phases::PhasesRef;
@@ -31,6 +37,9 @@ use repo_cross_repo::RepoCrossRepoRef;
 use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
 use repo_permission_checker::RepoPermissionCheckerRef;
+use repo_update_logger::log_bookmark_operation;
+use repo_update_logger::log_new_bonsai_changesets;
+use repo_update_logger::BookmarkInfo;
 use thiserror::Error;
 
 pub mod affected_changesets;
@@ -44,6 +53,7 @@ mod restrictions;
 mod update;
 
 pub use bookmarks_types::BookmarkKind;
+use git_push_redirect::GitPushRedirectConfigRef;
 pub use hooks::CrossRepoPushSource;
 pub use hooks::HookRejection;
 pub use pushrebase::PushrebaseOutcome;
@@ -60,16 +70,16 @@ pub use crate::update::BookmarkUpdatePolicy;
 pub use crate::update::BookmarkUpdateTargets;
 pub use crate::update::UpdateBookmarkOp;
 
+const ALLOW_NON_FFWD_PUSHVAR: &str = "x-git-allow-non-ffwd-push";
+
 /// Trait alias for bookmarks movement repositories.
 ///
 /// These are the repo attributes that are necessary to call most functions in
 /// bookmarks movement.
-pub trait Repo = AsBlobRepo
-    + BonsaiHgMappingRef
+pub trait Repo = BonsaiHgMappingRef
     + BonsaiGitMappingArc
     + BonsaiGlobalrevMappingArc
     + BookmarksRef
-    + ChangesetsRef
     + PhasesRef
     + PushrebaseMutationMappingRef
     + RepoBookmarkAttrsRef
@@ -82,6 +92,8 @@ pub trait Repo = AsBlobRepo
     + RepoPermissionCheckerRef
     + RepoLockRef
     + CommitGraphRef
+    + CommitGraphWriterRef
+    + GitPushRedirectConfigRef
     + Send
     + Sync;
 
@@ -155,9 +167,7 @@ pub enum BookmarkMovementError {
     )]
     PushRedirectorEnabledForPublishing { bookmark: BookmarkKey },
 
-    #[error(
-        "Bookmark '{bookmark}' cannot be moved because scratch bookmarks are being redirected"
-    )]
+    #[error("Bookmark '{bookmark}' cannot be moved because scratch bookmarks are being redirected")]
     PushRedirectorEnabledForScratch { bookmark: BookmarkKey },
 
     #[error(transparent)]
@@ -174,4 +184,103 @@ pub fn describe_hook_rejections(rejections: &[HookRejection]) -> String {
             )
         })
         .join("\n")
+}
+
+pub struct BookmarkInfoData {
+    bookmark_info: BookmarkInfo,
+    log_new_public_commits_to_scribe: bool,
+    commits: Vec<BonsaiChangeset>,
+}
+
+impl BookmarkInfoData {
+    pub fn new(
+        bookmark_info: BookmarkInfo,
+        log_new_public_commits_to_scribe: bool,
+        commits: Vec<BonsaiChangeset>,
+    ) -> Self {
+        Self {
+            bookmark_info,
+            log_new_public_commits_to_scribe,
+            commits,
+        }
+    }
+
+    pub async fn log(
+        self,
+        ctx: &CoreContext,
+        repo: &(
+             impl RepoIdentityRef
+             + CommitGraphRef
+             + RepoConfigRef
+             + BonsaiGlobalrevMappingRef
+             + BonsaiGitMappingRef
+             + GitPushRedirectConfigRef
+         ),
+    ) {
+        if self.log_new_public_commits_to_scribe {
+            log_new_bonsai_changesets(
+                ctx,
+                repo,
+                &self.bookmark_info.bookmark_name,
+                self.bookmark_info.bookmark_kind,
+                self.commits,
+            )
+            .await;
+        }
+        log_bookmark_operation(ctx, repo, &self.bookmark_info).await;
+    }
+}
+
+pub struct TransactionWithHooks {
+    pub transaction: Box<dyn BookmarkTransaction>,
+    pub txn_hooks: Vec<BookmarkTransactionHook>,
+}
+
+impl TransactionWithHooks {
+    pub fn new(
+        transaction: Box<dyn BookmarkTransaction>,
+        txn_hooks: Vec<BookmarkTransactionHook>,
+    ) -> Self {
+        Self {
+            transaction,
+            txn_hooks,
+        }
+    }
+
+    pub async fn commit(self) -> Result<BookmarkUpdateLogId, BookmarkMovementError> {
+        let maybe_log_id = self.transaction.commit_with_hooks(self.txn_hooks).await?;
+        if let Some(log_id) = maybe_log_id {
+            Ok(log_id.into())
+        } else {
+            Err(BookmarkMovementError::TransactionFailed)
+        }
+    }
+}
+
+pub struct BookmarkInfoTransaction {
+    pub info_data: BookmarkInfoData,
+    pub transaction: TransactionWithHooks,
+}
+
+impl BookmarkInfoTransaction {
+    pub fn new(
+        info_data: BookmarkInfoData,
+        transaction: Box<dyn BookmarkTransaction>,
+        txn_hooks: Vec<BookmarkTransactionHook>,
+    ) -> Self {
+        Self {
+            info_data,
+            transaction: TransactionWithHooks::new(transaction, txn_hooks),
+        }
+    }
+
+    pub async fn commit_and_log(
+        self,
+        ctx: &CoreContext,
+        repo: &impl Repo,
+    ) -> Result<BookmarkUpdateLogId, BookmarkMovementError> {
+        let log_id = self.transaction.commit().await?;
+        self.info_data.log(ctx, repo).await;
+        Ok(log_id)
+    }
 }

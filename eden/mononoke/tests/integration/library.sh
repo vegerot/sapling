@@ -121,6 +121,8 @@ function get_free_socket {
 
 ZELOS_PORT=$(get_free_socket)
 
+CAS_SERVER_SOCKET=$(get_free_socket)
+
 function mononoke_host {
   if [[ $LOCALIP == *":"* ]]; then
     # ipv6, surround in brackets
@@ -138,6 +140,16 @@ function mononoke_address {
     echo -n "$LOCALIP:$MONONOKE_SOCKET"
   fi
 }
+
+function cas_server_address {
+  if [[ $LOCALIP == *":"* ]]; then
+    # ipv6, surround in brackets
+    echo -n "[$LOCALIP]:$CAS_SERVER_SOCKET"
+  else
+    echo -n "$LOCALIP:$CAS_SERVER_SOCKET"
+  fi
+}
+
 
 function scs_address {
   echo -n "$(mononoke_host):$SCS_PORT"
@@ -238,6 +250,21 @@ function mononoke_hg_sync {
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --verify-server-bookmark-on-failure \
      ssh://user@dummy/"$HG_REPO" "$@" sync-once --start-id "$START_ID"
+}
+
+function mononoke_cas_sync {
+  HG_REPO_NAME="$1"
+  shift
+  START_ID="$1"
+  shift
+
+  GLOG_minloglevel=5 "$MONONOKE_CAS_SYNC" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
+    --retry-num 1 \
+    --repo-name $HG_REPO_NAME \
+    --mononoke-config-path "$TESTTMP/mononoke-config" \
+     sync-loop --start-id "$START_ID" --batch-size 20
 }
 
 function mononoke_backup_sync {
@@ -470,7 +497,8 @@ function mononoke_admin_source_target {
 # Remove the glog prefix
 function strip_glog {
   # based on https://our.internmc.facebook.com/intern/wiki/LogKnock/Log_formats/#regex-for-glog
-  sed -E -e 's%^[VDIWECF][[:digit:]]{4} [[:digit:]]{2}:?[[:digit:]]{2}:?[[:digit:]]{2}(\.[[:digit:]]+)?\s+(([0-9a-f]+)\s+)?(\[([^]]+)\]\s+)?(\(([^\)]+)\)\s+)?(([a-zA-Z0-9_./-]+):([[:digit:]]+))\]\s+%%'
+  sed -E -e 's%^[VDIWECF][[:digit:]]{4} [[:digit:]]{2}:?[[:digit:]]{2}:?[[:digit:]]{2}(\.[[:digit:]]+)?\s+(([0-9a-f]+)\s+)?(\[([^]]+)\]\s+)?(\(([^\)]+)\)\s+)?(([a-zA-Z0-9_./-]+):([[:digit:]]+))\]\s+%%' \
+  | grep -v "ODS3 SDK has dropped some samples." || true
 }
 
 function with_stripped_logs {
@@ -626,7 +654,6 @@ function setup_common_config {
     setup_mononoke_config "$@"
     setup_common_hg_configs
     setup_configerator_configs
-    setup_common_jks
 }
 
 function get_bonsai_svnrev_mapping {
@@ -650,6 +677,10 @@ function set_bonsai_globalrev_mapping {
   BCS_ID="$2"
   GLOBALREV="$3"
   sqlite3 "$TESTTMP/monsql/sqlite_dbs" "INSERT INTO bonsai_globalrev_mapping (repo_id, bcs_id, globalrev) VALUES ($REPO_ID, X'$BCS_ID', $GLOBALREV)";
+}
+
+function set_mononoke_as_source_of_truth_for_git {
+  sqlite3 "$TESTTMP/monsql/sqlite_dbs" "REPLACE INTO git_push_redirect (repo_id, mononoke) VALUES (0, 1)"
 }
 
 function setup_mononoke_config {
@@ -729,17 +760,6 @@ function setup_acls() {
 }
 ACLS
   fi
-}
-
-function setup_common_jks() {
-  merge_just_knobs <<EOF
-{
-  "bools": {
-    "scm/mononoke:pushredirect_use_xdb": false,
-    "scm/mononoke:pushredirect_disable_configerator": false
-  }
-}
-EOF
 }
 
 function db_config() {
@@ -1024,6 +1044,12 @@ repo_client_use_warm_bookmarks_cache=true
 CONFIG
 fi
 
+if [ "$GIT_LFS_INTERPRET_POINTERS" == "1" ]; then
+  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
+git_lfs_interpret_pointers = true
+CONFIG
+fi
+
 # Normally point to common storageconfig, but if none passed, create per-repo
 if [[ -z "$storageconfig" ]]; then
   storageconfig="blobstore_$reponame_urlencoded"
@@ -1073,6 +1099,18 @@ fi
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 [metadata_logger_config]
 bookmarks=["master"]
+CONFIG
+
+  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
+[mononoke_cas_sync_config]
+main_bookmark_to_sync="master"
+sync_all_bookmarks=true
+CONFIG
+
+  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
+[commit_cloud_config]
+mocked_employees=["myusername0@fb.com"]
+disable_interngraph_notification=true
 CONFIG
 
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
@@ -1191,6 +1229,10 @@ if [[ -n "${ENABLED_DERIVED_DATA:-}" ]]; then
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 [derived_data_config.available_configs.default]
 types = $ENABLED_DERIVED_DATA
+git_delta_manifest_version = 2
+git_delta_manifest_v2_config.max_inlined_object_size = 20
+git_delta_manifest_v2_config.max_inlined_delta_size = 20
+git_delta_manifest_v2_config.delta_chunk_size = 1000
 CONFIG
 else
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
@@ -1203,7 +1245,7 @@ types=[
   "filenodes",
   "fsnodes",
   "git_commits",
-  "git_delta_manifests",
+  "git_delta_manifests_v2",
   "git_trees",
   "unodes",
   "hgchangesets",
@@ -1213,6 +1255,10 @@ types=[
   "test_manifests",
   "test_sharded_manifests"
 ]
+git_delta_manifest_version = 2
+git_delta_manifest_v2_config.max_inlined_object_size = 20
+git_delta_manifest_v2_config.max_inlined_delta_size = 20
+git_delta_manifest_v2_config.delta_chunk_size = 1000
 CONFIG
 fi
 
@@ -1232,17 +1278,6 @@ fi
 if [[ -n "${HG_SET_COMMITTER_EXTRA}" ]]; then
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 hg_set_committer_extra = true
-CONFIG
-fi
-
-if [[ -n "${SEGMENTED_CHANGELOG_ENABLE:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[segmented_changelog_config]
-enabled=true
-heads_to_include = [
-   { bookmark = "master_bookmark" },
-]
-skip_dag_load_at_startup=true
 CONFIG
 fi
 
@@ -1287,6 +1322,7 @@ cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
   [zelos_config]
   local_zelos_port = $ZELOS_PORT
 CONFIG
+
 
 }
 
@@ -1372,7 +1408,7 @@ function blobimport {
   # --blobimport--> Mononoke repo
   local revlog="$input/revlog-export"
   rm -rf "$revlog"
-  hgedenapi --cwd "$input" debugexportrevlog revlog-export
+  sl --cwd "$input" debugexportrevlog revlog-export
   mkdir -p "$output"
   $MONONOKE_BLOBIMPORT \
     "${CACHE_ARGS[@]}" \
@@ -1507,7 +1543,7 @@ function wait_for_bookmark_delete() {
 function get_bookmark_value_edenapi {
   local repo="$1"
   local bookmark="$2"
-  REPONAME="$repo" hgedenapi debugapi -e bookmarks -i "[\"$bookmark\"]" | jq -r ".\"$bookmark\""
+  REPONAME="$repo" sl debugapi -e bookmarks -i "[\"$bookmark\"]" | jq -r ".\"$bookmark\""
 }
 
 function wait_for_bookmark_move_away_edenapi() {
@@ -1545,6 +1581,36 @@ function wait_for_git_bookmark_move() {
         return 1
     fi
     sleep 2
+  done
+}
+
+function wait_for_git_bookmark_delete() {
+  local bookmark_name="$1"
+  local attempt=0
+  while [ $attempt -lt 30 ]
+  do
+    attempt=$((attempt + 1))
+    refs=$(git_client ls-remote --quiet)
+    if echo "$refs" | grep -q "$bookmark_name"; then
+      sleep 2
+    else
+      return 0
+    fi
+  done
+}
+
+function wait_for_git_bookmark_create() {
+  local bookmark_name="$1"
+  local attempt=0
+  while [ $attempt -lt 30 ]
+  do
+    attempt=$((attempt + 1))
+    refs=$(git_client ls-remote --quiet)
+    if echo "$refs" | grep -q "$bookmark_name"; then
+      return 0
+    else
+      sleep 2
+    fi
   done
 }
 
@@ -1696,9 +1762,10 @@ function lfs_server {
     lfs_health "$poll" "$proto" "$bound_addr_file"
 
   export LFS_HOST_PORT
+  export BASE_LFS_URL
   LFS_HOST_PORT="$listen_host:$LFS_PORT"
-  uri="${proto}://$LFS_HOST_PORT"
-  echo "$uri"
+  BASE_LFS_URL="${proto}://$LFS_HOST_PORT"
+  echo "$BASE_LFS_URL"
 
   cp "$log" "$log.saved"
   truncate -s 0 "$log"
@@ -1751,7 +1818,7 @@ function hgmn {
 
 # Run an hg binary configured with the settings require to talk to Mononoke
 # via SaplingRemoteAPI
-function hgedenapi {
+function sl {
   hgmn \
     --config "edenapi.url=https://localhost:$MONONOKE_SOCKET/edenapi" \
     --config "edenapi.enable=true" \
@@ -1889,9 +1956,16 @@ function hook_test_setup() {
 
   reponame_urlencoded="$(urlencode encode "$REPONAME")"
   HOOKBOOKMARK="${HOOKBOOKMARK:-master_bookmark}"
+
+  if [[ -z "$HOOKBOOKMARK_REGEX" ]]; then
+    HOOKBOOKMARK_ENTRY="name=\"$HOOKBOOKMARK\""
+  else
+    HOOKBOOKMARK_ENTRY="regex=\"$HOOKBOOKMARK_REGEX\""
+  fi
+
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 [[bookmarks]]
-name="$HOOKBOOKMARK"
+$HOOKBOOKMARK_ENTRY
 CONFIG
 
   while [[ "$#" -gt 0 ]]; do
@@ -2019,8 +2093,8 @@ function mkcommit() {
 
 function mkcommitedenapi() {
    echo "$1" > "$1"
-   hgedenapi add "$1"
-   hgedenapi ci -m "$1"
+   sl add "$1"
+   sl ci -m "$1"
 }
 
 function mkgitcommit() {
@@ -2207,6 +2281,9 @@ function gitimport() {
     "${COMMON_ARGS[@]}" \
     --repo-id "$REPOID" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
+    --tls-ca "$TEST_CERTDIR/root-ca.crt" \
+    --tls-private-key "$TEST_CERTDIR/client0.key" \
+    --tls-certificate "$TEST_CERTDIR/client0.crt" \
     "$@"
 }
 
@@ -2258,37 +2335,6 @@ if [ -z "$HAS_FB" ]; then
   }
 fi
 
-function segmented_changelog_tailer_reseed() {
-  "$MONONOKE_SEGMENTED_CHANGELOG_TAILER" \
-    "${CACHE_ARGS[@]}" \
-    "${COMMON_ARGS[@]}" \
-    --mononoke-config-path "${TESTTMP}/mononoke-config" \
-    --force-reseed \
-    "$@"
-}
-
-function segmented_changelog_tailer_once() {
-  "$MONONOKE_SEGMENTED_CHANGELOG_TAILER" \
-    "${CACHE_ARGS[@]}" \
-    "${COMMON_ARGS[@]}" \
-    --mononoke-config-path "${TESTTMP}/mononoke-config" \
-    --once \
-    "$@"
-}
-
-function background_segmented_changelog_tailer() {
-  out_file=$1
-  shift
-  # short delay here - we don't want to wait too much during tests
-  "$MONONOKE_SEGMENTED_CHANGELOG_TAILER" \
-    "${CACHE_ARGS[@]}" \
-    "${COMMON_ARGS[@]}" \
-    --mononoke-config-path "${TESTTMP}/mononoke-config" \
-    "$@" >> "$TESTTMP/$out_file" 2>&1 &
-  pid=$!
-  echo "$pid" >> "$DAEMON_PIDS"
-}
-
 function microwave_builder() {
   "$MONONOKE_MICROWAVE_BUILDER" \
     "${CACHE_ARGS[@]}" \
@@ -2297,24 +2343,11 @@ function microwave_builder() {
     "$@"
 }
 
-function backfill_derived_data() {
-  "$MONONOKE_BACKFILL_DERIVED_DATA" \
-    --debug \
+function derived_data_tailer {
+  GLOG_minloglevel=5 "$DERIVED_DATA_TAILER" \
     "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
-    --repo-id "$REPOID" \
-    --mononoke-config-path "${TESTTMP}/mononoke-config" \
-    "$@"
-}
-
-function backfill_derived_data_multiple_repos() {
-  IFS=':' read -r -a ids <<< "${REPOS[*]}"
-  "$MONONOKE_BACKFILL_DERIVED_DATA" \
-    "${CACHE_ARGS[@]}" \
-    "${COMMON_ARGS[@]}" \
-    "${ids[@]}" \
-    --mononoke-config-path "${TESTTMP}/mononoke-config" \
-    "$@"
+    --mononoke-config-path "$TESTTMP"/mononoke-config "$@"
 }
 
 function hook_tailer() {
@@ -2549,8 +2582,8 @@ function x_repo_lookup() {
   SOURCE_REPO="$1"
   TARGET_REPO="$2"
   HASH="$3"
-  TRANSLATED=$(REPONAME=$SOURCE_REPO hgedenapi debugapi -e committranslateids -i "[{'Hg': '$HASH'}]" -i "'Hg'" -i "'$SOURCE_REPO'" -i "'$TARGET_REPO'")
-  hgedenapi debugshell <<EOF
+  TRANSLATED=$(REPONAME=$SOURCE_REPO sl debugapi -e committranslateids -i "[{'Hg': '$HASH'}]" -i "'Hg'" -i "'$SOURCE_REPO'" -i "'$TARGET_REPO'")
+  sl debugshell <<EOF
 print(hex(${TRANSLATED}[0]["translated"]["Hg"]))
 EOF
 }

@@ -12,15 +12,13 @@ path = "src/cache_warmup.rs"
 
 [dependencies]
 anyhow = "1.0.75"
-blobrepo = { version = "0.1.0", path = "../blobrepo" }
 blobrepo_hg = { version = "0.1.0", path = "../blobrepo/blobrepo_hg" }
 blobstore = { version = "0.1.0", path = "../blobstore" }
+bonsai_hg_mapping = { version = "0.1.0", path = "../bonsai_hg_mapping" }
 bookmarks = { version = "0.1.0", path = "../bookmarks" }
-changeset_fetcher = { version = "0.1.0", path = "../blobrepo/changeset_fetcher" }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 commit_graph = { version = "0.1.0", path = "../repo_attributes/commit_graph/commit_graph" }
 context = { version = "0.1.0", path = "../server/context" }
-derived_data = { version = "0.1.0", path = "../derived_data" }
 filenodes = { version = "0.1.0", path = "../filenodes" }
 filenodes_derivation = { version = "0.1.0", path = "../derived_data/filenodes_derivation" }
 futures = { version = "0.3.30", features = ["async-await", "compat"] }
@@ -33,8 +31,8 @@ metaconfig_types = { version = "0.1.0", path = "../metaconfig/types" }
 microwave = { version = "0.1.0", path = "../microwave" }
 mononoke_types = { version = "0.1.0", path = "../mononoke_types" }
 repo_blobstore = { version = "0.1.0", path = "../blobrepo/repo_blobstore" }
+repo_derived_data = { version = "0.1.0", path = "../repo_attributes/repo_derived_data" }
 repo_identity = { version = "0.1.0", path = "../repo_attributes/repo_identity" }
-revset = { version = "0.1.0", path = "../revset" }
 slog = { version = "2.7", features = ["max_level_trace", "nested-values"] }
 thiserror = "1.0.49"
 tokio = { version = "1.37.0", features = ["full", "test-util", "tracing"] }

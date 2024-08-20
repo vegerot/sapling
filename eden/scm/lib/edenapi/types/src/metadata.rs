@@ -8,7 +8,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use bytes::Bytes;
+use minibytes::Bytes;
 #[cfg(any(test, feature = "for-tests"))]
 use quickcheck::Arbitrary;
 #[cfg(any(test, feature = "for-tests"))]
@@ -17,6 +17,8 @@ use serde_derive::Deserialize;
 use serde_derive::Serialize;
 use type_macros::auto_wire;
 pub use types::Blake3;
+pub use types::Sha1;
+pub use types::Sha256;
 
 use crate::FileAuxData;
 use crate::ServerError;
@@ -99,8 +101,6 @@ impl Arbitrary for FileMetadata {
     }
 }
 
-sized_hash!(Sha1, 20);
-sized_hash!(Sha256, 32);
 blake2_hash!(ContentId);
 blake2_hash!(FsnodeId);
 

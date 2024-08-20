@@ -19,6 +19,8 @@ use async_trait::async_trait;
 use bookmarks::BookmarkKey;
 use bookmarks::Freshness;
 use cached_config::ConfigStore;
+use clientinfo::ClientEntryPoint;
+use clientinfo::ClientInfo;
 use cmdlib::args;
 use cmdlib::args::MononokeMatches;
 use cmdlib::helpers;
@@ -38,6 +40,7 @@ use fbinit::FacebookInit;
 use futures::future;
 use futures::TryStreamExt;
 use live_commit_sync_config::CONFIGERATOR_PUSHREDIRECT_ENABLE;
+use metadata::Metadata;
 use mononoke_types::ChangesetId;
 use pushredirect_enable::MononokePushRedirectEnable;
 use scuba_ext::MononokeScubaSampleBuilder;
@@ -278,8 +281,16 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 }
 
 fn create_core_context(fb: FacebookInit, logger: Logger) -> CoreContext {
-    let session_container = SessionContainer::new_with_defaults(fb);
+    let mut metadata = Metadata::default();
+    metadata.add_client_info(ClientInfo::default_with_entry_point(
+        ClientEntryPoint::MegarepoBookmarksValidator,
+    ));
+
+    let session_container = SessionContainer::builder(fb)
+        .metadata(Arc::new(metadata))
+        .build();
     let scuba_sample = MononokeScubaSampleBuilder::with_discard();
+
     session_container.new_context(logger, scuba_sample)
 }
 
@@ -554,6 +565,7 @@ mod tests {
     use cross_repo_sync::CandidateSelectionHint;
     use cross_repo_sync::CommitSyncContext;
     use cross_repo_sync_test_utils::init_small_large_repo;
+    use cross_repo_sync_test_utils::TestRepo;
     use mononoke_types::DateTime;
     use tests_utils::bookmark;
     use tests_utils::resolve_cs_id;
@@ -564,7 +576,7 @@ mod tests {
     #[fbinit::test]
     async fn test_simple_check_large_bookmark_history(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
-        let (syncers, _, _, _) = init_small_large_repo(&ctx).await?;
+        let (syncers, _, _, _) = init_small_large_repo::<TestRepo>(&ctx).await?;
         let small_to_large = &syncers.small_to_large;
         let large_repo = small_to_large.get_large_repo();
         let small_repo = small_to_large.get_small_repo();
@@ -639,7 +651,7 @@ mod tests {
     #[fbinit::test]
     async fn test_another_repo_check_large_bookmark_history(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
-        let (syncers, _, _, _) = init_small_large_repo(&ctx).await?;
+        let (syncers, _, _, _) = init_small_large_repo::<TestRepo>(&ctx).await?;
         let small_to_large = &syncers.small_to_large;
 
         let small_repo = small_to_large.get_small_repo();
@@ -713,7 +725,7 @@ mod tests {
         fb: FacebookInit,
     ) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
-        let (syncers, _, _, _) = init_small_large_repo(&ctx).await?;
+        let (syncers, _, _, _) = init_small_large_repo::<TestRepo>(&ctx).await?;
         let small_to_large = &syncers.small_to_large;
         let large_repo = small_to_large.get_large_repo();
 
@@ -766,7 +778,7 @@ mod tests {
         fb: FacebookInit,
     ) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
-        let (syncers, _, _, _) = init_small_large_repo(&ctx).await?;
+        let (syncers, _, _, _) = init_small_large_repo::<TestRepo>(&ctx).await?;
         let small_to_large = &syncers.small_to_large;
         let large_repo = small_to_large.get_large_repo();
 
@@ -797,7 +809,7 @@ mod tests {
         fb: FacebookInit,
     ) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
-        let (syncers, _, _, _) = init_small_large_repo(&ctx).await?;
+        let (syncers, _, _, _) = init_small_large_repo::<TestRepo>(&ctx).await?;
         let small_to_large = &syncers.small_to_large;
         let small_repo = small_to_large.get_small_repo();
         let large_repo = small_to_large.get_large_repo();

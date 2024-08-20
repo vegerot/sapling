@@ -13,8 +13,8 @@ use acl_regions::AssociatedRulesResult;
 use anyhow::Result;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bookmarks::Bookmarks;
-use changeset_fetcher::ChangesetFetcher;
-use changesets::Changesets;
+use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use context::CoreContext;
 use fbinit::FacebookInit;
 use filestore::FilestoreConfig;
@@ -43,7 +43,10 @@ struct Repo {
     bookmarks: dyn Bookmarks,
 
     #[facet]
-    changesets: dyn Changesets,
+    commit_graph: CommitGraph,
+
+    #[facet]
+    commit_graph_writer: dyn CommitGraphWriter,
 
     #[facet]
     filestore_config: FilestoreConfig,
@@ -53,9 +56,6 @@ struct Repo {
 
     #[facet]
     repo_derived_data: RepoDerivedData,
-
-    #[facet]
-    changeset_fetcher: dyn ChangesetFetcher,
 
     #[facet]
     repo_identity: RepoIdentity,

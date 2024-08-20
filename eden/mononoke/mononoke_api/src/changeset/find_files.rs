@@ -22,9 +22,10 @@ use super::to_vec1;
 use super::ChangesetContext;
 use super::ChangesetFileOrdering;
 use crate::errors::MononokeError;
+use crate::MononokeRepo;
 
 /// A context object representing a query to a particular commit in a repo.
-impl ChangesetContext {
+impl<R: MononokeRepo> ChangesetContext<R> {
     pub async fn find_files_unordered(
         &self,
         prefixes: Option<Vec<MPath>>,
@@ -67,14 +68,14 @@ impl ChangesetContext {
                 if justknobs::eval(
                     "scm/mononoke:enable_bssm_v3",
                     None,
-                    Some(self.repo().name()),
+                    Some(self.repo_ctx().name()),
                 )
                 .unwrap_or_default()
                     && (!basenames_and_suffixes.has_right()
                         || justknobs::eval(
                             "scm/mononoke:enable_bssm_v3_suffix_query",
                             None,
-                            Some(self.repo().name()),
+                            Some(self.repo_ctx().name()),
                         )
                         .unwrap_or_default()) =>
             {
@@ -108,7 +109,7 @@ impl ChangesetContext {
             .await?
             .find_files_filter_basenames(
                 self.ctx(),
-                self.repo().blob_repo().repo_blobstore().clone(),
+                self.repo_ctx().repo().repo_blobstore().clone(),
                 prefixes.unwrap_or_else(Vec::new).into_iter().collect(),
                 basenames_and_suffixes,
                 match ordering {

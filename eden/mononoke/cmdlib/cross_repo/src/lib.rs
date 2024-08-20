@@ -8,45 +8,35 @@
 //! Scaffolding that's generally useful to build CLI tools on top of Mononoke.
 
 #![feature(trait_alias)]
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::bail;
 use anyhow::Error;
 use anyhow::Result;
 use blobstore_factory::MetadataSqlFactory;
-use cacheblob::LeaseOps;
-use cloned::cloned;
 use context::CoreContext;
 use cross_repo_sync::create_commit_syncer_lease;
 use cross_repo_sync::create_commit_syncers;
-use cross_repo_sync::CommitSyncRepos;
-use cross_repo_sync::CommitSyncer;
+use cross_repo_sync::get_all_submodule_deps;
+use cross_repo_sync::RepoProvider;
 use cross_repo_sync::Source;
-use cross_repo_sync::SubmoduleDeps;
 use cross_repo_sync::Syncers;
 use cross_repo_sync::Target;
 use futures::future;
-use futures::stream;
-use futures::Future;
-use futures::StreamExt;
-use futures::TryStreamExt;
 use live_commit_sync_config::CfgrLiveCommitSyncConfig;
 use live_commit_sync_config::LiveCommitSyncConfig;
 use mononoke_app::args::AsRepoArg;
 use mononoke_app::args::RepoArg;
 use mononoke_app::args::SourceAndTargetRepoArgs;
 use mononoke_app::MononokeApp;
-use mononoke_types::NonRootMPath;
-use mononoke_types::RepositoryId;
 use pushredirect::SqlPushRedirectionConfigBuilder;
 use sql_construct::SqlConstructFromMetadataDatabaseConfig;
+use sql_query_config::SqlQueryConfigArc;
 use synced_commit_mapping::SqlSyncedCommitMapping;
 
-pub trait CrossRepo =
-    cross_repo_sync::Repo + for<'a> facet::AsyncBuildable<'a, repo_factory::RepoFactoryBuilder<'a>>;
+pub trait CrossRepo = cross_repo_sync::Repo
+    + SqlQueryConfigArc
+    + for<'a> facet::AsyncBuildable<'a, repo_factory::RepoFactoryBuilder<'a>>;
 
 /// Instantiate the `Syncers` struct by parsing `app`
 pub async fn create_commit_syncers_from_app<R: CrossRepo>(
@@ -82,10 +72,15 @@ async fn create_commit_syncers_from_app_impl<R: CrossRepo>(
 
     let repo_provider = repo_provider_from_mononoke_app(app);
 
-    let submodule_deps = get_all_possible_small_repo_submodule_deps(
-        source_repo.0.clone(),
-        live_commit_sync_config.clone(),
+    let source_repo_arc = Arc::new(source_repo.0.clone());
+    let target_repo_arc = Arc::new(target_repo.0.clone());
+
+    let submodule_deps = get_all_submodule_deps(
+        ctx,
+        source_repo_arc,
+        target_repo_arc,
         repo_provider,
+        live_commit_sync_config.clone(),
     )
     .await?;
 
@@ -117,28 +112,10 @@ async fn create_commit_syncers_from_app_impl<R: CrossRepo>(
     )
 }
 
-/// Instantiate the source-target `CommitSyncer` struct by parsing `app`
-pub async fn create_commit_syncer_from_app<R: CrossRepo>(
-    ctx: &CoreContext,
-    app: &MononokeApp,
-    repo_args: &SourceAndTargetRepoArgs,
-) -> Result<CommitSyncer<SqlSyncedCommitMapping, R>, Error> {
-    create_commit_syncer_from_app_impl(ctx, app, false /* reverse */, repo_args).await
-}
-
-/// Instantiate the target-source `CommitSyncer` struct by parsing `app`
-pub async fn create_reverse_commit_syncer_from_app<R: CrossRepo>(
-    ctx: &CoreContext,
-    app: &MononokeApp,
-    repo_args: &SourceAndTargetRepoArgs,
-) -> Result<CommitSyncer<SqlSyncedCommitMapping, R>, Error> {
-    create_commit_syncer_from_app_impl(ctx, app, true /* reverse */, repo_args).await
-}
-
 /// Instantiate some auxiliary things from `app`
 /// Naming is hard.
 async fn get_things_from_app<R: CrossRepo>(
-    ctx: &CoreContext,
+    _ctx: &CoreContext,
     app: &MononokeApp,
     repo_args: &SourceAndTargetRepoArgs,
     unredacted: bool,
@@ -174,7 +151,7 @@ async fn get_things_from_app<R: CrossRepo>(
     )
     .await?;
 
-    let (source_repo, target_repo) = if !unredacted {
+    let (source_repo, target_repo): (R, R) = if !unredacted {
         app.open_source_and_target_repos(repo_args).await?
     } else {
         future::try_join(
@@ -194,14 +171,11 @@ async fn get_things_from_app<R: CrossRepo>(
     let builder = sql_factory
         .open::<SqlPushRedirectionConfigBuilder>()
         .await?;
-    let push_redirection_config = builder.build();
+    let push_redirection_config = builder.build(source_repo.sql_query_config_arc());
 
-    let live_commit_sync_config: Arc<dyn LiveCommitSyncConfig> =
-        Arc::new(CfgrLiveCommitSyncConfig::new_with_xdb(
-            ctx.logger(),
-            config_store,
-            Arc::new(push_redirection_config),
-        )?);
+    let live_commit_sync_config: Arc<dyn LiveCommitSyncConfig> = Arc::new(
+        CfgrLiveCommitSyncConfig::new(config_store, Arc::new(push_redirection_config))?,
+    );
 
     Ok((
         Source(source_repo),
@@ -211,134 +185,15 @@ async fn get_things_from_app<R: CrossRepo>(
     ))
 }
 
-fn flip_direction<T>(source_item: Source<T>, target_item: Target<T>) -> (Source<T>, Target<T>) {
-    (Source(target_item.0), Target(source_item.0))
-}
-
-async fn create_commit_syncer_from_app_impl<R: CrossRepo>(
-    ctx: &CoreContext,
-    app: &MononokeApp,
-    reverse: bool,
-    repo_args: &SourceAndTargetRepoArgs,
-) -> Result<CommitSyncer<SqlSyncedCommitMapping, R>, Error> {
-    let (source_repo, target_repo, mapping, live_commit_sync_config) =
-        get_things_from_app::<R>(ctx, app, repo_args, false).await?;
-
-    let (source_repo, target_repo) = if reverse {
-        flip_direction(source_repo, target_repo)
-    } else {
-        (source_repo, target_repo)
-    };
-
-    let caching = app.environment().caching;
-    let x_repo_syncer_lease = create_commit_syncer_lease(app.fb, caching)?;
-
-    let repo_provider = repo_provider_from_mononoke_app(app);
-
-    let submodule_deps = get_all_possible_small_repo_submodule_deps(
-        source_repo.0.clone(),
-        live_commit_sync_config.clone(),
-        repo_provider,
-    )
-    .await?;
-
-    create_commit_syncer(
-        ctx,
-        source_repo,
-        target_repo,
-        submodule_deps,
-        mapping,
-        live_commit_sync_config,
-        x_repo_syncer_lease,
-    )
-    .await
-}
-
-async fn create_commit_syncer<'a, R: CrossRepo>(
-    ctx: &'a CoreContext,
-    source_repo: Source<R>,
-    target_repo: Target<R>,
-    submodule_deps: SubmoduleDeps<R>,
-    mapping: SqlSyncedCommitMapping,
-    live_commit_sync_config: Arc<dyn LiveCommitSyncConfig>,
-    x_repo_syncer_lease: Arc<dyn LeaseOps>,
-) -> Result<CommitSyncer<SqlSyncedCommitMapping, R>, Error> {
-    let common_config =
-        live_commit_sync_config.get_common_config(source_repo.0.repo_identity().id())?;
-
-    let repos = CommitSyncRepos::new(source_repo.0, target_repo.0, submodule_deps, &common_config)?;
-    let commit_syncer = CommitSyncer::new(
-        ctx,
-        mapping,
-        repos,
-        live_commit_sync_config,
-        x_repo_syncer_lease,
-    );
-    Ok(commit_syncer)
-}
-
-/// Async function that, given a RepositoryId, loads and returns the repo.
-pub type RepoProvider<'a, R> =
-    Arc<dyn Fn(RepositoryId) -> Pin<Box<dyn Future<Output = Result<R>> + Send + 'a>> + 'a>;
-
 pub fn repo_provider_from_mononoke_app<'a, R: CrossRepo>(
     app: &'a MononokeApp,
 ) -> RepoProvider<'a, R> {
     let repo_provider: RepoProvider<'a, R> = Arc::new(move |repo_id| {
         Box::pin(async move {
             let repo = app.open_repo_unredacted::<R>(&RepoArg::Id(repo_id)).await?;
-            Ok(repo)
+            Ok(Arc::new(repo))
         })
     });
 
     repo_provider
-}
-
-/// Loads the Mononoke repos from the git submodules that the small repo depends.
-///
-/// These repos need to be loaded in order to be able to sync commits from the
-/// small repo that have git submodule changes to the large repo.
-///
-/// Since the dependencies might change for each version, this eagerly loads
-/// the dependencies from all versions, to guarantee that if we sync a sligthly
-/// older commit, its dependencies will be loaded.
-pub async fn get_all_possible_small_repo_submodule_deps<'a, R: CrossRepo>(
-    small_repo: R,
-    live_commit_sync_config: Arc<dyn LiveCommitSyncConfig>,
-    repo_provider: RepoProvider<'_, R>,
-) -> Result<SubmoduleDeps<R>> {
-    let source_repo_id = small_repo.repo_identity().id();
-
-    let source_repo_sync_configs = live_commit_sync_config
-        .get_all_commit_sync_config_versions(source_repo_id)
-        .await?;
-
-    let small_repo_deps_ids = source_repo_sync_configs
-        .into_values()
-        .filter_map(|mut cfg| {
-            cfg.small_repos
-                .remove(&source_repo_id)
-                .map(|small_repo_cfg| small_repo_cfg.submodule_config.submodule_dependencies)
-        })
-        .flatten()
-        .collect::<HashSet<_>>();
-
-    let submodule_deps_to_load = small_repo_deps_ids.len();
-
-    let submodule_deps_map: HashMap<NonRootMPath, Arc<R>> = stream::iter(small_repo_deps_ids)
-        .then(|(submodule_path, repo_id)| {
-            cloned!(repo_provider);
-            async move {
-                let repo = repo_provider(repo_id).await?;
-                anyhow::Ok((submodule_path, Arc::new(repo)))
-            }
-        })
-        .try_collect()
-        .await?;
-
-    if submodule_deps_map.len() < submodule_deps_to_load {
-        return Ok(SubmoduleDeps::NotAvailable);
-    }
-
-    Ok(SubmoduleDeps::ForSync(submodule_deps_map))
 }

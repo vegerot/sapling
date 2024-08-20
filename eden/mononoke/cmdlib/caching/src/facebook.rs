@@ -109,12 +109,6 @@ pub fn init_cachelib_from_settings(
     )?;
 
     cachelib::get_or_create_volatile_pool(
-        "changesets",
-        settings
-            .changesets_cache_size
-            .unwrap_or(available_space / 20),
-    )?;
-    cachelib::get_or_create_volatile_pool(
         "commit_graph",
         settings
             .commit_graph_cache_size
@@ -166,22 +160,16 @@ pub fn init_cachelib_from_settings(
     )?;
 
     cachelib::get_or_create_volatile_pool(
-        "segmented_changelog",
-        settings.segmented_changelog_cache_size.unwrap_or(1024),
-    )?;
-
-    cachelib::get_or_create_volatile_pool(
         "mutable_renames",
         settings
             .mutable_renames_cache_size
             .unwrap_or(available_space / 20),
     )?;
 
-    // SQL queries being cached using `cacheable` keyword
-    // At present the feature is used in bubble look-ups in snapshots only.
-    // Defaults to a very small cache.
-    // Readjust if usage increases.
-    cachelib::get_or_create_volatile_pool("sql", settings.sql_cache_size.unwrap_or(1024))?;
+    cachelib::get_or_create_volatile_pool(
+        "sql",
+        settings.sql_cache_size.unwrap_or(32 * 1024 * 1024),
+    )?;
 
     cachelib::get_or_create_volatile_pool(
         "blobstore-blobs",

@@ -19,7 +19,6 @@ use bookmarks::BookmarkKey;
 use bookmarks::BookmarksMaybeStaleExt;
 use cloned::cloned;
 use context::CoreContext;
-use derived_data::BonsaiDerived;
 use fsnodes::RootFsnodeId;
 use futures::future;
 use futures::future::FutureExt;
@@ -66,7 +65,6 @@ use crate::types::Repo;
 use crate::types::Source;
 use crate::types::Target;
 use crate::InMemoryRepo;
-use crate::Large;
 use crate::SubmoduleDeps;
 use crate::SubmoduleExpansionData;
 
@@ -120,10 +118,14 @@ pub async fn verify_working_copy_with_version<
     let source_repo = commit_syncer.get_source_repo();
     let target_repo = commit_syncer.get_target_repo();
 
-    let source_root_fsnode_id = RootFsnodeId::derive(ctx, source_repo, source_hash.0)
+    let source_root_fsnode_id = source_repo
+        .repo_derived_data()
+        .derive::<RootFsnodeId>(ctx, source_hash.0)
         .await?
         .into_fsnode_id();
-    let target_root_fsnode_id = RootFsnodeId::derive(ctx, target_repo, target_hash.0)
+    let target_root_fsnode_id = target_repo
+        .repo_derived_data()
+        .derive::<RootFsnodeId>(ctx, target_hash.0)
         .await?
         .into_fsnode_id();
 
@@ -170,15 +172,15 @@ pub async fn verify_working_copy_with_version<
         SubmoduleDeps::ForSync(ref deps) => Some(SubmoduleExpansionData {
             submodule_deps: deps,
             x_repo_submodule_metadata_file_prefix: &x_repo_submodule_metadata_file_prefix,
-            large_repo_id: Large(large_repo.repo_identity().id()),
+            small_repo_id: small_repo.repo_identity().id(),
             large_repo: large_in_memory_repo,
             dangling_submodule_pointers,
         }),
         SubmoduleDeps::NotNeeded | SubmoduleDeps::NotAvailable => None,
     };
-    let mover = commit_syncer.get_mover_by_version(version).await?;
+    let movers = commit_syncer.get_movers_by_version(version).await?;
     let exp_and_metadata_paths =
-        list_possible_expansion_and_metadata_paths(&mover, submodules_action, &sm_exp_data)?;
+        list_possible_expansion_and_metadata_paths(&movers.mover, submodules_action, &sm_exp_data)?;
 
     let large_repo_prefixes_to_visit =
         get_large_repo_prefixes_to_visit(&commit_syncer, version, live_commit_sync_config).await?;
@@ -191,7 +193,7 @@ pub async fn verify_working_copy_with_version<
         small_repo.repo_identity().name(),
     );
     info!(ctx.logger(), "###");
-    let reverse_mover = commit_syncer.get_reverse_mover_by_version(version).await?;
+
     verify_working_copy_inner(
         ctx,
         CommitSyncDirection::LargeToSmall,
@@ -199,7 +201,7 @@ pub async fn verify_working_copy_with_version<
         large_root_fsnode_id,
         Target(small_repo),
         small_root_fsnode_id,
-        &reverse_mover,
+        &movers.reverse_mover,
         large_repo_prefixes_to_visit.clone().into_iter().collect(),
         submodules_action,
         &sm_exp_data,
@@ -217,7 +219,7 @@ pub async fn verify_working_copy_with_version<
     info!(ctx.logger(), "###");
     let small_repo_prefixes_to_visit = large_repo_prefixes_to_visit
         .into_iter()
-        .map(|prefix| wrap_mover_result(&reverse_mover, &prefix))
+        .map(|prefix| wrap_mover_result(&movers.reverse_mover, &prefix))
         .collect::<Result<Vec<Option<Option<NonRootMPath>>>, Error>>()?
         .into_iter()
         .flatten()
@@ -229,7 +231,7 @@ pub async fn verify_working_copy_with_version<
         small_root_fsnode_id,
         Target(large_repo),
         large_root_fsnode_id,
-        &mover,
+        &movers.mover,
         small_repo_prefixes_to_visit,
         submodules_action,
         &sm_exp_data,
@@ -1736,10 +1738,8 @@ mod test {
         Error,
     > {
         let ctx = CoreContext::test_mock(fb);
-        let small_repo: TestRepo =
-            Linear::get_custom_test_repo_with_id(fb, RepositoryId::new(0)).await;
-        let large_repo: TestRepo =
-            Linear::get_custom_test_repo_with_id(fb, RepositoryId::new(1)).await;
+        let small_repo: TestRepo = Linear::get_repo_with_id(fb, RepositoryId::new(0)).await;
+        let large_repo: TestRepo = Linear::get_repo_with_id(fb, RepositoryId::new(1)).await;
 
         let master = BookmarkKey::new("master")?;
         let maybe_master_val = small_repo.bookmarks().get(ctx.clone(), &master).await?;

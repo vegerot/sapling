@@ -59,10 +59,10 @@ Blobimport test repo.
   $ blobimport repo-hg/.hg repo
 
 Start up SaplingRemoteAPI server.
-  $ SEGMENTED_CHANGELOG_ENABLE=1 setup_mononoke_config
+  $ setup_mononoke_config
   $ start_and_wait_for_mononoke_server
 Check response.
-  $ hgedenapi debugapi -e commitgraph2 -i "['$H']" -i "['$B','$C']" --sort
+  $ sl debugapi -e commitgraph2 -i "['$H']" -i "['$B','$C']" --sort
   [{"hgid": bin("49cb92066bfd0763fff729c354345650b7428554"),
     "parents": [bin("112478962961147124edd43549aedd1a335e44bf")],
     "is_draft": False},

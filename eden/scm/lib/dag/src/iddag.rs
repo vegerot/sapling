@@ -28,9 +28,11 @@ use crate::errors::NotFoundError;
 use crate::id::Group;
 use crate::id::Id;
 use crate::iddagstore::IdDagStore;
-use crate::iddagstore::InProcessStore;
 #[cfg(any(test, feature = "indexedlog-backend"))]
 use crate::iddagstore::IndexedLogStore;
+use crate::iddagstore::MemStore;
+use crate::idset;
+use crate::idset::Span;
 use crate::ops::Persist;
 use crate::ops::StorageVersion;
 #[cfg(any(test, feature = "indexedlog-backend"))]
@@ -39,8 +41,6 @@ use crate::segment::FlatSegment;
 use crate::segment::PreparedFlatSegments;
 use crate::segment::Segment;
 use crate::segment::SegmentFlags;
-use crate::spanset;
-use crate::spanset::Span;
 use crate::types_ext::PreparedFlatSegmentsExt;
 use crate::Error::Programming;
 use crate::IdSegment;
@@ -64,7 +64,7 @@ use crate::VerLink;
 /// graphs about how segments help with ancestry queries.
 ///
 /// [`IdDag`] is often used together with [`IdMap`] to allow customized names
-/// on vertexes. The [`NameDag`] type provides an easy-to-use interface to
+/// on vertexes. The [`Dag`] type provides an easy-to-use interface to
 /// keep [`IdDag`] and [`IdMap`] in sync.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct IdDag<Store> {
@@ -122,11 +122,11 @@ impl TryClone for IdDag<IndexedLogStore> {
     }
 }
 
-impl IdDag<InProcessStore> {
+impl IdDag<MemStore> {
     /// Instantiate an [`IdDag`] that stores all it's data in process. Useful for scenarios that
     /// do not require data persistance.
-    pub fn new_in_process() -> Self {
-        let store = InProcessStore::new();
+    pub fn new_in_memory() -> Self {
+        let store = MemStore::new();
         Self {
             store,
             new_seg_size: default_seg_size(),
@@ -576,7 +576,7 @@ impl<Store: IdDagStore> IdDag<Store> {
 
         let push = |seg: FlatSegment| segments.push(seg);
         let span_iter = set.as_spans().iter().cloned();
-        spanset::intersect_iter(seg_iter, span_iter, push);
+        idset::intersect_iter(seg_iter, span_iter, push);
 
         Ok(PreparedFlatSegments {
             segments: segments.into_iter().collect(),
@@ -2180,7 +2180,7 @@ mod tests {
         assert_eq!(all.count(), 1001);
 
         // Insert discontinuous segments.
-        let mut dag = IdDag::new_in_process();
+        let mut dag = IdDag::new_in_memory();
         // 10..=20
         dag.build_segments(Id(20), &|p| {
             Ok(if p > Id(10) { vec![p - 1] } else { vec![] })
@@ -2252,7 +2252,7 @@ mod tests {
 
         // Segment 20..=30 shouldn't have the "ONLY_HEAD" flag because of the gap.
         // In debug output it does not have "H" prefix.
-        let mut dag = IdDag::new_in_process();
+        let mut dag = IdDag::new_in_memory();
         dag.build_segments_from_prepared_flat_segments(&prepared)
             .unwrap();
         let iter = dag.iter_segments_ascending(Id(0), 0).unwrap();
@@ -2263,7 +2263,7 @@ mod tests {
     fn test_roots_max_level_empty() {
         // Create segments in a way that the highest level
         // contains no segments in the master group.
-        let mut iddag = IdDag::new_in_process();
+        let mut iddag = IdDag::new_in_memory();
         let mut prepared = PreparedFlatSegments {
             segments: vec![
                 FlatSegment {
@@ -2310,7 +2310,7 @@ mod tests {
 
     #[test]
     fn test_strip() {
-        let mut iddag = IdDag::new_in_process();
+        let mut iddag = IdDag::new_in_memory();
         let mut prepared = PreparedFlatSegments::default();
         prepared.segments.insert(FlatSegment {
             low: Id(0),
@@ -2420,7 +2420,7 @@ mod tests {
 
     #[test]
     fn test_id_set_to_id_segments() {
-        let mut iddag = IdDag::new_in_process();
+        let mut iddag = IdDag::new_in_memory();
 
         // Insert some segments. Create a few levels.
         let mut prepared = PreparedFlatSegments::default();

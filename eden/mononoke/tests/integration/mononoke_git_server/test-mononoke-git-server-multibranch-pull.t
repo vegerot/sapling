@@ -7,11 +7,9 @@
 # Integration test based on scenario: https://internalfb.com/excalidraw/EX180257
   $ . "${TEST_FIXTURES}/library.sh"
   $ REPOTYPE="blob_files"
-  $ ENABLED_DERIVED_DATA='["git_commits", "git_trees", "git_delta_manifests", "unodes", "filenodes", "hgchangesets"]' setup_common_config $REPOTYPE
+  $ setup_common_config $REPOTYPE
   $ GIT_REPO_ORIGIN="${TESTTMP}/origin/repo-git"
   $ GIT_REPO="${TESTTMP}/repo-git"
-  $ HG_REPO="${TESTTMP}/repo-hg"
-  $ BUNDLE_PATH="${TESTTMP}/repo_bundle.bundle"
   $ cat >> repos/repo/server.toml <<EOF
   > [source_control_service]
   > permit_writes = true
@@ -46,6 +44,14 @@
 
 # Capture all the known Git objects from the repo
   $ cd $GIT_REPO
+  $ git fetch "$GIT_REPO_ORIGIN" +refs/*:refs/* --prune -u
+  From $TESTTMP/origin/repo-git
+   - [deleted]         (none)     -> origin/R1
+   - [deleted]         (none)     -> origin/R2
+     (refs/remotes/origin/HEAD has become dangling)
+   - [deleted]         (none)     -> origin/master
+   * [new branch]      R1         -> R1
+   * [new branch]      master     -> master
   $ git rev-list --objects --all | git cat-file --batch-check='%(objectname) %(objecttype) %(rest)' | sort > $TESTTMP/object_list
 
 # Import it into Mononoke

@@ -18,6 +18,7 @@ use clientinfo::CLIENT_INFO_HEADER;
 use connection_security_checker::ConnectionSecurityChecker;
 use ephemeral_blobstore::BubbleId;
 use ephemeral_blobstore::RepoEphemeralStore;
+use factory_group::FactoryGroup;
 use fbinit::FacebookInit;
 use futures::future::BoxFuture;
 use futures::try_join;
@@ -38,6 +39,7 @@ use mononoke_api::CoreContext;
 use mononoke_api::FileContext;
 use mononoke_api::FileId;
 use mononoke_api::Mononoke;
+use mononoke_api::Repo;
 use mononoke_api::RepoContext;
 use mononoke_api::SessionContainer;
 use mononoke_api::TreeContext;
@@ -92,34 +94,39 @@ define_stats! {
 
     // Duration per method
     method_completion_time_ms: dynamic_histogram("method.{}.completion_time_ms", (method: String); 10, 0, 1_000, Average, Sum, Count; P 5; P 50 ; P 90),
+    total_method_requests:  dynamic_timeseries("method.{}.total_method_requests", (method: String); Rate, Sum),
+    total_method_internal_failure:  dynamic_timeseries("method.{}.total_method_internal_failure", (method: String); Rate, Sum),
+
 }
 
 #[derive(Clone)]
 pub(crate) struct SourceControlServiceImpl {
     pub(crate) fb: FacebookInit,
-    pub(crate) mononoke: Arc<Mononoke>,
-    pub(crate) megarepo_api: Arc<MegarepoApi>,
+    pub(crate) mononoke: Arc<Mononoke<Repo>>,
+    pub(crate) megarepo_api: Arc<MegarepoApi<Repo>>,
     pub(crate) logger: Logger,
     pub(crate) scuba_builder: MononokeScubaSampleBuilder,
     pub(crate) identity: Identity,
     pub(crate) scribe: Scribe,
     pub(crate) configs: Arc<MononokeConfigs>,
+    pub(crate) factory_group: Option<Arc<FactoryGroup<2>>>,
     identity_proxy_checker: Arc<ConnectionSecurityChecker>,
 }
 
-pub(crate) struct SourceControlServiceThriftImpl(SourceControlServiceImpl);
+pub(crate) struct SourceControlServiceThriftImpl(Arc<SourceControlServiceImpl>);
 
 impl SourceControlServiceImpl {
     pub fn new(
         fb: FacebookInit,
-        mononoke: Arc<Mononoke>,
-        megarepo_api: Arc<MegarepoApi>,
+        mononoke: Arc<Mononoke<Repo>>,
+        megarepo_api: Arc<MegarepoApi<Repo>>,
         logger: Logger,
         mut scuba_builder: MononokeScubaSampleBuilder,
         scribe: Scribe,
         identity_proxy_checker: ConnectionSecurityChecker,
         configs: Arc<MononokeConfigs>,
         common_config: &CommonConfig,
+        factory_group: Option<Arc<FactoryGroup<2>>>,
     ) -> Self {
         scuba_builder.add_common_server_data();
 
@@ -136,11 +143,12 @@ impl SourceControlServiceImpl {
             scribe,
             configs,
             identity_proxy_checker: Arc::new(identity_proxy_checker),
+            factory_group,
         }
     }
 
     pub(crate) fn thrift_server(&self) -> SourceControlServiceThriftImpl {
-        SourceControlServiceThriftImpl(self.clone())
+        SourceControlServiceThriftImpl(Arc::new(self.clone()))
     }
 
     pub(crate) async fn create_ctx(
@@ -309,14 +317,19 @@ impl SourceControlServiceImpl {
                 return Ok(metadata);
             }
         }
+
         let mut metadata = Metadata::new(
             None,
             tls_identities.union(&cats_identities).cloned().collect(),
             false,
             metadata::security::is_client_untrusted(|h| req_ctxt.header(h))
                 .map_err(errors::invalid_request)?,
-            None,
-            None,
+            Some(
+                req_ctxt
+                    .get_peer_ip_address()
+                    .map_err(errors::internal_error)?,
+            ),
+            Some(req_ctxt.get_peer_port().map_err(errors::internal_error)?),
         )
         .await;
 
@@ -347,7 +360,7 @@ impl SourceControlServiceImpl {
         &self,
         ctx: CoreContext,
         repo: &thrift::RepoSpecifier,
-    ) -> Result<RepoContext, errors::ServiceError> {
+    ) -> Result<RepoContext<Repo>, errors::ServiceError> {
         let authz = AuthorizationContext::new(&ctx);
         self.repo_impl(ctx, repo, authz, |_| async { Ok(None) })
             .await
@@ -360,7 +373,7 @@ impl SourceControlServiceImpl {
         ctx: CoreContext,
         repo: &thrift::RepoSpecifier,
         service_name: Option<String>,
-    ) -> Result<RepoContext, errors::ServiceError> {
+    ) -> Result<RepoContext<Repo>, errors::ServiceError> {
         let authz = match service_name {
             Some(service_name) => AuthorizationContext::new_for_service_writes(service_name),
             None => AuthorizationContext::new(&ctx),
@@ -375,7 +388,7 @@ impl SourceControlServiceImpl {
         repo: &thrift::RepoSpecifier,
         authz: AuthorizationContext,
         bubble_fetcher: F,
-    ) -> Result<RepoContext, errors::ServiceError>
+    ) -> Result<RepoContext<Repo>, errors::ServiceError>
     where
         F: FnOnce(RepoEphemeralStore) -> R,
         R: Future<Output = anyhow::Result<Option<BubbleId>>>,
@@ -407,7 +420,7 @@ impl SourceControlServiceImpl {
         &self,
         ctx: CoreContext,
         commit: &thrift::CommitSpecifier,
-    ) -> Result<(RepoContext, ChangesetContext), errors::ServiceError> {
+    ) -> Result<(RepoContext<Repo>, ChangesetContext<Repo>), errors::ServiceError> {
         let changeset_specifier = ChangesetSpecifier::from_request(&commit.id)?;
         let authz = AuthorizationContext::new(&ctx);
         let bubble_fetcher =
@@ -429,7 +442,14 @@ impl SourceControlServiceImpl {
         ctx: CoreContext,
         commit: &thrift::CommitSpecifier,
         other_commit: &thrift::CommitId,
-    ) -> Result<(RepoContext, ChangesetContext, ChangesetContext), errors::ServiceError> {
+    ) -> Result<
+        (
+            RepoContext<Repo>,
+            ChangesetContext<Repo>,
+            ChangesetContext<Repo>,
+        ),
+        errors::ServiceError,
+    > {
         let changeset_specifier =
             ChangesetSpecifier::from_request(&commit.id).context("invalid target commit id")?;
         let other_changeset_specifier = ChangesetSpecifier::from_request(other_commit)
@@ -476,7 +496,7 @@ impl SourceControlServiceImpl {
     /// Get the changeset id specified by a `thrift::CommitId`.
     pub(crate) async fn changeset_id(
         &self,
-        repo: &RepoContext,
+        repo: &RepoContext<Repo>,
         id: &thrift::CommitId,
     ) -> Result<ChangesetId, errors::ServiceError> {
         let changeset_specifier = ChangesetSpecifier::from_request(id)?;
@@ -496,7 +516,7 @@ impl SourceControlServiceImpl {
         &self,
         ctx: CoreContext,
         tree: &thrift::TreeSpecifier,
-    ) -> Result<(RepoContext, Option<TreeContext>), errors::ServiceError> {
+    ) -> Result<(RepoContext<Repo>, Option<TreeContext<Repo>>), errors::ServiceError> {
         let (repo, tree) = match tree {
             thrift::TreeSpecifier::by_commit_path(commit_path) => {
                 let (repo, changeset) = self.repo_changeset(ctx, &commit_path.commit).await?;
@@ -531,7 +551,7 @@ impl SourceControlServiceImpl {
         &self,
         ctx: CoreContext,
         file: &thrift::FileSpecifier,
-    ) -> Result<(RepoContext, Option<FileContext>), errors::ServiceError> {
+    ) -> Result<(RepoContext<Repo>, Option<FileContext<Repo>>), errors::ServiceError> {
         let (repo, file) = match file {
             thrift::FileSpecifier::by_commit_path(commit_path) => {
                 let (repo, changeset) = self.repo_changeset(ctx, &commit_path.commit).await?;
@@ -636,6 +656,14 @@ fn log_result<T: AddScubaResponse>(
             }
         }
     };
+    if let Ok(true) = justknobs::eval("scm/mononoke:scs_alert_on_methods", None, Some(method)) {
+        STATS::total_method_requests.add_value(0, (method.to_string(),));
+        if status == "INTERNAL_ERROR" {
+            STATS::total_method_internal_failure.add_value(1, (method.to_string(),));
+        } else {
+            STATS::total_method_internal_failure.add_value(0, (method.to_string(),));
+        }
+    }
     let success = if error.is_none() { 1 } else { 0 };
 
     STATS::total_request_success.add_value(success);
@@ -780,23 +808,35 @@ macro_rules! impl_thrift_methods {
                 'req_ctxt: 'async_trait,
                 Self: Sync + 'async_trait,
             {
-                let handler = async move {
-                    let ctx = create_ctx!(self.0, $method_name, req_ctxt, $( $param_name ),*).await?;
-                    let start_mem_stats = log_start(&ctx, stringify!($method_name));
-                    STATS::total_request_start.add_value(1);
-                    let (stats, res) = async {
-                        check_memory_usage(&ctx, stringify!($method_name), start_mem_stats.as_ref())?;
-                        (self.0).$method_name(ctx.clone(), $( $param_name ),* ).await
+                let fut = async move {
+                    let svc = self.0.clone();
+                    let ctx = create_ctx!(svc, $method_name, req_ctxt, $( $param_name ),*).await?;
+                    let handler = async move {
+                        let start_mem_stats = log_start(&ctx, stringify!($method_name));
+                        STATS::total_request_start.add_value(1);
+                        let (stats, res) = async {
+                            check_memory_usage(&ctx, stringify!($method_name), start_mem_stats.as_ref())?;
+                            svc.$method_name(ctx.clone(), $( $param_name ),* ).await
+                        }
+                        .timed()
+                        .on_cancel_with_data(|stats| log_cancelled(&ctx, stringify!($method_name), &stats, start_mem_stats.as_ref()))
+                        .await;
+                        log_result(ctx, stringify!($method_name), &stats, &res, start_mem_stats.as_ref());
+                        let method = stringify!($method_name).to_string();
+                        STATS::method_completion_time_ms.add_value(stats.completion_time.as_millis_unchecked() as i64, (method,));
+                        res.map_err(Into::into)
+                    };
+
+                    if let Some(factory_group) = &self.0.factory_group {
+                        let group = factory_group.clone();
+                        let priority = 0; // TODO compute dynamically
+                        group.execute(priority, handler, None).await.expect("Failed to execute request") // FIXME convert error correctly
+                    } else {
+                        let res: Result<$ok_type, $err_type> = handler.await;
+                        res
                     }
-                    .timed()
-                    .on_cancel_with_data(|stats| log_cancelled(&ctx, stringify!($method_name), &stats, start_mem_stats.as_ref()))
-                    .await;
-                    log_result(ctx, stringify!($method_name), &stats, &res, start_mem_stats.as_ref());
-                    let method = stringify!($method_name).to_string();
-                    STATS::method_completion_time_ms.add_value(stats.completion_time.as_millis_unchecked() as i64, (method,));
-                    res.map_err(Into::into)
                 };
-                Box::pin(handler)
+                Box::pin(fut)
             }
         )*
     }
@@ -1072,6 +1112,10 @@ impl SourceControlService for SourceControlServiceThriftImpl {
         async fn megarepo_remerge_source_poll(
             token: thrift::MegarepoRemergeSourceToken,
         ) -> Result<thrift::MegarepoRemergeSourcePollResponse, service::MegarepoRemergeSourcePollExn>;
+
+        async fn repo_update_submodule_expansion(
+            params: thrift::RepoUpdateSubmoduleExpansionParams,
+        ) -> Result<thrift::RepoUpdateSubmoduleExpansionResponse, service::RepoUpdateSubmoduleExpansionExn>;
 
         async fn repo_upload_non_blob_git_object(
             repo: thrift::RepoSpecifier,

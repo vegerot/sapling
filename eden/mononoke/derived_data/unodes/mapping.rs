@@ -19,7 +19,6 @@ use bytes::Bytes;
 use context::CoreContext;
 use derived_data::batch::split_bonsais_in_linear_stacks;
 use derived_data::batch::FileConflicts;
-use derived_data::impl_bonsai_derived_via_manager;
 use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
@@ -225,9 +224,6 @@ impl BonsaiDerivable for RootUnodeManifestId {
     }
 }
 
-// For existing users of BonsaiDerived.
-impl_bonsai_derived_via_manager!(RootUnodeManifestId);
-
 pub(crate) fn get_file_changes(
     bcs: &BonsaiChangeset,
 ) -> Vec<(NonRootMPath, Option<(ContentId, FileType)>)> {
@@ -248,7 +244,6 @@ mod test {
     use borrowed::borrowed;
     use cloned::cloned;
     use commit_graph::CommitGraphRef;
-    use derived_data::BonsaiDerived;
     use derived_data_test_utils::iterate_all_manifest_entries;
     use fbinit::FacebookInit;
     use fixtures::BranchEven;
@@ -290,7 +285,9 @@ mod test {
         hg_cs_id: HgChangesetId,
     ) -> Result<RootUnodeManifestId> {
         let (unode_entries, mf_unode_id) = async move {
-            let mf_unode_id = RootUnodeManifestId::derive(ctx, repo, bcs_id)
+            let mf_unode_id = repo
+                .repo_derived_data()
+                .derive::<RootUnodeManifestId>(ctx, bcs_id)
                 .await?
                 .manifest_unode_id()
                 .clone();
@@ -387,22 +384,16 @@ mod test {
 
     #[fbinit::test]
     async fn test_unode_derivation_on_multiple_repos(fb: FacebookInit) {
-        verify_repo(fb, || Linear::get_custom_test_repo::<TestRepo>(fb)).await;
-        verify_repo(fb, || BranchEven::get_custom_test_repo::<TestRepo>(fb)).await;
-        verify_repo(fb, || BranchUneven::get_custom_test_repo::<TestRepo>(fb)).await;
-        verify_repo(fb, || BranchWide::get_custom_test_repo::<TestRepo>(fb)).await;
-        verify_repo(fb, || ManyDiamonds::get_custom_test_repo::<TestRepo>(fb)).await;
-        verify_repo(fb, || ManyFilesDirs::get_custom_test_repo::<TestRepo>(fb)).await;
-        verify_repo(fb, || MergeEven::get_custom_test_repo::<TestRepo>(fb)).await;
-        verify_repo(fb, || MergeUneven::get_custom_test_repo::<TestRepo>(fb)).await;
-        verify_repo(fb, || {
-            UnsharedMergeEven::get_custom_test_repo::<TestRepo>(fb)
-        })
-        .await;
-        verify_repo(fb, || {
-            UnsharedMergeUneven::get_custom_test_repo::<TestRepo>(fb)
-        })
-        .await;
+        verify_repo(fb, || Linear::get_repo::<TestRepo>(fb)).await;
+        verify_repo(fb, || BranchEven::get_repo::<TestRepo>(fb)).await;
+        verify_repo(fb, || BranchUneven::get_repo::<TestRepo>(fb)).await;
+        verify_repo(fb, || BranchWide::get_repo::<TestRepo>(fb)).await;
+        verify_repo(fb, || ManyDiamonds::get_repo::<TestRepo>(fb)).await;
+        verify_repo(fb, || ManyFilesDirs::get_repo::<TestRepo>(fb)).await;
+        verify_repo(fb, || MergeEven::get_repo::<TestRepo>(fb)).await;
+        verify_repo(fb, || MergeUneven::get_repo::<TestRepo>(fb)).await;
+        verify_repo(fb, || UnsharedMergeEven::get_repo::<TestRepo>(fb)).await;
+        verify_repo(fb, || UnsharedMergeUneven::get_repo::<TestRepo>(fb)).await;
         // Create a repo with a few empty commits in a row
         verify_repo(fb, || async {
             let repo: TestRepo = test_repo_factory::build_empty(fb).await.unwrap();

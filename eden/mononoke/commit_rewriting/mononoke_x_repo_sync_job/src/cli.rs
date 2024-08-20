@@ -10,9 +10,10 @@ use clap::command;
 use clap::Args;
 use clap::Parser;
 use cmdlib_logging::ScubaLoggingArgs;
+use executor_lib::args::ShardedExecutorArgs;
 use fbinit::FacebookInit;
 use mononoke_app::args::ChangesetArgs;
-use mononoke_app::args::SourceAndTargetRepoArgs;
+use mononoke_app::args::OptSourceAndTargetRepoArgs;
 use mononoke_app::fb303::Fb303AppExtension;
 use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
@@ -65,7 +66,7 @@ pub struct OnceCommandArgs {
     pub unsafe_force_rewrite_parent_to_target_bookmark: bool,
 }
 
-#[derive(Debug, Args, Clone)]
+#[derive(Clone, Debug, Args)]
 #[clap(
     about = "Start a live sync between repos, so commits from the small repo are automatically synced to the large one"
 )]
@@ -99,13 +100,21 @@ pub enum ForwardSyncerCommand {
 pub struct ForwardSyncerArgs {
     /// Identifiers or names for the source and target repos
     #[clap(flatten, next_help_heading = "CROSS REPO OPTIONS")]
-    pub repo_args: SourceAndTargetRepoArgs,
+    pub repo_args: OptSourceAndTargetRepoArgs,
 
     #[clap(long)]
     pub pushrebase_rewrite_dates: bool,
 
+    /// Flag determining if the syncer should run in leader only mode, i.e. for the given
+    /// set of repos, only the leader instance will run the syncer.
+    #[clap(long)]
+    pub leader_only: bool,
+
     #[command(subcommand)]
     pub command: ForwardSyncerCommand,
+
+    #[clap(flatten)]
+    pub sharded_executor_args: ShardedExecutorArgs,
 
     // TODO(gustavoavena): remove the default scuba logging after all tw
     // tasks have been updated.

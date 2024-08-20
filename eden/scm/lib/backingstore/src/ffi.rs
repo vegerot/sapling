@@ -15,7 +15,6 @@ use anyhow::Error;
 use anyhow::Result;
 use cxx::SharedPtr;
 use storemodel::FileAuxData as ScmStoreFileAuxData;
-use storemodel::TreeAuxData as ScmStoreTreeAuxData;
 use types::fetch_mode::FetchMode;
 use types::Key;
 
@@ -86,6 +85,7 @@ pub(crate) mod ffi {
         entries: Vec<TreeEntry>,
     }
 
+    #[derive(Debug)]
     pub struct TreeAuxData {
         total_size: u64,
         content_blake3: [u8; 32],
@@ -301,10 +301,8 @@ pub fn sapling_backingstore_get_tree_aux(
 ) -> Result<SharedPtr<ffi::TreeAuxData>> {
     Ok(SharedPtr::new(
         store
-            .get_tree(node, FetchMode::from(fetch_mode))
-            .and_then(|opt| opt.ok_or_else(|| Error::msg("no tree found")))?
-            .aux_data()
-            .and_then(|aux_data| aux_data.ok_or_else(|| Error::msg("no aux data found for tree")))?
+            .get_tree_aux(node, FetchMode::from(fetch_mode))
+            .and_then(|opt| opt.ok_or_else(|| Error::msg("no tree aux data found")))?
             .into(),
     ))
 }
@@ -317,22 +315,12 @@ pub fn sapling_backingstore_get_tree_aux_batch(
 ) {
     let keys: Vec<Key> = requests.iter().map(|req| req.key()).collect();
 
-    store.get_tree_batch(keys, FetchMode::from(fetch_mode), |idx, result| {
-        let maybe_tree_entry =
-            result.and_then(|opt| opt.ok_or_else(|| Error::msg("no trees found")));
-        let tree_entry = match maybe_tree_entry {
-            Ok(tree) => tree,
-            _ => return,
-        };
-        let result: Result<Option<ScmStoreTreeAuxData>> = tree_entry.aux_data();
+    store.get_tree_aux_batch(keys, FetchMode::from(fetch_mode), |idx, result| {
+        let result = result.and_then(|opt| opt.ok_or_else(|| Error::msg("no aux data found")));
         let resolver = resolver.clone();
         let (error, aux) = match result {
-            Ok(Some(aux)) => (String::default(), SharedPtr::new(aux.into())),
+            Ok(aux) => (String::default(), SharedPtr::new(aux.into())),
             Err(error) => (format!("{:?}", error), SharedPtr::null()),
-            Ok(None) => (
-                String::from("no aux data found for tree"),
-                SharedPtr::null(),
-            ),
         };
         unsafe { ffi::sapling_backingstore_get_tree_aux_batch_handler(resolver, idx, error, aux) };
     });

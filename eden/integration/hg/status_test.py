@@ -16,21 +16,33 @@ import time
 from threading import Thread
 from typing import Dict, List
 
+import thrift.transport
+
 from eden.integration.lib.hgrepo import HgRepository
 from facebook.eden.ttypes import (
     EdenError,
     EdenErrorType,
+    FaultDefinition,
+    GetBlockedFaultsRequest,
     GetScmStatusParams,
     ScmFileStatus,
     ScmStatus,
+    SynchronizeWorkingCopyParams,
+    UnblockFaultArg,
 )
 
 from .lib.hg_extension_test_base import EdenHgTestCase, hg_cached_status_test
+
+THREAD_JOIN_TIMEOUT_SECONDS = 3
+
+WINDOWS_RUNTIME_ERR_PREFIX = "class " if sys.platform == "win32" else ""
 
 
 @hg_cached_status_test
 # pyre-ignore[13]: T62487924
 class StatusTest(EdenHgTestCase):
+    enable_fault_injection: bool = True
+
     def populate_backing_repo(self, repo: HgRepository) -> None:
         repo.write_file("hello.txt", "hola")
         repo.write_file("subdir/file.txt", "contents")
@@ -427,8 +439,8 @@ class StatusTest(EdenHgTestCase):
                 t2 = Thread(target=func, args=args_2)
                 t1.start()
                 t2.start()
-                t1.join(30)
-                t2.join(30)
+                t1.join(THREAD_JOIN_TIMEOUT_SECONDS)
+                t2.join(THREAD_JOIN_TIMEOUT_SECONDS)
 
             two_threads_call_in_parallel(
                 self.assert_status_empty,
@@ -497,11 +509,277 @@ class StatusTest(EdenHgTestCase):
                     verify_status, args_1=arg_tuple_1, args_2=arg_tuple_2
                 )
 
+    def wait_for_status_cache_block_hit(self, client):
+        poll_interval_seconds = 0.1
+        deadline = time.monotonic() + 2
+        while True:
+            response = client.getBlockedFaults(
+                GetBlockedFaultsRequest(keyclass="scmStatusCache")
+            )
+            if len(response.keyValues) == 1:
+                break
+            if time.monotonic() >= deadline:
+                raise Exception("timeout waiting for the block hit")
+            time.sleep(poll_interval_seconds)
+
+    def test_status_shared_among_requests(self) -> None:
+        """Test that status requests with the same parameters will
+        wait for the first request to finish setting the value."""
+
+        if not self.enable_status_cache:
+            # no need to test the cache if it is not enabled
+            return
+
+        with self.get_thrift_client_legacy() as client:
+            self.touch("world.txt")
+            client.injectFault(
+                FaultDefinition(
+                    keyClass="scmStatusCache",
+                    keyValueRegex="blocking setValue",
+                    block=True,
+                    count=1,
+                )
+            )
+            num_requests = 10
+            threads = []
+
+            def thread_worker(cls, exceptions: List[Exception]) -> None:
+                try:
+                    cls.assert_status(
+                        {"world.txt": "?"}, timeout_seconds=0
+                    )  # retry can mess counters
+                except Exception as e:
+                    exceptions.append(e)
+
+            exceptions = []
+            t = Thread(target=thread_worker, args=(self, exceptions))
+            t.start()
+            threads.append(t)
+
+            try:
+                # wait for the block hit
+                self.wait_for_status_cache_block_hit(client)
+
+                for _ in range(num_requests - 1):
+                    t = Thread(target=thread_worker, args=(self, exceptions))
+                    t.start()
+                    threads.append(t)
+
+                # all threads should be blocking
+                for t in threads:
+                    assert (
+                        t.is_alive()
+                    ), f"thread should be blocking. dumping exceptions: {exceptions}"
+            finally:
+                client.unblockFault(
+                    UnblockFaultArg(
+                        keyClass="scmStatusCache", keyValueRegex="blocking setValue"
+                    )
+                )
+
+            for t in threads:
+                t.join(THREAD_JOIN_TIMEOUT_SECONDS)
+            assert len(exceptions) == 0, f"no exception should be raised: {exceptions}"
+            self.counter_check(client, miss_cnt=1, hit_cnt=num_requests - 1)
+
+    def test_status_cache_expire_blocking_setValue(self) -> None:
+        self.status_cache_expire_blocing_common("setValue")
+
+    def test_status_cache_expire_blocking_insert(self) -> None:
+        self.status_cache_expire_blocing_common("insert")
+
+    def test_status_cache_expire_blocking_dropPromise(self) -> None:
+        self.status_cache_expire_blocing_common("dropPromise")
+
+    # not suing subTest because it's hard to get threading working correctly with a clean env
+    def status_cache_expire_blocing_common(self, check_point) -> None:
+        """Test that status requests with latest journal sequence number will
+        invalidate the existing cache with old sequence number."""
+
+        if not self.enable_status_cache:
+            # no need to test the cache if it is not enabled
+            return
+
+        def thread_worker(cls, expect_status, exceptions: List[Exception]) -> None:
+            try:
+                cls.assert_status(
+                    expect_status, timeout_seconds=0
+                )  # retry can mess counters
+            except Exception as e:
+                exceptions.append(e)
+
+        block_key_value = "blocking " + check_point
+
+        with self.get_thrift_client_legacy() as client:
+            self.touch("world.txt")
+            client.injectFault(
+                FaultDefinition(
+                    keyClass="scmStatusCache",
+                    keyValueRegex=block_key_value,
+                    block=True,
+                    count=1,  # so the second thread will not be blocked
+                )
+            )
+            exceptions = []
+            thread_expect_one_entry = Thread(
+                target=thread_worker,
+                args=(self, {"world.txt": "?"}, exceptions),
+            )
+            thread_expect_one_entry.start()
+
+            try:
+                # wait for the block hit
+                self.wait_for_status_cache_block_hit(client)
+
+                # touching a new file should advance the journal sequence number
+                self.touch("peace.txt")
+                thread_expect_two_entries = Thread(
+                    target=thread_worker,
+                    # no matter where is the previous thread bloked, this thread
+                    # should always see the latest status
+                    args=(self, {"world.txt": "?", "peace.txt": "?"}, exceptions),
+                )
+                thread_expect_two_entries.start()
+
+                assert (
+                    thread_expect_one_entry.is_alive()
+                ), f"the first thread should be blocked. dumping exceptions: {exceptions}"
+            finally:
+                client.unblockFault(
+                    UnblockFaultArg(
+                        keyClass="scmStatusCache", keyValueRegex=block_key_value
+                    )
+                )
+
+            for t in [thread_expect_one_entry, thread_expect_two_entries]:
+                t.join(THREAD_JOIN_TIMEOUT_SECONDS)
+            assert len(exceptions) == 0, f"unexpected exception raised: {exceptions}"
+
+            # no cache should be hit since the sequence number is advanced
+            self.counter_check(client, miss_cnt=2, hit_cnt=0)
+
+    def test_status_cache_error_handlilng(self) -> None:
+        """Test that when there is error computing the diff, we don't cache the error
+        and the next call should succeed"""
+        if not self.enable_status_cache:
+            # no need to test the cache if it is not enabled
+            return
+
+        initial_commit_hex = self.repo.get_head_hash()
+        initial_commit = binascii.unhexlify(initial_commit_hex)
+
+        # prepare the folder structure
+        self.repo.write_file("parent/file_1.txt", "what")
+        self.repo.write_file("parent/file_2.txt", "what")
+
+        self.repo.write_file("parent/child/file_1.txt", "what")
+        self.repo.write_file("parent/child/file_2.txt", "what")
+
+        with self.get_thrift_client_legacy() as client:
+            client.injectFault(
+                FaultDefinition(
+                    keyClass="TreeInode::computeDiff",
+                    keyValueRegex="parent/child",
+                    count=1,
+                    errorType="runtime_error",
+                )
+            )
+            initial_status_with_error = client.getScmStatusV2(
+                GetScmStatusParams(
+                    mountPoint=bytes(self.mount, encoding="utf-8"),
+                    commit=initial_commit,
+                    listIgnored=False,
+                    rootIdOptions=None,
+                )
+            ).status
+            self.assertDictEqual(
+                {
+                    b"parent/child": f"{WINDOWS_RUNTIME_ERR_PREFIX}std::runtime_error: injected error"
+                },
+                initial_status_with_error.errors,
+            )
+            self.counter_check(client, miss_cnt=1, hit_cnt=0)
+
+            # after the error is cleared, the next call should succeed without errors
+            status_without_error = client.getScmStatusV2(
+                GetScmStatusParams(
+                    mountPoint=bytes(self.mount, encoding="utf-8"),
+                    commit=initial_commit,
+                    listIgnored=False,
+                    rootIdOptions=None,
+                )
+            ).status
+            self.assertDictEqual(
+                {},
+                status_without_error.errors,
+            )
+            # the previous call should not be cached so we are expecting two misses
+            self.counter_check(client, miss_cnt=2, hit_cnt=0)
+
+            # writing more files to advance the journal sequence number
+            self.repo.write_file("parent/file_3.txt", "what")
+            self.repo.write_file("parent/child/file_3.txt", "what")
+
+            # On windows platform, there is a chance that the changes are not
+            # synced so this call might hit the cache instead of returning an error.
+            client.synchronizeWorkingCopy(
+                self.mount.encode("utf-8"), SynchronizeWorkingCopyParams()
+            )
+
+            client.injectFault(
+                FaultDefinition(
+                    keyClass="EdenMount::diff",
+                    keyValueRegex=f".*{initial_commit_hex}.*",
+                    count=1,
+                    errorType="runtime_error",
+                    errorMessage="intentional exception",
+                )
+            )
+
+            try:
+                client.getScmStatusV2(
+                    GetScmStatusParams(
+                        mountPoint=bytes(self.mount, encoding="utf-8"),
+                        commit=initial_commit,
+                        listIgnored=False,
+                    )
+                )
+                self.fail("status cache should throw exception and fail this request!")
+            except thrift.Thrift.TApplicationException as e:
+                self.assertEqual(
+                    f"{WINDOWS_RUNTIME_ERR_PREFIX}std::runtime_error: intentional exception",
+                    e.message,
+                )
+            self.counter_check(client, miss_cnt=3, hit_cnt=0)
+
+            status_without_error = client.getScmStatusV2(
+                GetScmStatusParams(
+                    mountPoint=bytes(self.mount, encoding="utf-8"),
+                    commit=initial_commit,
+                    listIgnored=False,
+                )
+            ).status
+
+            self.assertDictEqual(
+                {
+                    b"parent/child/file_1.txt": 0,
+                    b"parent/child/file_2.txt": 0,
+                    b"parent/child/file_3.txt": 0,
+                    b"parent/file_1.txt": 0,
+                    b"parent/file_2.txt": 0,
+                    b"parent/file_3.txt": 0,
+                },
+                status_without_error.entries,
+            )
+            self.counter_check(client, miss_cnt=4, hit_cnt=0)
+
 
 @hg_cached_status_test
 # pyre-ignore[13]: T62487924
 class StatusEdgeCaseTest(EdenHgTestCase):
+    # pyre-fixme[13]: Attribute `commit1` is never initialized.
     commit1: str
+    # pyre-fixme[13]: Attribute `commit2` is never initialized.
     commit2: str
 
     def populate_backing_repo(self, repo: HgRepository) -> None:
@@ -565,9 +843,13 @@ class StatusEdgeCaseTest(EdenHgTestCase):
 @hg_cached_status_test
 # pyre-ignore[13]: T62487924
 class StatusRevertTest(EdenHgTestCase):
+    # pyre-fixme[13]: Attribute `commit1` is never initialized.
     commit1: str
+    # pyre-fixme[13]: Attribute `commit2` is never initialized.
     commit2: str
+    # pyre-fixme[13]: Attribute `commit3` is never initialized.
     commit3: str
+    # pyre-fixme[13]: Attribute `commit4` is never initialized.
     commit4: str
 
     def populate_backing_repo(self, repo: HgRepository) -> None:

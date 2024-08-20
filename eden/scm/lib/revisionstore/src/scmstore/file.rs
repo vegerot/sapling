@@ -20,6 +20,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::ensure;
 use anyhow::Result;
+use cas_client::CasClient;
 use clientinfo::get_client_request_info_thread_local;
 use clientinfo::set_client_request_info_thread_local;
 use crossbeam::channel::unbounded;
@@ -42,7 +43,6 @@ pub use self::types::StoreFile;
 use crate::datastore::HgIdDataStore;
 use crate::datastore::HgIdMutableDeltaStore;
 use crate::datastore::RemoteDataStore;
-use crate::fetch_logger::FetchLogger;
 use crate::indexedlogauxstore::AuxStore;
 use crate::indexedlogdatastore::Entry;
 use crate::indexedlogdatastore::IndexedLogHgIdDataStore;
@@ -87,9 +87,6 @@ pub struct FileStore {
     // Configured by scmstore.max-prefetch-size, where 0 means unlimited.
     pub(crate) max_prefetch_size: usize,
 
-    // Record remote fetches
-    pub(crate) fetch_logger: Option<Arc<FetchLogger>>,
-
     // Local-only stores
     pub(crate) indexedlog_local: Option<Arc<IndexedLogHgIdDataStore>>,
     pub(crate) lfs_local: Option<Arc<LfsStore>>,
@@ -109,6 +106,8 @@ pub struct FileStore {
 
     // Aux Data Store
     pub(crate) aux_cache: Option<Arc<AuxStore>>,
+
+    pub(crate) cas_client: Option<Arc<dyn CasClient>>,
 
     // Metrics, statistics, debugging
     pub(crate) activity_logger: Option<Arc<Mutex<ActivityLogger>>>,
@@ -179,6 +178,7 @@ impl FileStore {
         let lfs_cache = self.lfs_cache.clone();
         let lfs_local = self.lfs_local.clone();
         let edenapi = self.edenapi.clone();
+        let cas_client = self.cas_client.clone();
         let lfs_remote = self.lfs_remote.clone();
         let contentstore = self.contentstore.clone();
         let metrics = self.metrics.clone();
@@ -204,11 +204,17 @@ impl FileStore {
             );
             let _enter = span.enter();
 
-            if fetch_local {
+            if fetch_local || (fetch_remote && cas_client.is_some()) {
                 if let Some(ref aux_cache) = aux_cache {
-                    state.fetch_aux_indexedlog(aux_cache, StoreLocation::Cache);
+                    state.fetch_aux_indexedlog(
+                        aux_cache,
+                        StoreLocation::Cache,
+                        cas_client.is_some(),
+                    );
                 }
+            }
 
+            if fetch_local {
                 if let Some(ref indexedlog_cache) = indexedlog_cache {
                     state.fetch_indexedlog(
                         indexedlog_cache,
@@ -235,6 +241,10 @@ impl FileStore {
             }
 
             if fetch_remote {
+                if let Some(cas_client) = &cas_client {
+                    state.fetch_cas(cas_client);
+                }
+
                 if let Some(ref edenapi) = edenapi {
                     state.fetch_edenapi(
                         edenapi,
@@ -435,9 +445,9 @@ impl FileStore {
 
             edenapi: None,
             lfs_remote: None,
+            cas_client: None,
 
             contentstore: None,
-            fetch_logger: None,
             metrics: FileStoreMetrics::new(),
             activity_logger: None,
 
@@ -489,9 +499,9 @@ impl FileStore {
 
             edenapi: None,
             lfs_remote: None,
+            cas_client: None,
 
             contentstore: None,
-            fetch_logger: self.fetch_logger.clone(),
             metrics: self.metrics.clone(),
             activity_logger: self.activity_logger.clone(),
 

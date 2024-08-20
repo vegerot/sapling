@@ -15,14 +15,14 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Error;
 use anyhow::Result;
-use blobrepo::save_bonsai_changesets;
 use blobrepo_utils::convert_diff_result_into_file_change_for_diamond_merge;
 use blobsync::copy_content;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarksRef;
 use borrowed::borrowed;
-use changesets::ChangesetsRef;
+use changesets_creation::save_changesets;
 use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
 use derivative::Derivative;
 use filestore::FilestoreConfigRef;
@@ -94,12 +94,12 @@ pub struct FileChangeFilter<'a> {
 
 pub trait Repo = RepoIdentityRef
     + RepoBlobstoreArc
-    + ChangesetsRef
     + BookmarksRef
     + BonsaiHgMappingRef
     + RepoDerivedDataRef
     + RepoBlobstoreRef
     + CommitGraphRef
+    + CommitGraphWriterRef
     + Send
     + Sync;
 
@@ -594,7 +594,9 @@ pub fn rewrite_commit_with_implicit_deletes<'a>(
                         })
                         .transpose()?;
 
-                    Ok(FileChange::Change(change.with_new_copy_from(new_copy_from)))
+                    Ok(FileChange::Change(
+                        change.with_new_copy_from(new_copy_from).without_git_lfs(),
+                    ))
                 }
 
                 // Rewrite both path and changes
@@ -736,8 +738,14 @@ fn mark_as_created_by_lossy_conversion(
 pub async fn upload_commits<'a>(
     ctx: &'a CoreContext,
     rewritten_list: Vec<BonsaiChangeset>,
-    source_repo: &'a (impl RepoBlobstoreRef + ChangesetsRef),
-    target_repo: &'a (impl RepoBlobstoreRef + ChangesetsRef + FilestoreConfigRef + RepoIdentityRef),
+    source_repo: &'a impl RepoBlobstoreRef,
+    target_repo: &'a (
+            impl RepoBlobstoreRef
+            + CommitGraphRef
+            + CommitGraphWriterRef
+            + FilestoreConfigRef
+            + RepoIdentityRef
+        ),
     submodule_content_ids: Vec<(Arc<impl RepoBlobstoreRef>, HashSet<ContentId>)>,
 ) -> Result<(), Error> {
     let mut files_to_sync = HashSet::new();
@@ -792,7 +800,7 @@ pub async fn upload_commits<'a>(
 
     // Then copy from source repo
     copy_file_contents(ctx, source_repo, target_repo, files_to_sync, |_| {}).await?;
-    save_bonsai_changesets(rewritten_list.clone(), ctx.clone(), target_repo).await?;
+    save_changesets(ctx, target_repo, rewritten_list.clone()).await?;
     Ok(())
 }
 
@@ -837,20 +845,40 @@ mod test {
     use std::collections::HashSet;
 
     use anyhow::bail;
-    use blobrepo::save_bonsai_changesets;
     use blobstore::Loadable;
+    use bonsai_hg_mapping::BonsaiHgMapping;
+    use bookmarks::Bookmarks;
+    use commit_graph::CommitGraph;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
+    use filestore::FilestoreConfig;
     use maplit::btreemap;
     use maplit::hashmap;
     use maplit::hashset;
     use mononoke_types::ContentId;
     use mononoke_types::FileType;
     use mononoke_types::GitLfs;
+    use repo_blobstore::RepoBlobstore;
+    use repo_derived_data::RepoDerivedData;
+    use repo_identity::RepoIdentity;
     use test_repo_factory::TestRepoFactory;
     use tests_utils::list_working_copy_utf8;
     use tests_utils::CreateCommitContext;
 
     use super::*;
+
+    #[facet::container]
+    #[derive(Clone)]
+    pub struct Repo(
+        RepoIdentity,
+        RepoBlobstore,
+        dyn Bookmarks,
+        dyn BonsaiHgMapping,
+        RepoDerivedData,
+        CommitGraph,
+        dyn CommitGraphWriter,
+        FilestoreConfig,
+    );
 
     #[test]
     fn test_multi_mover_simple() -> Result<(), Error> {
@@ -989,7 +1017,7 @@ mod test {
 
     #[fbinit::test]
     async fn test_rewrite_commit_marks_lossy_conversions(fb: FacebookInit) -> Result<(), Error> {
-        let repo: blobrepo::BlobRepo = TestRepoFactory::new(fb)?.build().await?;
+        let repo: Repo = TestRepoFactory::new(fb)?.build().await?;
         let ctx = CoreContext::test_mock(fb);
         let mapping_rules = SourceMappingRules {
             default_prefix: "".to_string(), // Rewrite to root
@@ -1123,7 +1151,7 @@ mod test {
     async fn test_rewrite_commit_marks_lossy_conversions_with_implicit_deletes(
         fb: FacebookInit,
     ) -> Result<(), Error> {
-        let repo: blobrepo::BlobRepo = TestRepoFactory::new(fb)?.build().await?;
+        let repo: Repo = TestRepoFactory::new(fb)?.build().await?;
         let ctx = CoreContext::test_mock(fb);
         // This commit is not lossy because all paths will be mapped somewhere.
         let first = CreateCommitContext::new_root(&ctx, &repo)
@@ -1212,7 +1240,7 @@ mod test {
 
     #[fbinit::test]
     async fn test_rewrite_commit(fb: FacebookInit) -> Result<(), Error> {
-        let repo: blobrepo::BlobRepo = TestRepoFactory::new(fb)?.build().await?;
+        let repo: Repo = TestRepoFactory::new(fb)?.build().await?;
         let ctx = CoreContext::test_mock(fb);
         let first = CreateCommitContext::new_root(&ctx, &repo)
             .add_file("path", "path")
@@ -1364,7 +1392,7 @@ mod test {
         file_change_filters: Vec<FileChangeFilter<'_>>,
         mut expected_affected_paths: HashMap<&str, HashSet<NonRootMPath>>,
     ) -> Result<(), Error> {
-        let repo: blobrepo::BlobRepo = TestRepoFactory::new(fb)?.build().await?;
+        let repo: Repo = TestRepoFactory::new(fb)?.build().await?;
 
         let ctx = CoreContext::test_mock(fb);
         // This commit is not lossy because all paths will be mapped somewhere.
@@ -1397,7 +1425,7 @@ mod test {
 
         async fn verify_affected_paths(
             ctx: &CoreContext,
-            repo: &blobrepo::BlobRepo,
+            repo: &Repo,
             rewritten_bcs_id: &ChangesetId,
             expected_affected_paths: HashSet<NonRootMPath>,
         ) -> Result<()> {
@@ -1657,7 +1685,7 @@ mod test {
 
     async fn test_rewrite_commit_cs_id<'a>(
         ctx: &'a CoreContext,
-        repo: &'a impl Repo,
+        repo: &'a Repo,
         bcs_id: ChangesetId,
         parents: HashMap<ChangesetId, ChangesetId>,
         multi_mover: MultiMover<'a>,
@@ -1677,7 +1705,7 @@ mod test {
 
     async fn test_rewrite_commit_cs_id_with_file_change_filters<'a>(
         ctx: &'a CoreContext,
-        repo: &'a impl Repo,
+        repo: &'a Repo,
         bcs_id: ChangesetId,
         parents: HashMap<ChangesetId, ChangesetId>,
         multi_mover: MultiMover<'a>,
@@ -1702,14 +1730,14 @@ mod test {
             maybe_rewritten.ok_or_else(|| anyhow!("can't rewrite commit {}", bcs_id))?;
         let rewritten = rewritten.freeze()?;
 
-        save_bonsai_changesets(vec![rewritten.clone()], ctx.clone(), repo).await?;
+        save_changesets(ctx, repo, vec![rewritten.clone()]).await?;
 
         Ok(rewritten.get_changeset_id())
     }
 
     async fn assert_changeset_is_marked_lossy<'a>(
         ctx: &'a CoreContext,
-        repo: &'a impl Repo,
+        repo: &'a Repo,
         bcs_id: ChangesetId,
     ) -> Result<(), Error> {
         let bcs = bcs_id.load(ctx, &repo.repo_blobstore()).await?;
@@ -1724,7 +1752,7 @@ mod test {
 
     async fn assert_changeset_is_not_marked_lossy<'a>(
         ctx: &'a CoreContext,
-        repo: &'a impl Repo,
+        repo: &'a Repo,
         bcs_id: ChangesetId,
     ) -> Result<(), Error> {
         let bcs = bcs_id.load(ctx, &repo.repo_blobstore()).await?;
@@ -1750,6 +1778,54 @@ mod test {
         );
 
         assert_eq!(multi_mover(&MPath::ROOT)?, vec![MPath::new("prefix")?]);
+        Ok(())
+    }
+
+    #[fbinit::test]
+    async fn test_rewrite_lfs_file(fb: FacebookInit) -> Result<(), Error> {
+        let repo: Repo = TestRepoFactory::new(fb)?.build().await?;
+        let ctx = CoreContext::test_mock(fb);
+        let mapping_rules = SourceMappingRules {
+            default_prefix: "small".to_string(),
+            ..Default::default()
+        };
+        let multi_mover = create_source_to_target_multi_mover(mapping_rules)?;
+        // Add an LFS file to the repo
+        let first = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("foo.php", "foo content")
+            .add_file_with_type_and_lfs(
+                "large.avi",
+                "large file content",
+                FileType::Regular,
+                GitLfs::canonical_pointer(),
+            )
+            .commit()
+            .await?;
+
+        let first_rewritten_bcs_id = test_rewrite_commit_cs_id(
+            &ctx,
+            &repo,
+            first,
+            HashMap::new(),
+            multi_mover.clone(),
+            None,
+        )
+        .await?;
+
+        let first_rewritten_bcs = first_rewritten_bcs_id
+            .load(&ctx, &repo.repo_blobstore())
+            .await?;
+        let changes: Vec<_> = first_rewritten_bcs
+            .file_changes()
+            .map(|(path, change)| (path.to_string(), change.git_lfs().unwrap()))
+            .collect();
+        assert_eq!(
+            changes,
+            vec![
+                ("small/foo.php".to_string(), GitLfs::full_content()),
+                ("small/large.avi".to_string(), GitLfs::full_content())
+            ],
+        );
         Ok(())
     }
 }

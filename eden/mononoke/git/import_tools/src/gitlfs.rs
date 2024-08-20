@@ -6,37 +6,44 @@
  */
 
 use core::future::Future;
-use std::str;
 use std::sync::Arc;
 
 use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
 use bytes::Bytes;
+use clientinfo::ClientInfo;
+use clientinfo::CLIENT_INFO_HEADER;
 use context::CoreContext;
 use filestore::StoreRequest;
 use futures::stream;
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use git_types::git_lfs::parse_lfs_pointer;
+use git_types::git_lfs::LfsPointerData;
 use gix_hash::ObjectId;
+use http::HeaderValue;
+use http::Request;
 use http::Uri;
 use hyper::body;
 use hyper::client::connect::HttpConnector;
+use hyper::Body;
 use hyper::Client;
 use hyper::StatusCode;
 use hyper_openssl::HttpsConnector;
 use mononoke_types::hash;
+use openssl::ssl::SslConnector;
+use openssl::ssl::SslFiletype;
+use openssl::ssl::SslMethod;
 use rand::thread_rng;
 use rand::Rng;
 use slog::error;
 use slog::warn;
+use tls::TLSArgs;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tokio::time::Duration;
-/// We will not try to parse any file bigger then this.
-/// Any valid gitlfs metadata file should be smaller then this.
-const MAX_METADATA_LENGTH: usize = 511;
 
 /// Module to be passed into gitimport that defines how LFS files are imported.
 /// The default will disable any LFS support (and the metadata of files pointing to LFS files
@@ -62,54 +69,24 @@ pub struct GitImportLfsInner {
     client: Client<HttpsConnector<HttpConnector>>,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GitLfsFetchResult {
+    Fetched,
+    NotFound,
+}
+
+impl GitLfsFetchResult {
+    pub fn is_fetched(&self) -> bool {
+        *self == GitLfsFetchResult::Fetched
+    }
+
+    pub fn is_not_found(&self) -> bool {
+        *self == GitLfsFetchResult::NotFound
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct GitImportLfs {
     inner: Option<Arc<GitImportLfsInner>>,
-}
-
-#[derive(Debug)]
-pub struct LfsMetaData {
-    pub version: String,
-    pub sha256: hash::Sha256,
-    pub size: u64,
-    /// gitblob and gitid, where this metadata comes from. This is useful if we
-    /// end up storing the metadata instead of the content (if the content cannot
-    /// be found on the LFS server for example).
-    pub gitblob: Vec<u8>,
-    pub gitid: ObjectId,
-}
-
-/// Layout of the metafiles:
-/// | version https://git-lfs.github.com/spec/v1
-/// | oid sha256:73e2200459562bb068f08e33210ed106014b877f878932b2147991e17a7c089b
-/// | size 8423391
-fn parse_lfs_metafile(gitblob: &[u8], gitid: ObjectId) -> Option<LfsMetaData> {
-    if gitblob.len() > MAX_METADATA_LENGTH {
-        return None;
-    }
-
-    let mut lines = str::from_utf8(gitblob).ok()?.lines();
-    let version = lines.next()?.strip_prefix("version ")?;
-    if version != "https://git-lfs.github.com/spec/v1" {
-        return None;
-    }
-    let sha256 = lines
-        .next()?
-        .strip_prefix("oid sha256:")?
-        .parse::<hash::Sha256>()
-        .ok()?;
-    let size = lines.next()?.strip_prefix("size ")?.parse::<u64>().ok()?;
-    // As a precaution. If we have an additional line after this, then we assume its not a valid file.
-    if lines.next().is_some() {
-        return None;
-    }
-    Some(LfsMetaData {
-        version: version.to_string(),
-        sha256,
-        size,
-        gitblob: gitblob.to_vec(),
-        gitid,
-    })
 }
 
 impl GitImportLfs {
@@ -119,14 +96,26 @@ impl GitImportLfs {
     pub fn new(
         lfs_server: String,
         allow_not_found: bool,
+        max_attempts: u32,
         conn_limit: Option<usize>,
+        tls_args: Option<TLSArgs>,
     ) -> Result<Self, Error> {
-        let connector = HttpsConnector::new().map_err(Error::from)?;
+        let mut ssl_connector = SslConnector::builder(SslMethod::tls_client())?;
+        if let Some(tls_args) = tls_args {
+            ssl_connector.set_ca_file(tls_args.tls_ca)?;
+            ssl_connector.set_certificate_file(tls_args.tls_certificate, SslFiletype::PEM)?;
+            ssl_connector.set_private_key_file(tls_args.tls_private_key, SslFiletype::PEM)?;
+        };
+        let mut http_connector = HttpConnector::new();
+        http_connector.enforce_http(false);
+        let connector =
+            HttpsConnector::with_connector(http_connector, ssl_connector).map_err(Error::from)?;
+
         let client: Client<_, body::Body> = Client::builder().build(connector);
         let inner = GitImportLfsInner {
             lfs_server,
             allow_not_found,
-            max_attempts: 30,
+            max_attempts,
             time_ms_between_attempts: 10000,
             conn_limit_sem: conn_limit.map(|x| Arc::new(Semaphore::new(x))),
             client,
@@ -136,9 +125,10 @@ impl GitImportLfs {
         })
     }
 
-    pub fn is_lfs_file(&self, gitblob: &[u8], gitid: ObjectId) -> Option<LfsMetaData> {
+    /// Checks whether given blob is valid Git LFS pointer and returns its metadata
+    pub fn is_lfs_file(&self, gitblob: &[u8], gitid: ObjectId) -> Option<LfsPointerData> {
         if self.inner.is_some() {
-            parse_lfs_metafile(gitblob, gitid)
+            parse_lfs_pointer(gitblob, gitid)
         } else {
             None
         }
@@ -149,11 +139,12 @@ impl GitImportLfs {
     async fn fetch_bytes_internal(
         &self,
         ctx: &CoreContext,
-        metadata: &LfsMetaData,
+        metadata: &LfsPointerData,
     ) -> Result<
         (
             StoreRequest,
             impl Stream<Item = Result<Bytes, Error>> + Unpin,
+            GitLfsFetchResult,
         ),
         Error,
     > {
@@ -164,16 +155,28 @@ impl GitImportLfs {
         let uri = [&inner.lfs_server, "/", &metadata.sha256.to_string()]
             .concat()
             .parse::<Uri>()?;
+        let mut req = Request::get(uri.clone())
+            .body(Body::empty())
+            .context("creating LFS fetch request")?;
+        let client_info = ctx
+            .metadata()
+            .client_info()
+            .cloned()
+            .unwrap_or_else(ClientInfo::default);
+        req.headers_mut().insert(
+            CLIENT_INFO_HEADER,
+            HeaderValue::from_str(&client_info.to_json()?)?,
+        );
         let resp = inner
             .client
-            .get(uri.clone())
+            .request(req)
             .await
             .with_context(|| format!("fetch_bytes_internal {}", uri))?;
 
         if resp.status().is_success() {
             let bytes = resp.into_body().map_err(Error::from);
             let sr = StoreRequest::with_sha256(metadata.size, metadata.sha256);
-            return Ok((sr, bytes.left_stream()));
+            return Ok((sr, bytes.left_stream(), GitLfsFetchResult::Fetched));
         }
         if resp.status() == StatusCode::NOT_FOUND && inner.allow_not_found {
             warn!(
@@ -188,7 +191,11 @@ impl GitImportLfs {
                 size,
             )?;
             let sr = StoreRequest::with_git_sha1(size, git_sha1);
-            return Ok((sr, stream::once(futures::future::ok(bytes)).right_stream()));
+            return Ok((
+                sr,
+                stream::once(futures::future::ok(bytes)).right_stream(),
+                GitLfsFetchResult::NotFound,
+            ));
         }
         Err(format_err!("{} response {:?}", uri, resp))
     }
@@ -196,8 +203,15 @@ impl GitImportLfs {
     async fn fetch_bytes(
         &self,
         ctx: &CoreContext,
-        metadata: &LfsMetaData,
-    ) -> Result<(StoreRequest, impl Stream<Item = Result<Bytes, Error>>), Error> {
+        metadata: &LfsPointerData,
+    ) -> Result<
+        (
+            StoreRequest,
+            impl Stream<Item = Result<Bytes, Error>>,
+            GitLfsFetchResult,
+        ),
+        Error,
+    > {
         let inner = self.inner.as_ref().ok_or_else(|| {
             format_err!("GitImportLfs::fetch_bytes called on disabled GitImportLfs")
         })?;
@@ -235,15 +249,16 @@ impl GitImportLfs {
     pub async fn with<F, T, Fut>(
         self,
         ctx: CoreContext,
-        metadata: LfsMetaData,
+        metadata: LfsPointerData,
         f: F,
     ) -> Result<T, Error>
     where
         F: FnOnce(
                 CoreContext,
-                LfsMetaData,
+                LfsPointerData,
                 StoreRequest,
                 Box<dyn Stream<Item = Result<Bytes, Error>> + Send + Unpin>,
+                GitLfsFetchResult,
             ) -> Fut
             + Send
             + 'static,
@@ -262,8 +277,8 @@ impl GitImportLfs {
                 None
             };
 
-            let (req, bstream) = self.fetch_bytes(&ctx, &metadata).await?;
-            f(ctx, metadata, req, Box::new(bstream)).await
+            let (req, bstream, fetch_result) = self.fetch_bytes(&ctx, &metadata).await?;
+            f(ctx, metadata, req, Box::new(bstream), fetch_result).await
         })
         .await?
     }

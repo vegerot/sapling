@@ -5,32 +5,36 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {VSCodeServerPlatform} from './vscodePlatform';
 import type {Logger} from 'isl-server/src/logger';
 import type {ServerPlatform} from 'isl-server/src/serverPlatform';
-import type {ClientToServerMessage, ServerToClientMessage} from 'isl/src/types';
+import type {AppMode, ClientToServerMessage, ServerToClientMessage} from 'isl/src/types';
+import type {Comparison} from 'shared/Comparison';
 
 import packageJson from '../package.json';
 import {Internal} from './Internal';
 import {executeVSCodeCommand} from './commands';
-import {getCLICommand} from './config';
+import {getCLICommand, shouldOpenBeside} from './config';
 import {locale, t} from './i18n';
 import {onClientConnection} from 'isl-server/src';
 import {deserializeFromString, serializeToString} from 'isl/src/serialize';
 import crypto from 'node:crypto';
+import {ComparisonType, isComparison, labelForComparison} from 'shared/Comparison';
 import {nullthrows} from 'shared/utils';
 import * as vscode from 'vscode';
 
 let islPanelOrView: vscode.WebviewPanel | vscode.WebviewView | undefined = undefined;
 let hasOpenedISLWebviewBeforeState = false;
 
-const viewType = 'sapling.isl';
+const islViewType = 'sapling.isl';
+const comparisonViewType = 'sapling.comparison';
 
 const devPort = 3005;
 const devUri = `http://localhost:${devPort}`;
 
 function createOrFocusISLWebview(
   context: vscode.ExtensionContext,
-  platform: ServerPlatform,
+  platform: VSCodeServerPlatform,
   logger: Logger,
 ): vscode.WebviewPanel | vscode.WebviewView {
   // Try to re-use existing ISL panel/view
@@ -44,11 +48,44 @@ function createOrFocusISLWebview(
 
   islPanelOrView = populateAndSetISLWebview(
     context,
-    vscode.window.createWebviewPanel(viewType, t('isl.title'), column, getWebviewOptions(context)),
+    vscode.window.createWebviewPanel(
+      islViewType,
+      t('isl.title'),
+      column,
+      getWebviewOptions(context),
+    ),
     platform,
+    {mode: 'isl'},
     logger,
   );
   return nullthrows(islPanelOrView);
+}
+
+function createComparisonWebview(
+  context: vscode.ExtensionContext,
+  platform: VSCodeServerPlatform,
+  comparison: Comparison,
+  logger: Logger,
+): vscode.WebviewPanel {
+  // always create a new comparison webview
+  const column =
+    shouldOpenBeside() && islPanelOrView != null && isPanel(islPanelOrView) && islPanelOrView.active
+      ? vscode.ViewColumn.Beside
+      : vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
+
+  const webview = populateAndSetISLWebview(
+    context,
+    vscode.window.createWebviewPanel(
+      comparisonViewType,
+      labelForComparison(comparison),
+      column,
+      getWebviewOptions(context),
+    ),
+    platform,
+    {mode: 'comparison', comparison},
+    logger,
+  );
+  return webview;
 }
 
 function getWebviewOptions(
@@ -76,10 +113,20 @@ export function hasOpenedISLWebviewBefore() {
 
 export function registerISLCommands(
   context: vscode.ExtensionContext,
-  platform: ServerPlatform,
+  platform: VSCodeServerPlatform,
   logger: Logger,
 ): vscode.Disposable {
   const webviewViewProvider = new ISLWebviewViewProvider(context, platform, logger);
+
+  const createComparisonWebviewCommand = (comparison: Comparison) => {
+    try {
+      createComparisonWebview(context, platform, comparison, logger);
+    } catch (err: unknown) {
+      vscode.window.showErrorMessage(
+        `error opening ${labelForComparison(comparison)} comparison: ${err}`,
+      );
+    }
+  };
   return vscode.Disposable.from(
     vscode.commands.registerCommand('sapling.open-isl', () => {
       if (shouldUseWebviewView()) {
@@ -104,8 +151,24 @@ export function registerISLCommands(
         executeVSCodeCommand('workbench.action.closeSidebar');
       }
     }),
+    vscode.commands.registerCommand('sapling.open-comparison-view-uncommitted', () => {
+      createComparisonWebviewCommand({type: ComparisonType.UncommittedChanges});
+    }),
+    vscode.commands.registerCommand('sapling.open-comparison-view-head', () => {
+      createComparisonWebviewCommand({type: ComparisonType.HeadChanges});
+    }),
+    vscode.commands.registerCommand('sapling.open-comparison-view-stack', () => {
+      createComparisonWebviewCommand({type: ComparisonType.StackChanges});
+    }),
+    /** Command that opens the provided Comparison argument. Intended to be used programmatically. */
+    vscode.commands.registerCommand('sapling.open-comparison-view', (comparison: unknown) => {
+      if (!isComparison(comparison)) {
+        return;
+      }
+      createComparisonWebviewCommand(comparison);
+    }),
     registerDeserializer(context, platform, logger),
-    vscode.window.registerWebviewViewProvider(viewType, webviewViewProvider, {
+    vscode.window.registerWebviewViewProvider(islViewType, webviewViewProvider, {
       webviewOptions: {
         retainContextWhenHidden: true,
       },
@@ -123,11 +186,11 @@ export function registerISLCommands(
 
 function registerDeserializer(
   context: vscode.ExtensionContext,
-  platform: ServerPlatform,
+  platform: VSCodeServerPlatform,
   logger: Logger,
 ) {
   // Make sure we register a serializer in activation event
-  return vscode.window.registerWebviewPanelSerializer(viewType, {
+  return vscode.window.registerWebviewPanelSerializer(islViewType, {
     deserializeWebviewPanel(webviewPanel: vscode.WebviewPanel, _state: unknown) {
       if (shouldUseWebviewView()) {
         // if we try to deserialize a panel while we're trying to use view, destroy the panel and open the sidebar instead
@@ -137,7 +200,7 @@ function registerDeserializer(
       }
       // Reset the webview options so we use latest uri for `localResourceRoots`.
       webviewPanel.webview.options = getWebviewOptions(context);
-      populateAndSetISLWebview(context, webviewPanel, platform, logger);
+      populateAndSetISLWebview(context, webviewPanel, platform, {mode: 'isl'}, logger);
       return Promise.resolve();
     },
   });
@@ -151,13 +214,19 @@ function registerDeserializer(
 class ISLWebviewViewProvider implements vscode.WebviewViewProvider {
   constructor(
     private extensionContext: vscode.ExtensionContext,
-    private platform: ServerPlatform,
+    private platform: VSCodeServerPlatform,
     private logger: Logger,
   ) {}
 
   resolveWebviewView(webviewView: vscode.WebviewView): void | Thenable<void> {
     webviewView.webview.options = getWebviewOptions(this.extensionContext);
-    populateAndSetISLWebview(this.extensionContext, webviewView, this.platform, this.logger);
+    populateAndSetISLWebview(
+      this.extensionContext,
+      webviewView,
+      this.platform,
+      {mode: 'isl'},
+      this.logger,
+    );
   }
 }
 
@@ -171,13 +240,16 @@ function isPanel(
 function populateAndSetISLWebview<W extends vscode.WebviewPanel | vscode.WebviewView>(
   context: vscode.ExtensionContext,
   panelOrView: W,
-  platform: ServerPlatform,
+  platform: VSCodeServerPlatform,
+  mode: AppMode,
   logger: Logger,
 ): W {
   logger.info(`Populating ISL webview ${isPanel(panelOrView) ? 'panel' : 'view'}`);
   hasOpenedISLWebviewBeforeState = true;
-  if (isPanel(panelOrView)) {
+  if (mode.mode === 'isl' && isPanel(panelOrView)) {
     islPanelOrView = panelOrView;
+  }
+  if (isPanel(panelOrView)) {
     panelOrView.iconPath = vscode.Uri.joinPath(
       context.extensionUri,
       'resources',
@@ -188,8 +260,10 @@ function populateAndSetISLWebview<W extends vscode.WebviewPanel | vscode.Webview
     context,
     panelOrView.webview,
     isPanel(panelOrView) ? 'panel' : 'view',
+    mode,
     logger,
   );
+  const updatedPlatform = {...platform, panelOrView} as VSCodeServerPlatform as ServerPlatform;
 
   const disposeConnection = onClientConnection({
     postMessage(message: string) {
@@ -202,7 +276,8 @@ function populateAndSetISLWebview<W extends vscode.WebviewPanel | vscode.Webview
       });
     },
     cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(), // TODO
-    platform,
+    platform: updatedPlatform,
+    appMode: mode,
     logger,
     command: getCLICommand(),
     version: packageJson.version,
@@ -281,6 +356,36 @@ function getInitialStateJs(context: vscode.ExtensionContext, logger: Logger) {
 }
 
 /**
+ * Get any extra styles to inject into the webview.
+ * Important: this is injected into the HTML directly, and should not
+ * use any user-controlled data that could be used maliciously.
+ */
+function getExtraStyles(): string {
+  const fontFeatureSettings = vscode.workspace
+    .getConfiguration('editor')
+    .get<string | boolean>('fontLigatures');
+  const validFontFeaturesRegex = /^[0-9a-zA-Z"',\-_ ]*$/;
+  if (fontFeatureSettings === true) {
+    return ''; // no need to specify specific additional settings
+  }
+  if (
+    !fontFeatureSettings ||
+    typeof fontFeatureSettings !== 'string' ||
+    !validFontFeaturesRegex.test(fontFeatureSettings)
+  ) {
+    return `
+    html {
+      font-variant-ligatures: none;
+    }`;
+  }
+  return `
+  html {
+    font-feature-settings: ${fontFeatureSettings};
+  }
+  `;
+}
+
+/**
  * When built in dev mode using vite, files are not written to disk.
  * In order to get files to load, we need to set up the server path ourself.
  *
@@ -289,6 +394,7 @@ function getInitialStateJs(context: vscode.ExtensionContext, logger: Logger) {
 function devModeHtmlForISLWebview(
   kind: 'panel' | 'view',
   context: vscode.ExtensionContext,
+  appMode: AppMode,
   logger: Logger,
 ) {
   logger.info('using dev mode webview');
@@ -315,9 +421,13 @@ function devModeHtmlForISLWebview(
       window.__vite_plugin_react_preamble_installed__ = true
     </script>
     <script type="module" src="/@vite/client"></script>
+    <style>
+      ${getExtraStyles()}
+    </style>
 
 		<script>
 			window.saplingLanguage = "${locale /* important: locale has already been validated */}";
+      window.islAppMode = ${JSON.stringify(appMode)};
       ${getInitialStateJs(context, logger)}
 		</script>
     <script type="module" src="/webview/islWebviewPreload.ts"></script>
@@ -334,13 +444,14 @@ function htmlForISLWebview(
   context: vscode.ExtensionContext,
   webview: vscode.Webview,
   kind: 'panel' | 'view',
+  appMode: AppMode,
   logger: Logger,
 ) {
   if (IS_DEV_BUILD) {
     if (Internal?.supportsDevBuilds?.() === false) {
       throw new Error('Cannot use dev build with current VS Code version');
     }
-    return devModeHtmlForISLWebview(kind, context, logger);
+    return devModeHtmlForISLWebview(kind, context, appMode, logger);
   }
 
   // Only allow accessing resources relative to webview dir,
@@ -381,8 +492,12 @@ function htmlForISLWebview(
 		<title>${titleText}</title>
 		<link href="res/webview.css" rel="stylesheet">
 		<link href="res/stylex.css" rel="stylesheet">
+    <style>
+      ${getExtraStyles()}
+    </style>
 		<script nonce="${nonce}">
 			window.saplingLanguage = "${locale /* important: locale has already been validated */}";
+      window.islAppMode = ${JSON.stringify(appMode)};
       ${getInitialStateJs(context, logger)}
 		</script>
 		<script type="module" defer="defer" nonce="${nonce}" src="${scriptUri}"></script>

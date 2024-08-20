@@ -27,11 +27,11 @@ import testing repo
   $ blobimport repo-hg/.hg repo
 
 Start up SaplingRemoteAPI server.
-  $ SEGMENTED_CHANGELOG_ENABLE=1 setup_mononoke_config
+  $ setup_mononoke_config
   $ start_and_wait_for_mononoke_server
 Check responses.
 
-  $ hgedenapi debugapi -e uploadfilecontents -i '[({"Sha1":"03cfd743661f07975fa2f1220c5194cbaff48451"}, b"abc\n")]'
+  $ sl debugapi -e uploadfilecontents -i '[({"Sha1":"03cfd743661f07975fa2f1220c5194cbaff48451"}, b"abc\n")]'
   [{"data": {"id": {"AnyFileContentId": {"Sha1": bin("03cfd743661f07975fa2f1220c5194cbaff48451")}},
              "metadata": {"FileContentTokenMetadata": {"content_size": 4}},
              "bubble_id": None},
@@ -54,10 +54,10 @@ Check responses.
                                 114,
                                 101]}}]
 
-  $ hgedenapi debugapi -e ephemeralprepare -i None -i None
+  $ sl debugapi -e ephemeralprepare -i None -i None
   {"bubble_id": 1}
 
-  $ hgedenapi debugapi -e uploadfilecontents -i '[({"Sha1":"7b18d017f89f61cf17d47f92749ea6930a3f1deb"}, b"def\n")]' -i 1
+  $ sl debugapi -e uploadfilecontents -i '[({"Sha1":"7b18d017f89f61cf17d47f92749ea6930a3f1deb"}, b"def\n")]' -i 1
   [{"data": {"id": {"AnyFileContentId": {"Sha1": bin("7b18d017f89f61cf17d47f92749ea6930a3f1deb")}},
              "metadata": {"FileContentTokenMetadata": {"content_size": 4}},
              "bubble_id": 1},

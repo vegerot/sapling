@@ -17,14 +17,14 @@ use clidispatch::ReqCtx;
 use cliparser::define_flags;
 use cmdutil::ConfigSet;
 use cmdutil::Result;
-use dag::namedag::IndexedLogNameDagPath;
+use dag::dag::IndexedLogDagPath;
 use dag::ops::DagImportCloneData;
 use dag::ops::DagPersistent;
 use dag::ops::Open;
 use dag::CloneData;
 use dag::Group;
+use dag::Vertex;
 use dag::VertexListWithOptions;
-use dag::VertexName;
 use progress_model::ProgressBar;
 
 define_flags! {
@@ -70,7 +70,7 @@ pub fn run(ctx: ReqCtx<StatusOpts>) -> Result<u8> {
     segments_path.push("store");
     segments_path.push("segments");
     segments_path.push("v1");
-    let namedag_path = IndexedLogNameDagPath(segments_path);
+    let namedag_path = IndexedLogDagPath(segments_path);
 
     let mut namedag = namedag_path
         .open()
@@ -83,7 +83,7 @@ pub fn run(ctx: ReqCtx<StatusOpts>) -> Result<u8> {
         .into_iter()
         .map(|(k, v)| {
             bar.increase_position(1);
-            (k, VertexName::copy_from(&v.into_byte_array()))
+            (k, Vertex::copy_from(&v.into_byte_array()))
         })
         .collect();
 

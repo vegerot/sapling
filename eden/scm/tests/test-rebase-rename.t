@@ -294,9 +294,7 @@ copy records collapse correctly.
   $ hg rebase -s 68bf06433839 --dest 'max(desc(unrelated))' --collapse
   rebasing 68bf06433839 "File b created as copy of a and modified"
   rebasing af74b229bc02 "File c created as copy of b and modified"
-  merging b and c to c
   rebasing dbb9ba033561 "File d created as copy of c and modified"
-  merging c and d to d
   $ hg co tip
   3 files updated, 0 files merged, 0 files removed, 0 files unresolved
 

@@ -6,11 +6,9 @@
 
   $ . "${TEST_FIXTURES}/library.sh"
   $ REPOTYPE="blob_files"
-  $ ENABLED_DERIVED_DATA='["git_commits", "git_trees", "git_delta_manifests", "unodes", "filenodes", "hgchangesets"]' setup_common_config $REPOTYPE
+  $ setup_common_config $REPOTYPE
   $ GIT_REPO_ORIGIN="${TESTTMP}/origin/repo-git"
   $ GIT_REPO="${TESTTMP}/repo-git"
-  $ HG_REPO="${TESTTMP}/repo-hg"
-  $ BUNDLE_PATH="${TESTTMP}/repo_bundle.bundle"
   $ cat >> repos/repo/server.toml <<EOF
   > [source_control_service]
   > permit_writes = true
@@ -50,7 +48,7 @@
   $ find -type f -name '*git_object*' -delete
 
 # Regenerate git commits and trees
-  $ quiet backfill_derived_data backfill-all git_trees git_commits git_delta_manifests unodes
+  $ quiet mononoke_newadmin derived-data -R repo derive -T git_trees -T git_commits -T git_delta_manifests_v2 -T unodes --all-bookmarks
 
 # Capture the new bonsai_git_mapping output representing the git commits re-generated for the bonsais
   $ sqlite3 "$TESTTMP/monsql/sqlite_dbs" "SELECT hex(git_sha1) as git_id, hex(bcs_id) as bonsai_id FROM bonsai_git_mapping ORDER BY hex(git_sha1)" > new_bonsai_git_mapping

@@ -19,6 +19,7 @@ use mononoke_types::path::MPath;
 use pretty_assertions::assert_eq;
 use tests_utils::CreateCommitContext;
 
+use crate::repo::MononokeRepo;
 use crate::repo::Repo;
 use crate::ChangesetDiffItem;
 use crate::ChangesetFileOrdering;
@@ -194,7 +195,9 @@ async fn test_diff_with_multiple_moves(fb: FacebookInit) -> Result<(), Error> {
     Ok(())
 }
 
-fn check_root_dir_diff(diff: Option<&ChangesetPathDiffContext>) -> Result<(), Error> {
+fn check_root_dir_diff<R: MononokeRepo>(
+    diff: Option<&ChangesetPathDiffContext<R>>,
+) -> Result<(), Error> {
     match diff {
         Some(ChangesetPathDiffContext::Changed(path1, path2)) if path1.path() == path2.path() => {
             assert_eq!(path1.path(), &MPath::try_from("")?);
@@ -210,7 +213,7 @@ async fn test_diff_with_dirs(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mononoke = Mononoke::new_test(vec![(
         "test".to_string(),
-        ManyFilesDirs::get_custom_test_repo(fb).await,
+        ManyFilesDirs::get_repo(fb).await,
     )])
     .await?;
     let repo = mononoke
@@ -270,7 +273,7 @@ async fn test_diff_with_dirs(fb: FacebookInit) -> Result<(), Error> {
     Ok(())
 }
 
-fn check_diff_paths(diff_ctxs: &[ChangesetPathDiffContext], paths: &[&str]) {
+fn check_diff_paths<R: MononokeRepo>(diff_ctxs: &[ChangesetPathDiffContext<R>], paths: &[&str]) {
     let diff_paths = diff_ctxs
         .iter()
         .map(|diff_ctx| match diff_ctx {

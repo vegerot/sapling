@@ -144,13 +144,24 @@ py_class!(pub class commits |py| {
             Some(map) => map,
             None => self.inner(py).read().id_map_snapshot().map_pyerr(py)?,
         };
-        Ok(Spans(block_on(id_map.to_id_set(&set.0)).map_pyerr(py)?))
+        let id_set = block_on(id_map.to_id_set(&set.0)).map_pyerr(py)?;
+        Ok(Spans::from_id_set(id_set))
     }
 
+    /// tonodes(set, preserve_order=False)
     /// Convert IdSet to Set. For compatibility with legacy code only.
-    def tonodes(&self, set: Spans) -> PyResult<Names> {
+    def tonodes(&self, set: Spans, preserve_order: bool = false) -> PyResult<Names> {
         let inner = self.inner(py).read();
-        Ok(Names(inner.to_set(&set.0).map_pyerr(py)?))
+        let mut set = set;
+        if !preserve_order {
+            set.drop_order();
+        }
+        let set = if let Some(list) = set.maybe_as_id_list() {
+            inner.id_list_to_set(list)
+        } else {
+            inner.to_set(set.as_id_set())
+        }.map_pyerr(py)?;
+        Ok(Names(set))
     }
 
     /// Obtain the read-only dagalgo object that supports various DAG algorithms.

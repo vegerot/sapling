@@ -1,5 +1,6 @@
 {
   "bools": {
+    "scm/mononoke:backsync_submodule_expansion_changes": true,
     "scm/mononoke:bssm_enable_optimized_derivation": false,
     "scm/mononoke:cross_repo_skip_backsyncing_ordinary_empty_commits": false,
     "scs/mononoke:defer_to_backsyncer_for_backsync": true,
@@ -17,7 +18,9 @@
     "scm/mononoke:scs_commit_find_files_use_bssm_for_suffix_queries": false,
     "scm/mononoke:sql_disable_auto_cache": false,
     "scm/mononoke:sql_disable_auto_retries": false,
+    "scm/mononoke:disable_double_writing_to_changesets_table": true,
     "scm/mononoke:static-backend": false,
+    "scm/mononoke:use_optimized_git_packfile_stream": true,
     "scm/mononoke:disable_running_hooks_in_pushredirected_repo": false,
     "scm/mononoke:xrepo_assign_large_repo_version_on_pushrebase": true,
     "scm/mononoke:xrepo_disable_forward_sync_over_mapping_change": false,
@@ -46,6 +49,7 @@
     "scm/mononoke:scs_popular_methods_sampling_rate": 1000,
     "scm/mononoke:scs_other_methods_sampling_rate": 1,
     "scm/mononoke:warm_bookmark_cache_poll_interval_ms": 1000,
-    "scm/mononoke:derivation_worker_max_concurrent_derivations": 10
+    "scm/mononoke:derivation_worker_max_concurrent_derivations": 10,
+    "scm/mononoke:live_git_sync_batch_size": 50
   }
 }

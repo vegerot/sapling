@@ -36,8 +36,7 @@ Regenerate microwave snapshot. This will fail because we have no derived data:
 
 Derive data, then regenerate microwave snapshot:
 
-  $ quiet mononoke_newadmin dump-changesets -R repo --out-filename "$TESTTMP/prefetched_commits" fetch-public
-  $ quiet backfill_derived_data backfill --prefetched-commits-path "$TESTTMP/prefetched_commits" filenodes
+  $ quiet mononoke_newadmin derived-data -R repo derive --all-types --all-bookmarks
   $ quiet microwave_builder --debug blobstore
 
 Start Mononoke again, check that the microwave snapshot was used
@@ -47,7 +46,6 @@ Start Mononoke again, check that the microwave snapshot was used
   $ wait_for_mononoke_cache_warmup
   $ grep primed "$TESTTMP/mononoke.out"
   * primed filenodes cache with 1 entries, repo: repo (glob)
-  * primed changesets cache with 3 entries, repo: repo (glob)
   * microwave: successfully primed cache, repo: repo (glob)
 
 Finally, check that we can also generate a snapshot to files

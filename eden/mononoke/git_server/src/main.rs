@@ -49,6 +49,7 @@ use gotham_ext::serve;
 use http::HeaderValue;
 use metaconfig_parser::RepoConfigs;
 use metaconfig_types::ShardedService;
+use middleware::PushvarsParsingMiddleware;
 use mononoke_api::Repo;
 use mononoke_app::args::McrouterAppExtension;
 use mononoke_app::args::ReadonlyArgs;
@@ -157,7 +158,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         .with_default_scuba_dataset("mononoke_git_server")
         .with_bookmarks_cache(BookmarkCacheOptions {
             cache_kind: BookmarkCacheKind::Local,
-            derived_data: BookmarkCacheDerivedData::GitOnly,
+            derived_data: BookmarkCacheDerivedData::NoDerivation, // Derivation is already done at push time
         })
         .with_app_extension(WarmBookmarksCacheExtension {})
         .with_app_extension(McrouterAppExtension {})
@@ -259,6 +260,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                     None,
                     args.readonly.readonly,
                 ))
+                .add(PushvarsParsingMiddleware {})
                 .add(ResponseContentTypeMiddleware {})
                 .add(PostResponseMiddleware::default())
                 .add(LoadMiddleware::new())

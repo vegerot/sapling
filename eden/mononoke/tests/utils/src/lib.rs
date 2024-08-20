@@ -13,8 +13,10 @@ use std::str::FromStr;
 
 use anyhow::format_err;
 use anyhow::Error;
+use bonsai_git_mapping::BonsaiGitMapping;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
+use bonsai_tag_mapping::BonsaiTagMapping;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::Bookmarks;
@@ -22,8 +24,11 @@ use bookmarks::BookmarksRef;
 use bytes::Bytes;
 use bytes::BytesMut;
 use changesets::Changesets;
-use changesets::ChangesetsRef;
 use changesets_creation::save_changesets;
+use commit_graph::CommitGraph;
+use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriter;
+use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
 use filestore::FetchKey;
 use filestore::FilestoreConfig;
@@ -55,7 +60,8 @@ pub mod random;
 
 pub trait Repo = BonsaiHgMappingRef
     + BookmarksRef
-    + ChangesetsRef
+    + CommitGraphRef
+    + CommitGraphWriterRef
     + FilestoreConfigRef
     + RepoBlobstoreArc
     + RepoDerivedDataRef
@@ -77,6 +83,12 @@ pub struct BasicTestRepo {
     pub changesets: dyn Changesets,
 
     #[facet]
+    pub commit_graph: CommitGraph,
+
+    #[facet]
+    pub commit_graph_writer: dyn CommitGraphWriter,
+
+    #[facet]
     pub bonsai_hg_mapping: dyn BonsaiHgMapping,
 
     #[facet]
@@ -90,6 +102,12 @@ pub struct BasicTestRepo {
 
     #[facet]
     pub repo_identity: RepoIdentity,
+
+    #[facet]
+    pub bonsai_tag_mapping: dyn BonsaiTagMapping,
+
+    #[facet]
+    pub bonsai_git_mapping: dyn BonsaiGitMapping,
 }
 
 pub async fn list_working_copy_utf8(

@@ -23,7 +23,6 @@ use dag::protocol::RemoteIdConvertProtocol;
 use dag::Location;
 use dag::Set;
 use dag::Vertex;
-use dag::VertexName;
 use edenapi::configmodel;
 use edenapi::types::make_hash_lookup_request;
 use edenapi::types::AnyFileContentId;
@@ -88,7 +87,7 @@ use manifest_tree::Flag;
 use minibytes::Bytes;
 use mutationstore::MutationEntry;
 use nonblocking::non_blocking_result;
-use storemodel::types::AugmentedTreeEntryWithDigest;
+use storemodel::types::AugmentedTreeWithDigest;
 use storemodel::SerializationFormat;
 use tracing::debug;
 use tracing::error;
@@ -276,9 +275,7 @@ impl SaplingRemoteApi for EagerRepo {
                 {
                     Ok(tree) => {
                         let augmented_tree_with_digest =
-                            AugmentedTreeEntryWithDigest::try_deserialize(std::io::Cursor::new(
-                                tree,
-                            ))?;
+                            AugmentedTreeWithDigest::try_deserialize(std::io::Cursor::new(tree))?;
                         let mut converted_entry: TreeEntry =
                             TreeEntry::try_from(augmented_tree_with_digest).map_err(|err| {
                                 SaplingRemoteApiServerError::with_key(key.clone(), err)
@@ -345,7 +342,7 @@ impl SaplingRemoteApi for EagerRepo {
                                     self.get_sha1_blob_for_api(child.hgid, "trees (aux)")?;
                                 let file_body_without_parents = extract_body(&file_with_parents);
                                 let (file_body, _copy_from) =
-                                    hgstore::split_hg_file_metadata(&file_body_without_parents)?;
+                                    hgstore::split_hg_file_metadata(&file_body_without_parents);
 
                                 let aux_data = FileAuxData::from_content(&file_body);
                                 children.push(Ok(TreeChildEntry::File(TreeChildFileEntry {
@@ -938,6 +935,11 @@ impl SaplingRemoteApi for EagerRepo {
                 }
             }
 
+            // Eagerly compute augmented manifest data.
+            if let Err(err) = self.derive_augmented_tree_recursively(cs.manifestid) {
+                error!(?err, "error pre-deriving augmented tree data");
+            }
+
             let text = match changeset_to_text(cs) {
                 Ok(text) => text,
                 Err(err) => {
@@ -1507,9 +1509,7 @@ fn to_vec_vertex(ids: &[HgId]) -> Vec<Vertex> {
     ids.iter().map(|i| Vertex::copy_from(i.as_ref())).collect()
 }
 
-fn convert_clone_data(
-    clone_data: dag::CloneData<VertexName>,
-) -> edenapi::Result<dag::CloneData<HgId>> {
+fn convert_clone_data(clone_data: dag::CloneData<Vertex>) -> edenapi::Result<dag::CloneData<HgId>> {
     check_convert_to_hgid(clone_data.idmap.values())?;
     let clone_data = dag::CloneData {
         flat_segments: clone_data.flat_segments,

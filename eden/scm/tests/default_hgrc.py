@@ -3,11 +3,6 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This software may be used and distributed according to the terms of the
-# GNU General Public License version 2.
-
 """
 Default config file for testing
 """
@@ -36,7 +31,6 @@ ignore.test=$RUNTESTDIR/gitignore
 
 [devel]
 all-warnings=True
-collapse-traceback =True
 default-date=0 0
 
 [web]
@@ -58,7 +52,6 @@ rust-checkout=True
 
 [extensions]
 treemanifest=
-copytrace=
 
 [treemanifest]
 sendtrees=True
@@ -78,6 +71,7 @@ httpcommitgraph2=true
 
 [hint]
 ack-match-full-traversal=True
+ack = smartlog-default-command
 
 [scmstore]
 contentstorefallback=True
@@ -85,7 +79,6 @@ contentstorefallback=True
 [experimental]
 use-rust-changelog=True
 windows-symlinks=True
-copytrace=off
 
 [tweakdefaults]
 graftkeepdate=True

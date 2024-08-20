@@ -223,6 +223,9 @@ class manifestdict:
             return m1.diff(m2)
         return self._lm.diff(m2._lm)
 
+    def set(self, key, node, flag):
+        self._lm[key] = node, flag
+
     def setflag(self, key, flag):
         self._lm[key] = self[key], flag
 
@@ -305,6 +308,14 @@ class manifestdict:
             deltatext = mdiff.textdiff(util.buffer(base), util.buffer(arraytext))
 
         return arraytext, deltatext
+
+    # For compat with Rust manifest.
+    def hasgrafts(self):
+        return False
+
+    # For compat with Rust manifest.
+    def ungraftedpath(self, path):
+        return None
 
 
 def _msearch(m, s, lo=0, hi=None):

@@ -431,7 +431,7 @@ invalid options
   
   (some details hidden, use --verbose to show complete help)
   $ hg no--config
-  abort: option --config may not be abbreviated or used in aliases
+  abort: option --config may not be abbreviated, used in aliases, or used as a value for another option
   [255]
   $ hg no --config alias.no='--repo elsewhere --cwd elsewhere status'
   unknown command '--repo'
@@ -629,7 +629,7 @@ shell aliases with global options
 global flags after the shell alias name is passed to the shell command, not handled by hg
 
   $ hg echoall --cwd ..
-  abort: option --cwd may not be abbreviated!
+  abort: option --cwd may not be abbreviated or used in aliases
   [255]
 
 

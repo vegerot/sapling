@@ -19,9 +19,9 @@ import {
   SLOC_THRESHOLD_FOR_SPLIT_SUGGESTIONS,
 } from '../sloc/diffStatConstants';
 import {
-  useFetchPendingAmendSignificantLinesOfCode,
-  useFetchPendingSignificantLinesOfCode,
-  useFetchSignificantLinesOfCode,
+  useFetchStrictSignificantLinesOfCode,
+  useFetchStrictPendingAmendSignificantLinesOfCode,
+  useFetchStrictPendingSignificantLinesOfCode,
 } from '../sloc/useFetchSignificantLinesOfCode';
 import {SplitButton} from '../stackEdit/ui/SplitButton';
 import {type CommitInfo} from '../types';
@@ -103,7 +103,7 @@ function SuggestionBanner({
 }
 
 function NewCommitSuggestion() {
-  const pendingSignificantLinesOfCode = useFetchPendingSignificantLinesOfCode();
+  const pendingSignificantLinesOfCode = useFetchStrictPendingSignificantLinesOfCode();
   if (pendingSignificantLinesOfCode == null) {
     return null;
   }
@@ -117,14 +117,14 @@ function NewCommitSuggestion() {
         <b>
           <T>Consider unselecting some of these changes</T>
         </b>
-        <T>Small Diffs lead to less SEVs & quicker review times</T>
+        <T>Small Diffs lead to quicker review times</T>
       </SuggestionBanner>
     );
   }
 }
 
 function AmendSuggestion() {
-  const pendingAmendSignificantLinesOfCode = useFetchPendingAmendSignificantLinesOfCode();
+  const pendingAmendSignificantLinesOfCode = useFetchStrictPendingAmendSignificantLinesOfCode();
 
   if (pendingAmendSignificantLinesOfCode == null) {
     return null;
@@ -139,7 +139,7 @@ function AmendSuggestion() {
         <b>
           <T>Consider unselecting some of these changes</T>
         </b>
-        <T>Small Diffs lead to less SEVs & quicker review times</T>
+        <T>Small Diffs lead to quicker review times</T>
       </SuggestionBanner>
     );
   }
@@ -147,7 +147,7 @@ function AmendSuggestion() {
 
 function SplitSuggestionImpl({commit}: {commit: CommitInfo}) {
   const mode = useAtomValue(commitMode);
-  const significantLinesOfCode = useFetchSignificantLinesOfCode(commit) ?? -1;
+  const significantLinesOfCode = useFetchStrictSignificantLinesOfCode(commit) ?? -1;
   const uncommittedChanges = useAtomValue(uncommittedChangesWithPreviews);
 
   // no matter what if the commit is over the threshold, we show the split suggestion
@@ -164,7 +164,7 @@ function SplitSuggestionImpl({commit}: {commit: CommitInfo}) {
         <b>
           <T>Consider splitting up this commit</T>
         </b>
-        <T>Small Diffs lead to less SEVs & quicker review times</T>
+        <T>Small Diffs lead to quicker review times</T>
       </SuggestionBanner>
     );
   }

@@ -29,12 +29,11 @@ use bookmarks::BookmarkUpdateLogRef;
 use bookmarks::Bookmarks;
 use bookmarks::BookmarksArc;
 use bookmarks::BookmarksRef;
-use changesets::Changesets;
-use changesets::ChangesetsArc;
-use changesets::ChangesetsRef;
 use commit_graph::CommitGraph;
 use commit_graph::CommitGraphArc;
 use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriter;
+use commit_graph::CommitGraphWriterRef;
 use filenodes::Filenodes;
 use filenodes::FilenodesArc;
 use filenodes::FilenodesRef;
@@ -66,6 +65,7 @@ use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentity;
 use repo_identity::RepoIdentityRef;
 use sorted_vector_map::SortedVectorMap;
+use sql_query_config::SqlQueryConfig;
 use static_assertions::assert_impl_all;
 use thiserror::Error;
 
@@ -192,8 +192,6 @@ pub trait Repo = BookmarksArc
     + BonsaiGitMappingRef
     + BonsaiGitMappingArc
     + FilestoreConfigRef
-    + ChangesetsRef
-    + ChangesetsArc
     + RepoIdentityRef
     + MutableCountersArc
     + PhasesRef
@@ -202,6 +200,7 @@ pub trait Repo = BookmarksArc
     + RepoDerivedDataRef
     + RepoDerivedDataArc
     + CommitGraphRef
+    + CommitGraphWriterRef
     + CommitGraphArc
     + FilenodesArc
     + FilenodesRef
@@ -236,9 +235,6 @@ pub struct ConcreteRepo {
     filestore_config: FilestoreConfig,
 
     #[facet]
-    changesets: dyn Changesets,
-
-    #[facet]
     id: RepoIdentity,
 
     #[facet]
@@ -266,7 +262,13 @@ pub struct ConcreteRepo {
     commit_graph: CommitGraph,
 
     #[facet]
+    commit_graph_writer: dyn CommitGraphWriter,
+
+    #[facet]
     file_nodes: dyn Filenodes,
+
+    #[facet]
+    sql_query_config: SqlQueryConfig,
 }
 
 assert_impl_all!(ConcreteRepo: Repo);

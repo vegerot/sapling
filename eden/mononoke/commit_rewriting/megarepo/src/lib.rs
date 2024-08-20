@@ -14,7 +14,8 @@ use anyhow::Error;
 use blobstore::Loadable;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarksRef;
-use changesets::ChangesetsRef;
+use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
 use futures::future;
 use futures::Stream;
@@ -61,7 +62,8 @@ const REPORTING_INTERVAL_FILES: usize = 10000;
 pub trait Repo = BonsaiHgMappingRef
     + RepoBlobstoreRef
     + RepoDerivedDataRef
-    + ChangesetsRef
+    + CommitGraphRef
+    + CommitGraphWriterRef
     + PhasesRef
     + BookmarksRef
     + RepoIdentityRef
@@ -255,9 +257,9 @@ mod test {
     use anyhow::Result;
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::Bookmarks;
-    use changeset_fetcher::ChangesetFetcher;
-    use changesets::Changesets;
     use cloned::cloned;
+    use commit_graph::CommitGraph;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use fixtures::Linear;
@@ -286,9 +288,9 @@ mod test {
         #[facet]
         repo_derived_data: RepoDerivedData,
         #[facet]
-        changeset_fetcher: dyn ChangesetFetcher,
+        commit_graph: CommitGraph,
         #[facet]
-        changesets: dyn Changesets,
+        commit_graph_writer: dyn CommitGraphWriter,
         #[facet]
         filestore_config: FilestoreConfig,
         #[facet]
@@ -348,7 +350,7 @@ mod test {
         ChangesetId,
         ChangesetArgs,
     ) {
-        let repo: Arc<TestRepo> = Arc::new(ManyFilesDirs::get_custom_test_repo(fb).await);
+        let repo: Arc<TestRepo> = Arc::new(ManyFilesDirs::get_repo(fb).await);
         let ctx = CoreContext::test_mock(fb);
 
         let hg_cs_id = HgChangesetId::from_str("2f866e7e549760934e31bf0420a873f65100ad63").unwrap();
@@ -499,7 +501,7 @@ mod test {
 
     #[fbinit::test]
     async fn test_stack_move(fb: FacebookInit) -> Result<(), Error> {
-        let repo: Arc<TestRepo> = Arc::new(Linear::get_custom_test_repo(fb).await);
+        let repo: Arc<TestRepo> = Arc::new(Linear::get_repo(fb).await);
         let ctx = CoreContext::test_mock(fb);
 
         let old_bcs_id = resolve_cs_id(&ctx, &repo, "master").await?;

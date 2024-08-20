@@ -2,7 +2,7 @@
   "name": "sapling-scm",
   "displayName": "Sapling SCM",
   "description": "Sapling: A Scalable, User-Friendly Source Control System",
-  "version": "0.1.53",
+  "version": "0.1.55",
   "publisher": "meta",
   "license": "MIT",
   "engines": {
@@ -52,6 +52,24 @@
           "type": "boolean",
           "description": "%settings.markConflictingFilesResolvedOnSave.description%",
           "default": true
+        },
+        "sapling.comparisonPanelMode": {
+          "type": "string",
+          "enum": [
+            "Auto",
+            "Always Separate Panel"
+          ],
+          "enumDescriptions": [
+            "%settings.comparisonPanelMode.enumDescriptions.auto%",
+            "%settings.comparisonPanelMode.enumDescriptions.always-separate-panel%"
+          ],
+          "description": "%settings.comparisonPanelMode.description%",
+          "default": "Auto"
+        },
+        "sapling.isl.openBeside": {
+          "type": "boolean",
+          "default": false,
+          "description": "%settings.isl.openBeside.description%"
         },
         "sapling.isl.showInSidebar": {
           "type": "boolean",
@@ -109,6 +127,26 @@
         "category": "%sapling.command-category%"
       },
       {
+        "command": "sapling.open-comparison-view-uncommitted",
+        "title": "%sapling.open-comparison-view-uncommitted-command%",
+        "category": "%sapling.command-category%"
+      },
+      {
+        "command": "sapling.open-comparison-view-head",
+        "title": "%sapling.open-comparison-view-head-command%",
+        "category": "%sapling.command-category%"
+      },
+      {
+        "command": "sapling.open-comparison-view-stack",
+        "title": "%sapling.open-comparison-view-stack-command%",
+        "category": "%sapling.command-category%"
+      },
+      {
+        "command": "sapling.open-comparison-view",
+        "title": "%sapling.open-comparison-view-command%",
+        "when": false
+      },
+      {
         "command": "sapling.isl.focus",
         "title": "Focus Sapling ISL Sidebar"
       },
@@ -121,6 +159,20 @@
         "command": "sapling.copy-remote-file-link",
         "title": "Copy Code Review Link",
         "enablement": "sapling:hasRemoteLinkRepo"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "sapling.open-comparison-view-uncommitted",
+        "key": "ctrl-'",
+        "mac": "cmd-'",
+        "when": "activeWebviewPanelId != 'sapling.isl'"
+      },
+      {
+        "command": "sapling.open-comparison-view-head",
+        "key": "ctrl-shift-'",
+        "mac": "cmd-shift-'",
+        "when": "activeWebviewPanelId != 'sapling.isl'"
       }
     ],
     "menus": {

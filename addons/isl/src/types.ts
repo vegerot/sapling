@@ -169,6 +169,21 @@ export type ApplicationInfo = {
   logFilePath: string;
 };
 
+/**
+ * Which "mode" for the App to run. Controls the basic rendering.
+ * Useful to render full-screen alternate views.
+ * isl => normal, full ISL
+ * comparison => just the comparison viewer is rendered, set to some specific comparison
+ */
+export type AppMode =
+  | {
+      mode: 'isl';
+    }
+  | {
+      mode: 'comparison';
+      comparison: Comparison;
+    };
+
 export type CodeReviewSystem =
   | {
       type: 'github';
@@ -298,6 +313,8 @@ export type ExactRevset = {type: 'exact-revset'; revset: Revset};
 /**
  * Most arguments to eden commands are literal `string`s, except:
  * - When specifying file paths, the server needs to know which args are files to convert them to be cwd-relative.
+ *     - For long file lists, we pass them in a single bulk arg, which will be passed via stdin instead
+ *       to avoid command line length limits.
  * - When specifying commit hashes, you may be acting on optimistic version of those hashes.
  *   The server can re-write hashes using a revset that transforms into the latest successor instead.
  *   This allows you to act on the optimistic versions of commits in queued commands,
@@ -309,6 +326,7 @@ export type ExactRevset = {type: 'exact-revset'; revset: Revset};
 export type CommandArg =
   | string
   | {type: 'repo-relative-file'; path: RepoRelativePath}
+  | {type: 'repo-relative-file-list'; paths: Array<RepoRelativePath>}
   | {type: 'config'; key: string; value: string}
   | ExactRevset
   | SucceedableRevset
@@ -534,6 +552,7 @@ export type PlatformSpecificClientToServerMessages =
   | {type: 'platform/openContainingFolder'; path: RepoRelativePath}
   | {type: 'platform/openDiff'; path: RepoRelativePath; comparison: Comparison}
   | {type: 'platform/openExternal'; url: string}
+  | {type: 'platform/changeTitle'; title: string}
   | {type: 'platform/confirm'; message: string; details?: string | undefined}
   | {type: 'platform/subscribeToAvailableCwds'}
   | {type: 'platform/subscribeToUnsavedFiles'}
@@ -733,6 +752,7 @@ export type ClientToServerMessage =
   | CodeReviewProviderSpecificClientToServerMessages
   | PlatformSpecificClientToServerMessages
   | {type: 'fetchSignificantLinesOfCode'; hash: Hash; excludedFiles: string[]}
+  | {type: 'fetchStrictSignificantLinesOfCode'; hash: Hash; excludedFiles: string[]}
   | {
       type: 'fetchPendingSignificantLinesOfCode';
       requestId: number;
@@ -740,7 +760,19 @@ export type ClientToServerMessage =
       includedFiles: string[];
     }
   | {
+      type: 'fetchPendingStrictSignificantLinesOfCode';
+      requestId: number;
+      hash: Hash;
+      includedFiles: string[];
+    }
+  | {
       type: 'fetchPendingAmendSignificantLinesOfCode';
+      requestId: number;
+      hash: Hash;
+      includedFiles: string[];
+    }
+  | {
+      type: 'fetchPendingAmendStrictSignificantLinesOfCode';
       requestId: number;
       hash: Hash;
       includedFiles: string[];
@@ -823,6 +855,7 @@ export type ServerToClientMessage =
   | OperationProgressEvent
   | PlatformSpecificServerToClientMessages
   | {type: 'fetchedSignificantLinesOfCode'; hash: Hash; linesOfCode: Result<number>}
+  | {type: 'fetchedStrictSignificantLinesOfCode'; hash: Hash; linesOfCode: Result<number>}
   | {
       type: 'fetchedPendingSignificantLinesOfCode';
       requestId: number;
@@ -830,7 +863,19 @@ export type ServerToClientMessage =
       linesOfCode: Result<number>;
     }
   | {
+      type: 'fetchedPendingStrictSignificantLinesOfCode';
+      requestId: number;
+      hash: Hash;
+      linesOfCode: Result<number>;
+    }
+  | {
       type: 'fetchedPendingAmendSignificantLinesOfCode';
+      requestId: number;
+      hash: Hash;
+      linesOfCode: Result<number>;
+    }
+  | {
+      type: 'fetchedPendingAmendStrictSignificantLinesOfCode';
       requestId: number;
       hash: Hash;
       linesOfCode: Result<number>;

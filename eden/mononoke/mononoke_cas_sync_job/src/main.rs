@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::format_err;
 use anyhow::Context;
@@ -31,9 +32,9 @@ use bookmarks::BookmarkUpdateLogEntry;
 use bookmarks::BookmarkUpdateLogId;
 use bookmarks::Freshness;
 use borrowed::borrowed;
-use changeset_fetcher::ChangesetFetcher;
-use changesets::Changesets;
-use changesets_uploader::MononokeCasChangesetsUploader;
+use cas_client::build_mononoke_cas_client;
+use cas_client::CasClient;
+use changesets_uploader::CasChangesetsUploader;
 use clap_old::Arg;
 use clap_old::SubCommand;
 use clientinfo::ClientEntryPoint;
@@ -68,6 +69,7 @@ use mutable_counters::MutableCountersArc;
 use repo_blobstore::RepoBlobstore;
 use repo_derived_data::RepoDerivedData;
 use repo_identity::RepoIdentity;
+use repo_name::encode_repo_name;
 use retry::retry_always;
 use retry::RetryAttemptsCount;
 use scuba_ext::MononokeScubaSampleBuilder;
@@ -75,6 +77,8 @@ use sharding_ext::RepoShard;
 use slog::error;
 use slog::info;
 use tokio::runtime::Runtime;
+use zk_leader_election::LeaderElection;
+use zk_leader_election::ZkMode;
 
 mod errors;
 mod re_cas_sync;
@@ -94,9 +98,6 @@ const DEFAULT_EXECUTION_RETRY_NUM: usize = 1;
 const DEFAULT_RETRY_DELAY_MS: u64 = 1000;
 const DEFAULT_BATCH_SIZE: u64 = 10;
 
-// TODO: make it configurable via a configerator config
-const SUPPORTED_BOOKMARK: &str = "master";
-
 #[derive(Copy, Clone)]
 struct QueueSize(usize);
 
@@ -113,12 +114,6 @@ pub struct MononokeCasSyncProcess {
 #[facet::container]
 #[derive(Clone)]
 pub struct Repo {
-    #[facet]
-    pub changeset_fetcher: dyn ChangesetFetcher,
-
-    #[facet]
-    pub changesets: dyn Changesets,
-
     #[facet]
     pub commit_graph: CommitGraph,
 
@@ -174,6 +169,15 @@ impl MononokeCasSyncProcess {
                 .takes_value(true)
                 .required(false)
                 .help("how many times to retry the execution")
+        )
+        .arg(
+            Arg::with_name("leader-only")
+                .long("leader-only")
+                .takes_value(false)
+                .required(false)
+                .help(
+                    "If leader election is enabled, only one instance of the job will be running at a time for a repo",
+                )
         )
         .about(
             "Special job that takes commits that were sent to Mononoke and \
@@ -259,6 +263,13 @@ pub struct MononokeCasSyncProcessExecutor {
     repo_name: String,
 }
 
+#[async_trait]
+impl LeaderElection for MononokeCasSyncProcessExecutor {
+    fn get_shared_lock_path(&self) -> String {
+        format!("{}_{}", JOB_NAME, encode_repo_name(self.repo_name.clone()))
+    }
+}
+
 impl MononokeCasSyncProcessExecutor {
     fn new(
         fb: FacebookInit,
@@ -292,6 +303,7 @@ impl MononokeCasSyncProcessExecutor {
             "retry-num",
             DEFAULT_EXECUTION_RETRY_NUM,
         );
+        let mode: ZkMode = self.matches.as_ref().is_present("leader-only").into();
 
         retry_always(
             self.ctx.logger(),
@@ -303,25 +315,31 @@ impl MononokeCasSyncProcessExecutor {
                         self.ctx.logger(),
                         "sync stopping due to cancellation request at attempt {}", attempt
                     );
-                    anyhow::Ok(())
                 } else {
-                    run(
-                        attempt,
-                        self.fb,
-                        &self.ctx,
-                        &self.matches,
-                        self.repo_name.clone(),
-                        Arc::clone(&self.cancellation_requested),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Error during mononoke RE CAS sync command execution for repo {}. Attempt number {}",
-                            &self.repo_name, attempt
-                        )
-                    })?;
-                    anyhow::Ok(())
+                    match self.maybe_become_leader(mode, self.ctx.logger().clone()).await {
+                        Ok(_leader_token) => {
+                            run(
+                                attempt,
+                                self.fb,
+                                &self.ctx,
+                                &self.matches,
+                                self.repo_name.clone(),
+                                Arc::clone(&self.cancellation_requested),
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "Error during mononoke RE CAS sync command execution for repo {}. Attempt number {}",
+                                    &self.repo_name, attempt
+                                )
+                            })?;
+                        },
+                        Err(e) => {
+                            error!(self.ctx.logger(), "Failed to become leader {:#}", e);
+                        }
+                    }
                 }
+                anyhow::Ok(())
             },
             base_retry_delay_ms,
             retry_num,
@@ -496,12 +514,20 @@ pub struct CombinedBookmarkUpdateLogEntry {
 
 /// Sends commits to CAS while syncing a set of bookmark update log entries.
 async fn try_sync_single_combined_entry<'a>(
-    re_cas_client: &MononokeCasChangesetsUploader<'a>,
+    re_cas_client: &CasChangesetsUploader<impl CasClient + 'a>,
     repo: &'a Repo,
     ctx: &'a CoreContext,
     combined_entry: &'a CombinedBookmarkUpdateLogEntry,
+    main_bookmark: &'a str,
 ) -> Result<RetryAttemptsCount, Error> {
-    re_cas_sync::try_sync_single_combined_entry(re_cas_client, repo, ctx, combined_entry).await
+    re_cas_sync::try_sync_single_combined_entry(
+        re_cas_client,
+        repo,
+        ctx,
+        combined_entry,
+        main_bookmark,
+    )
+    .await
 }
 
 /// Logs to Scuba information about a single sync event
@@ -644,15 +670,8 @@ async fn run<'a>(
     repo_name: String,
     cancellation_requested: Arc<AtomicBool>,
 ) -> Result<(), Error> {
-    #[cfg(fbcode_build)]
-    let re_cas_client = MononokeCasChangesetsUploader::new(
-        cas_client::RemoteExecutionCasdClient::new(fb, ctx, &repo_name, false)?,
-    );
-
-    #[cfg(not(fbcode_build))]
-    let re_cas_client = MononokeCasChangesetsUploader::new(cas_client::DummyCasClient::default());
-    let _ = fb;
-
+    let re_cas_client =
+        CasChangesetsUploader::new(build_mononoke_cas_client(fb, ctx, &repo_name, false)?);
     let resolved_repo = args::resolve_repo_by_name(matches.config_store(), matches, &repo_name)
         .with_context(|| format!("Invalid repo name provided: {}", &repo_name))?;
 
@@ -665,6 +684,7 @@ async fn run<'a>(
         MononokeScubaSampleBuilder::with_discard()
     };
     scuba_sample.add_common_server_data();
+    scuba_sample.add("repo_name", repo_name.clone());
 
     let repo: Repo =
         args::open_repo_by_id_unredacted(ctx.fb, ctx.logger(), matches, repo_id).await?;
@@ -675,6 +695,18 @@ async fn run<'a>(
 
     let bookmarks = bookmarks.with_repo_id(repo_id);
     let reporting_handler = build_reporting_handler(ctx, &scuba_sample, attempt_num, &bookmarks);
+
+    let sync_config = resolved_repo
+        .config
+        .mononoke_cas_sync_config
+        .ok_or_else(|| {
+            anyhow!(
+                "mononoke_cas_sync_config is not found for the repo {}",
+                repo_name
+            )
+        })?;
+    let main_bookmark_to_sync = sync_config.main_bookmark_to_sync.as_str();
+    let sync_all_bookmarks = sync_config.sync_all_bookmarks;
 
     // Before beginning any actual processing, check if cancellation has been requested.
     // If yes, then lets return early.
@@ -746,7 +778,9 @@ async fn run<'a>(
                     components: entries
                         .into_iter()
                         .filter_map(|entry| {
-                            if entry.bookmark_name.as_str() == SUPPORTED_BOOKMARK {
+                            if sync_all_bookmarks
+                                || entry.bookmark_name.as_str() == main_bookmark_to_sync
+                            {
                                 Some(entry)
                             } else {
                                 None
@@ -755,11 +789,16 @@ async fn run<'a>(
                         .collect::<Vec<_>>(),
                 };
                 if can_continue() && !combined_entry.components.is_empty() {
-                    let (stats, res) =
-                        try_sync_single_combined_entry(re_cas_client, repo, ctx, &combined_entry)
-                            .watched(ctx.logger())
-                            .timed()
-                            .await;
+                    let (stats, res) = try_sync_single_combined_entry(
+                        re_cas_client,
+                        repo,
+                        ctx,
+                        &combined_entry,
+                        main_bookmark_to_sync,
+                    )
+                    .watched(ctx.logger())
+                    .timed()
+                    .await;
 
                     let res = bind_sync_result(&combined_entry.components, res);
                     let res = match res {

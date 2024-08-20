@@ -15,6 +15,7 @@ use mononoke_api::MononokeError;
 use source_control as thrift;
 use source_control_services::errors::source_control_service as service;
 
+#[derive(Debug)]
 pub(crate) enum ServiceError {
     Request(thrift::RequestError),
     Internal(thrift::InternalError),
@@ -188,6 +189,13 @@ impl From<MononokeError> for ServiceError {
                 reason: error.to_string(),
                 ..Default::default()
             }),
+            error @ MononokeError::NonFastForwardMove { .. } => {
+                Self::Request(thrift::RequestError {
+                    kind: thrift::RequestErrorKind::INVALID_REQUEST,
+                    reason: error.to_string(),
+                    ..Default::default()
+                })
+            }
             error @ MononokeError::PushrebaseConflicts(_) => Self::Request(thrift::RequestError {
                 kind: thrift::RequestErrorKind::INVALID_REQUEST,
                 reason: error.to_string(),
@@ -294,6 +302,7 @@ impl_into_thrift_error!(service::MegarepoSyncChangesetExn);
 impl_into_thrift_error!(service::MegarepoSyncChangesetPollExn);
 impl_into_thrift_error!(service::MegarepoRemergeSourceExn);
 impl_into_thrift_error!(service::MegarepoRemergeSourcePollExn);
+impl_into_thrift_error!(service::RepoUpdateSubmoduleExpansionExn);
 impl_into_thrift_error!(service::RepoUploadNonBlobGitObjectExn);
 impl_into_thrift_error!(service::RepoUploadPackfileBaseItemExn);
 impl_into_thrift_error!(service::CreateGitTreeExn);

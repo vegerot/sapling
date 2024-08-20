@@ -31,13 +31,13 @@ Setup repo, and create test repo
   $ touch foo/456
   $ hg commit -Aqm 'add more files'
 
-  $ hgedenapi push -q -r . --to master_bookmark --force
+  $ sl push -q -r . --to master_bookmark --force
 
 Setup a client repo that doesn't have any of the manifests in its local store.
 
   $ hgclone_treemanifest ssh://user@dummy/repo-hg test_repo --noupdate --config extensions.remotenames= -q
   $ cd test_repo
-  $ hgedenapi pull -q -B master_bookmark
+  $ sl pull -q -B master_bookmark
 
 Set up some config to enable sparse profiles, get logging from fetches, and
 also disable ondemand fetch to check this is overriden by sparse profiles.
@@ -56,17 +56,17 @@ also disable ondemand fetch to check this is overriden by sparse profiles.
 
 Checkout commits. Expect BFS prefetch to fill our tree
 
-  $ hgedenapi up 'master_bookmark~3'
-   INFO fetch_edenapi: revisionstore::scmstore::tree: enter
-   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree: exit (glob)
-   INFO fetch_edenapi: revisionstore::scmstore::tree: enter
-   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree: exit (glob)
+  $ sl up 'master_bookmark~3'
+   INFO fetch_edenapi: revisionstore::scmstore::tree::fetch: enter
+   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree::fetch: exit (glob)
+   INFO fetch_edenapi: revisionstore::scmstore::tree::fetch: enter
+   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree::fetch: exit (glob)
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  $ hgedenapi sparse enable sparse/profile
+  $ sl sparse enable sparse/profile
 
-  $ hgedenapi up 'master_bookmark~2'
-   INFO fetch_edenapi: revisionstore::scmstore::tree: enter
-   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree: exit (glob)
+  $ sl up 'master_bookmark~2'
+   INFO fetch_edenapi: revisionstore::scmstore::tree::fetch: enter
+   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree::fetch: exit (glob)
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
 # Now, force load the root tree for the commit we have, which simulates a hg
@@ -75,57 +75,57 @@ Checkout commits. Expect BFS prefetch to fill our tree
 # fetching for the rest of the tree.
 
   $ rm -r "$TESTTMP/test_repo.cache"
-  $ hgedenapi debuggetroottree "$(hg log -r '.' -T '{manifest}')"
-   INFO fetch_edenapi: revisionstore::scmstore::tree: enter
-   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree: exit (glob)
+  $ sl debuggetroottree "$(hg log -r '.' -T '{manifest}')"
+   INFO fetch_edenapi: revisionstore::scmstore::tree::fetch: enter
+   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree::fetch: exit (glob)
 
-  $ hgedenapi up 'master_bookmark' --config sparse.force_full_prefetch_on_sparse_profile_change=True
+  $ sl up 'master_bookmark' --config sparse.force_full_prefetch_on_sparse_profile_change=True
   2 files fetched over 2 fetches - (2 misses, 0.00% hit ratio) over * (glob) (?)
-   INFO fetch_edenapi: revisionstore::scmstore::tree: enter
-   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree: exit (glob)
-   INFO fetch_edenapi: revisionstore::scmstore::tree: enter
-   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree: exit (glob)
-   INFO fetch_edenapi: revisionstore::scmstore::tree: enter
-   INFO fetch_edenapi{* requests=1 *:scmstore::tree: exit (glob)
-   INFO fetch_edenapi: revisionstore::scmstore::tree: enter
-   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree: exit (glob)
-   INFO fetch_edenapi: revisionstore::scmstore::tree: enter
-   INFO fetch_edenapi{* requests=1 *:scmstore::tree: exit (glob)
-   INFO fetch_edenapi: revisionstore::scmstore::tree: enter
-   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree: exit (glob)
+   INFO fetch_edenapi: revisionstore::scmstore::tree::fetch: enter
+   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree::fetch: exit (glob)
+   INFO fetch_edenapi: revisionstore::scmstore::tree::fetch: enter
+   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree::fetch: exit (glob)
+   INFO fetch_edenapi: revisionstore::scmstore::tree::fetch: enter
+   INFO fetch_edenapi{* requests=1 *:scmstore::tree::fetch: exit (glob)
+   INFO fetch_edenapi: revisionstore::scmstore::tree::fetch: enter
+   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree::fetch: exit (glob)
+   INFO fetch_edenapi: revisionstore::scmstore::tree::fetch: enter
+   INFO fetch_edenapi{* requests=1 *:scmstore::tree::fetch: exit (glob)
+   INFO fetch_edenapi: revisionstore::scmstore::tree::fetch: enter
+   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree::fetch: exit (glob)
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
 # Now, force load the root tree for the commit again, and do update to master_bookmark
 # without force_full_prefetch_on_sparse_profile_change set. Note that we fetch less trees
 
-  $ hgedenapi up 'master_bookmark~2' -q
+  $ sl up 'master_bookmark~2' -q
   $ rm -r "$TESTTMP/test_repo.cache"
-  $ hgedenapi debuggetroottree "$(hg log -r '.' -T '{manifest}')"
-   INFO fetch_edenapi: revisionstore::scmstore::tree: enter
-   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree: exit (glob)
-  $ hgedenapi up 'master_bookmark'
-   INFO fetch_edenapi: revisionstore::scmstore::tree: enter
-   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree: exit (glob)
-   INFO fetch_edenapi: revisionstore::scmstore::tree: enter
-   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree: exit (glob)
-   INFO fetch_edenapi: revisionstore::scmstore::tree: enter
-   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree: exit (glob)
+  $ sl debuggetroottree "$(hg log -r '.' -T '{manifest}')"
+   INFO fetch_edenapi: revisionstore::scmstore::tree::fetch: enter
+   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree::fetch: exit (glob)
+  $ sl up 'master_bookmark'
+   INFO fetch_edenapi: revisionstore::scmstore::tree::fetch: enter
+   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree::fetch: exit (glob)
+   INFO fetch_edenapi: revisionstore::scmstore::tree::fetch: enter
+   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree::fetch: exit (glob)
+   INFO fetch_edenapi: revisionstore::scmstore::tree::fetch: enter
+   INFO fetch_edenapi{* requests=1 *}: revisionstore::scmstore::tree::fetch: exit (glob)
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
 Check that we can create some commits, and that nothing breaks even if the
 server does not know about our root manifest.
 
-  $ hgedenapi book client
+  $ sl book client
 
   $ cat >> sparse/profile <<EOF
   > # more comment
   > EOF
-  $ hgedenapi commit -Aqm 'modify sparse profile again'
+  $ sl commit -Aqm 'modify sparse profile again'
 
-  $ hgedenapi up 'client~1'
+  $ sl up 'client~1'
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   (leaving bookmark client)
 
-  $ hgedenapi up 'client'
+  $ sl up 'client'
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   (activating bookmark client)

@@ -24,38 +24,34 @@ use ::types::RepoPath;
 use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Result;
+use cas_client::CasClient;
 use clientinfo::get_client_request_info_thread_local;
 use clientinfo::set_client_request_info_thread_local;
 use crossbeam::channel::unbounded;
 use edenapi_types::FileAuxData;
 use edenapi_types::TreeAuxData;
 use edenapi_types::TreeChildEntry;
+use fetch::FetchState;
 use minibytes::Bytes;
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use storemodel::BoxIterator;
 use storemodel::SerializationFormat;
 use storemodel::TreeEntry;
-use tracing::field;
 
-use self::metrics::TreeStoreFetchMetrics;
 pub use self::metrics::TreeStoreMetrics;
 use crate::datastore::HgIdDataStore;
 use crate::datastore::RemoteDataStore;
 use crate::indexedlogdatastore::Entry;
 use crate::indexedlogdatastore::IndexedLogHgIdDataStore;
 use crate::indexedlogtreeauxstore::TreeAuxStore;
-use crate::scmstore::fetch::CommonFetchState;
-use crate::scmstore::fetch::FetchErrors;
 use crate::scmstore::fetch::FetchResults;
 use crate::scmstore::fetch::KeyFetchError;
 use crate::scmstore::file::FileStore;
 use crate::scmstore::metrics::StoreLocation;
-use crate::scmstore::tree::types::AuxData;
 use crate::scmstore::tree::types::LazyTree;
 use crate::scmstore::tree::types::StoreTree;
 use crate::scmstore::tree::types::TreeAttributes;
-use crate::util;
 use crate::ContentDataStore;
 use crate::ContentMetadata;
 use crate::ContentStore;
@@ -72,6 +68,7 @@ use crate::SaplingRemoteApiTreeStore;
 use crate::StoreKey;
 use crate::StoreResult;
 
+mod fetch;
 mod metrics;
 pub mod types;
 
@@ -117,6 +114,8 @@ pub struct TreeStore {
     pub historystore_local: Option<Arc<IndexedLogHgIdHistoryStore>>,
     pub historystore_cache: Option<Arc<IndexedLogHgIdHistoryStore>>,
 
+    pub cas_client: Option<Arc<dyn CasClient>>,
+
     /// Write tree parents to history cache even if parents weren't requested.
     pub prefetch_tree_parents: bool,
 
@@ -145,10 +144,9 @@ impl TreeStore {
     ) -> FetchResults<StoreTree> {
         let (found_tx, found_rx) = unbounded();
         let found_tx2 = found_tx.clone();
-        let mut common: CommonFetchState<StoreTree> =
-            CommonFetchState::new(reqs, attrs, found_tx, fetch_mode);
+        let mut state = FetchState::new(reqs, attrs, found_tx, fetch_mode);
 
-        let keys_len = common.pending_len();
+        let keys_len = state.common.pending_len();
 
         let indexedlog_cache = self.indexedlog_cache.clone();
         let indexedlog_local = self.indexedlog_local.clone();
@@ -161,13 +159,14 @@ impl TreeStore {
         let cache_to_local_cache = self.cache_to_local_cache;
         let aux_cache = self.filestore.as_ref().and_then(|fs| fs.aux_cache.clone());
         let tree_aux_store = self.tree_aux_store.clone();
+        let cas_client = self.cas_client.clone();
 
         let fetch_children_metadata = match self.tree_metadata_mode {
             TreeMetadataMode::Always => true,
             TreeMetadataMode::Never => false,
             TreeMetadataMode::OptIn => fetch_mode.contains(FetchMode::PREFETCH),
         };
-        let fetch_tree_aux_data = self.fetch_tree_aux_data.clone();
+        let fetch_tree_aux_data = self.fetch_tree_aux_data || attrs.aux_data;
         let fetch_parents = attrs.parents || self.prefetch_tree_parents;
 
         let fetch_local = fetch_mode.contains(FetchMode::LOCAL);
@@ -175,6 +174,7 @@ impl TreeStore {
 
         tracing::debug!(
             ?fetch_mode,
+            ?attrs,
             fetch_children_metadata,
             fetch_tree_aux_data,
             fetch_local,
@@ -185,8 +185,6 @@ impl TreeStore {
         let store_metrics = self.metrics.clone();
 
         let process_func = move || -> Result<()> {
-            let mut metrics = TreeStoreFetchMetrics::default();
-
             if fetch_local {
                 for (log, location) in [
                     (&indexedlog_cache, StoreLocation::Cache),
@@ -195,12 +193,13 @@ impl TreeStore {
                     if let Some(log) = log {
                         let start_time = Instant::now();
 
-                        let pending: Vec<_> = common
+                        let pending: Vec<_> = state
+                            .common
                             .pending(TreeAttributes::CONTENT, false)
                             .map(|(key, _attrs)| key.clone())
                             .collect();
 
-                        let store_metrics = metrics.indexedlog.store(location);
+                        let store_metrics = state.metrics.indexedlog.store(location);
                         let fetch_count = pending.len();
 
                         store_metrics.fetch(fetch_count);
@@ -209,7 +208,8 @@ impl TreeStore {
                         for key in pending.into_iter() {
                             if let Some(entry) = log.get_entry(key)? {
                                 tracing::trace!("{:?} found in {:?}", entry.key(), location);
-                                common
+                                state
+                                    .common
                                     .found(entry.key().clone(), LazyTree::IndexedLog(entry).into());
                                 found_count += 1;
                             }
@@ -226,14 +226,15 @@ impl TreeStore {
                     ("local", &historystore_local),
                 ] {
                     if let Some(log) = log {
-                        let pending: Vec<_> = common
+                        let pending: Vec<_> = state
+                            .common
                             .pending(TreeAttributes::PARENTS, false)
                             .map(|(key, _attrs)| key.clone())
                             .collect();
                         for key in pending.into_iter() {
                             if let Some(entry) = log.get_node_info(&key)? {
                                 tracing::trace!("{:?} found parents in {name}", key);
-                                common.found(
+                                state.common.found(
                                     key,
                                     StoreTree {
                                         content: None,
@@ -248,16 +249,26 @@ impl TreeStore {
                         }
                     }
                 }
+            }
 
+            if fetch_local || (fetch_remote && cas_client.is_some()) {
                 if let Some(tree_aux_store) = &tree_aux_store {
-                    let pending: Vec<_> = common
-                        .pending(TreeAttributes::AUX_DATA, false)
+                    let mut wants_aux = TreeAttributes::AUX_DATA;
+                    if cas_client.is_some() {
+                        wants_aux |= TreeAttributes::CONTENT;
+                    }
+                    let pending: Vec<_> = state
+                        .common
+                        .pending(wants_aux, false)
                         .map(|(key, _attrs)| key.clone())
                         .collect();
                     for key in pending.into_iter() {
                         if let Some(entry) = tree_aux_store.get(&key.hgid)? {
                             tracing::trace!(?key, ?entry, "found tree aux entry in cache");
-                            common.found(
+                            if cas_client.is_some() {
+                                tracing::trace!(target: "cas", ?key, ?entry, "found tree aux data");
+                            }
+                            state.common.found(
                                 key.clone(),
                                 StoreTree {
                                     content: None,
@@ -271,110 +282,37 @@ impl TreeStore {
             }
 
             if fetch_remote {
-                if let Some(ref edenapi) = edenapi {
-                    let pending: Vec<_> = common
-                        .pending(
-                            TreeAttributes::CONTENT
-                                | TreeAttributes::PARENTS
-                                | TreeAttributes::AUX_DATA,
-                            false,
-                        )
-                        .map(|(key, _attrs)| key.clone())
-                        .collect();
-                    if !pending.is_empty() {
-                        let start_time = Instant::now();
+                if let Some(cas_client) = &cas_client {
+                    state.fetch_cas(cas_client, aux_cache.as_deref(), tree_aux_store.as_deref());
+                }
 
-                        metrics.edenapi.fetch(pending.len());
+                if let Some(edenapi) = &edenapi {
+                    let attributes = edenapi_types::TreeAttributes {
+                        manifest_blob: true,
+                        // We use parents to check hash integrity.
+                        parents: true,
+                        // Include file and tree aux data for entries, if available (tree aux data requires augmented_trees=true).
+                        child_metadata: fetch_children_metadata,
+                        // Use pre-derived "augmented" tree data, which includes tree aux data.
+                        augmented_trees: fetch_tree_aux_data,
+                    };
 
-                        let span = tracing::info_span!(
-                            "fetch_edenapi",
-                            downloaded = field::Empty,
-                            uploaded = field::Empty,
-                            requests = field::Empty,
-                            time = field::Empty,
-                            latency = field::Empty,
-                            download_speed = field::Empty,
-                        );
-                        let _enter = span.enter();
-                        tracing::debug!(
-                            "attempt to fetch {} keys from edenapi ({:?})",
-                            pending.len(),
-                            edenapi.url()
-                        );
-
-                        let attributes = edenapi_types::TreeAttributes {
-                            manifest_blob: true,
-                            // We use parents to check hash integrity.
-                            parents: true,
-                            // Include file and tree aux data for entries, if available (tree aux data requires augmented_trees=true).
-                            child_metadata: fetch_children_metadata,
-                            // Use pre-derived "augmented" tree data, which includes tree aux data.
-                            augmented_trees: fetch_tree_aux_data,
-                        };
-
-                        let response = edenapi
-                            .trees_blocking(pending, Some(attributes))
-                            .map_err(|e| e.tag_network())?;
-                        for entry in response.entries {
-                            let entry = entry?;
-                            let key = entry.key.clone();
-                            let entry = LazyTree::SaplingRemoteApi(entry);
-
-                            if aux_cache.is_some() || tree_aux_store.is_some() {
-                                let aux_data = entry.children_aux_data();
-                                for (hgid, aux) in aux_data.into_iter() {
-                                    match aux {
-                                        AuxData::File(file_aux) => {
-                                            if let Some(aux_cache) = aux_cache.as_ref() {
-                                                tracing::trace!(?hgid, "writing to aux cache");
-                                                aux_cache.put(hgid, &file_aux)?;
-                                            }
-                                        }
-                                        AuxData::Tree(tree_aux) => {
-                                            if let Some(tree_aux_store) = tree_aux_store.as_ref() {
-                                                tracing::trace!(?hgid, "writing to tree aux store");
-                                                tree_aux_store.put(hgid, &tree_aux)?;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if let Some(aux_data) = entry.aux_data() {
-                                    if let Some(tree_aux_store) = tree_aux_store.as_ref() {
-                                        tracing::trace!(
-                                            hgid = %key.hgid,
-                                            "writing self to tree aux store"
-                                        );
-                                        tree_aux_store.put(key.hgid, &aux_data)?;
-                                    }
-                                }
-                            }
-
-                            if indexedlog_cache.is_some() && cache_to_local_cache {
-                                if let Some(entry) = entry.indexedlog_cache_entry(key.clone())? {
-                                    indexedlog_cache.as_ref().unwrap().put_entry(entry)?;
-                                }
-                            }
-
-                            if fetch_parents {
-                                if let Some(historystore_cache) = &historystore_cache {
-                                    if let Some(parents) = entry.parents() {
-                                        historystore_cache.add(
-                                            &key,
-                                            &NodeInfo {
-                                                parents: parents.to_keys(),
-                                                linknode: NULL_ID,
-                                            },
-                                        )?;
-                                    }
-                                }
-                            }
-
-                            common.found(key, entry.into());
-                        }
-                        util::record_edenapi_stats(&span, &response.stats);
-                        let _ = metrics.edenapi.time_from_duration(start_time.elapsed());
-                    }
+                    state.fetch_edenapi(
+                        edenapi,
+                        attributes,
+                        if cache_to_local_cache {
+                            indexedlog_cache.as_deref()
+                        } else {
+                            None
+                        },
+                        aux_cache.as_deref(),
+                        tree_aux_store.as_deref(),
+                        if fetch_parents {
+                            historystore_cache.as_deref()
+                        } else {
+                            None
+                        },
+                    )?;
                 } else {
                     tracing::debug!("no SaplingRemoteApi associated with TreeStore");
                 }
@@ -384,7 +322,8 @@ impl TreeStore {
             // TODO: Not handling RemoteOnly for now due to legacy, reinvestigate when refactoring the datastores
             if let FetchMode::AllowRemote = fetch_mode {
                 if let Some(ref contentstore) = contentstore {
-                    let pending: Vec<_> = common
+                    let pending: Vec<_> = state
+                        .common
                         .pending(TreeAttributes::CONTENT, false)
                         .map(|(key, _attrs)| StoreKey::HgId(key.clone()))
                         .collect();
@@ -413,7 +352,9 @@ impl TreeStore {
                                 // We don't write to local indexedlog for contentstore fallbacks because
                                 // contentstore handles that internally.
                                 tracing::trace!("{:?} found in contentstore", &key);
-                                common.found(key, LazyTree::ContentStore(blob.into()).into());
+                                state
+                                    .common
+                                    .found(key, LazyTree::ContentStore(blob.into()).into());
                             }
                         }
                     }
@@ -421,13 +362,13 @@ impl TreeStore {
             }
 
             // TODO(meyer): Report incomplete / not found, handle errors better instead of just always failing the batch, etc
-            common.results(FetchErrors::new());
+            state.common.results(state.errors);
 
-            if let Err(err) = metrics.update_ods() {
+            if let Err(err) = state.metrics.update_ods() {
                 tracing::error!(?err, "error updating tree ods counters");
             }
 
-            store_metrics.write().fetch += metrics;
+            store_metrics.write().fetch += state.metrics;
 
             Ok(())
         };
@@ -468,6 +409,7 @@ impl TreeStore {
             indexedlog_cache: None,
             cache_to_local_cache: true,
             edenapi: None,
+            cas_client: None,
             contentstore: None,
             historystore_cache: None,
             historystore_local: None,
@@ -548,6 +490,7 @@ impl LegacyStore for TreeStore {
             historystore_cache: None,
             cache_to_local_cache: false,
             edenapi: None,
+            cas_client: None,
             contentstore: None,
             filestore: None,
             tree_aux_store: None,
@@ -974,6 +917,24 @@ impl storemodel::TreeStore for TreeStore {
                     basic_tree_entry: OnceCell::new(),
                 };
                 Ok((key, Box::new(tree_entry)))
+            });
+        Ok(Box::new(iter))
+    }
+
+    fn get_tree_aux_data_iter(
+        &self,
+        keys: Vec<Key>,
+        fetch_mode: FetchMode,
+    ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, TreeAuxData)>>> {
+        let fetched = self.fetch_batch(keys.into_iter(), TreeAttributes::AUX_DATA, fetch_mode);
+        let iter = fetched
+            .into_iter()
+            .map(|entry| -> anyhow::Result<(Key, TreeAuxData)> {
+                let (key, store_tree) = entry?;
+                let aux = store_tree
+                    .aux_data
+                    .ok_or_else(|| anyhow::anyhow!("aux data is missing from store tree"))?;
+                Ok((key, aux))
             });
         Ok(Box::new(iter))
     }

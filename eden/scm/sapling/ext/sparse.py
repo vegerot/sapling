@@ -281,15 +281,13 @@ def _setupupdates(_ui) -> None:
     ):
         """Filter updates to only lay out files that match the sparse rules."""
         ui = repo.ui
-        actions, diverge, renamedelete = orig(
-            repo, wctx, mctx, ancestors, branchmerge, *arg, **kwargs
-        )
+        actions = orig(repo, wctx, mctx, ancestors, branchmerge, *arg, **kwargs)
 
         # If the working context is in memory (virtual), there's no need to
         # apply the user's sparse rules at all (and in fact doing so would
         # cause unexpected behavior in the real working copy).
         if not _hassparse(repo) or wctx.isinmemory():
-            return actions, diverge, renamedelete
+            return actions
 
         files = set()
         prunedactions = {}
@@ -354,7 +352,7 @@ def _setupupdates(_ui) -> None:
             for file in temporaryfiles:
                 if file in wctxmanifest:
                     fctx = repo[None][file]
-                    actions.append((file, (fctx.flags(), False), message))
+                    actions.append((file, (file, fctx.flags(), False), message))
 
             typeactions = collections.defaultdict(list)
             typeactions["g"] = actions
@@ -405,11 +403,11 @@ def _setupupdates(_ui) -> None:
                             new = sparsematch(file)
                             if not old and new:
                                 flags = mf.flags(file)
-                                prunedactions[file] = ("g", (flags, False), "")
+                                prunedactions[file] = ("g", (file, flags, False), "")
                             elif old and not new:
                                 prunedactions[file] = ("r", [], "")
 
-        return prunedactions, diverge, renamedelete
+        return prunedactions
 
     extensions.wrapfunction(mergemod, "calculateupdates", _calculateupdates)
 
@@ -1231,7 +1229,7 @@ def _wraprepo(ui, repo) -> None:
                             actions[file] = ("e", (fl,), "")
                             lookup.append(file)
                         else:
-                            actions[file] = ("g", (fl, False), "")
+                            actions[file] = ("g", (file, fl, False), "")
                             added.append(file)
                     # Drop files that are newly excluded, or that still exist in
                     # the dirstate.

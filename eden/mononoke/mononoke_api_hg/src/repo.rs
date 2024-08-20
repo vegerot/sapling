@@ -5,7 +5,6 @@
  * GNU General Public License version 2.
  */
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -14,8 +13,6 @@ use std::time::Duration;
 use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
-use blobrepo::BlobRepo;
-use blobrepo_hg::save_bonsai_changeset_object;
 use blobrepo_hg::BlobRepoHg;
 use blobrepo_hg::ChangesetHandle;
 use blobstore::Blobstore;
@@ -25,18 +22,11 @@ use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarkKey;
 use bookmarks::Freshness;
 use bytes::Bytes;
-use changeset_fetcher::ChangesetFetcherRef;
-use changesets::ChangesetInsert;
-use changesets::ChangesetsRef;
-use commit_cloud::CommitCloudRef;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
+use dag_types::Location;
 use edenapi_types::AnyId;
-use edenapi_types::GetReferencesParams;
-use edenapi_types::ReferencesData;
-use edenapi_types::UpdateReferencesParams;
 use edenapi_types::UploadToken;
-use edenapi_types::WorkspaceData;
 use ephemeral_blobstore::Bubble;
 use ephemeral_blobstore::BubbleId;
 use ephemeral_blobstore::RepoEphemeralStore;
@@ -67,6 +57,7 @@ use mercurial_types::HgNodeHash;
 use metaconfig_types::RepoConfig;
 use mononoke_api::errors::MononokeError;
 use mononoke_api::repo::RepoContext;
+use mononoke_api::MononokeRepo;
 use mononoke_types::path::MPath;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
@@ -80,8 +71,6 @@ use repo_client::find_new_draft_commits_and_derive_filenodes_for_public_roots;
 use repo_client::gettreepack_entries;
 use repo_update_logger::log_new_commits;
 use repo_update_logger::CommitInfo;
-use segmented_changelog::CloneData;
-use segmented_changelog::Location;
 use slog::debug;
 use unbundle::upload_changeset;
 
@@ -89,8 +78,8 @@ use super::HgFileContext;
 use super::HgTreeContext;
 
 #[derive(Clone)]
-pub struct HgRepoContext {
-    repo: RepoContext,
+pub struct HgRepoContext<R> {
+    repo_ctx: RepoContext<R>,
 }
 
 pub struct HgChangesetSegment {
@@ -105,29 +94,29 @@ pub struct HgChangesetSegmentParent {
     pub location: Option<Location<HgChangesetId>>,
 }
 
-impl HgRepoContext {
-    pub(crate) fn new(repo: RepoContext) -> Self {
-        Self { repo }
+impl<R: MononokeRepo> HgRepoContext<R> {
+    pub(crate) fn new(repo_ctx: RepoContext<R>) -> Self {
+        Self { repo_ctx }
     }
 
     /// The `CoreContext` for this query.
     pub fn ctx(&self) -> &CoreContext {
-        self.repo.ctx()
+        self.repo_ctx.ctx()
     }
 
     /// The `RepoContext` for this query.
-    pub fn repo(&self) -> &RepoContext {
-        &self.repo
+    pub fn repo_ctx(&self) -> &RepoContext<R> {
+        &self.repo_ctx
     }
 
-    /// The underlying Mononoke `BlobRepo` backing this repo.
-    pub(crate) fn blob_repo(&self) -> &BlobRepo {
-        self.repo().blob_repo()
+    /// The underlying Mononoke `Repo` backing this `HgRepoContext`.
+    pub(crate) fn repo(&self) -> &R {
+        self.repo_ctx().repo()
     }
 
     /// The configuration for the repository.
     pub(crate) fn config(&self) -> &RepoConfig {
-        self.repo.config()
+        self.repo_ctx.config()
     }
 
     /// Create bubble and return its id
@@ -137,19 +126,19 @@ impl HgRepoContext {
         labels: Vec<String>,
     ) -> Result<Bubble, MononokeError> {
         Ok(self
-            .repo()
+            .repo_ctx()
             .repo_ephemeral_store_arc()
             .create_bubble(self.ctx(), custom_duration, labels)
             .await?)
     }
 
     pub fn ephemeral_store(&self) -> Arc<RepoEphemeralStore> {
-        self.repo().repo_ephemeral_store_arc()
+        self.repo_ctx().repo_ephemeral_store_arc()
     }
 
     /// Load bubble from id
     pub async fn open_bubble(&self, bubble_id: BubbleId) -> Result<Bubble, MononokeError> {
-        self.repo.open_bubble(bubble_id).await
+        self.repo_ctx.open_bubble(bubble_id).await
     }
 
     /// Get blobstore. If bubble id is present, this is the ephemeral blobstore
@@ -157,10 +146,10 @@ impl HgRepoContext {
         &self,
         bubble_id: Option<BubbleId>,
     ) -> Result<RepoBlobstore, MononokeError> {
-        let main_blobstore = self.blob_repo().repo_blobstore().clone();
+        let main_blobstore = self.repo().repo_blobstore().clone();
         Ok(match bubble_id {
             Some(id) => self
-                .repo
+                .repo_ctx
                 .open_bubble(id)
                 .await?
                 .wrap_repo_blobstore(main_blobstore),
@@ -174,7 +163,7 @@ impl HgRepoContext {
         hgid: HgChangesetId,
     ) -> Result<Option<ChangesetId>, MononokeError> {
         Ok(self
-            .blob_repo()
+            .repo()
             .bonsai_hg_mapping()
             .get_bonsai_from_hg(self.ctx(), hgid)
             .await?)
@@ -260,7 +249,7 @@ impl HgRepoContext {
     ) -> Result<ContentMetadataV2, MononokeError> {
         filestore::store(
             &self.bubble_blobstore(bubble_id).await?,
-            *self.blob_repo().filestore_config(),
+            *self.repo().filestore_config(),
             self.ctx(),
             &StoreRequest::with_fetch_key(size, key.into()),
             data,
@@ -296,7 +285,7 @@ impl HgRepoContext {
         &self,
         hg_changeset_id: HgChangesetId,
     ) -> Result<bool, MononokeError> {
-        self.blob_repo()
+        self.repo()
             .hg_changeset_exists(self.ctx().clone(), hg_changeset_id)
             .await
             .map_err(MononokeError::from)
@@ -308,7 +297,7 @@ impl HgRepoContext {
         changeset_id: ChangesetId,
         storage_location: StorageLocation,
     ) -> Result<bool, MononokeError> {
-        self.repo
+        self.repo_ctx
             .changeset_exists(changeset_id, storage_location)
             .await
     }
@@ -329,7 +318,7 @@ impl HgRepoContext {
     pub async fn file(
         &self,
         filenode_id: HgFileNodeId,
-    ) -> Result<Option<HgFileContext>, MononokeError> {
+    ) -> Result<Option<HgFileContext<R>>, MononokeError> {
         HgFileContext::new_check_exists(self.clone(), filenode_id).await
     }
 
@@ -337,7 +326,7 @@ impl HgRepoContext {
     pub async fn tree(
         &self,
         manifest_id: HgManifestId,
-    ) -> Result<Option<HgTreeContext>, MononokeError> {
+    ) -> Result<Option<HgTreeContext<R>>, MononokeError> {
         HgTreeContext::new_check_exists(self.clone(), manifest_id).await
     }
 
@@ -360,7 +349,7 @@ impl HgRepoContext {
             metadata,
         };
 
-        self.blob_repo()
+        self.repo()
             .repo_blobstore()
             .put(
                 self.ctx(),
@@ -389,7 +378,7 @@ impl HgRepoContext {
         };
         let (_, upload_future) = entry.upload(
             self.ctx().clone(),
-            Arc::new(self.blob_repo().repo_blobstore().clone()),
+            Arc::new(self.repo().repo_blobstore().clone()),
         )?;
 
         upload_future.await.map_err(MononokeError::from)?;
@@ -409,7 +398,7 @@ impl HgRepoContext {
         for (node, revlog_cs) in changesets {
             uploaded_changesets = upload_changeset(
                 self.ctx().clone(),
-                self.blob_repo().clone(),
+                self.repo().clone(),
                 self.ctx().scuba().clone(),
                 node,
                 &revlog_cs,
@@ -435,8 +424,8 @@ impl HgRepoContext {
             };
             results.push(result);
         }
-        log_new_commits(self.ctx(), self.repo().inner_repo(), None, commits_to_log).await;
-        self.blob_repo()
+        log_new_commits(self.ctx(), self.repo_ctx().repo(), None, commits_to_log).await;
+        self.repo()
             .hg_mutation_store()
             .add_entries(self.ctx(), hg_changesets, mutations)
             .await
@@ -450,29 +439,10 @@ impl HgRepoContext {
         hg_changesets: HashSet<HgChangesetId>,
     ) -> Result<Vec<HgMutationEntry>, MononokeError> {
         Ok(self
-            .blob_repo()
+            .repo()
             .hg_mutation_store()
             .all_predecessors(self.ctx(), hg_changesets)
             .await?)
-    }
-
-    /// Store bonsai changeset
-    pub async fn store_bonsai_changeset(
-        &self,
-        bonsai_cs: BonsaiChangeset,
-    ) -> Result<(), MononokeError> {
-        let blobstore = self.blob_repo().repo_blobstore();
-        let cs_id = bonsai_cs.get_changeset_id();
-        let insert = ChangesetInsert {
-            cs_id,
-            parents: bonsai_cs.parents().collect(),
-        };
-        match save_bonsai_changeset_object(self.ctx(), blobstore, bonsai_cs).await {
-            Ok(_) => self.blob_repo().changesets().add(self.ctx(), insert).await,
-            Err(err) => Err(err),
-        }?;
-
-        Ok(())
     }
 
     /// Request all of the tree nodes in the repo under a given path.
@@ -496,9 +466,9 @@ impl HgRepoContext {
         root_versions: impl IntoIterator<Item = HgManifestId>,
         base_versions: impl IntoIterator<Item = HgManifestId>,
         depth: Option<usize>,
-    ) -> impl TryStream<Ok = (HgTreeContext, MPath), Error = MononokeError> {
+    ) -> impl TryStream<Ok = (HgTreeContext<R>, MPath), Error = MononokeError> {
         let ctx = self.ctx().clone();
-        let blob_repo = self.blob_repo();
+        let repo = self.repo_ctx.repo();
         let args = GettreepackArgs {
             rootdir: path,
             mfnodes: root_versions.into_iter().collect(),
@@ -507,7 +477,7 @@ impl HgRepoContext {
             depth,
         };
 
-        gettreepack_entries(ctx, blob_repo, args)
+        gettreepack_entries(ctx, repo, args)
             .compat()
             .map_err(MononokeError::from)
             .and_then({
@@ -527,10 +497,7 @@ impl HgRepoContext {
         &self,
         cs_id: ChangesetId,
     ) -> Result<HgChangesetId, MononokeError> {
-        Ok(self
-            .blob_repo()
-            .derive_hg_changeset(self.ctx(), cs_id)
-            .await?)
+        Ok(self.repo().derive_hg_changeset(self.ctx(), cs_id).await?)
     }
 
     /// This provides the same functionality as
@@ -543,7 +510,7 @@ impl HgRepoContext {
     ) -> Result<Vec<HgChangesetId>, MononokeError> {
         let cs_location = location
             .and_then_descendant(|descendant| async move {
-                self.blob_repo()
+                self.repo()
                     .bonsai_hg_mapping()
                     .get_bonsai_from_hg(self.ctx(), descendant)
                     .await?
@@ -556,13 +523,12 @@ impl HgRepoContext {
             })
             .await?;
         let result_csids = self
-            .repo()
+            .repo_ctx()
             .location_to_changeset_id(cs_location, count)
             .await?;
-        let hg_id_futures = result_csids.iter().map(|result_csid| {
-            self.blob_repo()
-                .derive_hg_changeset(self.ctx(), *result_csid)
-        });
+        let hg_id_futures = result_csids
+            .iter()
+            .map(|result_csid| self.repo().derive_hg_changeset(self.ctx(), *result_csid));
         future::try_join_all(hg_id_futures)
             .await
             .map_err(MononokeError::from)
@@ -583,7 +549,7 @@ impl HgRepoContext {
             .chain(hg_master_heads.clone().into_iter())
             .collect();
         let hg_to_bonsai: HashMap<HgChangesetId, ChangesetId> = self
-            .blob_repo()
+            .repo()
             .get_hg_bonsai_mapping(self.ctx().clone(), all_hg_ids)
             .await?
             .into_iter()
@@ -609,12 +575,12 @@ impl HgRepoContext {
             .collect::<Vec<ChangesetId>>();
 
         let cs_to_blocations = self
-            .repo()
+            .repo_ctx()
             .many_changeset_ids_to_locations(master_heads, cs_ids)
             .await?;
 
         let bonsai_to_hg: HashMap<ChangesetId, HgChangesetId> = self
-            .blob_repo()
+            .repo()
             .get_hg_bonsai_mapping(
                 self.ctx().clone(),
                 cs_to_blocations
@@ -661,7 +627,7 @@ impl HgRepoContext {
         hg_cs_id: HgChangesetId,
     ) -> Result<Option<Bytes>, MononokeError> {
         let ctx = self.ctx();
-        let blobstore = self.blob_repo().repo_blobstore();
+        let blobstore = self.repo().repo_blobstore();
         let revlog_cs = RevlogChangeset::load(ctx, blobstore, hg_cs_id)
             .await
             .map_err(MononokeError::from)?;
@@ -677,103 +643,6 @@ impl HgRepoContext {
         Ok(Some(buffer.into()))
     }
 
-    pub async fn segmented_changelog_clone_data(
-        &self,
-    ) -> Result<CloneData<HgChangesetId>, MononokeError> {
-        let (m_clone_data, hints) = self.repo().segmented_changelog_clone_data().await?;
-        self.convert_clone_data(m_clone_data, hints).await
-    }
-
-    pub async fn segmented_changelog_disabled(&self) -> Result<bool, MononokeError> {
-        self.repo().segmented_changelog_disabled().await
-    }
-
-    pub async fn segmented_changelog_pull_data(
-        &self,
-        common: Vec<HgChangesetId>,
-        missing: Vec<HgChangesetId>,
-    ) -> Result<CloneData<HgChangesetId>, MononokeError> {
-        let input_hgids = common
-            .iter()
-            .chain(missing.iter())
-            .cloned()
-            .collect::<Vec<_>>();
-        let hg_to_bonsai: HashMap<HgChangesetId, ChangesetId> = self
-            .blob_repo()
-            .get_hg_bonsai_mapping(self.ctx().clone(), input_hgids)
-            .await?
-            .into_iter()
-            .collect();
-        let common = common
-            .into_iter()
-            .map(|hgid| {
-                hg_to_bonsai
-                    .get(&hgid)
-                    .copied()
-                    .ok_or_else(|| format_err!("Failed to convert common {} to bonsai", hgid))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let missing = missing
-            .into_iter()
-            .map(|hgid| {
-                hg_to_bonsai
-                    .get(&hgid)
-                    .copied()
-                    .ok_or_else(|| format_err!("Failed to convert missing {} to bonsai", hgid))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let m_clone_data = self
-            .repo()
-            .segmented_changelog_pull_data(common, missing)
-            .await?;
-        self.convert_clone_data(m_clone_data, HashMap::new()).await
-    }
-
-    async fn convert_clone_data(
-        &self,
-        m_clone_data: CloneData<ChangesetId>,
-        hints: HashMap<ChangesetId, HgChangesetId>,
-    ) -> Result<CloneData<HgChangesetId>, MononokeError> {
-        let mapping = {
-            let to_fetch: Vec<ChangesetId> = m_clone_data
-                .idmap
-                .values()
-                .filter(|csid| !hints.contains_key(csid))
-                .copied()
-                .collect();
-
-            let mut mapping = hints;
-
-            if !to_fetch.is_empty() {
-                self.blob_repo()
-                    .get_hg_bonsai_mapping(self.ctx().clone(), to_fetch)
-                    .await
-                    .context("error fetching hg bonsai mapping")?
-                    .into_iter()
-                    .fold(&mut mapping, |mapping, (hgid, csid)| {
-                        mapping.insert(csid, hgid);
-                        mapping
-                    });
-            }
-            mapping
-        };
-        let mut hg_idmap = BTreeMap::new();
-        for (v, csid) in m_clone_data.idmap {
-            let hgid = mapping.get(&csid).ok_or_else(|| {
-                MononokeError::from(format_err!(
-                    "failed to find bonsai '{}' mapping to hg",
-                    csid
-                ))
-            })?;
-            hg_idmap.insert(v, *hgid);
-        }
-        let hg_clone_data = CloneData {
-            flat_segments: m_clone_data.flat_segments,
-            idmap: hg_idmap,
-        };
-        Ok(hg_clone_data)
-    }
-
     /// resolve a bookmark name to an Hg Changeset
     pub async fn resolve_bookmark(
         &self,
@@ -781,7 +650,7 @@ impl HgRepoContext {
         freshness: Freshness,
     ) -> Result<Option<HgChangesetId>, MononokeError> {
         match self
-            .repo
+            .repo_ctx
             .resolve_bookmark(&BookmarkKey::new(bookmark)?, freshness)
             .await?
         {
@@ -797,7 +666,7 @@ impl HgRepoContext {
         high: HgChangesetId,
     ) -> Result<Vec<HgChangesetId>, MononokeError> {
         const LIMIT: usize = 10;
-        let bonsai_hg_mapping = self.blob_repo().bonsai_hg_mapping();
+        let bonsai_hg_mapping = self.repo().bonsai_hg_mapping();
         bonsai_hg_mapping
             .get_hg_in_range(self.ctx(), low, high, LIMIT)
             .await
@@ -805,12 +674,12 @@ impl HgRepoContext {
     }
 
     /// Convert a list of hg changesets to a list of bonsai changesets.
-    async fn convert_changeset_ids(
+    pub(crate) async fn convert_changeset_ids(
         &self,
         changesets: Vec<HgChangesetId>,
     ) -> Result<Vec<ChangesetId>, MononokeError> {
         Ok(self
-            .blob_repo()
+            .repo()
             .get_hg_bonsai_mapping(self.ctx().clone(), changesets.to_vec())
             .await
             .context("error fetching hg bonsai mapping")?
@@ -824,7 +693,7 @@ impl HgRepoContext {
     pub async fn is_all_public(&self, changesets: &[HgChangesetId]) -> Result<bool, MononokeError> {
         let len = changesets.len();
         let public_phases = self
-            .blob_repo()
+            .repo()
             .phases()
             .get_cached_public(
                 self.ctx(),
@@ -844,7 +713,7 @@ impl HgRepoContext {
         let bonsai_heads = self.convert_changeset_ids(heads).await?;
 
         let segments = self
-            .repo()
+            .repo_ctx()
             .repo()
             .commit_graph()
             .ancestors_difference_segments(self.ctx(), bonsai_heads, bonsai_common)
@@ -865,7 +734,7 @@ impl HgRepoContext {
                     }
                 }
                 let mapping: HashMap<ChangesetId, HgChangesetId> = self
-                    .blob_repo()
+                    .repo()
                     .get_hg_bonsai_mapping(self.ctx().clone(), ids.into_iter().collect::<Vec<_>>())
                     .await
                     .context("error fetching hg bonsai mapping")?
@@ -927,12 +796,12 @@ impl HgRepoContext {
         MononokeError,
     > {
         let ctx = self.ctx().clone();
-        let blob_repo = self.blob_repo().clone();
+        let repo = self.repo().clone();
         let bonsai_common = self.convert_changeset_ids(common).await?;
         let bonsai_heads = self.convert_changeset_ids(heads).await?;
         debug!(ctx.logger(), "Streaming Commit Graph...");
         let commit_graph_stream = self
-            .repo()
+            .repo_ctx()
             .repo()
             .commit_graph()
             .ancestors_difference_stream(&ctx, bonsai_heads, bonsai_common)
@@ -940,10 +809,9 @@ impl HgRepoContext {
             .map_err(MononokeError::from)
             .map_ok(move |bcs_id| {
                 let ctx = ctx.clone();
-                let blob_repo = blob_repo.clone();
+                let repo = repo.clone();
                 async move {
-                    blob_repo
-                        .get_hg_changeset_and_parents_from_bonsai(ctx, bcs_id)
+                    repo.get_hg_changeset_and_parents_from_bonsai(ctx, bcs_id)
                         .await
                         .map_err(MononokeError::from)
                 }
@@ -963,8 +831,8 @@ impl HgRepoContext {
         heads: Vec<HgChangesetId>,
     ) -> Result<Vec<(HgChangesetId, (Vec<HgChangesetId>, bool))>, MononokeError> {
         let ctx = self.ctx().clone();
-        let blob_repo = self.blob_repo();
-        let phases = blob_repo.phases();
+        let repo = self.repo();
+        let phases = repo.phases();
 
         let common_set: HashSet<_> = common.iter().cloned().collect();
         let heads_vec: Vec<_> = heads.to_vec();
@@ -973,7 +841,7 @@ impl HgRepoContext {
         let (draft_commits, missing_commits) = try_join!(
             find_new_draft_commits_and_derive_filenodes_for_public_roots(
                 &ctx,
-                blob_repo,
+                repo,
                 &common_set,
                 &heads_vec,
                 phases
@@ -981,7 +849,7 @@ impl HgRepoContext {
             {
                 let bonsai_common = self.convert_changeset_ids(common).await?;
                 let bonsai_heads = self.convert_changeset_ids(heads).await?;
-                self.repo().repo().commit_graph().ancestors_difference(
+                self.repo_ctx().repo().commit_graph().ancestors_difference(
                     &ctx,
                     bonsai_heads,
                     bonsai_common,
@@ -991,9 +859,9 @@ impl HgRepoContext {
 
         let cs_parent_mapping = stream::iter(missing_commits.clone())
             .map(move |cs_id| async move {
-                let parents = blob_repo
-                    .changeset_fetcher()
-                    .get_parents(self.ctx(), cs_id)
+                let parents = repo
+                    .commit_graph()
+                    .changeset_parents(self.ctx(), cs_id)
                     .await?;
                 Ok::<_, Error>((cs_id, parents))
             })
@@ -1014,7 +882,7 @@ impl HgRepoContext {
             .chunks(map_chunk_size)
             .map(move |chunk| async move {
                 let mapping = self
-                    .blob_repo()
+                    .repo()
                     .get_hg_bonsai_mapping(self.ctx().clone(), chunk.to_vec())
                     .await
                     .context("error fetching hg bonsai mapping")?;
@@ -1051,40 +919,6 @@ impl HgRepoContext {
 
         Ok(hg_parent_mapping)
     }
-
-    pub async fn cloud_workspace(
-        &self,
-        workspace: &str,
-        reponame: &str,
-    ) -> Result<WorkspaceData, MononokeError> {
-        Ok(self
-            .blob_repo()
-            .commit_cloud()
-            .get_workspace(workspace, reponame)
-            .await?)
-    }
-
-    pub async fn cloud_references(
-        &self,
-        params: &GetReferencesParams,
-    ) -> Result<ReferencesData, MononokeError> {
-        Ok(self
-            .blob_repo()
-            .commit_cloud()
-            .get_references(params)
-            .await?)
-    }
-
-    pub async fn cloud_update_references(
-        &self,
-        params: &UpdateReferencesParams,
-    ) -> Result<ReferencesData, MononokeError> {
-        Ok(self
-            .blob_repo()
-            .commit_cloud()
-            .update_references(params)
-            .await?)
-    }
 }
 
 #[cfg(test)]
@@ -1110,7 +944,7 @@ mod tests {
         let repo_ctx = RepoContext::new_test(ctx, Arc::new(repo)).await?;
 
         let hg = repo_ctx.hg();
-        assert_eq!(hg.repo().name(), "repo");
+        assert_eq!(hg.repo_ctx().name(), "repo");
 
         Ok(())
     }
@@ -1121,20 +955,20 @@ mod tests {
         let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
 
         // Create test stack; child commit modifies 2 directories.
-        let commit_1 = CreateCommitContext::new_root(&ctx, repo.blob_repo())
+        let commit_1 = CreateCommitContext::new_root(&ctx, &repo)
             .add_file("dir1/a", "1")
             .add_file("dir2/b", "1")
             .add_file("dir3/c", "1")
             .commit()
             .await?;
-        let commit_2 = CreateCommitContext::new(&ctx, repo.blob_repo(), vec![commit_1])
+        let commit_2 = CreateCommitContext::new(&ctx, &repo, vec![commit_1])
             .add_file("dir1/a", "2")
             .add_file("dir3/a/b/c", "1")
             .commit()
             .await?;
 
-        let root_mfid_1 = root_manifest_id(ctx.clone(), repo.blob_repo(), commit_1).await?;
-        let root_mfid_2 = root_manifest_id(ctx.clone(), repo.blob_repo(), commit_2).await?;
+        let root_mfid_1 = root_manifest_id(ctx.clone(), &repo, commit_1).await?;
+        let root_mfid_2 = root_manifest_id(ctx.clone(), &repo, commit_2).await?;
 
         let repo_ctx = RepoContext::new_test(ctx, Arc::new(repo)).await?;
         let hg = repo_ctx.hg();
@@ -1161,13 +995,11 @@ mod tests {
     /// Get the HgManifestId of the root tree manifest for the given commit.
     async fn root_manifest_id(
         ctx: CoreContext,
-        blob_repo: &BlobRepo,
+        repo: &Repo,
         csid: ChangesetId,
     ) -> Result<HgManifestId, Error> {
-        let hg_cs_id = blob_repo.derive_hg_changeset(&ctx, csid).await?;
-        let hg_cs = hg_cs_id
-            .load(&ctx, &blob_repo.repo_blobstore().clone())
-            .await?;
+        let hg_cs_id = repo.derive_hg_changeset(&ctx, csid).await?;
+        let hg_cs = hg_cs_id.load(&ctx, &repo.repo_blobstore().clone()).await?;
         Ok(hg_cs.manifestid())
     }
 }

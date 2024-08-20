@@ -21,6 +21,7 @@ constexpr size_t WIN32_MAX_BODY_LEN = 255;
 constexpr size_t kNotificationsEnabledBit = 0;
 
 class ReloadableConfig;
+class StructuredLogger;
 struct InodePopulationReport;
 
 struct WindowDeleter {
@@ -44,6 +45,7 @@ class WindowsNotifier : public Notifier {
  public:
   explicit WindowsNotifier(
       std::shared_ptr<ReloadableConfig> edenConfig,
+      std::shared_ptr<StructuredLogger> logger,
       std::string_view version,
       std::chrono::time_point<std::chrono::steady_clock> startTime);
   ~WindowsNotifier();
@@ -128,6 +130,12 @@ class WindowsNotifier : public Notifier {
    */
   void updateIconColor(std::optional<size_t> numActive);
 
+  /**
+   * Logs event to Scuba
+   */
+  template <typename Event>
+  void logEvent(const Event& event);
+
  private:
   void appendInodePopulationReportMenu(HMENU hMenu);
   void appendOptionsMenu(HMENU hMenu);
@@ -147,6 +155,7 @@ class WindowsNotifier : public Notifier {
   uint8_t notificationStatus_;
   // Set by IDM_SIGNAL_CHECKOUT checkout signal.
   size_t lastNumActive_;
+  std::shared_ptr<StructuredLogger> structuredLogger_;
 };
 
 } // namespace facebook::eden

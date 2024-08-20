@@ -315,6 +315,7 @@ impl ShardedHgAugmentedManifest {
                     .map(|res| {
                         res.and_then(|(k, v)| anyhow::Ok((MPathElement::from_smallvec(k)?, v)))
                     })
+                    .yield_periodically()
                     .chunks(MAX_BUFFERED_ENTRIES)
                     .map(|results| {
                         results
@@ -561,39 +562,35 @@ impl HgAugmentedManifestEnvelope {
         blobstore: &B,
         manifestid: HgAugmentedManifestId,
     ) -> Result<Option<Self>> {
-        if manifestid.clone().into_nodehash() == NULL_HASH {
-            Ok(None)
-        } else {
-            async {
-                let blobstore_key = manifestid.blobstore_key();
-                let bytes = blobstore
-                    .get(ctx, &blobstore_key)
-                    .await
-                    .context("While fetching aurmented manifest envelope blob")?;
-                (|| {
-                    let envelope = match bytes {
-                        Some(bytes) => Self::from_blob(bytes.into_raw_bytes())?,
-                        None => return Ok(None),
-                    };
-                    if manifestid.into_nodehash() != envelope.augmented_manifest.hg_node_id() {
-                        bail!(
-                            "Augmented Manifest ID mismatch (requested: {}, got: {})",
-                            manifestid,
-                            envelope.augmented_manifest.hg_node_id()
-                        );
-                    }
-                    Ok(Some(envelope))
-                })()
-                .context(MononokeHgBlobError::ManifestDeserializeFailed(
-                    blobstore_key,
-                ))
-            }
-            .await
-            .context(format!(
-                "Failed to load manifest {} from blobstore",
-                manifestid
+        async {
+            let blobstore_key = manifestid.blobstore_key();
+            let bytes = blobstore
+                .get(ctx, &blobstore_key)
+                .await
+                .context("While fetching aurmented manifest envelope blob")?;
+            (|| {
+                let envelope = match bytes {
+                    Some(bytes) => Self::from_blob(bytes.into_raw_bytes())?,
+                    None => return Ok(None),
+                };
+                if manifestid.into_nodehash() != envelope.augmented_manifest.hg_node_id() {
+                    bail!(
+                        "Augmented Manifest ID mismatch (requested: {}, got: {})",
+                        manifestid,
+                        envelope.augmented_manifest.hg_node_id()
+                    );
+                }
+                Ok(Some(envelope))
+            })()
+            .context(MononokeHgBlobError::ManifestDeserializeFailed(
+                blobstore_key,
             ))
         }
+        .await
+        .context(format!(
+            "Failed to load manifest {} from blobstore",
+            manifestid
+        ))
     }
 
     /// Serialize this structure into bytes
@@ -801,14 +798,35 @@ impl<Store: Blobstore> AsyncManifest<Store> for HgAugmentedManifestEnvelope {
 mod sharded_augmented_manifest_tests {
     use std::io::Cursor;
 
+    use bonsai_hg_mapping::BonsaiHgMapping;
+    use bookmarks::Bookmarks;
     use bytes::BytesMut;
+    use commit_graph::CommitGraph;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
+    use filestore::FilestoreConfig;
     use fixtures::Linear;
     use fixtures::TestRepoFixture;
+    use repo_blobstore::RepoBlobstore;
     use repo_blobstore::RepoBlobstoreArc;
-    use types::AugmentedTreeEntry;
+    use repo_derived_data::RepoDerivedData;
+    use repo_identity::RepoIdentity;
+    use types::AugmentedTree;
 
     use super::*;
+
+    #[facet::container]
+    #[derive(Clone)]
+    struct TestRepo(
+        dyn BonsaiHgMapping,
+        dyn Bookmarks,
+        RepoBlobstore,
+        RepoDerivedData,
+        RepoIdentity,
+        CommitGraph,
+        dyn CommitGraphWriter,
+        FilestoreConfig,
+    );
 
     fn hash_ones() -> HgNodeHash {
         HgNodeHash::new("1111111111111111111111111111111111111111".parse().unwrap())
@@ -863,7 +881,7 @@ mod sharded_augmented_manifest_tests {
     #[fbinit::test]
     async fn test_serialize_augmented_manifest(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
-        let blobrepo = Linear::getrepo(fb).await;
+        let blobrepo: TestRepo = Linear::get_repo(fb).await;
         let blobstore = blobrepo.repo_blobstore_arc();
 
         let subentries = vec![
@@ -935,7 +953,7 @@ mod sharded_augmented_manifest_tests {
         );
 
         // Check compatibility with the Sapling Type, to make sure Sapling can deserialize
-        assert!(AugmentedTreeEntry::try_deserialize(Cursor::new(bytes)).is_ok());
+        assert!(AugmentedTree::try_deserialize(Cursor::new(bytes)).is_ok());
 
         Ok(())
     }

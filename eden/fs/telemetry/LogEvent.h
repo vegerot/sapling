@@ -391,7 +391,12 @@ struct NfsCrawlDetected {
 };
 
 struct FetchMiss {
-  enum MissType : uint8_t { Tree = 0, Blob = 1, BlobMetadata = 2 };
+  enum MissType : uint8_t {
+    Tree = 0,
+    Blob = 1,
+    BlobMetadata = 2,
+    TreeMetadata = 3
+  };
 
   static constexpr const char* type = "fetch_miss";
 
@@ -406,8 +411,12 @@ struct FetchMiss {
       event.addString("miss_type", "tree");
     } else if (miss_type == Blob) {
       event.addString("miss_type", "blob");
+    } else if (miss_type == BlobMetadata) {
+      event.addString("miss_type", "blob_aux");
+    } else if (miss_type == TreeMetadata) {
+      event.addString("miss_type", "tree_aux");
     } else {
-      event.addString("miss_type", "aux");
+      throw std::range_error(fmt::format("Unknown miss type: {}", miss_type));
     }
     event.addString("reason", reason);
     event.addBool("retry", retry);
@@ -442,6 +451,22 @@ struct SaplingBlobDownloadEvent {
     event.addInt("size_in_bytes", sizeInBytes);
     event.addInt("time_to_download_in_ms", timeToDownloadInMs);
     event.addString("fetch_mode", fetchMode);
+  }
+};
+
+/**
+ * Used to log user actions on e-Menu
+ */
+struct EMenuActionEvent {
+  static constexpr const char* type = "e_menu_action_events";
+  enum ActionType : uint8_t { EMenuClick = 0 };
+
+  ActionType action_type;
+
+  void populate(DynamicEvent& event) const {
+    if (action_type == EMenuClick) {
+      event.addString("action_type", "EMenuClick");
+    }
   }
 };
 

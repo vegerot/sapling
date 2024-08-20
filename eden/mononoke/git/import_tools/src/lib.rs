@@ -37,6 +37,7 @@ use futures::StreamExt;
 use futures::TryFutureExt;
 use futures::TryStreamExt;
 use git_symbolic_refs::GitSymbolicRefsEntry;
+pub use git_types::git_lfs::LfsPointerData;
 use gix_hash::ObjectId;
 use gix_object::Object;
 use linked_hash_map::LinkedHashMap;
@@ -70,7 +71,6 @@ pub use crate::gitimport_objects::GitimportPreferences;
 pub use crate::gitimport_objects::GitimportTarget;
 pub use crate::gitimport_objects::TagMetadata;
 pub use crate::gitlfs::GitImportLfs;
-pub use crate::gitlfs::LfsMetaData;
 
 pub const HGGIT_MARKER_EXTRA: &str = "hg-git-rename-source";
 pub const HGGIT_MARKER_VALUE: &[u8] = b"git";
@@ -291,12 +291,12 @@ pub async fn gitimport<Uploader: GitUploader>(
         .context(
             "Failure in converting Result<Vec<commits>> to Vec<commits> in target.list_commits",
         )?;
-    let nb_commits_to_import = all_commits.len();
-    if 0 == nb_commits_to_import {
+
+    if all_commits.is_empty() {
         info!(ctx.logger(), "Nothing to import for repo {}.", repo_name);
         return Ok(acc.into_inner());
     }
-    let acc = GitimportAccumulator::from_roots(target.get_roots().clone());
+
     import_commit_contents(ctx, repo_name, all_commits, uploader, reader, prefs, acc).await
 }
 
@@ -319,7 +319,6 @@ pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
     let mappings: Vec<(ObjectId, ChangesetId)> = stream::iter(all_commits.clone())
         // Ignore any error. This is an optional optimization
         .chunks(SQL_CONCURRENCY)
-        .map(|v| v.into_iter().collect::<Vec<_>>())
         .map(|oids| {
             cloned!(uploader, ctx);
             async move {
@@ -385,10 +384,18 @@ pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
             while let Some(incoming) = rx.recv().await {
                 cloned!(backfill_derivation, ctx, acc, uploader, repo_name,);
                 task::spawn(async move {
-                    let finalized_chunk = uploader
+                    let finalized_chunk_res = uploader
                         .finalize_batch(&ctx, dry_run, backfill_derivation, incoming, &acc)
                         .await
-                        .context("finalize_batch")?;
+                        .context("finalize_batch");
+                    let finalized_chunk = match finalized_chunk_res {
+                        Err(e) => {
+                            // Log the error if any
+                            info!(ctx.logger(), "{:?}", e);
+                            anyhow::bail!(e);
+                        }
+                        Ok(chunk) => chunk,
+                    };
                     // Only log progress after every batch to avoid log-spew and wasted time
                     if let Some((last_git_sha1, last_bcs_id)) = finalized_chunk.last() {
                         info!(

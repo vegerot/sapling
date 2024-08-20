@@ -15,8 +15,7 @@ bookmarks = { version = "0.1.0", path = "../../bookmarks" }
 bookmarks_cache = { version = "0.1.0", path = "../../bookmarks/bookmarks_cache" }
 buffered_weighted = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 bytes = { version = "1.6.0", features = ["serde"] }
-changesets = { version = "0.1.0", path = "../../changesets" }
-clap = { version = "4.5.6", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.5.11", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 commit_graph = { version = "0.1.0", path = "../../repo_attributes/commit_graph/commit_graph" }
 commit_graph_types = { version = "0.1.0", path = "../../repo_attributes/commit_graph/commit_graph_types" }
@@ -30,7 +29,6 @@ gix-features = { version = "0.32", features = ["parallel", "rustsha1"] }
 gix-hash = "0.11"
 gix-object = "0.33"
 gix-pack = "0.40"
-justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 manifest = { version = "0.1.0", path = "../../manifest" }
 metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }

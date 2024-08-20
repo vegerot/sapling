@@ -10,7 +10,13 @@ use anyhow::anyhow;
 use anyhow::Result;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkKind;
+use commit_cloud::ctx::CommitCloudContext;
+use commit_cloud::CommitCloudRef;
+use commit_cloud_helpers::make_workspace_acl_name;
+#[cfg(fbcode_build)]
+use commit_cloud_intern_utils::acl_check::infer_workspace_identity;
 use context::CoreContext;
+use futures_stats::futures03::TimedFutureExt;
 use metaconfig_types::RepoConfigRef;
 use mononoke_types::path::MPath;
 use mononoke_types::BonsaiChangeset;
@@ -80,6 +86,14 @@ impl AuthorizationContext {
     /// Returns true if this context is for a service write.
     pub fn is_service(&self) -> bool {
         matches!(self, AuthorizationContext::Service(_))
+    }
+
+    /// Returns service identiry for a service write.
+    pub fn service_identity(&self) -> Option<String> {
+        match self {
+            AuthorizationContext::Service(service_name) => Some(service_name.clone()),
+            _ => None,
+        }
     }
 
     /// Create a permission denied error for a particular action.
@@ -502,6 +516,127 @@ impl AuthorizationContext {
         self.check_git_import_operations(ctx, repo)
             .await
             .permitted_or_else(|| self.permission_denied(ctx, DeniedAction::GitImportOperation))
+    }
+
+    /// Check whether the caller is allowed to operate on certain commit cloud workspace.
+    pub async fn check_commitcloud_operation(
+        &self,
+        ctx: &CoreContext,
+        repo: &impl CommitCloudRef,
+        cc_ctx: &mut CommitCloudContext,
+        action: &str,
+    ) -> AuthorizationCheckOutcome {
+        let permitted = match self {
+            AuthorizationContext::FullAccess => true,
+            AuthorizationContext::Identity => {
+                #[cfg(fbcode_build)]
+                {
+                    if cc_ctx.owner.is_none() {
+                        let (stats, inferred_owner) = infer_workspace_identity(
+                            ctx.fb,
+                            &cc_ctx.workspace,
+                            repo.commit_cloud().config.mocked_employees.clone(),
+                        )
+                        .timed()
+                        .await;
+
+                        ctx.scuba().clone().add_future_stats(&stats).log_with_msg(
+                            "commit cloud: inferred owner ",
+                            format!(
+                                "inferred owner: got outcome {:?} for workspace {}",
+                                inferred_owner, cc_ctx.workspace
+                            ),
+                        );
+
+                        match inferred_owner {
+                            Ok(owner) => cc_ctx.set_owner(owner),
+                            Err(_) => {}
+                        };
+                    }
+                    match &cc_ctx.owner {
+                        Some(owner) => {
+                            if ctx.metadata().identities().contains(owner) {
+                                ctx.scuba().clone().log_with_msg(
+                                    "commit cloud ACL check success",
+                                    Some("inferred owner check".to_owned()),
+                                );
+                                return AuthorizationCheckOutcome::from_permitted(true);
+                            }
+                        }
+                        None => (),
+                    };
+                }
+
+                match repo
+                    .commit_cloud()
+                    .commit_cloud_acl(&make_workspace_acl_name(
+                        &cc_ctx.workspace,
+                        &cc_ctx.reponame,
+                    ))
+                    .await
+                {
+                    Ok(Some(checker)) => {
+                        if checker
+                            .check_set(ctx.metadata().identities(), &[action])
+                            .await
+                        {
+                            ctx.scuba().clone().log_with_msg(
+                                "commit cloud ACL check success",
+                                Some("ACL check".to_owned()),
+                            );
+                            return AuthorizationCheckOutcome::from_permitted(true);
+                        }
+                    }
+                    Err(_) | Ok(None) => (),
+                }
+
+                match repo.commit_cloud().commit_cloud_acl("allow_list").await {
+                    Ok(Some(checker)) => {
+                        if checker
+                            .check_set(ctx.metadata().identities(), &[action])
+                            .await
+                        {
+                            ctx.scuba().clone().log_with_msg(
+                                "commit cloud ACL check success",
+                                Some("global allow list".to_owned()),
+                            );
+                            return AuthorizationCheckOutcome::from_permitted(true);
+                        }
+                    }
+                    Err(_) | Ok(None) => (),
+                }
+                ctx.scuba()
+                    .clone()
+                    .log_with_msg("commit cloud ACL check failed", None);
+                false
+            }
+            AuthorizationContext::Service(_service_name) => false,
+            AuthorizationContext::ReadOnlyIdentity | AuthorizationContext::DraftOnlyIdentity => {
+                false
+            }
+        };
+        AuthorizationCheckOutcome::from_permitted(permitted)
+    }
+
+    /// Require that the caller is allowed to operate on certain commit cloud workspace.
+    pub async fn require_commitcloud_operation(
+        &self,
+        ctx: &CoreContext,
+        repo: &impl CommitCloudRef,
+        cc_ctx: &mut CommitCloudContext,
+        action: &str,
+    ) -> Result<(), AuthorizationError> {
+        self.check_commitcloud_operation(ctx, repo, cc_ctx, action)
+            .await
+            .permitted_or_else(|| {
+                self.permission_denied(
+                    ctx,
+                    DeniedAction::CommitCloudOperation(
+                        action.to_string(),
+                        cc_ctx.workspace.clone(),
+                    ),
+                )
+            })
     }
 }
 

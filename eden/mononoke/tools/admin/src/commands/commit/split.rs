@@ -211,8 +211,8 @@ mod test {
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bonsai_svnrev_mapping::BonsaiSvnrevMapping;
     use bookmarks::Bookmarks;
-    use changeset_fetcher::ChangesetFetcher;
-    use changesets::Changesets;
+    use commit_graph::CommitGraph;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use maplit::hashmap;
@@ -232,7 +232,8 @@ mod test {
             dyn BonsaiGitMapping,
             dyn BonsaiGlobalrevMapping,
             dyn BonsaiSvnrevMapping,
-            dyn Changesets,
+            CommitGraph,
+            dyn CommitGraphWriter,
             RepoBlobstore,
         )]
         repo: Repo,
@@ -245,9 +246,6 @@ mod test {
 
         #[facet]
         repo_derived_data: RepoDerivedData,
-
-        #[facet]
-        changeset_fetcher: dyn ChangesetFetcher,
 
         #[facet]
         repo_identity: RepoIdentity,

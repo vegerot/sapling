@@ -61,10 +61,13 @@ class Command {
  public:
   Command()
       : userInfo_(UserInfo::lookup()),
-        config_(getEdenConfig(userInfo_)),
+        config_(std::make_shared<ReloadableConfig>(getEdenConfig(userInfo_))),
         edenDir_([this]() {
-          XLOG(INFO) << "Using Eden directory: " << config_->edenDir.getValue();
-          return EdenStateDir(config_->edenDir.getValue());
+          XLOGF(
+              INFO,
+              "Using Eden directory: {}",
+              config_->getEdenConfig()->edenDir.getValue());
+          return EdenStateDir(config_->getEdenConfig()->edenDir.getValue());
         }()) {
     if (!edenDir_.acquireLock()) {
       throw ArgumentError(
@@ -90,18 +93,19 @@ class Command {
         makeRefPtr<EdenStats>(),
         std::make_shared<NullStructuredLogger>(),
         &faultInjector_,
+        config_,
         mode);
     localStore->open();
-    XLOG(INFO) << "Opened RocksDB store in "
-               << (mode == RocksDBOpenMode::ReadOnly ? "read-only"
-                                                     : "read-write")
-               << " mode in " << (watch.elapsed().count() / 1000.0)
-               << " seconds.";
+    XLOGF(
+        INFO,
+        "Opened RocksDB store in {} mode in {} seconds.",
+        mode == RocksDBOpenMode::ReadOnly ? "read-only" : "read-write",
+        watch.elapsed().count() / 1000.0);
     return localStore;
   }
 
   UserInfo userInfo_;
-  std::shared_ptr<EdenConfig> config_;
+  std::shared_ptr<ReloadableConfig> config_;
   EdenStateDir edenDir_;
   FaultInjector faultInjector_{/*enabled=*/false};
 };
@@ -199,10 +203,12 @@ class ShowSizesCommand : public Command {
     auto localStore = openLocalStore(RocksDBOpenMode::ReadOnly);
 
     for (const auto& ks : KeySpace::kAll) {
-      LOG(INFO) << "Column family \"" << ks->name << "\": "
-                << folly::prettyPrint(
-                       localStore->getApproximateSize(ks),
-                       folly::PRETTY_BYTES_METRIC);
+      XLOGF(
+          INFO,
+          "Column family \"{}\": {}",
+          ks->name,
+          folly::prettyPrint(
+              localStore->getApproximateSize(ks), folly::PRETTY_BYTES_METRIC));
     }
   }
 };

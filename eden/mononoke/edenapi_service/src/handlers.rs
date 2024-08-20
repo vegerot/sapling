@@ -47,6 +47,7 @@ use gotham_ext::state_ext::StateExt;
 use hyper::Body;
 use hyper::Response;
 use mime::Mime;
+use mononoke_api::Repo;
 use serde::Deserialize;
 use serde::Serialize;
 use time_ext::DurationExt;
@@ -63,7 +64,6 @@ use crate::utils::to_cbor_bytes;
 mod blame;
 mod bookmarks;
 mod capabilities;
-mod clone;
 mod commit;
 mod commit_cloud;
 mod files;
@@ -71,7 +71,6 @@ mod handler;
 mod history;
 mod land;
 mod lookup;
-mod pull;
 mod repos;
 mod suffix_query;
 mod trees;
@@ -87,77 +86,81 @@ const REPORTING_LOOP_WAIT: u64 = 5;
 /// Used to identify the handler for logging and stats collection.
 #[derive(Copy, Clone)]
 pub enum SaplingRemoteApiMethod {
-    SuffixQuery,
+    AlterSnapshot,
     Blame,
-    Capabilities,
-    Files2,
-    Lookup,
-    UploadFile,
-    UploadHgFilenodes,
-    UploadTrees,
-    UploadHgChangesets,
-    UploadBonsaiChangeset,
-    Trees,
-    History,
-    CommitLocationToHash,
-    CommitHashToLocation,
-    CommitRevlogData,
-    CommitHashLookup,
-    Clone,
     Bookmarks,
-    SetBookmark,
-    LandStack,
-    PullFastForwardMaster,
-    PullLazy,
+    Capabilities,
+    CloudReferences,
+    CloudRenameWorkspace,
+    CloudShareWorkspace,
+    CloudSmartlog,
+    CloudUpdateArchive,
+    CloudUpdateReferences,
+    CloudWorkspace,
+    CloudWorkspaces,
+    CommitGraphSegments,
+    CommitGraphV2,
+    CommitHashLookup,
+    CommitHashToLocation,
+    CommitLocationToHash,
+    CommitMutations,
+    CommitRevlogData,
+    CommitTranslateId,
+    DownloadFile,
     EphemeralPrepare,
     FetchSnapshot,
-    AlterSnapshot,
-    CommitGraphV2,
-    CommitGraphSegments,
-    DownloadFile,
-    CommitMutations,
-    CommitTranslateId,
-    CloudWorkspace,
-    CloudReferences,
-    CloudUpdateReferences,
+    Files2,
+    History,
+    LandStack,
+    Lookup,
+    SetBookmark,
+    SuffixQuery,
+    Trees,
+    UploadBonsaiChangeset,
+    UploadFile,
+    UploadHgChangesets,
+    UploadHgFilenodes,
+    UploadTrees,
 }
 
 impl fmt::Display for SaplingRemoteApiMethod {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
-            Self::SuffixQuery => "suffix_query",
+            Self::AlterSnapshot => "alter_snapshot",
             Self::Blame => "blame",
-            Self::Capabilities => "capabilities",
-            Self::Files2 => "files2",
-            Self::Trees => "trees",
-            Self::History => "history",
-            Self::CommitLocationToHash => "commit_location_to_hash",
-            Self::CommitHashToLocation => "commit_hash_to_location",
-            Self::CommitRevlogData => "commit_revlog_data",
-            Self::CommitHashLookup => "commit_hash_lookup",
-            Self::CommitGraphV2 => "commit_graph_v2",
-            Self::CommitGraphSegments => "commit_graph_segments",
-            Self::Clone => "clone",
             Self::Bookmarks => "bookmarks",
-            Self::SetBookmark => "set_bookmark",
-            Self::LandStack => "land_stack",
-            Self::Lookup => "lookup",
-            Self::UploadFile => "upload_file",
-            Self::PullFastForwardMaster => "pull_fast_forward_master",
-            Self::PullLazy => "pull_lazy",
-            Self::UploadHgFilenodes => "upload_filenodes",
-            Self::UploadTrees => "upload_trees",
-            Self::UploadHgChangesets => "upload_hg_changesets",
-            Self::UploadBonsaiChangeset => "upload_bonsai_changeset",
+            Self::Capabilities => "capabilities",
+            Self::CloudReferences => "cloud_references",
+            Self::CloudRenameWorkspace => "cloud_rename_workspace",
+            Self::CloudShareWorkspace => "cloud_share_workspace",
+            Self::CloudSmartlog => "cloud_smartlog",
+            Self::CloudUpdateArchive => "cloud_update_archive",
+            Self::CloudUpdateReferences => "cloud_update_references",
+            Self::CloudWorkspace => "cloud_workspace",
+            Self::CloudWorkspaces => "cloud_workspaces",
+            Self::CommitGraphSegments => "commit_graph_segments",
+            Self::CommitGraphV2 => "commit_graph_v2",
+            Self::CommitHashLookup => "commit_hash_lookup",
+            Self::CommitHashToLocation => "commit_hash_to_location",
+            Self::CommitLocationToHash => "commit_location_to_hash",
+            Self::CommitMutations => "commit_mutations",
+            Self::CommitRevlogData => "commit_revlog_data",
+            Self::CommitTranslateId => "commit_translate_id",
+            Self::DownloadFile => "download_file",
             Self::EphemeralPrepare => "ephemeral_prepare",
             Self::FetchSnapshot => "fetch_snapshot",
-            Self::AlterSnapshot => "alter_snapshot",
-            Self::DownloadFile => "download_file",
-            Self::CommitMutations => "commit_mutations",
-            Self::CommitTranslateId => "commit_translate_id",
-            Self::CloudWorkspace => "cloud_workspace",
-            Self::CloudReferences => "cloud_references",
-            Self::CloudUpdateReferences => "cloud_update_references",
+            Self::Files2 => "files2",
+            Self::History => "history",
+            Self::LandStack => "land_stack",
+            Self::Lookup => "lookup",
+            Self::SetBookmark => "set_bookmark",
+            Self::SuffixQuery => "suffix_query",
+            Self::Trees => "trees",
+            Self::UploadBonsaiChangeset => "upload_bonsai_changeset",
+            Self::UploadFile => "upload_file",
+            Self::UploadHgChangesets => "upload_hg_changesets",
+            Self::UploadHgFilenodes => "upload_filenodes",
+            Self::UploadTrees => "upload_trees",
         };
         write!(f, "{}", name)
     }
@@ -233,15 +236,12 @@ macro_rules! define_handler {
     };
 }
 
-define_handler!(repos_handler, repos::repos);
-define_handler!(trees_handler, trees::trees);
 define_handler!(capabilities_handler, capabilities::capabilities_handler);
 define_handler!(commit_hash_to_location_handler, commit::hash_to_location);
 define_handler!(commit_revlog_data_handler, commit::revlog_data);
-define_handler!(clone_handler, clone::clone_data);
+define_handler!(repos_handler, repos::repos);
+define_handler!(trees_handler, trees::trees);
 define_handler!(upload_file_handler, files::upload_file);
-define_handler!(pull_fast_forward_master, pull::pull_fast_forward_master);
-define_handler!(pull_lazy, pull::pull_lazy);
 
 static HIGH_LOAD_SIGNAL: &str = "I_AM_OVERLOADED";
 static ALIVE: &str = "I_AM_ALIVE";
@@ -249,7 +249,7 @@ static EXITING: &str = "EXITING";
 
 // Used for monitoring VIP health
 fn proxygen_health_handler(state: State) -> (State, &'static str) {
-    if ServerContext::borrow_from(&state).will_exit() {
+    if ServerContext::<Repo>::borrow_from(&state).will_exit() {
         (state, EXITING)
     } else {
         if let Some(request_load) = RequestLoad::try_borrow_from(&state) {
@@ -266,7 +266,7 @@ fn proxygen_health_handler(state: State) -> (State, &'static str) {
 
 // Used for monitoring TW tasks
 fn health_handler(state: State) -> (State, &'static str) {
-    if ServerContext::borrow_from(&state).will_exit() {
+    if ServerContext::<Repo>::borrow_from(&state).will_exit() {
         (state, EXITING)
     } else {
         (state, ALIVE)
@@ -415,7 +415,7 @@ where
     }
 }
 
-pub fn build_router(ctx: ServerContext) -> Router {
+pub fn build_router<R: Send + Sync + Clone + 'static>(ctx: ServerContext<R>) -> Router {
     let pipeline = new_pipeline().add(StateMiddleware::new(ctx)).build();
     let (chain, pipelines) = single_pipeline(pipeline);
 
@@ -425,31 +425,37 @@ pub fn build_router(ctx: ServerContext) -> Router {
         route
             .get("/proxygen/health_check")
             .to(proxygen_health_handler);
-        Handlers::setup::<commit::EphemeralPrepareHandler>(route);
-        Handlers::setup::<commit::UploadHgChangesetsHandler>(route);
-        Handlers::setup::<commit::UploadBonsaiChangesetHandler>(route);
-        Handlers::setup::<commit::LocationToHashHandler>(route);
-        Handlers::setup::<commit::HashLookupHandler>(route);
-        Handlers::setup::<files::Files2Handler>(route);
-        Handlers::setup::<files::UploadHgFilenodesHandler>(route);
+        Handlers::setup::<blame::BlameHandler>(route);
         Handlers::setup::<bookmarks::BookmarksHandler>(route);
         Handlers::setup::<bookmarks::SetBookmarkHandler>(route);
-        Handlers::setup::<land::LandStackHandler>(route);
-        Handlers::setup::<history::HistoryHandler>(route);
-        Handlers::setup::<lookup::LookupHandler>(route);
-        Handlers::setup::<trees::UploadTreesHandler>(route);
-        Handlers::setup::<commit::FetchSnapshotHandler>(route);
+        Handlers::setup::<commit_cloud::CommitCloudReferences>(route);
+        Handlers::setup::<commit_cloud::CommitCloudRenameWorkspace>(route);
+        Handlers::setup::<commit_cloud::CommitCloudShareWorkspace>(route);
+        Handlers::setup::<commit_cloud::CommitCloudSmartlog>(route);
+        Handlers::setup::<commit_cloud::CommitCloudUpdateArchive>(route);
+        Handlers::setup::<commit_cloud::CommitCloudUpdateReferences>(route);
+        Handlers::setup::<commit_cloud::CommitCloudWorkspace>(route);
+        Handlers::setup::<commit_cloud::CommitCloudWorkspaces>(route);
         Handlers::setup::<commit::AlterSnapshotHandler>(route);
-        Handlers::setup::<commit::GraphHandlerV2>(route);
-        Handlers::setup::<commit::GraphSegmentsHandler>(route);
-        Handlers::setup::<files::DownloadFileHandler>(route);
         Handlers::setup::<commit::CommitMutationsHandler>(route);
         Handlers::setup::<commit::CommitTranslateId>(route);
-        Handlers::setup::<blame::BlameHandler>(route);
-        Handlers::setup::<commit_cloud::CommitCloudWorkspace>(route);
-        Handlers::setup::<commit_cloud::CommitCloudReferences>(route);
-        Handlers::setup::<commit_cloud::CommitCloudUpdateReferences>(route);
+        Handlers::setup::<commit::EphemeralPrepareHandler>(route);
+        Handlers::setup::<commit::FetchSnapshotHandler>(route);
+        Handlers::setup::<commit::GraphHandlerV2>(route);
+        Handlers::setup::<commit::GraphSegmentsHandler>(route);
+        Handlers::setup::<commit::HashLookupHandler>(route);
+        Handlers::setup::<commit::LocationToHashHandler>(route);
+        Handlers::setup::<commit::UploadBonsaiChangesetHandler>(route);
+        Handlers::setup::<commit::UploadHgChangesetsHandler>(route);
+        Handlers::setup::<files::DownloadFileHandler>(route);
+        Handlers::setup::<files::Files2Handler>(route);
+        Handlers::setup::<files::UploadHgFilenodesHandler>(route);
+        Handlers::setup::<history::HistoryHandler>(route);
+        Handlers::setup::<land::LandStackHandler>(route);
+        Handlers::setup::<lookup::LookupHandler>(route);
+        Handlers::setup::<commit_cloud::CommitCloudSmartlog>(route);
         Handlers::setup::<suffix_query::SuffixQueryHandler>(route);
+        Handlers::setup::<trees::UploadTreesHandler>(route);
         route.get("/:repo/health_check").to(health_handler);
         route
             .get("/:repo/capabilities")
@@ -467,18 +473,6 @@ pub fn build_router(ctx: ServerContext) -> Router {
             .post("/:repo/commit/revlog_data")
             .with_path_extractor::<commit::RevlogDataParams>()
             .to(commit_revlog_data_handler);
-        route
-            .post("/:repo/clone")
-            .with_path_extractor::<clone::CloneParams>()
-            .to(clone_handler);
-        route
-            .post("/:repo/pull_fast_forward_master")
-            .with_path_extractor::<pull::PullFastForwardParams>()
-            .to(pull_fast_forward_master);
-        route
-            .post("/:repo/pull_lazy")
-            .with_path_extractor::<pull::PullLazyParams>()
-            .to(pull_lazy);
         route
             .put("/:repo/upload/file/:idtype/:id")
             .with_path_extractor::<files::UploadFileParams>()

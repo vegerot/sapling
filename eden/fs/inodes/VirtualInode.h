@@ -50,10 +50,11 @@ class VirtualInode {
   explicit VirtualInode(TreePtr value, mode_t mode)
       : variant_(std::move(value)), treeMode_(mode) {}
 
-  explicit VirtualInode(TreeEntry value) : variant_(std::move(value)) {
+  explicit VirtualInode(TreeEntry value) {
     XCHECK(!value.isTree())
         << "TreeEntries which represent a tree should be resolved to a tree "
         << "before being constructed into VirtualInode";
+    variant_ = std::move(value);
   }
 
   /**
@@ -132,7 +133,8 @@ class VirtualInode {
       EntryAttributeFlags requestedAttributes,
       RelativePathPiece path,
       const std::shared_ptr<ObjectStore>& objectStore,
-      const ObjectFetchContextPtr& fetchContext) const;
+      const ObjectFetchContextPtr& fetchContext,
+      bool shouldFetchTreeMetadata) const;
 
   /**
    * Emulate stat in a way that works for source control.
@@ -176,7 +178,8 @@ class VirtualInode {
       EntryAttributeFlags requestedAttributes,
       RelativePath path,
       const std::shared_ptr<ObjectStore>& objectStore,
-      const ObjectFetchContextPtr& fetchContext);
+      const ObjectFetchContextPtr& fetchContext,
+      bool shouldFetchTreeMetadata);
 
  private:
   /**
@@ -188,9 +191,12 @@ class VirtualInode {
       const ObjectFetchContextPtr& fetchContext,
       bool blake3Required = false) const;
 
-  EntryAttributes getEntryAttributesForNonFile(
+  ImmediateFuture<EntryAttributes> getEntryAttributesForNonFile(
       EntryAttributeFlags requestedAttributes,
       RelativePathPiece path,
+      const std::shared_ptr<ObjectStore>& objectStore,
+      const ObjectFetchContextPtr& fetchContext,
+      bool shouldFetchTreeMetadata,
       std::optional<TreeEntryType> entryType,
       int errorCode,
       std::string additionalErrorContext = {}) const;

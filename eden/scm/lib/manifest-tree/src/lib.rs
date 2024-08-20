@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+use anyhow::bail;
 use anyhow::Result;
 use iter::bfs_iter;
 use manifest::DiffEntry;
@@ -66,6 +67,9 @@ pub struct TreeManifest {
     store: InnerStore,
     // TODO: root can't be a Leaf
     root: Link,
+
+    // List of from->to grafts to perform before diff operation.
+    diff_grafts: Vec<(RepoPathBuf, RepoPathBuf)>,
 }
 
 #[derive(Error, Debug)]
@@ -100,6 +104,7 @@ impl TreeManifest {
         TreeManifest {
             store: InnerStore::new(store),
             root: Link::durable(hgid),
+            diff_grafts: Vec::new(),
         }
     }
 
@@ -108,6 +113,7 @@ impl TreeManifest {
         TreeManifest {
             store: InnerStore::new(store),
             root: Link::ephemeral(),
+            diff_grafts: Vec::new(),
         }
     }
 
@@ -574,6 +580,196 @@ impl TreeManifest {
         Ok(executor.converted_nodes.into_iter())
     }
 
+    /// Insert `other[other_path]` into `self[path]`. If `path` is already in `self`,
+    /// it is replaced, not merged or overlaid. Any conflicting entries in `self` are
+    /// overwritten in order to insert into `path`. `other_path` can be a Leaf, but if so cannot be
+    /// inserted as the root of `self`. `other[other_path]` is deep copied so it remains mutable. If
+    /// `other[other_path]` does not exist, an empty directory is inserted at `path`.
+    pub fn graft(&mut self, path: &RepoPath, other: &Self, other_path: &RepoPath) -> Result<()> {
+        let other_link = other.get_link(other_path)?;
+
+        if path.is_empty() && other_link.is_some_and(Link::is_leaf) {
+            bail!("can't graft leaf node to root of tree");
+        }
+
+        let mut cursor = &mut self.root;
+        for (parent, component) in path.parents().zip(path.components()) {
+            let links = cursor.mut_ephemeral_links(&self.store, parent)?;
+            cursor = match links.entry(component.to_owned()) {
+                Entry::Vacant(e) => e.insert(Link::ephemeral()),
+                Entry::Occupied(o) => {
+                    let link = o.into_mut();
+                    if link.is_leaf() {
+                        // Path conflict - replace file with a directory.
+                        *link = Link::ephemeral();
+                    }
+                    link
+                }
+            };
+        }
+
+        // Deep copy `other_link` so it, and our grafted copy, remain mutable.
+        *cursor = other_link.map_or_else(Link::ephemeral, |other| other.clone());
+
+        Ok(())
+    }
+
+    /// Return a new tree with registered grafts applied. If there are no grafts, a
+    /// shallow copy of `self` is returned. If we have no grafts but `other` does (`other`
+    /// is the other side of the diff operation), return a new tree with only the "to"
+    /// side of `other`'s grafts present.
+    ///
+    /// For example in "sl graft -r A --from-path foo --to-path bar", we apply foo->bar
+    /// graft to A yielding a tree with just "bar", and we apply bar->bar graft to the
+    /// wdir manifest, yield a tree with just "bar". This way we strip out parts of the
+    /// manifest that aren't part of the graft.
+    pub fn apply_diff_grafts(&self, other: &Self) -> Result<Self> {
+        if self.diff_grafts.is_empty() && other.diff_grafts.is_empty() {
+            // No grafts to apply - return a shallow copy of ourself.
+            return Ok(Self {
+                store: self.store.clone(),
+                root: self.root.thread_copy(),
+                diff_grafts: Vec::new(),
+            });
+        }
+
+        let mut grafted = Self {
+            store: self.store.clone(),
+            root: Link::ephemeral(),
+            diff_grafts: Vec::new(),
+        };
+
+        if self.diff_grafts.is_empty() {
+            for (_, to) in other.diff_grafts.iter() {
+                tracing::info!(%to, "applying self diff graft");
+                grafted.graft(to, self, to)?;
+            }
+        } else {
+            for (from, to) in self.diff_grafts.iter() {
+                tracing::info!(%from, %to, "applying diff graft");
+                grafted.graft(to, self, from)?;
+            }
+        }
+        Ok(grafted)
+    }
+
+    /// Register a graft to take effect during `diff` operations.
+    /// This allows temporarily moving tree nodes around just for the diff.
+    /// See `ungrafted_path` for mapping the diff result back to the original path.
+    /// Returns an error if `to` overlaps with existing graft destination.
+    pub fn register_diff_graft(&mut self, from: &RepoPath, to: &RepoPath) -> Result<()> {
+        for (_, existing) in self.diff_grafts.iter() {
+            if to.starts_with(existing, true) || existing.starts_with(to, true) {
+                bail!("overlapping graft destinations {} and {}", existing, to);
+            }
+        }
+        self.diff_grafts.push((from.to_owned(), to.to_owned()));
+        Ok(())
+    }
+
+    /// Map a grafted path back to this manifest's original path.
+    /// This is used in conjunction with `graft_for_diff` to translate a grafted path in the
+    /// diff result back to the original path, if any.
+    pub fn ungrafted_path(&self, path: &RepoPath) -> Option<RepoPathBuf> {
+        for (from, to) in self.diff_grafts.iter().rev() {
+            if let Some(suffix) = path.strip_prefix(to, true) {
+                if from == to {
+                    return None;
+                } else if suffix.is_empty() {
+                    return Some(from.clone());
+                } else {
+                    return Some(from.join(suffix));
+                }
+            }
+        }
+        None
+    }
+
+    /// Turn a regular path into the equivalent paths after applying registered grafts.
+    /// This is the inverse of ungrafted_path, but is one-to-many in this direction.
+    ///
+    /// With grafts of `foo->bar, foo->baz`, this turns `foo/file` into `[bar/file, baz/file]`.
+
+    pub fn grafted_paths(&self, path: &RepoPath) -> Vec<RepoPathBuf> {
+        // NB: we can assume we don't have overlappying "to"s since we validate in
+        // register_diff_graft.
+        self.diff_grafts
+            .iter()
+            .filter_map(|(from, to)| {
+                if let Some(suffix) = path.strip_prefix(from, true) {
+                    if from == to {
+                        None
+                    } else if suffix.is_empty() {
+                        Some(to.clone())
+                    } else {
+                        Some(to.join(suffix))
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Turn the regular local_path into the equivalent grafted path, inferring which
+    /// graft to use based on dest_path (making it a one-to-one mapping).
+    ///
+    /// With grafts of `foo->bar, foo->baz`, this turns `(foo/file, bar/something)` into `bar/file`.
+    pub fn grafted_path(&self, local_path: &RepoPath, dest_path: &RepoPath) -> Option<RepoPathBuf> {
+        for (from, to) in self.diff_grafts.iter().rev() {
+            if !dest_path.starts_with(to, true) {
+                continue;
+            }
+
+            // From here on, return unconditionally since `dest_path` can only match one
+            // `to` (since `to`s cannot overlap).
+
+            if from == to {
+                return None;
+            }
+
+            return match local_path.strip_prefix(from, true) {
+                None => None,
+                Some(suffix) => {
+                    if suffix.is_empty() {
+                        Some(to.clone())
+                    } else {
+                        Some(to.join(suffix))
+                    }
+                }
+            };
+        }
+        None
+    }
+
+    /// Turn a regular path into the containing grafts after applying registered grafts.
+    ///
+    /// With grafts `foo->bar, foo->baz`, this turns path `foo/file` into `[bar, baz]`.
+    pub fn grafted_dests(&self, path: &RepoPath) -> Vec<RepoPathBuf> {
+        // NB: we can assume we don't have overlappying "to"s since we validate in
+        // register_diff_graft.
+        self.diff_grafts
+            .iter()
+            .filter_map(|(from, to)| {
+                if path.starts_with(from, true) && from != to {
+                    Some(to.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Report whether this manifest has any registered diff grafts.
+    pub fn has_grafts(&self) -> bool {
+        !self.diff_grafts.is_empty()
+    }
+
+    /// Reports whether this manifest has been modified (in-memory).
+    pub fn is_dirty(&self) -> bool {
+        self.root.is_ephemeral() || !self.diff_grafts.is_empty()
+    }
+
     fn get_link(&self, path: &RepoPath) -> Result<Option<&Link>> {
         let mut cursor = &self.root;
         for (parent, component) in path.parents().zip(path.components()) {
@@ -688,6 +884,13 @@ pub fn compat_subtree_diff(
     Ok(state.result)
 }
 
+pub fn apply_diff_grafts(
+    m1: &TreeManifest,
+    m2: &TreeManifest,
+) -> Result<(TreeManifest, TreeManifest)> {
+    Ok((m1.apply_diff_grafts(m2)?, m2.apply_diff_grafts(m1)?))
+}
+
 /// Prefetch everything under given tree nodes, filtered by the given matcher.
 ///
 /// Server requests are only made for trees not already available locally.
@@ -710,9 +913,13 @@ pub fn init() {
 }
 
 #[cfg(test)]
+dev_logger::init!();
+
+#[cfg(test)]
 mod tests {
     use manifest::testutil::*;
     use manifest::FileType;
+    use pathmatcher::AlwaysMatcher;
     use store::Element;
     use storemodel::InsertOpts;
     use storemodel::Kind;
@@ -1559,5 +1766,259 @@ mod tests {
                 (path_component_buf("a2"), FsNodeMetadata::Directory(None)),
             ]),
         );
+    }
+
+    fn list_files(m: &TreeManifest) -> Vec<String> {
+        let mut files = m
+            .files(AlwaysMatcher::new())
+            .map(|f| Ok(f?.path.into_string()))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn test_graft() {
+        let mut tree = TreeManifest::ephemeral(Arc::new(TestStore::new()));
+        tree.insert(repo_path_buf("a"), make_meta("10")).unwrap();
+        tree.insert(repo_path_buf("dir/b"), make_meta("10"))
+            .unwrap();
+        tree.insert(repo_path_buf("dir/dir/c"), make_meta("10"))
+            .unwrap();
+
+        let mut grafted = tree.clone();
+        grafted
+            .graft(repo_path("dir"), &tree, repo_path("dir/dir"))
+            .unwrap();
+        // Graft overwrites existing tree - does not "overlay".
+        assert_eq!(list_files(&grafted), vec!["a", "dir/c"]);
+
+        // Other tree didn't change
+        assert_eq!(list_files(&tree), vec!["a", "dir/b", "dir/dir/c"]);
+
+        // Can graft over a file
+        let mut grafted = tree.clone();
+        grafted
+            .graft(repo_path("dir/b"), &tree, repo_path("dir/dir"))
+            .unwrap();
+        assert_eq!(list_files(&grafted), vec!["a", "dir/b/c", "dir/dir/c"]);
+
+        // Can insert empty directories
+        let mut grafted = tree.clone();
+        grafted
+            .graft(repo_path("dir"), &tree, repo_path("not_exist"))
+            .unwrap();
+        assert_eq!(list_files(&grafted), vec!["a"]);
+    }
+
+    fn grafted_diff(a: &TreeManifest, b: &TreeManifest) -> Vec<String> {
+        let (a, b) = apply_diff_grafts(a, b).unwrap();
+        let mut files = a
+            .diff(&b, &AlwaysMatcher::new())
+            .unwrap()
+            .map(|e| Ok(e?.path.into_string()))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn test_register_diff_graft_validation() {
+        let mut tree = TreeManifest::ephemeral(Arc::new(TestStore::new()));
+        // Test we don't allow overlapping "to" values in grafts.
+        assert!(
+            tree.register_diff_graft(repo_path("foo"), repo_path("bar"))
+                .is_ok()
+        );
+        assert!(
+            tree.register_diff_graft(repo_path("foo"), repo_path("baz"))
+                .is_ok()
+        );
+        assert!(
+            tree.register_diff_graft(repo_path("anything"), repo_path("bar"))
+                .is_err()
+        );
+        assert!(
+            tree.register_diff_graft(repo_path("anything"), repo_path("bar/anything"))
+                .is_err()
+        );
+        assert!(
+            tree.register_diff_graft(repo_path("anything"), repo_path(""))
+                .is_err()
+        );
+
+        let mut tree = TreeManifest::ephemeral(Arc::new(TestStore::new()));
+        assert!(
+            tree.register_diff_graft(repo_path("foo"), repo_path(""))
+                .is_ok()
+        );
+        assert!(
+            tree.register_diff_graft(repo_path("anything"), repo_path("anything"))
+                .is_err()
+        );
+
+        let mut tree = TreeManifest::ephemeral(Arc::new(TestStore::new()));
+        assert!(
+            tree.register_diff_graft(repo_path("foo"), repo_path("bar/one"))
+                .is_ok()
+        );
+        assert!(
+            tree.register_diff_graft(repo_path("foo"), repo_path("bar/two"))
+                .is_ok()
+        );
+        assert!(
+            tree.register_diff_graft(repo_path("foo"), repo_path("bar/two"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_graft_for_diff() {
+        let mut left = TreeManifest::ephemeral(Arc::new(TestStore::new()));
+        left.insert(repo_path_buf("left/a"), make_meta("10"))
+            .unwrap();
+        left.insert(repo_path_buf("left/b"), make_meta("10"))
+            .unwrap();
+        left.insert(repo_path_buf("left_only"), make_meta("10"))
+            .unwrap();
+
+        let mut right = TreeManifest::ephemeral(Arc::new(TestStore::new()));
+        right
+            .insert(repo_path_buf("right/b"), make_meta("10"))
+            .unwrap();
+        right
+            .insert(repo_path_buf("right/c"), make_meta("10"))
+            .unwrap();
+        right
+            .insert(repo_path_buf("right_only"), make_meta("10"))
+            .unwrap();
+
+        // Sanity with no grafts registered
+        assert_eq!(
+            grafted_diff(&left, &right),
+            vec![
+                "left/a",
+                "left/b",
+                "left_only",
+                "right/b",
+                "right/c",
+                "right_only",
+            ]
+        );
+        assert!(left.ungrafted_path(repo_path("right/b")).is_none());
+
+        // Now register a graft form left->right
+        left.register_diff_graft(repo_path("left"), repo_path("right"))
+            .unwrap();
+
+        assert_eq!(grafted_diff(&left, &right), vec!["right/a", "right/c"]);
+        assert_eq!(
+            left.ungrafted_path(repo_path("right/b")),
+            Some(repo_path_buf("left/b"))
+        );
+        assert!(right.ungrafted_path(repo_path("right/b")).is_none());
+
+        // Order doesn't matter
+        assert_eq!(grafted_diff(&right, &left), vec!["right/a", "right/c"]);
+
+        // Can graft same path again
+        left.register_diff_graft(repo_path("left"), repo_path("right-copy"))
+            .unwrap();
+
+        assert_eq!(
+            grafted_diff(&left, &right),
+            vec!["right-copy/a", "right-copy/b", "right/a", "right/c"]
+        );
+
+        // Can graft other side, too:
+
+        // This keeps "right" in place.
+        right
+            .register_diff_graft(repo_path("right"), repo_path("right"))
+            .unwrap();
+        // This grafts right into right-copy
+        right
+            .register_diff_graft(repo_path("right"), repo_path("right-copy"))
+            .unwrap();
+
+        assert_eq!(
+            grafted_diff(&left, &right),
+            vec!["right-copy/a", "right-copy/c", "right/a", "right/c"]
+        );
+        assert_eq!(
+            right.ungrafted_path(repo_path("right-copy/b")),
+            Some(repo_path_buf("right/b"))
+        );
+        assert!(right.ungrafted_path(repo_path("right/b")).is_none());
+        assert_eq!(
+            left.ungrafted_path(repo_path("right-copy/b")),
+            Some(repo_path_buf("left/b"))
+        );
+    }
+
+    #[test]
+    fn test_grafted_conversion() {
+        let mut tree = TreeManifest::ephemeral(Arc::new(TestStore::new()));
+        tree.insert(repo_path_buf("foo/a"), make_meta("10"))
+            .unwrap();
+
+        tree.register_diff_graft(repo_path("foo"), repo_path("bar"))
+            .unwrap();
+        tree.register_diff_graft(repo_path("foo"), repo_path("baz"))
+            .unwrap();
+        tree.register_diff_graft(repo_path("something"), repo_path("else"))
+            .unwrap();
+
+        assert_eq!(
+            tree.grafted_paths(repo_path("foo")),
+            &[repo_path_buf("bar"), repo_path_buf("baz")]
+        );
+        assert_eq!(
+            tree.grafted_dests(repo_path("foo")),
+            &[repo_path_buf("bar"), repo_path_buf("baz")]
+        );
+
+        assert_eq!(
+            tree.grafted_paths(repo_path("foo/a/b")),
+            &[repo_path_buf("bar/a/b"), repo_path_buf("baz/a/b")]
+        );
+        assert_eq!(
+            tree.grafted_dests(repo_path("foo/a/b")),
+            &[repo_path_buf("bar"), repo_path_buf("baz")]
+        );
+
+        assert!(
+            tree.grafted_path(repo_path("foo/a/b"), repo_path("nothing"))
+                .is_none()
+        );
+        assert_eq!(
+            tree.grafted_path(repo_path("foo/a/b"), repo_path("baz/something")),
+            Some(repo_path_buf("baz/a/b"))
+        );
+    }
+
+    #[test]
+    fn test_is_dirty() {
+        let mut tree = TreeManifest::ephemeral(Arc::new(TestStore::new()));
+
+        tree.insert(repo_path_buf("foo/bar/file"), make_meta("10"))
+            .unwrap();
+        assert!(tree.is_dirty());
+
+        let _ = tree.finalize(Vec::new()).unwrap();
+        assert!(!tree.is_dirty());
+
+        tree.insert(repo_path_buf("foo/bar/file"), make_meta("11"))
+            .unwrap();
+        assert!(tree.is_dirty());
+
+        let _ = tree.finalize(Vec::new()).unwrap();
+        assert!(!tree.is_dirty());
+
+        tree.register_diff_graft(repo_path("from"), repo_path("to"))
+            .unwrap();
+        assert!(tree.is_dirty());
     }
 }

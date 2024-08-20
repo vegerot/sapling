@@ -20,6 +20,7 @@
 #include "eden/common/utils/Throw.h"
 #include "eden/fs/model/Blob.h"
 #include "eden/fs/model/Tree.h"
+#include "eden/fs/model/TreeMetadata.h"
 #include "eden/fs/store/BackingStore.h"
 #include "eden/fs/store/LocalStore.h"
 #include "eden/fs/store/ObjectFetchContext.h"
@@ -232,6 +233,7 @@ ImmediateFuture<shared_ptr<const Tree>> ObjectStore::getTree(
     const ObjectFetchContextPtr& fetchContext) const {
   TaskTraceBlock block{"ObjectStore::getTree"};
   DurationScope<EdenStats> statScope{stats_, &ObjectStoreStats::getTree};
+  folly::stop_watch<std::chrono::milliseconds> watch;
 
   // TODO: We should consider checking if we have in flight BackingStore
   // requests on this layer instead of only in the BackingStore. Consider the
@@ -250,13 +252,14 @@ ImmediateFuture<shared_ptr<const Tree>> ObjectStore::getTree(
         ObjectFetchContext::Tree, id, ObjectFetchContext::FromMemoryCache);
 
     updateProcessFetch(*fetchContext);
-
+    stats_->addDuration(
+        &ObjectStoreStats::getTreeMemoryDuration, watch.elapsed());
     return changeCaseSensitivity(std::move(maybeTree), caseSensitive_);
   }
 
   deprioritizeWhenFetchHeavy(*fetchContext);
 
-  return ImmediateFuture{getTreeImpl(id, fetchContext)}.thenValue(
+  return ImmediateFuture{getTreeImpl(id, fetchContext, watch)}.thenValue(
       [self = shared_from_this(),
        statScope = std::move(statScope),
        id,
@@ -272,7 +275,8 @@ ImmediateFuture<shared_ptr<const Tree>> ObjectStore::getTree(
 
 folly::SemiFuture<BackingStore::GetTreeResult> ObjectStore::getTreeImpl(
     const ObjectId& id,
-    const ObjectFetchContextPtr& context) const {
+    const ObjectFetchContextPtr& context,
+    folly::stop_watch<std::chrono::milliseconds> watch) const {
   auto localStoreGetTree = ImmediateFuture<TreePtr>{std::in_place, nullptr};
   if (shouldCacheOnDisk(BackingStore::LocalStoreCachingPolicy::Trees)) {
     // Check Local Store first
@@ -280,11 +284,14 @@ folly::SemiFuture<BackingStore::GetTreeResult> ObjectStore::getTreeImpl(
   }
   return std::move(localStoreGetTree)
       .thenValue(
-          [self = shared_from_this(), id = id, context = context.copy()](
+          [self = shared_from_this(), id = id, context = context.copy(), watch](
               TreePtr tree) mutable
           -> ImmediateFuture<BackingStore::GetTreeResult> {
             if (tree) {
               self->stats_->increment(&ObjectStoreStats::getTreeFromLocalStore);
+              self->stats_->addDuration(
+                  &ObjectStoreStats::getTreeLocalstoreDuration,
+                  watch.elapsed());
               return BackingStore::GetTreeResult{
                   std::move(tree), ObjectFetchContext::FromDiskCache};
             }
@@ -293,7 +300,7 @@ folly::SemiFuture<BackingStore::GetTreeResult> ObjectStore::getTreeImpl(
                 // TODO: This is a good use for toUnsafeFuture to ensure the
                 // tree is cached even if the resulting future is never
                 // consumed.
-                .thenValue([self](BackingStore::GetTreeResult result) {
+                .thenValue([self, watch](BackingStore::GetTreeResult result) {
                   auto batch = self->localStore_->beginWrite();
                   if (self->shouldCacheOnDisk(
                           BackingStore::LocalStoreCachingPolicy::Trees)) {
@@ -319,6 +326,9 @@ folly::SemiFuture<BackingStore::GetTreeResult> ObjectStore::getTreeImpl(
                   batch->flush();
                   self->stats_->increment(
                       &ObjectStoreStats::getTreeFromBackingStore);
+                  self->stats_->addDuration(
+                      &ObjectStoreStats::getTreeBackingstoreDuration,
+                      watch.elapsed());
                   return result;
                 })
                 .thenError(
@@ -329,6 +339,69 @@ folly::SemiFuture<BackingStore::GetTreeResult> ObjectStore::getTreeImpl(
                       return makeImmediateFuture<BackingStore::GetTreeResult>(
                           ew);
                     });
+          })
+      .semi();
+}
+
+ImmediateFuture<TreeMetadata> ObjectStore::getTreeMetadata(
+    const ObjectId& id,
+    const ObjectFetchContextPtr& fetchContext) const {
+  DurationScope<EdenStats> statScope{
+      stats_, &ObjectStoreStats::getTreeMetadata};
+
+  // TODO(cuev): Check in-memory cache
+
+  deprioritizeWhenFetchHeavy(*fetchContext);
+
+  return ImmediateFuture<BackingStore::GetTreeMetaResult>{
+      getTreeMetadataImpl(id, fetchContext)}
+      .thenValue(
+          [self = shared_from_this(),
+           fetchContext = fetchContext.copy(),
+           id,
+           statScope =
+               std::move(statScope)](BackingStore::GetTreeMetaResult result)
+              -> ImmediateFuture<TreeMetadata> {
+            if (!result.treeMeta) {
+              self->stats_->increment(&ObjectStoreStats::getTreeMetadataFailed);
+              XLOGF(DBG4, "unable to find aux data for {}", id);
+              throwf<std::domain_error>("aux data for {} not found", id);
+            }
+            auto metadata = std::move(result.treeMeta);
+            // TODO(cuev): Write back to caches
+            fetchContext->didFetch(
+                ObjectFetchContext::TreeMetadata, id, result.origin);
+            self->updateProcessFetch(*fetchContext);
+            return *metadata;
+          });
+}
+
+folly::SemiFuture<BackingStore::GetTreeMetaResult>
+ObjectStore::getTreeMetadataImpl(
+    const ObjectId& id,
+    const ObjectFetchContextPtr& context) const {
+  // TODO(cuev): Look in the LocalStore for TreeMetadata
+
+  return ImmediateFuture{backingStore_->getTreeMetadata(id, context)}
+      .thenValue(
+          [self = shared_from_this(), id, context = context.copy()](
+              BackingStore::GetTreeMetaResult result)
+              -> ImmediateFuture<BackingStore::GetTreeMetaResult> {
+            if (result.treeMeta) {
+              self->stats_->increment(
+                  &ObjectStoreStats::getTreeMetadataFromBackingStore);
+              return result;
+            }
+            self->stats_->increment(&ObjectStoreStats::getTreeMetadataFailed);
+            return BackingStore::GetTreeMetaResult{
+                nullptr, ObjectFetchContext::Origin::NotFetched};
+          })
+      .thenError(
+          [self = shared_from_this(), id](const folly::exception_wrapper& ew)
+              -> ImmediateFuture<BackingStore::GetTreeMetaResult> {
+            self->stats_->increment(&ObjectStoreStats::getTreeMetadataFailed);
+            XLOGF(DBG4, "unable to find aux data for {}", id);
+            return makeImmediateFuture<BackingStore::GetTreeMetaResult>(ew);
           })
       .semi();
 }
@@ -426,7 +499,6 @@ std::optional<BlobMetadata> ObjectStore::getBlobMetadataFromInMemoryCache(
     auto metadataCache = metadataCache_.wlock();
     auto cacheIter = metadataCache->find(id);
     if (cacheIter != metadataCache->end()) {
-      stats_->increment(&ObjectStoreStats::getBlobMetadataFromMemory);
       context->didFetch(
           ObjectFetchContext::BlobMetadata,
           id,
@@ -445,6 +517,7 @@ ImmediateFuture<BlobMetadata> ObjectStore::getBlobMetadata(
     bool blake3Needed) const {
   DurationScope<EdenStats> statScope{
       stats_, &ObjectStoreStats::getBlobMetadata};
+  folly::stop_watch<std::chrono::milliseconds> watch;
 
   // Check in-memory cache
   auto inMemoryCacheBlobMetadata =
@@ -455,24 +528,31 @@ ImmediateFuture<BlobMetadata> ObjectStore::getBlobMetadata(
           .thenValue(
               [self = shared_from_this(),
                id,
-               metadata = std::move(inMemoryCacheBlobMetadata).value()](
-                  auto&& blob) mutable -> ImmediateFuture<BlobMetadata> {
+               metadata = std::move(inMemoryCacheBlobMetadata).value(),
+               watch](auto&& blob) mutable -> ImmediateFuture<BlobMetadata> {
                 auto blake3 = self->computeBlake3(*blob);
                 // updating the metadata with the computed blake3 hash and
                 // update the cache
                 metadata.blake3.emplace(blake3);
                 self->metadataCache_.wlock()->set(id, metadata);
+                self->stats_->increment(
+                    &ObjectStoreStats::getBlobMetadataFromBlob);
+                self->stats_->addDuration(
+                    &ObjectStoreStats::getBlobMetadataFromBlobDuration,
+                    watch.elapsed());
                 return metadata;
               });
     }
-
+    stats_->increment(&ObjectStoreStats::getBlobMetadataFromMemory);
+    stats_->addDuration(
+        &ObjectStoreStats::getBlobMetadataMemoryDuration, watch.elapsed());
     return std::move(inMemoryCacheBlobMetadata).value();
   }
 
   deprioritizeWhenFetchHeavy(*fetchContext);
 
   return ImmediateFuture<BackingStore::GetBlobMetaResult>{
-      getBlobMetadataImpl(id, fetchContext)}
+      getBlobMetadataImpl(id, fetchContext, watch)}
       .thenValue(
           [self = shared_from_this(),
            fetchContext = fetchContext.copy(),
@@ -516,7 +596,8 @@ ImmediateFuture<BlobMetadata> ObjectStore::getBlobMetadata(
 folly::SemiFuture<BackingStore::GetBlobMetaResult>
 ObjectStore::getBlobMetadataImpl(
     const ObjectId& id,
-    const ObjectFetchContextPtr& context) const {
+    const ObjectFetchContextPtr& context,
+    folly::stop_watch<std::chrono::milliseconds> watch) const {
   auto localStoreGetBlobMetadata =
       ImmediateFuture<BlobMetadataPtr>{std::in_place, nullptr};
   if (shouldCacheOnDisk(BackingStore::LocalStoreCachingPolicy::BlobMetadata)) {
@@ -525,12 +606,15 @@ ObjectStore::getBlobMetadataImpl(
 
   return std::move(localStoreGetBlobMetadata)
       .thenValue(
-          [self = shared_from_this(), id = id, context = context.copy()](
+          [self = shared_from_this(), id = id, context = context.copy(), watch](
               BlobMetadataPtr metadata) mutable
           -> ImmediateFuture<BackingStore::GetBlobMetaResult> {
             if (metadata) {
               self->stats_->increment(
                   &ObjectStoreStats::getBlobMetadataFromLocalStore);
+              self->stats_->addDuration(
+                  &ObjectStoreStats::getBlobMetadataLocalstoreDuration,
+                  watch.elapsed());
               return BackingStore::GetBlobMetaResult{
                   std::move(metadata), ObjectFetchContext::FromDiskCache};
             }
@@ -538,7 +622,7 @@ ObjectStore::getBlobMetadataImpl(
             return ImmediateFuture{
                 self->backingStore_->getBlobMetadata(id, context)}
                 .thenValue(
-                    [self, id, context = context.copy()](
+                    [self, id, context = context.copy(), watch](
                         BackingStore::GetBlobMetaResult result)
                         -> ImmediateFuture<BackingStore::GetBlobMetaResult> {
                       if (result.blobMeta &&
@@ -546,12 +630,17 @@ ObjectStore::getBlobMetadataImpl(
                               kZeroHash) { // from eden/fs/model/Hash.cpp
                         self->stats_->increment(
                             &ObjectStoreStats::getBlobMetadataFromBackingStore);
+                        self->stats_->addDuration(
+                            &ObjectStoreStats::
+                                getBlobMetadataBackingstoreDuration,
+                            watch.elapsed());
                         return result;
                       }
 
                       return ImmediateFuture{self->getBlobImpl(id, context)}
                           .thenValue([self,
-                                      backingStoreResult = std::move(result)](
+                                      backingStoreResult = std::move(result),
+                                      watch](
                                          BackingStore::GetBlobResult result) {
                             if (result.blob) {
                               self->stats_->increment(
@@ -564,6 +653,11 @@ ObjectStore::getBlobMetadataImpl(
                                 blake3 =
                                     backingStoreResult.blobMeta->blake3.value();
                               }
+
+                              self->stats_->addDuration(
+                                  &ObjectStoreStats::
+                                      getBlobMetadataFromBlobDuration,
+                                  watch.elapsed());
 
                               return BackingStore::GetBlobMetaResult{
                                   std::make_shared<BlobMetadata>(

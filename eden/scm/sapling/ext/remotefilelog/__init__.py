@@ -189,15 +189,6 @@ def uisetup(ui):
     extensions.wrapcommand(commands.table, "pull", pull)
     extensions.wrapfunction(bundle2, "getrepocaps", getrepocaps)
 
-    # Prevent 'hg manifest --all'
-    def _manifest(orig, ui, repo, *args, **opts):
-        if shallowrepo.requirement in repo.requirements and opts.get("all"):
-            raise error.Abort(_("--all is not supported in a shallow repo"))
-
-        return orig(ui, repo, *args, **opts)
-
-    extensions.wrapcommand(commands.table, "manifest", _manifest)
-
     # Wrap remotefilelog with lfs code
     def _lfsloaded(loaded=False):
         lfsmod = None
@@ -336,8 +327,9 @@ def onetimeclientsetup(ui):
         if shallowrepo.requirement in repo.requirements:
             manifest = mctx.manifest()
             files = []
-            for f, args, msg in actions["g"]:
-                files.append((f, manifest[f]))
+            for _f, args, msg in actions["g"]:
+                f2 = args[0]
+                files.append((f2, manifest[f2]))
             # batch fetch the needed files from the server
             repo.fileservice.prefetch(files, fetchhistory=False)
         return orig(
@@ -354,9 +346,12 @@ def onetimeclientsetup(ui):
             for f, (m, actionargs, msg) in pycompat.iteritems(actions):
                 if sparsematch and not sparsematch(f):
                     continue
-                if m in ("c", "dc", "cm"):
+                if m == "c":
                     files.append((f, mctx.filenode(f)))
-                elif m == "dg":
+                elif m == "dc":
+                    f2 = actionargs[1]
+                    files.append((f, mctx.filenode(f2)))
+                elif m in ("dg", "cm"):
                     f2 = actionargs[0]
                     files.append((f2, mctx.filenode(f2)))
             # We need history for the files so we can compute the sha(p1, p2,

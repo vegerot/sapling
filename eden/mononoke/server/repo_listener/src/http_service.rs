@@ -34,6 +34,7 @@ use http::Uri;
 use hyper::service::Service;
 use hyper::Body;
 use metadata::Metadata;
+use mononoke_api::Repo;
 use percent_encoding::percent_decode;
 use qps::Qps;
 use session_id::generate_session_id;
@@ -333,7 +334,7 @@ where
 
         if path == "/drop_bookmarks_cache" {
             for repo in self.acceptor().mononoke.repos() {
-                repo.blob_repo().bookmarks().drop_caches();
+                repo.bookmarks().drop_caches();
             }
 
             return Ok(ok);
@@ -384,7 +385,7 @@ where
         Ok(res)
     }
 
-    fn acceptor(&self) -> &Acceptor {
+    fn acceptor(&self) -> &Acceptor<Repo> {
         &self.conn.pending.acceptor
     }
 

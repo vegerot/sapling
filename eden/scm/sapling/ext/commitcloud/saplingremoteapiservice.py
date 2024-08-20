@@ -5,6 +5,8 @@
 
 from __future__ import absolute_import
 
+import time
+
 from bindings import clientinfo as clientinfomod
 
 # Standard Library
@@ -164,7 +166,32 @@ class SaplingRemoteAPIService(baseservice.BaseService):
         )
 
     def getsmartlog(self, reponame, workspace, repo, limit, flags=[]):
-        return self.fallback.getsmartlog(reponame, workspace, repo, limit, flags)
+        self.ui.debug("sending 'get_smartlog' request\n", component="commitcloud")
+
+        data = {
+            "reponame": reponame,
+            "workspace": workspace,
+            "flags": self._map_legacy_flags(flags),
+        }
+        response = self.repo.edenapi.cloudsmartlog(data)
+
+        smartlog = self._getdatafromresponse(response)
+        if limit != 0:
+            cutoff = int(time.time()) - limit
+            smartlog["nodes"] = list(
+                filter(lambda x: x["date"] >= cutoff, smartlog["nodes"])
+            )
+        self.ui.debug(
+            "'get_smartlog' returns %d entries\n" % len(smartlog["nodes"]),
+            component="commitcloud",
+        )
+        for nodeinfo in smartlog["nodes"]:
+            nodeinfo["node"] = nodeinfo["node"].hex()
+            nodeinfo["parents"] = list(map(lambda x: x.hex(), nodeinfo["parents"]))
+        try:
+            return self._makesmartloginfo(smartlog)
+        except Exception as e:
+            raise error.UnexpectedError(self.ui, e)
 
     def getsmartlogbyversion(
         self, reponame, workspace, repo, date, version, limit, flags=[]
@@ -181,7 +208,16 @@ class SaplingRemoteAPIService(baseservice.BaseService):
         )
 
     def getworkspaces(self, reponame, prefix):
-        return self.fallback.getworkspaces(reponame, prefix)
+        """Fetch Commit Cloud workspaces for the given prefix"""
+        self.ui.debug(
+            "sending 'get_workspaces' request on Sapling Remote API\n",
+            component="commitcloud",
+        )
+
+        response = self.repo.edenapi.cloudworkspaces(prefix, reponame)
+        # Put everything into "workspaces" key, so it's easier to parse in the client
+        workspaces = {"workspaces": self._getdatafromresponse(response)}
+        return self._makeworkspacesinfo(workspaces)
 
     def getworkspace(self, reponame, workspacename):
         self.ui.debug(
@@ -204,15 +240,40 @@ class SaplingRemoteAPIService(baseservice.BaseService):
 
     def updateworkspacearchive(self, reponame, workspace, archived):
         """Archive or Restore the given workspace"""
-        return self.fallback.updateworkspacearchive(reponame, workspace, archived)
+        self.ui.debug(
+            "sending 'update_workspace_archive' request on SaplingRemoteAPI\n",
+            component="commitcloud",
+        )
+
+        data = {"reponame": reponame, "workspace": workspace, "archived": archived}
+        self.repo.edenapi.cloudupdatearchive(data)
 
     def renameworkspace(self, reponame, workspace, new_workspace):
         """Rename the given workspace"""
-        return self.fallback.renameworkspace(reponame, workspace, new_workspace)
+        self.ui.debug(
+            "sending 'rename_workspace' request on SaplingRemoteAPI\n",
+            component="commitcloud",
+        )
+
+        data = {
+            "reponame": reponame,
+            "workspace": workspace,
+            "new_workspace": new_workspace,
+        }
+        self._getdatafromresponse(self.repo.edenapi.cloudrenameworkspace(data))
 
     def shareworkspace(self, reponame, workspace):
         """Enable sharing for the given workspace"""
-        return self.fallback.shareworkspace(reponame, workspace)
+        self.ui.debug(
+            "sending 'share_workspace' request through Sapling Remote API\n",
+            component="commitcloud",
+        )
+        data = {
+            "reponame": reponame,
+            "workspace": workspace,
+        }
+        response = self.repo.edenapi.cloudshareworkspace(data)
+        return self._getdatafromresponse(response)
 
     def rollbackworkspace(self, reponame, workspace, version):
         """Rollback the given workspace to a specific version"""
@@ -221,6 +282,9 @@ class SaplingRemoteAPIService(baseservice.BaseService):
     def cleanupworkspace(self, reponame, workspace):
         """Cleanup unnecessary remote bookmarks from the given workspace"""
         return self.fallback.cleanupworkspace(reponame, workspace)
+
+    def gethistoricalversions(self, reponame, workspace):
+        return self.fallback.gethistoricalversions(reponame, workspace)
 
     def _castreferences(self, refs):
         """
@@ -260,3 +324,20 @@ class SaplingRemoteAPIService(baseservice.BaseService):
         else:
             version = response["version"]
         return version
+
+    def _getdatafromresponse(self, response):
+        if "data" in response:
+            if "Ok" in response["data"]:
+                return response["data"]["Ok"]
+            else:
+                raise error.Abort(response["data"]["Err"]["message"])
+
+        raise error.Abort("No data revceived from server")
+
+    def _map_legacy_flags(self, strings):
+        mapping = {
+            "ADD_REMOTE_BOOKMARKS": "AddRemoteBookmarks",
+            "ADD_ALL_BOOKMARKS": "AddAllBookmarks",
+            "SKIP_PUBLIC_COMMITS_METADATA": "SkipPublicCommitsMetadata",
+        }
+        return [mapping[s] for s in strings]

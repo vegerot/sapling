@@ -218,7 +218,6 @@ def uisetup(ui):
     )
     extensions.wrapfunction(debugcommands, "_debugbundle2part", _debugbundle2part)
     extensions.wrapfunction(repair, "_collectfiles", collectfiles)
-    extensions.wrapfunction(repair, "striptrees", striptrees)
     extensions.wrapfunction(repair, "_collectmanifest", _collectmanifest)
     extensions.wrapfunction(repair, "stripmanifest", stripmanifest)
     extensions.wrapfunction(bundle2, "_addpartsfromopts", _addpartsfromopts)
@@ -549,7 +548,17 @@ class basetreemanifestlog:
         if node == nullid or self._isgit or self._iseager:
             return treemanifestctx(self, dir, node)
         if node in self._treemanifestcache:
-            return self._treemanifestcache[node]
+            m = self._treemanifestcache[node]
+            if m.dirty():
+                # Manifest has been modified in memory - don't share it.
+                del self._treemanifestcache[node]
+            else:
+                # Manifest is clean. Copy it so mutations aren't shared between
+                # objects accidentally. Since the manifest is clean, this should
+                # be a cheap, shallow copy.
+                if m._tree:
+                    m._tree = m._tree.copy()
+                return m
 
         store = self.datastore
 
@@ -585,7 +594,7 @@ class basetreemanifestlog:
             )
             self.datastore = self.treescmstore
             self.historystore = revisionstore.metadatastore(
-                self._repo.svfs.vfs.base,
+                self._repo.svfs.base,
                 self.ui._rcfg,
                 remotestore,
                 None,
@@ -714,6 +723,9 @@ class treemanifestctx:
 
     def find(self, key):
         return self.read().find(key)
+
+    def dirty(self):
+        return self._tree and self._tree.dirty()
 
 
 class memtreemanifestctx:
@@ -1707,11 +1719,6 @@ def collectfiles(orig, repo, striprev):
             files.update(repo[x].files())
 
     return sorted(files)
-
-
-def striptrees(orig, repo, tr, striprev, files):
-    if not treeenabled(repo.ui):
-        return orig(repo, tr, striprev, files)
 
 
 def _addpartsfromopts(orig, ui, repo, bundler, source, outgoing, *args, **kwargs):

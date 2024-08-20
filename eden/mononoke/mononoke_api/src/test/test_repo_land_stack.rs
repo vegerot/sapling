@@ -29,7 +29,9 @@ use crate::repo::BookmarkFreshness;
 use crate::repo::Repo;
 use crate::repo::RepoContext;
 
-async fn init_repo(ctx: &CoreContext) -> Result<(RepoContext, BTreeMap<String, ChangesetId>)> {
+async fn init_repo(
+    ctx: &CoreContext,
+) -> Result<(RepoContext<Repo>, BTreeMap<String, ChangesetId>)> {
     let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
     let changesets = create_from_dag(
         ctx,
@@ -148,7 +150,7 @@ async fn land_stack(fb: FacebookInit) -> Result<()> {
 
     // Check the bookmark moves created BookmarkLogUpdate entries
     let entries = repo
-        .blob_repo()
+        .repo()
         .bookmark_update_log()
         .list_bookmark_log_entries(
             ctx.clone(),

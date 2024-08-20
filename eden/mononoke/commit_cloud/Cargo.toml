@@ -21,6 +21,7 @@ commit_cloud_helpers = { version = "0.1.0", path = "helpers" }
 context = { version = "0.1.0", path = "../server/context" }
 edenapi_types = { version = "0.1.0", path = "../../scm/lib/edenapi/types" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 mercurial_types = { version = "0.1.0", path = "../mercurial/types" }
 metaconfig_types = { version = "0.1.0", path = "../metaconfig/types" }
 mononoke_types = { version = "0.1.0", path = "../mononoke_types" }
@@ -33,6 +34,6 @@ sql_construct = { version = "0.1.0", path = "../common/sql_construct" }
 sql_ext = { version = "0.1.0", path = "../common/rust/sql_ext" }
 
 [dev-dependencies]
-fbinit = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 once_cell = "1.12"

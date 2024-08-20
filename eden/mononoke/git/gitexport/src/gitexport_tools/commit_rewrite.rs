@@ -31,17 +31,19 @@ use futures::stream::TryStreamExt;
 use futures::stream::{self};
 use futures::StreamExt;
 use git_types::MappedGitCommitId;
-use git_types::RootGitDeltaManifestId;
+use git_types::RootGitDeltaManifestV2Id;
 use git_types::TreeHandle;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use maplit::hashmap;
 use maplit::hashset;
 use metaconfig_types::DerivedDataTypesConfig;
+use metaconfig_types::GitDeltaManifestV2Config;
 use mononoke_api::BookmarkKey;
 use mononoke_api::ChangesetContext;
 use mononoke_api::CoreContext;
 use mononoke_api::MononokeError;
+use mononoke_api::MononokeRepo;
 use mononoke_api::Repo;
 use mononoke_api::RepoContext;
 use mononoke_types::BonsaiChangeset;
@@ -73,8 +75,8 @@ pub use crate::partial_commit_graph::GitExportGraphInfo;
 
 pub const MASTER_BOOKMARK: &str = "heads/master";
 
-struct ChangesetRewriteInfo {
-    changeset_context: ChangesetContext,
+struct ChangesetRewriteInfo<R> {
+    changeset_context: ChangesetContext<R>,
     export_paths: Vec<NonRootMPath>,
     implicit_deletes: Vec<Vec<NonRootMPath>>,
 }
@@ -82,13 +84,13 @@ struct ChangesetRewriteInfo {
 /// Given a list of changesets, their parents and a list of paths, create
 /// copies in a target mononoke repository containing only changes that
 /// were made on the given paths.
-pub async fn rewrite_partial_changesets(
+pub async fn rewrite_partial_changesets<R: MononokeRepo>(
     fb: FacebookInit,
-    source_repo_ctx: RepoContext,
-    graph_info: GitExportGraphInfo,
-    export_paths: Vec<ExportPathInfo>,
+    source_repo_ctx: RepoContext<R>,
+    graph_info: GitExportGraphInfo<R>,
+    export_paths: Vec<ExportPathInfo<R>>,
     implicit_delete_prefetch_buffer_size: usize,
-) -> Result<RepoContext> {
+) -> Result<RepoContext<Repo>> {
     let source_repo_ctx = Arc::new(source_repo_ctx);
     let ctx = source_repo_ctx.ctx().clone();
     let changesets = graph_info.changesets;
@@ -122,7 +124,7 @@ pub async fn rewrite_partial_changesets(
         .map(|cs| {
             cloned!(source_repo_ctx, export_paths);
 
-            let blobstore = source_repo_ctx.blob_repo().repo_blobstore_arc();
+            let blobstore = source_repo_ctx.repo().repo_blobstore_arc();
             async move {
                 task::spawn(async move {
                     let ctx = source_repo_ctx.ctx();
@@ -225,16 +227,16 @@ pub async fn rewrite_partial_changesets(
 
                     run_and_log_stats_to_scuba(
                         ctx,
-                        "Deriving RootGitDeltaManifestId",
+                        "Deriving RootGitDeltaManifestV2Id",
                         temp_repo_ctx
                             .repo()
                             .repo_derived_data()
-                            .derive::<RootGitDeltaManifestId>(ctx, new_bcs_id),
+                            .derive::<RootGitDeltaManifestV2Id>(ctx, new_bcs_id),
                     )
                     .await
                     .with_context(|| {
                         format!(
-                            "Error in deriving RootGitDeltaManifestId for Bonsai commit {:?}",
+                            "Error in deriving RootGitDeltaManifestV2Id for Bonsai commit {:?}",
                             new_bcs_id
                         )
                     })?;
@@ -273,12 +275,12 @@ pub async fn rewrite_partial_changesets(
 
 /// Given a changeset and a set of paths being exported, build the
 /// BonsaiChangeset containing only the changes to those paths.
-async fn create_bonsai_for_new_repo<'a>(
-    source_repo_ctx: &RepoContext,
+async fn create_bonsai_for_new_repo<'a, R: MononokeRepo>(
+    source_repo_ctx: &RepoContext<R>,
     multi_mover: MultiMover<'_>,
     changeset_parents: &ChangesetParents,
     mut remapped_parents: HashMap<ChangesetId, ChangesetId>,
-    changeset_ctx: ChangesetContext,
+    changeset_ctx: ChangesetContext<R>,
     export_paths: &'a [NonRootMPath],
     mut export_paths_not_created: HashSet<NonRootMPath>,
     implicit_deletes: Vec<Vec<NonRootMPath>>,
@@ -290,7 +292,7 @@ async fn create_bonsai_for_new_repo<'a>(
     ),
     MononokeError,
 > {
-    let logger = changeset_ctx.repo().ctx().logger();
+    let logger = changeset_ctx.ctx().logger();
     trace!(
         logger,
         "Rewriting changeset: {:#?} | {:#?}",
@@ -298,7 +300,7 @@ async fn create_bonsai_for_new_repo<'a>(
         &changeset_ctx.message().await?
     );
 
-    let blobstore = source_repo_ctx.blob_repo().repo_blobstore_arc();
+    let blobstore = source_repo_ctx.repo().repo_blobstore_arc();
     let bcs: BonsaiChangeset = changeset_ctx
         .id()
         .load(source_repo_ctx.ctx(), &blobstore)
@@ -437,9 +439,9 @@ async fn create_bonsai_for_new_repo<'a>(
 
 /// Builds a vector of references to the paths that should be exported when
 /// rewriting the provided changeset based on each export path's head commit.
-async fn get_export_paths_for_changeset<'a>(
-    processed_cs: &ChangesetContext,
-    export_path_infos: &'a Vec<ExportPathInfo>,
+async fn get_export_paths_for_changeset<'a, R: MononokeRepo>(
+    processed_cs: &ChangesetContext<R>,
+    export_path_infos: &'a Vec<ExportPathInfo<R>>,
 ) -> Result<Vec<NonRootMPath>> {
     // Get the export paths for the changeset being processed considering its
     // head commit.
@@ -511,7 +513,7 @@ fn build_multi_mover_for_changeset<'a>(
 /// directories.
 /// The temporary repo uses file-backed storage and does not perform any writes
 /// to the Mononoke instance provided to the tool (e.g. production Mononoke).
-async fn create_temp_repo(fb: FacebookInit, ctx: &CoreContext) -> Result<RepoContext, Error> {
+async fn create_temp_repo(fb: FacebookInit, ctx: &CoreContext) -> Result<RepoContext<Repo>, Error> {
     let logger = ctx.logger();
     let system_tmp = env::temp_dir();
     let temp_dir_suffix = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
@@ -540,15 +542,19 @@ async fn create_temp_repo(fb: FacebookInit, ctx: &CoreContext) -> Result<RepoCon
             ChangesetInfo::VARIANT,
             MappedGitCommitId::VARIANT,
             TreeHandle::VARIANT,
-            RootGitDeltaManifestId::VARIANT,
+            RootGitDeltaManifestV2Id::VARIANT,
             RootUnodeManifestId::VARIANT,
         },
+        git_delta_manifest_v2_config: Some(GitDeltaManifestV2Config {
+            max_inlined_object_size: 2_000,
+            max_inlined_delta_size: 2_000,
+            delta_chunk_size: 1_000_000,
+        }),
         ..Default::default()
     };
 
     let available_configs = hashmap! {
         "default".to_string() => derived_data_types_config.clone(),
-        "backfilling".to_string() => derived_data_types_config
     };
     let mut factory = TestRepoFactory::with_sqlite_connection(fb, metadata_conn, hg_mutation_conn)?;
     factory

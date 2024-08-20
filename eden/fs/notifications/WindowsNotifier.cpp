@@ -22,10 +22,12 @@
 #include <folly/futures/Future.h>
 #include <folly/portability/Windows.h>
 
+#include "eden/common/telemetry/StructuredLogger.h"
 #include "eden/common/utils/SpawnedProcess.h"
 #include "eden/common/utils/StringConv.h"
 #include "eden/common/utils/SystemError.h"
 #include "eden/fs/config/EdenConfig.h"
+#include "eden/fs/telemetry/LogEvent.h"
 
 namespace facebook::eden {
 namespace {
@@ -460,10 +462,11 @@ WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) noexcept {
             // is prerable to listening to mouse clicks and key presses
             // directly.
           case WM_CONTEXTMENU: {
+            auto notifier = getWindowsNotifier(hwnd);
+            notifier->logEvent(EMenuActionEvent{EMenuActionEvent::EMenuClick});
             POINT pt = {};
             pt.x = GET_X_LPARAM(wParam);
             pt.y = GET_Y_LPARAM(wParam);
-            auto notifier = getWindowsNotifier(hwnd);
             notifier->showContextMenu(hwnd, pt);
           } break;
         }
@@ -581,9 +584,11 @@ void cacheIconImages() {
 
 WindowsNotifier::WindowsNotifier(
     std::shared_ptr<ReloadableConfig> edenConfig,
+    std::shared_ptr<StructuredLogger> logger,
     std::string_view version,
     std::chrono::time_point<std::chrono::steady_clock> startTime)
     : Notifier(std::move(edenConfig)),
+      structuredLogger_{std::move(logger)},
       guid_{
           version == "(dev build)" ? std::nullopt
                                    : std::optional<Guid>(EMenuGuid)},
@@ -648,6 +653,13 @@ void WindowsNotifier::updateIconColor(std::optional<size_t> numActive) {
     changeIconColor(IDI_ONOTIFICATIONICON);
   } else {
     changeIconColor(getDefaultIcon());
+  }
+}
+
+template <typename Event>
+void WindowsNotifier::logEvent(const Event& event) {
+  if (structuredLogger_) {
+    structuredLogger_->logEvent(event);
   }
 }
 

@@ -63,7 +63,7 @@ fn last_chance_to_abort(early: &HgGlobalOpts, full: &HgGlobalOpts) -> Result<()>
     // parse.
     abort_if!(
         early.config != full.config,
-        "option --config may not be abbreviated or used in aliases",
+        "option --config may not be abbreviated, used in aliases, or used as a value for another option",
     );
 
     abort_if!(
@@ -98,7 +98,7 @@ fn early_parse(args: &[String]) -> Result<ParseOutput, ParseError> {
         .parse_args(args)
 }
 
-fn parse(definition: &CommandDefinition, args: &Vec<String>) -> Result<ParseOutput, ParseError> {
+fn parse(definition: &CommandDefinition, args: &[String]) -> Result<ParseOutput, ParseError> {
     let flags = definition
         .flags()
         .into_iter()
@@ -243,21 +243,27 @@ impl Dispatcher {
         configloader::hg::load(None, &pinned_configs(&self.early_global_opts))
     }
 
-    fn default_command(&self) -> Result<String, UnknownCommand> {
-        // Passing in --verbose also disables this behavior,
+    fn default_command(&self) -> Result<String> {
+        // Passing in --version also disables this behavior,
         // but that option is handled somewhere else
         if self.early_global_opts.help || hgplain::is_plain(None) {
-            return Err(errors::UnknownCommand(String::new()));
+            return Err(UnknownCommand(String::new()).into());
         }
-        Ok(if let OptionalRepo::Some(repo) = &self.optional_repo {
-            repo.config().get("commands", "naked-default.in-repo")
-        } else {
-            self.optional_repo
-                .config()
-                .get("commands", "naked-default.no-repo")
+
+        let config = self.optional_repo.config();
+        let no_repo_command = config.get_nonempty("commands", "naked-default.no-repo");
+        let in_repo_command = config.get_nonempty("commands", "naked-default.in-repo");
+
+        match (
+            self.optional_repo.has_repo(),
+            no_repo_command,
+            in_repo_command,
+        ) {
+            (false, Some(command), _) => Ok(command.to_string()),
+            (true, _, None) => Err(errors::CommandRequired.into()),
+            (false, None, None) => Err(UnknownCommand(String::new()).into()),
+            (true, _, Some(command)) | (false, None, Some(command)) => Ok(command.to_string()),
         }
-        .ok_or_else(|| errors::UnknownCommand(String::new()))?
-        .to_string())
     }
 
     fn prepare_command<'a>(
@@ -425,7 +431,8 @@ impl Dispatcher {
                 CommandFunc::NoRepo(f) => f(parsed, io, self.optional_repo.config()),
                 CommandFunc::WorkingCopy(f) => {
                     let repo = self.repo_mut()?;
-                    let mut wc = repo.working_copy()?;
+                    let wc = repo.working_copy()?;
+                    let mut wc = wc.write();
                     f(parsed, io, repo, &mut wc)
                 }
             };

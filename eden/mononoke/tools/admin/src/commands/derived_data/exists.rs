@@ -6,28 +6,35 @@
  */
 
 use anyhow::Result;
+use bulk_derivation::BulkDerivation;
 use clap::Args;
 use context::CoreContext;
+use derived_data_manager::DerivedDataManager;
 use mononoke_app::args::ChangesetArgs;
+use mononoke_app::args::DerivedDataArgs;
 
-use super::args::DerivedUtilsArgs;
 use super::Repo;
 
 #[derive(Args)]
 pub(super) struct ExistsArgs {
     #[clap(flatten)]
     changeset_args: ChangesetArgs,
+
     #[clap(flatten)]
-    derived_utils_args: DerivedUtilsArgs,
+    derived_data_args: DerivedDataArgs,
 }
 
-pub(super) async fn exists(ctx: &CoreContext, repo: &Repo, args: ExistsArgs) -> Result<()> {
-    let derived_utils = args.derived_utils_args.derived_utils(ctx, repo)?;
-
+pub(super) async fn exists(
+    ctx: &CoreContext,
+    repo: &Repo,
+    manager: &DerivedDataManager,
+    args: ExistsArgs,
+) -> Result<()> {
     let cs_ids = args.changeset_args.resolve_changesets(ctx, repo).await?;
+    let derived_data_type = args.derived_data_args.resolve_type()?;
 
-    let pending = derived_utils
-        .pending(ctx.clone(), repo.repo_derived_data.clone(), cs_ids.clone())
+    let pending = manager
+        .pending(ctx, &cs_ids, None, derived_data_type)
         .await?;
 
     for cs_id in cs_ids {

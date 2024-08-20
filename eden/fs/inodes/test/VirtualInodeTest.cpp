@@ -557,7 +557,8 @@ void verifyTreeState(
                                        ENTRY_ATTRIBUTE_BLAKE3,
                                    expected.path,
                                    mount.getEdenMount()->getObjectStore(),
-                                   ObjectFetchContext::getNullContext())
+                                   ObjectFetchContext::getNullContext(),
+                                   /*shouldFetchTreeMetadata=*/true)
                                .semi()
                                .via(mount.getServerExecutor().get());
         mount.drainServerExecutor();
@@ -759,7 +760,8 @@ TEST(VirtualInodeTest, getChildrenAttributes) {
                               attribute_request,
                               info->path,
                               mount.getEdenMount()->getObjectStore(),
-                              ObjectFetchContext::getNullContext())
+                              ObjectFetchContext::getNullContext(),
+                              /*shouldFetchTreeMetadata=*/true)
                           .get();
 
         for (auto child : files.getChildren(RelativePathPiece{info->path})) {
@@ -774,7 +776,8 @@ TEST(VirtualInodeTest, getChildrenAttributes) {
                           attribute_request,
                           child->path,
                           mount.getEdenMount()->getObjectStore(),
-                          ObjectFetchContext::getNullContext())
+                          ObjectFetchContext::getNullContext(),
+                          /*shouldFetchTreeMetadata=*/true)
                       .getTry())));
         }
       }
@@ -826,7 +829,8 @@ TEST(VirtualInodeTest, fileOpsOnCorrectObjectsOnly) {
                                    ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE,
                                info.path,
                                mount.getEdenMount()->getObjectStore(),
-                               ObjectFetchContext::getNullContext())
+                               ObjectFetchContext::getNullContext(),
+                               /*shouldFetchTreeMetadata=*/true)
                            .getTry();
     if (info.isRegularFile()) {
       EXPECT_EQ(true, metadataTry.hasValue())
@@ -846,7 +850,13 @@ TEST(VirtualInodeTest, fileOpsOnCorrectObjectsOnly) {
       if (metadataTry.hasValue()) {
         auto& metadata = metadataTry.value();
         EXPECT_TRUE(metadata.sha1.value().hasException());
-        EXPECT_TRUE(metadata.size.value().hasException());
+        if (info.isMaterialized()) {
+          // We can't get the size/blake3 of materialized directory
+          EXPECT_FALSE(metadata.size.has_value());
+        } else {
+          // We require a remote lookup to get the size/blake3 of directories
+          EXPECT_TRUE(metadata.size.value().hasException());
+        }
         EXPECT_EQ(metadata.type.value().value(), info.getTreeEntryType())
             << " on path " << info.getLogPath();
       }
@@ -858,7 +868,8 @@ TEST(VirtualInodeTest, fileOpsOnCorrectObjectsOnly) {
                 ENTRY_ATTRIBUTE_SIZE | ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE,
                 info.path,
                 mount.getEdenMount()->getObjectStore(),
-                ObjectFetchContext::getNullContext())
+                ObjectFetchContext::getNullContext(),
+                /*shouldFetchTreeMetadata=*/true)
             .getTry();
     if (info.isRegularFile()) {
       EXPECT_EQ(true, metadataTry.hasValue())
@@ -878,7 +889,13 @@ TEST(VirtualInodeTest, fileOpsOnCorrectObjectsOnly) {
       if (metadataTry.hasValue()) {
         auto& metadata = metadataTry.value();
         EXPECT_FALSE(metadata.sha1.has_value());
-        EXPECT_TRUE(metadata.size.value().hasException());
+        if (info.isMaterialized()) {
+          // We can't get the size/blake3 of materialized directory
+          EXPECT_FALSE(metadata.size.has_value());
+        } else {
+          // We require a remote lookup to get the size/blake3 of directories
+          EXPECT_TRUE(metadata.size.value().hasException());
+        }
         EXPECT_EQ(metadata.type.value().value(), info.getTreeEntryType())
             << " on path " << info.getLogPath();
       }
@@ -915,7 +932,8 @@ TEST(VirtualInodeTest, getEntryAttributesAttributeError) {
           ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE,
       RelativePathPiece{"root_dirA"},
       mount.getEdenMount()->getObjectStore(),
-      ObjectFetchContext::getNullContext());
+      ObjectFetchContext::getNullContext(),
+      /*shouldFetchTreeMetadata=*/true);
 
   builder.triggerError(
       "root_dirA/child1_fileA1", std::domain_error("fake error for testing"));

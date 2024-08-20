@@ -8,11 +8,11 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use dag::namedag::MemNameDag;
-use dag::nameset::SyncNameSetQuery;
+use dag::dag::MemDag;
 use dag::ops::ImportAscii;
+use dag::set::SyncSetQuery;
 use dag::DagAlgorithm;
-use dag::VertexName;
+use dag::Vertex;
 use nonblocking::non_blocking_result;
 use unicode_width::UnicodeWidthStr;
 
@@ -22,14 +22,14 @@ use super::test_fixtures::TestFixture;
 
 pub(crate) fn render_string(
     fixture: &TestFixture,
-    renderer: &mut dyn Renderer<VertexName, Output = String>,
+    renderer: &mut dyn Renderer<Vertex, Output = String>,
 ) -> String {
     render_string_with_order(fixture, renderer, None)
 }
 
 pub(crate) fn render_string_with_order(
     fixture: &TestFixture,
-    renderer: &mut dyn Renderer<VertexName, Output = String>,
+    renderer: &mut dyn Renderer<Vertex, Output = String>,
     order: Option<&[&str]>,
 ) -> String {
     let TestFixture {
@@ -40,10 +40,10 @@ pub(crate) fn render_string_with_order(
         ancestors,
         missing,
     } = fixture;
-    let mut dag = MemNameDag::new();
+    let mut dag = MemDag::new();
     dag.import_ascii_with_heads(ascii, Some(heads)).unwrap();
-    // str -> VertexName
-    let v = |s: &str| VertexName::copy_from(s.as_bytes());
+    // str -> Vertex
+    let v = |s: &str| Vertex::copy_from(s.as_bytes());
 
     let ancestors: HashSet<_> = ancestors
         .iter()

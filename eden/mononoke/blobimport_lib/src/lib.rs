@@ -8,6 +8,7 @@
 mod bookmark;
 mod changeset;
 mod concurrency;
+mod repo;
 
 use std::cmp;
 use std::collections::HashMap;
@@ -20,16 +21,15 @@ use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
 use ascii::AsciiString;
-use blobrepo::BlobRepo;
 use blobrepo_hg::BlobRepoHg;
 use bonsai_git_mapping::BonsaiGitMappingRef;
 use bonsai_globalrev_mapping::bulk_import_globalrevs;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
 use bookmarks::BookmarksMaybeStaleExt;
 use bookmarks::BookmarksRef;
+use bulk_derivation::BulkDerivation;
 pub use consts::HIGHEST_IMPORTED_GEN_NUM;
 use context::CoreContext;
-use derived_data_utils::derive_data_for_csids;
 use futures::compat::Future01CompatExt;
 use futures::compat::Stream01CompatExt;
 use futures::future;
@@ -46,6 +46,7 @@ use mononoke_types::ChangesetId;
 use mononoke_types::DerivableType;
 use mononoke_types::RepositoryId;
 use phases::PhasesRef;
+use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
 use slog::debug;
 use slog::error;
@@ -56,6 +57,8 @@ use synced_commit_mapping::SyncedCommitSourceRepo;
 use wireproto_handler::BackupSourceRepo;
 
 use crate::changeset::UploadChangesets;
+pub use crate::repo::BlobimportRepo;
+use crate::repo::BlobimportRepoLike;
 
 // What to do with bookmarks when blobimporting a repo
 pub enum BookmarkImportPolicy {
@@ -65,9 +68,9 @@ pub enum BookmarkImportPolicy {
     Prefix(AsciiString),
 }
 
-pub struct Blobimport<'a> {
+pub struct Blobimport<'a, R: BlobimportRepoLike + Clone + 'static> {
     pub ctx: &'a CoreContext,
-    pub blobrepo: BlobRepo,
+    pub repo: R,
     pub revlogrepo_path: PathBuf,
     pub changeset: Option<HgNodeHash>,
     pub skip: Option<usize>,
@@ -87,11 +90,11 @@ pub struct Blobimport<'a> {
     pub origin_repo: Option<BackupSourceRepo>,
 }
 
-impl<'a> Blobimport<'a> {
+impl<'a, R: BlobimportRepoLike + Clone + 'static> Blobimport<'a, R> {
     pub async fn import(self) -> Result<Option<(RevIdx, ChangesetId)>, Error> {
         let Self {
             ctx,
-            blobrepo,
+            repo,
             revlogrepo_path,
             changeset,
             skip,
@@ -113,12 +116,12 @@ impl<'a> Blobimport<'a> {
 
         // Take refs to avoid `async move` blocks capturing data data
         // in async move blocks
-        let blobrepo = &blobrepo;
+        let repo = &repo;
         let globalrevs_store = &globalrevs_store;
         let synced_commit_mapping = &synced_commit_mapping;
         let derived_data_types = &derived_data_types;
 
-        let repo_id = blobrepo.repo_identity().id();
+        let repo_id = repo.repo_identity().id();
 
         let revlogrepo = RevlogRepo::open(&revlogrepo_path)
             .with_context(|| format!("While opening revlog repo at {:?}", revlogrepo_path))?;
@@ -138,7 +141,7 @@ impl<'a> Blobimport<'a> {
 
         let mut upload_changesets = UploadChangesets {
             ctx: ctx.clone(),
-            blobrepo: blobrepo.clone(),
+            repo: repo.clone(),
             revlogrepo: revlogrepo.clone(),
             lfs_helper,
             concurrent_changesets,
@@ -183,7 +186,7 @@ impl<'a> Blobimport<'a> {
 
         // Blobimport does not see scratch bookmarks in Mercurial, so we use
         // PublishingOrPullDefaultPublishing here, which is the non-scratch set in Mononoke.
-        let mononoke_bookmarks_fut = blobrepo
+        let mononoke_bookmarks_fut = repo
             .bookmarks()
             .get_publishing_bookmarks_maybe_stale(ctx.clone())
             .map_ok(|(bookmark, changeset_id)| (bookmark.into_key(), changeset_id))
@@ -236,7 +239,7 @@ impl<'a> Blobimport<'a> {
 
             let git_mapping_work = async move {
                 if populate_git_mapping {
-                    let git_mapping_store = blobrepo.bonsai_git_mapping();
+                    let git_mapping_store = repo.bonsai_git_mapping();
                     git_mapping_store
                         .bulk_import_from_bonsai(ctx, changesets)
                         .await
@@ -256,12 +259,19 @@ impl<'a> Blobimport<'a> {
                 );
             }
 
-            let derivation_work = derive_data_for_csids(
-                ctx,
-                blobrepo,
-                changesets.iter().map(|cs| cs.get_changeset_id()).collect(),
-                &derived_data_types[..],
-            )?;
+            let cs_ids = changesets
+                .iter()
+                .map(|cs| cs.get_changeset_id())
+                .collect::<Vec<_>>();
+            let derivation_work = async move {
+                for cs_id in &cs_ids {
+                    repo.repo_derived_data()
+                        .manager()
+                        .derive_bulk(ctx, &[*cs_id], None, derived_data_types, None)
+                        .await?;
+                }
+                Ok(())
+            };
 
             future::try_join4(
                 synced_commit_mapping_work,
@@ -289,7 +299,7 @@ impl<'a> Blobimport<'a> {
                     ctx.clone(),
                     ctx.logger(),
                     revlogrepo,
-                    blobrepo.clone(),
+                    repo.clone(),
                     stale_bookmarks,
                     mononoke_bookmarks,
                     bookmark::get_bookmark_prefixer(prefix),
@@ -311,7 +321,7 @@ impl<'a> Blobimport<'a> {
     ) -> Result<Option<(RevIdx, ChangesetId)>, Error> {
         let Self {
             ctx,
-            blobrepo,
+            repo,
             revlogrepo_path,
             changeset,
             skip,
@@ -319,14 +329,14 @@ impl<'a> Blobimport<'a> {
             ..
         } = self;
 
-        let blobrepo = &blobrepo;
+        let repo = &repo;
         let revlogrepo = RevlogRepo::open(revlogrepo_path)?;
         let imported: Vec<_> = get_changeset_stream(&revlogrepo, changeset, skip, commits_limit)
             .chunks(100)
             .then(|chunk| async move {
                 let chunk: Result<Vec<_>, Error> = chunk.into_iter().collect();
                 let chunk = chunk?;
-                let hg_to_bcs_ids = blobrepo
+                let hg_to_bcs_ids = repo
                     .get_hg_bonsai_mapping(
                         ctx.clone(),
                         chunk
@@ -337,7 +347,7 @@ impl<'a> Blobimport<'a> {
                     )
                     .await?;
 
-                let public = blobrepo
+                let public = repo
                     .phases()
                     .get_public(
                         ctx,

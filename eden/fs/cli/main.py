@@ -788,7 +788,7 @@ class CloneCmd(Subcmd):
         # Optional arguments to control how to start the daemon if clone needs
         # to start edenfs.  We do not show these in --help by default These
         # behave identically to the daemon arguments with the same name.
-        parser.add_argument("--daemon-binary", help=argparse.SUPPRESS)
+        parser.add_argument("--daemon-binary", "-d", help=argparse.SUPPRESS)
         parser.add_argument(
             "--daemon-args",
             dest="edenfs_args",
@@ -1927,7 +1927,7 @@ class UnmountCmd(Subcmd):
 class StartCmd(Subcmd):
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
-            "--daemon-binary", help="Path to the binary for the edenfs daemon."
+            "--daemon-binary", "-d", help="Path to the binary for the edenfs daemon."
         )
         parser.add_argument(
             "--if-necessary",
@@ -2088,7 +2088,6 @@ def stop_aux_processes_for_path(
 ) -> None:
     """Tear down processes that will hold onto file handles and prevent shutdown
     for a given mount point/repo"""
-    buck.stop_buckd_for_repo(repo_path)
     unmount_redirections_for_path(repo_path, complain_about_failing_to_unmount_redirs)
     stop_internal_processes(repo_path)
 
@@ -2116,8 +2115,8 @@ RESTART_MODE_FORCE = "force"
 
 
 @subcmd("restart", "Restart the EdenFS service")
-# pyre-fixme[13]: Attribute `args` is never initialized.
 class RestartCmd(Subcmd):
+    # pyre-fixme[13]: Attribute `args` is never initialized.
     args: argparse.Namespace
 
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
@@ -2151,7 +2150,7 @@ class RestartCmd(Subcmd):
             "still in the middle of starting or stopping.",
         )
         parser.add_argument(
-            "--daemon-binary", help="Path to the binary for the edenfs daemon."
+            "--daemon-binary", "-d", help="Path to the binary for the edenfs daemon."
         )
         parser.add_argument(
             "--shutdown-timeout",
@@ -2788,7 +2787,9 @@ def main() -> int:
     parser = create_parser()
     try:
         args = parser.parse_args()
-    except SystemExit:
+    except SystemExit as ex:
+        if ex.code == 0:
+            return 0
         # For some reason argparse calls sys.exit(2) when it encounters a parse
         # error... This makes it hard for us to distinguish between edenfsctl
         # failing w/ exit code 2 and a parse error. Let's catch the parse

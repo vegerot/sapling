@@ -30,8 +30,18 @@ pub struct RichCasClient {
     metadata: RemoteExecutionMetadata,
 }
 
-pub fn construct(config: &dyn Config) -> Result<Arc<dyn CasClient>> {
-    RichCasClient::from_config(config).map(|c| Arc::new(c) as Arc<dyn CasClient>)
+pub fn init() {
+    fn construct(config: &dyn Config) -> Result<Option<Arc<dyn CasClient>>> {
+        // Kill switch in case something unexpected happens during construction of client.
+        if config.get_or_default("cas", "disable")? {
+            tracing::warn!(target: "cas", "disabled (cas.disable=true)");
+            return Ok(None);
+        }
+
+        tracing::debug!(target: "cas", "creating rich client");
+        RichCasClient::from_config(config).map(|c| Some(Arc::new(c) as Arc<dyn CasClient>))
+    }
+    factory::register_constructor("rich-client", construct);
 }
 
 impl RichCasClient {
@@ -40,8 +50,7 @@ impl RichCasClient {
 
         re_config.client_name = Some("sapling".to_string());
         re_config.quiet_mode = !config.get_or_default("cas", "verbose")?;
-        re_config.features_config_path =
-            "remote_execution/features/client_source_control".to_string();
+        re_config.features_config_path = "remote_execution/features/client_eden".to_string();
 
         re_config.cas_client_config =
             CASDaemonClientCfg::embedded_config(EmbeddedCASDaemonClientCfg {
@@ -89,7 +98,12 @@ fn from_re_digest(d: &TDigest) -> Result<CasDigest> {
 
 #[async_trait::async_trait]
 impl CasClient for RichCasClient {
-    async fn fetch(&self, digests: &[CasDigest]) -> Result<Vec<(CasDigest, Result<Vec<u8>>)>> {
+    async fn fetch(
+        &self,
+        digests: &[CasDigest],
+    ) -> Result<Vec<(CasDigest, Result<Option<Vec<u8>>>)>> {
+        tracing::debug!(target: "cas", "rich client fetching {} digests", digests.len());
+
         let request = DownloadRequest {
             inlined_digests: Some(digests.iter().map(to_re_digest).collect()),
             ..Default::default()
@@ -103,10 +117,10 @@ impl CasClient for RichCasClient {
             .into_iter()
             .map(|blob| {
                 let digest = from_re_digest(&blob.digest)?;
-                if blob.status.code == TCode::OK {
-                    Ok((digest, Ok(blob.blob)))
-                } else {
-                    Ok((
+                match blob.status.code {
+                    TCode::OK => Ok((digest, Ok(Some(blob.blob)))),
+                    TCode::NOT_FOUND => Ok((digest, Ok(None))),
+                    _ => Ok((
                         digest,
                         Err(anyhow!(
                             "bad status (code={}, message={}, group={})",
@@ -114,7 +128,7 @@ impl CasClient for RichCasClient {
                             blob.status.message,
                             blob.status.group
                         )),
-                    ))
+                    )),
                 }
             })
             .collect::<Result<Vec<_>>>()
