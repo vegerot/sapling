@@ -11,6 +11,7 @@ use anyhow::Error;
 use fbinit::FacebookInit;
 use scs_client_raw::ScsClient;
 use scs_client_raw::ScsClientBuilder;
+use scs_client_raw::ScsClientHostBuilder;
 use scs_client_raw::SCS_DEFAULT_TIER;
 
 #[derive(clap::Args)]
@@ -28,15 +29,16 @@ pub(super) struct ConnectionArgs {
 
 impl ConnectionArgs {
     pub fn get_connection(&self, fb: FacebookInit, repo: Option<&str>) -> Result<ScsClient, Error> {
-        if let Some(host_port) = &self.host {
-            ScsClientBuilder::new().build_from_host_port(fb, host_port)
+        let disable_sr =
+            std::env::var("MONONOKE_INTEGRATION_TEST_DISABLE_SR").map_or(false, |v| v == "true");
+        if self.host.is_some() && disable_sr {
+            ScsClientHostBuilder::new().build_from_host_port(fb, self.host.clone().unwrap())
         } else {
-            ScsClientBuilder::new().build_from_tier_name(
-                fb,
-                self.client_id.clone(),
-                &self.tier,
-                repo,
-            )
+            ScsClientBuilder::new(fb, self.client_id.clone())
+                .with_tier(&self.tier)
+                .with_repo(repo.map(|r| r.to_string()))
+                .with_host_and_port(self.host.clone())?
+                .build()
         }
     }
 }

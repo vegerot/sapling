@@ -680,7 +680,7 @@ function set_bonsai_globalrev_mapping {
 }
 
 function set_mononoke_as_source_of_truth_for_git {
-  sqlite3 "$TESTTMP/monsql/sqlite_dbs" "REPLACE INTO git_push_redirect (repo_id, mononoke) VALUES (0, 1)"
+  sqlite3 "$TESTTMP/monsql/sqlite_dbs" "REPLACE INTO git_push_redirect (repo_id, mononoke) VALUES (${REPO_ID:-0}, 1)"
 }
 
 function setup_mononoke_config {
@@ -1208,12 +1208,19 @@ CONFIG
 fi
 
 
-if [[ -n "${LFS_THRESHOLD:-}" ]]; then
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 [lfs]
+CONFIG
+if [[ -n "${LFS_THRESHOLD:-}" ]]; then
+  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 threshold=$LFS_THRESHOLD
 rollout_percentage=${LFS_ROLLOUT_PERCENTAGE:-100}
 generate_lfs_blob_in_hg_sync_job=${LFS_BLOB_HG_SYNC_JOB:-true}
+CONFIG
+fi
+if [[ -n "${LFS_USE_UPSTREAM:-}" ]]; then
+  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
+use_upstream_lfs_server = true
 CONFIG
 fi
 
@@ -1559,6 +1566,26 @@ function wait_for_bookmark_move_away_edenapi() {
     if [[ $attempt -gt 30 ]]
     then
         echo "bookmark move of $bookmark away from $prev has not happened"
+        return 1
+    fi
+    sleep 2
+    flush_mononoke_bookmarks
+  done
+}
+
+function wait_for_bookmark_move_edenapi() {
+  local repo="$1"
+  local bookmark="$2"
+  local target="$3"
+  local attempt=1
+  sleep 1
+  flush_mononoke_bookmarks
+  while [[ "$(get_bookmark_value_edenapi "$repo" "$bookmark")" != "$target" ]]
+  do
+    attempt=$((attempt + 1))
+    if [[ $attempt -gt 30 ]]
+    then
+        echo "bookmark move of $bookmark away to $target has not happened"
         return 1
     fi
     sleep 2
@@ -1955,7 +1982,7 @@ function hook_test_setup() {
   cd "$TESTTMP/mononoke-config" || exit 1
 
   reponame_urlencoded="$(urlencode encode "$REPONAME")"
-  HOOKBOOKMARK="${HOOKBOOKMARK:-master_bookmark}"
+  HOOKBOOKMARK="${HOOKBOOKMARK:-${MASTER_BOOKMARK:-master_bookmark}}"
 
   if [[ -z "$HOOKBOOKMARK_REGEX" ]]; then
     HOOKBOOKMARK_ENTRY="name=\"$HOOKBOOKMARK\""
@@ -2232,7 +2259,7 @@ B
 A
 EOF
 
-  hg bookmark master_bookmark -r tip
+  hg bookmark "${MASTER_BOOKMARK:-master_bookmark}" -r tip
 
   echo "hg repo"
   log -r ":"

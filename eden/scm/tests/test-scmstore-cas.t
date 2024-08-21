@@ -1,5 +1,6 @@
   $ setconfig push.edenapi=true
   $ setconfig scmstore.fetch-from-cas=true scmstore.fetch-tree-aux-data=true scmstore.tree-metadata-mode=always
+  $ setconfig scmstore.contentstorefallback=false
 
 First sanity check eagerepo works as CAS store
   $ newclientrepo client1 test:server
@@ -135,3 +136,18 @@ Then fetch "dir" from CAS:
           aux_data: None,
       },
   )
+
+Empty the caches
+  $ setconfig remotefilelog.cachepath=$TESTTMP/cache4
+
+Make sure prefetch uses CAS:
+  $ LOG=cas=debug,eagerepo=debug hg prefetch -r $A .
+  DEBUG cas: creating eager remote client
+  DEBUG cas: created client
+  DEBUG cas: EagerRepoStore fetching 1 digest(s)
+  DEBUG cas: EagerRepoStore fetching 1 digest(s)
+  DEBUG cas: EagerRepoStore fetching 2 digest(s)
+
+Don't rewrite aux data to cache:
+  $ LOG=revisionstore=trace hg prefetch -r $A . 2>&1 | grep "writing to"
+  [1]

@@ -67,8 +67,6 @@ use cacheblob::LeaseOps;
 use cacheblob::MemcacheOps;
 use caching_commit_graph_storage::CachingCommitGraphStorage;
 use caching_ext::CacheHandlerFactory;
-use changesets::ArcChangesets;
-use changesets_impl::SqlChangesetsBuilder;
 use commit_cloud::sql::builder::SqlCommitCloudBuilder;
 use commit_cloud::ArcCommitCloud;
 use commit_cloud::CommitCloud;
@@ -76,7 +74,6 @@ use commit_graph::ArcCommitGraph;
 use commit_graph::ArcCommitGraphWriter;
 use commit_graph::BaseCommitGraphWriter;
 use commit_graph::CommitGraph;
-use commit_graph::CompatCommitGraphWriter;
 use commit_graph::LoggingCommitGraphWriter;
 use commit_graph_types::storage::CommitGraphStorage;
 use context::CoreContext;
@@ -652,9 +649,6 @@ pub fn cachelib_blobstore<B: Blobstore + 'static>(
 
 #[derive(Debug, Error)]
 pub enum RepoFactoryError {
-    #[error("Error opening changesets")]
-    Changesets,
-
     #[error("Error opening bookmarks")]
     Bookmarks,
 
@@ -756,20 +750,6 @@ impl RepoFactory {
 
     pub fn caching(&self) -> Caching {
         self.env.caching
-    }
-
-    pub async fn changesets(
-        &self,
-        repo_identity: &ArcRepoIdentity,
-        repo_config: &ArcRepoConfig,
-    ) -> Result<ArcChangesets> {
-        let builder = self
-            .open_sql::<SqlChangesetsBuilder>(repo_config)
-            .await
-            .context(RepoFactoryError::Changesets)?;
-        let changesets = builder.build(self.env.rendezvous_options, repo_identity.id());
-
-        Ok(Arc::new(changesets))
     }
 
     pub async fn repo_stats_logger(
@@ -1681,7 +1661,6 @@ impl RepoFactory {
         repo_identity: &ArcRepoIdentity,
         repo_config: &ArcRepoConfig,
         commit_graph: &CommitGraph,
-        changesets: &ArcChangesets,
     ) -> Result<ArcCommitGraphWriter> {
         let scuba_table = repo_config.commit_graph_config.scuba_table.as_deref();
         let scuba = match scuba_table {
@@ -1694,13 +1673,8 @@ impl RepoFactory {
 
         let base_writer = Arc::new(BaseCommitGraphWriter::new(commit_graph.clone()));
 
-        let compat_writer = Arc::new(CompatCommitGraphWriter::new(
-            base_writer,
-            changesets.clone(),
-        ));
-
         Ok(Arc::new(LoggingCommitGraphWriter::new(
-            compat_writer,
+            base_writer,
             scuba,
             repo_identity.name().to_string(),
         )))
