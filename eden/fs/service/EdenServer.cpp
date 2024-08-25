@@ -898,8 +898,11 @@ void EdenServer::unloadInodes() {
       auto& rootInode = mountHandle.getRootInode();
       auto unloaded = rootInode->unloadChildrenLastAccessedBefore(cutoff_ts);
       if (unloaded) {
-        XLOG(INFO) << "Unloaded " << unloaded
-                   << " inodes in background from mount " << mount.getPath();
+        XLOGF(
+            DBG6,
+            "Unloaded {} inodes in background from mount {}",
+            unloaded,
+            mount.getPath());
       }
       mount.getInodeMap()->recordPeriodicInodeUnload(unloaded);
     }
@@ -2515,9 +2518,10 @@ void EdenServer::detectNfsCrawl() {
                        processRecords.find(pid) == processRecords.end()) {
                   auto processInfo =
                       serverState->getProcessInfoCache()->lookup(pid).get();
-                  nonLeafPids.insert(processInfo.ppid);
-                  processRecords.insert({pid, processInfo});
-                  pid = processInfo.ppid;
+                  auto ppid = processInfo.ppid;
+                  nonLeafPids.insert(ppid);
+                  processRecords.insert({pid, std::move(processInfo)});
+                  pid = ppid;
                 }
               }
 

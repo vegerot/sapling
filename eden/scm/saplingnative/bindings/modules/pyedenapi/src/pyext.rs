@@ -46,10 +46,13 @@ use edenapi_types::FetchSnapshotRequest;
 use edenapi_types::FetchSnapshotResponse;
 use edenapi_types::FileResponse;
 use edenapi_types::GetReferencesParams;
+use edenapi_types::GetSmartlogByVersionParams;
 use edenapi_types::GetSmartlogParams;
 use edenapi_types::HgChangesetContent;
 use edenapi_types::HgFilenodeData;
 use edenapi_types::HgMutationEntryContent;
+use edenapi_types::HistoricalVersionsParams;
+use edenapi_types::HistoricalVersionsResponse;
 use edenapi_types::HistoryEntry;
 use edenapi_types::IndexableId;
 use edenapi_types::LandStackResponse;
@@ -812,6 +815,30 @@ pub trait SaplingRemoteApiPyExt: SaplingRemoteApi {
     ) -> PyResult<Serde<RenameWorkspaceResponse>> {
         let responses = py
             .allow_threads(|| block_unless_interrupted(self.cloud_rename_workspace(data.0)))
+            .map_pyerr(py)?
+            .map_pyerr(py)?;
+        Ok(Serde(responses))
+    }
+
+    fn cloud_smartlog_by_version_py(
+        &self,
+        data: Serde<GetSmartlogByVersionParams>,
+        py: Python,
+    ) -> PyResult<Serde<SmartlogDataResponse>> {
+        let responses = py
+            .allow_threads(|| block_unless_interrupted(self.cloud_smartlog_by_version(data.0)))
+            .map_pyerr(py)?
+            .map_pyerr(py)?;
+        Ok(Serde(responses))
+    }
+
+    fn cloud_historical_versions_py(
+        &self,
+        data: Serde<HistoricalVersionsParams>,
+        py: Python,
+    ) -> PyResult<Serde<HistoricalVersionsResponse>> {
+        let responses = py
+            .allow_threads(|| block_unless_interrupted(self.cloud_historical_versions(data.0)))
             .map_pyerr(py)?
             .map_pyerr(py)?;
         Ok(Serde(responses))

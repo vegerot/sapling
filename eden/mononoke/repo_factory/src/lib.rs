@@ -104,8 +104,8 @@ use filenodes::ArcFilenodes;
 use filestore::ArcFilestoreConfig;
 use filestore::FilestoreConfig;
 use futures_watchdog::WatchdogExt;
-use git_push_redirect::ArcGitPushRedirectConfig;
-use git_push_redirect::SqlGitPushRedirectConfigBuilder;
+use git_source_of_truth::ArcGitSourceOfTruthConfig;
+use git_source_of_truth::SqlGitSourceOfTruthConfigBuilder;
 use git_symbolic_refs::ArcGitSymbolicRefs;
 use git_symbolic_refs::SqlGitSymbolicRefsBuilder;
 use hook_manager::manager::ArcHookManager;
@@ -186,7 +186,7 @@ use sqlphases::SqlPhasesBuilder;
 use streaming_clone::ArcStreamingClone;
 use streaming_clone::StreamingCloneBuilder;
 use synced_commit_mapping::ArcSyncedCommitMapping;
-use synced_commit_mapping::SqlSyncedCommitMapping;
+use synced_commit_mapping::SqlSyncedCommitMappingBuilder;
 use thiserror::Error;
 use virtually_sharded_blobstore::VirtuallyShardedBlobstore;
 use warm_bookmarks_cache::NoopBookmarksCache;
@@ -677,7 +677,7 @@ pub enum RepoFactoryError {
     RepoMetadataCheckpoint,
 
     #[error("Error opening git-push-redirect-config")]
-    GitPushRedirectConfig,
+    GitSourceOfTruthConfig,
 
     #[error("Error opening pushrebase mutation mapping")]
     PushrebaseMutationMapping,
@@ -961,16 +961,16 @@ impl RepoFactory {
         Ok(Arc::new(repo_metadata_info))
     }
 
-    pub async fn git_push_redirect_config(
+    pub async fn git_source_of_truth_config(
         &self,
         repo_config: &ArcRepoConfig,
-    ) -> Result<ArcGitPushRedirectConfig> {
-        let git_push_redirect_config = self
-            .open_sql::<SqlGitPushRedirectConfigBuilder>(repo_config)
+    ) -> Result<ArcGitSourceOfTruthConfig> {
+        let git_source_of_truth_config = self
+            .open_sql::<SqlGitSourceOfTruthConfigBuilder>(repo_config)
             .await
-            .context(RepoFactoryError::GitPushRedirectConfig)?
+            .context(RepoFactoryError::GitSourceOfTruthConfig)?
             .build();
-        Ok(Arc::new(git_push_redirect_config))
+        Ok(Arc::new(git_source_of_truth_config))
     }
 
     pub async fn pushrebase_mutation_mapping(
@@ -1273,7 +1273,9 @@ impl RepoFactory {
         repo_config: &ArcRepoConfig,
     ) -> Result<ArcSyncedCommitMapping> {
         Ok(Arc::new(
-            self.open_sql::<SqlSyncedCommitMapping>(repo_config).await?,
+            self.open_sql::<SqlSyncedCommitMappingBuilder>(repo_config)
+                .await?
+                .build(self.env.rendezvous_options),
         ))
     }
 
@@ -1326,6 +1328,7 @@ impl RepoFactory {
         repo_blobstore: &ArcRepoBlobstore,
         bonsai_tag_mapping: &ArcBonsaiTagMapping,
         bonsai_git_mapping: &ArcBonsaiGitMapping,
+        permission_checker: &ArcRepoPermissionChecker,
     ) -> Result<ArcHookManager> {
         let name = repo_identity.name();
 
@@ -1366,6 +1369,7 @@ impl RepoFactory {
                 self.env.acl_provider.as_ref(),
                 content_provider,
                 repo_config.hook_manager_params.clone().unwrap_or_default(),
+                permission_checker.clone(),
                 hooks_scuba,
                 name.to_string(),
             )

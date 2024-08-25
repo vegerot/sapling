@@ -6,6 +6,7 @@
  */
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Error;
 use async_trait::async_trait;
@@ -18,7 +19,7 @@ use fbinit::FacebookInit;
 use futures::TryFutureExt;
 use hook_manager::ChangesetHook;
 use hook_manager::CrossRepoPushSource;
-use hook_manager::FileChange as FileDiff;
+use hook_manager::FileChangeType;
 use hook_manager::HookExecution;
 use hook_manager::HookManager;
 use hook_manager::HookRejectionInfo;
@@ -41,6 +42,7 @@ use mononoke_types_mocks::contentid::TWOS_CTID;
 use permission_checker::InternalAclProvider;
 use regex::Regex;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_permission_checker::AlwaysAllowRepoPermissionChecker;
 use scuba_ext::MononokeScubaSampleBuilder;
 use sorted_vector_map::sorted_vector_map;
 use tests_utils::bookmark;
@@ -114,9 +116,9 @@ impl ChangesetHook for FileChangesChangesetHook {
             let (mut added, mut changed, mut removed) = (0, 0, 0);
             for (_path, change) in file_changes.into_iter() {
                 match change {
-                    FileDiff::Added(_) => added += 1,
-                    FileDiff::Changed(_, _) => changed += 1,
-                    FileDiff::Removed => removed += 1,
+                    FileChangeType::Added(_) => added += 1,
+                    FileChangeType::Changed(_, _) => changed += 1,
+                    FileChangeType::Removed => removed += 1,
                 }
             }
             Result::<_, Error>::Ok((added, changed, removed))
@@ -435,6 +437,7 @@ async fn hook_manager_repo(fb: FacebookInit, repo: &BasicTestRepo) -> HookManage
             disable_acl_checker: true,
             ..Default::default()
         },
+        Arc::new(AlwaysAllowRepoPermissionChecker {}),
         MononokeScubaSampleBuilder::with_discard(),
         "zoo".to_string(),
     )

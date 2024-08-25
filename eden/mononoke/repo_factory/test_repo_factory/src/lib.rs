@@ -46,8 +46,8 @@ use fbinit::FacebookInit;
 use filenodes::ArcFilenodes;
 use filestore::ArcFilestoreConfig;
 use filestore::FilestoreConfig;
-use git_push_redirect::ArcGitPushRedirectConfig;
-use git_push_redirect::SqlGitPushRedirectConfigBuilder;
+use git_source_of_truth::ArcGitSourceOfTruthConfig;
+use git_source_of_truth::SqlGitSourceOfTruthConfigBuilder;
 use git_symbolic_refs::ArcGitSymbolicRefs;
 use git_symbolic_refs::SqlGitSymbolicRefsBuilder;
 use hook_manager::manager::ArcHookManager;
@@ -127,7 +127,7 @@ use streaming_clone::ArcStreamingClone;
 use streaming_clone::StreamingCloneBuilder;
 use strum::IntoEnumIterator;
 use synced_commit_mapping::ArcSyncedCommitMapping;
-use synced_commit_mapping::SqlSyncedCommitMapping;
+use synced_commit_mapping::SqlSyncedCommitMappingBuilder;
 use warm_bookmarks_cache::WarmBookmarksCacheBuilder;
 use wireproto_handler::ArcRepoHandlerBase;
 use wireproto_handler::PushRedirectorBase;
@@ -164,7 +164,9 @@ pub struct TestRepoFactory {
 /// This configuration enables all derived data types at the latest version.
 pub fn default_test_repo_derived_data_types_config() -> DerivedDataTypesConfig {
     DerivedDataTypesConfig {
-        types: DerivableType::iter().collect(),
+        types: DerivableType::iter()
+            .filter(|t| *t != DerivableType::SkeletonManifestsV2)
+            .collect(),
         unode_version: UnodeVersion::V2,
         blame_version: BlameVersion::V2,
         git_delta_manifest_v2_config: Some(GitDeltaManifestV2Config {
@@ -260,7 +262,7 @@ impl TestRepoFactory {
         metadata_con.execute_batch(SqlPushrebaseMutationMappingConnection::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlLongRunningRequestsQueue::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlMutableRenamesStore::CREATION_QUERY)?;
-        metadata_con.execute_batch(SqlSyncedCommitMapping::CREATION_QUERY)?;
+        metadata_con.execute_batch(SqlSyncedCommitMappingBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlRepoLock::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlSparseProfilesSizes::CREATION_QUERY)?;
         metadata_con.execute_batch(StreamingCloneBuilder::CREATION_QUERY)?;
@@ -511,9 +513,10 @@ impl TestRepoFactory {
 
     /// Construct Git Push Redirect Config using the in-memory metadata
     /// database.
-    pub fn git_push_redirect_config(&self) -> Result<ArcGitPushRedirectConfig> {
+    pub fn git_source_of_truth_config(&self) -> Result<ArcGitSourceOfTruthConfig> {
         Ok(Arc::new(
-            SqlGitPushRedirectConfigBuilder::from_sql_connections(self.metadata_db.clone()).build(),
+            SqlGitSourceOfTruthConfigBuilder::from_sql_connections(self.metadata_db.clone())
+                .build(),
         ))
     }
 
@@ -633,9 +636,10 @@ impl TestRepoFactory {
 
     /// The commit mapping bettween repos for synced commits.
     pub fn synced_commit_mapping(&self) -> Result<ArcSyncedCommitMapping> {
-        Ok(Arc::new(SqlSyncedCommitMapping::from_sql_connections(
-            self.metadata_db.clone(),
-        )))
+        Ok(Arc::new(
+            SqlSyncedCommitMappingBuilder::from_sql_connections(self.metadata_db.clone())
+                .build(RendezVousOptions::for_test()),
+        ))
     }
 
     /// Cross-repo sync manager for this repo

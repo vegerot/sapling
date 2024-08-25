@@ -12,7 +12,9 @@ use edenapi_types::CloudShareWorkspaceResponse;
 use edenapi_types::CloudWorkspaceRequest;
 use edenapi_types::CloudWorkspacesRequest;
 use edenapi_types::GetReferencesParams;
+use edenapi_types::GetSmartlogByVersionParams;
 use edenapi_types::GetSmartlogParams;
+use edenapi_types::HistoricalVersionsParams;
 use edenapi_types::ReferencesDataResponse;
 use edenapi_types::RenameWorkspaceRequest;
 use edenapi_types::RenameWorkspaceResponse;
@@ -39,10 +41,12 @@ pub struct CommitCloudWorkspaces;
 pub struct CommitCloudReferences;
 pub struct CommitCloudUpdateReferences;
 pub struct CommitCloudSmartlog;
+pub struct CommitCloudSmartlogByVersion;
 pub struct CommitCloudShareWorkspace;
 pub struct CommitCloudRenameWorkspace;
-
 pub struct CommitCloudUpdateArchive;
+pub struct CommitCloudHistoricalVersions;
+use edenapi_types::HistoricalVersionsResponse;
 
 #[async_trait]
 impl SaplingRemoteApiHandler for CommitCloudWorkspace {
@@ -287,6 +291,68 @@ async fn rename_workspace<R: MononokeRepo>(
     Ok(RenameWorkspaceResponse {
         data: repo
             .cloud_rename_workspace(&request)
+            .await
+            .map_err(ServerError::from),
+    })
+}
+
+#[async_trait]
+impl SaplingRemoteApiHandler for CommitCloudSmartlogByVersion {
+    type Request = GetSmartlogByVersionParams;
+    type Response = SmartlogDataResponse;
+
+    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CloudSmartlogByVersion;
+    const ENDPOINT: &'static str = "/cloud/smartlog_by_version";
+
+    async fn handler(
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor, Repo>,
+        request: Self::Request,
+    ) -> HandlerResult<'async_trait, Self::Response> {
+        let repo = ectx.repo();
+        let res = get_smartlog_by_version(request, repo).boxed();
+        Ok(stream::once(res).boxed())
+    }
+}
+
+async fn get_smartlog_by_version<R: MononokeRepo>(
+    request: GetSmartlogByVersionParams,
+    repo: HgRepoContext<R>,
+) -> anyhow::Result<SmartlogDataResponse, Error> {
+    Ok(SmartlogDataResponse {
+        data: repo
+            .cloud_smartlog_by_version(&request)
+            .await
+            .map_err(ServerError::from),
+    })
+}
+
+#[async_trait]
+impl SaplingRemoteApiHandler for CommitCloudHistoricalVersions {
+    type Request = HistoricalVersionsParams;
+    type Response = HistoricalVersionsResponse;
+
+    const HTTP_METHOD: hyper::Method = hyper::Method::POST;
+    const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CloudHistoricalVersions;
+    const ENDPOINT: &'static str = "/cloud/historical_versions";
+
+    async fn handler(
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor, Repo>,
+        request: Self::Request,
+    ) -> HandlerResult<'async_trait, Self::Response> {
+        let repo = ectx.repo();
+        let res = historical_versions(request, repo).boxed();
+        Ok(stream::once(res).boxed())
+    }
+}
+
+async fn historical_versions<R: MononokeRepo>(
+    request: HistoricalVersionsParams,
+    repo: HgRepoContext<R>,
+) -> anyhow::Result<HistoricalVersionsResponse, Error> {
+    Ok(HistoricalVersionsResponse {
+        data: repo
+            .cloud_historical_versions(&request)
             .await
             .map_err(ServerError::from),
     })

@@ -49,6 +49,7 @@ export type OutgoingMessage = ServerToClientMessage;
 type GeneralMessage = IncomingMessage &
   (
     | {type: 'heartbeat'}
+    | {type: 'stress'}
     | {type: 'changeCwd'}
     | {type: 'requestRepoInfo'}
     | {type: 'requestApplicationInfo'}
@@ -304,6 +305,10 @@ export default class ServerToClientAPI {
     switch (data.type) {
       case 'heartbeat': {
         this.postMessage({type: 'heartbeat', id: data.id});
+        break;
+      }
+      case 'stress': {
+        this.postMessage(data);
         break;
       }
       case 'track': {
@@ -630,7 +635,7 @@ export default class ServerToClientAPI {
                 type: 'fetchedPendingSignificantLinesOfCode',
                 requestId: data.requestId,
                 hash: data.hash,
-                linesOfCode: {value},
+                result: {value: {linesOfCode: value.sloc, strictLinesOfCode: value.strictSloc}},
               });
             })
             .catch(err => {
@@ -638,29 +643,7 @@ export default class ServerToClientAPI {
                 type: 'fetchedPendingSignificantLinesOfCode',
                 hash: data.hash,
                 requestId: data.requestId,
-                linesOfCode: {error: err as Error},
-              });
-            });
-        }
-        break;
-      case 'fetchPendingStrictSignificantLinesOfCode':
-        {
-          repo
-            .fetchPendingStrictSignificantLinesOfCode(ctx, data.hash, data.includedFiles)
-            .then(value => {
-              this.postMessage({
-                type: 'fetchedPendingStrictSignificantLinesOfCode',
-                requestId: data.requestId,
-                hash: data.hash,
-                linesOfCode: {value},
-              });
-            })
-            .catch(err => {
-              this.postMessage({
-                type: 'fetchedPendingStrictSignificantLinesOfCode',
-                hash: data.hash,
-                requestId: data.requestId,
-                linesOfCode: {error: err as Error},
+                result: {error: err as Error},
               });
             });
         }
@@ -673,34 +656,14 @@ export default class ServerToClientAPI {
               this.postMessage({
                 type: 'fetchedSignificantLinesOfCode',
                 hash: data.hash,
-                linesOfCode: {value},
+                result: {value: {linesOfCode: value.sloc, strictLinesOfCode: value.strictSloc}},
               });
             })
             .catch(err => {
               this.postMessage({
                 type: 'fetchedSignificantLinesOfCode',
                 hash: data.hash,
-                linesOfCode: {error: err as Error},
-              });
-            });
-        }
-        break;
-      case 'fetchStrictSignificantLinesOfCode':
-        {
-          repo
-            .fetchStrictSignificantLinesOfCode(ctx, data.hash, data.excludedFiles)
-            .then(value => {
-              this.postMessage({
-                type: 'fetchedStrictSignificantLinesOfCode',
-                hash: data.hash,
-                linesOfCode: {value},
-              });
-            })
-            .catch(err => {
-              this.postMessage({
-                type: 'fetchedStrictSignificantLinesOfCode',
-                hash: data.hash,
-                linesOfCode: {error: err as Error},
+                result: {error: err as Error},
               });
             });
         }
@@ -714,7 +677,7 @@ export default class ServerToClientAPI {
                 type: 'fetchedPendingAmendSignificantLinesOfCode',
                 requestId: data.requestId,
                 hash: data.hash,
-                linesOfCode: {value},
+                result: {value: {linesOfCode: value.sloc, strictLinesOfCode: value.strictSloc}},
               });
             })
             .catch(err => {
@@ -722,29 +685,7 @@ export default class ServerToClientAPI {
                 type: 'fetchedPendingAmendSignificantLinesOfCode',
                 hash: data.hash,
                 requestId: data.requestId,
-                linesOfCode: {error: err as Error},
-              });
-            });
-        }
-        break;
-      case 'fetchPendingAmendStrictSignificantLinesOfCode':
-        {
-          repo
-            .fetchPendingAmendStrictSignificantLinesOfCode(ctx, data.hash, data.includedFiles)
-            .then(value => {
-              this.postMessage({
-                type: 'fetchedPendingAmendStrictSignificantLinesOfCode',
-                requestId: data.requestId,
-                hash: data.hash,
-                linesOfCode: {value},
-              });
-            })
-            .catch(err => {
-              this.postMessage({
-                type: 'fetchedPendingAmendStrictSignificantLinesOfCode',
-                hash: data.hash,
-                requestId: data.requestId,
-                linesOfCode: {error: err as Error},
+                result: {error: err as Error},
               });
             });
         }
@@ -1043,7 +984,7 @@ export default class ServerToClientAPI {
         const args = ['url', '--rev', data.revset];
         // validate that the path is a valid file in repo
         if (data.path != null && absolutePathForFileInRepo(data.path, repo) != null) {
-          args.push(data.path);
+          args.push(`path:${data.path}`);
         }
         repo
           .runCommand(args, 'RepoUrlCommand', ctx)

@@ -62,7 +62,7 @@ mkdir -p "${LOCAL_CONFIGERATOR_PATH}"
 export ACL_FILE="$TESTTMP/acls.json"
 
 export MONONOKE_JUST_KNOBS_OVERRIDES_PATH="${LOCAL_CONFIGERATOR_PATH}/just_knobs.json"
-cp "${TEST_FIXTURES}/just_knobs.json" "$MONONOKE_JUST_KNOBS_OVERRIDES_PATH"
+cp "${JUST_KNOBS_DEFAULTS}/just_knobs_defaults/just_knobs.json" "$MONONOKE_JUST_KNOBS_OVERRIDES_PATH"
 
 function get_configerator_relative_path {
   realpath --relative-to "${LOCAL_CONFIGERATOR_PATH}" "$1"
@@ -680,7 +680,7 @@ function set_bonsai_globalrev_mapping {
 }
 
 function set_mononoke_as_source_of_truth_for_git {
-  sqlite3 "$TESTTMP/monsql/sqlite_dbs" "REPLACE INTO git_push_redirect (repo_id, mononoke) VALUES (${REPO_ID:-0}, 1)"
+  sqlite3 "$TESTTMP/monsql/sqlite_dbs" "REPLACE INTO git_repositories_source_of_truth (repo_id, repo_name, source_of_truth) VALUES (${REPO_ID:-0}, '${REPONAME}', 'mononoke')"
 }
 
 function setup_mononoke_config {

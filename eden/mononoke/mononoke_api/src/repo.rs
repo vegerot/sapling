@@ -19,8 +19,6 @@ use anyhow::anyhow;
 use anyhow::Error;
 use blobrepo_hg::BlobRepoHg;
 use blobstore::Loadable;
-use blobstore_factory::MetadataSqlFactory;
-use blobstore_factory::ReadOnlyStorage;
 use bonsai_git_mapping::BonsaiGitMapping;
 use bonsai_git_mapping::BonsaiGitMappingRef;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
@@ -72,7 +70,6 @@ use ephemeral_blobstore::RepoEphemeralStore;
 use ephemeral_blobstore::RepoEphemeralStoreArc;
 use ephemeral_blobstore::RepoEphemeralStoreRef;
 use ephemeral_blobstore::StorageLocation;
-use fbinit::FacebookInit;
 use filenodes::Filenodes;
 use filestore::Alias;
 use filestore::FetchKey;
@@ -85,7 +82,7 @@ use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures::try_join;
 use futures::Future;
-use git_push_redirect::GitPushRedirectConfig;
+use git_source_of_truth::GitSourceOfTruthConfig;
 use git_symbolic_refs::GitSymbolicRefs;
 use git_types::MappedGitCommitId;
 use hook_manager::manager::HookManager;
@@ -133,12 +130,10 @@ use repo_sparse_profiles::RepoSparseProfilesArc;
 use repo_stats_logger::RepoStatsLogger;
 use slog::debug;
 use slog::error;
-use sql_ext::facebook::MysqlOptions;
 use sql_query_config::SqlQueryConfig;
 use stats::prelude::*;
 use streaming_clone::StreamingClone;
 use synced_commit_mapping::ArcSyncedCommitMapping;
-use synced_commit_mapping::SqlSyncedCommitMapping;
 use unbundle::PushRedirector;
 use unbundle::PushRedirectorArgs;
 use wireproto_handler::PushRedirectorBase;
@@ -269,7 +264,7 @@ pub struct Repo {
     pub git_symbolic_refs: dyn GitSymbolicRefs,
 
     #[facet]
-    pub git_push_redirect_config: dyn GitPushRedirectConfig,
+    pub git_source_of_truth_config: dyn GitSourceOfTruthConfig,
 
     #[facet]
     pub filenodes: dyn Filenodes,
@@ -413,25 +408,6 @@ impl<R: MononokeRepo> RepoContextBuilder<R> {
         )
         .await
     }
-}
-
-pub async fn open_synced_commit_mapping(
-    fb: FacebookInit,
-    config: RepoConfig,
-    mysql_options: &MysqlOptions,
-    readonly_storage: ReadOnlyStorage,
-) -> Result<Arc<SqlSyncedCommitMapping>, Error> {
-    let sql_factory = MetadataSqlFactory::new(
-        fb,
-        config.storage_config.metadata,
-        mysql_options.clone(),
-        readonly_storage,
-    )
-    .await?;
-
-    Ok(Arc::new(
-        sql_factory.open::<SqlSyncedCommitMapping>().await?,
-    ))
 }
 
 /// Defines behavuiour of xrepo_commit_lookup when there's no mapping for queries commit just yet.
@@ -1789,10 +1765,10 @@ impl<R: MononokeRepo> Hash for RepoContext<R> {
 mod tests {
     use std::str::FromStr;
 
+    use fbinit::FacebookInit;
     use fixtures::Linear;
     use fixtures::MergeEven;
     use fixtures::TestRepoFixture;
-    use justknobs::test_helpers::override_just_knobs;
     use mononoke_macros::mononoke;
 
     use super::*;
@@ -1824,7 +1800,7 @@ mod tests {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_try_find_child_merge(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let repo: Repo = MergeEven::get_repo(fb).await;

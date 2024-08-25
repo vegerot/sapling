@@ -312,6 +312,75 @@ pub struct RenameWorkspaceResponse {
     pub data: Result<String, ServerError>,
 }
 
+#[auto_wire]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct GetSmartlogByVersionParams {
+    #[id(0)]
+    pub workspace: String,
+    #[id(1)]
+    pub reponame: String,
+    #[id(2)]
+    #[no_default]
+    pub filter: SmartlogFilter,
+    #[id(3)]
+    pub flags: Vec<GetSmartlogFlag>,
+}
+
+#[auto_wire]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub enum SmartlogFilter {
+    #[id(1)]
+    Version(i64),
+    #[id(2)]
+    Timestamp(i64),
+}
+
+// Wire requires a default value, shouldn't be used
+impl Default for SmartlogFilter {
+    fn default() -> Self {
+        Self::Version(0)
+    }
+}
+
+#[auto_wire]
+#[derive(Clone, Default, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct HistoricalVersion {
+    #[id(0)]
+    pub version_number: i64,
+    #[id(1)]
+    pub timestamp: i64,
+}
+
+#[auto_wire]
+#[derive(Clone, Default, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct HistoricalVersionsData {
+    #[id(0)]
+    pub versions: Vec<HistoricalVersion>,
+}
+
+#[auto_wire]
+#[derive(Clone, Default, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct HistoricalVersionsParams {
+    #[id(0)]
+    pub workspace: String,
+    #[id(1)]
+    pub reponame: String,
+}
+
+#[auto_wire]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
+pub struct HistoricalVersionsResponse {
+    #[id(0)]
+    #[no_default]
+    pub data: Result<HistoricalVersionsData, ServerError>,
+}
+
 impl RemoteBookmark {
     pub fn full_name(&self) -> String {
         format!("{}/{}", self.remote, self.name)

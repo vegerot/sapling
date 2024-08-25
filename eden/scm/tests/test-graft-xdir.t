@@ -22,7 +22,10 @@ Test validation of --from-path and --to-path
   grafting 7b3f3d5e5faf "A"
   abort: overlapping --to-path entries
   [255]
-  $ hg graft -qr $A --from-path foo --from-path bar --to-path baz/a --to-path baz/b
+  $ hg graft -r $A --from-path foo --from-path bar --to-path baz/a --to-path baz/b
+  grafting 7b3f3d5e5faf "A"
+  path 'foo' does not exist in commit 7b3f3d5e5faf
+  path 'bar' does not exist in commit 7b3f3d5e5faf
   note: graft of 7b3f3d5e5faf created no changes to commit
   $ hg graft -r $A --from-path foo --from-path bar --to-path baz/a --to-path baz/a
   grafting 7b3f3d5e5faf "A"
@@ -679,6 +682,24 @@ Graft supports non-root relative paths
   > EOS
   $ hg go -q $B
   $ cd my
-Tofix: graft should be able to graft commit $C when using non-relative paths
   $ hg graft -qr $C --from-path foo --to-path bar
-  note: graft of 48b96237613e created no changes to commit
+  $ hg show
+  commit:      79108b2a64e6
+  user:        test
+  date:        Thu Jan 01 00:00:00 1970 +0000
+  files:       my/bar/file
+  description:
+  C
+  
+  Grafted from 48b96237613e0f4a5fb16198b55dd4a03ca3c527
+    Grafted path foo to bar
+  
+  
+  diff --git a/my/bar/file b/my/bar/file
+  --- a/my/bar/file
+  +++ b/my/bar/file
+  @@ -1,3 +1,3 @@
+  -a
+  +aa
+   b
+   cc

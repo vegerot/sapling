@@ -5,7 +5,8 @@
 
 import json
 
-from .. import cmdutil, context, error, hg, pathutil, scmutil
+from .. import cmdutil, context, error, hg, scmutil
+
 from ..cmdutil import commitopts, commitopts2
 from ..i18n import _
 from .cmdtable import command
@@ -76,21 +77,21 @@ def copy(ui, repo, *args, **opts):
 
 def _docopy(ui, repo, *args, **opts):
     cmdutil.bailifchanged(repo)
-    cwd = repo.getcwd()
-
-    from_paths = [pathutil.canonpath(repo.root, cwd, f) for f in opts.get("from_path")]
-    to_paths = [pathutil.canonpath(repo.root, cwd, f) for f in opts.get("to_path")]
-    if len(from_paths) != len(to_paths):
-        raise error.Abort(_("must provide same number of --from-path and --to-path"))
-
-    user = opts.get("user")
-    date = opts.get("date")
-    text = opts.get("message")
 
     # if 'rev' is not specificed, copy from the working copy parent
     from_rev = opts.get("rev") or "."
     from_ctx = scmutil.revsingle(repo, from_rev)
     to_ctx = repo["."]
+
+    from_paths = scmutil.rootrelpaths(from_ctx, opts.get("from_path"))
+    to_paths = scmutil.rootrelpaths(from_ctx, opts.get("to_path"))
+    scmutil.validate_path_size(from_paths, to_paths, abort_on_empty=True)
+    scmutil.validate_path_exist(ui, from_ctx, from_paths, abort_on_missing=True)
+    scmutil.validate_path_overlap(to_paths)
+
+    user = opts.get("user")
+    date = opts.get("date")
+    text = opts.get("message")
 
     extra = {}
     extra.update(_gen_branch_info(from_ctx.hex(), from_paths, to_paths))

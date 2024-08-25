@@ -113,20 +113,25 @@ async fn write_packetline(
             "empty packet lines are not permitted as '0004' is invalid",
         ));
     }
+    let max_data_len = if !is_binary || channel.is_some() {
+        MAX_DATA_LEN - 1 // One byte would be taken up by the prefix
+    } else {
+        MAX_DATA_LEN
+    };
     let mut written = 0;
     while !buf.is_empty() {
-        let (data, rest) = buf.split_at(buf.len().min(MAX_DATA_LEN));
+        let (data, rest) = buf.split_at(buf.len().min(max_data_len));
         written += if is_binary {
             if let Some(channel) = channel {
-                band_to_write(channel, data, out).await?
+                band_to_write(channel, data, out).await? - 1 // Don't count the prefix
             } else {
                 data_to_write(data, out).await?
             }
         } else {
-            text_to_write(data, out).await?
+            text_to_write(data, out).await? - 1 // Don't count the prefix
         };
         // subtract header (and trailing NL) because write-all can't handle writing more than it passes in
-        written -= U16_HEX_BYTES + usize::from(is_binary);
+        written -= U16_HEX_BYTES;
         buf = rest;
     }
     Ok(written)
