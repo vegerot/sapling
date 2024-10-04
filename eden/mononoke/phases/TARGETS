@@ -1,6 +1,5 @@
 load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
 load("@fbcode_macros//build_defs:rust_unittest.bzl", "rust_unittest")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("mononoke")
 
@@ -9,6 +8,7 @@ rust_library(
     srcs = glob([
         "src/**/*.rs",
     ]),
+    test_deps = ["//eden/mononoke/mononoke_macros:mononoke_macros"],
     deps = [
         "fbsource//third-party/rust:abomonation",
         "fbsource//third-party/rust:abomonation_derive",
@@ -39,6 +39,7 @@ rust_library(
         "fbsource//third-party/rust:maplit",
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
         "//eden/mononoke/mononoke_types:mononoke_types-mocks",
     ],
     deps = [
@@ -85,6 +86,7 @@ rust_unittest(
         "//eden/mononoke/bookmarks:bookmarks",
         "//eden/mononoke/filestore:filestore",
         "//eden/mononoke/mercurial:mercurial_types",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
         "//eden/mononoke/mononoke_types:mononoke_types",
         "//eden/mononoke/repo_attributes/commit_graph/commit_graph:commit_graph",
         "//eden/mononoke/repo_attributes/repo_derived_data:repo_derived_data",

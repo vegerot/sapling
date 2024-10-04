@@ -23,12 +23,12 @@ from functools import partial
 from typing import Optional, Set
 
 import bindings
+
 from sapling import tracing
 from sapling.ext.extlib.phabricator import diffprops
 
 from . import (
     bookmarks,
-    branchmap,
     bundle2,
     changegroup,
     changelog2,
@@ -76,7 +76,6 @@ from . import (
 from .i18n import _, _n
 from .node import bin, hex, nullhex, nullid
 from .pycompat import range
-
 
 release = lockmod.release
 urlerr = util.urlerr
@@ -646,6 +645,8 @@ class localrepository:
 
         self._eventreporting = True
 
+        self.svfs._reporef = weakref.ref(self)
+
         # needed by revlog2
         sfmt = self.storage_format()
         if not create and (
@@ -655,13 +656,7 @@ class localrepository:
 
             revlog2.patch_types()
 
-            self.svfs._reporef = weakref.ref(self)
-
-            if (
-                "eagercompat" not in self.storerequirements
-                # seems incompatible with legacy lfs extension
-                and not extensions.isenabled(self.ui, "lfs")
-            ):
+            if "eagercompat" not in self.storerequirements:
                 with self.lock(wait=False):
                     self.storerequirements.add("eagercompat")
                     self._writestorerequirements()
@@ -973,9 +968,6 @@ class localrepository:
         for r in self.requirements:
             if r.startswith("exp-compression-"):
                 self.svfs.options["compengine"] = r[len("exp-compression-") :]
-
-        treemanifestserver = self.ui.configbool("treemanifest", "server")
-        self.svfs.options["treemanifest-server"] = treemanifestserver
 
         bypassrevlogtransaction = self.ui.configbool(
             "experimental", "narrow-heads"
@@ -1319,7 +1311,7 @@ class localrepository:
         """Create a connection from the connection pool"""
         from . import hg  # avoid cycle
 
-        source, _branches = hg.parseurl(self.ui.expandpath(source))
+        source = hg.parseurl(self.ui.expandpath(source))
         return self.connectionpool.get(source, opts=opts)
 
     @repofilecache(localpaths=["shared"])
@@ -1614,7 +1606,7 @@ class localrepository:
     def nodebookmarks(self, node):
         """return the list of bookmarks pointing to the specified node"""
         marks = []
-        for bookmark, n in pycompat.iteritems(self._bookmarks):
+        for bookmark, n in self._bookmarks.items():
             if n == node:
                 marks.append(bookmark)
         return sorted(marks)
@@ -1622,35 +1614,13 @@ class localrepository:
     def branchmap(self):
         """returns a dictionary {branch: [branchheads]} with branchheads
         ordered by increasing revision number"""
-        branchmap.updatecache(self)
-        return self._branchcaches[None]
-
-    def branchtip(self, branch, ignoremissing=False):
-        """return the tip node for a given branch
-
-        If ignoremissing is True, then this method will not raise an error.
-        This is helpful for callers that only expect None for a missing branch
-        (e.g. namespace).
-
-        """
-        try:
-            return self.branchmap().branchtip(branch)
-        except KeyError:
-            if not ignoremissing:
-                raise errormod.RepoLookupError(_("unknown branch '%s'") % branch)
-            else:
-                pass
+        branches = {}
+        if heads := list(self.changelog.dag.sort(self.heads()).reverse()):
+            branches["default"] = heads
+        return branches
 
     def lookup(self, key):
         return self[key].node()
-
-    def lookupbranch(self, key, remote=None):
-        repo = remote or self
-        if key in repo.branchmap():
-            return key
-
-        repo = (remote and remote.local()) and remote or self
-        return repo[key].branch()
 
     def known(self, nodes):
         cl = self.changelog
@@ -2184,17 +2154,6 @@ class localrepository:
             dsguard.close()
 
             self.dirstate.restorebackup(None, "undo.dirstate")
-            try:
-                branch = self.localvfs.readutf8("undo.branch")
-                self.dirstate.setbranch(encoding.tolocal(branch))
-            except IOError:
-                ui.warn(
-                    _(
-                        "named branch could not be reset: "
-                        "current branch is still '%s'\n"
-                    )
-                    % self.dirstate.branch()
-                )
 
             parents = tuple([p.rev() for p in self[None].parents()])
             if len(parents) > 1:
@@ -2783,11 +2742,7 @@ class localrepository:
 
             # internal config: ui.allowemptycommit
             allowemptycommit = (
-                wctx.branch() != wctx.p1().branch()
-                or extra.get("close")
-                or merge
-                or cctx.files()
-                or self.ui.configbool("ui", "allowemptycommit")
+                merge or cctx.files() or self.ui.configbool("ui", "allowemptycommit")
             )
             if not allowemptycommit:
                 return None
@@ -3084,27 +3039,6 @@ class localrepository:
         headrevs = self.headrevs(start, includepublic, includedraft)
         return list(map(self.changelog.node, headrevs))
 
-    def branchheads(self, branch=None, start=None, closed=False):
-        """return a list of heads for the given branch
-
-        Heads are returned in topological order, from newest to oldest.
-        If branch is None, use the dirstate branch.
-        If start is not None, return only heads reachable from start.
-        If closed is True, return heads that are marked as closed as well.
-        """
-        if branch is None:
-            branch = self[None].branch()
-        branches = self.branchmap()
-        if branch not in branches:
-            return []
-        # the cache returns heads ordered lowest to highest
-        bheads = list(reversed(branches.branchheads(branch, closed=closed)))
-        if start is not None:
-            # filter out the heads that cannot be reached from startrev
-            fbheads = set(self.changelog.nodesbetween([start], bheads)[2])
-            bheads = [h for h in bheads if h in fbheads]
-        return bheads
-
     def branches(self, nodes):
         if not nodes:
             nodes = [self.changelog.tip()]
@@ -3190,7 +3124,7 @@ class localrepository:
                 if pattern.endswith("*"):
                     pattern = "re:^" + pattern[:-1] + ".*"
                 kind, pat, matcher = util.stringmatcher(pattern)
-                for bookmark, node in pycompat.iteritems(bmarks):
+                for bookmark, node in bmarks.items():
                     if matcher(bookmark):
                         values[bookmark] = node
         return values
@@ -3408,7 +3342,7 @@ def _validate_committable_ctx(ui, ctx):
 
     extraslimit = ui.configbytes("commit", "extras-size-limit")
     if extraslimit:
-        extraslen = sum(len(k) + len(v) for k, v in pycompat.iteritems(ctx.extra()))
+        extraslen = sum(len(k) + len(v) for k, v in ctx.extra().items())
         if extraslen > extraslimit:
             raise errormod.Abort(
                 _("commit extras total size (%s) exceeds configured limit (%s)")

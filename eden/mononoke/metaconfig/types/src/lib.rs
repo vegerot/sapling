@@ -22,6 +22,7 @@ use std::str;
 use std::str::FromStr;
 use std::time::Duration;
 
+use abomonation_derive::Abomonation;
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Error;
@@ -112,6 +113,15 @@ pub struct RedactionConfig {
     pub redaction_sets_location: String,
 }
 
+/// Configuration for the async requests system
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AsyncRequestsConfig {
+    /// The database used for the queue table
+    pub db_config: Option<DatabaseConfig>,
+    /// The blobstore used for request params and response
+    pub blobstore: Option<BlobConfig>,
+}
+
 /// Configuration for all repos
 #[facet::facet]
 #[derive(Clone, Default, Debug, Eq, PartialEq)]
@@ -138,6 +148,8 @@ pub struct CommonConfig {
     pub git_memory_upper_bound: Option<u64>,
     /// Scuba table to dump edenapi requests to (for replay).
     pub edenapi_dumper_scuba_table: Option<String>,
+    /// Configuration for the async requests system.
+    pub async_requests_config: AsyncRequestsConfig,
 }
 
 /// Configuration for logging of censored blobstore accesses
@@ -237,8 +249,6 @@ pub struct RepoConfig {
     pub deep_sharding_config: Option<ShardingModeConfig>,
     /// Local directory to write files to instead of uploading to everstore
     pub everstore_local_path: Option<String>,
-    /// The concurrency setting to be used during git protocol for this repo
-    pub git_concurrency: Option<GitConcurrencyParams>,
     /// Configuration for the repo metadata logger
     pub metadata_logger_config: MetadataLoggerConfig,
     /// Configuration for connecting to Zelos
@@ -255,12 +265,8 @@ pub struct RepoConfig {
     pub commit_cloud_config: CommitCloudConfig,
     /// Mononoke Cas Sync Configuration
     pub mononoke_cas_sync_config: Option<MononokeCasSyncConfig>,
-    /// Determines the behaviour on converting from Git commits
-    /// to bonsais for this repo.
-    ///  - With the flag ON the git lfs pointers will be interpreted and the actual file contents will
-    ///    be stored. File contents have to be available in Mononoke.
-    ///  - With this flag OFF the git lfs pointers are treated like any other file in the repo.
-    pub git_lfs_interpret_pointers: bool,
+    /// All Git related configs (e.g. Git Server and Git-only repos)
+    pub git_configs: GitConfigs,
 }
 
 /// Config determining if the repo is deep sharded in the context of a service.
@@ -1393,7 +1399,7 @@ pub enum CommitSyncDirection {
 }
 
 /// CommitSyncConfig version name
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Abomonation, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[derive(mysql::OptTryFromRowField)]
 pub struct CommitSyncConfigVersion(pub String);
 
@@ -1846,7 +1852,7 @@ pub struct MetadataLoggerConfig {
 }
 
 /// Configuration for connecting to Zelos
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub enum ZelosConfig {
     /// Connect to a local Zelos server
     Local {
@@ -1878,6 +1884,25 @@ pub struct GitConcurrencyParams {
     pub commits: usize,
     /// The concurrency value for tag fetches
     pub tags: usize,
+}
+
+/// All Git related configs (e.g. Git Server and Git-only repos)
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct GitConfigs {
+    /// The concurrency setting to be used during git protocol for this repo
+    pub git_concurrency: Option<GitConcurrencyParams>,
+    /// Determines the behaviour on converting from Git commits
+    /// to bonsais for this repo.
+    ///  - With the flag ON the git lfs pointers will be interpreted and the actual file contents will
+    ///    be stored. File contents have to be available in Mononoke.
+    ///  - With this flag OFF the git lfs pointers are treated like any other file in the repo.
+    pub git_lfs_interpret_pointers: bool,
+    /// Optional messages to display to users after they run fetch commands (e.g.
+    /// pull, clone).
+    ///
+    /// NOTE: Adding a message is not enough! The message will only be displayed
+    /// if the repo enables this feature through a JK.
+    pub fetch_message: Option<String>,
 }
 
 /// Configuration for x repo syncs

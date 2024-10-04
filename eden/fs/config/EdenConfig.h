@@ -20,7 +20,6 @@
 #include "eden/fs/config/ConfigSetting.h"
 #include "eden/fs/config/ConfigSource.h"
 #include "eden/fs/config/ConfigVariables.h"
-#include "eden/fs/config/FileChangeMonitor.h"
 #include "eden/fs/config/HgObjectIdFormat.h"
 #include "eden/fs/config/InodeCatalogType.h"
 #include "eden/fs/config/MountProtocol.h"
@@ -324,6 +323,23 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<bool> shouldFetchTreeMetadata{
       "thrift:request-tree-metadata",
       false,
+      this};
+
+  /**
+   * How often to collect Thrift server metrics. The default value mirrors the
+   * value from facebook::fb303::TServerCounters::kDefaultSampleRate
+   */
+  ConfigSetting<uint32_t> thriftServerObserverSamplingRate{
+      "thrift:server-observer-sampling-rate",
+      32,
+      this};
+
+  /**
+   * How often to publish Thrift server metrics in milliseconds.
+   */
+  ConfigSetting<std::chrono::nanoseconds> thriftServerObserverPublishInterval{
+      "thrift:server-observer-publish-interval",
+      std::chrono::milliseconds(1000),
       this};
 
   // [ssl]
@@ -1549,6 +1565,16 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<std::vector<std::string>> doctorExtensionAuthorAllowList{
       "doctor:vscode-extensions-author-allow-list",
       {},
+      this};
+
+  /**
+   * How often to automatically run the eden doctor.
+   * Defaults to 0 for now, so that we can run config based rollouts.
+   * 0 = eden doctor would not run at all.
+   */
+  ConfigSetting<std::chrono::nanoseconds> edenDoctorInterval{
+      "core:eden-doctor-interval",
+      std::chrono::hours(0),
       this};
 
   // [rage]

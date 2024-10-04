@@ -101,15 +101,34 @@ function setup_sync_config_stripping_git_submodules {
 }
 
 function run_common_xrepo_sync_with_gitsubmodules_setup {
-  INFINITEPUSH_ALLOW_WRITES=true ENABLE_API_WRITES=1 REPOID="$LARGE_REPO_ID" \
+  export SM_COMMIT_DATE="1970-1-1 00:00:01"
+  # Avoid local clone error "fatal: transport 'file' not allowed" in new Git versions (see CVE-2022-39253).
+  export XDG_CONFIG_HOME=$TESTTMP
+  git config --global protocol.file.allow always
+
+  INFINITEPUSH_ALLOW_WRITES=true REPOID="$LARGE_REPO_ID" \
     REPONAME="$LARGE_REPO_NAME" setup_common_config "$REPOTYPE"
-  # Enable writes in small repo as well, so we can update bookmarks when running gitimport
-  INFINITEPUSH_ALLOW_WRITES=true ENABLE_API_WRITES=1 REPOID="$SUBMODULE_REPO_ID" \
-    REPONAME="$SUBMODULE_REPO_NAME" setup_common_config "$REPOTYPE"
+  # Enable writes in small repo as well, so we can update bookmarks when running gitimport,
+  # and set the default commit identity schema to git.
+  INFINITEPUSH_ALLOW_WRITES=true REPOID="$SUBMODULE_REPO_ID" \
+    REPONAME="$SUBMODULE_REPO_NAME" COMMIT_IDENTITY_SCHEME=3 setup_common_config "$REPOTYPE"
+
+  # Set the REPONAME environment variable to the large repo name, so that all
+  # sapling commands run with the large repo by default.
+  # The small repos don't support sapling, because hg types are not derived in
+  # them, since they have submodule file changes.
+  export REPONAME=$LARGE_REPO_NAME
 
   setup_sync_config_stripping_git_submodules
 
   start_and_wait_for_mononoke_server
+
+  # Create a commit in the large repo
+  testtool_drawdag -R "$LARGE_REPO_NAME" --no-default-files <<EOF
+L_A
+# modify: L_A "file_in_large_repo.txt" "first file"
+# bookmark: L_A master
+EOF
 
   # Setting up mutable counter for live forward sync
   # NOTE: this might need to be updated/refactored when setting up test for backsyncing
@@ -118,10 +137,14 @@ function run_common_xrepo_sync_with_gitsubmodules_setup {
   cd "$TESTTMP" || exit
 }
 
+function sl_log() {
+   hg log --graph -T '{node|short} {desc}\n' "$@"
+}
+
 function clone_and_log_large_repo {
   LARGE_BCS_IDS=( "$@" )
   cd "$TESTTMP" || exit
-  REPONAME="$LARGE_REPO_NAME" hgmn_clone "mononoke://$(mononoke_address)/$LARGE_REPO_NAME" "$LARGE_REPO_NAME"
+  hg clone -q mono:$LARGE_REPO_NAME "$LARGE_REPO_NAME"
   cd "$LARGE_REPO_NAME" || exit
 
 
@@ -132,7 +155,7 @@ function clone_and_log_large_repo {
     fi
   done
 
-  hg log --graph -T '{node|short} {desc}\n' --stat -r "sort(all(), desc)"
+  sl_log --stat -r "sort(all(), desc)"
 
   printf "\n\nRunning mononoke_admin to verify mapping\n\n"
   for LARGE_BCS_ID in "${LARGE_BCS_IDS[@]}"; do

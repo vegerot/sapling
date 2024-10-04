@@ -572,6 +572,16 @@ function wait_for_mononoke {
   wait_for_server "Mononoke" MONONOKE_SOCKET "$TESTTMP/mononoke.out" \
     "${MONONOKE_START_TIMEOUT:-"$MONONOKE_DEFAULT_START_TIMEOUT"}" "$MONONOKE_SERVER_ADDR_FILE" \
     mononoke_health
+
+  # Now that we have started, write out a Sapling "mono" scheme that references our current IP/port,
+  # and configure the SLAPI URL.
+  cat >> "$HGRCPATH" <<EOF
+[schemes]
+mono=mononoke://$(mononoke_address)/{1}
+
+[edenapi]
+url=https://localhost:$MONONOKE_SOCKET/edenapi/
+EOF
 }
 
 function flush_mononoke_bookmarks {
@@ -616,38 +626,61 @@ function setup_common_hg_configs {
   cat >> "$HGRCPATH" <<EOF
 [ui]
 ssh="$DUMMYSSH"
+
 [devel]
 segmented-changelog-rev-compat=True
-[extensions]
-remotefilelog=
-[remotefilelog]
-cachepath=$TESTTMP/cachepath
+
 [extensions]
 commitextras=
+remotenames=
+smartlog=
+clienttelemetry=
+
+[remotefilelog]
+cachepath=$TESTTMP/cachepath
+shallowtrees=True
+
 [hint]
 ack=*
+
 [experimental]
 changegroup3=True
+
 [mutation]
 record=False
+
 [web]
 cacerts=$TEST_CERTDIR/root-ca.crt
+
 [auth]
+mononoke.prefix=*
+mononoke.schemes=https mononoke
 mononoke.cert=$TEST_CERTDIR/${OVERRIDE_CLIENT_CERT:-client0}.crt
 mononoke.key=$TEST_CERTDIR/${OVERRIDE_CLIENT_CERT:-client0}.key
-mononoke.prefix=mononoke://*
 mononoke.cn=localhost
-edenapi.cert=$TEST_CERTDIR/${OVERRIDE_CLIENT_CERT:-client0}.crt
-edenapi.key=$TEST_CERTDIR/${OVERRIDE_CLIENT_CERT:-client0}.key
-edenapi.prefix=localhost
-edenapi.cacerts=$TEST_CERTDIR/root-ca.crt
 
 [checkout]
 use-rust=false
 
 [workingcopy]
 rust-checkout=false
+
+[schemes]
+hg=ssh://user@dummy/{1}
+
+[cas]
+use-case=source-control-testing
+log-dir=$TESTTMP
 EOF
+
+  # Only set the dummy ssh "mono" scheme the first time. If we are called again after
+  # Mononoke starts, we don't want to override the scheme.
+  if ! hg config schemes.mono > /dev/null; then
+    cat >> "$HGRCPATH" <<EOF
+[schemes]
+mono=ssh://user@dummy/{1}
+EOF
+  fi
 }
 
 function setup_common_config {
@@ -719,6 +752,10 @@ CONFIG
   fi
 
   cat >> common/common.toml <<CONFIG
+[async_requests_config]
+db_config = { local = { local_db_path="$TESTTMP/monsql" } }
+blobstore_config = { blob_files = { path = "$TESTTMP/async_requests.blobstore" } }
+
 [internal_identity]
 identity_type = "SERVICE_IDENTITY"
 identity_data = "proxy"
@@ -897,18 +934,6 @@ function setup_configerator_configs {
 EOF
   fi
 
-  export PUSHREDIRECT_CONF
-  PUSHREDIRECT_CONF="${LOCAL_CONFIGERATOR_PATH}/scm/mononoke/pushredirect"
-  mkdir -p "$PUSHREDIRECT_CONF"
-
-  if [[ ! -f "$PUSHREDIRECT_CONF/enable" ]]; then
-    cat >> "$PUSHREDIRECT_CONF/enable" <<EOF
-{
-  "per_repo": {}
-}
-EOF
-  fi
-
   COMMIT_SYNC_CONF="${LOCAL_CONFIGERATOR_PATH}/scm/mononoke/repos/commitsyncmaps"
   mkdir -p "$COMMIT_SYNC_CONF"
   export COMMIT_SYNC_CONF
@@ -998,7 +1023,6 @@ function setup_mononoke_repo_config {
   mkdir -p "repos/$reponame_urlencoded"
   mkdir -p "repo_definitions/$reponame_urlencoded"
   mkdir -p "$TESTTMP/monsql"
-  mkdir -p "$TESTTMP/$reponame_urlencoded"
   mkdir -p "$everstore_local_path"
   cat > "repos/$reponame_urlencoded/server.toml" <<CONFIG
 hash_validation_percentage=100
@@ -1017,6 +1041,12 @@ CONFIG
 if [[ -n "${READ_ONLY_REPO:-}" ]]; then
   cat >> "repo_definitions/$reponame_urlencoded/server.toml" <<CONFIG
 readonly=true
+CONFIG
+fi
+
+if [[ -n "${COMMIT_IDENTITY_SCHEME:-}" ]]; then
+  cat >> "repo_definitions/$reponame_urlencoded/server.toml" <<CONFIG
+default_commit_identity_scheme=$COMMIT_IDENTITY_SCHEME
 CONFIG
 fi
 
@@ -1046,7 +1076,7 @@ fi
 
 if [ "$GIT_LFS_INTERPRET_POINTERS" == "1" ]; then
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-git_lfs_interpret_pointers = true
+git_configs.git_lfs_interpret_pointers = true
 CONFIG
 fi
 
@@ -1109,7 +1139,7 @@ CONFIG
 
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 [commit_cloud_config]
-mocked_employees=["myusername0@fb.com"]
+mocked_employees=["myusername0@fb.com","anotheruser@fb.com"]
 disable_interngraph_notification=true
 CONFIG
 
@@ -1258,7 +1288,9 @@ types=[
   "hgchangesets",
   "hg_augmented_manifests",
   "skeleton_manifests",
+  "skeleton_manifests_v2",
   "bssm_v3",
+  "ccsm",
   "test_manifests",
   "test_sharded_manifests"
 ]
@@ -1294,12 +1326,12 @@ backup_source_repo_name="$BACKUP_FROM"
 CONFIG
 fi
 
-if [[ -n "${ENABLE_API_WRITES:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
+cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
 [source_control_service]
-permit_writes = true
+permit_writes = ${SCS_PERMIT_WRITES:-true}
+permit_service_writes = ${SCS_PERMIT_SERVICE_WRITES:-true}
+permit_commits_without_parents = ${SCS_PERMIT_COMMITS_WITHOUT_PARENTS:-true}
 CONFIG
-fi
 
 if [[ -n "${SPARSE_PROFILES_LOCATION}" ]]; then
   cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
@@ -1415,8 +1447,7 @@ function blobimport {
   # --blobimport--> Mononoke repo
   local revlog="$input/revlog-export"
   rm -rf "$revlog"
-  sl --cwd "$input" debugexportrevlog revlog-export
-  mkdir -p "$output"
+  hg --cwd "$input" debugexportrevlog revlog-export
   $MONONOKE_BLOBIMPORT \
     "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
@@ -1550,20 +1581,48 @@ function wait_for_bookmark_delete() {
 function get_bookmark_value_edenapi {
   local repo="$1"
   local bookmark="$2"
-  REPONAME="$repo" sl debugapi -e bookmarks -i "[\"$bookmark\"]" | jq -r ".\"$bookmark\""
+  hg debugapi mono:"$repo" -e bookmarks -i "[\"$bookmark\"]" | jq -r ".\"$bookmark\""
 }
 
 function wait_for_bookmark_move_away_edenapi() {
   local repo="$1"
   local bookmark="$2"
   local prev="$3"
+  local max_attempts=${ATTEMPTS:-30}
   local attempt=1
   sleep 1
   flush_mononoke_bookmarks
   while [[ "$(get_bookmark_value_edenapi "$repo" "$bookmark")" == "$prev" ]]
   do
     attempt=$((attempt + 1))
-    if [[ $attempt -gt 30 ]]
+    if [[ $attempt -gt $max_attempts ]]
+    then
+        echo "bookmark move of $bookmark away from $prev has not happened"
+        return 1
+    fi
+    sleep 2
+    flush_mononoke_bookmarks
+  done
+}
+
+function get_bookmark_value_bonsai {
+  local repo="$1"
+  local bookmark="$2"
+  mononoke_newadmin bookmarks -R "$repo" get "$bookmark"
+}
+
+function wait_for_bookmark_move_away_bonsai() {
+  local repo="$1"
+  local bookmark="$2"
+  local prev="$3"
+  local max_attempts=${ATTEMPTS:-30}
+  local attempt=1
+  sleep 1
+  flush_mononoke_bookmarks
+  while [[ "$(get_bookmark_value_bonsai "$repo" "$bookmark")" == "$prev" ]]
+  do
+    attempt=$((attempt + 1))
+    if [[ $attempt -gt $max_attempts ]]
     then
         echo "bookmark move of $bookmark away from $prev has not happened"
         return 1
@@ -1659,15 +1718,23 @@ function start_and_wait_for_land_service {
   wait_for_land_service
 }
 
-function megarepo_async_worker {
+function _megarepo_async_worker_cmd {
   GLOG_minloglevel=5 "$ASYNC_REQUESTS_WORKER" "$@" \
     --log-level INFO \
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --scuba-dataset "file://$TESTTMP/async-worker.json" \
     "${CACHE_ARGS[@]}" \
-    "${COMMON_ARGS[@]}" >> "$TESTTMP/megarepo_async_worker.out" 2>&1 &
+    "${COMMON_ARGS[@]}"
+}
+
+function megarepo_async_worker {
+  _megarepo_async_worker_cmd "$@" >> "$TESTTMP/megarepo_async_worker.out" 2>&1 &
   export MEGAREPO_ASYNC_WORKER_PID=$!
   echo "$MEGAREPO_ASYNC_WORKER_PID" >> "$DAEMON_PIDS"
+}
+
+function megarepo_async_worker_foreground {
+  _megarepo_async_worker_cmd "$@"
 }
 
 function scsc_as {
@@ -1837,101 +1904,23 @@ function mononoke_git_service {
   MONONOKE_GIT_SERVICE_BASE_URL="https://localhost:$MONONOKE_GIT_SERVICE_PORT/repos/git/ro"
 }
 
-# Run an hg binary configured with the settings required to talk to Mononoke
-function hgmn {
-  reponame_urlencoded="$(urlencode encode "$REPONAME")"
-  hg --config paths.default="mononoke://$(mononoke_address)/$reponame_urlencoded" "$@"
-}
-
-# Run an hg binary configured with the settings require to talk to Mononoke
-# via SaplingRemoteAPI
-function sl {
-  hgmn \
-    --config "edenapi.url=https://localhost:$MONONOKE_SOCKET/edenapi" \
-    --config "edenapi.enable=true" \
-    --config "remotefilelog.http=true" \
-    --config "remotefilelog.reponame=$REPONAME" \
-    "$@"
-}
-
 function hginit_treemanifest() {
   hg init "$@"
   cat >> "$1"/.hg/hgrc <<EOF
 [extensions]
-treemanifest=!
-treemanifestserver=
-remotefilelog=
-smartlog=
-clienttelemetry=
-[treemanifest]
-flatcompat=False
-server=True
-sendtrees=True
-treeonly=True
+commitextras=
+
 [remotefilelog]
 reponame=$1
-cachepath=$TESTTMP/cachepath
 server=True
-shallowtrees=True
-EOF
-}
-
-function hgclone_treemanifest() {
-  hg clone -q --shallow --config remotefilelog.reponame="$2" --config extensions.treemanifest= --config treemanifest.treeonly=True "$@"
-  cat >> "$2"/.hg/hgrc <<EOF
-[extensions]
-treemanifest=
-remotefilelog=
-smartlog=
-clienttelemetry=
-[treemanifest]
-flatcompat=False
-sendtrees=True
-treeonly=True
-[remotefilelog]
-reponame=$2
-cachepath=$TESTTMP/cachepath
-shallowtrees=True
 EOF
 }
 
 function hgmn_init() {
   hg init "$@"
   cat >> "$1"/.hg/hgrc <<EOF
-[extensions]
-treemanifest=
-remotefilelog=
-remotenames=
-smartlog=
-clienttelemetry=
-[treemanifest]
-flatcompat=False
-sendtrees=True
-treeonly=True
 [remotefilelog]
 reponame=$1
-cachepath=$TESTTMP/cachepath
-shallowtrees=True
-EOF
-}
-
-function hgmn_clone() {
-  quiet hgmn clone --shallow  --config extensions.remotenames= --config remotefilelog.reponame="$REPONAME" "$@" --config extensions.treemanifest= --config treemanifest.treeonly=True && \
-  cat >> "$2"/.hg/hgrc <<EOF
-[extensions]
-treemanifest=
-remotefilelog=
-remotenames=
-smartlog=
-clienttelemetry=
-[treemanifest]
-flatcompat=False
-sendtrees=True
-treeonly=True
-[remotefilelog]
-reponame=$REPONAME
-cachepath=$TESTTMP/cachepath
-shallowtrees=True
 EOF
 }
 
@@ -1942,43 +1931,7 @@ $1=
 EOF
 }
 
-function setup_hg_server() {
-  cat >> .hg/hgrc <<EOF
-[extensions]
-commitextras=
-treemanifest=!
-treemanifestserver=
-remotefilelog=
-clienttelemetry=
-[treemanifest]
-server=True
-[remotefilelog]
-server=True
-shallowtrees=True
-EOF
-}
-
-function setup_hg_client() {
-  cat >> .hg/hgrc <<EOF
-[extensions]
-treemanifest=
-remotefilelog=
-clienttelemetry=
-[treemanifest]
-flatcompat=False
-server=False
-treeonly=True
-[remotefilelog]
-server=False
-reponame=$REPONAME
-[mutation]
-record=False
-EOF
-}
-
-# Does all the setup necessary for hook tests
-function hook_test_setup() {
-  HOOKS_SCUBA_LOGGING_PATH="$TESTTMP/hooks-scuba.json" setup_mononoke_config
+function register_hooks {
   cd "$TESTTMP/mononoke-config" || exit 1
 
   reponame_urlencoded="$(urlencode encode "$REPONAME")"
@@ -2006,6 +1959,14 @@ CONFIG
     register_hook "$HOOK_NAME" "$EXTRA_CONFIG_DESCRIPTOR"
   done
 
+
+}
+# Does all the setup necessary for hook tests
+function hook_test_setup() {
+  HOOKS_SCUBA_LOGGING_PATH="$TESTTMP/hooks-scuba.json" setup_mononoke_config
+
+  register_hooks "$@"
+
   setup_common_hg_configs
   cd "$TESTTMP" || exit 1
 
@@ -2014,9 +1975,8 @@ CONFIG
 ssh="$DUMMYSSH"
 EOF
 
-  hg init repo-hg
-  cd repo-hg || exit 1
-  setup_hg_server
+  hginit_treemanifest "$REPONAME"
+  cd "$REPONAME" || exit 1
   drawdag <<EOF
 C
 |
@@ -2028,18 +1988,17 @@ EOF
   hg bookmark "$HOOKBOOKMARK" -r tip
 
   cd ..
-  blobimport repo-hg/.hg "$REPONAME"
+  blobimport "$REPONAME"/.hg "$REPONAME"
+
+  hg clone -q mono:"$REPONAME" repo2 --noupdate
 
   start_and_wait_for_mononoke_server
 
-  hgclone_treemanifest ssh://user@dummy/repo-hg repo2 --noupdate --config extensions.remotenames= -q
   cd repo2 || exit 1
-  setup_hg_client
   cat >> .hg/hgrc <<EOF
 [extensions]
-pushrebase =
+pushrebase=
 amend=
-remotenames =
 EOF
 }
 
@@ -2060,38 +2019,14 @@ function setup_hg_modern_lfs() {
 lfs=True
 useruststore=True
 getpackversion = 2
+
 [worker]
 rustworkers=True
-[extensions]
-lfs=!
+
 [lfs]
 url=$1
 threshold=$2
 backofftimes=0
-EOF
-}
-
-function setup_hg_edenapi() {
-  local repo
-  repo="$1"
-
-  cat >> .hg/hgrc <<EOF
-[edenapi]
-enable=true
-url=https://localhost:$MONONOKE_SOCKET/edenapi/$repo
-[remotefilelog]
-http=True
-useruststore=True
-getpackversion = 2
-[treemanifest]
-http=True
-useruststore=True
-[auth]
-edenapi.cert=$TEST_CERTDIR/client0.crt
-edenapi.key=$TEST_CERTDIR/client0.key
-edenapi.prefix=localhost
-edenapi.schemes=https
-edenapi.cacerts=$TEST_CERTDIR/root-ca.crt
 EOF
 }
 
@@ -2120,8 +2055,8 @@ function mkcommit() {
 
 function mkcommitedenapi() {
    echo "$1" > "$1"
-   sl add "$1"
-   sl ci -m "$1"
+   hg add "$1"
+   hg ci -m "$1"
 }
 
 function mkgitcommit() {
@@ -2191,8 +2126,8 @@ function add_synced_commit_mapping_entry() {
   large_repo_id="$3"
   large_bcs_id="$4"
   version="$5"
-  quiet mononoke_admin_source_target "$small_repo_id" "$large_repo_id" crossrepo insert rewritten --source-hash "$small_bcs_id" \
-    --target-hash "$large_bcs_id" \
+  quiet mononoke_newadmin cross-repo --source-repo-id "$small_repo_id" --target-repo-id "$large_repo_id" insert rewritten --source-commit-id "$small_bcs_id" \
+    --target-commit-id "$large_bcs_id" \
     --version-name "$version"
 }
 
@@ -2248,9 +2183,8 @@ ssh="$DUMMYSSH"
 amend=
 EOF
 
-hg init repo-hg
-cd repo-hg || exit 1
-setup_hg_server
+hginit_treemanifest repo
+cd repo || exit 1
 drawdag <<EOF
 C
 |
@@ -2270,7 +2204,7 @@ EOF
 function default_setup_blobimport() {
   default_setup_pre_blobimport "$@"
   echo "blobimporting"
-  blobimport repo-hg/.hg "$REPONAME"
+  blobimport repo/.hg "$REPONAME"
 }
 
 function default_setup() {
@@ -2280,13 +2214,11 @@ function default_setup() {
   start_and_wait_for_mononoke_server "$@"
 
   echo "cloning repo in hg client 'repo2'"
-  hgclone_treemanifest ssh://user@dummy/repo-hg repo2 --noupdate --config extensions.remotenames= -q
+  hg clone -q "mono:$REPONAME" repo2 --noupdate
   cd repo2 || exit 1
-  setup_hg_client
   cat >> .hg/hgrc <<EOF
 [extensions]
 pushrebase =
-remotenames =
 EOF
 }
 
@@ -2303,9 +2235,18 @@ function gitexport() {
 function gitimport() {
   log="$TESTTMP/gitimport.out"
 
+  local git_cmd
+  # git.real not present in OSS but mononoke defaults to it, so detect right command
+  if type --path git.real > /dev/null; then
+    git_cmd="git.real"
+  else
+    git_cmd="git"
+  fi
+
   "$MONONOKE_GITIMPORT" \
     "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
+    --git-command-path $git_cmd\
     --repo-id "$REPOID" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
     --tls-ca "$TEST_CERTDIR/root-ca.crt" \
@@ -2319,13 +2260,22 @@ function git() {
   date="01/01/0000 00:00 +0000"
   name="mononoke"
   email="mononoke@mononoke"
+
+  if ! command git config --get uploadpack.allowFilter > /dev/null; then
+    # Need this option in global config for filtering to work
+    # It has to be global unfortunately
+    GIT_AUTHOR_NAME="$name" \
+    GIT_AUTHOR_EMAIL="$email" \
+    command git config --global uploadpack.allowFilter true > /dev/null
+  fi
+
   GIT_COMMITTER_DATE="${GIT_COMMITTER_DATE:-$date}" \
   GIT_COMMITTER_NAME="$name" \
   GIT_COMMITTER_EMAIL="$email" \
   GIT_AUTHOR_DATE="${GIT_AUTHOR_DATE:-$date}" \
   GIT_AUTHOR_NAME="$name" \
   GIT_AUTHOR_EMAIL="$email" \
-  command git -c protocol.file.allow=always "$@"
+  command git -c init.defaultBranch=master -c protocol.file.allow=always "$@"
 }
 
 function git_set_only_author() {
@@ -2336,7 +2286,7 @@ function git_set_only_author() {
   GIT_AUTHOR_DATE="$date" \
   GIT_AUTHOR_NAME="$name" \
   GIT_AUTHOR_EMAIL="$email" \
-  command git -c protocol.file.allow=always "$@"
+  command git -c init.defaultBranch=master -c protocol.file.allow=always "$@"
 }
 
 function summarize_scuba_json() {
@@ -2474,9 +2424,18 @@ function streaming_clone() {
 function repo_import() {
   log="$TESTTMP/repo_import.out"
 
+  local git_cmd
+  # git.real not present in OSS but mononoke defaults to it, so detect right command
+  if type --path git.real > /dev/null; then
+    git_cmd="git.real"
+  else
+    git_cmd="git"
+  fi
+
   "$MONONOKE_REPO_IMPORT" \
     "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
+    --git-command-path "$git_cmd"\
     --repo-id "$REPOID" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
     "$@"
@@ -2609,8 +2568,28 @@ function x_repo_lookup() {
   SOURCE_REPO="$1"
   TARGET_REPO="$2"
   HASH="$3"
-  TRANSLATED=$(REPONAME=$SOURCE_REPO sl debugapi -e committranslateids -i "[{'Hg': '$HASH'}]" -i "'Hg'" -i "'$SOURCE_REPO'" -i "'$TARGET_REPO'")
-  sl debugshell <<EOF
+  TRANSLATED=$(hg debugapi -e committranslateids -i "[{'Hg': '$HASH'}]" -i "'Hg'" -i "'$SOURCE_REPO'" -i "'$TARGET_REPO'")
+  hg debugshell <<EOF
 print(hex(${TRANSLATED}[0]["translated"]["Hg"]))
 EOF
+}
+
+function async_worker_enqueue() {
+  local repo_id bookmark request_type args_blobstore_key
+  repo_id=$1
+  bookmark=$2
+  request_type=$3
+  args_blobstore_key=$4
+  status=${5:-new}
+
+  sqlite3 "$TESTTMP/monsql/sqlite_dbs" << EOF
+insert into long_running_request_queue
+  (repo_id, bookmark, request_type, args_blobstore_key, created_at, inprogress_last_updated_at, status)
+values
+  ($repo_id, '$bookmark', '$request_type', '$args_blobstore_key', strftime('%s', 'now') * 1000000000, strftime('%s', 'now') * 1000000000, '$status');
+EOF
+}
+
+function async_requests_clear_queue() {
+  sqlite3 "$TESTTMP/monsql/sqlite_dbs" 'delete from long_running_request_queue;'
 }

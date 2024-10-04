@@ -25,6 +25,8 @@ use gotham_ext::response::BytesBody;
 use gotham_ext::response::TryIntoResponse;
 use hyper::Body;
 use hyper::Response;
+use import_tools::GitImportLfs;
+use metaconfig_types::RepoConfigRef;
 use mononoke_api::Repo;
 use packetline::encode::flush_to_write;
 use packetline::encode::write_text_packetline;
@@ -37,6 +39,7 @@ use crate::command::PushArgs;
 use crate::command::RefUpdate;
 use crate::command::RequestCommand;
 use crate::model::GitMethodInfo;
+use crate::model::GitServerContext;
 use crate::model::RepositoryParams;
 use crate::model::RepositoryRequestContext;
 use crate::service::set_ref;
@@ -90,15 +93,35 @@ async fn push<'a>(
         let parsed_objects = parse_pack(push_args.pack_file, ctx, blobstore.clone()).await?;
         // Generate the GitObjectStore using the parsed objects
         let object_store = Arc::new(GitObjectStore::new(parsed_objects, ctx, blobstore.clone()));
+        // Instantiate the LFS configuration
+        let git_ctx = GitServerContext::borrow_from(state);
+        let lfs = if request_context
+            .repo
+            .repo_config()
+            .git_configs
+            .git_lfs_interpret_pointers
+        {
+            GitImportLfs::new(
+                git_ctx
+                    .upstream_lfs_server()?
+                    .ok_or_else(|| anyhow::anyhow!("No upstream LFS server specified"))?,
+                false,    // allow_not_found
+                2,        // max attempts
+                Some(50), // conn_limit
+                git_ctx.tls_args()?,
+            )?
+        } else {
+            GitImportLfs::new_disabled()
+        };
         // Upload the objects corresponding to the push to the underlying store
         let ref_map = upload_objects(
             ctx,
             request_context.repo.clone(),
             object_store.clone(),
             &push_args.ref_updates,
+            lfs,
         )
         .await?;
-        let affected_changesets_len = ref_map.len();
         // We were successful in parsing the pack and uploading the objects to underlying store. Indicate this to the client
         write_text_packetline(PACK_OK, &mut output).await?;
         // Create bonsai_git_mapping store to enable mapping lookup during bookmark movement
@@ -112,7 +135,6 @@ async fn push<'a>(
             request_context.clone(),
             git_bonsai_mapping_store.clone(),
             object_store.clone(),
-            affected_changesets_len,
         )
         .await?;
         // For each ref, update the status as ok or ng based on the result of the bookmark set operation
@@ -146,7 +168,6 @@ async fn refs_update(
     request_context: Arc<RepositoryRequestContext>,
     git_bonsai_mapping_store: Arc<GitMappingsStore>,
     object_store: Arc<GitObjectStore>,
-    affected_changesets_len: usize,
 ) -> anyhow::Result<Vec<(RefUpdate, anyhow::Result<()>)>> {
     if push_args.settings.atomic {
         atomic_refs_update(
@@ -154,7 +175,6 @@ async fn refs_update(
             request_context,
             git_bonsai_mapping_store,
             object_store,
-            affected_changesets_len,
         )
         .await
     } else {
@@ -163,7 +183,6 @@ async fn refs_update(
             request_context,
             git_bonsai_mapping_store,
             object_store,
-            affected_changesets_len,
         )
         .await
     }
@@ -175,7 +194,6 @@ async fn non_atomic_refs_update(
     request_context: Arc<RepositoryRequestContext>,
     git_bonsai_mapping_store: Arc<GitMappingsStore>,
     object_store: Arc<GitObjectStore>,
-    affected_changesets_len: usize,
 ) -> anyhow::Result<Vec<(RefUpdate, anyhow::Result<()>)>> {
     stream::iter(push_args.ref_updates.clone())
         .map(|ref_update| {
@@ -186,7 +204,7 @@ async fn non_atomic_refs_update(
                         request_context,
                         git_bonsai_mapping_store,
                         object_store,
-                        RefUpdateOperation::new(ref_update.clone(), affected_changesets_len),
+                        RefUpdateOperation::new(ref_update.clone()),
                     )
                     .await
                 })
@@ -205,12 +223,11 @@ async fn atomic_refs_update(
     request_context: Arc<RepositoryRequestContext>,
     git_bonsai_mapping_store: Arc<GitMappingsStore>,
     object_store: Arc<GitObjectStore>,
-    affected_changesets_len: usize,
 ) -> anyhow::Result<Vec<(RefUpdate, anyhow::Result<()>)>> {
     let ref_update_ops = push_args
         .ref_updates
         .iter()
-        .map(|ref_update| RefUpdateOperation::new(ref_update.clone(), affected_changesets_len))
+        .map(|ref_update| RefUpdateOperation::new(ref_update.clone()))
         .collect::<Vec<_>>();
     let ref_updates = push_args.ref_updates.clone();
     match set_refs(

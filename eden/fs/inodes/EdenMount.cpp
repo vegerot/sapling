@@ -702,6 +702,16 @@ void EdenMount::transitionToFsChannelInitializationErrorState() {
         break;
     }
   }
+
+  // For NFS mounts, we register the mount prior to finishing initialization.
+  // Failure after registration (but before initialization) causes the
+  // uninitialized mount to get stuck in the Mountd's map of registered mounts
+  // and causes crashes when remount attempts occur. To avoid this, we must
+  // always unregister upon initialization failure.
+  auto nfsServer = serverState_->getNfsServer();
+  if (nfsServer) {
+    nfsServer->tryUnregisterMount(getPath());
+  }
 }
 
 static folly::StringPiece getCheckoutModeString(CheckoutMode checkoutMode) {
@@ -1852,6 +1862,11 @@ ImmediateFuture<Unit> EdenMount::diff(
     auto latestInfo = getJournal().getLatest();
     if (latestInfo.has_value()) {
       auto key = ScmStatusCache::makeKey(commitHash, listIgnored);
+      XLOG(DBG7) << fmt::format(
+          "ScmStatusCache: hash={}, listIgnored={}, key={}",
+          commitHash.value(),
+          listIgnored,
+          key);
       auto curSequenceID = latestInfo.value().sequenceID;
       std::variant<StatusResultFuture, StatusResultPromise> getResult{nullptr};
       {
@@ -1940,10 +1955,7 @@ ImmediateFuture<Unit> EdenMount::diff(
                 auto lockedCachePtr = scmStatusCache_.wlock();
                 if (shouldInsert) {
                   (*lockedCachePtr)
-                      ->insert(
-                          key,
-                          std::make_shared<SeqStatusPair>(
-                              curSequenceID, std::move(newStatus)));
+                      ->insert(key, curSequenceID, std::move(newStatus));
                 }
 
                 // FaultInjector check point: for testing only
@@ -2059,6 +2071,10 @@ std::string EdenMount::getCounterName(CounterName name) {
     case CounterName::PERIODIC_UNLINKED_INODE_UNLOAD:
       return folly::to<std::string>(
           "inodemap.", base, ".unloaded_unlinked_inodes");
+    case CounterName::OVERLAY_DIR_COUNT:
+      return folly::to<std::string>("overlay.", base, ".dir_count");
+    case CounterName::OVERLAY_FILE_COUNT:
+      return folly::to<std::string>("overlay.", base, ".file_count");
   }
   EDEN_BUG() << "unknown counter name "
              << static_cast<std::underlying_type_t<CounterName>>(name);
@@ -2197,6 +2213,12 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
                 // Channel is later moved. We must assign addr to a local var
                 // to avoid the possibility of a use-after-move bug.
                 auto addr = channel->getAddr();
+
+                // For testing purposes only: allow tests to force an exception
+                // that mimics privhelper mount failing
+                serverState_->getFaultInjector().check(
+                    "failMountInitialization", mountPath.view());
+
                 // TODO: teach privhelper or something to mount on Windows
                 return serverState_->getPrivHelper()
                     ->nfsMount(
@@ -2263,6 +2285,11 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
               return makeFuture(folly::unit);
             });
 #else
+
+        // For testing purposes only: allow tests to force an exception
+        // that mimics privhelper mount failing
+        serverState_->getFaultInjector().check(
+            "failMountInitialization", mountPath.view());
         return serverState_->getPrivHelper()
             ->fuseMount(
                 mountPath.view(),
@@ -2396,22 +2423,7 @@ void EdenMount::fsChannelInitSuccessful(
   // This state transition could fail if shutdown() was called before we saw
   // the FUSE_INIT message from the kernel.
   transitionState(State::STARTING, State::RUNNING);
-  preparePostFsChannelCompletion(
-      std::move(channelCompleteFuture)
-          .deferValue([this](FsStopDataPtr stopData) {
-            if (isNfsdChannel()) {
-              // TODO: Understand why destroying Nfsd3 here is necessary, and
-              // allowing it to destroy itself when EdenMount dies is not
-              // sufficient. The problem with clearing channel_ is that it
-              // introduces a potential race with every other use of channel_ in
-              // EdenMount.
-              //
-              // In particular, it races with fb303's dynamic counter
-              // aggregation.
-              channel_ = nullptr;
-            }
-            return stopData;
-          }));
+  preparePostFsChannelCompletion(std::move(channelCompleteFuture));
 }
 
 void EdenMount::takeoverFuse(FuseChannelData takeoverData) {

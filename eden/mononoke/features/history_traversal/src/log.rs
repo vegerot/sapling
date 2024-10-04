@@ -524,10 +524,15 @@ async fn fetch_linknodes_and_update_graph(
     let linknodes = unode_entries.into_iter().map({
         let path = &path;
         move |entry| async move {
-            let unode = entry.load(ctx, repo.repo_blobstore()).await?;
-            Ok::<_, FastlogError>(match unode {
-                Entry::Tree(mf_unode) => (*mf_unode.linknode(), path.clone()),
-                Entry::Leaf(file_unode) => (*file_unode.linknode(), path.clone()),
+            Ok::<_, FastlogError>(match entry {
+                Entry::Tree(mf_unode_id) => {
+                    let mf_unode = mf_unode_id.load(ctx, repo.repo_blobstore()).await?;
+                    (*mf_unode.linknode(), path.clone())
+                }
+                Entry::Leaf(file_unode_id) => {
+                    let file_unode = file_unode_id.load(ctx, repo.repo_blobstore()).await?;
+                    (*file_unode.linknode(), path.clone())
+                }
             })
         }
     });
@@ -701,10 +706,15 @@ async fn find_mutable_renames(
         .await?
     {
         let src_path = Arc::new(rename.src_path().clone());
-        let src_unode = rename.src_unode().load(ctx, repo.repo_blobstore()).await?;
-        let linknode = match src_unode {
-            Entry::Tree(tree_unode) => *tree_unode.linknode(),
-            Entry::Leaf(leaf_unode) => *leaf_unode.linknode(),
+        let linknode = match rename.src_unode() {
+            Entry::Tree(tree_unode_id) => {
+                let tree_unode = tree_unode_id.load(ctx, repo.repo_blobstore()).await?;
+                *tree_unode.linknode()
+            }
+            Entry::Leaf(leaf_unode_id) => {
+                let leaf_unode = leaf_unode_id.load(ctx, repo.repo_blobstore()).await?;
+                *leaf_unode.linknode()
+            }
         };
         history_graph.insert((linknode, src_path.clone()), None);
         Ok(vec![(linknode, src_path)])
@@ -901,10 +911,15 @@ async fn replace_ancestors_with_mutable_ancestors(
             .get_rename(ctx, *possible_ancestor_cs_id, path.as_ref().clone())
             .await?
         {
-            let src_unode = rename.src_unode().load(ctx, repo.repo_blobstore()).await?;
-            let linknode = match src_unode {
-                Entry::Tree(tree_unode) => *tree_unode.linknode(),
-                Entry::Leaf(leaf_unode) => *leaf_unode.linknode(),
+            let linknode = match rename.src_unode() {
+                Entry::Tree(tree_unode_id) => {
+                    let tree_unode = tree_unode_id.load(ctx, repo.repo_blobstore()).await?;
+                    *tree_unode.linknode()
+                }
+                Entry::Leaf(leaf_unode_id) => {
+                    let leaf_unode = leaf_unode_id.load(ctx, repo.repo_blobstore()).await?;
+                    *leaf_unode.linknode()
+                }
             };
             Ok((
                 vec![(linknode, Arc::new(rename.src_path().clone()))],
@@ -977,13 +992,18 @@ async fn replace_ancestor_with_mutable_ancestor<'a>(
                     .get_rename(ctx, *possible_ancestor_cs_id, path.as_ref().clone())
                     .await?
                 {
-                    let src_unode = rename.src_unode().load(ctx, repo.repo_blobstore()).await?;
                     // The next node in path history doesn't have to be the src
                     // changeset. It needs to be the last commit that modified
                     // the path as of src changeset.
-                    let linknode = match src_unode {
-                        Entry::Tree(tree_unode) => *tree_unode.linknode(),
-                        Entry::Leaf(leaf_unode) => *leaf_unode.linknode(),
+                    let linknode = match rename.src_unode() {
+                        Entry::Tree(tree_unode_id) => {
+                            let tree_unode = tree_unode_id.load(ctx, repo.repo_blobstore()).await?;
+                            *tree_unode.linknode()
+                        }
+                        Entry::Leaf(leaf_unode_id) => {
+                            let leaf_unode = leaf_unode_id.load(ctx, repo.repo_blobstore()).await?;
+                            *leaf_unode.linknode()
+                        }
                     };
                     return Ok((
                         // The extra node in ancestry path where the mutable rename is attached
@@ -1209,11 +1229,11 @@ mod test {
     use filestore::FilestoreConfig;
     use futures::future::FutureExt;
     use futures::future::TryFutureExt;
-    use justknobs::test_helpers::override_just_knobs;
     use justknobs::test_helpers::with_just_knobs_async;
     use justknobs::test_helpers::JustKnobsInMemory;
     use justknobs::test_helpers::KnobVal;
     use maplit::hashmap;
+    use mononoke_macros::mononoke;
     use mutable_renames::MutableRenameEntry;
     use mutable_renames::MutableRenamesArc;
     use repo_blobstore::RepoBlobstore;
@@ -1254,9 +1274,8 @@ mod test {
         mutable_renames: MutableRenames,
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_list_linear_history(fb: FacebookInit) -> Result<(), Error> {
-        override_just_knobs(None);
         // generate couple of hundreds linear file changes and list history
         let repo: TestRepoWithMutableRenames = test_repo_factory::build_empty(fb).await.unwrap();
         let mutable_renames = repo.mutable_renames_arc();
@@ -1305,7 +1324,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_list_history_with_merges(fb: FacebookInit) -> Result<(), Error> {
         // test generates commit graph with merges and compares result of list_file_history with
         // the result of BFS sorting on the graph
@@ -1333,8 +1352,6 @@ mod test {
         //           o
         //           A
         //
-
-        override_just_knobs(None);
         let repo: TestRepoWithMutableRenames = test_repo_factory::build_empty(fb).await.unwrap();
         let mutable_renames = repo.mutable_renames_arc();
         let ctx = CoreContext::test_mock(fb);
@@ -1382,7 +1399,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_list_history_many_diamonds(fb: FacebookInit) -> Result<(), Error> {
         // test generates commit graph with 50 diamonds
         //
@@ -1408,8 +1425,6 @@ mod test {
         //           |
         //           o
         //
-
-        override_just_knobs(None);
         let repo: TestRepoWithMutableRenames = test_repo_factory::build_empty(fb).await.unwrap();
         let mutable_renames = repo.mutable_renames_arc();
         let ctx = CoreContext::test_mock(fb);
@@ -1450,7 +1465,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_list_history_visitor(fb: FacebookInit) -> Result<(), Error> {
         // Test history termination on one of the history branches.
         // The main branch (top) and branch A have commits that change only single file.
@@ -1472,7 +1487,6 @@ mod test {
         //        |   |
         //        o   o
         //
-        override_just_knobs(None);
         let repo: TestRepoWithMutableRenames = test_repo_factory::build_empty(fb).await.unwrap();
         let mutable_renames = repo.mutable_renames_arc();
         let ctx = CoreContext::test_mock(fb);
@@ -1562,9 +1576,8 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_list_history_deleted(fb: FacebookInit) -> Result<(), Error> {
-        override_just_knobs(None);
         let repo: TestRepoWithMutableRenames = test_repo_factory::build_empty(fb).await.unwrap();
         let mutable_renames = repo.mutable_renames_arc();
         let ctx = CoreContext::test_mock(fb);
@@ -1642,7 +1655,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_list_history_merged_deleted(fb: FacebookInit) -> Result<(), Error> {
         //
         //     L
@@ -1659,7 +1672,6 @@ mod test {
         //     |
         //     A
         //
-        override_just_knobs(None);
         let repo: TestRepoWithMutableRenames = test_repo_factory::build_empty(fb).await.unwrap();
         let mutable_renames = repo.mutable_renames_arc();
         let ctx = CoreContext::test_mock(fb);
@@ -1787,9 +1799,8 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_list_history_across_deletions_linear(fb: FacebookInit) -> Result<(), Error> {
-        override_just_knobs(None);
         let repo: TestRepoWithMutableRenames = test_repo_factory::build_empty(fb).await.unwrap();
         let mutable_renames = repo.mutable_renames_arc();
         let ctx = CoreContext::test_mock(fb);
@@ -1844,9 +1855,8 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_list_history_across_deletions_with_merges(fb: FacebookInit) -> Result<(), Error> {
-        override_just_knobs(None);
         let repo: TestRepoWithMutableRenames = test_repo_factory::build_empty(fb).await.unwrap();
         let mutable_renames = repo.mutable_renames_arc();
         let ctx = CoreContext::test_mock(fb);
@@ -1927,7 +1937,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_list_history_with_mutable_renames(fb: FacebookInit) -> Result<(), Error> {
         let repo: TestRepoWithMutableRenames = test_repo_factory::build_empty(fb).await.unwrap();
         let mutable_renames = repo.mutable_renames_arc();
@@ -2104,11 +2114,10 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_list_history_with_mutable_renames_attached_to_unrelated_commits(
         fb: FacebookInit,
     ) -> Result<(), Error> {
-        override_just_knobs(None);
         let repo: TestRepoWithMutableRenames = test_repo_factory::build_empty(fb).await.unwrap();
         let mutable_renames = repo.mutable_renames_arc();
         let ctx = CoreContext::test_mock(fb);
@@ -2235,9 +2244,8 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_different_order(fb: FacebookInit) -> Result<(), Error> {
-        override_just_knobs(None);
         let repo: TestRepoWithMutableRenames = test_repo_factory::build_empty(fb).await.unwrap();
         let mutable_renames = repo.mutable_renames_arc();
         let ctx = CoreContext::test_mock(fb);
@@ -2304,9 +2312,8 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_simple_gen_num(fb: FacebookInit) -> Result<(), Error> {
-        override_just_knobs(None);
         let repo: TestRepoWithMutableRenames = test_repo_factory::build_empty(fb).await.unwrap();
         let mutable_renames = repo.mutable_renames_arc();
         let ctx = CoreContext::test_mock(fb);

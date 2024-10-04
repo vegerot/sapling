@@ -398,6 +398,21 @@ struct FetchMiss {
     TreeMetadata = 3
   };
 
+  std::string_view missTypeToString(MissType miss) const {
+    switch (miss) {
+      case Tree:
+        return "Tree";
+      case Blob:
+        return "Blob";
+      case BlobMetadata:
+        return "BlobMetadata";
+      case TreeMetadata:
+        return "TreeMetadata";
+      default:
+        return "Unknown";
+    }
+  }
+
   static constexpr const char* type = "fetch_miss";
 
   std::string_view repo_source;
@@ -416,7 +431,8 @@ struct FetchMiss {
     } else if (miss_type == TreeMetadata) {
       event.addString("miss_type", "tree_aux");
     } else {
-      throw std::range_error(fmt::format("Unknown miss type: {}", miss_type));
+      throw std::range_error(
+          fmt::format("Unknown miss type: {}", missTypeToString(miss_type)));
     }
     event.addString("reason", reason);
     event.addBool("retry", retry);
@@ -435,23 +451,6 @@ struct ManyLiveFsChannelRequests {
   static constexpr const char* type = "high_fschannel_requests";
 
   void populate(DynamicEvent& /*event*/) const {}
-};
-
-/**
- * Used to log sapling blob download events from Sapling Backing Store
- */
-struct SaplingBlobDownloadEvent {
-  static constexpr const char* type = "sl_blob_download_events";
-
-  size_t sizeInBytes;
-  long timeToDownloadInMs;
-  std::string fetchMode;
-
-  void populate(DynamicEvent& event) const {
-    event.addInt("size_in_bytes", sizeInBytes);
-    event.addInt("time_to_download_in_ms", timeToDownloadInMs);
-    event.addString("fetch_mode", fetchMode);
-  }
 };
 
 /**

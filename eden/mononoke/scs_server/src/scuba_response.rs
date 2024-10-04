@@ -5,13 +5,12 @@
  * GNU General Public License version 2.
  */
 
+use faster_hex::hex_string;
 use scuba_ext::MononokeScubaSampleBuilder;
-use source_control as thrift;
+use source_control::AsyncPingResult;
+use source_control::{self as thrift};
 
 use crate::commit_id::CommitIdExt;
-use crate::scuba_common::hex;
-use crate::scuba_common::report_megarepo_target;
-use crate::scuba_common::Reported;
 
 /// A trait for logging a thrift `Response` struct to scuba.
 pub(crate) trait AddScubaResponse: Send + Sync {
@@ -69,7 +68,7 @@ impl AddScubaResponse for thrift::RepoPrepareCommitsResponse {}
 
 impl AddScubaResponse for thrift::RepoUploadFileContentResponse {
     fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
-        scuba.add("response_id", hex(&self.id));
+        scuba.add("response_id", hex_string(&self.id));
     }
 }
 
@@ -144,6 +143,12 @@ impl AddScubaResponse for thrift::FileDiffResponse {}
 
 impl AddScubaResponse for thrift::TreeListResponse {}
 
+impl AddScubaResponse for thrift::CreateReposResponse {}
+
+impl AddScubaResponse for thrift::CreateReposToken {}
+
+impl AddScubaResponse for thrift::CreateReposPollResponse {}
+
 // TODO: report cs_ids and actual error where possible
 impl AddScubaResponse for thrift::MegarepoRemergeSourceResult {}
 
@@ -160,6 +165,10 @@ impl AddScubaResponse for thrift::MegarepoAddConfigResponse {}
 impl AddScubaResponse for thrift::MegarepoReadConfigResponse {}
 
 impl AddScubaResponse for thrift::CloudWorkspaceInfoResponse {}
+
+impl AddScubaResponse for thrift::CloudUserWorkspacesResponse {}
+
+impl AddScubaResponse for thrift::CloudWorkspaceSmartlogResponse {}
 
 // Helper fn to report PollResponse types
 fn report_maybe_result<R: AddScubaResponse>(
@@ -204,7 +213,6 @@ impl AddScubaResponse for thrift::MegarepoAddTargetPollResponse {
 impl AddScubaResponse for thrift::MegarepoAddTargetToken {
     fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
         scuba.add("megarepo_token", self.id);
-        report_megarepo_target(&self.target, scuba, Reported::Response);
     }
 }
 
@@ -217,28 +225,24 @@ impl AddScubaResponse for thrift::MegarepoAddBranchingTargetPollResponse {
 impl AddScubaResponse for thrift::MegarepoAddBranchingTargetToken {
     fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
         scuba.add("megarepo_token", self.id);
-        report_megarepo_target(&self.target, scuba, Reported::Response);
     }
 }
 
 impl AddScubaResponse for thrift::MegarepoChangeConfigToken {
     fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
         scuba.add("megarepo_token", self.id);
-        report_megarepo_target(&self.target, scuba, Reported::Response);
     }
 }
 
 impl AddScubaResponse for thrift::MegarepoRemergeSourceToken {
     fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
         scuba.add("megarepo_token", self.id);
-        report_megarepo_target(&self.target, scuba, Reported::Response);
     }
 }
 
 impl AddScubaResponse for thrift::MegarepoSyncChangesetToken {
     fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
         scuba.add("megarepo_token", self.id);
-        report_megarepo_target(&self.target, scuba, Reported::Response);
     }
 }
 
@@ -255,3 +259,25 @@ impl AddScubaResponse for thrift::RepoStackGitBundleStoreResponse {
         scuba.add("response_bundle_handle", self.everstore_handle.as_ref());
     }
 }
+
+impl AddScubaResponse for thrift::AsyncPingToken {
+    fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("token", self.id);
+    }
+}
+
+impl AddScubaResponse for thrift::AsyncPingPollResponse {
+    fn add_scuba_response(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        match &self.result {
+            None => {
+                scuba.add("poll_ready", false);
+            }
+            Some(resp) => {
+                scuba.add("poll_ready", true);
+                <AsyncPingResult as AddScubaResponse>::add_scuba_response(resp, scuba);
+            }
+        }
+    }
+}
+
+impl AddScubaResponse for thrift::AsyncPingResult {}

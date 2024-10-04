@@ -1,5 +1,4 @@
 load("@fbcode_macros//build_defs:rust_binary.bzl", "rust_binary")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("mononoke")
 
@@ -11,6 +10,7 @@ rust_binary(
     ]),
     test_deps = [
         "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
         "//eden/mononoke/repo_factory:test_repo_factory",
     ],
     deps = [

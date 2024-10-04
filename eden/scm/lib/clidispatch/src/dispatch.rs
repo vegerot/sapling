@@ -20,8 +20,10 @@ use cliparser::parser::StructFlags;
 use cliparser::parser::Value;
 use configloader::config::ConfigSet;
 use configloader::hg::set_pinned;
+use configloader::hg::RepoInfo;
 use configmodel::Config;
 use configmodel::ConfigExt;
+use hgtime::HgTime;
 use repo::repo::Repo;
 
 use crate::abort_if;
@@ -132,6 +134,25 @@ fn initialize_blackbox(optional_repo: &OptionalRepo) -> Result<()> {
     Ok(())
 }
 
+fn initialize_hgtime(config: &dyn Config) -> Result<()> {
+    let mut should_clear = true;
+    if let Some(now_str) = config.get("devel", "default-date") {
+        let now_str = now_str.trim();
+        if !now_str.is_empty() {
+            if let Some(now) = HgTime::parse(now_str) {
+                tracing::info!(?now, "set 'now' for testing");
+                now.set_as_now_for_testing();
+                should_clear = false;
+            }
+        }
+    }
+    if should_clear {
+        tracing::debug!("unset 'now' for testing");
+        HgTime::clear_now_for_testing();
+    }
+    Ok(())
+}
+
 fn initialize_indexedlog(config: &dyn Config) -> Result<()> {
     indexedlog::config::configure(config)?;
     Ok(())
@@ -195,7 +216,9 @@ impl Dispatcher {
             Err(err) => {
                 // If we failed to load the repo, make one last ditch effort to load a repo-less config.
                 // This might allow us to run the network doctor even if this repo's dynamic config is not loadable.
-                if let Ok(config) = configloader::hg::load(None, &pinned_configs(&global_opts)) {
+                if let Ok(config) =
+                    configloader::hg::load(RepoInfo::NoRepo, &pinned_configs(&global_opts))
+                {
                     Err(errors::triage_error(&config, err, None))
                 } else {
                     Err(err)
@@ -240,7 +263,7 @@ impl Dispatcher {
     }
 
     fn load_repoless_config(&self) -> Result<ConfigSet> {
-        configloader::hg::load(None, &pinned_configs(&self.early_global_opts))
+        configloader::hg::load(RepoInfo::NoRepo, &pinned_configs(&self.early_global_opts))
     }
 
     fn default_command(&self) -> Result<String> {
@@ -278,6 +301,7 @@ impl Dispatcher {
         }
 
         initialize_indexedlog(config)?;
+        initialize_hgtime(config)?;
 
         // Prepare alias handling.
         let alias_lookup = |name: &str| {

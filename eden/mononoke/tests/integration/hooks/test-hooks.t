@@ -30,9 +30,8 @@ setup common configuration
   > EOF
 
 setup repo
-  $ hg init repo-hg
-  $ cd repo-hg
-  $ setup_hg_server
+  $ hginit_treemanifest repo
+  $ cd repo
   $ hg debugdrawdag <<EOF
   > C
   > |
@@ -47,30 +46,28 @@ create master bookmark
 
 blobimport them into Mononoke storage and start Mononoke
   $ cd ..
-  $ blobimport repo-hg/.hg repo
+  $ blobimport repo/.hg repo
 
 start mononoke
   $ start_and_wait_for_mononoke_server
 Clone the repo
-  $ hgclone_treemanifest ssh://user@dummy/repo-hg repo2 --noupdate --config extensions.remotenames= -q
+  $ hg clone -q mono:repo repo2 --noupdate
   $ cd repo2
-  $ setup_hg_client
   $ cat >> .hg/hgrc <<EOF
   > [extensions]
   > pushrebase =
-  > remotenames =
   > EOF
 
   $ hg up -q "min(all())"
   $ echo 1 > 1 && hg add 1 && hg ci -m 1
-  $ hgmn push -r . --to master_bookmark -q
+  $ hg push -r . --to master_bookmark -q
 
 Delete a file, make sure that file_size_hook is not called on deleted files
-  $ hgmn up -q tip
+  $ hg up -q tip
   $ hg rm 1
   $ hg ci -m 'delete a file'
-  $ hgmn push -r . --to master_bookmark
-  pushing rev 8ecfb5e6aa64 to destination mononoke://$LOCALIP:$LOCAL_PORT/repo bookmark master_bookmark
+  $ hg push -r . --to master_bookmark
+  pushing rev 8ecfb5e6aa64 to destination mono:repo bookmark master_bookmark
   searching for changes
   adding changesets
   adding manifests
@@ -81,8 +78,8 @@ Send large file
   $ hg up -q "min(all())"
   $ echo 'aaaaaaaaaaa' > largefile
   $ hg ci -Aqm 'largefile'
-  $ hgmn push -r . --to master_bookmark
-  pushing rev 3e0db158edcc to destination mononoke://$LOCALIP:$LOCAL_PORT/repo bookmark master_bookmark
+  $ hg push -r . --to master_bookmark
+  pushing rev 3e0db158edcc to destination mono:repo bookmark master_bookmark
   searching for changes
   remote: Command failed
   remote:   Error:
@@ -100,8 +97,8 @@ Send large file
 
 Bypass large file hook
   $ hg amend -m '@allow-large-files'
-  $ hgmn push -r . --to master_bookmark
-  pushing rev ba007efeea59 to destination mononoke://$LOCALIP:$LOCAL_PORT/repo bookmark master_bookmark
+  $ hg push -r . --to master_bookmark
+  pushing rev ba007efeea59 to destination mono:repo bookmark master_bookmark
   searching for changes
   adding changesets
   adding manifests
@@ -113,8 +110,8 @@ Send large file inside a directory
   $ mkdir dir/
   $ echo 'aaaaaaaaaaa' > dir/largefile
   $ hg ci -Aqm 'dir/largefile'
-  $ hgmn push -r . --to master_bookmark
-  pushing rev cbc62a724366 to destination mononoke://$LOCALIP:$LOCAL_PORT/repo bookmark master_bookmark
+  $ hg push -r . --to master_bookmark
+  pushing rev cbc62a724366 to destination mono:repo bookmark master_bookmark
   searching for changes
   remote: Command failed
   remote:   Error:

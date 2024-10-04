@@ -18,6 +18,8 @@ use anyhow::Error;
 use async_trait::async_trait;
 use clap::Parser;
 use clap::ValueEnum;
+use client::AsyncRequestsQueue;
+use clientinfo::ClientEntryPoint;
 use cloned::cloned;
 use cmdlib_logging::ScribeLoggingArgs;
 use connection_security_checker::ConnectionSecurityChecker;
@@ -42,7 +44,6 @@ use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
 use mononoke_app::MononokeReposManager;
 use panichandler::Fate;
-use permission_checker::DefaultAclProvider;
 use sharding_ext::RepoShard;
 use slog::info;
 use slog::Logger;
@@ -66,6 +67,7 @@ use tracing_subscriber::filter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Layer;
 
+mod async_requests;
 mod commit_id;
 mod errors;
 mod facebook;
@@ -75,7 +77,6 @@ mod into_response;
 mod metadata;
 mod methods;
 mod monitoring;
-mod scuba_common;
 mod scuba_params;
 mod scuba_response;
 mod source_control_impl;
@@ -124,6 +125,9 @@ struct ScsServerArgs {
     /// Number of Thrift workers for slow methods
     #[clap(long, default_value = "5")]
     thrift_workers_num_slow: usize,
+    /// Some long-running requests are processed asynchronously by default. This flag disables that behavior; requests will fail.
+    #[clap(long, default_value = "false")]
+    disable_async_requests: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +234,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     panichandler::set_panichandler(Fate::Abort);
 
     let app = MononokeAppBuilder::new(fb)
+        .with_entry_point(ClientEntryPoint::ScsServer)
         .with_bookmarks_cache(BookmarkCacheOptions {
             cache_kind: BookmarkCacheKind::Local,
             derived_data: BookmarkCacheDerivedData::AllKinds,
@@ -248,11 +253,18 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     let scuba_builder = env.scuba_sample_builder.clone();
     // Service name is used for shallow or deep sharding. If sharding itself is disabled, provide
     // service name as None while opening repos.
-    let service_name = args
-        .sharded_executor_args
-        .sharded_service_name
-        .as_ref()
-        .map(|_| ShardedService::SourceControlService);
+    let service_name = if args.sharded_executor_args.sharded_service_name.is_some()
+        || justknobs::eval(
+            "scm/mononoke:scs_unsharded_load_only_shallow_sharded",
+            None,
+            None,
+        )
+        .unwrap_or(false)
+    {
+        Some(ShardedService::SourceControlService)
+    } else {
+        None
+    };
     let repos_mgr = runtime.block_on(app.open_managed_repos(service_name))?;
     let mononoke = Arc::new(repos_mgr.make_mononoke_api()?);
     let megarepo_api = Arc::new(MegarepoApi::new(&app, mononoke.clone())?);
@@ -263,11 +275,17 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         memory::set_max_memory(max_memory);
     }
 
-    let acl_provider = DefaultAclProvider::new(fb);
     let security_checker = runtime.block_on(ConnectionSecurityChecker::new(
-        acl_provider.as_ref(),
+        app.environment().acl_provider.as_ref(),
         &app.repo_configs().common,
     ))?;
+
+    let async_requests_queue_client = if args.disable_async_requests {
+        None
+    } else {
+        let queue_client = runtime.block_on(AsyncRequestsQueue::new(fb, &app, None))?;
+        Some(Arc::new(queue_client))
+    };
 
     let source_control_server = {
         let maybe_factory_group = if let ThriftServerMode::FactoryGroup = args.thift_server_mode {
@@ -286,8 +304,9 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         } else {
             None
         };
-        source_control_impl::SourceControlServiceImpl::new(
+        runtime.block_on(source_control_impl::SourceControlServiceImpl::new(
             fb,
+            &app,
             mononoke.clone(),
             megarepo_api,
             logger.clone(),
@@ -297,7 +316,8 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
             app.configs(),
             &app.repo_configs().common,
             maybe_factory_group,
-        )
+            async_requests_queue_client,
+        ))?
     };
 
     let monitoring_forever = {

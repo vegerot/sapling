@@ -14,6 +14,11 @@ mononoke_fbpkg(
 mononoke_fbpkg(
     name = "mononoke.scs_server",
     path_actions = {
+        # deps temporarily needed to satisfy metagit repo creation reqs
+        "hipstercli": "fbcode//infrasec/authorization/tools/py/hipstercli:hipstercli",
+        "oncalls": "fbcode//oncall/py:oncalls",
+        "scmadmin": "fbcode//scm/scmadmin:client",
+        # actual scs server binary
         "scs_server": "fbcode//eden/mononoke/scs_server:scs_server",
     },
 )
@@ -60,7 +65,7 @@ mononoke_fbpkg(
 mononoke_fbpkg(
     name = "mononoke.megarepo_async_requests_worker",
     path_actions = {
-        "async_requests_worker": "//eden/mononoke/megarepo_api:async_requests_worker",
+        "async_requests_worker": "//eden/mononoke/async_requests:worker",
     },
 )
 
@@ -248,7 +253,7 @@ tw.container(
             mononoke_fbpkg(
                 name = "mononoke.git_server_push_poller",
                 path_actions = {
-                    "git_server_push_poller": "//eden/mononoke/git_server/push_poller:git_server_push_poller",
+                    "git_server_push_poller": "//eden/mononoke/facebook/git_server/push_poller:git_server_push_poller",
                 },
             ),
         ),

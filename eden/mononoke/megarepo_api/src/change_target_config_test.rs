@@ -19,6 +19,7 @@ use megarepo_mapping::SourceName;
 use megarepo_mapping::REMAPPING_STATE_FILE;
 use metaconfig_types::RepoConfigArc;
 use mononoke_api::MononokeRepo;
+use mononoke_macros::mononoke;
 use mononoke_types::FileType;
 use mononoke_types::NonRootMPath;
 use repo_blobstore::RepoBlobstoreRef;
@@ -30,10 +31,11 @@ use tests_utils::CreateCommitContext;
 use crate::add_sync_target::AddSyncTarget;
 use crate::change_target_config::ChangeTargetConfig;
 use crate::common::MegarepoOp;
+use crate::common::SYNC_TARGET_CONFIG_FILE;
 use crate::megarepo_test_utils::MegarepoTest;
 use crate::megarepo_test_utils::SyncTargetConfigBuilder;
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_change_target_config(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -90,6 +92,10 @@ async fn test_change_target_config(fb: FacebookInit) -> Result<(), Error> {
         wc.remove(&NonRootMPath::new(REMAPPING_STATE_FILE)?)
             .is_some()
     );
+    assert!(
+        wc.remove(&NonRootMPath::new(SYNC_TARGET_CONFIG_FILE)?)
+            .is_some()
+    );
 
     assert_eq!(
         wc,
@@ -108,6 +114,7 @@ async fn test_change_target_config(fb: FacebookInit) -> Result<(), Error> {
             .collect::<Vec<_>>(),
         vec![
             NonRootMPath::new(".megarepo/remapping_state")?,
+            NonRootMPath::new(".megarepo/sync_target_config")?,
             NonRootMPath::new("linkfiles/first")?,
             NonRootMPath::new("linkfiles/second")?,
             NonRootMPath::new("source_2/second")?
@@ -182,7 +189,7 @@ async fn init_megarepo<R: MononokeRepo>(
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_change_target_config_invalid_config_linkfile(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -239,7 +246,7 @@ async fn test_change_target_config_invalid_config_linkfile(fb: FacebookInit) -> 
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_change_target_config_invalid_config_normal_file(
     fb: FacebookInit,
 ) -> Result<(), Error> {
@@ -299,7 +306,7 @@ async fn test_change_target_config_invalid_config_normal_file(
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_change_target_config_invalid_config_file_dir_conflict(
     fb: FacebookInit,
 ) -> Result<(), Error> {
@@ -361,7 +368,7 @@ async fn test_change_target_config_invalid_config_file_dir_conflict(
 }
 
 // Replace "source_1/first" with "source_1/first/first"
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_change_target_config_no_file_dir_conflict(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -410,7 +417,7 @@ async fn test_change_target_config_no_file_dir_conflict(fb: FacebookInit) -> Res
 }
 
 // Replace "source_1/dir/first" with "source_1/dir"
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_change_target_config_no_file_dir_conflict_2(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -498,7 +505,7 @@ async fn test_change_target_config_no_file_dir_conflict_2(fb: FacebookInit) -> R
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_change_target_config_repeat_same_request(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -585,7 +592,7 @@ async fn test_change_target_config_repeat_same_request(fb: FacebookInit) -> Resu
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_change_target_config_noop_change(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -656,7 +663,7 @@ async fn test_change_target_config_noop_change(fb: FacebookInit) -> Result<(), E
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_change_target_config_linkfile_to_file_mapped_to_multiple_paths(
     fb: FacebookInit,
 ) -> Result<(), Error> {
@@ -701,6 +708,10 @@ async fn test_change_target_config_linkfile_to_file_mapped_to_multiple_paths(
     // Remove file with commit remapping state because it's never present in source
     assert!(
         wc.remove(&NonRootMPath::new(REMAPPING_STATE_FILE)?)
+            .is_some()
+    );
+    assert!(
+        wc.remove(&NonRootMPath::new(SYNC_TARGET_CONFIG_FILE)?)
             .is_some()
     );
 

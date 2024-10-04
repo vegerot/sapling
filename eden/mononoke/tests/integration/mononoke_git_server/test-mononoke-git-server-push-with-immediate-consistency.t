@@ -9,10 +9,6 @@
   $ setup_common_config $REPOTYPE
   $ GIT_REPO_ORIGIN="${TESTTMP}/origin/repo-git"
   $ GIT_REPO="${TESTTMP}/repo-git"
-  $ cat >> repos/repo/server.toml <<EOF
-  > [source_control_service]
-  > permit_writes = true
-  > EOF
 
 # Setup git repository
   $ mkdir -p "$GIT_REPO_ORIGIN"
@@ -122,7 +118,7 @@
   $ git commit -qam "Moving master branch"
   $ git checkout yet_another_branch
   Switched to a new branch 'yet_another_branch'
-  branch 'yet_another_branch' set up to track 'origin/yet_another_branch'.
+  ?ranch 'yet_another_branch' set up to track *yet_another_branch*. (glob)
   $ echo "Moving yet another file" > yet_another_new_file
   $ git add .
   $ git commit -qam "Moving yet another branch"

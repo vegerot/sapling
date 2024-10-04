@@ -15,13 +15,11 @@ use anyhow::bail;
 use anyhow::Error;
 use anyhow::Result;
 use blobstore_factory::MetadataSqlFactory;
-use cacheblob::LeaseOps;
 use cmdlib::args;
 use cmdlib::args::MononokeMatches;
 use context::CoreContext;
-use cross_repo_sync::create_commit_syncer_lease;
 use cross_repo_sync::create_commit_syncers;
-use cross_repo_sync::get_all_submodule_deps;
+use cross_repo_sync::get_all_submodule_deps_from_repo_pair;
 use cross_repo_sync::CommitSyncRepos;
 use cross_repo_sync::CommitSyncer;
 use cross_repo_sync::RepoProvider;
@@ -48,24 +46,20 @@ pub async fn create_commit_syncers_from_matches<R: Repo>(
     ctx: &CoreContext,
     matches: &MononokeMatches<'_>,
     repo_pair: Option<(RepositoryId, RepositoryId)>,
-) -> Result<Syncers<SqlSyncedCommitMapping, R>, Error> {
-    let (source_repo, target_repo, mapping, live_commit_sync_config) =
+) -> Result<Syncers<R>, Error> {
+    let (source_repo, target_repo, _mapping, live_commit_sync_config) =
         get_things_from_matches::<R>(ctx, matches, repo_pair).await?;
 
     let common_config =
         live_commit_sync_config.get_common_config(source_repo.0.repo_identity().id())?;
 
-    let caching = matches.caching();
-    let x_repo_syncer_lease = create_commit_syncer_lease(ctx.fb, caching)?;
-
     let repo_provider = repo_provider_from_matches(ctx, matches);
 
-    let submodule_deps = get_all_submodule_deps(
+    let submodule_deps = get_all_submodule_deps_from_repo_pair(
         ctx,
         Arc::new(source_repo.0.clone()),
         Arc::new(target_repo.0.clone()),
         repo_provider,
-        live_commit_sync_config.clone(),
     )
     .await?;
 
@@ -90,9 +84,7 @@ pub async fn create_commit_syncers_from_matches<R: Repo>(
         small_repo,
         large_repo,
         submodule_deps,
-        mapping,
         live_commit_sync_config,
-        x_repo_syncer_lease,
     )
 }
 
@@ -101,7 +93,7 @@ pub async fn create_commit_syncer_from_matches<R: Repo>(
     ctx: &CoreContext,
     matches: &MononokeMatches<'_>,
     repo_pair: Option<(RepositoryId, RepositoryId)>,
-) -> Result<CommitSyncer<SqlSyncedCommitMapping, R>, Error> {
+) -> Result<CommitSyncer<R>, Error> {
     create_commit_syncer_from_matches_impl(ctx, matches, false /* reverse */, repo_pair).await
 }
 
@@ -110,7 +102,7 @@ pub async fn create_reverse_commit_syncer_from_matches<R: Repo>(
     ctx: &CoreContext,
     matches: &MononokeMatches<'_>,
     repo_pair: Option<(RepositoryId, RepositoryId)>,
-) -> Result<CommitSyncer<SqlSyncedCommitMapping, R>, Error> {
+) -> Result<CommitSyncer<R>, Error> {
     create_commit_syncer_from_matches_impl(ctx, matches, true /* reverse */, repo_pair).await
 }
 
@@ -202,9 +194,13 @@ async fn create_commit_syncer_from_matches_impl<R: Repo>(
     matches: &MononokeMatches<'_>,
     reverse: bool,
     repo_pair: Option<(RepositoryId, RepositoryId)>,
-) -> Result<CommitSyncer<SqlSyncedCommitMapping, R>, Error> {
-    let (source_repo, target_repo, mapping, live_commit_sync_config): (Source<R>, Target<R>, _, _) =
-        get_things_from_matches(ctx, matches, repo_pair).await?;
+) -> Result<CommitSyncer<R>, Error> {
+    let (source_repo, target_repo, _mapping, live_commit_sync_config): (
+        Source<R>,
+        Target<R>,
+        _,
+        _,
+    ) = get_things_from_matches(ctx, matches, repo_pair).await?;
 
     let (source_repo, target_repo) = if reverse {
         flip_direction(source_repo, target_repo)
@@ -212,17 +208,13 @@ async fn create_commit_syncer_from_matches_impl<R: Repo>(
         (source_repo, target_repo)
     };
 
-    let caching = matches.caching();
-    let x_repo_syncer_lease = create_commit_syncer_lease(ctx.fb, caching)?;
-
     let repo_provider = repo_provider_from_matches(ctx, matches);
 
-    let submodule_deps = get_all_submodule_deps(
+    let submodule_deps = get_all_submodule_deps_from_repo_pair(
         ctx,
         Arc::new(source_repo.0.clone()),
         Arc::new(target_repo.0.clone()),
         repo_provider,
-        live_commit_sync_config.clone(),
     )
     .await?;
 
@@ -231,9 +223,7 @@ async fn create_commit_syncer_from_matches_impl<R: Repo>(
         source_repo,
         target_repo,
         submodule_deps,
-        mapping,
         live_commit_sync_config,
-        x_repo_syncer_lease,
     )
     .await
 }
@@ -243,21 +233,10 @@ async fn create_commit_syncer<'a, R: Repo>(
     source_repo: Source<R>,
     target_repo: Target<R>,
     submodule_deps: SubmoduleDeps<R>,
-    mapping: SqlSyncedCommitMapping,
     live_commit_sync_config: Arc<dyn LiveCommitSyncConfig>,
-    x_repo_syncer_lease: Arc<dyn LeaseOps>,
-) -> Result<CommitSyncer<SqlSyncedCommitMapping, R>, Error> {
-    let common_config =
-        live_commit_sync_config.get_common_config(source_repo.0.repo_identity().id())?;
-
-    let repos = CommitSyncRepos::new(source_repo.0, target_repo.0, submodule_deps, &common_config)?;
-    let commit_syncer = CommitSyncer::new(
-        ctx,
-        mapping,
-        repos,
-        live_commit_sync_config,
-        x_repo_syncer_lease,
-    );
+) -> Result<CommitSyncer<R>, Error> {
+    let repos = CommitSyncRepos::new(source_repo.0, target_repo.0, submodule_deps)?;
+    let commit_syncer = CommitSyncer::new(ctx, repos, live_commit_sync_config);
     Ok(commit_syncer)
 }
 

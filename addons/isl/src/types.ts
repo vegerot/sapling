@@ -204,7 +204,7 @@ export type CodeReviewSystem =
       path?: string;
     };
 
-export type PreferredSubmitCommand = 'pr' | 'ghstack';
+export type PreferredSubmitCommand = 'pr' | 'ghstack' | 'push';
 
 export type StableCommitMetadata = {
   value: string;
@@ -289,6 +289,16 @@ export type CommitInfo = {
   diffId?: DiffId;
   isFollower?: boolean;
   stableCommitMetadata?: ReadonlyArray<StableCommitMetadata>;
+  /**
+   * Longest path prefix shared by all files in this commit.
+   * For example, if a commit changes files like `a/b/c` and `a/b/d`, this is `a/b/`.
+   * Note: this always acts on `/` delimited paths, and is done on complete subdir names,
+   * never on matching prefixes of directories. For example, `a/dir1/a` and `a/dir2/a`
+   * have `a/` as the common prefix, not `a/dir`.
+   * If no commonality is found (due to edits to top level files or multiple subdirs), this is empty string.
+   * This can be useful to determine if a commit is relevant to your cwd.
+   */
+  maxCommonPathPrefix: RepoRelativePath;
 };
 export type SuccessorInfo = {
   hash: string;
@@ -543,6 +553,18 @@ export type OperationProgressEvent = {type: 'operationProgress'} & OperationProg
 /** A line number starting from 1 */
 export type OneIndexedLineNumber = Exclude<number, 0>;
 
+export type DiagnosticSeverity = 'error' | 'warning' | 'info' | 'hint';
+
+export type Diagnostic = {
+  range: {startLine: number; startCol: number; endLine: number; endCol: number};
+  message: string;
+  severity: DiagnosticSeverity;
+  /** LSP providing this diagnostic, like "typescript" or "eslint" */
+  source?: string;
+  /** Code or name for this kind of diagnostic */
+  code?: string;
+};
+
 /* protocol */
 
 /**
@@ -564,13 +586,14 @@ export type PlatformSpecificClientToServerMessages =
   | {type: 'platform/subscribeToAvailableCwds'}
   | {type: 'platform/subscribeToUnsavedFiles'}
   | {type: 'platform/saveAllUnsavedFiles'}
-  | {type: 'platform/setPersistedState'; data?: string}
+  | {type: 'platform/setPersistedState'; key: string; data?: string}
   | {
       type: 'platform/setVSCodeConfig';
       config: string;
       value: Json | undefined;
       scope: 'workspace' | 'global';
     }
+  | {type: 'platform/checkForDiagnostics'; paths: Array<RepoRelativePath>}
   | {type: 'platform/executeVSCodeCommand'; command: string; args: Array<Json>}
   | {type: 'platform/subscribeToVSCodeConfig'; config: string};
 
@@ -590,6 +613,10 @@ export type PlatformSpecificServerToClientMessages =
   | {type: 'platform/unsavedFiles'; unsaved: Array<{path: RepoRelativePath; uri: string}>}
   | {type: 'platform/savedAllUnsavedFiles'; success: boolean}
   | {
+      type: 'platform/gotDiagnostics';
+      diagnostics: Map<RepoRelativePath, Array<Diagnostic>>;
+    }
+  | {
       type: 'platform/vscodeConfigChanged';
       config: string;
       value: Json | undefined;
@@ -598,6 +625,10 @@ export type PlatformSpecificServerToClientMessages =
 export type CodeReviewProviderSpecificClientToServerMessages =
   | never
   | InternalTypes['PhabricatorClientToServerMessages'];
+
+export type CodeReviewProviderSpecificServerToClientMessages =
+  | never
+  | InternalTypes['PhabricatorServerToClientMessages'];
 
 export type PageVisibility = 'focused' | 'visible' | 'hidden';
 
@@ -611,16 +642,6 @@ export type FileABugProgress =
   | {status: 'success'; taskNumber: string; taskLink: string}
   | {status: 'error'; error: Error};
 export type FileABugProgressMessage = {type: 'fileBugReportProgress'} & FileABugProgress;
-
-/**
- * Like ClientToServerMessage, but these messages will be followed
- * on the message bus by an additional binary ArrayBuffer payload message.
- */
-export type ClientToServerMessageWithPayload = {
-  type: 'uploadFile';
-  filename: string;
-  id: string;
-} & {hasBinaryPayload: true};
 
 export type SubscriptionKind = 'uncommittedChanges' | 'smartlogCommits' | 'mergeConflicts';
 
@@ -692,11 +713,16 @@ export type LocalStorageName =
   | 'isl.debug-react-tools'
   | 'isl.debug-redux-tools'
   | 'isl.condense-obsolete-stacks'
+  | 'isl.deemphasize-cwd-irrelevant-commits'
   | 'isl.split-suggestion-enabled'
   | 'isl.comparison-display-mode'
   | 'isl.expand-generated-files'
   | 'isl-color-theme'
-  | 'isl.auto-resolve-before-continue';
+  | 'isl.auto-resolve-before-continue'
+  | 'isl.warn-about-diagnostics'
+  | 'isl.hide-non-blocking-diagnostics'
+  // These keys are prefixes, with further dynamic keys appended afterwards
+  | 'isl.edited-commit-messages:';
 
 export type ClientToServerMessage =
   | {type: 'heartbeat'; id: string}
@@ -715,6 +741,12 @@ export type ClientToServerMessage =
   | {type: 'fetchShelvedChanges'}
   | {type: 'fetchLatestCommit'; revset: string}
   | {type: 'fetchCommitChangedFiles'; hash: Hash; limit: number}
+  | {
+      type: 'uploadFile';
+      filename: string;
+      id: string;
+      b64Content: string;
+    }
   | {type: 'renderMarkup'; markup: string; id: number}
   | {type: 'typeahead'; kind: TypeaheadKind; query: string; id: string}
   | {type: 'requestRepoInfo'}
@@ -850,6 +882,7 @@ export type ServerToClientMessage =
   | {type: 'getUiState'}
   | OperationProgressEvent
   | PlatformSpecificServerToClientMessages
+  | CodeReviewProviderSpecificServerToClientMessages
   | {
       type: 'fetchedSignificantLinesOfCode';
       hash: Hash;

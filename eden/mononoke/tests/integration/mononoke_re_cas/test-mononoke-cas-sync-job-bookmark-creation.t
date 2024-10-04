@@ -10,7 +10,7 @@
   $ setconfig drawdag.defaultfiles=false
 
   $ start_and_wait_for_mononoke_server
-  $ hgmn_init repo
+  $ hg clone -q mono:repo repo
   $ cd repo
   $ drawdag << EOS
   > D # D/qux = random:30
@@ -22,8 +22,8 @@
   > A # A/foo = random:30
   > EOS
 
-  $ sl goto D -q
-  $ sl push -r . --to master -q --create
+  $ hg goto D -q
+  $ hg push -r . --to master -q --create
 
 
 Validate that blobs and trees were uploaded for _all_ 4 commits (this should include 4 files and 4 trees)

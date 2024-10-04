@@ -47,7 +47,7 @@ impl TryFrom<BlobstoreBytes> for RootFsnodeId {
     type Error = Error;
 
     fn try_from(blob_bytes: BlobstoreBytes) -> Result<Self> {
-        FsnodeId::from_bytes(&blob_bytes.into_bytes()).map(RootFsnodeId)
+        FsnodeId::from_bytes(blob_bytes.into_bytes()).map(RootFsnodeId)
     }
 }
 
@@ -201,6 +201,7 @@ mod test {
     use mercurial_derivation::DeriveHgChangeset;
     use mercurial_types::HgChangesetId;
     use mercurial_types::HgManifestId;
+    use mononoke_macros::mononoke;
     use repo_blobstore::RepoBlobstore;
     use repo_blobstore::RepoBlobstoreRef;
     use repo_derived_data::RepoDerivedData;
@@ -306,7 +307,7 @@ mod test {
             .unwrap();
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     fn test_derive_data(fb: FacebookInit) {
         let runtime = Runtime::new().unwrap();
         verify_repo(fb, Linear::get_repo(fb), &runtime);

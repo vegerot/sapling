@@ -19,6 +19,7 @@ use megarepo_mapping::CommitRemappingState;
 use megarepo_mapping::SourceName;
 use megarepo_mapping::REMAPPING_STATE_FILE;
 use metaconfig_types::RepoConfigArc;
+use mononoke_macros::mononoke;
 use mononoke_types::FileType;
 use mononoke_types::NonRootMPath;
 use repo_blobstore::RepoBlobstoreRef;
@@ -30,11 +31,12 @@ use tests_utils::CreateCommitContext;
 
 use crate::add_sync_target::AddSyncTarget;
 use crate::common::MegarepoOp;
+use crate::common::SYNC_TARGET_CONFIG_FILE;
 use crate::megarepo_test_utils::MegarepoTest;
 use crate::megarepo_test_utils::SyncTargetConfigBuilder;
 use crate::sync_changeset::SyncChangeset;
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_add_sync_target_simple(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -116,6 +118,10 @@ async fn test_add_sync_target_simple(fb: FacebookInit) -> Result<(), Error> {
         wc.remove(&NonRootMPath::new(REMAPPING_STATE_FILE)?)
             .is_some()
     );
+    assert!(
+        wc.remove(&NonRootMPath::new(SYNC_TARGET_CONFIG_FILE)?)
+            .is_some()
+    );
 
     assert_eq!(
         wc,
@@ -153,6 +159,10 @@ async fn test_add_sync_target_simple(fb: FacebookInit) -> Result<(), Error> {
         wc.remove(&NonRootMPath::new(REMAPPING_STATE_FILE)?)
             .is_some()
     );
+    assert!(
+        wc.remove(&NonRootMPath::new(SYNC_TARGET_CONFIG_FILE)?)
+            .is_some()
+    );
 
     assert_eq!(
         wc,
@@ -165,7 +175,7 @@ async fn test_add_sync_target_simple(fb: FacebookInit) -> Result<(), Error> {
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_add_sync_target_with_linkfiles(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -237,6 +247,10 @@ async fn test_add_sync_target_with_linkfiles(fb: FacebookInit) -> Result<(), Err
         wc.remove(&NonRootMPath::new(REMAPPING_STATE_FILE)?)
             .is_some()
     );
+    assert!(
+        wc.remove(&NonRootMPath::new(SYNC_TARGET_CONFIG_FILE)?)
+            .is_some()
+    );
 
     assert_eq!(
         wc,
@@ -251,7 +265,7 @@ async fn test_add_sync_target_with_linkfiles(fb: FacebookInit) -> Result<(), Err
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_add_sync_target_invalid_same_prefix(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -321,7 +335,7 @@ async fn test_add_sync_target_invalid_same_prefix(fb: FacebookInit) -> Result<()
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_add_sync_target_same_file_different_prefix(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -403,6 +417,10 @@ async fn test_add_sync_target_same_file_different_prefix(fb: FacebookInit) -> Re
         wc.remove(&NonRootMPath::new(REMAPPING_STATE_FILE)?)
             .is_some()
     );
+    assert!(
+        wc.remove(&NonRootMPath::new(SYNC_TARGET_CONFIG_FILE)?)
+            .is_some()
+    );
 
     assert_eq!(
         wc,
@@ -415,7 +433,7 @@ async fn test_add_sync_target_same_file_different_prefix(fb: FacebookInit) -> Re
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_add_sync_target_invalid_linkfiles(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -484,7 +502,7 @@ async fn test_add_sync_target_invalid_linkfiles(fb: FacebookInit) -> Result<(), 
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_add_sync_target_invalid_hash_to_merge(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -541,7 +559,7 @@ async fn test_add_sync_target_invalid_hash_to_merge(fb: FacebookInit) -> Result<
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_add_sync_target_merge_three_sources(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -624,6 +642,10 @@ async fn test_add_sync_target_merge_three_sources(fb: FacebookInit) -> Result<()
         wc.remove(&NonRootMPath::new(REMAPPING_STATE_FILE)?)
             .is_some()
     );
+    assert!(
+        wc.remove(&NonRootMPath::new(SYNC_TARGET_CONFIG_FILE)?)
+            .is_some()
+    );
 
     assert_eq!(
         wc,
@@ -656,7 +678,7 @@ async fn test_add_sync_target_merge_three_sources(fb: FacebookInit) -> Result<()
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_add_sync_target_repeat_same_request(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;

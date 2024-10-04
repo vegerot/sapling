@@ -2632,6 +2632,25 @@ FileAttributeDataOrErrorV2 serializeEntryAttributes(
     fileData.objectId() = std::move(objectId);
   }
 
+  if (requestedAttributes.contains(ENTRY_ATTRIBUTE_DIGEST_SIZE)) {
+    DigestSizeOrError digestSize;
+    if (!fillErrorRef(
+            digestSize, attributes->digestSize, entryPath, "digestsize")) {
+      digestSize.digestSize_ref() = attributes->digestSize.value().value();
+    }
+    fileData.digestSize() = std::move(digestSize);
+  }
+
+  if (requestedAttributes.contains(ENTRY_ATTRIBUTE_DIGEST_HASH)) {
+    DigestHashOrError digestHash;
+    if (!fillErrorRef(
+            digestHash, attributes->digestHash, entryPath, "digesthash")) {
+      digestHash.digestHash_ref() =
+          thriftHash32(attributes->digestHash.value().value());
+    }
+    fileData.digestHash() = std::move(digestHash);
+  }
+
   fileResult.fileAttributeData_ref() = fileData;
   return fileResult;
 }
@@ -5471,6 +5490,7 @@ EdenServiceHandler::streamStartStatus() {
 void EdenServiceHandler::checkPrivHelper(PrivHelperInfo& result) {
   auto privhelper = server_->getServerState()->getPrivHelper();
   result.connected_ref() = privhelper->checkConnection();
+  result.pid_ref() = privhelper->getPid();
 }
 
 int64_t EdenServiceHandler::getPid() {
@@ -5482,9 +5502,16 @@ void EdenServiceHandler::getCheckoutProgressInfo(
     unique_ptr<CheckoutProgressInfoRequest> params) {
   auto mountPath = absolutePathFromThrift(*params->mountPoint());
   auto mountHandle = server_->getMount(mountPath);
-  auto checkoutProgress = mountHandle.getEdenMount().getCheckoutProgress();
+  auto& mount = mountHandle.getEdenMount();
+  auto checkoutProgress = mount.getCheckoutProgress();
   if (checkoutProgress.has_value()) {
     CheckoutProgressInfo progressInfoRet;
+    auto counts = mount.getInodeMap()->getInodeCounts();
+    auto totalInodes =
+        counts.unloadedInodeCount + counts.fileCount + counts.treeCount;
+
+    progressInfoRet.totalInodes_ref() = totalInodes;
+
     progressInfoRet.updatedInodes_ref() = std::move(checkoutProgress.value());
     ret.checkoutProgressInfo_ref() = std::move(progressInfoRet);
   } else {

@@ -6,14 +6,10 @@
 
   $ . "${TEST_FIXTURES}/library.sh"
   $ REPOTYPE="blob_files"
-  $ ENABLED_DERIVED_DATA='["git_trees", "git_commits", "git_delta_manifests_v2"]' setup_common_config $REPOTYPE
+  $ ENABLED_DERIVED_DATA='["git_trees", "git_commits", "git_delta_manifests_v2", "ccsm", "skeleton_manifests", "skeleton_manifests_v2"]' setup_common_config $REPOTYPE
   $ GIT_REPO_ORIGIN="${TESTTMP}/origin/repo-git"
   $ GIT_REPO_SUBMODULE="${TESTTMP}/origin/repo-submodule"
   $ GIT_REPO="${TESTTMP}/repo-git"
-  $ cat >> repos/repo/server.toml <<EOF
-  > [source_control_service]
-  > permit_writes = true
-  > EOF
 
 # Setup submodule git repository
   $ mkdir -p "$GIT_REPO_SUBMODULE"

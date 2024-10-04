@@ -9,10 +9,6 @@
   $ GIT_REPO="${TESTTMP}/repo-git"
   $ REPOTYPE="blob_files"
   $ ENABLED_DERIVED_DATA='["unodes", "git_commits", "git_trees", "git_delta_manifests_v2"]' setup_common_config $REPOTYPE
-  $ cat >> repos/repo/server.toml <<EOF
-  > [source_control_service]
-  > permit_writes = true
-  > EOF
 
 # Setup git repository
   $ mkdir -p "$GIT_REPO"
@@ -82,7 +78,7 @@
          tagger mononoke <mononoke@mononoke>
          ```
          into object of kind Tag
-  
+      2: object parsing failed
   Error: Execution failed
 
 

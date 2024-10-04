@@ -11,6 +11,7 @@ import re
 
 from sapling import commands, error, extensions, registrar
 from sapling.i18n import _
+from sapling.utils.subtreeutil import SUBTREE_BRANCH_KEY
 
 
 cmdtable = {}
@@ -32,8 +33,7 @@ usedinternally = {
     "mutdate",
     "mutop",
     "mutsplit",
-    "branch_info",
-    "test_branch_info",
+    SUBTREE_BRANCH_KEY,
 }
 
 

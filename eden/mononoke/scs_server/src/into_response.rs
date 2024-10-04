@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::collections::HashSet;
 
 use async_trait::async_trait;
+use commit_cloud_types::WorkspaceData;
 use futures::future::try_join_all;
 use futures::try_join;
 use itertools::Itertools;
@@ -274,6 +275,25 @@ impl IntoResponse<thrift::Diff> for HeaderlessUnifiedDiff {
             is_binary: self.is_binary,
             ..Default::default()
         })
+    }
+}
+
+impl IntoResponse<thrift::WorkspaceInfo> for WorkspaceData {
+    fn into_response(self) -> thrift::WorkspaceInfo {
+        thrift::WorkspaceInfo {
+            specifier: thrift::WorkspaceSpecifier {
+                name: self.name,
+                repo: thrift::RepoSpecifier {
+                    name: self.reponame,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            is_archived: self.archived,
+            latest_version: self.version as i64,
+            latest_timestamp: self.timestamp,
+            ..Default::default()
+        }
     }
 }
 

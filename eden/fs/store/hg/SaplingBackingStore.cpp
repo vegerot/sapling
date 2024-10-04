@@ -48,6 +48,9 @@
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/StaticAssert.h"
+#ifdef EDEN_HAVE_SERVER_OBSERVER
+#include "common/fb303/cpp/ThreadPoolExecutorCounters.h" // @manual
+#endif
 
 DEFINE_bool(
     hg_fetch_missing_trees,
@@ -202,6 +205,36 @@ TreePtr fromRawTree(
   return std::make_shared<TreePtr::element_type>(
       std::move(entries), edenTreeId);
 }
+
+std::unique_ptr<folly::Executor> makeRetryThreadPool(
+    AbsolutePathPiece repository,
+    const EdenStatsPtr& stats,
+    std::shared_ptr<StructuredLogger> structuredLogger) {
+  std::unique_ptr<folly::CPUThreadPoolExecutor> retryThreadPool =
+      std::make_unique<folly::CPUThreadPoolExecutor>(
+          FLAGS_num_hg_import_threads,
+          /* Eden performance will degrade when, for example, a status operation
+           * causes a large number of import requests to be scheduled before a
+           * lightweight operation needs to check the RocksDB cache. In that
+           * case, the RocksDB threads can end up all busy inserting work into
+           * the retry queue, preventing future requests that would hit cache
+           * from succeeding.
+           *
+           * Thus, make the retry queue unbounded.
+           *
+           * In the long term, we'll want a more comprehensive approach to
+           * bounding the parallelism of scheduled work.
+           */
+          std::make_unique<folly::UnboundedBlockingQueue<
+              folly::CPUThreadPoolExecutor::CPUTask>>(),
+          std::make_shared<SaplingRetryThreadFactory>(
+              repository, stats.copy(), structuredLogger));
+#ifdef EDEN_HAVE_SERVER_OBSERVER
+  facebook::fb303::installThreadPoolExecutorCounters("", *retryThreadPool);
+#endif
+  return retryThreadPool;
+}
+
 } // namespace
 
 HgImportTraceEvent::HgImportTraceEvent(
@@ -241,26 +274,8 @@ SaplingBackingStore::SaplingBackingStore(
     FaultInjector* FOLLY_NONNULL faultInjector)
     : localStore_(std::move(localStore)),
       stats_(stats.copy()),
-      retryThreadPool_(std::make_unique<folly::CPUThreadPoolExecutor>(
-          FLAGS_num_hg_import_threads,
-          /* Eden performance will degrade when, for example, a status operation
-           * causes a large number of import requests to be scheduled before a
-           * lightweight operation needs to check the RocksDB cache. In that
-           * case, the RocksDB threads can end up all busy inserting work into
-           * the retry queue, preventing future requests that would hit cache
-           * from succeeding.
-           *
-           * Thus, make the retry queue unbounded.
-           *
-           * In the long term, we'll want a more comprehensive approach to
-           * bounding the parallelism of scheduled work.
-           */
-          std::make_unique<folly::UnboundedBlockingQueue<
-              folly::CPUThreadPoolExecutor::CPUTask>>(),
-          std::make_shared<SaplingRetryThreadFactory>(
-              repository,
-              stats.copy(),
-              structuredLogger))),
+      retryThreadPool_(
+          makeRetryThreadPool(repository, stats, structuredLogger)),
       config_(config),
       serverThreadPool_(serverThreadPool),
       queue_(std::move(config)),
@@ -423,10 +438,10 @@ void SaplingBackingStore::processBlobImportRequests(
   std::vector<std::shared_ptr<SaplingImportRequest>> retryRequest;
   retryRequest.reserve(requests.size());
   if (config_->getEdenConfig()->allowRemoteGetBatch.getValue()) {
-    getBlobBatch(requests, watch, sapling::FetchMode::AllowRemote);
+    getBlobBatch(requests, sapling::FetchMode::AllowRemote);
     retryRequest = std::move(requests);
   } else {
-    getBlobBatch(requests, watch, sapling::FetchMode::LocalOnly);
+    getBlobBatch(requests, sapling::FetchMode::LocalOnly);
 
     for (auto& request : requests) {
       auto* promise = request->getPromise<BlobPtr>();
@@ -460,7 +475,7 @@ void SaplingBackingStore::processBlobImportRequests(
       }
     }
 
-    getBlobBatch(retryRequest, watch, sapling::FetchMode::RemoteOnly);
+    getBlobBatch(retryRequest, sapling::FetchMode::RemoteOnly);
   }
 
   {
@@ -656,24 +671,8 @@ folly::SemiFuture<BlobPtr> SaplingBackingStore::retryGetBlob(
       });
 }
 
-std::string getFetchModeStr(sapling::FetchMode fetchMode) {
-  switch (fetchMode) {
-    case sapling::FetchMode::LocalOnly:
-      return "local_only";
-    case sapling::FetchMode::RemoteOnly:
-      return "remote_only";
-    case sapling::FetchMode::AllowRemotePrefetch:
-      return "allow_remote_prefetch";
-    case sapling::FetchMode::AllowRemote:
-      return "allow_remote";
-  }
-
-  EDEN_BUG() << "Unknown fetchmode: " << enumValue(fetchMode);
-}
-
 void SaplingBackingStore::getBlobBatch(
     const ImportRequestsList& importRequests,
-    const folly::stop_watch<std::chrono::milliseconds>& getBlobWatch,
     sapling::FetchMode fetchMode) {
   auto preparedRequests = prepareRequests<SaplingImportRequest::BlobImport>(
       importRequests, SaplingImportObject::BLOB);
@@ -710,13 +709,6 @@ void SaplingBackingStore::getBlobBatch(
             ? folly::Try<BlobPtr>{content.exception()}
             : folly::Try{
                   std::make_shared<BlobPtr::element_type>(*content.value())};
-        if (structuredLogger_) {
-          size_t blobSizeInBytes = result->get()->getSizeBytes();
-          structuredLogger_->logEvent(SaplingBlobDownloadEvent{
-              blobSizeInBytes,
-              static_cast<long>(getBlobWatch.elapsed().count()),
-              getFetchModeStr(fetchMode)});
-        }
         for (auto& importRequest : importRequestList) {
           importRequest->getPromise<BlobPtr>()->setWith(
               [&]() -> folly::Try<BlobPtr> { return result; });
@@ -937,7 +929,7 @@ SaplingBackingStore::prepareRequests(
           DBG9,
           "Duplicate {} fetch request with proxyHash: {}",
           stringOfSaplingImportObject(requestType),
-          nodeId);
+          folly::StringPiece{nodeId});
       auto& importRequestList = importRequestsEntry->second.first;
 
       // Only look for mismatched requests if logging level is high enough.
@@ -1233,7 +1225,7 @@ void SaplingBackingStore::getTreeMetadataBatch(
         } else {
           auto& aux = auxTry.value();
           result = folly::Try{std::make_shared<TreeMetadataPtr::element_type>(
-              Hash32{std::move(aux->content_blake3)}, aux->total_size)};
+              Hash32{std::move(aux->digest_blake3)}, aux->digest_size)};
         }
         for (auto& importRequest : importRequestList) {
           importRequest->getPromise<TreeMetadataPtr>()->setWith(
@@ -1524,8 +1516,8 @@ folly::Try<TreeMetadataPtr> SaplingBackingStore::getLocalTreeMetadata(
   if (metadata.hasValue()) {
     return GetTreeMetadataResult{
         std::make_shared<TreeMetadataPtr::element_type>(TreeMetadata{
-            Hash32{std::move(metadata.value()->content_blake3)},
-            metadata.value()->total_size})};
+            Hash32{std::move(metadata.value()->digest_blake3)},
+            metadata.value()->digest_size})};
   } else {
     return GetTreeMetadataResult{metadata.exception()};
   }

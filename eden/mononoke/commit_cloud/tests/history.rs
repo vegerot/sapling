@@ -8,20 +8,21 @@
 use std::str::FromStr;
 
 use commit_cloud::ctx::CommitCloudContext;
-use commit_cloud::references::heads::WorkspaceHead;
-use commit_cloud::references::local_bookmarks::WorkspaceLocalBookmark;
-use commit_cloud::references::remote_bookmarks::WorkspaceRemoteBookmark;
 use commit_cloud::sql::builder::SqlCommitCloudBuilder;
 use commit_cloud::sql::common::UpdateWorkspaceNameArgs;
 use commit_cloud::sql::ops::Delete;
 use commit_cloud::sql::ops::Insert;
 use commit_cloud::sql::ops::Update;
+use commit_cloud_types::references::WorkspaceRemoteBookmark;
+use commit_cloud_types::WorkspaceHead;
+use commit_cloud_types::WorkspaceLocalBookmark;
 use fbinit::FacebookInit;
 use mercurial_types::HgChangesetId;
+use mononoke_macros::mononoke;
 use mononoke_types::Timestamp;
 use sql_construct::SqlConstruct;
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_history(_fb: FacebookInit) -> anyhow::Result<()> {
     use commit_cloud::references::history::WorkspaceHistory;
     use commit_cloud::sql::history_ops::DeleteArgs;
@@ -35,7 +36,7 @@ async fn test_history(_fb: FacebookInit) -> anyhow::Result<()> {
     let workspace = "user_testuser_default".to_owned();
     let renamed_workspace = "user_testuser_default_renamed".to_owned();
     let cc_ctx = CommitCloudContext::new(&workspace.clone(), &reponame.clone())?;
-    let timestamp = Timestamp::now();
+    let timestamp = Timestamp::now_as_secs();
 
     let head1 = WorkspaceHead {
         commit: HgChangesetId::from_str("2d7d4ba9ce0a6ffd222de7785b249ead9c51c536").unwrap(),
@@ -54,7 +55,7 @@ async fn test_history(_fb: FacebookInit) -> anyhow::Result<()> {
 
     let args1 = WorkspaceHistory {
         version: 1,
-        timestamp: Some(Timestamp::now()),
+        timestamp: Some(Timestamp::now_as_secs()),
         heads: vec![head1.clone()],
         local_bookmarks: vec![local_bookmark1.clone()],
         remote_bookmarks: vec![remote_bookmark1.clone()],
@@ -94,7 +95,7 @@ async fn test_history(_fb: FacebookInit) -> anyhow::Result<()> {
     // Insert a new history entry
     let args2 = WorkspaceHistory {
         version: 2,
-        timestamp: Some(Timestamp::now()),
+        timestamp: Some(Timestamp::now_as_secs()),
         heads: vec![head1],
         local_bookmarks: vec![local_bookmark1],
         remote_bookmarks: vec![remote_bookmark1],

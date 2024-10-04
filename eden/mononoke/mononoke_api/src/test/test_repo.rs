@@ -7,15 +7,12 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
 
-use anyhow::anyhow;
 use anyhow::Error;
 use anyhow::Result;
 use blobstore::Loadable;
 use bookmarks::BookmarkKey;
 use bytes::Bytes;
-use cacheblob::InProcessLease;
 use chrono::FixedOffset;
 use chrono::TimeZone;
 use cross_repo_sync::update_mapping_with_version;
@@ -793,9 +790,6 @@ async fn xrepo_commit_lookup_config_changing_live(fb: FacebookInit) -> Result<()
             &CommitSyncConfigVersion("TEST_VERSION_NAME".to_string()),
         )?
         .unwrap();
-    let common_config = cfg_src
-        .get_common_config_if_exists(large_repo_id)?
-        .ok_or_else(|| anyhow!("common config doesn't exist"))?;
     cfg.small_repos
         .get_mut(&small_repo_id)
         .unwrap()
@@ -819,16 +813,10 @@ async fn xrepo_commit_lookup_config_changing_live(fb: FacebookInit) -> Result<()
         largerepo.repo().clone(),
         smallrepo.repo().clone(),
         SubmoduleDeps::ForSync(HashMap::new()),
-        &common_config,
     )?;
 
-    let commit_syncer = CommitSyncer::new(
-        &ctx,
-        largerepo.synced_commit_mapping().clone(),
-        commit_sync_repos,
-        largerepo.live_commit_sync_config(),
-        Arc::new(InProcessLease::new()),
-    );
+    let commit_syncer =
+        CommitSyncer::new(&ctx, commit_sync_repos, largerepo.live_commit_sync_config());
 
     update_mapping_with_version(
         &ctx,

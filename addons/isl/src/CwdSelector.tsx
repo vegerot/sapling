@@ -24,12 +24,12 @@ import {ButtonDropdown} from 'isl-components/ButtonDropdown';
 import {Divider} from 'isl-components/Divider';
 import {Icon} from 'isl-components/Icon';
 import {Kbd} from 'isl-components/Kbd';
+import {KeyCode, Modifier} from 'isl-components/KeyboardShortcuts';
 import {RadioGroup} from 'isl-components/Radio';
 import {Subtle} from 'isl-components/Subtle';
 import {Tooltip} from 'isl-components/Tooltip';
 import {atom, useAtomValue} from 'jotai';
 import {Suspense} from 'react';
-import {KeyCode, Modifier} from 'shared/KeyboardShortcuts';
 import {basename} from 'shared/utils';
 
 /**
@@ -95,7 +95,7 @@ export function CwdSelector() {
     <Tooltip
       trigger="click"
       component={dismiss => <CwdDetails dismiss={dismiss} />}
-      additionalToggles={additionalToggles}
+      additionalToggles={additionalToggles.asEventTarget()}
       group="topbar"
       placement="bottom"
       title={

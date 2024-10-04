@@ -1,7 +1,6 @@
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup", "buck_sh_binary")
 load("@fbcode_macros//build_defs:python_binary.bzl", "python_binary")
 load("@fbcode_macros//build_defs:python_library.bzl", "python_library")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 load(
     "//eden/mononoke/tests/integration/facebook:fb_manifest_deps.bzl",
     "dott_test",
@@ -32,6 +31,7 @@ buck_filegroup(
     name = "facebook_test_fixtures",
     srcs = [
         "fb_library.sh",
+        "git_pushrebase/library-git-pushrebase.sh",
         "verify_integrity_mocked_diff_info.json",
     ],
 )
@@ -248,8 +248,12 @@ dott_test(
     disable_all_network_access_target = False,
     dott_files = glob(
         ["test-scs*.t"],
-        exclude = ["test-scs-git*.t"],
+        exclude = [
+            "test-scs-git*.t",
+            "test-scs-land-service*.t",
+        ],
     ),
+    enable_async_requests_worker = True,
     deps = [
         "//eden/mononoke:admin",
         "//eden/mononoke:backfill_mapping",
@@ -271,6 +275,22 @@ dott_test(
     deps = [
         "//eden/mononoke:mononoke",
         "//eden/mononoke/git/gitimport:gitimport",
+        "//eden/mononoke/scs/client:scsc",
+        "//eden/mononoke/scs_server:scs_server",
+        "//eden/mononoke/tools/admin:newadmin",
+        "//eden/mononoke/tools/testtool:testtool",
+    ],
+)
+
+dott_test(
+    name = "scs-land-service",
+    disable_all_network_access_target = False,
+    dott_files = glob(["test-scs-land-service*.t"]),
+    deps = [
+        "//eden/mononoke:admin",
+        "//eden/mononoke:mononoke",
+        "//eden/mononoke/commit_rewriting/backsyncer:backsyncer_cmd",
+        "//eden/mononoke/land_service/facebook/server:land_service",
         "//eden/mononoke/scs/client:scsc",
         "//eden/mononoke/scs_server:scs_server",
         "//eden/mononoke/tools/admin:newadmin",

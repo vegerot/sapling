@@ -78,6 +78,7 @@ use minibytes::Bytes;
 use pyconfigloader::config;
 use pyrevisionstore::edenapifilestore;
 use pyrevisionstore::edenapitreestore;
+use pyrevisionstore::filescmstore;
 use revisionstore::SaplingRemoteApiFileStore;
 use revisionstore::SaplingRemoteApiTreeStore;
 use types::HgId;
@@ -99,8 +100,20 @@ py_class!(pub class client |py| {
         _cls,
         config: config,
         reponame: Option<String> = None,
+        path: Option<String> = None,
     ) -> PyResult<client> {
-        let config = config.get_cfg(py);
+        let mut config = config.get_cfg(py);
+        let mut reponame = reponame;
+
+        if let Some(path) = path {
+            if reponame.is_none() {
+                // This sets reponame properly for mononoke:// URLs.
+                reponame = repourl::repo_name_from_url(&config, &path);
+            }
+            // This is required for eager:// URLs.
+            config.set("paths", "default", Some(path), &"pyedenapi".into());
+        }
+
         let inner = Builder::from_config(&config)
             .map_pyerr(py)?
             .repo_name(reponame)
@@ -360,7 +373,7 @@ py_class!(pub class client |py| {
     /// Upload file contents and hg filenodes
     def uploadfiles(
         &self,
-        store: PyObject,
+        store: filescmstore,
         keys: Vec<(
             PyPathBuf,     /* path */
             Serde<HgId>,   /* hgid */

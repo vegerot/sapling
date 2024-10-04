@@ -343,15 +343,9 @@ fn create_bonsai_changeset(
         parents,
         author,
         author_date: DateTime::now(),
-        committer: None,
-        committer_date: None,
         message,
-        hg_extra: Default::default(),
-        git_extra_headers: None,
-        git_tree_hash: None,
         file_changes,
-        is_snapshot: false,
-        git_annotated_tag: None,
+        ..Default::default()
     }
     .freeze()
 }
@@ -367,6 +361,7 @@ mod test {
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use maplit::hashmap;
+    use mononoke_macros::mononoke;
     use mononoke_types::RepositoryId;
     use repo_blobstore::RepoBlobstore;
     use repo_derived_data::RepoDerivedData;
@@ -404,7 +399,7 @@ mod test {
         bookmarks: dyn Bookmarks,
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_list_directory(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
@@ -425,7 +420,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_rsync_simple(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
@@ -469,7 +464,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_rsync_multiple(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
@@ -532,7 +527,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_rsync_with_limit(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
@@ -610,7 +605,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_rsync_with_excludes(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
@@ -661,7 +656,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_rsync_with_file_size_limit(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
@@ -741,7 +736,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_rsync_with_file_size_limit_and_lfs_threshold(
         fb: FacebookInit,
     ) -> Result<(), Error> {
@@ -790,7 +785,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_rsync_with_overwrite(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
@@ -880,7 +875,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_delete_excessive_files(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
@@ -916,7 +911,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_delete_excessive_files_multiple_dirs(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
@@ -966,7 +961,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_delete_excessive_files_xrepo(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let mut factory = TestRepoFactory::new(fb)?;
@@ -1008,7 +1003,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_xrepo_rsync_with_overwrite(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let mut factory = TestRepoFactory::new(fb)?;

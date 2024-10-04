@@ -16,7 +16,6 @@ use cross_repo_sync::CommitSyncer;
 use cross_repo_sync::Repo as CrossRepo;
 use metaconfig_types::CommitSyncConfigVersion;
 use mononoke_types::ChangesetId;
-use synced_commit_mapping::SyncedCommitMapping;
 
 /// This operation is useful immediately after a small repo is merged into a large repo.
 /// See example below
@@ -35,9 +34,9 @@ use synced_commit_mapping::SyncedCommitMapping;
 /// commit A.
 /// The function below can be used to achieve exactly that.
 /// ```
-pub async fn manual_commit_sync<M: SyncedCommitMapping + Clone + 'static, R: CrossRepo>(
+pub async fn manual_commit_sync<R: CrossRepo>(
     ctx: &CoreContext,
-    commit_syncer: &CommitSyncer<M, R>,
+    commit_syncer: &CommitSyncer<R>,
     source_cs_id: ChangesetId,
     target_repo_parents: Option<Vec<ChangesetId>>,
     mapping_version: CommitSyncConfigVersion,
@@ -88,6 +87,7 @@ mod test {
     use cross_repo_sync_test_utils::TestRepo;
     use fbinit::FacebookInit;
     use maplit::hashmap;
+    use mononoke_macros::mononoke;
     use mononoke_types::NonRootMPath;
     use tests_utils::list_working_copy_utf8;
     use tests_utils::resolve_cs_id;
@@ -95,7 +95,7 @@ mod test {
 
     use super::*;
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_manual_commit_sync(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
 
@@ -156,7 +156,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_manual_commit_sync_select_parents_automatically(
         fb: FacebookInit,
     ) -> Result<(), Error> {

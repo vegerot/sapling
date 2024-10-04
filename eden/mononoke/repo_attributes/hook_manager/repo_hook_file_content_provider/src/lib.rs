@@ -18,6 +18,7 @@ use bonsai_git_mapping::ArcBonsaiGitMapping;
 use bonsai_git_mapping::BonsaiGitMappingArc;
 use bonsai_tag_mapping::ArcBonsaiTagMapping;
 use bonsai_tag_mapping::BonsaiTagMappingArc;
+use bonsai_tag_mapping::Freshness;
 use bookmarks::ArcBookmarks;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarksArc;
@@ -99,6 +100,16 @@ impl HookStateProvider for RepoHookStateProvider {
             .with_context(|| format!("Error fetching bookmark: {}", bookmark))?
             .ok_or_else(|| format_err!("Bookmark {} does not exist", bookmark))?;
 
+        self.find_content_by_changeset_id(ctx, changeset_id, paths)
+            .await
+    }
+
+    async fn find_content_by_changeset_id<'a>(
+        &'a self,
+        ctx: &'a CoreContext,
+        changeset_id: ChangesetId,
+        paths: Vec<NonRootMPath>,
+    ) -> Result<HashMap<NonRootMPath, PathContent>, HookStateProviderError> {
         let fsnode_id = derive_fsnode(ctx, &self.repo_derived_data, changeset_id).await?;
 
         fsnode_id
@@ -197,13 +208,15 @@ impl HookStateProvider for RepoHookStateProvider {
             .find_entries(ctx.clone(), self.repo_blobstore.clone(), paths)
             .map_ok(|(path, entry)| async move {
                 if let Some(path) = Option::<NonRootMPath>::from(path) {
-                    let unode = entry
-                        .load(ctx, &self.repo_blobstore)
-                        .await
-                        .with_context(|| format!("Error loading unode entry: {:?}", entry))?;
-                    let linknode = match unode {
-                        Entry::Leaf(file) => file.linknode().clone(),
-                        Entry::Tree(tree) => tree.linknode().clone(),
+                    let linknode = match entry {
+                        Entry::Leaf(file_id) => {
+                            let file = file_id.load(ctx, &self.repo_blobstore).await?;
+                            file.linknode().clone()
+                        }
+                        Entry::Tree(tree_id) => {
+                            let tree = tree_id.load(ctx, &self.repo_blobstore).await?;
+                            tree.linknode().clone()
+                        }
                     };
 
                     let cs_info = self
@@ -286,7 +299,7 @@ impl HookStateProvider for RepoHookStateProvider {
         }
         match self
             .bonsai_tag_mapping
-            .get_entry_by_tag_name(bookmark.to_string())
+            .get_entry_by_tag_name(bookmark.to_string(), Freshness::Latest)
             .await?
         {
             Some(entry) => Ok(TagType::AnnotatedTag(entry.tag_hash)),

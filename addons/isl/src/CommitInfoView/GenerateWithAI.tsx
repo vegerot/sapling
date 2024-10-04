@@ -21,6 +21,7 @@ import {
   commitMode,
   latestCommitMessageFieldsWithEdits,
 } from './CommitInfoState';
+import {convertFieldNameToKey} from './utils';
 import {Button} from 'isl-components/Button';
 import {ErrorNotice} from 'isl-components/ErrorNotice';
 import {Icon} from 'isl-components/Icon';
@@ -37,12 +38,14 @@ import './GenerateWithAI.css';
 /** Either a commit hash or "commit/aaaaa" when making a new commit on top of hash aaaaa  */
 type HashKey = `commit/${string}` | string;
 
-export function GenerateAICommitMessageButton({
+export function GenerateAIButton({
   textAreaRef,
   appendToTextArea,
+  fieldName,
 }: {
   textAreaRef: RefObject<HTMLTextAreaElement>;
   appendToTextArea: (toAdd: string) => unknown;
+  fieldName: string;
 }) {
   const currentCommit = useAtomValue(commitInfoViewCurrentCommits)?.[0];
   const mode = useAtomValue(commitMode);
@@ -75,25 +78,28 @@ export function GenerateAICommitMessageButton({
     }
   }, [hashKey]);
 
+  const fieldKey = convertFieldNameToKey(fieldName);
+
   if (hashKey == null || !featureEnabled) {
     return null;
   }
   return (
-    <span key="generate-ai-commit-message-button">
+    <span key={`generate-ai-${fieldKey}-button`}>
       <Tooltip
         trigger="click"
         placement="bottom"
         component={(dismiss: () => void) => (
-          <GenerateAICommitMessageModal
+          <GenerateAIModal
             dismiss={dismiss}
             hashKey={hashKey}
             textArea={textAreaRef.current}
             appendToTextArea={appendToTextArea}
+            fieldName={fieldName}
           />
         )}
         onDismiss={onDismiss}
-        title={t('Generate a commit message suggestion with AI')}>
-        <Button icon data-testid="generate-commit-message-button">
+        title={t('Generate a $fieldName suggestion with AI', {replace: {$fieldName: fieldName}})}>
+        <Button icon data-testid={`generate-${fieldKey}-button`}>
           <Icon icon="sparkle" />
         </Button>
       </Tooltip>
@@ -165,15 +171,17 @@ const generatedCommitMessages = atomFamilyWeak((hashKey: string | undefined) =>
 
 const hasAcceptedAIMessageSuggestion = atomFamilyWeak((_key: HashKey) => atom<boolean>(false));
 
-function GenerateAICommitMessageModal({
+function GenerateAIModal({
   hashKey,
   dismiss,
   appendToTextArea,
+  fieldName,
 }: {
   hashKey: HashKey;
   textArea: HTMLElement | null;
   dismiss: () => unknown;
   appendToTextArea: (toAdd: string) => unknown;
+  fieldName: string;
 }) {
   const [content, refetch] = useAtom(generatedCommitMessages(hashKey));
 
@@ -206,13 +214,17 @@ function GenerateAICommitMessageModal({
   );
 
   return (
-    <div className="generated-ai-commit-message-modal">
+    <div className="generated-ai-modal">
       <Button icon className="dismiss-modal" onClick={dismiss}>
         <Icon icon="x" />
       </Button>
-      <b>Generate Summary</b>
+      <b>{`Generate ${fieldName}`}</b>
       {error ? (
-        <ErrorNotice error={error} title={t('Unable to generate commit message')}></ErrorNotice>
+        <ErrorNotice
+          error={error}
+          title={t('Unable to generate $fieldName', {
+            replace: {$fieldName: fieldName},
+          })}></ErrorNotice>
       ) : (
         <div className="generated-message-textarea-container">
           <TextArea
@@ -249,7 +261,7 @@ function GenerateAICommitMessageModal({
             dismiss();
           }}>
           <Icon icon="check" />
-          <T>Insert into Summary</T>
+          <T replace={{$fieldName: fieldName}}>Insert into $fieldName</T>
         </Button>
       </div>
     </div>

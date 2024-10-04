@@ -50,17 +50,7 @@ use-rust=True
 [workingcopy]
 rust-checkout=True
 
-[extensions]
-treemanifest=
-
-[treemanifest]
-sendtrees=True
-treeonly=True
-rustmanifest=True
-useruststore=True
-
 [remotefilelog]
-reponame=reponame-default
 cachepath=$TESTTMP/default-hgcache
 
 [mutation]
@@ -74,7 +64,7 @@ ack-match-full-traversal=True
 ack = smartlog-default-command
 
 [scmstore]
-contentstorefallback=True
+contentstorefallback=False
 
 [experimental]
 use-rust-changelog=True
@@ -89,6 +79,10 @@ use-rust=true
 
 [copytrace]
 dagcopytrace=True
+
+[committemplate]
+commit-message-fields=Summary,"Test Plan",Reviewers,Subscribers,Tasks,Tags,"Differential Revision","Reviewed By"
+summary-field=Summary
 """
     if use_watchman:
         content += """
@@ -150,6 +144,9 @@ ssh=python {testdir}/dummyssh
 
 [visibility]
 enabled=true
+
+[clone]
+use-rust=true
 """
 
     return content

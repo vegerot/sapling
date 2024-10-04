@@ -16,6 +16,7 @@ import {pageVisibility} from '../codeReview/CodeReviewInfo';
 import {atomFamilyWeak, lazyAtom} from '../jotaiUtils';
 import {isFullyOrPartiallySelected} from '../partialSelection';
 import {uncommittedChangesWithPreviews} from '../previews';
+import {commitByHash} from '../serverAPIState';
 import {GeneratedStatus} from '../types';
 import {MAX_FILES_ALLOWED_FOR_DIFF_STAT} from './diffStatConstants';
 import {atom, useAtomValue} from 'jotai';
@@ -28,12 +29,20 @@ const getGeneratedFiles = (files: string[]): string[] => {
   return files.reduce<string[]>((filtered, path) => {
     // check if the file should be excluded
     // the __generated__ pattern is included in the exclusions, so we don't need to include it here
-    if (path.match(/__generated__/) && generatedStatuses[path] === GeneratedStatus.Manual) {
+    if (path.match(/__generated__/) || generatedStatuses[path] === GeneratedStatus.Generated) {
       filtered.push(path);
     }
 
     return filtered;
   }, []);
+};
+
+const filterGeneratedFiles = (files: string[]): string[] => {
+  const generatedStatuses = getGeneratedFilesFrom(files);
+
+  return files.filter(
+    path => !path.match(/__generated__/) && generatedStatuses[path] !== GeneratedStatus.Generated,
+  );
 };
 
 async function fetchSignificantLinesOfCode(
@@ -60,14 +69,16 @@ async function fetchSignificantLinesOfCode(
   return slocData;
 }
 
-const commitSloc = atomFamilyWeak((_hash: string) => {
+const commitSlocFamily = atomFamilyWeak((hash: string) => {
   return lazyAtom(async get => {
-    const commits = get(commitInfoViewCurrentCommits);
-    if (commits == null || commits.length > 1) {
+    const commit = get(commitByHash(hash));
+    if (commit == null) {
       return undefined;
     }
-    const [commit] = commits;
     if (commit.totalFileCount > MAX_FILES_ALLOWED_FOR_DIFF_STAT) {
+      return undefined;
+    }
+    if (commit.optimisticRevset != null) {
       return undefined;
     }
     const sloc = await fetchSignificantLinesOfCode(commit);
@@ -102,15 +113,16 @@ const fetchPendingAmendSloc = async (
     return undefined;
   }
   const [commit] = commits;
-  if (commit.totalFileCount > MAX_FILES_ALLOWED_FOR_DIFF_STAT) {
+  if (commit.totalFileCount > MAX_FILES_ALLOWED_FOR_DIFF_STAT || commit.optimisticRevset != null) {
     return undefined;
   }
 
-  if (includedFiles.length > MAX_FILES_ALLOWED_FOR_DIFF_STAT) {
+  const filteredFiles = filterGeneratedFiles(includedFiles);
+  if (filteredFiles.length > MAX_FILES_ALLOWED_FOR_DIFF_STAT) {
     return undefined;
   }
 
-  if (includedFiles.length === 0) {
+  if (filteredFiles.length === 0) {
     return {sloc: 0, strictSloc: 0};
   }
 
@@ -127,7 +139,7 @@ const fetchPendingAmendSloc = async (
   serverAPI.postMessage({
     type: 'fetchPendingAmendSignificantLinesOfCode',
     hash: commit.hash,
-    includedFiles,
+    includedFiles: filteredFiles,
     requestId,
   });
 
@@ -191,18 +203,19 @@ const fetchPendingSloc = async (
     return undefined;
   }
 
-  if (includedFiles.length > MAX_FILES_ALLOWED_FOR_DIFF_STAT) {
+  const filteredFiles = filterGeneratedFiles(includedFiles);
+  if (filteredFiles.length > MAX_FILES_ALLOWED_FOR_DIFF_STAT) {
     return undefined;
   }
 
-  if (includedFiles.length === 0) {
+  if (filteredFiles.length === 0) {
     return {sloc: 0, strictSloc: 0};
   }
 
   serverAPI.postMessage({
     type: 'fetchPendingSignificantLinesOfCode',
     hash: commit.hash,
-    includedFiles,
+    includedFiles: filteredFiles,
     requestId,
   });
 
@@ -226,12 +239,13 @@ const pendingChangesSlocAtom = atom(async get => {
   return fetchPendingSloc(get, selectedFiles, pendingRequestId++);
 });
 
-const pendingAmendChangesSloc = loadable(pendingAmendSlocAtom);
-const pendingChangesSloc = loadable(pendingChangesSlocAtom);
+const pendingAmendSlocLoadableAtom = loadable(pendingAmendSlocAtom);
+const pendingChangesSlocLoadableAtom = loadable(pendingChangesSlocAtom);
 
-function useFetchWithPrevious(
-  atom: Atom<Loadable<Promise<SlocInfo | undefined>>>,
-): SlocInfo | undefined {
+function useFetchWithPrevious(atom: Atom<Loadable<Promise<SlocInfo | undefined>>>): {
+  slocInfo: SlocInfo | undefined;
+  isLoading: boolean;
+} {
   const previous = useRef<SlocInfo | undefined>(undefined);
   const results = useAtomValue(atom);
   if (results.state === 'hasError') {
@@ -239,22 +253,33 @@ function useFetchWithPrevious(
   }
   if (results.state === 'loading') {
     //using the previous value in the loading state to avoid flickering / jankiness in the UI
-    return previous.current;
+    return {slocInfo: previous.current, isLoading: true};
   }
 
   previous.current = results.data;
 
-  return results.data;
+  return {slocInfo: results.data, isLoading: false};
 }
 
 export function useFetchSignificantLinesOfCode(commit: CommitInfo) {
-  return useAtomValue(commitSloc(commit.hash));
+  const loadableAtom = loadable(commitSlocFamily(commit.hash));
+  const result = useAtomValue(loadableAtom);
+
+  if (result.state === 'hasError') {
+    throw result.error;
+  }
+
+  if (result.state === 'loading') {
+    return {slocInfo: undefined, isLoading: true};
+  }
+
+  return {slocInfo: result.data, isLoading: false};
 }
 
 export function useFetchPendingSignificantLinesOfCode() {
-  return useFetchWithPrevious(pendingChangesSloc);
+  return useFetchWithPrevious(pendingChangesSlocLoadableAtom);
 }
 
 export function useFetchPendingAmendSignificantLinesOfCode() {
-  return useFetchWithPrevious(pendingAmendChangesSloc);
+  return useFetchWithPrevious(pendingAmendSlocLoadableAtom);
 }

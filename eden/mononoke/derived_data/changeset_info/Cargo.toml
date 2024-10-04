@@ -11,7 +11,7 @@ license = "GPLv2+"
 path = "lib.rs"
 
 [dependencies]
-anyhow = "1.0.75"
+anyhow = "1.0.86"
 async-trait = "0.1.71"
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 bytes = { version = "1.6.0", features = ["serde"] }
@@ -35,6 +35,7 @@ fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperiment
 filestore = { version = "0.1.0", path = "../../filestore" }
 fixtures = { version = "0.1.0", path = "../../tests/fixtures" }
 mercurial_types = { version = "0.1.0", path = "../../mercurial/types" }
+mononoke_macros = { version = "0.1.0", path = "../../mononoke_macros" }
 repo_blobstore = { version = "0.1.0", path = "../../blobrepo/repo_blobstore" }
 repo_derived_data = { version = "0.1.0", path = "../../repo_attributes/repo_derived_data" }
 repo_identity = { version = "0.1.0", path = "../../repo_attributes/repo_identity" }

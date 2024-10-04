@@ -273,12 +273,12 @@ async fn create_unode_file(
     }
 
     let LeafInfo {
-        leaf,
+        change,
         path,
         parents,
     } = leaf_info;
 
-    let leaf_id = if let Some((content_id, file_type)) = leaf {
+    let leaf = if let Some((content_id, file_type)) = change {
         save_unode(
             ctx,
             blobstore,
@@ -350,7 +350,7 @@ async fn create_unode_file(
         }
     };
 
-    Ok(((), leaf_id))
+    Ok(((), leaf))
 }
 
 // reuse_manifest_parent() and reuse_file_parent() are used in unodes v2 in order to avoid
@@ -464,6 +464,7 @@ mod tests {
     use mercurial_types::blobs::HgBlobManifest;
     use mercurial_types::HgFileNodeId;
     use mercurial_types::HgManifestId;
+    use mononoke_macros::mononoke;
     use mononoke_types::path::MPath;
     use mononoke_types::BlobstoreValue;
     use mononoke_types::BonsaiChangeset;
@@ -483,7 +484,7 @@ mod tests {
     use crate::mapping::RootUnodeManifestId;
     use crate::tests::TestRepo;
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn linear_test(fb: FacebookInit) -> Result<(), Error> {
         let repo: TestRepo = Linear::get_repo(fb).await;
         let derivation_ctx = repo.repo_derived_data().manager().derivation_context(None);
@@ -568,7 +569,7 @@ mod tests {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_same_content_different_paths(fb: FacebookInit) -> Result<(), Error> {
         let repo: TestRepo = Linear::get_repo(fb).await;
         let ctx = CoreContext::test_mock(fb);
@@ -615,7 +616,7 @@ mod tests {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_same_content_no_change(fb: FacebookInit) -> Result<(), Error> {
         let repo: TestRepo = Linear::get_repo(fb).await;
         let ctx = CoreContext::test_mock(fb);
@@ -733,12 +734,12 @@ mod tests {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_diamond_merge_unodes_v2(fb: FacebookInit) -> Result<(), Error> {
         diamond_merge_unodes_v2(fb).await
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_parent_order(fb: FacebookInit) -> Result<(), Error> {
         let repo: TestRepo = test_repo_factory::build_empty(fb).await.unwrap();
         let derivation_ctx = repo.repo_derived_data().manager().derivation_context(None);
@@ -930,15 +931,10 @@ mod tests {
             parents,
             author: "author".to_string(),
             author_date: DateTime::now(),
-            committer: None,
-            committer_date: None,
             message: message.to_string(),
             hg_extra: Default::default(),
-            git_extra_headers: None,
-            git_tree_hash: None,
             file_changes: file_changes.into(),
-            is_snapshot: false,
-            git_annotated_tag: None,
+            ..Default::default()
         }
         .freeze()
         .unwrap();

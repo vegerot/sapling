@@ -10,7 +10,7 @@
   $ setconfig drawdag.defaultfiles=false
 
   $ start_and_wait_for_mononoke_server
-  $ hgmn_init repo
+  $ hg clone -q mono:repo repo
   $ cd repo
   $ drawdag << EOS
   > F # F/quux = random:30
@@ -24,20 +24,20 @@
   > A # A/foo = random:30
   > EOS
 
-  $ sl goto A -q
-  $ sl push -r . --to master -q --create
+  $ hg goto A -q
+  $ hg push -r . --to master -q --create
 
-  $ sl goto B -q
-  $ sl push -r . --to master -q
+  $ hg goto B -q
+  $ hg push -r . --to master -q
 
-  $ sl goto C -q
-  $ sl push -r . --to master -q
+  $ hg goto C -q
+  $ hg push -r . --to master -q
 
-  $ sl goto D -q
-  $ sl push -r . --to master -q
+  $ hg goto D -q
+  $ hg push -r . --to master -q
 
-  $ sl goto F -q
-  $ sl push -r . --to other_bookmark -q --create
+  $ hg goto F -q
+  $ hg push -r . --to other_bookmark -q --create
 
 Check that new entry was added to the sync database. 4 pushes
   $ sqlite3 "$TESTTMP/monsql/sqlite_dbs" "select count(*) from bookmarks_update_log";
@@ -59,6 +59,10 @@ Validate that all the blobs are now present in CAS for the commit D
   $ with_stripped_logs mononoke_newadmin cas-store --repo-name repo upload --full --hg-id $D
   Upload completed. Upload stats: uploaded digests: 0, already present digests: 5, uploaded bytes: 0 B, the largest uploaded blob: 0 B
 
+Validate that all the blobs are now present in CAS for the commit D (by bookmark name)
+  $ with_stripped_logs mononoke_newadmin cas-store --repo-name repo upload --full -B master
+  Upload completed. Upload stats: uploaded digests: 0, already present digests: 5, uploaded bytes: 0 B, the largest uploaded blob: 0 B
+
 Validate that all the blobs are now present in CAS for the middle commit B
   $ with_stripped_logs mononoke_newadmin cas-store --repo-name repo upload --full --hg-id $B
   Upload completed. Upload stats: uploaded digests: 0, already present digests: 3, uploaded bytes: 0 B, the largest uploaded blob: 0 B
@@ -69,4 +73,8 @@ Validate that all the blobs are now present in CAS for the first commit A
 
 Commit F belongs to a different bookmark, validate that the commit is fully uploaded
   $ with_stripped_logs mononoke_newadmin cas-store --repo-name repo upload --full --hg-id $F
+  Upload completed. Upload stats: uploaded digests: 0, already present digests: 6, uploaded bytes: 0 B, the largest uploaded blob: 0 B
+
+Commit F belongs to a different bookmark, validate that the commit is fully uploaded (by bookmark name)
+  $ with_stripped_logs mononoke_newadmin cas-store --repo-name repo upload --full -B other_bookmark
   Upload completed. Upload stats: uploaded digests: 0, already present digests: 6, uploaded bytes: 0 B, the largest uploaded blob: 0 B

@@ -12,7 +12,7 @@ name = "admin"
 path = "../cmds/admin/main.rs"
 
 [dependencies]
-anyhow = "1.0.75"
+anyhow = "1.0.86"
 backsyncer = { version = "0.1.0", path = "../commit_rewriting/backsyncer" }
 blame = { version = "0.1.0", path = "../derived_data/blame" }
 blobrepo_hg = { version = "0.1.0", path = "../blobrepo/blobrepo_hg" }
@@ -72,13 +72,14 @@ sorted_vector_map = { version = "0.2.0", git = "https://github.com/facebookexper
 sql_query_config = { version = "0.1.0", path = "../repo_attributes/sql_query_config" }
 synced_commit_mapping = { version = "0.1.0", path = "../commit_rewriting/synced_commit_mapping" }
 thiserror = "1.0.49"
-tokio = { version = "1.37.0", features = ["full", "test-util", "tracing"] }
 unodes = { version = "0.1.0", path = "../derived_data/unodes" }
 xdiff = { version = "0.1.0", path = "../../scm/lib/xdiff" }
 
 [dev-dependencies]
 ascii = "1.0"
-cacheblob = { version = "0.1.0", path = "../blobstore/cacheblob" }
+fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fixtures = { version = "0.1.0", path = "../tests/fixtures" }
+mononoke_macros = { version = "0.1.0", path = "../mononoke_macros" }
 rendezvous = { version = "0.1.0", path = "../common/rendezvous" }
 sql_construct = { version = "0.1.0", path = "../common/sql_construct" }
+test_repo_factory = { version = "0.1.0", path = "../repo_factory/test_repo_factory" }

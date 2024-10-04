@@ -10,18 +10,20 @@ use std::str::FromStr;
 use commit_cloud::ctx::CommitCloudContext;
 use commit_cloud::references::remote_bookmarks::rbs_from_list;
 use commit_cloud::references::remote_bookmarks::rbs_to_list;
-use commit_cloud::references::remote_bookmarks::WorkspaceRemoteBookmark;
 use commit_cloud::sql::builder::SqlCommitCloudBuilder;
 use commit_cloud::sql::common::UpdateWorkspaceNameArgs;
 use commit_cloud::sql::ops::Delete;
 use commit_cloud::sql::ops::GetAsMap;
 use commit_cloud::sql::ops::Insert;
 use commit_cloud::sql::ops::Update;
+use commit_cloud_types::RemoteBookmarksMap;
+use commit_cloud_types::WorkspaceRemoteBookmark;
 use fbinit::FacebookInit;
 use mercurial_types::HgChangesetId;
+use mononoke_macros::mononoke;
 use sql_construct::SqlConstruct;
 
-#[test]
+#[mononoke::test]
 fn test_remote_bookmark_creation() {
     let commit_id = HgChangesetId::from_str("2d7d4ba9ce0a6ffd222de7785b249ead9c51c536").unwrap();
     let bookmark =
@@ -33,7 +35,7 @@ fn test_remote_bookmark_creation() {
     assert_eq!(bookmark.remote(), &"origin".to_string());
 }
 
-#[test]
+#[mononoke::test]
 fn test_remote_bookmark_creation_empty_name() {
     let commit_id = HgChangesetId::from_str("2d7d4ba9ce0a6ffd222de7785b249ead9c51c536").unwrap();
     let bookmark = WorkspaceRemoteBookmark::new("origin".to_string(), "".to_string(), commit_id);
@@ -44,7 +46,7 @@ fn test_remote_bookmark_creation_empty_name() {
     );
 }
 
-#[test]
+#[mononoke::test]
 fn test_remote_bookmark_creation_empty_remote() {
     let commit_id = HgChangesetId::from_str("2d7d4ba9ce0a6ffd222de7785b249ead9c51c536").unwrap();
     let bookmark =
@@ -56,7 +58,7 @@ fn test_remote_bookmark_creation_empty_remote() {
     );
 }
 
-#[test]
+#[mononoke::test]
 fn test_rbs_from_list_valid() {
     let bookmarks = vec![vec![
         "origin".to_string(),
@@ -74,7 +76,7 @@ fn test_rbs_from_list_valid() {
     assert_eq!(bookmark.remote(), &"origin".to_string());
 }
 
-#[test]
+#[mononoke::test]
 fn test_rbs_from_list_invalid_format() {
     let bookmarks = vec![vec!["origin".to_string(), "bookmark_name".to_string()]];
     let result = rbs_from_list(&bookmarks);
@@ -85,7 +87,7 @@ fn test_rbs_from_list_invalid_format() {
     );
 }
 
-#[test]
+#[mononoke::test]
 fn test_rbs_to_list() {
     let commit_id = HgChangesetId::from_str("2d7d4ba9ce0a6ffd222de7785b249ead9c51c536").unwrap();
     let bookmark =
@@ -101,9 +103,8 @@ fn test_rbs_to_list() {
     assert_eq!(bookmark[2], "2d7d4ba9ce0a6ffd222de7785b249ead9c51c536");
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_remote_bookmarks(_fb: FacebookInit) -> anyhow::Result<()> {
-    use commit_cloud::references::remote_bookmarks::RemoteBookmarksMap;
     use commit_cloud::sql::ops::Get;
     use commit_cloud::sql::remote_bookmarks_ops::DeleteArgs;
 
@@ -146,22 +147,9 @@ async fn test_remote_bookmarks(_fb: FacebookInit) -> anyhow::Result<()> {
     assert_eq!(res.len(), 2);
 
     let res_map: RemoteBookmarksMap = sql.get_as_map(reponame.clone(), workspace.clone()).await?;
+    assert_eq!(res_map.get(&hgid1).unwrap().to_vec(), vec![bookmark1]);
     assert_eq!(
-        res_map
-            .get(&hgid1)
-            .unwrap()
-            .iter()
-            .map(|b| b.clone().into())
-            .collect::<Vec<WorkspaceRemoteBookmark>>(),
-        vec![bookmark1]
-    );
-    assert_eq!(
-        res_map
-            .get(&hgid2)
-            .unwrap()
-            .iter()
-            .map(|b| b.clone().into())
-            .collect::<Vec<WorkspaceRemoteBookmark>>(),
+        res_map.get(&hgid2).unwrap().to_vec(),
         vec![bookmark2.clone()]
     );
 

@@ -12,9 +12,11 @@ use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use client::AsyncRequestsQueue;
 use clientinfo::ClientEntryPoint;
 use clientinfo::ClientInfo;
 use clientinfo::CLIENT_INFO_HEADER;
+use cloned::cloned;
 use connection_security_checker::ConnectionSecurityChecker;
 use ephemeral_blobstore::BubbleId;
 use ephemeral_blobstore::RepoEphemeralStore;
@@ -44,9 +46,11 @@ use mononoke_api::RepoContext;
 use mononoke_api::SessionContainer;
 use mononoke_api::TreeContext;
 use mononoke_api::TreeId;
+use mononoke_app::MononokeApp;
 use mononoke_configs::MononokeConfigs;
 use mononoke_types::hash::Sha1;
 use mononoke_types::hash::Sha256;
+use permission_checker::AclProvider;
 use permission_checker::MononokeIdentity;
 use permission_checker::MononokeIdentitySet;
 use repo_authorization::AuthorizationContext;
@@ -110,14 +114,17 @@ pub(crate) struct SourceControlServiceImpl {
     pub(crate) scribe: Scribe,
     pub(crate) configs: Arc<MononokeConfigs>,
     pub(crate) factory_group: Option<Arc<FactoryGroup<2>>>,
+    pub(crate) async_requests_queue_client: Option<Arc<AsyncRequestsQueue>>,
     identity_proxy_checker: Arc<ConnectionSecurityChecker>,
+    pub(crate) acl_provider: Arc<dyn AclProvider>,
 }
 
 pub(crate) struct SourceControlServiceThriftImpl(Arc<SourceControlServiceImpl>);
 
 impl SourceControlServiceImpl {
-    pub fn new(
+    pub async fn new(
         fb: FacebookInit,
+        app: &MononokeApp,
         mononoke: Arc<Mononoke<Repo>>,
         megarepo_api: Arc<MegarepoApi<Repo>>,
         logger: Logger,
@@ -127,12 +134,13 @@ impl SourceControlServiceImpl {
         configs: Arc<MononokeConfigs>,
         common_config: &CommonConfig,
         factory_group: Option<Arc<FactoryGroup<2>>>,
-    ) -> Self {
+        async_requests_queue_client: Option<Arc<AsyncRequestsQueue>>,
+    ) -> Result<Self, anyhow::Error> {
         scuba_builder.add_common_server_data();
 
-        Self {
+        Ok(Self {
             fb,
-            mononoke,
+            mononoke: mononoke.clone(),
             megarepo_api,
             logger,
             scuba_builder,
@@ -144,7 +152,9 @@ impl SourceControlServiceImpl {
             configs,
             identity_proxy_checker: Arc::new(identity_proxy_checker),
             factory_group,
-        }
+            async_requests_queue_client,
+            acl_provider: app.environment().acl_provider.clone(),
+        })
     }
 
     pub(crate) fn thrift_server(&self) -> SourceControlServiceThriftImpl {
@@ -657,7 +667,7 @@ fn log_result<T: AddScubaResponse>(
         }
     };
     if let Ok(true) = justknobs::eval("scm/mononoke:scs_alert_on_methods", None, Some(method)) {
-        STATS::total_method_requests.add_value(0, (method.to_string(),));
+        STATS::total_method_requests.add_value(1, (method.to_string(),));
         if status == "INTERNAL_ERROR" {
             STATS::total_method_internal_failure.add_value(1, (method.to_string(),));
         } else {
@@ -811,20 +821,23 @@ macro_rules! impl_thrift_methods {
                 let fut = async move {
                     let svc = self.0.clone();
                     let ctx = create_ctx!(svc, $method_name, req_ctxt, $( $param_name ),*).await?;
-                    let handler = async move {
-                        let start_mem_stats = log_start(&ctx, stringify!($method_name));
-                        STATS::total_request_start.add_value(1);
-                        let (stats, res) = async {
-                            check_memory_usage(&ctx, stringify!($method_name), start_mem_stats.as_ref())?;
-                            svc.$method_name(ctx.clone(), $( $param_name ),* ).await
+                    let handler = {
+                        cloned!(ctx);
+                        async move {
+                            let start_mem_stats = log_start(&ctx, stringify!($method_name));
+                            STATS::total_request_start.add_value(1);
+                            let (stats, res) = async {
+                                check_memory_usage(&ctx, stringify!($method_name), start_mem_stats.as_ref())?;
+                                svc.$method_name(ctx.clone(), $( $param_name ),* ).await
+                            }
+                            .timed()
+                            .on_cancel_with_data(|stats| log_cancelled(&ctx, stringify!($method_name), &stats, start_mem_stats.as_ref()))
+                            .await;
+                            log_result(ctx, stringify!($method_name), &stats, &res, start_mem_stats.as_ref());
+                            let method = stringify!($method_name).to_string();
+                            STATS::method_completion_time_ms.add_value(stats.completion_time.as_millis_unchecked() as i64, (method,));
+                            res.map_err(Into::into)
                         }
-                        .timed()
-                        .on_cancel_with_data(|stats| log_cancelled(&ctx, stringify!($method_name), &stats, start_mem_stats.as_ref()))
-                        .await;
-                        log_result(ctx, stringify!($method_name), &stats, &res, start_mem_stats.as_ref());
-                        let method = stringify!($method_name).to_string();
-                        STATS::method_completion_time_ms.add_value(stats.completion_time.as_millis_unchecked() as i64, (method,));
-                        res.map_err(Into::into)
                     };
 
                     if let Some(factory_group) = &self.0.factory_group {
@@ -1066,6 +1079,14 @@ impl SourceControlService for SourceControlServiceThriftImpl {
             params: thrift::RepoUploadFileContentParams,
         ) -> Result<thrift::RepoUploadFileContentResponse, service::RepoUploadFileContentExn>;
 
+        async fn create_repos(
+            params: thrift::CreateReposParams,
+        ) -> Result<thrift::CreateReposToken, service::CreateReposExn>;
+
+        async fn create_repos_poll(
+            params: thrift::CreateReposToken,
+        ) -> Result<thrift::CreateReposPollResponse, service::CreateReposPollExn>;
+
         async fn megarepo_add_sync_target_config(
             params: thrift::MegarepoAddConfigParams,
         ) -> Result<thrift::MegarepoAddConfigResponse, service::MegarepoAddSyncTargetConfigExn>;
@@ -1146,5 +1167,22 @@ impl SourceControlService for SourceControlServiceThriftImpl {
         async fn cloud_workspace_info(
             params: thrift::CloudWorkspaceInfoParams,
         ) -> Result<thrift::CloudWorkspaceInfoResponse, service::CloudWorkspaceInfoExn>;
+
+        async fn cloud_user_workspaces(
+            params: thrift::CloudUserWorkspacesParams,
+        ) -> Result<thrift::CloudUserWorkspacesResponse, service::CloudUserWorkspacesExn>;
+
+        async fn cloud_workspace_smartlog(
+            params: thrift::CloudWorkspaceSmartlogParams,
+        ) -> Result<thrift::CloudWorkspaceSmartlogResponse, service::CloudWorkspaceSmartlogExn>;
+
+        async fn async_ping(
+            params: thrift::AsyncPingParams,
+        ) -> Result<thrift::AsyncPingToken, service::AsyncPingExn>;
+
+        async fn async_ping_poll(
+            params: thrift::AsyncPingToken,
+        ) -> Result<thrift::AsyncPingPollResponse, service::AsyncPingPollExn>;
+
     }
 }

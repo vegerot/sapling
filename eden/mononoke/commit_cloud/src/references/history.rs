@@ -6,18 +6,17 @@
  */
 
 use anyhow::bail;
-use edenapi_types::cloud::HistoricalVersion;
-use edenapi_types::cloud::HistoricalVersionsData;
-use edenapi_types::cloud::RemoteBookmark;
+use commit_cloud_types::references::WorkspaceRemoteBookmark;
+use commit_cloud_types::HistoricalVersion;
+use commit_cloud_types::LocalBookmarksMap;
+use commit_cloud_types::RemoteBookmarksMap;
+use commit_cloud_types::SmartlogFlag;
+use commit_cloud_types::WorkspaceHead;
+use commit_cloud_types::WorkspaceLocalBookmark;
 use mercurial_types::HgChangesetId;
 use mononoke_types::Timestamp;
 
-use super::local_bookmarks::LocalBookmarksMap;
-use super::remote_bookmarks::RemoteBookmarksMap;
 use super::RawReferencesData;
-use crate::references::heads::WorkspaceHead;
-use crate::references::local_bookmarks::WorkspaceLocalBookmark;
-use crate::references::remote_bookmarks::WorkspaceRemoteBookmark;
 use crate::sql::history_ops::GetOutput;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -60,13 +59,8 @@ impl WorkspaceHistory {
     pub fn remote_bookmarks_as_map(&self) -> RemoteBookmarksMap {
         let mut map = RemoteBookmarksMap::new();
         self.remote_bookmarks.iter().for_each(|bookmark| {
-            let rb = RemoteBookmark {
-                name: bookmark.name().clone(),
-                node: Some((*bookmark.commit()).into()),
-                remote: bookmark.remote().clone(),
-            };
             let value = map.entry(*bookmark.commit()).or_insert(vec![]);
-            value.push(rb)
+            value.push(bookmark.clone())
         });
         map
     }
@@ -77,20 +71,33 @@ impl WorkspaceHistory {
         &self,
         rbs: &RemoteBookmarksMap,
         lbs: &LocalBookmarksMap,
+        flags: &[SmartlogFlag],
     ) -> Vec<HgChangesetId> {
+        let lbs_heads = flags
+            .contains(&SmartlogFlag::AddAllBookmarks)
+            .then_some(lbs.keys().cloned())
+            .into_iter()
+            .flatten();
+
+        let rbs_heads = flags
+            .contains(&SmartlogFlag::AddRemoteBookmarks)
+            .then_some(rbs.keys().cloned())
+            .into_iter()
+            .flatten();
+
         self.heads
             .clone()
             .into_iter()
             .map(|head| head.commit)
-            .chain(rbs.keys().cloned())
-            .chain(lbs.keys().cloned())
+            .chain(lbs_heads)
+            .chain(rbs_heads)
             .collect::<Vec<HgChangesetId>>()
     }
 }
 
 pub fn historical_versions_from_get_output(
     output: Vec<GetOutput>,
-) -> anyhow::Result<HistoricalVersionsData> {
+) -> anyhow::Result<Vec<HistoricalVersion>> {
     let mut versions = Vec::new();
     for out in output {
         match out {
@@ -103,5 +110,5 @@ pub fn historical_versions_from_get_output(
             _ => bail!("'historical_data' failed: expected output from get_version_timestamp"),
         }
     }
-    Ok(HistoricalVersionsData { versions })
+    Ok(versions)
 }

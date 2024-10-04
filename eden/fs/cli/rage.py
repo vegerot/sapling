@@ -329,6 +329,8 @@ def print_diagnostic_info(
         dry_run,
     )
 
+    print_eden_doctor(processor, out, dry_run)
+
     print_system_load(out)
 
     quickstack_cmd = get_quickstack_cmd(instance)
@@ -618,12 +620,31 @@ def print_system_mount_table(out: IO[bytes]) -> None:
 def print_disk_space_usage(out: IO[bytes]) -> None:
 
     section_title("Disk space usage:", out)
-    cmd = ["eden", "du", "--fast"]
-    try:
-        output = subprocess.check_output(cmd)
-        out.write(output)
-    except Exception as e:
-        out.write(f"Error printing {cmd}: {e}\n".encode())
+    cmds = [["eden", "du", "--fast"]]
+    if sys.platform == "darwin":
+        cmds.extend(
+            [
+                ["diskutil", "apfs", "list"],
+                [
+                    "/System/Library/Filesystems/apfs.fs/Contents/Resources/apfs.util",
+                    "-G",
+                    str(Path.home()),
+                ],
+            ]
+        )
+    if sys.platform == "linux":
+        cmds.extend([["df", "-h"]])
+    for i, cmd in enumerate(cmds):
+        try:
+            output = subprocess.run(cmd, capture_output=True, shell=False).stdout
+            out.write(output)
+            if i < len(cmds) - 1:
+                out.write(
+                    b"\n-------------------------------------------------------------------\n"
+                )
+
+        except Exception as e:
+            out.write(f"Error running {cmd}: {e}\n\n".encode())
 
 
 def print_system_load(out: IO[bytes]) -> None:
@@ -664,6 +685,20 @@ def run_cmd(
         out.write(
             f"Command {' '.join(cmd)} timed out after {timeout} seconds\n".encode()
         )
+
+
+def print_eden_doctor(processor: str, out: IO[bytes], dry_run: bool) -> None:
+    section_title("EdenFS doctor:", out)
+    cmd = ["edenfsctl", "doctor"]
+    try:
+        paste_output(
+            lambda sink: run_cmd(cmd, sink, out, 20),
+            processor,
+            out,
+            dry_run,
+        )
+    except Exception as e:
+        out.write(f"Error printing {cmd}: {e}\n".encode())
 
 
 def print_eden_config(

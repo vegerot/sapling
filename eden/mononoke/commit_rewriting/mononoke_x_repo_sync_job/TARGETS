@@ -1,5 +1,4 @@
 load("@fbcode_macros//build_defs:rust_binary.bzl", "rust_binary")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("mononoke")
 
@@ -10,6 +9,7 @@ rust_binary(
         "fbsource//third-party/rust:maplit",
         "//common/rust/shed/fbinit:fbinit-tokio",
         "//eden/mononoke/commit_rewriting/cross_repo_sync:cross_repo_sync_test_utils",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
         "//eden/mononoke/tests/utils:tests_utils",
     ],
     deps = [
@@ -38,7 +38,6 @@ rust_binary(
         "//eden/mononoke/commit_rewriting/backsyncer:backsyncer",
         "//eden/mononoke/commit_rewriting/cross_repo_sync:cross_repo_sync",
         "//eden/mononoke/commit_rewriting/live_commit_sync_config:live_commit_sync_config",
-        "//eden/mononoke/commit_rewriting/synced_commit_mapping:synced_commit_mapping",
         "//eden/mononoke/common/scuba_ext:scuba_ext",
         "//eden/mononoke/derived_data:bulk_derivation",
         "//eden/mononoke/derived_data:fsnodes",

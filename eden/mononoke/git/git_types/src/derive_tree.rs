@@ -188,7 +188,7 @@ async fn derive_git_manifest<B: Blobstore + Clone + 'static>(
             // representation, that won't happen.
             |leaf_info| {
                 let leaf = leaf_info
-                    .leaf
+                    .change
                     .ok_or_else(|| MononokeGitError::TreeDerivationFailed.into())
                     .map(|l| ((), l));
                 ready(leaf)
@@ -290,6 +290,7 @@ mod test {
     use git2::Oid;
     use git2::Repository;
     use manifest::ManifestOps;
+    use mononoke_macros::mononoke;
     use repo_blobstore::RepoBlobstore;
     use repo_blobstore::RepoBlobstoreArc;
     use repo_derived_data::RepoDerivedData;
@@ -351,7 +352,7 @@ mod test {
 
             let path = &mpath.to_string();
             let path = Path::new(&path);
-            File::create(&root_path.join(path))?.write_all(&blob)?;
+            File::create(root_path.join(path))?.write_all(&blob)?;
 
             index.add_path(path)?;
         }
@@ -367,7 +368,7 @@ mod test {
 
     macro_rules! impl_test {
         ($test_name:ident, $fixture:ident) => {
-            #[fbinit::test]
+            #[mononoke::fbinit_test]
             fn $test_name(fb: FacebookInit) -> Result<(), Error> {
                 let runtime = tokio::runtime::Runtime::new()?;
                 runtime.block_on(async move {

@@ -126,6 +126,8 @@ use metaconfig_types::MetadataDatabaseConfig;
 use metaconfig_types::Redaction;
 use metaconfig_types::RepoConfig;
 use metaconfig_types::RepoReadOnly;
+#[cfg(fbcode_build)]
+use metaconfig_types::ZelosConfig;
 use mutable_counters::ArcMutableCounters;
 use mutable_counters::SqlMutableCountersBuilder;
 use mutable_renames::ArcMutableRenames;
@@ -171,21 +173,24 @@ use repo_sparse_profiles::RepoSparseProfiles;
 use repo_sparse_profiles::SqlSparseProfilesSizes;
 use repo_stats_logger::ArcRepoStatsLogger;
 use repo_stats_logger::RepoStatsLogger;
-use requests_table::ArcLongRunningRequestsQueue;
-use requests_table::SqlLongRunningRequestsQueue;
 use scuba_ext::MononokeScubaSampleBuilder;
+use slog::debug;
+use slog::error;
 use slog::o;
 use sql_commit_graph_storage::ArcCommitGraphBulkFetcher;
 use sql_commit_graph_storage::CommitGraphBulkFetcher;
 use sql_commit_graph_storage::SqlCommitGraphStorageBuilder;
 use sql_construct::SqlConstructFromDatabaseConfig;
 use sql_construct::SqlConstructFromMetadataDatabaseConfig;
+use sql_construct::SqlShardableConstructFromMetadataDatabaseConfig;
 use sql_query_config::ArcSqlQueryConfig;
 use sql_query_config::SqlQueryConfig;
 use sqlphases::SqlPhasesBuilder;
+use stats::prelude::*;
 use streaming_clone::ArcStreamingClone;
 use streaming_clone::StreamingCloneBuilder;
 use synced_commit_mapping::ArcSyncedCommitMapping;
+use synced_commit_mapping::CachingSyncedCommitMapping;
 use synced_commit_mapping::SqlSyncedCommitMappingBuilder;
 use thiserror::Error;
 use virtually_sharded_blobstore::VirtuallyShardedBlobstore;
@@ -201,17 +206,42 @@ use wireproto_handler::RepoHandlerBase;
 use wireproto_handler::TargetRepoDbs;
 #[cfg(fbcode_build)]
 use zelos_queue::zelos_derivation_queues;
+#[cfg(fbcode_build)]
+use zeus_client::zeus_cpp_client::ZeusCppClient;
+#[cfg(fbcode_build)]
+use zeus_client::ZeusClient;
 
 const DERIVED_DATA_LEASE: &str = "derived-data-lease";
+const ZEUS_CLIENT_ID: &str = "mononoke";
+
+define_stats! {
+    prefix = "mononoke.repo_factory";
+    cache_hit: dynamic_singleton_counter(
+        "cache.{}.hit",
+        (cache_name: String)
+    ),
+    cache_init_error: dynamic_singleton_counter(
+        "cache.{}.init.error",
+        (cache_name: String)
+    ),
+    cache_miss: dynamic_singleton_counter(
+        "cache.{}.miss",
+        (cache_name: String)
+    ),
+}
 
 #[derive(Clone)]
 struct RepoFactoryCache<K: Clone + Eq + Hash, V: Clone> {
+    fb: FacebookInit,
+    name: String,
     cache: Arc<Mutex<HashMap<K, Arc<AsyncOnceCell<V>>>>>,
 }
 
 impl<K: Clone + Eq + Hash, V: Clone> RepoFactoryCache<K, V> {
-    fn new() -> Self {
+    fn new(fb: FacebookInit, name: &str) -> Self {
         RepoFactoryCache {
+            fb,
+            name: name.to_string(),
             cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -226,19 +256,26 @@ impl<K: Clone + Eq + Hash, V: Clone> RepoFactoryCache<K, V> {
             match cache.get(key) {
                 Some(cell) => {
                     if let Some(value) = cell.get() {
+                        STATS::cache_hit.increment_value(self.fb, 1, (self.name.clone(),));
                         return Ok(value.clone());
                     }
                     cell.clone()
                 }
                 None => {
+                    STATS::cache_miss.increment_value(self.fb, 1, (self.name.clone(),));
                     let cell = Arc::new(AsyncOnceCell::new());
                     cache.insert(key.clone(), cell.clone());
                     cell
                 }
             }
         };
-        let value = cell.get_or_try_init(init).await?;
-        Ok(value.clone())
+        match cell.get_or_try_init(init).await {
+            Ok(value) => Ok(value.clone()),
+            Err(e) => {
+                STATS::cache_init_error.increment_value(self.fb, 1, (self.name.clone(),));
+                Err(e)
+            }
+        }
     }
 }
 
@@ -250,6 +287,8 @@ pub struct RepoFactory {
     sql_factories: RepoFactoryCache<MetadataDatabaseConfig, Arc<MetadataSqlFactory>>,
     blobstores: RepoFactoryCache<BlobConfig, Arc<dyn Blobstore>>,
     redacted_blobs: RepoFactoryCache<MetadataDatabaseConfig, Arc<RedactedBlobs>>,
+    #[cfg(fbcode_build)]
+    zelos_clients: RepoFactoryCache<ZelosConfig, Arc<dyn ZeusClient>>,
     blobstore_override: Option<Arc<dyn RepoFactoryOverride<Arc<dyn Blobstore>>>>,
     lease_override: Option<Arc<dyn RepoFactoryOverride<Arc<dyn LeaseOps>>>>,
     scrub_handler: Arc<dyn ScrubHandler>,
@@ -260,9 +299,11 @@ pub struct RepoFactory {
 impl RepoFactory {
     pub fn new(env: Arc<MononokeEnvironment>) -> RepoFactory {
         RepoFactory {
-            sql_factories: RepoFactoryCache::new(),
-            blobstores: RepoFactoryCache::new(),
-            redacted_blobs: RepoFactoryCache::new(),
+            sql_factories: RepoFactoryCache::new(env.fb, "sql_factories"),
+            blobstores: RepoFactoryCache::new(env.fb, "blobstore"),
+            redacted_blobs: RepoFactoryCache::new(env.fb, "redacted_blobs"),
+            #[cfg(fbcode_build)]
+            zelos_clients: RepoFactoryCache::new(env.fb, "zelos_clients"),
             blobstore_override: None,
             lease_override: None,
             scrub_handler: default_scrub_handler(),
@@ -319,7 +360,22 @@ impl RepoFactory {
                     self.env.readonly_storage,
                 )
                 .watched(&self.env.logger)
-                .await?;
+                .await
+                .inspect_err(|e| {
+                    error!(
+                        self.env.logger,
+                        "initializing DB connection failed for config: {:?}: {}", config, e
+                    )
+                })
+                .context("initializing DB connection")?;
+
+                if justknobs::eval("scm/mononoke:log_sql_factory_init", None, None).unwrap_or(false)
+                {
+                    debug!(
+                        self.env.logger,
+                        "initializing DB connection succeeded for config: {:?}", config
+                    )
+                }
                 Ok(Arc::new(sql_factory))
             })
             .await
@@ -331,6 +387,15 @@ impl RepoFactory {
     ) -> Result<T> {
         let sql_factory = self.sql_factory(&config.storage_config.metadata).await?;
         sql_factory.open::<T>().await
+    }
+
+    async fn open_sql_shardable<T: SqlShardableConstructFromMetadataDatabaseConfig>(
+        &self,
+        config: &RepoConfig,
+    ) -> Result<(Arc<MetadataSqlFactory>, T)> {
+        let sql_factory = self.sql_factory(&config.storage_config.metadata).await?;
+        let db = sql_factory.open_shardable::<T>().await?;
+        Ok((sql_factory, db))
     }
 
     async fn blobstore_no_cache(&self, config: &BlobConfig) -> Result<Arc<dyn Blobstore>> {
@@ -472,6 +537,33 @@ impl RepoFactory {
                 }
 
                 Ok(blobstore)
+            })
+            .await
+    }
+
+    #[cfg(fbcode_build)]
+    async fn zelos_client(&self, config: &ZelosConfig) -> Result<Arc<dyn ZeusClient>> {
+        self.zelos_clients
+            .get_or_try_init(config, || async move {
+                let zelos_client = match config {
+                    ZelosConfig::Local { port } => {
+                        ZeusCppClient::zelos_client_for_local_ensemble_reconnecting(*port)
+                            .with_context(|| {
+                                format!("Error creating Local Zeus client on port {}", port)
+                            })?
+                    }
+                    ZelosConfig::Remote { tier } => {
+                        ZeusCppClient::new_reconnecting(self.env.fb, ZEUS_CLIENT_ID, tier)
+                            .with_context(|| {
+                                format!(
+                                    "Error creating Zeus client to {} with client id {}",
+                                    tier, ZEUS_CLIENT_ID
+                                )
+                            })?
+                    }
+                };
+                let zelos_client: Arc<dyn ZeusClient> = Arc::new(zelos_client);
+                Ok(zelos_client)
             })
             .await
     }
@@ -867,17 +959,6 @@ impl RepoFactory {
         }
     }
 
-    pub async fn long_running_requests_queue(
-        &self,
-        repo_config: &ArcRepoConfig,
-    ) -> Result<ArcLongRunningRequestsQueue> {
-        let long_running_requests_queue = self
-            .open_sql::<SqlLongRunningRequestsQueue>(repo_config)
-            .await
-            .context(RepoFactoryError::LongRunningRequestsQueue)?;
-        Ok(Arc::new(long_running_requests_queue))
-    }
-
     pub async fn bonsai_globalrev_mapping(
         &self,
         repo_config: &ArcRepoConfig,
@@ -1022,11 +1103,8 @@ impl RepoFactory {
         repo_config: &ArcRepoConfig,
         repo_identity: &ArcRepoIdentity,
     ) -> Result<ArcFilenodes> {
-        let sql_factory = self
-            .sql_factory(&repo_config.storage_config.metadata)
-            .await?;
-        let mut filenodes_builder = sql_factory
-            .open_shardable::<NewFilenodesBuilder>()
+        let (sql_factory, mut filenodes_builder) = self
+            .open_sql_shardable::<NewFilenodesBuilder>(repo_config)
             .await
             .context(RepoFactoryError::Filenodes)?;
         if let (Some(filenodes_cache_handler_factory), Some(history_cache_handler_factory)) = (
@@ -1237,18 +1315,19 @@ impl RepoFactory {
         #[cfg(fbcode_build)]
         {
             let config = repo_config.derived_data_config.clone();
-            let zelos_config = repo_config.zelos_config.as_ref().ok_or_else(|| {
-                anyhow!("Missing zelos config while trying to construct repo_derivation_queues")
-            })?;
             let lease = self.lease(DERIVED_DATA_LEASE)?;
             let derived_data_scuba = build_scuba(
                 self.env.fb,
                 config.scuba_table.clone(),
                 repo_identity.name(),
             )?;
+            let zelos_config = repo_config.zelos_config.as_ref().ok_or_else(|| {
+                anyhow!("Missing zelos config while trying to construct repo_derivation_queues")
+            })?;
+            let zelos_client = self.zelos_client(zelos_config).await?;
+
             anyhow::Ok(Arc::new(
                 zelos_derivation_queues(
-                    self.env.fb,
                     repo_identity.id(),
                     repo_identity.name().to_string(),
                     commit_graph.clone(),
@@ -1260,7 +1339,7 @@ impl RepoFactory {
                     lease,
                     derived_data_scuba,
                     config,
-                    zelos_config,
+                    zelos_client,
                 )
                 .await?,
             ))
@@ -1272,11 +1351,22 @@ impl RepoFactory {
         &self,
         repo_config: &ArcRepoConfig,
     ) -> Result<ArcSyncedCommitMapping> {
-        Ok(Arc::new(
+        let sql_mapping = Arc::new(
             self.open_sql::<SqlSyncedCommitMappingBuilder>(repo_config)
                 .await?
                 .build(self.env.rendezvous_options),
-        ))
+        );
+        let maybe_cached_mapping: ArcSyncedCommitMapping = if let Some(cache_handler_factory) =
+            self.cache_handler_factory("synced_commit_mapping")?
+        {
+            Arc::new(CachingSyncedCommitMapping::new(
+                sql_mapping,
+                cache_handler_factory,
+            )?)
+        } else {
+            sql_mapping
+        };
+        Ok(maybe_cached_mapping)
     }
 
     /// Cross-repo sync manager for this repo
@@ -1633,7 +1723,9 @@ impl RepoFactory {
             .commit_graph_config
             .preloaded_commit_graph_blobstore_key
         {
-            Some(preloaded_commit_graph_key) => {
+            Some(preloaded_commit_graph_key)
+                if !self.env.commit_graph_options.skip_preloading_commit_graph =>
+            {
                 let blobstore_without_cache = self
                     .repo_blobstore_from_blobstore(
                         repo_identity,
@@ -1656,7 +1748,7 @@ impl RepoFactory {
 
                 Ok(Arc::new(CommitGraph::new(preloaded_commit_graph_storage)))
             }
-            None => Ok(Arc::new(CommitGraph::new(maybe_cached_storage))),
+            _ => Ok(Arc::new(CommitGraph::new(maybe_cached_storage))),
         }
     }
 
@@ -1701,11 +1793,8 @@ impl RepoFactory {
         &self,
         repo_config: &ArcRepoConfig,
     ) -> Result<ArcBonsaiBlobMapping> {
-        let sql_factory = self
-            .sql_factory(&repo_config.storage_config.metadata)
-            .await?;
-        let sql_bonsai_blob_mapping = sql_factory
-            .open_shardable::<SqlBonsaiBlobMapping>()
+        let (_, sql_bonsai_blob_mapping) = self
+            .open_sql_shardable::<SqlBonsaiBlobMapping>(repo_config)
             .await
             .context(RepoFactoryError::BonsaiBlobMapping)?;
         Ok(Arc::new(BonsaiBlobMapping {

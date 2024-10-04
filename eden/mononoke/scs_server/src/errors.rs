@@ -8,6 +8,7 @@
 use std::backtrace::BacktraceStatus;
 use std::error::Error as StdError;
 
+use async_requests::AsyncRequestsError;
 use derived_data_manager::DerivationError;
 use git_types::GitError;
 use megarepo_error::MegarepoError;
@@ -131,6 +132,38 @@ impl From<MegarepoError> for ServiceError {
                 ..Default::default()
             }),
             MegarepoError::InternalError(error) => {
+                let reason = error.to_string();
+                let backtrace = match error.backtrace().status() {
+                    BacktraceStatus::Captured => Some(error.backtrace().to_string()),
+                    _ => None,
+                };
+                let mut source_chain = Vec::new();
+                let mut error: &dyn StdError = &error;
+                while let Some(source) = error.source() {
+                    source_chain.push(source.to_string());
+                    error = source;
+                }
+
+                Self::Internal(thrift::InternalError {
+                    reason,
+                    backtrace,
+                    source_chain,
+                    ..Default::default()
+                })
+            }
+        }
+    }
+}
+
+impl From<AsyncRequestsError> for ServiceError {
+    fn from(e: AsyncRequestsError) -> Self {
+        match e {
+            AsyncRequestsError::RequestError(e) => Self::Request(thrift::RequestError {
+                kind: thrift::RequestErrorKind::INVALID_REQUEST,
+                reason: format!("{}", e),
+                ..Default::default()
+            }),
+            AsyncRequestsError::InternalError(error) => {
                 let reason = error.to_string();
                 let backtrace = match error.backtrace().status() {
                     BacktraceStatus::Captured => Some(error.backtrace().to_string()),
@@ -290,6 +323,8 @@ impl_into_thrift_error!(service::FileInfoExn);
 impl_into_thrift_error!(service::FileContentChunkExn);
 impl_into_thrift_error!(service::FileDiffExn);
 impl_into_thrift_error!(service::CommitLookupXrepoExn);
+impl_into_thrift_error!(service::CreateReposExn);
+impl_into_thrift_error!(service::CreateReposPollExn);
 impl_into_thrift_error!(service::MegarepoAddSyncTargetConfigExn);
 impl_into_thrift_error!(service::MegarepoReadTargetConfigExn);
 impl_into_thrift_error!(service::MegarepoAddSyncTargetExn);
@@ -308,6 +343,10 @@ impl_into_thrift_error!(service::RepoUploadPackfileBaseItemExn);
 impl_into_thrift_error!(service::CreateGitTreeExn);
 impl_into_thrift_error!(service::CreateGitTagExn);
 impl_into_thrift_error!(service::CloudWorkspaceInfoExn);
+impl_into_thrift_error!(service::CloudUserWorkspacesExn);
+impl_into_thrift_error!(service::CloudWorkspaceSmartlogExn);
+impl_into_thrift_error!(service::AsyncPingExn);
+impl_into_thrift_error!(service::AsyncPingPollExn);
 
 pub(crate) fn invalid_request(reason: impl ToString) -> thrift::RequestError {
     thrift::RequestError {

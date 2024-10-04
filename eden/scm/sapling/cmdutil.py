@@ -20,10 +20,11 @@ import stat
 import tempfile
 import typing
 from enum import Enum
-from typing import Dict
+from typing import Dict, List, Optional, Set, Tuple
 
 import bindings
 from bindings import renderdag
+
 from sapling import tracing
 from sapling.ext.extlib.phabricator import PHABRICATOR_COMMIT_MESSAGE_TAGS
 
@@ -209,6 +210,23 @@ debugrevlogopts = [
     ("c", "changelog", False, _("open changelog")),
     ("m", "manifest", False, _("open manifest")),
     ("", "dir", "", _("open directory manifest")),
+]
+
+subtree_path_opts = [
+    (
+        "",
+        "from-path",
+        [],
+        _("the path of source directory or file"),
+        _("PATH"),
+    ),
+    (
+        "",
+        "to-path",
+        [],
+        _("the path of dest directory or file"),
+        _("PATH"),
+    ),
 ]
 
 # special string such that everything below this line will be ingored in the
@@ -502,7 +520,7 @@ def dorecord(ui, repo, commitfunc, cmdsuggest, backupall, filterfn, *pats, **opt
             # 5. finally restore backed-up files
             try:
                 dirstate = repo.dirstate
-                for realname, tmpname in pycompat.iteritems(backups):
+                for realname, tmpname in backups.items():
                     ui.debug("restoring %r to %r\n" % (tmpname, realname))
 
                     if dirstate[realname] == "n":
@@ -1149,7 +1167,6 @@ def makefileobj(
     modemap=None,
     pathname=None,
 ):
-
     writable = mode not in ("r", "rb")
 
     if isstdiofilename(pat):
@@ -1711,9 +1728,6 @@ def tryimportone(ui, repo, hunk, parents, opts, msgs, updatefunc):
             if p2 != parents[1]:
                 repo.setparents(p1.node(), p2.node())
 
-            if opts.get("exact"):
-                repo.dirstate.setbranch(branch or "default")
-
             partial = opts.get("partial", False)
             files = set()
             try:
@@ -1763,10 +1777,6 @@ def tryimportone(ui, repo, hunk, parents, opts, msgs, updatefunc):
                     for idfunc in extrapostimport:
                         extrapostimportmap[idfunc](repo[n])
         else:
-            if opts.get("exact"):
-                branch = branch or "default"
-            else:
-                branch = p1.branch()
             store = patch.filestore()
             try:
                 files = set()
@@ -1788,7 +1798,6 @@ def tryimportone(ui, repo, hunk, parents, opts, msgs, updatefunc):
                     filectxfn=store,
                     user=user,
                     date=date,
-                    branch=branch,
                     editor=editor,
                 )
                 n = memctx.commit()
@@ -1833,7 +1842,6 @@ def _exportsingle(
 
     node = scmutil.binnode(ctx)
     parents = [p.node() for p in ctx.parents() if p]
-    branch = ctx.branch()
     if switch_parent:
         parents.reverse()
 
@@ -1846,8 +1854,6 @@ def _exportsingle(
     writestr("# User %s\n" % ctx.user())
     writestr("# Date %d %d\n" % ctx.date())
     writestr("#      %s\n" % util.datestr(ctx.date()))
-    if branch and branch != "default":
-        writestr("# Branch %s\n" % branch)
     writestr("# Node ID %s\n" % hex(node))
     writestr("# Parent  %s\n" % hex(prev))
     if len(parents) > 1:
@@ -2092,18 +2098,7 @@ class changeset_printer:
                 label=_changesetlabels(ctx),
             )
 
-        # branches are shown first before any other names due to backwards
-        # compatibility
-        branch = ctx.branch()
-        # don't show the default branch name
-        if branch != "default":
-            self.ui.write(columns["branch"] % branch, label="log.branch")
-
-        for nsname, ns in pycompat.iteritems(self.repo.names):
-            # branches has special logic already handled above, so here we just
-            # skip it
-            if nsname == "branches":
-                continue
+        for nsname, ns in self.repo.names.items():
             # we will use the templatename as the color name since those two
             # should be the same
             for name in ns.names(self.repo, changenode):
@@ -2236,7 +2231,7 @@ class jsonchangeset(changeset_printer):
 
         self.ui.write(_x('\n  "rev": %s') % jrev)
         self.ui.write(_x(',\n  "node": %s') % jnode)
-        self.ui.write(_x(',\n  "branch": %s') % j(ctx.branch()))
+        self.ui.write(_x(',\n  "branch": %s') % j("default"))
         self.ui.write(_x(',\n  "phase": "%s"') % ctx.phasestr())
         self.ui.write(_x(',\n  "user": %s') % j(ctx.user()))
         date = ctx.date()
@@ -4075,7 +4070,7 @@ def _amend(ui, repo, wctx, old, extra, opts, matcher):
 
 def commiteditor(repo, ctx, editform="", summaryfooter=""):
     if description := ctx.description():
-        return add_summary_footer(description, summaryfooter)
+        return add_summary_footer(repo.ui, description, summaryfooter)
 
     return commitforceeditor(
         repo,
@@ -4087,24 +4082,36 @@ def commiteditor(repo, ctx, editform="", summaryfooter=""):
 
 
 def add_summary_footer(
+    ui,
     commit_msg: str,
     summary_footer: str,
-    commit_tags: str = PHABRICATOR_COMMIT_MESSAGE_TAGS,
 ) -> str:
     """
-    >>> print(add_summary_footer("", "i am a summary footer"))
+    >>> class FakeUI:
+    ...   def configlist(self, section, key):
+    ...     assert section == "committemplate" and key == "commit-message-fields"
+    ...     return ["Summary", "Test Plan"]
+    ...
+    ...   def config(self, section, key):
+    ...     assert section == "committemplate" and key == "summary-field"
+    ...     return "Summary"
+    ...
+
+    >>> ui = FakeUI()
+    >>> print(add_summary_footer(ui, "", "i am a summary footer"))
     <BLANKLINE>
     i am a summary footer
 
-    >>> print(add_summary_footer("this is a title", ""))
+    >>> print(add_summary_footer(ui, "this is a title", ""))
     this is a title
 
-    >>> print(add_summary_footer("this is a title", "i am a summary footer"))
+    >>> print(add_summary_footer(ui, "this is a title", "i am a summary footer"))
     this is a title
     <BLANKLINE>
     i am a summary footer
 
     >>> print(add_summary_footer(
+    ...   ui,
     ...   "this is a title\\n\\nSummary: I am a summary",
     ...   "i am a summary footer"
     ... ))
@@ -4115,6 +4122,7 @@ def add_summary_footer(
     i am a summary footer
 
     >>> print(add_summary_footer(
+    ...   ui,
     ...   "this is a title\\n\\nSummary: I am a summary\\n\\nTest Plan: I am a test plan",
     ...   "i am a summary footer"
     ... ))
@@ -4129,32 +4137,118 @@ def add_summary_footer(
     if not summary_footer:
         return commit_msg
 
+    commit_fields = set(ui.configlist("committemplate", "commit-message-fields"))
+    summary_field = ui.config("committemplate", "summary-field")
+
     lines = commit_msg.split("\n")
-    prev_tag = None
-    insert_idx = len(lines)
-    for i, line in enumerate(lines):
+    field_content_list = _parse_commit_message(lines, commit_fields)
+
+    # defaults to the last field
+    summary_index = len(field_content_list) - 1
+    summary_content = field_content_list[summary_index][1]
+    for i, (field, content) in enumerate(field_content_list):
+        if field == summary_field:
+            summary_index, summary_content = i, content
+            break
+
+    if summary_content[-1]:
+        summary_content.append("")
+    summary_content.append(summary_footer)
+    if summary_index < len(field_content_list) - 1:
+        summary_content.append("")
+
+    return "\n".join(
+        line for (_field, content) in field_content_list for line in content
+    )
+
+
+def extract_summary(ui, message: str) -> str:
+    """Extract summary (including title) of a commit message.
+
+    >>> class FakeUI:
+    ...   def configlist(self, section, key):
+    ...     assert section == "committemplate" and key == "commit-message-fields"
+    ...     return ["Summary", "Test Plan"]
+    ...
+    ...   def config(self, section, key):
+    ...     assert section == "committemplate" and key == "summary-field"
+    ...     return "Summary"
+    ...
+
+    >>> ui = FakeUI()
+
+    >>> print(extract_summary(ui, "this is a title"))
+    this is a title
+
+    >>> print(extract_summary(
+    ...   ui,
+    ...   "this is a title\\n\\nSummary: I am a summary"
+    ... ))
+    this is a title
+    <BLANKLINE>
+    Summary: I am a summary
+
+    >>> print(extract_summary(
+    ...   ui,
+    ...   "this is a title\\n\\nSummary: I am a summary\\n\\nTest Plan: I am a test plan",
+    ... ))
+    this is a title
+    <BLANKLINE>
+    Summary: I am a summary
+    """
+    commit_fields = set(ui.configlist("committemplate", "commit-message-fields"))
+    summary_field = ui.config("committemplate", "summary-field")
+    lines = message.split("\n")
+    field_content_list = _parse_commit_message(lines, commit_fields)
+
+    new_lines = []
+    for field, content in field_content_list:
+        new_lines.extend(content)
+        if field == summary_field:
+            break
+    while new_lines and not new_lines[-1]:
+        new_lines.pop()
+    return "\n".join(new_lines)
+
+
+def _parse_commit_message(
+    lines: List[str], commit_fields: Set[str]
+) -> List[Tuple[Optional[str], List[str]]]:
+    """Parse commit message lines and return list of (field, content_lines) pairs.
+
+    >>> _parse_commit_message(["this is a title"], {"Summary"})
+    [(None, ['this is a title'])]
+    >>> _parse_commit_message(
+    ...   ['this is a title', '', 'Summary: I am a summary'],
+    ...   {'Summary', 'Test Plan'},
+    ... )
+    [(None, ['this is a title', '']), ('Summary', ['Summary: I am a summary'])]
+    >>> _parse_commit_message(
+    ...   ["this is a title", "", "Summary: I am a summary", "", "Test Plan: I am a test plan"],
+    ...   {"Summary", "Test Plan"},
+    ... )
+    [(None, ['this is a title', '']), ('Summary', ['Summary: I am a summary', '']), ('Test Plan', ['Test Plan: I am a test plan'])]
+    """
+    result = []
+    curr_key, curr_content = None, []
+    for line in lines:
         try:
-            tag = line[: line.index(":")]
+            key = line[: line.index(":")]
         except ValueError:
             # not found ":"
+            curr_content.append(line)
             continue
 
-        if tag in commit_tags:
-            if prev_tag == "Summary":
-                # found a tag after summary
-                insert_idx = i
-                break
-            prev_tag = tag
+        if key in commit_fields:
+            if curr_content:
+                result.append((curr_key, curr_content))
+            curr_key, curr_content = key, [line]
+        else:
+            curr_content.append(line)
 
-    new_lines = lines[:insert_idx]
-    if new_lines[-1]:
-        new_lines.append("")
-    new_lines.append(summary_footer)
-    if insert_idx < len(lines):
-        new_lines.append("")
-    new_lines.extend(lines[insert_idx:])
-
-    return "\n".join(new_lines)
+    if curr_content:
+        result.append((curr_key, curr_content))
+    return result
 
 
 def commitforceeditor(
@@ -4290,7 +4384,7 @@ def buildcommittext(repo, ctx, summaryfooter=""):
     edittext = []
     modified, added, removed = ctx.modified(), ctx.added(), ctx.removed()
     description = ctx.description()
-    edittext.append(add_summary_footer(description, summaryfooter))
+    edittext.append(add_summary_footer(repo.ui, description, summaryfooter))
     if edittext[-1]:
         edittext.append("")
     edittext.append("")  # Empty line between message and comments.
@@ -4307,8 +4401,6 @@ def buildcommittext(repo, ctx, summaryfooter=""):
     edittext.append(hgprefix(_("user: %s") % ctx.user()))
     if ctx.p2():
         edittext.append(hgprefix(_("branch merge")))
-    if ctx.branch():
-        edittext.append(hgprefix(_("branch '%s'") % ctx.branch()))
     if bookmarks.isactivewdirparent(repo):
         edittext.append(hgprefix(_("bookmark '%s'") % repo._activebookmark))
     edittext.extend([hgprefix(_("added %s") % f) for f in added])
@@ -4321,16 +4413,10 @@ def buildcommittext(repo, ctx, summaryfooter=""):
     return "\n".join(edittext)
 
 
-def commitstatus(repo, node, branch, opts=None):
+def commitstatus(repo, node, opts=None):
     if opts is None:
         opts = {}
     ctx = repo[node]
-    parents = ctx.parents()
-
-    if not opts.get("close_branch"):
-        for r in parents:
-            if r.closesbranch() and r.branch() == branch:
-                repo.ui.status(_("reopening closed branch head %d\n") % r)
 
     if repo.ui.debugflag:
         repo.ui.write(_("committed %s\n") % (ctx.hex()))
@@ -4751,7 +4837,6 @@ def _performrevert(
         originalchunks = patch.parsepatch(diff)
 
         try:
-
             chunks, opts = recordfilter(repo.ui, originalchunks, operation=operation)
             if reversehunks:
                 chunks = patch.reversehunks(chunks)
@@ -4859,7 +4944,7 @@ def howtocontinue(repo):
     for f, msg in afterresolvedstates:
         if repo.localvfs.exists(f):
             return contmsg % msg, True
-    if repo[None].dirty(missing=True, merge=False, branch=False):
+    if repo[None].dirty(missing=True, merge=False):
         return contmsg % _("@prog@ commit"), False
     return None, None
 

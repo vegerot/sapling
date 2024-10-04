@@ -7,7 +7,7 @@
 # Setup Mononoke
   $ . "${TEST_FIXTURES}/library.sh"
   $ GIT_REPO="${TESTTMP}/repo-git"
-  $ HG_REPO="${TESTTMP}/repo-hg"
+  $ HG_REPO="${TESTTMP}/repo"
   $ setup_common_config
 
 # Setup git repo without LFS
@@ -28,13 +28,6 @@
 # Setup a matching hg repo, and import it
   $ hg init "$HG_REPO"
   $ cd "$HG_REPO"
-  $ cat >> .hg/hgrc <<EOF
-  > [extensions]
-  > treemanifest=!
-  > treemanifestserver=
-  > [treemanifest]
-  > server=True
-  > EOF
   $ echo "this is file1" > file1
   $ hg add file1
   $ mkdir dir

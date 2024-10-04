@@ -12,6 +12,7 @@ use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
+use base64::Engine;
 use blake3::Hasher as Blake3Hasher;
 use blobstore::Blobstore;
 use blobstore::BlobstoreBytes;
@@ -26,8 +27,8 @@ use futures::stream::BoxStream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures_ext::FbStreamExt;
-use manifest::AsyncManifest;
 use manifest::Entry;
+use manifest::Manifest;
 use mononoke_types::hash::Blake2;
 use mononoke_types::hash::Blake3;
 use mononoke_types::hash::Sha1;
@@ -294,7 +295,11 @@ impl ShardedHgAugmentedManifest {
             w.write_all(file.content_sha1.to_hex().as_bytes())?;
             w.write_all(b" ")?;
             if let Some(file_header_metadata) = &file.file_header_metadata {
-                w.write_all(base64::encode(file_header_metadata).as_ref())?;
+                w.write_all(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(file_header_metadata)
+                        .as_ref(),
+                )?;
             } else {
                 w.write_all(b"-")?;
             }
@@ -699,10 +704,10 @@ fn convert_hg_augmented_manifest_entry(
 }
 
 #[async_trait]
-impl<Store: Blobstore> AsyncManifest<Store> for HgAugmentedManifestEnvelope {
+impl<Store: Blobstore> Manifest<Store> for HgAugmentedManifestEnvelope {
     type TreeId = HgAugmentedManifestId;
 
-    type LeafId = HgAugmentedFileLeafNode;
+    type Leaf = HgAugmentedFileLeafNode;
 
     type TrieMapType = LoadableShardedMapV2Node<HgAugmentedManifestEntry>;
 
@@ -710,7 +715,7 @@ impl<Store: Blobstore> AsyncManifest<Store> for HgAugmentedManifestEnvelope {
         &self,
         ctx: &CoreContext,
         blobstore: &Store,
-    ) -> Result<BoxStream<'async_trait, Result<(MPathElement, Entry<Self::TreeId, Self::LeafId>)>>>
+    ) -> Result<BoxStream<'async_trait, Result<(MPathElement, Entry<Self::TreeId, Self::Leaf>)>>>
     {
         anyhow::Ok(
             self.augmented_manifest
@@ -726,7 +731,7 @@ impl<Store: Blobstore> AsyncManifest<Store> for HgAugmentedManifestEnvelope {
         ctx: &CoreContext,
         blobstore: &Store,
         prefix: &[u8],
-    ) -> Result<BoxStream<'async_trait, Result<(MPathElement, Entry<Self::TreeId, Self::LeafId>)>>>
+    ) -> Result<BoxStream<'async_trait, Result<(MPathElement, Entry<Self::TreeId, Self::Leaf>)>>>
     {
         anyhow::Ok(
             self.augmented_manifest
@@ -743,7 +748,7 @@ impl<Store: Blobstore> AsyncManifest<Store> for HgAugmentedManifestEnvelope {
         blobstore: &Store,
         prefix: &[u8],
         after: &[u8],
-    ) -> Result<BoxStream<'async_trait, Result<(MPathElement, Entry<Self::TreeId, Self::LeafId>)>>>
+    ) -> Result<BoxStream<'async_trait, Result<(MPathElement, Entry<Self::TreeId, Self::Leaf>)>>>
     {
         anyhow::Ok(
             self.augmented_manifest
@@ -759,7 +764,7 @@ impl<Store: Blobstore> AsyncManifest<Store> for HgAugmentedManifestEnvelope {
         ctx: &CoreContext,
         blobstore: &Store,
         skip: usize,
-    ) -> Result<BoxStream<'async_trait, Result<(MPathElement, Entry<Self::TreeId, Self::LeafId>)>>>
+    ) -> Result<BoxStream<'async_trait, Result<(MPathElement, Entry<Self::TreeId, Self::Leaf>)>>>
     {
         anyhow::Ok(
             self.augmented_manifest
@@ -775,7 +780,7 @@ impl<Store: Blobstore> AsyncManifest<Store> for HgAugmentedManifestEnvelope {
         ctx: &CoreContext,
         blobstore: &Store,
         name: &MPathElement,
-    ) -> Result<Option<Entry<Self::TreeId, Self::LeafId>>> {
+    ) -> Result<Option<Entry<Self::TreeId, Self::Leaf>>> {
         Ok(self
             .augmented_manifest
             .lookup(ctx, blobstore, name)
@@ -807,6 +812,7 @@ mod sharded_augmented_manifest_tests {
     use filestore::FilestoreConfig;
     use fixtures::Linear;
     use fixtures::TestRepoFixture;
+    use mononoke_macros::mononoke;
     use repo_blobstore::RepoBlobstore;
     use repo_blobstore::RepoBlobstoreArc;
     use repo_derived_data::RepoDerivedData;
@@ -878,7 +884,7 @@ mod sharded_augmented_manifest_tests {
         Sha1::from_byte_array([0x44; 20])
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_serialize_augmented_manifest(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
         let blobrepo: TestRepo = Linear::get_repo(fb).await;

@@ -253,7 +253,7 @@ impl<'a, R: MononokeRepo> ChangeTargetConfig<'a, R> {
                 &target_repo,
                 &diff,
                 &changesets_to_merge,
-                new_config.version.clone(),
+                &new_config,
                 message.clone(),
                 self.mutable_renames,
                 target.bookmark.to_owned(),
@@ -284,7 +284,7 @@ impl<'a, R: MononokeRepo> ChangeTargetConfig<'a, R> {
                 &additions_merge,
                 old_target_cs,
                 &new_remapping_state,
-                Some(new_config.version),
+                Some(&new_config),
             )
             .await?;
         let mut scuba = ctx.scuba().clone();
@@ -331,7 +331,7 @@ impl<'a, R: MononokeRepo> ChangeTargetConfig<'a, R> {
         repo: &RepoContext<R>,
         diff: &SyncTargetConfigChanges,
         changesets_to_merge: &BTreeMap<SourceName, ChangesetId>,
-        sync_config_version: SyncConfigVersion,
+        sync_target_config: &SyncTargetConfig,
         message: Option<String>,
         mutable_renames: &Arc<MutableRenames>,
         bookmark: String,
@@ -366,7 +366,7 @@ impl<'a, R: MononokeRepo> ChangeTargetConfig<'a, R> {
                 repo.repo(),
                 moved_commits,
                 false, /* write_commit_remapping_state */
-                sync_config_version,
+                sync_target_config,
                 message,
                 bookmark,
             )
@@ -421,6 +421,7 @@ mod test {
     use anyhow::Error;
     use maplit::btreemap;
     use megarepo_config::Target;
+    use mononoke_macros::mononoke;
     use mononoke_types::RepositoryId;
     use mononoke_types_mocks::changesetid::ONES_CSID;
     use mononoke_types_mocks::changesetid::THREES_CSID;
@@ -436,7 +437,7 @@ mod test {
             .collect()
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_diff_configs() -> Result<(), Error> {
         let repo_id = RepositoryId::new(1);
         let target = Target {

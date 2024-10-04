@@ -52,7 +52,7 @@ use commit_graph::CommitGraphArc;
 use commit_graph::CommitGraphRef;
 use commit_graph::CommitGraphWriter;
 use context::CoreContext;
-use cross_repo_sync::get_all_submodule_deps;
+use cross_repo_sync::get_all_submodule_deps_from_repo_pair;
 use cross_repo_sync::get_small_and_large_repos;
 use cross_repo_sync::CandidateSelectionHint;
 use cross_repo_sync::CommitSyncContext;
@@ -334,6 +334,7 @@ async fn maybe_push_redirector<R: MononokeRepo>(
     let enabled = live_commit_sync_config
         .push_redirector_enabled_for_public(ctx, repo.repo_identity().id())
         .await?;
+
     if enabled {
         let large_repo_id = base.common_commit_sync_config.large_repo_id;
         let large_repo = repos.get_by_id(large_repo_id.id()).ok_or_else(|| {
@@ -346,11 +347,7 @@ async fn maybe_push_redirector<R: MononokeRepo>(
                 base.synced_commit_mapping.clone(),
                 base.target_repo_dbs.clone(),
             )
-            .into_push_redirector(
-                ctx,
-                live_commit_sync_config.clone(),
-                repo.repo_cross_repo().sync_lease().clone(),
-            )
+            .into_push_redirector(ctx, live_commit_sync_config.clone())
             .map_err(|e| MononokeError::InvalidRequest(e.to_string()))?,
         ))
     } else {
@@ -1529,29 +1526,13 @@ impl<R: MononokeRepo> RepoContext<R> {
     where
         R: Clone,
     {
-        let common_config = self
-            .live_commit_sync_config()
-            .get_common_config(self.repo().repo_identity().id())
-            .map_err(|e| {
-                MononokeError::InvalidRequest(format!(
-                    "Commits from {} are not configured to be remapped to another repo: {}",
-                    self.name(),
-                    e
-                ))
-            })?;
-
         let candidate_selection_hint: CandidateSelectionHint<R> = self
             .build_candidate_selection_hint(maybe_candidate_selection_hint_args, other)
             .await?;
 
         let (_small_repo, _large_repo) =
-            get_small_and_large_repos(self.repo.as_ref(), other.repo.as_ref(), &common_config)?;
+            get_small_and_large_repos(self.repo.as_ref(), other.repo.as_ref())?;
 
-        let live_commit_sync_config = self
-            .repo
-            .repo_cross_repo()
-            .live_commit_sync_config()
-            .clone();
         let repo_provider: RepoProvider<'a, R> = Arc::new(move |repo_id| {
             Box::pin({
                 let repos = self.repos.clone();
@@ -1565,34 +1546,24 @@ impl<R: MononokeRepo> RepoContext<R> {
             })
         });
 
-        let submodule_deps = get_all_submodule_deps(
+        let submodule_deps = get_all_submodule_deps_from_repo_pair(
             &self.ctx,
             self.repo.clone(),
             other.repo.clone(),
             repo_provider,
-            live_commit_sync_config,
         )
         .await?;
 
-        let commit_sync_repos = CommitSyncRepos::new(
-            self.repo().clone(),
-            other.repo().clone(),
-            submodule_deps,
-            &common_config,
-        )?;
+        let commit_sync_repos =
+            CommitSyncRepos::new(self.repo().clone(), other.repo().clone(), submodule_deps)?;
 
         let specifier = specifier.into();
         let changeset = self.resolve_specifier(specifier).await?.ok_or_else(|| {
             MononokeError::InvalidRequest(format!("unknown commit specifier {}", specifier))
         })?;
 
-        let commit_syncer = CommitSyncer::new(
-            &self.ctx,
-            self.synced_commit_mapping().clone(),
-            commit_sync_repos,
-            self.live_commit_sync_config(),
-            self.repo.repo_cross_repo().sync_lease().clone(),
-        );
+        let commit_syncer =
+            CommitSyncer::new(&self.ctx, commit_sync_repos, self.live_commit_sync_config());
 
         if sync_behaviour == XRepoLookupSyncBehaviour::SyncIfAbsent {
             let _ = commit_syncer

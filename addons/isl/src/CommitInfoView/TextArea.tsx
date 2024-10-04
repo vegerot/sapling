@@ -16,8 +16,9 @@ import {
 } from '../ImageUpload';
 import {Internal} from '../Internal';
 import {insertAtCursor} from '../textareaUtils';
-import {GenerateAICommitMessageButton} from './GenerateWithAI';
+import {GenerateAIButton} from './GenerateWithAI';
 import {MinHeightTextField} from './MinHeightTextField';
+import {convertFieldNameToKey} from './utils';
 import {TextArea} from 'isl-components/TextArea';
 import {useRef, useEffect} from 'react';
 
@@ -71,7 +72,7 @@ export function CommitInfoTextArea({
 
   const uploadFiles = useUploadFilesCallback(name, ref, onInput);
 
-  const fieldKey = name.toLowerCase().replace(/\s/g, '-');
+  const fieldKey = convertFieldNameToKey(name);
 
   const rendered = (
     <div className="commit-info-field">
@@ -141,9 +142,10 @@ export function EditorToolbar({
   }
   if (supportsGeneratingAIMessage != null) {
     parts.push(
-      <GenerateAICommitMessageButton
+      <GenerateAIButton
         textAreaRef={textAreaRef}
         appendToTextArea={appendToTextArea}
+        fieldName={fieldName}
         key="gen-ai-message"
       />,
     );

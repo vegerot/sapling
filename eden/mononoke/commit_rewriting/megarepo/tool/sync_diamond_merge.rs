@@ -23,7 +23,6 @@ use blobstore::Loadable;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
-use cacheblob::LeaseOps;
 use cloned::cloned;
 use commit_graph::CommitGraphRef;
 use commit_transformation::upload_commits;
@@ -57,13 +56,13 @@ use metaconfig_types::CommitSyncConfigVersion;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::FileChange;
+use mononoke_types::FileType;
 use mononoke_types::NonRootMPath;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_identity::RepoIdentityRef;
 use slog::info;
 use slog::warn;
 use sorted_vector_map::SortedVectorMap;
-use synced_commit_mapping::SqlSyncedCommitMapping;
 
 use crate::Repo;
 
@@ -118,10 +117,8 @@ pub async fn do_sync_diamond_merge(
     large_repo: &Repo,
     submodule_deps: SubmoduleDeps<Repo>,
     small_merge_cs_id: ChangesetId,
-    mapping: SqlSyncedCommitMapping,
     onto_bookmark: BookmarkKey,
     live_commit_sync_config: Arc<dyn LiveCommitSyncConfig>,
-    lease: Arc<dyn LeaseOps>,
 ) -> Result<(), Error> {
     info!(
         ctx.logger(),
@@ -142,9 +139,7 @@ pub async fn do_sync_diamond_merge(
         small_repo.clone(),
         large_repo.clone(),
         submodule_deps,
-        mapping,
         live_commit_sync_config,
-        lease,
     )?;
 
     let small_root = find_root(&new_branch)?;
@@ -239,7 +234,7 @@ async fn create_rewritten_merge_commit(
     small_merge_cs_id: ChangesetId,
     small_repo: &Repo,
     large_repo: &Repo,
-    syncers: &Syncers<SqlSyncedCommitMapping, Repo>,
+    syncers: &Syncers<Repo>,
     small_root: ChangesetId,
     onto_value: ChangesetId,
 ) -> Result<(BonsaiChangeset, CommitSyncConfigVersion), Error> {
@@ -356,7 +351,7 @@ async fn generate_additional_file_changes(
     ctx: CoreContext,
     root: ChangesetId,
     large_repo: &Repo,
-    large_to_small: &CommitSyncer<SqlSyncedCommitMapping, Repo>,
+    large_to_small: &CommitSyncer<Repo>,
     onto_value: ChangesetId,
     version: &CommitSyncConfigVersion,
 ) -> Result<SortedVectorMap<NonRootMPath, FileChange>, Error> {
@@ -366,16 +361,10 @@ async fn generate_additional_file_changes(
 
     let additional_file_changes = FuturesUnordered::new();
     for diff_res in bonsai_diff {
-        match diff_res {
-            BonsaiDiffFileChange::Changed(ref path, ..)
-            | BonsaiDiffFileChange::ChangedReusedId(ref path, ..)
-            | BonsaiDiffFileChange::Deleted(ref path) => {
-                let mover = large_to_small.get_movers_by_version(version).await?.mover;
-                let maybe_new_path = mover(path)?;
-                if maybe_new_path.is_some() {
-                    continue;
-                }
-            }
+        let mover = large_to_small.get_movers_by_version(version).await?.mover;
+        let maybe_new_path = mover(diff_res.path())?;
+        if maybe_new_path.is_some() {
+            continue;
         }
 
         let fc = convert_diff_result_into_file_change_for_diamond_merge(&ctx, large_repo, diff_res);
@@ -389,7 +378,7 @@ async fn generate_additional_file_changes(
 
 async fn remap_commit(
     ctx: CoreContext,
-    small_to_large_commit_syncer: &CommitSyncer<SqlSyncedCommitMapping, Repo>,
+    small_to_large_commit_syncer: &CommitSyncer<Repo>,
     cs_id: ChangesetId,
 ) -> Result<(ChangesetId, CommitSyncConfigVersion), Error> {
     let maybe_sync_outcome = small_to_large_commit_syncer
@@ -489,7 +478,7 @@ fn find_bonsai_diff(
     repo: &Repo,
     ancestor: ChangesetId,
     descendant: ChangesetId,
-) -> BoxStream<'static, Result<BonsaiDiffFileChange<HgFileNodeId>, Error>> {
+) -> BoxStream<'static, Result<BonsaiDiffFileChange<(FileType, HgFileNodeId)>, Error>> {
     stream::once({
         cloned!(ctx, repo);
         async move {

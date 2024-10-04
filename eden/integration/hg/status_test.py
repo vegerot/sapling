@@ -140,6 +140,9 @@ class StatusTest(EdenHgTestCase):
             self.touch("new_tracked.txt")
 
             self.hg("add", "new_tracked.txt")
+            client.synchronizeWorkingCopy(
+                self.mount.encode("utf-8"), SynchronizeWorkingCopyParams()
+            )
 
             # `hg add` would trigger a call to getScmStatusV2
             if enable_status_cache:
@@ -148,6 +151,9 @@ class StatusTest(EdenHgTestCase):
                 self.counter_check(client, miss_cnt=0, hit_cnt=0)
 
             self.touch("untracked.txt")
+            client.synchronizeWorkingCopy(
+                self.mount.encode("utf-8"), SynchronizeWorkingCopyParams()
+            )
             expected_entries = {
                 b"hello.txt": ScmFileStatus.MODIFIED,
                 b"new_tracked.txt": ScmFileStatus.ADDED,
@@ -319,14 +325,6 @@ class StatusTest(EdenHgTestCase):
         client.reloadConfig()
 
     def counter_check(self, client, miss_cnt, hit_cnt) -> None:
-        if self.enable_status_cache and sys.platform == "win32":
-            # currently we are not filtering out file changes under ".hg/"
-            # somehow the cache counters can be impacted by file
-            # changes under ".hg/"
-            # before that, let's skip the counter check for now
-            # TODO: remove this once we ignore the changes under ".hg/" reported by Journal
-            return
-
         timeout_seconds = 2.0
         poll_interval_seconds = 0.1
         deadline = time.monotonic() + timeout_seconds
@@ -396,8 +394,9 @@ class StatusTest(EdenHgTestCase):
             second_commit = self.repo.commit("adding world")
             # `commit` method would internally call getStatus twice
             # against the old commit with listIgnoired=False.
-            # This adds 2 to the miss count because .hg changes advance the Journal sequence
-            miss_cnt += 2
+            # but these two calls won't return new entries since there are
+            # only changes under .hg folder
+            hit_cnt += 2
             self.counter_check(client, miss_cnt=miss_cnt, hit_cnt=hit_cnt)
 
             def verify_status(commit, listIgnored, expect_status) -> None:
@@ -555,6 +554,9 @@ class StatusTest(EdenHgTestCase):
 
         with self.get_thrift_client_legacy() as client:
             self.touch("world.txt")
+            client.synchronizeWorkingCopy(
+                self.mount.encode("utf-8"), SynchronizeWorkingCopyParams()
+            )
             client.injectFault(
                 FaultDefinition(
                     keyClass="scmStatusCache",

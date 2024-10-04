@@ -5,6 +5,7 @@ oncall("mononoke")
 rust_library(
     name = "import_tools",
     srcs = glob(["src/**/*.rs"]),
+    test_deps = ["//eden/mononoke/mononoke_macros:mononoke_macros"],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-trait",
@@ -24,6 +25,7 @@ rust_library(
         "fbsource//third-party/rust:slog",
         "fbsource//third-party/rust:smallvec",
         "fbsource//third-party/rust:tokio",
+        "//common/rust/shed/borrowed:borrowed",
         "//common/rust/shed/cloned:cloned",
         "//common/rust/shed/futures_stats:futures_stats",
         "//common/rust/shed/sorted_vector_map:sorted_vector_map",
@@ -35,6 +37,7 @@ rust_library(
         "//eden/mononoke/bookmarks:bookmarks_movement",
         "//eden/mononoke/changesets/changesets_creation:changesets_creation",
         "//eden/mononoke/cmdlib/mononoke_app/tls:tls",
+        "//eden/mononoke/common/retry:retry",
         "//eden/mononoke/derived_data:bulk_derivation",
         "//eden/mononoke/derived_data:derived_data_manager",
         "//eden/mononoke/filestore:filestore",

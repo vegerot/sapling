@@ -1,9 +1,9 @@
 #modern-config-incompatible
+#inprocess-hg-incompatible
 
 #require no-eden
 
   $ setconfig devel.segmented-changelog-rev-compat=true
-  $ setconfig experimental.allowfilepeer=True
 
   $ configure modern
   $ showgraph() {

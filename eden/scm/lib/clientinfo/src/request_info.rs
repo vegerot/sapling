@@ -18,6 +18,8 @@ use rand::Rng;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::log_cross_environment_session_id;
+
 pub const ENV_SAPLING_CLIENT_ENTRY_POINT: &str = "SAPLING_CLIENT_ENTRY_POINT";
 pub const ENV_SAPLING_CLIENT_CORRELATOR: &str = "SAPLING_CLIENT_CORRELATOR";
 
@@ -77,6 +79,7 @@ fn new_client_request_info() -> ClientRequestInfo {
 
     tracing::info!(target: "clienttelemetry", client_entry_point=entry_point.to_string());
     tracing::info!(target: "clienttelemetry", client_correlator=correlator);
+    log_cross_environment_session_id();
 
     ClientRequestInfo::new_ext(entry_point, correlator)
 }
@@ -109,6 +112,7 @@ pub struct ClientRequestInfo {
 
 #[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
 pub enum ClientEntryPoint {
+    Unknown,
     Sapling,
     EdenFs,
     Fbclone,
@@ -197,6 +201,7 @@ impl ClientRequestInfo {
 impl Display for ClientEntryPoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let out = match self {
+            ClientEntryPoint::Unknown => "unknown",
             ClientEntryPoint::Sapling => "sapling",
             ClientEntryPoint::EdenFs => "edenfs",
             ClientEntryPoint::Fbclone => "fbclone",

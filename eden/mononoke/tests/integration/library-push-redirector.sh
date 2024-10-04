@@ -10,12 +10,12 @@
 function verify_wc() {
    local large_repo_commit
    large_repo_commit="$1"
-   "$MONONOKE_ADMIN" \
+   "$MONONOKE_NEWADMIN" \
      "${CACHE_ARGS[@]}" \
      "${COMMON_ARGS[@]}" --log-level ERROR \
      --mononoke-config-path  "$TESTTMP"/mononoke-config \
-     --source-repo-id="$REPOIDLARGE" --target-repo-id="$REPOIDSMALL" \
-     crossrepo verify-wc "$large_repo_commit"
+     cross-repo --source-repo-id="$REPOIDLARGE" --target-repo-id="$REPOIDSMALL" \
+     verify-working-copy "$large_repo_commit"
 }
 
 function validate_commit_sync() {
@@ -573,12 +573,12 @@ function init_large_small_repo() {
 
 function init_local_large_small_clones {
   cd "$TESTTMP" || exit 1
-  REPONAME=small-mon hgmn_clone "mononoke://$(mononoke_address)/small-mon" small-hg-client --config extensions.remotenames=
+  hg clone -q mono:small-mon small-hg-client
   cat >> small-hg-client/.hg/hgrc <<EOF
 [extensions]
 pushrebase =
 EOF
-  REPONAME=large-mon hgmn_clone "mononoke://$(mononoke_address)/large-mon" large-hg-client --config extensions.remotenames=
+  hg clone -q mono:large-mon large-hg-client
   cat >> large-hg-client/.hg/hgrc <<EOF
 [extensions]
 pushrebase =
@@ -609,12 +609,11 @@ function create_first_post_move_commit {
 
 function init_client() {
   cd "$TESTTMP" || exit 1
-  hgclone_treemanifest ssh://user@dummy/"$1" "$2" --noupdate --config extensions.remotenames=
+  hg clone -q mono:"$1" "$2" --noupdate
   cd "$TESTTMP/$2" || exit 1
   cat >> .hg/hgrc <<EOF
 [extensions]
 pushrebase =
-remotenames =
 EOF
 }
 
@@ -715,8 +714,8 @@ EOF
 
   # init fbsource
   cd "$TESTTMP" || exit 1
-  hginit_treemanifest fbs-hg-srv
-  cd fbs-hg-srv || exit 1
+  hginit_treemanifest fbs-mon
+  cd fbs-mon || exit 1
   # create an initial commit, which will be the last_synced_commit
   createfile fbcode/fbcodefile_fbsource
   createfile arvr/arvrfile_fbsource
@@ -724,8 +723,8 @@ EOF
   hg -q ci -m "fbsource commit 1" && hg book -ir . "${MASTER_BOOKMARK:-master_bookmark}"
   # init ovrsource
   cd "$TESTTMP" || exit 1
-  hginit_treemanifest ovr-hg-srv
-  cd ovr-hg-srv || exit 1
+  hginit_treemanifest ovr-mon
+  cd ovr-mon || exit 1
   createfile fbcode/fbcodefile_ovrsource
   createfile arvr/arvrfile_ovrsource
   createfile otherfile_ovrsource
@@ -733,8 +732,8 @@ EOF
   hg -q ci -m "ovrsource commit 1" && hg book -r . "${MASTER_BOOKMARK:-master_bookmark}"
   # init megarepo - note that some paths are shifted, but content stays the same
   cd "$TESTTMP" || exit 1
-  hginit_treemanifest meg-hg-srv
-  cd meg-hg-srv || exit 1
+  hginit_treemanifest meg-mon
+  cd meg-mon || exit 1
   createfile fbcode/fbcodefile_fbsource
   createfile_with_content .fbsource-rest/arvr/arvrfile_fbsource arvr/arvrfile_fbsource
   createfile otherfile_fbsource
@@ -746,31 +745,12 @@ EOF
   hg book -r . "${MASTER_BOOKMARK:-master_bookmark}"
   # blobimport hg servers repos into Mononoke repos
   cd "$TESTTMP" || exit 1
-  REPOID=0 blobimport meg-hg-srv/.hg meg-mon
-  REPOID=1 blobimport fbs-hg-srv/.hg fbs-mon
-  REPOID=2 blobimport ovr-hg-srv/.hg ovr-mon
+  REPOID=0 blobimport meg-mon/.hg meg-mon
+  REPOID=1 blobimport fbs-mon/.hg fbs-mon
+  REPOID=2 blobimport ovr-mon/.hg ovr-mon
 }
 
 function enable_pushredirect {
-  local repo_id=$1
-  local draft_push=${2:-false}
-  local public_push=${3:-true}
-
-  cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-{
-  "per_repo": {
-    "$repo_id": {
-      "draft_push": $draft_push,
-      "public_push": $public_push
-    }
-  }
-}
-EOF
-
-  enable_pushredirect_xdb "$repo_id" "$draft_push" "$public_push"
-}
-
-function enable_pushredirect_xdb {
   local repo_id=$1
   local draft_push=${2:-false}
   local public_push=${3:-true}
@@ -787,13 +767,6 @@ function enable_pushredirect_xdb {
 
 function reset_pushredirect {
   local repo_id=$1
-
-  cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-{
-  "per_repo": {
-  }
-}
-EOF
 
   sqlite3 "$TESTTMP/monsql/sqlite_dbs" <<EOF
     DELETE from pushredirect;

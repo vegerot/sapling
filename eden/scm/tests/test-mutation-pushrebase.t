@@ -1,9 +1,8 @@
 #modern-config-incompatible
-#modern-config-incompatible
+#inprocess-hg-incompatible
 
 #require no-eden
 
-  $ setconfig experimental.allowfilepeer=True
 
   $ configure dummyssh
   $ enable pushrebase amend remotenames

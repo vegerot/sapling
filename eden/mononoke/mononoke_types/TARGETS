@@ -1,5 +1,4 @@
 load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("mononoke")
 
@@ -17,6 +16,7 @@ rust_library(
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/fbinit:fbinit-tokio",
         "//eden/mononoke/blobstore:memblob",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
     ],
     deps = [
         "fbsource//third-party/rust:abomonation",
@@ -49,6 +49,7 @@ rust_library(
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:vec_map",
         "//common/rust/shed/borrowed:borrowed",
+        "//common/rust/shed/cloned:cloned",
         "//common/rust/shed/quickcheck_arbitrary_derive:quickcheck_arbitrary_derive",
         "//common/rust/shed/sorted_vector_map:sorted_vector_map",
         "//common/rust/shed/sql:sql",
@@ -71,6 +72,7 @@ rust_library(
     autocargo = {
         "cargo_toml_dir": "mocks",
     },
+    test_deps = ["//eden/mononoke/mononoke_macros:mononoke_macros"],
     deps = [
         "fbsource//third-party/rust:chrono",
         "fbsource//third-party/rust:lazy_static",

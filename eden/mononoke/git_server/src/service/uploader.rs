@@ -23,6 +23,7 @@ use import_tools::git_reader::GitReader;
 use import_tools::import_commit_contents;
 use import_tools::upload_git_tag;
 use import_tools::BackfillDerivation;
+use import_tools::GitImportLfs;
 use import_tools::GitimportAccumulator;
 use import_tools::GitimportPreferences;
 use import_tools::ReuploadCommits;
@@ -82,10 +83,6 @@ impl RefMap {
     fn insert_tag(&mut self, oid: &ObjectId, cs_id: ChangesetId) {
         self.tags_to_bonsai.insert(*oid, cs_id);
         self.bonsai_to_tags.insert(cs_id, *oid);
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.commits_to_bonsai.len() + self.tags_to_bonsai.len()
     }
 }
 
@@ -191,6 +188,7 @@ pub async fn upload_objects(
     repo: Arc<Repo>,
     object_store: Arc<GitObjectStore>,
     ref_updates: &[RefUpdate],
+    lfs: GitImportLfs,
 ) -> Result<RefMap> {
     let repo_name = repo.repo_identity().name().to_string();
     let uploader = Arc::new(DirectUploader::with_arc(
@@ -201,6 +199,8 @@ pub async fn upload_objects(
         backfill_derivation: BackfillDerivation::OnlySpecificTypes(vec![
             DerivableType::GitDeltaManifestsV2,
         ]),
+        concurrency: 100,
+        lfs,
         ..Default::default()
     };
     let acc = GitimportAccumulator::from_roots(HashMap::new());

@@ -10,10 +10,12 @@ use std::collections::BTreeMap;
 
 use anyhow::bail;
 use anyhow::Result;
-use gitcompat::rungit::RunGitOptions;
+use gitcompat::rungit::RepoGit;
+use gitcompat::GitCmd;
 use types::workingcopy_client::CheckoutConflict;
 use types::workingcopy_client::CheckoutMode;
 use types::workingcopy_client::FileStatus;
+use types::workingcopy_client::ProgressInfo;
 use types::HgId;
 use types::RepoPathBuf;
 
@@ -39,7 +41,7 @@ pub trait WorkingCopyClient: Send + Sync {
     /// Progress as reported by the external program (in reported units of
     /// progress, not percentage).
     /// When a checkout is not ongoing it returns None.
-    fn checkout_progress(&self) -> Result<Option<u64>>;
+    fn checkout_progress(&self) -> Result<Option<ProgressInfo>>;
 
     /// Checkout. Set parents and update working copy content.
     fn checkout(
@@ -79,7 +81,7 @@ impl WorkingCopyClient for edenfs_client::EdenFsClient {
         edenfs_client::EdenFsClient::checkout(self, node, tree_node, mode)
     }
 
-    fn checkout_progress(&self) -> Result<Option<u64>> {
+    fn checkout_progress(&self) -> Result<Option<ProgressInfo>> {
         edenfs_client::EdenFsClient::checkout_progress(self)
     }
 
@@ -88,7 +90,7 @@ impl WorkingCopyClient for edenfs_client::EdenFsClient {
     }
 }
 
-impl WorkingCopyClient for RunGitOptions {
+impl WorkingCopyClient for RepoGit {
     fn get_status(
         &self,
         node: HgId,
@@ -161,25 +163,22 @@ impl WorkingCopyClient for RunGitOptions {
     ) -> Result<Vec<CheckoutConflict>> {
         tracing::debug!(p1=?node, p1_tree=?tree_node, mode=?mode, "checkout");
         // TODO: Conflicts are not reported properly. Are they needed?
+        let flags = match mode {
+            CheckoutMode::Normal => "-d",
+            CheckoutMode::Force => "-fd",
+            CheckoutMode::DryRun => return Ok(Vec::new()),
+        };
+
         let hex = node.to_hex();
-        match mode {
-            CheckoutMode::Normal => {
-                self.run("checkout", &["-d", "--recurse-submodules", &hex])?;
-                Ok(Vec::new())
-            }
-            CheckoutMode::Force => {
-                self.run("checkout", &["-f", "-d", "--recurse-submodules", &hex])?;
-                Ok(Vec::new())
-            }
-            CheckoutMode::DryRun => Ok(Vec::new()),
-        }
+        self.run("checkout", &[flags, "--recurse-submodules", &hex])?;
+        Ok(Vec::new())
     }
 
     fn as_any(&self) -> &dyn Any {
         self as &dyn Any
     }
 
-    fn checkout_progress(&self) -> Result<Option<u64>> {
+    fn checkout_progress(&self) -> Result<Option<ProgressInfo>> {
         bail!("Progress for Git checkout not yet implemented!");
     }
 }

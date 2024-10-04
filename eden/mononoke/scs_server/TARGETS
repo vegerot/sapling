@@ -1,6 +1,5 @@
 load("@fbcode_macros//build_defs:cpp_library.bzl", "cpp_library")
 load("@fbcode_macros//build_defs:rust_binary.bzl", "rust_binary")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 load("//eden/mononoke/facebook:lib.bzl", "tokio_dependency_test")
 
 oncall("mononoke")
@@ -47,6 +46,8 @@ rust_binary(
         "//common/rust/shed/time_ext:time_ext",
         "//common/rust/srserver:srserver",
         "//configerator/structs/common/fbtype:fbtypes-rust",
+        "//eden/mononoke/async_requests:async_requests",
+        "//eden/mononoke/async_requests:client",
         "//eden/mononoke/blobstore:ephemeral_blobstore",
         "//eden/mononoke/bookmarks:bookmarks",
         "//eden/mononoke/bookmarks:bookmarks_movement",
@@ -55,6 +56,8 @@ rust_binary(
         "//eden/mononoke/cmdlib/mononoke_app:mononoke_app",
         "//eden/mononoke/cmdlib/sharding:executor_lib",
         "//eden/mononoke/cmdlib/sharding_ext:sharding_ext",
+        "//eden/mononoke/commit_cloud/helpers:commit_cloud_helpers",
+        "//eden/mononoke/commit_cloud/types:commit_cloud_types",
         "//eden/mononoke/commit_rewriting/synced_commit_mapping:synced_commit_mapping",
         "//eden/mononoke/common/connection_security_checker:connection_security_checker",
         "//eden/mononoke/common/dedupmap:dedupmap",
@@ -64,12 +67,12 @@ rust_binary(
         "//eden/mononoke/derived_data:derived_data_manager",
         "//eden/mononoke/git/git_types:git_types",
         "//eden/mononoke/hooks:hooks",
-        "//eden/mononoke/megarepo_api:async_requests",
         "//eden/mononoke/megarepo_api:megarepo_api",
         "//eden/mononoke/megarepo_api:megarepo_config",
         "//eden/mononoke/megarepo_api:megarepo_error",
         "//eden/mononoke/metaconfig:metaconfig_types",
         "//eden/mononoke/mononoke_api:mononoke_api",
+        "//eden/mononoke/mononoke_api_hg:mononoke_api_hg",
         "//eden/mononoke/mononoke_configs:mononoke_configs",
         "//eden/mononoke/mononoke_types:mononoke_types",
         "//eden/mononoke/permission_checker:permission_checker",

@@ -23,8 +23,8 @@ use mononoke_types::MPathElement;
 use mononoke_types::MPathElementPrefix;
 use mononoke_types::NonRootMPath;
 
-use crate::AsyncManifest;
 use crate::Entry;
+use crate::Manifest;
 use crate::TrieMapOps;
 
 /// Result of a multi-way comparison between a manifest tree and the merge of
@@ -86,13 +86,13 @@ pub async fn compare_manifest<'a, M, Store>(
     mf: M,
     base_mfs: Vec<Option<M>>,
 ) -> Result<
-    impl Stream<Item = Result<ManifestComparison<M::TrieMapType, Entry<M::TreeId, M::LeafId>>>> + 'a,
+    impl Stream<Item = Result<ManifestComparison<M::TrieMapType, Entry<M::TreeId, M::Leaf>>>> + 'a,
 >
 where
-    M: AsyncManifest<Store>,
+    M: Manifest<Store>,
     M::TreeId: Send + Sync + Eq + 'static,
-    M::LeafId: Send + Sync + Eq + 'static,
-    M::TrieMapType: TrieMapOps<Store, Entry<M::TreeId, M::LeafId>> + Eq,
+    M::Leaf: Send + Sync + Eq + 'static,
+    M::TrieMapType: TrieMapOps<Store, Entry<M::TreeId, M::Leaf>> + Eq,
     Store: Send + Sync + 'static,
 {
     let (mf_trie_map, base_mf_trie_maps) = future::try_join(
@@ -283,13 +283,13 @@ pub fn compare_manifest_tree<'a, M, Store>(
     blobstore: &'a Store,
     manifest_id: M::TreeId,
     base_manifest_ids: Vec<M::TreeId>,
-) -> impl Stream<Item = Result<Comparison<M::TrieMapType, Entry<M::TreeId, M::LeafId>>>> + 'a
+) -> impl Stream<Item = Result<Comparison<M::TrieMapType, Entry<M::TreeId, M::Leaf>>>> + 'a
 where
     Store: Send + Sync + 'static,
-    M: AsyncManifest<Store> + Send + Sync + 'static,
+    M: Manifest<Store> + Send + Sync + 'static,
     M::TreeId: StoreLoadable<Store, Value = M> + Clone + Send + Sync + Eq + 'static,
-    M::LeafId: Send + Sync + Eq + 'static,
-    M::TrieMapType: TrieMapOps<Store, Entry<M::TreeId, M::LeafId>> + Eq,
+    M::Leaf: Send + Sync + Eq + 'static,
+    M::TrieMapType: TrieMapOps<Store, Entry<M::TreeId, M::Leaf>> + Eq,
 {
     let base_manifest_ids: Vec<_> = base_manifest_ids.into_iter().map(Some).collect();
     bounded_traversal::bounded_traversal_stream(
@@ -412,6 +412,7 @@ mod tests {
     use futures::stream::TryStreamExt;
     use maplit::btreemap;
     use memblob::Memblob;
+    use mononoke_macros::mononoke;
     use mononoke_types::path::MPath;
     use mononoke_types::FileType;
     use mononoke_types::SortedVectorTrieMap;
@@ -420,6 +421,7 @@ mod tests {
     use super::*;
     use crate::ops::ManifestOps;
     use crate::tests::test_manifest::derive_test_manifest;
+    // use crate::tests::test_manifest::TestLeaf;
     use crate::tests::test_manifest::TestLeafId;
     use crate::tests::test_manifest::TestManifestId;
 
@@ -462,7 +464,7 @@ mod tests {
             .ok_or_else(|| anyhow!("path {} not found", path))
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_compare_manifest_single_parent(fb: FacebookInit) -> Result<()> {
         let blobstore: Arc<dyn Blobstore> = Arc::new(Memblob::new(PutBehaviour::Overwrite));
         let ctx = CoreContext::test_mock(fb);
@@ -551,7 +553,7 @@ mod tests {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_compare_manifest_tree(fb: FacebookInit) -> Result<()> {
         let blobstore: Arc<dyn Blobstore> = Arc::new(Memblob::new(PutBehaviour::Overwrite));
         let ctx = CoreContext::test_mock(fb);

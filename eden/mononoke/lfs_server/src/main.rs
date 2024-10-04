@@ -188,6 +188,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     };
 
     let app = MononokeAppBuilder::new(fb)
+        .with_entry_point(ClientEntryPoint::LfsServer)
         .with_app_extension(Fb303AppExtension {})
         .with_app_extension(RepoFilterAppExtension {})
         .with_cachelib_settings(cachelib_settings)
@@ -305,7 +306,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
             )?;
             let enforce_authentication = ctx.get_config().enforce_authentication();
 
-            let router = build_router(fb, ctx, git_blob_upload_allowed);
+            let router = build_router(fb, ctx, scuba_logger.clone(), git_blob_upload_allowed);
 
             let capture_session_data = tls_session_data_log.is_some();
 

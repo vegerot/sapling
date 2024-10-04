@@ -9,10 +9,6 @@
   $ REPOTYPE="blob_files"
   $ ENABLED_DERIVED_DATA='["git_commits", "git_trees", "git_delta_manifests_v2", "unodes", "filenodes", "hgchangesets"]' setup_common_config $REPOTYPE
 Without that bit gitimport is unable to set bookmarks
-  $ cat >> repos/repo/server.toml <<EOF
-  > [source_control_service]
-  > permit_writes = true
-  > EOF
 
 Use common repo setup
   $ GIT_LFS_INTERPRET_POINTERS=1 test_repos_for_git_lfs_import
@@ -35,7 +31,7 @@ But it's available on the separate lfs server
   laaaaaaaaaarge file
 
 Git Import without extra option will fail
-  $ with_stripped_logs gitimport "$GIT_REPO_SERVER" --lfs-import-max-attempts 1 --generate-bookmarks --concurrency 100 --lfs-server "$LEGACY_LFS_URL/download_sha256" full-repo | grep failed
+  $ with_stripped_logs gitimport "$GIT_REPO_SERVER" --lfs-import-max-attempts 1 --generate-bookmarks --concurrency 100 --lfs-server "$LEGACY_LFS_URL/download_sha256" full-repo | grep -e error -e Execution
   Execution error: gitimport failed
   Error: Execution failed
 
@@ -130,12 +126,16 @@ Inspect bonsai change
   Tree {
       entries: [
           Entry {
-              mode: Blob,
+              mode: EntryMode(
+                  33188,
+              ),
               filename: "large_file",
               oid: Sha1(1ab2b3357e304fef596198d92807d8d7e3580f0d),
           },
           Entry {
-              mode: Blob,
+              mode: EntryMode(
+                  33188,
+              ),
               filename: "small_file",
               oid: Sha1(8910fc3d7dae273e6ffd1d3982af8dfc418af416),
           },

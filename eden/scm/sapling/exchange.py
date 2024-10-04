@@ -18,6 +18,7 @@ import hashlib
 from typing import List, Tuple
 
 import bindings
+
 from sapling import tracing
 
 from . import (
@@ -26,6 +27,7 @@ from . import (
     changegroup,
     discovery,
     error,
+    extensions,
     git,
     lock as lockmod,
     mutation,
@@ -42,7 +44,6 @@ from . import (
 )
 from .i18n import _
 from .node import bin, hex, nullid
-
 
 urlerr = util.urlerr
 urlreq = util.urlreq
@@ -1090,7 +1091,7 @@ def _getbundlesendvars(pushop, bundler):
 
         part = bundler.newpart("pushvars")
 
-        for key, value in pycompat.iteritems(shellvars):
+        for key, value in shellvars.items():
             part.addparam(key, value, mandatory=False)
 
 
@@ -1468,14 +1469,6 @@ def pull(
                 "required features are not" " supported in the destination:" " %s"
             ) % (", ".join(sorted(missing)))
             raise error.Abort(msg)
-
-    if (
-        not pullop.repo.ui.configbool("treemanifest", "treeonly")
-        and "treeonly" in pullop.remote.capabilities()
-    ):
-        raise error.Abort(
-            _("non-treemanifest clients cannot pull from " "treemanifest-only servers")
-        )
 
     wlock = lock = None
     try:

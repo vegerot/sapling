@@ -8,10 +8,8 @@
 use std::str::FromStr;
 
 use clientinfo::ClientRequestInfo;
-use edenapi_types::HgId;
+use commit_cloud_types::WorkspaceHead;
 use mercurial_types::HgChangesetId;
-use serde::Deserialize;
-use serde::Serialize;
 use sql::Transaction;
 
 use crate::sql::heads_ops::DeleteArgs;
@@ -19,11 +17,6 @@ use crate::sql::ops::Delete;
 use crate::sql::ops::Insert;
 use crate::CommitCloudContext;
 use crate::SqlCommitCloud;
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct WorkspaceHead {
-    pub commit: HgChangesetId,
-}
 
 #[allow(clippy::ptr_arg)]
 pub fn heads_from_list(s: &Vec<String>) -> anyhow::Result<Vec<WorkspaceHead>> {
@@ -42,15 +35,12 @@ pub async fn update_heads(
     mut txn: Transaction,
     cri: Option<&ClientRequestInfo>,
     ctx: &CommitCloudContext,
-    removed_heads: Vec<HgId>,
-    new_heads: Vec<HgId>,
+    removed_heads: Vec<HgChangesetId>,
+    new_heads: Vec<HgChangesetId>,
 ) -> anyhow::Result<Transaction> {
     if !removed_heads.is_empty() {
         let delete_args = DeleteArgs {
-            removed_commits: removed_heads
-                .into_iter()
-                .map(|id| id.into())
-                .collect::<Vec<HgChangesetId>>(),
+            removed_commits: removed_heads,
         };
 
         txn = Delete::<WorkspaceHead>::delete(
@@ -70,9 +60,7 @@ pub async fn update_heads(
             cri,
             ctx.reponame.clone(),
             ctx.workspace.clone(),
-            WorkspaceHead {
-                commit: head.into(),
-            },
+            WorkspaceHead { commit: head },
         )
         .await?;
     }

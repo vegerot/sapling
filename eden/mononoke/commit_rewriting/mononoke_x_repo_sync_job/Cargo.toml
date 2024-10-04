@@ -8,7 +8,7 @@ edition = "2021"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.75"
+anyhow = "1.0.86"
 async-trait = "0.1.71"
 backsyncer = { version = "0.1.0", path = "../backsyncer" }
 blobstore = { version = "0.1.0", path = "../../blobstore" }
@@ -28,7 +28,7 @@ fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rus
 fsnodes = { version = "0.1.0", path = "../../derived_data/fsnodes" }
 futures = { version = "0.3.30", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-indicatif = { version = "0.17.6", features = ["improved_unicode", "rayon", "tokio"] }
+indicatif = { version = "0.17.6", features = ["futures", "improved_unicode", "rayon", "tokio"] }
 justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 live_commit_sync_config = { version = "0.1.0", path = "../live_commit_sync_config" }
 metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
@@ -47,7 +47,6 @@ scuba_ext = { version = "0.1.0", path = "../../common/scuba_ext" }
 sharding_ext = { version = "0.1.0", path = "../../cmdlib/sharding_ext" }
 slog = { version = "2.7", features = ["max_level_trace", "nested-values"] }
 sql_query_config = { version = "0.1.0", path = "../../repo_attributes/sql_query_config" }
-synced_commit_mapping = { version = "0.1.0", path = "../synced_commit_mapping" }
 tokio = { version = "1.37.0", features = ["full", "test-util", "tracing"] }
 zk_leader_election = { version = "0.1.0", path = "../../cmdlib/zk_leader_election" }
 
@@ -55,4 +54,5 @@ zk_leader_election = { version = "0.1.0", path = "../../cmdlib/zk_leader_electio
 cross_repo_sync_test_utils = { version = "0.1.0", path = "../cross_repo_sync/test_utils" }
 fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 maplit = "1.0"
+mononoke_macros = { version = "0.1.0", path = "../../mononoke_macros" }
 tests_utils = { version = "0.1.0", path = "../../tests/utils" }

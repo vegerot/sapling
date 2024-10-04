@@ -6,7 +6,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = { version = "1.0.75", features = ["backtrace"] }
+anyhow = { version = "1.0.86", features = ["backtrace"] }
 atexit = { version = "0.1.0", path = "../util/atexit" }
 blackbox = { version = "0.1.0", path = "../blackbox" }
 clidispatch = { version = "0.1.0", path = "../clidispatch" }
@@ -21,6 +21,8 @@ cmddebugdumpindexedlog = { version = "0.1.0", path = "debugcommands/cmddebugdump
 cmddebugdumpinternalconfig = { version = "0.1.0", path = "debugcommands/cmddebugdumpinternalconfig" }
 cmddebugfsync = { version = "0.1.0", path = "debugcommands/cmddebugfsync" }
 cmddebughttp = { version = "0.1.0", path = "debugcommands/cmddebughttp" }
+cmddebuglfsreceive = { version = "0.1.0", path = "debugcommands/cmddebuglfsreceive" }
+cmddebuglfssend = { version = "0.1.0", path = "debugcommands/cmddebuglfssend" }
 cmddebugmergestate = { version = "0.1.0", path = "debugcommands/cmddebugmergestate" }
 cmddebugmetrics = { version = "0.1.0", path = "debugcommands/cmddebugmetrics" }
 cmddebugnetworkdoctor = { version = "0.1.0", path = "debugcommands/cmddebugnetworkdoctor" }
@@ -49,9 +51,9 @@ commandserver = { version = "0.1.0", path = "../commandserver" }
 configloader = { version = "0.1.0", path = "../config/loader" }
 configmodel = { version = "0.1.0", path = "../config/model" }
 constructors = { version = "0.1.0", path = "../constructors", features = ["git"] }
-ctrlc = { version = "3.1", features = ["termination"] }
+ctrlc = { version = "3.4.5", features = ["termination"] }
 fail = { version = "0.4", features = ["failpoints"] }
-flate2 = { version = "1.0.26", features = ["rust_backend"], default-features = false }
+flate2 = { version = "1.0.33", features = ["rust_backend"], default-features = false }
 hg-http = { version = "0.1.0", path = "../hg-http" }
 hg-metrics = { version = "0.1.0", path = "../hg-metrics" }
 hgplain = { version = "0.1.0", path = "../util/hgplain" }
@@ -71,6 +73,7 @@ pytracing = { version = "0.1.0", path = "../../saplingnative/bindings/modules/py
 pyworkingcopy = { version = "0.1.0", path = "../../saplingnative/bindings/modules/pyworkingcopy" }
 pyworkingcopyclient = { version = "0.1.0", path = "../../saplingnative/bindings/modules/pyworkingcopyclient" }
 repo = { version = "0.1.0", path = "../repo", features = ["wdir"] }
+repourl = { version = "0.1.0", path = "../repo/url" }
 revisionstore = { version = "0.1.0", path = "../revisionstore" }
 runlog = { version = "0.1.0", path = "../runlog" }
 sampling = { version = "0.1.0", path = "../sampling" }

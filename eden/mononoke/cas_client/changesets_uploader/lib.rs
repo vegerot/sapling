@@ -27,10 +27,9 @@ use futures::stream::TryStreamExt;
 use futures::try_join;
 use futures::FutureExt;
 use futures_watchdog::WatchdogExt;
-use manifest::find_intersection_of_diffs;
-use manifest::AsyncManifest;
 use manifest::Diff;
 use manifest::Entry;
+use manifest::Manifest;
 use manifest::ManifestOps;
 use mercurial_types::HgAugmentedManifestId;
 use mercurial_types::HgChangesetId;
@@ -223,26 +222,10 @@ where
             hg_cs.p1().map(HgChangesetId::new),
             hg_cs.p2().map(HgChangesetId::new),
         ) {
-            (Some(p1), Some(p2)) => {
-                let p1_hg_cs = p1.load(ctx, &blobstore);
-                let p2_hg_cs = p2.load(ctx, &blobstore);
-                let hg_cs = hg_cs_id.load(ctx, &blobstore);
-                let (p1_hg_cs, p2_hg_cs, hg_cs) = future::try_join3(p1_hg_cs, p2_hg_cs, hg_cs)
-                    .await
-                    .map_err(|e| CasChangesetUploaderErrorKind::Error(e.into()))?;
-
-                find_intersection_of_diffs(
-                    ctx.clone(),
-                    blobstore,
-                    hg_cs.manifestid(),
-                    vec![p1_hg_cs.manifestid(), p2_hg_cs.manifestid()],
-                )
-                .map_ok(move |(_, entry)| entry)
-                .map_err(CasChangesetUploaderErrorKind::DiffChangesetFailed)
-                .boxed()
-            }
-
-            (Some(p), None) | (None, Some(p)) => {
+            // If there is a merge commit, there is no guarantee that the p2 parent is uploaded to CAS
+            // (since the sync follows p1 chain)
+            // Therefore, we need to diff fully with the p1 parent only.
+            (Some(p), None) | (None, Some(p)) | (Some(p), Some(_)) => {
                 let blobstore = repo.repo_blobstore();
                 let parent_hg_cs = p.load(ctx, &blobstore);
                 let hg_cs = hg_cs_id.load(ctx, &blobstore);
@@ -418,7 +401,7 @@ where
             HgAugmentedManifestId::new(hg_manifest_id.into_nodehash());
 
         // We will traverse over Mercurial manifests for now, as augmented manifests haven't been
-        // derived yet and don't yet implement AsyncManifest.  This will be trivial to swap in later.
+        // derived yet and don't yet implement Manifest.  This will be trivial to swap in later.
         let max_concurrent_manifests = if matches!(upload_policy, UploadPolicy::TreesOnly) {
             MAX_CONCURRENT_MANIFESTS_TREES_ONLY
         } else {

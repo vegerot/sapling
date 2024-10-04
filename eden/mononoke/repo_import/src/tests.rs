@@ -21,7 +21,6 @@ mod tests {
     use bookmarks::BookmarksRef;
     use bookmarks::Freshness;
     use bulk_derivation::BulkDerivation;
-    use cacheblob::InProcessLease;
     use cached_config::ConfigStore;
     use cached_config::ModificationTime;
     use cached_config::TestSource;
@@ -52,6 +51,7 @@ mod tests {
     use metaconfig_types::SmallRepoCommitSyncConfig;
     use metaconfig_types::SmallRepoPermanentConfig;
     use mononoke_hg_sync_job_helper_lib::LATEST_REPLAYED_REQUEST_KEY;
+    use mononoke_macros::mononoke;
     use mononoke_types::globalrev::Globalrev;
     use mononoke_types::globalrev::START_COMMIT_GLOBALREV;
     use mononoke_types::BonsaiChangeset;
@@ -66,11 +66,8 @@ mod tests {
     use mutable_counters::MutableCountersRef;
     use pushredirect::PushRedirectionConfig;
     use pushredirect::TestPushRedirectionConfig;
-    use rendezvous::RendezVousOptions;
     use repo_blobstore::RepoBlobstoreRef;
     use repo_derived_data::RepoDerivedDataRef;
-    use sql_construct::SqlConstruct;
-    use synced_commit_mapping::SqlSyncedCommitMappingBuilder;
     use test_repo_factory::TestRepoFactory;
     use tests_utils::bookmark;
     use tests_utils::drawdag::create_from_dag;
@@ -122,6 +119,29 @@ mod tests {
         Ok(repo)
     }
 
+    async fn create_repo_with_live_commit_sync_config(
+        fb: FacebookInit,
+        id: i32,
+        live_commit_sync_config: Arc<dyn LiveCommitSyncConfig>,
+    ) -> Result<Repo> {
+        let repo: Repo = TestRepoFactory::new(fb)?
+            .with_config_override(|config| {
+                let config = config
+                    .derived_data_config
+                    .get_active_config_mut()
+                    .expect("No enabled derived data types config");
+                // Repo import has no need of these derived data types
+                config.types.remove(&TreeHandle::VARIANT);
+                config.types.remove(&MappedGitCommitId::VARIANT);
+                config.types.remove(&RootGitDeltaManifestV2Id::VARIANT);
+            })
+            .with_live_commit_sync_config(live_commit_sync_config.clone())
+            .with_id(RepositoryId::new(id))
+            .build()
+            .await?;
+        Ok(repo)
+    }
+
     fn get_file_changes_mpaths(bcs: &BonsaiChangeset) -> Vec<NonRootMPath> {
         bcs.file_changes()
             .map(|(mpath, _)| mpath)
@@ -156,7 +176,7 @@ mod tests {
         }
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_move_bookmark(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
         let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
@@ -216,7 +236,7 @@ mod tests {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_move_bookmark_with_existing_bookmark(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
         let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
@@ -290,7 +310,7 @@ mod tests {
         Move bookmark   2               1                        inifite loop -> timeout
         Set counter     2               2                        Ok(())
     */
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_hg_sync_check(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
         let repo: Repo = test_repo_factory::build_empty(ctx.fb).await?;
@@ -351,7 +371,7 @@ mod tests {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_merge_push_commit(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
         let repo = create_repo(fb, 1).await?;
@@ -455,7 +475,7 @@ mod tests {
         repo1: push-redirects to repo0 => Some(repo_config)
         repo2: draft push-redirects => None
     */
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_get_large_repo_config_if_pushredirected(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
         let test_source = Arc::new(TestSource::new());
@@ -478,11 +498,15 @@ mod tests {
             .set(&ctx, RepositoryId::new(2), true, false)
             .await?;
 
-        let repo0 = create_repo(fb, 0).await?;
-
         let config_store = ConfigStore::new(test_source.clone(), Duration::from_millis(2), None);
-        let live_commit_sync_config =
-            CfgrLiveCommitSyncConfig::new(&config_store, test_push_redirection_config)?;
+        let live_commit_sync_config = Arc::new(CfgrLiveCommitSyncConfig::new(
+            &config_store,
+            test_push_redirection_config,
+        )?);
+
+        let repo0 =
+            create_repo_with_live_commit_sync_config(fb, 0, live_commit_sync_config.clone())
+                .await?;
 
         insert_repo_config(0, &mut repos);
         assert!(
@@ -491,7 +515,9 @@ mod tests {
                 .is_none()
         );
 
-        let repo1 = create_repo(fb, 1).await?;
+        let repo1 =
+            create_repo_with_live_commit_sync_config(fb, 1, live_commit_sync_config.clone())
+                .await?;
 
         insert_repo_config(1, &mut repos);
         assert!(
@@ -500,7 +526,9 @@ mod tests {
                 .is_some()
         );
 
-        let repo2 = create_repo(fb, 2).await?;
+        let repo2 =
+            create_repo_with_live_commit_sync_config(fb, 2, live_commit_sync_config.clone())
+                .await?;
 
         insert_repo_config(2, &mut repos);
         assert!(
@@ -607,29 +635,28 @@ mod tests {
         variables for a large repo setting given small repo settings.
         -> bookmarks are prepended with the bookmark_prefixes given in the configs
     */
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_get_large_repo_setting(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
-        let mapping = SqlSyncedCommitMappingBuilder::with_sqlite_in_memory()
-            .unwrap()
-            .build(RendezVousOptions::for_test());
-        let large_repo = create_repo(fb, 0).await?;
-        let small_repo_1 = create_repo(fb, 1).await?;
+        let live_commit_sync_config = get_large_repo_live_commit_sync_config();
+        let large_repo =
+            create_repo_with_live_commit_sync_config(fb, 0, live_commit_sync_config.clone())
+                .await?;
+        let small_repo_1 =
+            create_repo_with_live_commit_sync_config(fb, 1, live_commit_sync_config.clone())
+                .await?;
 
         let small_repo_setting_1 = RepoImportSetting {
             importing_bookmark: create_bookmark_name("importing_bookmark"),
             dest_bookmark: create_bookmark_name("dest_bookmark"),
         };
 
-        let live_commit_sync_config = get_large_repo_live_commit_sync_config();
         let syncers_1 = create_commit_syncers(
             &ctx,
             small_repo_1.clone(),
             large_repo.clone(),
             SubmoduleDeps::ForSync(HashMap::new()),
-            mapping.clone(),
             live_commit_sync_config.clone(),
-            Arc::new(InProcessLease::new()),
         )?;
 
         let large_repo_setting_1 =
@@ -642,7 +669,9 @@ mod tests {
 
         assert_eq!(expected_large_repo_setting_1, large_repo_setting_1);
 
-        let small_repo_2 = create_repo(fb, 2).await?;
+        let small_repo_2 =
+            create_repo_with_live_commit_sync_config(fb, 2, live_commit_sync_config.clone())
+                .await?;
 
         let small_repo_setting_2 = RepoImportSetting {
             importing_bookmark: create_bookmark_name("importing_bookmark_2"),
@@ -654,9 +683,7 @@ mod tests {
             small_repo_2.clone(),
             large_repo.clone(),
             SubmoduleDeps::ForSync(HashMap::new()),
-            mapping.clone(),
             live_commit_sync_config,
-            Arc::new(InProcessLease::new()),
         )?;
 
         let large_repo_setting_2 =
@@ -686,11 +713,16 @@ mod tests {
         and B into random_dir/B places. When we backsync to small_repo, we should get
         dest_path_prefix/A and dest_path_prefix/B paths, respectively.
     */
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_rewrite_file_paths_and_backsync(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
-        let large_repo = create_repo(fb, 0).await?;
-        let small_repo = create_repo(fb, 1).await?;
+        let live_commit_sync_config = get_large_repo_live_commit_sync_config();
+        let large_repo =
+            create_repo_with_live_commit_sync_config(fb, 0, live_commit_sync_config.clone())
+                .await?;
+        let small_repo =
+            create_repo_with_live_commit_sync_config(fb, 1, live_commit_sync_config.clone())
+                .await?;
         let changesets = create_from_dag(
             &ctx,
             &large_repo,
@@ -701,18 +733,12 @@ mod tests {
         .await?;
         let cs_ids: Vec<ChangesetId> = changesets.values().copied().collect();
 
-        let live_commit_sync_config = get_large_repo_live_commit_sync_config();
-        let mapping = SqlSyncedCommitMappingBuilder::with_sqlite_in_memory()
-            .unwrap()
-            .build(RendezVousOptions::for_test());
         let syncers = create_commit_syncers(
             &ctx,
             small_repo.clone(),
             large_repo.clone(),
             SubmoduleDeps::ForSync(HashMap::new()),
-            mapping.clone(),
             live_commit_sync_config,
-            Arc::new(InProcessLease::new()),
         )?;
 
         let large_to_small_syncer = syncers.large_to_small;
@@ -818,7 +844,7 @@ mod tests {
         Given two repos and their changesets, we check if we have derived all the
         data types for the changesets
     */
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_derive_bonsais_multiple_repos(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
         let repo_0 = create_repo(fb, 0).await?;
@@ -859,11 +885,16 @@ mod tests {
         Given a large repo that backsyncs to small_repo, we check if we have
         derived all the data types for both repos.
     */
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_rewrite_and_derive(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
-        let large_repo = create_repo(fb, 0).await?;
-        let small_repo = create_repo(fb, 1).await?;
+        let live_commit_sync_config = get_large_repo_live_commit_sync_config();
+        let large_repo =
+            create_repo_with_live_commit_sync_config(fb, 0, live_commit_sync_config.clone())
+                .await?;
+        let small_repo =
+            create_repo_with_live_commit_sync_config(fb, 1, live_commit_sync_config.clone())
+                .await?;
         let changesets = create_from_dag(
             &ctx,
             &large_repo,
@@ -875,17 +906,12 @@ mod tests {
 
         let cs_ids: Vec<ChangesetId> = changesets.values().copied().collect();
 
-        let live_commit_sync_config = get_large_repo_live_commit_sync_config();
-        let mapping = SqlSyncedCommitMappingBuilder::with_sqlite_in_memory()?
-            .build(RendezVousOptions::for_test());
         let syncers = create_commit_syncers(
             &ctx,
             small_repo.clone(),
             large_repo.clone(),
             SubmoduleDeps::ForSync(HashMap::new()),
-            mapping.clone(),
             live_commit_sync_config,
-            Arc::new(InProcessLease::new()),
         )?;
 
         let large_to_small_syncer = syncers.large_to_small;
@@ -944,11 +970,16 @@ mod tests {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_find_version_and_backsync(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
-        let large_repo = create_repo(fb, 0).await?;
-        let small_repo = create_repo(fb, 1).await?;
+        let live_commit_sync_config = get_large_repo_live_commit_sync_config();
+        let large_repo =
+            create_repo_with_live_commit_sync_config(fb, 0, live_commit_sync_config.clone())
+                .await?;
+        let small_repo =
+            create_repo_with_live_commit_sync_config(fb, 1, live_commit_sync_config.clone())
+                .await?;
 
         let root = CreateCommitContext::new_root(&ctx, &large_repo)
             .add_file("random_dir/B/file", "text")
@@ -964,17 +995,12 @@ mod tests {
             .set_to(first_commit)
             .await?;
 
-        let live_commit_sync_config = get_large_repo_live_commit_sync_config();
-        let mapping = SqlSyncedCommitMappingBuilder::with_sqlite_in_memory()?
-            .build(RendezVousOptions::for_test());
         let syncers = create_commit_syncers(
             &ctx,
             small_repo.clone(),
             large_repo.clone(),
             SubmoduleDeps::ForSync(HashMap::new()),
-            mapping.clone(),
             live_commit_sync_config,
-            Arc::new(InProcessLease::new()),
         )?;
 
         let large_to_small_syncer = syncers.large_to_small;

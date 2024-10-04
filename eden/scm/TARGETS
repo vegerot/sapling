@@ -12,7 +12,6 @@ load("@fbcode_macros//build_defs:native_rules.bzl", "buck_command_alias", "buck_
 load("@fbcode_macros//build_defs:python_binary.bzl", "python_binary")
 load("@fbcode_macros//build_defs:python_library.bzl", "python_library")
 load("@fbcode_macros//build_defs:rust_universal_binary.bzl", "rust_universal_binary")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("sapling")
 
@@ -202,6 +201,7 @@ ci_hint(
 rust_universal_binary(
     name = "hg_universal_binary",
     source = ":hg",
+    visibility = ["PUBLIC"],
 )
 
 cpp_library(

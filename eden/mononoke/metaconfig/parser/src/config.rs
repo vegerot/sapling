@@ -17,6 +17,7 @@ use anyhow::Context;
 use anyhow::Result;
 use cached_config::ConfigHandle;
 use cached_config::ConfigStore;
+use metaconfig_types::AsyncRequestsConfig;
 use metaconfig_types::BackupRepoConfig;
 use metaconfig_types::BlobConfig;
 use metaconfig_types::CensoredScubaParams;
@@ -231,7 +232,6 @@ fn parse_with_repo_definition(
         commit_graph_config,
         deep_sharding_config,
         everstore_local_path,
-        git_concurrency,
         metadata_logger_config,
         commit_cloud_config,
         zelos_config,
@@ -239,7 +239,7 @@ fn parse_with_repo_definition(
         default_objects_count,
         x_repo_sync_source_mapping,
         mononoke_cas_sync_config,
-        git_lfs_interpret_pointers,
+        git_configs,
         ..
     } = named_repo_config;
 
@@ -353,11 +353,13 @@ fn parse_with_repo_definition(
 
     let commit_graph_config = commit_graph_config.convert()?.unwrap_or_default();
     let deep_sharding_config = deep_sharding_config.convert()?;
-    let git_concurrency = git_concurrency.convert()?;
     let metadata_logger_config = metadata_logger_config.convert()?.unwrap_or_default();
     let zelos_config = zelos_config.convert()?;
     let x_repo_sync_source_mapping = x_repo_sync_source_mapping.convert()?;
-    let git_lfs_interpret_pointers = git_lfs_interpret_pointers.unwrap_or(false);
+
+    let raw_git_configs = git_configs.unwrap_or_default();
+
+    let git_configs = raw_git_configs.convert()?;
 
     let commit_cloud_config = commit_cloud_config.convert()?.unwrap_or_default();
     let mononoke_cas_sync_config = mononoke_cas_sync_config.convert()?;
@@ -402,7 +404,6 @@ fn parse_with_repo_definition(
         default_commit_identity_scheme,
         deep_sharding_config,
         everstore_local_path,
-        git_concurrency,
         metadata_logger_config,
         zelos_config,
         bookmark_name_for_objects_count,
@@ -410,7 +411,7 @@ fn parse_with_repo_definition(
         x_repo_sync_source_mapping,
         commit_cloud_config,
         mononoke_cas_sync_config,
-        git_lfs_interpret_pointers,
+        git_configs,
     })
 }
 
@@ -490,6 +491,14 @@ fn parse_common_config(
         redaction_sets_location: redaction_config.redaction_sets_location,
     };
 
+    let async_requests_config = match common.async_requests_config {
+        Some(config) => AsyncRequestsConfig {
+            db_config: Some(config.db_config.convert()?),
+            blobstore: Some(config.blobstore_config.convert()?),
+        },
+        None => AsyncRequestsConfig::default(),
+    };
+
     Ok(CommonConfig {
         trusted_parties_hipster_tier,
         trusted_parties_allowlist,
@@ -501,6 +510,7 @@ fn parse_common_config(
         internal_identity,
         git_memory_upper_bound,
         edenapi_dumper_scuba_table,
+        async_requests_config,
     })
 }
 
@@ -549,6 +559,7 @@ mod test {
     use metaconfig_types::EphemeralBlobstoreConfig;
     use metaconfig_types::FilestoreParams;
     use metaconfig_types::GitConcurrencyParams;
+    use metaconfig_types::GitConfigs;
     use metaconfig_types::HgSyncConfig;
     use metaconfig_types::HookBypass;
     use metaconfig_types::HookConfig;
@@ -584,6 +595,7 @@ mod test {
     use metaconfig_types::WalkerConfig;
     use metaconfig_types::XRepoSyncSourceConfig;
     use metaconfig_types::XRepoSyncSourceConfigMapping;
+    use mononoke_macros::mononoke;
     use mononoke_types::path::MPath;
     use mononoke_types::DerivableType;
     use mononoke_types::NonRootMPath;
@@ -631,7 +643,7 @@ mod test {
         tmp_dir
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_commit_sync_config_correct() {
         let commit_sync_config = r#"
             [mega]
@@ -700,7 +712,7 @@ mod test {
         assert_eq!(commit_sync, expected);
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_commit_sync_config_large_is_small() {
         let commit_sync_config = r#"
             [mega]
@@ -734,7 +746,7 @@ mod test {
         }
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_commit_sync_config_duplicated_small_repos() {
         let commit_sync_config = r#"
             [mega]
@@ -770,7 +782,7 @@ mod test {
             assert!(msg.contains("present multiple times in the same CommitSyncConfig"));
         }
     }
-    #[test]
+    #[mononoke::test]
     fn test_duplicated_repo_ids() {
         let www_content = r#"
             scuba_table_hooks="scm_hooks"
@@ -821,7 +833,7 @@ mod test {
         assert!(msg.contains("DuplicatedRepoId"));
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_read_manifest() {
         let fbsource_content = r#"
             generation_cache_size=1048576
@@ -919,7 +931,7 @@ mod test {
             scrub_enabled = true
             validate_enabled = true
 
-            [git_concurrency]
+            [git_configs.git_concurrency]
             trees_and_blobs = 500
             commits = 1000
             tags = 1000
@@ -1348,11 +1360,7 @@ mod test {
                 },
                 deep_sharding_config: Some(ShardingModeConfig { status: hashmap!() }),
                 everstore_local_path: None,
-                git_concurrency: Some(GitConcurrencyParams {
-                    trees_and_blobs: 500,
-                    commits: 1000,
-                    tags: 1000,
-                }),
+
                 metadata_logger_config: MetadataLoggerConfig {
                     bookmarks: vec![
                         BookmarkKey::new("master").unwrap(),
@@ -1378,7 +1386,15 @@ mod test {
                     disable_interngraph_notification: false,
                 },
                 mononoke_cas_sync_config: None,
-                git_lfs_interpret_pointers: false,
+                git_configs: GitConfigs {
+                    git_concurrency: Some(GitConcurrencyParams {
+                        trees_and_blobs: 500,
+                        commits: 1000,
+                        tags: 1000,
+                    }),
+                    git_lfs_interpret_pointers: false,
+                    fetch_message: None,
+                },
             },
         );
 
@@ -1443,7 +1459,6 @@ mod test {
                 commit_graph_config: CommitGraphConfig::default(),
                 deep_sharding_config: None,
                 everstore_local_path: None,
-                git_concurrency: None,
                 metadata_logger_config: MetadataLoggerConfig::default(),
                 zelos_config: None,
                 bookmark_name_for_objects_count: None,
@@ -1451,7 +1466,11 @@ mod test {
                 x_repo_sync_source_mapping: None,
                 commit_cloud_config: CommitCloudConfig::default(),
                 mononoke_cas_sync_config: None,
-                git_lfs_interpret_pointers: false,
+                git_configs: GitConfigs {
+                    git_concurrency: None,
+                    git_lfs_interpret_pointers: false,
+                    fetch_message: None,
+                },
             },
         );
         assert_eq!(
@@ -1480,6 +1499,10 @@ mod test {
                 },
                 git_memory_upper_bound: Some(100),
                 edenapi_dumper_scuba_table: Some("dumped_requests".to_string()),
+                async_requests_config: AsyncRequestsConfig {
+                    db_config: None,
+                    blobstore: None
+                },
             }
         );
         assert_eq!(
@@ -1508,7 +1531,7 @@ mod test {
         )
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_broken_bypass_config() {
         // Incorrect bypass string
         let content = r#"
@@ -1550,7 +1573,7 @@ mod test {
         assert!(msg.contains("InvalidPushvar"));
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_broken_common_config() {
         fn check_fails(common: &str, expect: &str) {
             let content = r#"
@@ -1603,7 +1626,7 @@ mod test {
         check_fails(common, "identity type and data must be specified");
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_common_storage() {
         const STORAGE: &str = r#"
         [multiplex_store.metadata.remote]
@@ -1720,7 +1743,7 @@ mod test {
         )
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_common_blobstores_local_override() {
         const STORAGE: &str = r#"
         [multiplex_store.metadata.remote]
@@ -1819,7 +1842,7 @@ mod test {
         )
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_stray_fields() {
         const REPO: &str = r#"
         storage_config = "randomstore"
@@ -1854,7 +1877,7 @@ mod test {
         assert!(msg.contains("unknown keys in config parsing"));
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_multiplexed_store_types() {
         const STORAGE: &str = r#"
         [multiplex_store.metadata.remote]

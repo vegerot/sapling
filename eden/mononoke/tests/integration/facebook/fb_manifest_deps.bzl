@@ -1,12 +1,10 @@
 # This needs to use native. to define a UDR.
 # @lint-ignore-every BUCKLINT
 
-load("@fbcode_macros//build_defs:custom_rule.bzl", "custom_rule")
 load("@fbcode_macros//build_defs:custom_unittest.bzl", "custom_unittest")
 load("@fbcode_macros//build_defs/lib:rust_common.bzl", "rust_common")
 load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 load("@fbcode_macros//build_defs/lib:test_utils.bzl", "test_utils")
-load("@fbsource//tools/build_defs/buck2:is_buck2.bzl", "is_buck2")
 load(
     "//eden/mononoke/tests/integration/facebook:symlink.bzl",
     "symlink",
@@ -28,10 +26,10 @@ MONONOKE_TARGETS_TO_ENV = {
     "//eden/mononoke/facebook/mirror_hg_commits:mirror_hg_commits": "MIRROR_HG_COMMITS",
     "//eden/mononoke/facebook/slow_bookmark_mover:slow_bookmark_mover": "MONONOKE_SLOW_BOOKMARK_MOVER",
     "//eden/mononoke/git/facebook/git_move_bookmark:git_move_bookmark": "MONONOKE_GIT_MOVE_BOOKMARK",
+    "//eden/mononoke/git/facebook/pushrebase:git_pushrebase": "GIT_PUSHREBASE",
     "//eden/mononoke/git/facebook/remote_gitimport:remote_gitimport": "MONONOKE_REMOTE_GITIMPORT",
     "//eden/mononoke/git/gitexport:gitexport": "MONONOKE_GITEXPORT",
     "//eden/mononoke/git/gitimport:gitimport": "MONONOKE_GITIMPORT",
-    "//eden/mononoke/git/pushrebase:git_pushrebase": "GIT_PUSHREBASE",
     "//eden/mononoke/git_server:git_server": "MONONOKE_GIT_SERVER",
     "//eden/mononoke/land_service/facebook/server:land_service": "LAND_SERVICE",
     "//eden/mononoke/lfs_server:lfs_server": "LFS_SERVER",
@@ -93,6 +91,10 @@ DOTT_HG_CAS = {
     "//eden/scm:hgpython_cas": "BINARY_HGPYTHON",
 }
 
+DOTT_ASYNC_WORKER = {
+    "//eden/mononoke/async_requests:worker": "ASYNC_REQUESTS_WORKER",
+}
+
 DISABLE_ALL_NETWORK_ACCESS_DEPS = {
     # Stop network
     "//eden/mononoke/tests/integration/facebook:disable-all-network-access": "DISABLE_ALL_NETWORK_ACCESS",
@@ -133,7 +135,7 @@ generate_manifest = native.rule(
         "filename": native.attrs.string(),
         "generator": native.attrs.exec_dep(),
     },
-) if is_buck2() else None
+)
 
 def custom_manifest_rule(name, manifest_file, targets):
     if rust_oss.is_oss_build():
@@ -157,28 +159,17 @@ def custom_manifest_rule(name, manifest_file, targets):
 
     env = {k: "$(location %s)" % v for k, v in targets.items()}
 
-    if is_buck2():
-        generate_manifest(
-            name = name,
-            generator = "//eden/mononoke/tests/integration/facebook:generate_manifest",
-            env = env,
-            filename = manifest_file,
-        )
-    else:
-        custom_rule(
-            name = name,
-            add_install_dir = False,
-            build_args = " ".join([manifest_file] + list(targets.keys())),
-            build_script_dep = "//eden/mononoke/tests/integration/facebook:generate_manifest",
-            env = env,
-            output_gen_files = [manifest_file],
-            strict = True,
-        )
+    generate_manifest(
+        name = name,
+        generator = "//eden/mononoke/tests/integration/facebook:generate_manifest",
+        env = env,
+        filename = manifest_file,
+    )
 
     return list(targets.values())
 
-def dott_test(name, dott_files, deps, use_mysql = False, disable_all_network_access_target = True, enable_sapling_cas = False):
-    _dott_test(name, dott_files, deps, use_mysql, False, enable_sapling_cas = enable_sapling_cas)
+def dott_test(name, dott_files, deps, use_mysql = False, disable_all_network_access_target = True, enable_sapling_cas = False, enable_async_requests_worker = False):
+    _dott_test(name, dott_files, deps, use_mysql, False, enable_sapling_cas = enable_sapling_cas, enable_async_requests_worker = enable_async_requests_worker)
 
     if use_mysql:
         # NOTE: We need network to talk to MySQL
@@ -186,9 +177,9 @@ def dott_test(name, dott_files, deps, use_mysql = False, disable_all_network_acc
 
     if disable_all_network_access_target:
         # there's not much sense in blocking network for OSS builds
-        _dott_test(name + "-disable-all-network-access", dott_files, deps, use_mysql, disable_all_network_access = True, rust_allow_oss_build = False, enable_sapling_cas = enable_sapling_cas)
+        _dott_test(name + "-disable-all-network-access", dott_files, deps, use_mysql, disable_all_network_access = True, rust_allow_oss_build = False, enable_sapling_cas = enable_sapling_cas, enable_async_requests_worker = enable_async_requests_worker)
 
-def _dott_test(name, dott_files, deps, use_mysql = False, disable_all_network_access = True, rust_allow_oss_build = None, enable_sapling_cas = False):
+def _dott_test(name, dott_files, deps, use_mysql = False, disable_all_network_access = True, rust_allow_oss_build = None, enable_sapling_cas = False, enable_async_requests_worker = False):
     manifest_target = name + "-manifest"
 
     noop_for_oss = rust_common.is_noop_in_oss_build(rust_allow_oss_build)
@@ -218,6 +209,10 @@ def _dott_test(name, dott_files, deps, use_mysql = False, disable_all_network_ac
         dott_deps = dott_deps | DOTT_HG
     else:
         dott_deps = dott_deps | DOTT_HG_CAS
+
+    if enable_async_requests_worker:
+        dott_deps = dott_deps | DOTT_ASYNC_WORKER
+
     for d in deps:
         # test runner takes sybolic names not targets, map from targets to the placeholder names
         if d in dott_deps:

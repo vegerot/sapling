@@ -19,6 +19,7 @@ use megarepo_mapping::CommitRemappingState;
 use megarepo_mapping::SourceName;
 use megarepo_mapping::REMAPPING_STATE_FILE;
 use metaconfig_types::RepoConfigArc;
+use mononoke_macros::mononoke;
 use mononoke_types::NonRootMPath;
 use tests_utils::bookmark;
 use tests_utils::list_working_copy_utf8;
@@ -27,11 +28,12 @@ use tests_utils::CreateCommitContext;
 
 use crate::add_sync_target::AddSyncTarget;
 use crate::common::MegarepoOp;
+use crate::common::SYNC_TARGET_CONFIG_FILE;
 use crate::megarepo_test_utils::MegarepoTest;
 use crate::megarepo_test_utils::SyncTargetConfigBuilder;
 use crate::remerge_source::RemergeSource;
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_remerge_source_simple(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -117,6 +119,10 @@ async fn test_remerge_source_simple(fb: FacebookInit) -> Result<(), Error> {
         wc.remove(&NonRootMPath::new(REMAPPING_STATE_FILE)?)
             .is_some()
     );
+    assert!(
+        wc.remove(&NonRootMPath::new(SYNC_TARGET_CONFIG_FILE)?)
+            .is_some()
+    );
 
     assert_eq!(
         wc,
@@ -177,6 +183,10 @@ async fn test_remerge_source_simple(fb: FacebookInit) -> Result<(), Error> {
     // Remove file with commit remapping state because it's never present in source
     assert!(
         wc.remove(&NonRootMPath::new(REMAPPING_STATE_FILE)?)
+            .is_some()
+    );
+    assert!(
+        wc.remove(&NonRootMPath::new(SYNC_TARGET_CONFIG_FILE)?)
             .is_some()
     );
 

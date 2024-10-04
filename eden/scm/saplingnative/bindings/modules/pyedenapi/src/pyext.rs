@@ -17,6 +17,7 @@ use cpython::*;
 use cpython_async::PyFuture;
 use cpython_async::TStream;
 use cpython_ext::convert::Serde;
+use cpython_ext::ExtractInner;
 use cpython_ext::PyCell;
 use cpython_ext::PyPathBuf;
 use cpython_ext::ResultPyErrExt;
@@ -74,7 +75,8 @@ use edenapi_types::WorkspacesDataResponse;
 use futures::prelude::*;
 use hgstore::split_hg_file_metadata;
 use progress_model::ProgressBar;
-use pyrevisionstore::as_legacystore;
+use pyrevisionstore::filescmstore;
+use revisionstore::HgIdDataStore;
 use revisionstore::HgIdMutableDeltaStore;
 use revisionstore::StoreKey;
 use revisionstore::StoreResult;
@@ -508,7 +510,7 @@ pub trait SaplingRemoteApiPyExt: SaplingRemoteApi {
     fn uploadfiles_py(
         &self,
         py: Python,
-        store: PyObject,
+        store: filescmstore,
         keys: Vec<(
             PyPathBuf,   /* path */
             Serde<HgId>, /* hgid */
@@ -518,7 +520,7 @@ pub trait SaplingRemoteApiPyExt: SaplingRemoteApi {
         use_sha1: bool,
     ) -> PyResult<(TStream<anyhow::Result<Serde<UploadToken>>>, PyFuture)> {
         let keys = to_keys_with_parents(py, &keys)?;
-        let store = as_legacystore(py, store)?;
+        let store = store.extract_inner(py);
 
         let file_content_id = |data: &[u8]| -> AnyFileContentId {
             if use_sha1 {
@@ -533,7 +535,7 @@ pub trait SaplingRemoteApiPyExt: SaplingRemoteApi {
 
         // Preupload LFS blobs
         store
-            .upload(
+            .upload_lfs(
                 &keys
                     .iter()
                     .map(|(key, _)| StoreKey::hgid(key.clone()))

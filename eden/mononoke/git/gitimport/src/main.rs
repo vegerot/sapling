@@ -281,7 +281,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
     } else {
         BackfillDerivation::AllConfiguredTypes
     };
-    let lfs = match repo.repo_config().git_lfs_interpret_pointers {
+    let lfs = match repo.repo_config().git_configs.git_lfs_interpret_pointers {
         true => GitImportLfs::new(
             args.lfs_server.ok_or_else(|| {
                 anyhow!("LFS server url is required when LFS is enabled in the repo config")
@@ -440,7 +440,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                         }
                     });
                     // Only upload the tag if it's new or has changed.
-                    if new_or_updated_tag {
+                    if new_or_updated_tag || reupload.reupload_commit() {
                         // The ref getting imported is a tag, so store the raw git Tag object.
                         upload_git_tag(&ctx, uploader.clone(), reader.clone(), tag_id).await?;
                         // Create the changeset corresponding to the commit pointed to by the tag.
@@ -471,7 +471,6 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                     .with_context(|| format!("failed to resolve bookmark {name}"))?
                     .map(|context| context.id());
                 let allow_non_fast_forward = true;
-                let affected_changesets_limit = Some(gitimport_result.len());
                 let operation =
                     BookmarkOperation::new(bookmark_key, old_changeset, Some(final_changeset))?;
                 set_bookmark(
@@ -480,7 +479,6 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                     &operation,
                     pushvars.as_ref(),
                     allow_non_fast_forward,
-                    affected_changesets_limit,
                     BookmarkOperationErrorReporting::WithContext,
                 )
                 .await?;

@@ -12,7 +12,6 @@ use std::task::Poll;
 use anyhow::Context;
 use anyhow::Ok;
 use anyhow::Result;
-use bonsai_tag_mapping::BonsaiTagMappingEntry;
 use bookmarks::BookmarkKey;
 use buffered_weighted::MemoryBound;
 use cloned::cloned;
@@ -66,6 +65,7 @@ use crate::utils::commits;
 use crate::utils::delta_base;
 use crate::utils::entry_weight;
 use crate::utils::filter_object;
+use crate::utils::tag_entries_to_hashes;
 use crate::utils::to_commit_stream;
 use crate::Repo;
 
@@ -492,7 +492,7 @@ async fn commit_packfile_stream<'a>(
 /// Convert the provided tag entries into a stream of packfile items
 fn tag_entries_to_stream<'a>(
     fetch_container: FetchContainer,
-    tag_entries: Vec<BonsaiTagMappingEntry>,
+    tag_entries: FxHashSet<GitSha1>,
 ) -> BoxStream<'a, Result<PackfileItem>> {
     let FetchContainer {
         ctx,
@@ -502,11 +502,11 @@ fn tag_entries_to_stream<'a>(
         ..
     } = fetch_container;
     stream::iter(tag_entries.into_iter().map(Ok))
-        .map_ok(move |entry| {
+        .map_ok(move |tag_hash| {
             let blobstore = blobstore.clone();
             let ctx = ctx.clone();
             async move {
-                let git_objectid = entry.tag_hash.to_object_id()?;
+                let git_objectid = tag_hash.to_object_id()?;
                 base_packfile_item(
                     ctx,
                     blobstore.clone(),
@@ -537,7 +537,10 @@ async fn tag_packfile_stream<'a>(
             if bookmark.is_tag() {
                 let tag_name = bookmark.name().to_string();
                 repo.bonsai_tag_mapping()
-                    .get_entry_by_tag_name(tag_name.clone())
+                    .get_entry_by_tag_name(
+                        tag_name.clone(),
+                        bonsai_tag_mapping::Freshness::MaybeStale,
+                    )
                     .await
                     .with_context(|| {
                         format!(
@@ -552,6 +555,13 @@ async fn tag_packfile_stream<'a>(
         })
         .try_collect::<Vec<_>>()
         .await?;
+    let annotated_tags = tag_entries_to_hashes(
+        annotated_tags,
+        fetch_container.ctx.clone(),
+        fetch_container.blobstore.clone(),
+        fetch_container.concurrency.tags,
+    )
+    .await?;
     let tags_count = annotated_tags.len();
     let tag_stream = tag_entries_to_stream(fetch_container, annotated_tags);
     Ok((tag_stream, tags_count))
@@ -565,7 +575,12 @@ async fn tags_packfile_stream<'a>(
     requested_commits: Vec<ChangesetId>,
     requested_tag_names: Arc<FxHashSet<String>>,
 ) -> Result<(BoxStream<'a, Result<PackfileItem>>, usize)> {
-    let (ctx, filter) = (fetch_container.ctx.clone(), fetch_container.filter.clone());
+    let (ctx, filter, blobstore, concurrency) = (
+        fetch_container.ctx.clone(),
+        fetch_container.filter.clone(),
+        fetch_container.blobstore.clone(),
+        fetch_container.concurrency,
+    );
     let include_tags = if let Some(filter) = filter.as_ref() {
         filter.include_tags()
     } else {
@@ -607,8 +622,11 @@ async fn tags_packfile_stream<'a>(
                 || requested_tag_names.contains(&entry.tag_name)
         })
         .collect::<Vec<_>>();
-    let tags_count = tag_entries.len();
-    let tag_stream = tag_entries_to_stream(fetch_container, tag_entries);
+    let exhaustive_tag_entries =
+        tag_entries_to_hashes(tag_entries, ctx, blobstore, concurrency.tags).await?;
+
+    let tags_count = exhaustive_tag_entries.len();
+    let tag_stream = tag_entries_to_stream(fetch_container, exhaustive_tag_entries);
     Ok((tag_stream, tags_count))
 }
 

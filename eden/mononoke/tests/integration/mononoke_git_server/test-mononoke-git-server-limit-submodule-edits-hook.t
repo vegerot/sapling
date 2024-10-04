@@ -11,10 +11,6 @@
   $ GIT_REPO_ORIGIN="${TESTTMP}/origin/repo-git"
   $ GIT_REPO_SUBMODULE="${TESTTMP}/origin/repo-submodule-git"
   $ GIT_REPO="${TESTTMP}/repo-git"
-  $ cat >> repos/repo/server.toml <<EOF
-  > [source_control_service]
-  > permit_writes = true
-  > EOF
 
   $ cat >> repos/repo/server.toml <<EOF
   > [[bookmarks]]
@@ -26,14 +22,6 @@
   > config_json='''{
   > "allow_edits_with_marker": "@update-submodule"
   > }'''
-  > EOF
-
-  $ merge_just_knobs <<EOF
-  > {
-  >   "bools": {
-  >     "scm/mononoke:run_hooks_on_additional_changesets": true
-  >   }
-  > }
   > EOF
 
 # Setup git repository
