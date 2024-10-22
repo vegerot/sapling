@@ -71,7 +71,7 @@ class EdenConfig : private ConfigSettingManager {
   EdenConfig& operator=(EdenConfig&& source) = delete;
 
   /**
-   * Create an EdenConfig for testing usage>
+   * Create an EdenConfig for testing usage
    */
   static std::shared_ptr<EdenConfig> createTestEdenConfig();
 
@@ -831,7 +831,7 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Controls the max number of blob metadata import requests we batch in
+   * Controls the max number of blob aux data import requests we batch in
    * SaplingBackingStore
    */
   ConfigSetting<uint32_t> importBatchSizeBlobMeta{
@@ -840,7 +840,7 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
-   * Controls the max number of tree metadata import requests we batch in
+   * Controls the max number of tree aux data import requests we batch in
    * SaplingBackingStore
    */
   ConfigSetting<uint32_t> importBatchSizeTreeMeta{
@@ -875,20 +875,6 @@ class EdenConfig : private ConfigSettingManager {
       "hg:cache-blobs-in-localstore",
       false,
       this};
-  /**
-   * List of paths to filter out when importing Mercurial trees.
-   *
-   * This config must be set prior to cloning as no cache flushing is performed
-   * when setting this config and thus setting this after a mount has been
-   * created will lead to undefined behavior.
-   *
-   * DO NOT USE UNLESS YOU HAVE THE OK FROM THE EDENFS TEAM.
-   */
-  ConfigSetting<std::shared_ptr<std::unordered_set<RelativePath>>>
-      hgFilteredPaths{
-          "hg:filtered-paths",
-          std::make_shared<std::unordered_set<RelativePath>>(),
-          this};
 
   /**
    * Should we use the cached `sl status` results or not
@@ -952,6 +938,15 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Scribe category is the first argument passed to the scribe_cat binary. This
+   * is used by the FileAccessStructuredLogger
+   */
+  ConfigSetting<std::string> fileAccessScribeCategory{
+      "telemetry:file-access-scribe-category",
+      "",
+      this};
+
+  /**
    * Controls which paths eden will log data fetches for when this is set.
    * Fetches for any paths that match the regex will be logged.
    */
@@ -1000,6 +995,15 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<uint32_t> requestSamplesPerMinute{
       "telemetry:request-samples-per-minute",
       0,
+      this};
+
+  /**
+   * Minimum interval between NFS stats updates in seconds. NFS stat collection
+   * only happens on macOS. Change this to 0 to disable NFS stat collection.
+   */
+  ConfigSetting<std::chrono::nanoseconds> updateNFSStatsInterval{
+      "telemetry:update-nfs-stats-interval",
+      std::chrono::seconds{0},
       this};
 
   /**
@@ -1461,9 +1465,19 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<uint64_t> fsckLogFrequency{"fsck:log-frequency", 10000, this};
 
   /**
-   * Should FSCK be run on multiple threads, or serialized.
+   * Should FSCK be run on multiple threads, or serialized. This option is
+   * specific to Windows.
    */
   ConfigSetting<bool> multiThreadedFsck{"fsck:multi-threaded", true, this};
+
+  /**
+   * The number of threads that the OverlayChecker will use when performing
+   * error discovery.
+   */
+  ConfigSetting<uint64_t> fsckNumErrorDiscoveryThreads{
+      "fsck:num-error-discovery-threads",
+      4,
+      this};
 
   // [glob]
 
@@ -1600,12 +1614,12 @@ class EdenConfig : private ConfigSettingManager {
       std::nullopt,
       this};
 
-  // [facebook]
-  // Facebook internal
+// [facebook]
+// Facebook internal
 
-  /**
-   * (Facebook Internal) Determines if EdenFS should use ServiceRouter.
-   */
+/**
+ * (Facebook Internal) Determines if EdenFS should use ServiceRouter.
+ */
 #ifdef EDEN_HAVE_SERVICEROUTER
   ConfigSetting<bool> enableServiceRouter{
       "facebook:enable-service-router",

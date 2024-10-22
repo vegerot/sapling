@@ -81,10 +81,10 @@ impl AffectedChangesets {
         }
     }
 
-    pub(crate) fn with_source_changesets(source_changesets: HashSet<BonsaiChangeset>) -> Self {
+    pub(crate) fn with_source_changesets(source_changesets: &[BonsaiChangeset]) -> Self {
         Self {
             new_changesets: HashMap::new(),
-            source_changesets,
+            source_changesets: source_changesets.iter().cloned().collect(),
             already_checked_changesets: HashSet::new(),
             should_bypass_checks_on_additional_changesets: false,
         }
@@ -111,10 +111,6 @@ impl AffectedChangesets {
 
     pub(crate) fn bypass_checks_on_additional_changesets(&mut self) {
         self.should_bypass_checks_on_additional_changesets = true;
-    }
-
-    fn adding_new_changesets_to_repo(&self) -> bool {
-        !self.source_changesets.is_empty() || !self.new_changesets.is_empty()
     }
 
     /// Load bonsais in the additional changeset range that are not already in
@@ -270,7 +266,6 @@ impl AffectedChangesets {
             // Aggregate any error loading changesets on a per-chunk basis
             .map(|chunk| chunk.into_iter().collect::<Result<Vec<_>, _>>())
             .try_fold(HashSet::new(), |mut checked_changesets, chunk| {
-                let adding_new_changesets_to_repo = self.adding_new_changesets_to_repo();
                 async move {
                     if needs_extras_check {
                         Self::check_extras(&chunk).await?;
@@ -281,11 +276,9 @@ impl AffectedChangesets {
                     }
                     if needs_hooks_check {
                         Self::check_changeset_hooks(
-                            adding_new_changesets_to_repo,
                             &chunk,
                             ctx,
                             authz,
-                            repo,
                             hook_manager,
                             bookmark,
                             pushvars,
@@ -541,41 +534,14 @@ impl AffectedChangesets {
     /// service-initiated pushrebase but hooks will run with taking this
     /// into account.
     async fn check_changeset_hooks(
-        adding_new_changesets_to_repo: bool,
         loaded_changesets: &[BonsaiChangeset],
         ctx: &CoreContext,
         authz: &AuthorizationContext,
-        repo: &impl Repo,
         hook_manager: &HookManager,
         bookmark: &BookmarkKey,
         pushvars: Option<&HashMap<String, Bytes>>,
         cross_repo_push_source: CrossRepoPushSource,
     ) -> Result<(), BookmarkMovementError> {
-        let skip_running_hooks_if_public: bool = repo
-            .repo_bookmark_attrs()
-            .select(bookmark)
-            .map(|attr| attr.params().allow_move_to_public_commits_without_hooks)
-            .any(|x| x);
-        if skip_running_hooks_if_public && !adding_new_changesets_to_repo {
-            // For some bookmarks we allow to skip running hooks if:
-            // 1) this is just a bookmark move i.e. no new commits are added or pushrebased to the repo
-            // 2) we are allowed to skip commits for a bookmark like that
-            // 3) if all commits that are affectd by this bookmark move are public (which means
-            //  we should have already ran hooks for these commits).
-
-            let cs_ids = loaded_changesets
-                .iter()
-                .map(|bcs| bcs.get_changeset_id())
-                .collect::<Vec<_>>();
-            let public = repo
-                .phases()
-                .get_public(ctx, cs_ids.clone(), false /* ephemeral_derive */)
-                .await?;
-            if public == cs_ids.into_iter().collect::<HashSet<_>>() {
-                return Ok(());
-            }
-        }
-
         if !loaded_changesets.is_empty() {
             let push_authored_by = if authz.is_service() {
                 PushAuthoredBy::Service
@@ -586,7 +552,7 @@ impl AffectedChangesets {
                 ctx,
                 hook_manager,
                 bookmark,
-                loaded_changesets.iter(),
+                loaded_changesets,
                 pushvars,
                 cross_repo_push_source,
                 push_authored_by,

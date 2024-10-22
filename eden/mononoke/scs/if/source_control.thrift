@@ -181,6 +181,9 @@ struct Repo {
 struct RepoInfo {
   1: string name;
   2: CommitIdentityScheme default_commit_identity_scheme;
+  /// Name of a large repo to which this repo is push redirected, i.e. when
+  /// the large repo is the source of truth.
+  3: optional string push_redirected_to;
 }
 
 struct CommitInfo {
@@ -1487,6 +1490,19 @@ struct CommitSparseProfileSizeParams {
   1: SparseProfiles profiles;
 }
 
+struct CommitSparseProfileSizeToken {
+  /// A target this token relates to
+  1: SparseProfiles target;
+  /// An actual token payload
+  2: i64 id;
+}
+
+struct CommitSparseProfileSizeParamsV2 {
+  1: CommitSpecifier commit;
+  /// list of sparse profiles for which calculate total size
+  2: SparseProfiles profiles;
+}
+
 struct TreeExistsParams {}
 
 struct TreeListParams {
@@ -2074,6 +2090,18 @@ struct CommitSparseProfileSizeResponse {
   1: SparseProfileSizes profiles_size;
 }
 
+union CommitSparseProfileSizeResult {
+  1: CommitSparseProfileSizeResponse success;
+  2: AsyncRequestError error;
+}
+
+struct PollPending {}
+
+union CommitSparseProfileSizePollResponse {
+  1: PollPending poll_pending;
+  2: CommitSparseProfileSizeResponse response;
+}
+
 struct TreeListResponse {
   /// The directory entries in this directory, at the offset requested,
   /// limited by the limit requested.
@@ -2355,6 +2383,11 @@ transient server exception InternalError {
 }
 
 transient server exception OverloadError {
+  @thrift.ExceptionMessage
+  1: string reason;
+}
+
+transient server exception PollError {
   @thrift.ExceptionMessage
   1: string reason;
 }
@@ -2826,6 +2859,25 @@ service SourceControlService extends fb303_core.BaseService {
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
+  );
+
+  /// Calculate the total size of each sparse profiles
+  CommitSparseProfileSizeToken commit_sparse_profile_size_async(
+    1: CommitSparseProfileSizeParamsV2 params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
+  /// Calculate the total size of each sparse profiles
+  CommitSparseProfileSizePollResponse commit_sparse_profile_size_poll(
+    1: CommitSparseProfileSizeToken token,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+    4: PollError poll_error,
   );
 
   /// Tree Methods

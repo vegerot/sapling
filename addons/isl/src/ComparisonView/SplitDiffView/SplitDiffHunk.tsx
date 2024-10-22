@@ -5,20 +5,20 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {Result} from '../../types';
 import type {TokenizedDiffHunk, TokenizedHunk} from './syntaxHighlightingTypes';
 import type {Context, OneIndexedLineNumber} from './types';
 import type {ReactNode} from 'react';
 import type {Hunk, ParsedDiff} from 'shared/patch/parse';
 
-import {T, t} from '../../i18n';
-import {useFetchLines} from '../ComparisonView';
 import SplitDiffRow, {BlankLineNumber} from './SplitDiffRow';
 import {useTableColumnSelection} from './copyFromSelectedColumn';
 import {useTokenizedContents, useTokenizedHunks} from './syntaxHighlighting';
 import {diffChars} from 'diff';
 import {ErrorNotice} from 'isl-components/ErrorNotice';
 import {Icon} from 'isl-components/Icon';
-import React, {useCallback, useState} from 'react';
+import React, {useCallback, useEffect, useState} from 'react';
+import {comparisonStringKey} from 'shared/Comparison';
 import organizeLinesIntoGroups from 'shared/SplitDiffView/organizeLinesIntoGroups';
 import {
   applyTokenizationToLine,
@@ -48,7 +48,8 @@ export const SplitDiffTable = React.memo(
       [expandedSeparators, setExpandedSeparators],
     );
 
-    const tokenization = useTokenizedHunks(patch.newFileName ?? '', patch.hunks);
+    const t = ctx.t ?? (s => s);
+    const tokenization = useTokenizedHunks(patch.newFileName ?? '', patch.hunks, ctx.useThemeHook);
 
     const {className: tableSelectionClassName, ...tableSelectionProps} = useTableColumnSelection();
 
@@ -79,7 +80,7 @@ export const SplitDiffTable = React.memo(
                 afterLineStart={1}
               />,
             );
-          } else if (ctx.supportsExpandingContext) {
+          } else if (ctx.fetchAdditionalLines != null) {
             const numLines = Math.max(hunk.oldStart, hunk.newStart) - 1;
             rows.push(
               <HunkSeparator key={key} numLines={numLines} onExpand={() => onExpand(key)} t={t} />,
@@ -109,7 +110,7 @@ export const SplitDiffTable = React.memo(
                 afterLineStart={hunk.newStart + hunk.newLines}
               />,
             );
-          } else if (ctx.supportsExpandingContext) {
+          } else if (ctx.fetchAdditionalLines != null) {
             const numLines = isLast ? null : nextHunk.oldStart - hunk.oldLines - hunk.oldStart;
             rows.push(
               <HunkSeparator key={key} numLines={numLines} onExpand={() => onExpand(key)} t={t} />,
@@ -510,8 +511,9 @@ function ExpandingSeparator({
   afterLineStart: number;
 }): React.ReactElement {
   const result = useFetchLines(ctx, numLines, start);
+  const t = ctx.t ?? (s => s);
 
-  const tokenization = useTokenizedContents(path, result?.value);
+  const tokenization = useTokenizedContents(path, result?.value, ctx.useThemeHook);
   if (result == null) {
     return (
       <SeparatorRow>
@@ -526,7 +528,7 @@ function ExpandingSeparator({
     return (
       <SeparatorRow>
         <div className="split-diff-view-error-row">
-          <ErrorNotice error={result.error} title={<T>Unable to fetch additional lines</T>} />
+          <ErrorNotice error={result.error} title={t('Unable to fetch additional lines')} />
         </div>
       </SeparatorRow>
     );
@@ -556,4 +558,22 @@ function SeparatorRow({children}: {children: React.ReactNode}): React.ReactEleme
       </td>
     </tr>
   );
+}
+
+/** Fetches context lines */
+function useFetchLines(ctx: Context, numLines: number, start: number) {
+  const [fetchedLines, setFetchedLines] = useState<Result<Array<string>> | undefined>(undefined);
+
+  // Use-case controlled key that allows invalidating the fetched lines.
+  const invalidationKey = ctx.useComparisonInvalidationKeyHook?.();
+
+  const comparisonKey = comparisonStringKey(ctx.id.comparison);
+  useEffect(() => {
+    ctx.fetchAdditionalLines?.(ctx.id, start, numLines).then(result => {
+      setFetchedLines(result);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [invalidationKey, ctx.id.path, comparisonKey, numLines, start]);
+
+  return fetchedLines;
 }

@@ -34,13 +34,26 @@ pub(crate) fn register(py: Python) {
     register_into(py, py_to_dyn_treestore);
 
     register_into(py, |py, f: filescmstore| f.to_read_file_contents(py));
+    register_into(py, |py, f: filescmstore| f.to_dyn_key_store(py));
+    register_into(py, |py, f: filescmstore| f.to_dyn_file_store(py));
 }
 
 impl filescmstore {
-    fn to_read_file_contents(&self, py: Python) -> Arc<dyn FileStore> {
+    fn to_arc_store(&self, py: Python) -> Arc<ArcFileStore> {
         let store = self.extract_inner(py);
-        let store = ArcFileStore(store);
-        Arc::new(store)
+        Arc::new(ArcFileStore(store))
+    }
+
+    fn to_read_file_contents(&self, py: Python) -> Arc<dyn FileStore> {
+        self.to_arc_store(py)
+    }
+
+    fn to_dyn_key_store(&self, py: Python) -> Arc<dyn KeyStore> {
+        self.to_arc_store(py)
+    }
+
+    fn to_dyn_file_store(&self, py: Python) -> Arc<dyn FileStore> {
+        self.to_arc_store(py)
     }
 }
 
@@ -59,17 +72,18 @@ fn py_to_dyn_treestore(_py: Python, obj: PyObject) -> Arc<dyn TreeStore> {
     Arc::new(ManifestStore::new(PythonHgIdDataStore::new(obj)))
 }
 
-struct ManifestStore<T> {
-    underlying: T,
+#[derive(Clone)]
+struct ManifestStore {
+    underlying: PythonHgIdDataStore,
 }
 
-impl<T> ManifestStore<T> {
-    pub fn new(underlying: T) -> Self {
+impl ManifestStore {
+    pub fn new(underlying: PythonHgIdDataStore) -> Self {
         ManifestStore { underlying }
     }
 }
 
-impl<T: HgIdDataStore + RemoteDataStore> KeyStore for ManifestStore<T> {
+impl KeyStore for ManifestStore {
     fn get_local_content(
         &self,
         path: &RepoPath,
@@ -98,6 +112,14 @@ impl<T: HgIdDataStore + RemoteDataStore> KeyStore for ManifestStore<T> {
             .collect::<Vec<_>>();
         self.underlying.prefetch(&keys).map(|_| ())
     }
+
+    fn clone_key_store(&self) -> Box<dyn KeyStore> {
+        Box::new(self.clone())
+    }
 }
 
-impl<T: HgIdDataStore + RemoteDataStore> TreeStore for ManifestStore<T> {}
+impl TreeStore for ManifestStore {
+    fn clone_tree_store(&self) -> Box<dyn TreeStore> {
+        Box::new(self.clone())
+    }
+}

@@ -537,8 +537,16 @@ inc
                 _ => Ok(None),
             }
         }
+
+        fn clone_key_store(&self) -> Box<dyn KeyStore> {
+            Box::new(self.clone())
+        }
     }
 
     #[async_trait::async_trait]
-    impl FileStore for StubCommit {}
+    impl FileStore for StubCommit {
+        fn clone_file_store(&self) -> Box<dyn FileStore> {
+            Box::new(self.clone())
+        }
+    }
 }

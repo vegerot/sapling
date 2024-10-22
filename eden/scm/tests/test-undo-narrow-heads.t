@@ -4,9 +4,9 @@
 
   $ eagerepo
   $ configure mutation
-  $ enable undo remotenames
+  $ enable undo
   $ setconfig extensions.extralog="$TESTDIR/extralog.py"
-  $ setconfig experimental.narrow-heads=true ui.interactive=true
+  $ setconfig ui.interactive=true
 
   $ newrepo
   $ drawdag << 'EOS'

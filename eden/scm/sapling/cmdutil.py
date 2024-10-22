@@ -26,7 +26,6 @@ import bindings
 from bindings import renderdag
 
 from sapling import tracing
-from sapling.ext.extlib.phabricator import PHABRICATOR_COMMIT_MESSAGE_TAGS
 
 from . import (
     bookmarks,
@@ -66,6 +65,7 @@ from . import (
 from .i18n import _, _x
 from .node import hex, nullid, nullrev, short
 from .pycompat import ensureunicode, range
+from .utils import subtreeutil
 
 if typing.TYPE_CHECKING:
     from .ui import ui
@@ -1915,10 +1915,7 @@ def export(
     dest = "<unnamed>"
     if fp:
         dest = getattr(fp, "name", dest)
-
-        def write(s, **kw):
-            fp.write(s)
-
+        write = lambda s, **kw: fp.write(s)
     elif not fntemplate:
         write = repo.ui.writebytes
         writestr = repo.ui.write
@@ -1941,9 +1938,7 @@ def export(
                 modemap=filemode,
             )
             dest = getattr(fo, "name", "<unnamed>")
-
-            def write(s, **kw):
-                fo.write(s)
+            write = lambda s, **kw: fo.write(s)
 
         if not dest.startswith("<"):
             repo.ui.note("%s\n" % dest)
@@ -3312,8 +3307,6 @@ def getloglinerangerevs(repo, userrevs, opts):
                 linerange
             )
 
-    filematcher = None
-    hunksfilter = None
     if opts.get("patch") or opts.get("stat"):
 
         def nofilterhunksfn(fctx, hunks):
@@ -3342,6 +3335,10 @@ def getloglinerangerevs(repo, userrevs, opts):
         def filematcher(rev):
             files = list(linerangesbyrev.get(rev, []))
             return scmutil.matchfiles(repo, files)
+
+    else:
+        filematcher = None
+        hunksfilter = None
 
     revs = sorted(linerangesbyrev, reverse=True)
 
@@ -3685,7 +3682,7 @@ def eden_files(ui, ctx, m, fm, fmt):
     return ret
 
 
-def remove(ui, repo, m, prefix, mark, force, warnings=None):
+def remove(ui, repo, m, mark, force, warnings=None):
     ret = 0
     clean = force or not mark
     s = repo.status(match=m, clean=clean)
@@ -5008,8 +5005,8 @@ def registerdiffgrafts(from_paths, to_paths, *ctxs):
     if not ctxs:
         return error.ProgrammingError("registerdiffgrafts() requires ctxs")
 
-    scmutil.validate_path_size(from_paths, to_paths)
-    scmutil.validate_path_overlap(to_paths)
+    subtreeutil.validate_path_size(from_paths, to_paths)
+    subtreeutil.validate_path_overlap(from_paths, to_paths)
 
     for ctx in ctxs:
         manifest = ctx.manifest()

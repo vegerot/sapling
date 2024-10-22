@@ -40,11 +40,11 @@ constexpr auto kTimeout = std::chrono::seconds{1};
 constexpr size_t kStartingInodeWidth = 5;
 static const auto kTreeEmoji =
     reinterpret_cast<const char*>(u8"\U0001F332"); // 🌲
-static const auto kTreeMetaEmoji =
+static const auto kTreeAuxEmoji =
     reinterpret_cast<const char*>(u8"U000100B7"); // 𐂷
 static const auto kBlobEmoji =
     reinterpret_cast<const char*>(u8"\U0001F4C4"); // 📄
-static const auto kBlobMetaEmoji =
+static const auto kBlobAuxEmoji =
     reinterpret_cast<const char*>(u8"\U0001F5C2\U00000020"); // 🗂️
 static const auto kRequestStartEmoji =
     reinterpret_cast<const char*>(u8"\u2193"); // ↓
@@ -99,8 +99,8 @@ static const std::unordered_map<InodeEventProgress, const char*>
 static const std::unordered_map<HgResourceType, const char*> kResourceTypes = {
     {HgResourceType::BLOB, kBlobEmoji},
     {HgResourceType::TREE, kTreeEmoji},
-    {HgResourceType::BLOBMETA, kBlobMetaEmoji},
-    {HgResourceType::TREEMETA, kTreeMetaEmoji},
+    {HgResourceType::BLOBMETA, kBlobAuxEmoji},
+    {HgResourceType::TREEMETA, kTreeAuxEmoji},
 };
 
 static const std::unordered_map<HgImportPriority, const char*>
@@ -273,8 +273,9 @@ void print_hg_event(
 
   std::string processInfo;
   if (auto requestInfo = evt.requestInfo()) {
-    auto* pid = requestInfo.value().get_pid();
-    auto* processName = requestInfo.value().get_processName();
+    auto* pid = apache::thrift::get_pointer(requestInfo.value().pid());
+    auto* processName =
+        apache::thrift::get_pointer(requestInfo.value().processName());
     if (pid && processName) {
       processInfo = fmt::format("{}({})", *pid, processName->c_str());
     } else if (pid) {

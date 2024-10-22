@@ -4,7 +4,7 @@
 
 
   $ configure dummyssh mutation-norecord
-  $ enable amend arcdiff commitcloud infinitepush rebase remotenames share
+  $ enable amend arcdiff commitcloud infinitepush rebase share
   $ setconfig extensions.arcconfig="$TESTDIR/../sapling/ext/extlib/phabricator/arcconfig.py"
   $ setconfig infinitepush.branchpattern="re:scratch/.*" commitcloud.hostname=testhost
   $ readconfig <<EOF
@@ -144,7 +144,6 @@ Test for `hg diff --since-last-submit`
   commitcloud: nothing to upload
   pulling 1166f984c176 from ssh://user@dummy/server
   searching for changes
-  fetching revlog data for 1 commits
   commitcloud: commits synchronized
   finished in * (glob)
 
@@ -177,7 +176,6 @@ Test for `hg diff --since-last-submit`
   commitcloud: nothing to upload
   pulling 1166f984c176 from ssh://user@dummy/server
   searching for changes
-  fetching revlog data for 1 commits
   commitcloud: commits synchronized
   finished in * (glob)
 

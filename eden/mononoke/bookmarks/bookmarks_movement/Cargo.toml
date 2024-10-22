@@ -28,7 +28,7 @@ futures_ext = { version = "0.1.0", git = "https://github.com/facebookexperimenta
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 git_source_of_truth = { version = "0.1.0", path = "../../git_source_of_truth" }
 hooks = { version = "0.1.0", path = "../../hooks" }
-itertools = "0.11.0"
+itertools = "0.13.0"
 justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
@@ -49,7 +49,7 @@ repo_permission_checker = { version = "0.1.0", path = "../../repo_attributes/rep
 repo_update_logger = { version = "0.1.0", path = "../../features/repo_update_logger" }
 skeleton_manifest = { version = "0.1.0", path = "../../derived_data/skeleton_manifest" }
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-thiserror = "1.0.49"
+thiserror = "1.0.64"
 
 [dev-dependencies]
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }

@@ -18,6 +18,7 @@
 
   $ touch base
   $ hg commit -Aqm base
+  $ hg book master
   $ cd ..
 
   $ hgcloneshallow ssh://user@dummy/server shallow -q

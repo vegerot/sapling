@@ -10,6 +10,7 @@
 
 # Setup
 
+
   $ cat > $TESTTMP/pretxnchangegroup.sh << 'EOF'
   > env | egrep "^HG_USERVAR_(DEBUG|BYPASS_REVIEW)" | sort
   > exit 0
@@ -30,7 +31,7 @@
   $ cd ../child
   $ echo b > a
   $ hg commit -Aqm a
-  $ hg push --pushvars 'DEBUG=1' --pushvars 'BYPASS_REVIEW=true' --config 'push.pushvars.server=False'
+  $ hg push --pushvars 'DEBUG=1' --pushvars 'BYPASS_REVIEW=true' --config 'push.pushvars.server=False' --allow-anon
   pushing to $TESTTMP/repo
   searching for changes
   adding changesets
@@ -44,7 +45,7 @@
   $ cd ../child
   $ echo b >> a
   $ hg commit -Aqm a
-  $ hg push --pushvars 'DEBUG=1' --pushvars 'BYPASS_REVIEW=true'
+  $ hg push --pushvars 'DEBUG=1' --pushvars 'BYPASS_REVIEW=true' --allow-anon
   pushing to $TESTTMP/repo
   searching for changes
   adding changesets
@@ -57,7 +58,7 @@
 
   $ echo b >> a
   $ hg commit -Aqm a
-  $ hg push --pushvars 'DEBUG='
+  $ hg push --pushvars 'DEBUG=' --allow-anon
   pushing to $TESTTMP/repo
   searching for changes
   adding changesets
@@ -69,7 +70,7 @@
 
   $ echo b >> a
   $ hg commit -Aqm b
-  $ hg push --pushvars DEBUG
+  $ hg push --pushvars DEBUG --allow-anon
   pushing to $TESTTMP/repo
   searching for changes
   abort: unable to parse variable 'DEBUG', should follow 'KEY=VALUE' or 'KEY=' format
@@ -90,7 +91,7 @@
   > pretxnchangegroup.pyhook = python:$TESTTMP/pyhook.py:hook
   > EOF
 
-  $ hg push --pushvars 'A=1' --pushvars 'B=2'
+  $ hg push --pushvars 'A=1' --pushvars 'B=2' --allow-anon
   pushing to $TESTTMP/repo
   searching for changes
   adding changesets
@@ -114,7 +115,7 @@
   abort: "Because I said so"
   (use `--pushvars PUSH_REASON='because ...'`)
   [255]
-  $ hg push --pushvars 'PUSH_REASON=I want to'
+  $ hg push --pushvars 'PUSH_REASON=I want to' --allow-anon
   pushing to $TESTTMP/repo
   searching for changes
   adding changesets

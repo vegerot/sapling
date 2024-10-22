@@ -42,6 +42,7 @@ use clientinfo_async::with_client_request_info_scope;
 use configmodel::convert::ByteCount;
 use configmodel::Config;
 use configmodel::ConfigExt;
+use format_util::strip_file_metadata;
 use fs_err::File;
 use futures::future::FutureExt;
 use futures::stream::iter;
@@ -49,7 +50,6 @@ use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
 use hg_http::http_client;
 use hg_http::http_config;
-use hgstore::strip_hg_file_metadata;
 use http::status::StatusCode;
 use http_client::Encoding;
 use http_client::HttpClient;
@@ -80,6 +80,7 @@ use rand::thread_rng;
 use rand::Rng;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
+use storemodel::SerializationFormat;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tokio::time::timeout;
@@ -830,7 +831,7 @@ pub(crate) fn lfs_from_hg_file_blob(
     hgid: HgId,
     raw_content: &Bytes,
 ) -> Result<(LfsPointersEntry, Bytes)> {
-    let (data, copy_from) = strip_hg_file_metadata(raw_content)?;
+    let (data, copy_from) = strip_file_metadata(raw_content, SerializationFormat::Hg)?;
     let pointer = LfsPointersEntry::from_file_content(hgid, &data, copy_from)?;
     Ok((pointer, data))
 }
@@ -2115,6 +2116,7 @@ mod tests {
     use std::str::FromStr;
 
     use quickcheck::quickcheck;
+    use storemodel::SerializationFormat;
     use tempfile::TempDir;
     use types::testutil::*;
 
@@ -2467,7 +2469,7 @@ mod tests {
             };
 
             let with_metadata = rebuild_metadata(data.clone(), &pointer);
-            let (without, copy) = strip_hg_file_metadata(&with_metadata)?;
+            let (without, copy) = strip_file_metadata(&with_metadata, SerializationFormat::Hg)?;
 
             Ok(data == without && copy == copy_from)
         }
@@ -2518,6 +2520,7 @@ mod tests {
             &dir,
             &indexedlog_config,
             StoreType::Rotated,
+            SerializationFormat::Hg,
         )?);
 
         let multiplexer = LfsMultiplexer::new(lfs, indexedlog.clone(), 10);
@@ -2556,6 +2559,7 @@ mod tests {
             &dir,
             &indexedlog_config,
             StoreType::Rotated,
+            SerializationFormat::Hg,
         )?);
 
         let multiplexer = LfsMultiplexer::new(lfs, indexedlog.clone(), 4);
@@ -2594,6 +2598,7 @@ mod tests {
             &dir,
             &indexedlog_config,
             StoreType::Rotated,
+            SerializationFormat::Hg,
         )?);
 
         let multiplexer = LfsMultiplexer::new(lfs, indexedlog.clone(), 4);
@@ -2672,6 +2677,7 @@ mod tests {
             &dir,
             &indexedlog_config,
             StoreType::Rotated,
+            SerializationFormat::Hg,
         )?);
 
         let multiplexer = LfsMultiplexer::new(lfs, indexedlog.clone(), 4);
@@ -2753,6 +2759,7 @@ mod tests {
             &dir,
             &indexedlog_config,
             StoreType::Rotated,
+            SerializationFormat::Hg,
         )?);
 
         let blob = Bytes::from(&b"\x01\nTHIS IS A BLOB WITH A HEADER"[..]);

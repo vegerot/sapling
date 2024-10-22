@@ -14,7 +14,6 @@ dott_test(
             ],
         ),
     deps = [
-        "//eden/mononoke:admin",
         "//eden/mononoke:blobimport",
         "//eden/mononoke:mononoke",
         # TODO: This is required for test-getpackv2-multibyte-filenames.t, as
@@ -41,5 +40,7 @@ dott_test(
     deps = [
         "//eden/mononoke:blobimport",
         "//eden/mononoke:mononoke",
+        "//eden/mononoke/tools/admin:newadmin",
+        "//eden/mononoke/tools/testtool:testtool",
     ],
 )

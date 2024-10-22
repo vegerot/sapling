@@ -10,20 +10,23 @@ import type {ValidatedRepoInfo} from './types';
 import type {ReactNode} from 'react';
 
 import {Delayed} from './Delayed';
+import {LogRenderExposures} from './analytics/LogRenderExposures';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {T, t} from './i18n';
 import {
   EXIT_CODE_FORGET,
   operationList,
   queuedOperations,
+  queuedOperationsErrorAtom,
   useAbortRunningOperation,
 } from './operationsState';
 import {repositoryInfo} from './serverAPIState';
 import {processTerminalLines} from './terminalOutput';
 import {CommandRunner} from './types';
 import {short} from './utils';
+import {Banner, BannerKind} from 'isl-components/Banner';
 import {Button} from 'isl-components/Button';
-import {Row} from 'isl-components/Flex';
+import {Column, Row} from 'isl-components/Flex';
 import {Icon} from 'isl-components/Icon';
 import {Subtle} from 'isl-components/Subtle';
 import {Tooltip} from 'isl-components/Tooltip';
@@ -95,13 +98,16 @@ function OperationDescription(props: {
 }
 
 const nextToRunCollapsedAtom = atom(false);
+const queueErrorCollapsedAtom = atom(true);
 
 export function CommandHistoryAndProgress() {
   const list = useAtomValue(operationList);
   const queued = useAtomValue(queuedOperations);
+  const [queuedError, setQueuedError] = useAtom(queuedOperationsErrorAtom);
   const abortRunningOperation = useAbortRunningOperation();
 
   const [collapsed, setCollapsed] = useAtom(nextToRunCollapsedAtom);
+  const [errorCollapsed, setErrorCollapsed] = useAtom(queueErrorCollapsedAtom);
 
   const info = useAtomValue(repositoryInfo);
   if (info?.type !== 'success') {
@@ -170,10 +176,68 @@ export function CommandHistoryAndProgress() {
 
   const processedLines = processTerminalLines(progress.commandOutput ?? []);
 
-  const MAX_VISIBLE_NEXT_TO_RUN = 10;
-
   return (
     <div className="progress-container" data-testid="progress-container">
+      {queuedError != null || queued.length > 0 ? (
+        <div className="queued-operations-container" data-testid="queued-commands">
+          {queuedError != null && (
+            <LogRenderExposures eventName="QueueCancelledWarningShown">
+              <Column alignStart data-testid="cancelled-queued-commands">
+                <Tooltip
+                  title={t(
+                    'When an operation process fails or is aborted, any operations queued after that are cancelled, as they may depend on the previous operation succeeding.',
+                  )}>
+                  <Row
+                    style={{cursor: 'pointer'}}
+                    onClick={() => {
+                      setErrorCollapsed(!errorCollapsed);
+                    }}>
+                    <Icon icon={errorCollapsed ? 'chevron-right' : 'chevron-down'} />
+                    <Banner kind={BannerKind.warning}>
+                      <Icon icon="warning" color="yellow" />
+                      <T count={queuedError.operations.length}>queuedOperationsWereCancelled</T>
+                    </Banner>
+                    <Tooltip title={t('Dismiss')}>
+                      <Button
+                        icon
+                        onClick={() => {
+                          setQueuedError(undefined);
+                        }}>
+                        <Icon icon="x" />
+                      </Button>
+                    </Tooltip>
+                  </Row>
+                </Tooltip>
+                {errorCollapsed ? null : (
+                  <TruncatedOperationList operations={queuedError.operations} info={info} />
+                )}
+              </Column>
+            </LogRenderExposures>
+          )}
+          {queued.length > 0 ? (
+            <>
+              <Row
+                style={{cursor: 'pointer'}}
+                onClick={() => {
+                  setCollapsed(!collapsed);
+                }}>
+                <Icon icon={collapsed ? 'chevron-right' : 'chevron-down'} />
+                <strong>
+                  <T>Next to run</T>
+                </strong>
+              </Row>
+              {collapsed ? (
+                <div>
+                  <T count={queued.length}>moreCommandsToRun</T>
+                </div>
+              ) : (
+                <TruncatedOperationList operations={queued} info={info} />
+              )}
+            </>
+          ) : null}
+        </div>
+      ) : null}
+
       <Tooltip
         component={() => (
           <div className="progress-command-tooltip">
@@ -201,42 +265,6 @@ export function CommandHistoryAndProgress() {
             )}
           </div>
         )}>
-        {queued.length > 0 ? (
-          <div className="queued-operations-container" data-testid="queued-commands">
-            <Row
-              style={{cursor: 'pointer'}}
-              onClick={() => {
-                setCollapsed(!collapsed);
-              }}>
-              <Icon icon={collapsed ? 'chevron-right' : 'chevron-down'} />
-              <strong>
-                <T>Next to run</T>
-              </strong>
-            </Row>
-            {collapsed ? (
-              <div>
-                <T count={queued.length}>moreCommandsToRun</T>
-              </div>
-            ) : (
-              <>
-                {(queued.length > MAX_VISIBLE_NEXT_TO_RUN
-                  ? queued.slice(0, MAX_VISIBLE_NEXT_TO_RUN)
-                  : queued
-                ).map(op => (
-                  <div key={op.id} id={op.id} className="queued-operation">
-                    <OperationDescription info={info} operation={op} />
-                  </div>
-                ))}
-                {queued.length > MAX_VISIBLE_NEXT_TO_RUN && (
-                  <div>
-                    <T replace={{$count: queued.length - MAX_VISIBLE_NEXT_TO_RUN}}>+$count more</T>
-                  </div>
-                )}
-              </>
-            )}
-          </div>
-        ) : null}
-
         <div className="progress-container-row">
           {icon}
           {label}
@@ -259,6 +287,33 @@ export function CommandHistoryAndProgress() {
         {abort}
       </Tooltip>
     </div>
+  );
+}
+
+const MAX_VISIBLE_NEXT_TO_RUN = 10;
+function TruncatedOperationList({
+  info,
+  operations,
+}: {
+  info: ValidatedRepoInfo;
+  operations: Array<Operation>;
+}) {
+  return (
+    <>
+      {(operations.length > MAX_VISIBLE_NEXT_TO_RUN
+        ? operations.slice(0, MAX_VISIBLE_NEXT_TO_RUN)
+        : operations
+      ).map(op => (
+        <div key={op.id} id={op.id} className="queued-operation">
+          <OperationDescription info={info} operation={op} />
+        </div>
+      ))}
+      {operations.length > MAX_VISIBLE_NEXT_TO_RUN && (
+        <div>
+          <T replace={{$count: operations.length - MAX_VISIBLE_NEXT_TO_RUN}}>+$count more</T>
+        </div>
+      )}
+    </>
   );
 }
 

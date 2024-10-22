@@ -21,12 +21,13 @@ LATEST_CONFIG_VERSION_NAME="INITIAL_IMPORT_SYNC_CONFIG"
 # By default, the `git_submodules_action` will be `STRIP`, meaning that any
 # changes to git submodules will not be synced to the large repo.
 function default_small_repo_config {
+  local repo_folder=${SMALL_REPO_DIR-smallrepofolder1}
   jq . << EOF
   {
     "repoid": $SUBMODULE_REPO_ID,
     "default_action": "prepend_prefix",
-    "default_prefix": "smallrepofolder1",
-    "bookmark_prefix": "bookprefix1/",
+    "default_prefix": "$repo_folder",
+    "bookmark_prefix": "$repo_folder/",
     "mapping": {
       "special": "specialsmallrepofolder_after_change"
     },
@@ -39,6 +40,7 @@ EOF
 # By default, the `git_submodules_action` will be `STRIP`, meaning that any
 # changes to git submodules will not be synced to the large repo.
 function default_initial_import_config {
+  repo_folder=${SMALL_REPO_DIR-smallrepofolder1}
   SMALL_REPO_CFG=$(default_small_repo_config)
   jq . << EOF
   {
@@ -47,7 +49,7 @@ function default_initial_import_config {
         "versions": [
           {
             "large_repo_id": $LARGE_REPO_ID,
-            "common_pushrebase_bookmarks": ["master"],
+            "common_pushrebase_bookmarks": ["master_bookmark"],
             "small_repos": [
               $SMALL_REPO_CFG
             ],
@@ -55,12 +57,12 @@ function default_initial_import_config {
           }
         ],
         "common": {
-          "common_pushrebase_bookmarks": ["master"],
+          "common_pushrebase_bookmarks": ["master_bookmark"],
           "large_repo_id": $LARGE_REPO_ID,
           "small_repos": {
             "$SUBMODULE_REPO_ID": {
-              "bookmark_prefix": "bookprefix1/",
-              "common_pushrebase_bookmarks_map": { "master": "heads/master" }
+              "bookmark_prefix": "$repo_folder/",
+              "common_pushrebase_bookmarks_map": { "master_bookmark": "heads/master_bookmark" }
             }
           }
         }
@@ -113,6 +115,22 @@ function run_common_xrepo_sync_with_gitsubmodules_setup {
   INFINITEPUSH_ALLOW_WRITES=true REPOID="$SUBMODULE_REPO_ID" \
     REPONAME="$SUBMODULE_REPO_NAME" COMMIT_IDENTITY_SCHEME=3 setup_common_config "$REPOTYPE"
 
+  # Save a copy of the config before the deny_files hook, so we can disable it later
+  cp "$TESTTMP/mononoke-config/repos/$LARGE_REPO_NAME/server.toml" "$TESTTMP/old_large_repo_config.toml"
+  # Disable pushes to small repo's directory in large repo
+  cat >> "$TESTTMP/mononoke-config/repos/$LARGE_REPO_NAME/server.toml" << CONFIG
+[[bookmarks]]
+name="$MASTER_BOOKMARK_NAME"
+[[bookmarks.hooks]]
+hook_name="deny_files"
+[[hooks]]
+name="deny_files"
+[hooks.config_string_lists]
+  native_push_only_deny_patterns = [
+    "^$SMALL_REPO_DIR/",
+  ]
+CONFIG
+
   # Set the REPONAME environment variable to the large repo name, so that all
   # sapling commands run with the large repo by default.
   # The small repos don't support sapling, because hg types are not derived in
@@ -127,7 +145,7 @@ function run_common_xrepo_sync_with_gitsubmodules_setup {
   testtool_drawdag -R "$LARGE_REPO_NAME" --no-default-files <<EOF
 L_A
 # modify: L_A "file_in_large_repo.txt" "first file"
-# bookmark: L_A master
+# bookmark: L_A master_bookmark
 EOF
 
   # Setting up mutable counter for live forward sync
@@ -144,9 +162,9 @@ function sl_log() {
 function clone_and_log_large_repo {
   LARGE_BCS_IDS=( "$@" )
   cd "$TESTTMP" || exit
-  hg clone -q mono:$LARGE_REPO_NAME "$LARGE_REPO_NAME"
-  cd "$LARGE_REPO_NAME" || exit
+  clone_large_repo
 
+  cd "$LARGE_REPO_NAME" || exit
 
   for LARGE_BCS_ID in "${LARGE_BCS_IDS[@]}"; do
     LARGE_CS_ID=$(mononoke_newadmin convert --from bonsai --to hg -R "$LARGE_REPO_NAME" "$LARGE_BCS_ID" --derive)
@@ -157,9 +175,9 @@ function clone_and_log_large_repo {
 
   sl_log --stat -r "sort(all(), desc)"
 
-  printf "\n\nRunning mononoke_admin to verify mapping\n\n"
+  printf "\n\nRunning mononoke_newadmin to verify mapping\n\n"
   for LARGE_BCS_ID in "${LARGE_BCS_IDS[@]}"; do
-    quiet_grep RewrittenAs -- with_stripped_logs mononoke_admin_source_target "$LARGE_REPO_ID" "$SUBMODULE_REPO_ID" crossrepo map "$LARGE_BCS_ID"
+    quiet_grep RewrittenAs -- with_stripped_logs mononoke_newadmin cross-repo --source-repo-id "$LARGE_REPO_ID" --target-repo-id "$SUBMODULE_REPO_ID" map -i "$LARGE_BCS_ID"
   done
 
   printf "\nDeriving all the enabled derived data types\n"
@@ -167,4 +185,15 @@ function clone_and_log_large_repo {
     quiet mononoke_newadmin derived-data -R "$LARGE_REPO_NAME" derive --all-types \
       -i "$LARGE_BCS_ID" 2>&1| rg "Error" || true # filter to keep only Error line if there is an error
   done
+}
+
+# Clone the large repo if it hasn't been cloned yet
+function clone_large_repo {
+  orig_pwd=$(pwd)
+  cd "$TESTTMP" || exit
+  if [ ! -d "$LARGE_REPO_NAME" ]; then
+    hg clone -q "mono:$LARGE_REPO_NAME" "$LARGE_REPO_NAME"
+  fi
+
+  cd "$orig_pwd" || exit
 }

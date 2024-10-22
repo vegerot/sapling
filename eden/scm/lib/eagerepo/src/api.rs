@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Write;
@@ -55,12 +56,15 @@ use edenapi::types::HgMutationEntryContent;
 use edenapi::types::HistoryEntry;
 use edenapi::types::IndexableId;
 use edenapi::types::Key;
+use edenapi::types::LandStackData;
+use edenapi::types::LandStackResponse;
 use edenapi::types::LookupResponse;
 use edenapi::types::LookupResult;
 use edenapi::types::NodeInfo;
 use edenapi::types::Parents;
 use edenapi::types::RepoPathBuf;
 use edenapi::types::SaplingRemoteApiServerError;
+use edenapi::types::ServerError;
 use edenapi::types::SetBookmarkResponse;
 use edenapi::types::SuffixQueryResponse;
 use edenapi::types::TreeAttributes;
@@ -78,17 +82,26 @@ use edenapi::ResponseMeta;
 use edenapi::SaplingRemoteApi;
 use edenapi::SaplingRemoteApiError;
 use edenapi_trait as edenapi;
+use format_util::git_sha1_deserialize;
+use format_util::hg_sha1_deserialize;
 use futures::stream::BoxStream;
 use futures::stream::TryStreamExt;
 use futures::StreamExt;
 use http::StatusCode;
 use http::Version;
+use manifest::DiffType;
+use manifest::Manifest;
 use manifest_tree::Flag;
+use manifest_tree::TreeManifest;
 use minibytes::Bytes;
 use mutationstore::MutationEntry;
 use nonblocking::non_blocking_result;
+use pathmatcher::AlwaysMatcher;
 use repourl::RepoUrl;
 use storemodel::types::AugmentedTreeWithDigest;
+use storemodel::InsertOpts;
+use storemodel::KeyStore;
+use storemodel::Kind;
 use storemodel::SerializationFormat;
 use tracing::debug;
 use tracing::error;
@@ -117,12 +130,16 @@ impl SaplingRemoteApi for EagerRepo {
     }
 
     async fn capabilities(&self) -> Result<Vec<String>, SaplingRemoteApiError> {
-        Ok(vec![
+        let mut caps = vec![
             "segmented-changelog".to_string(),
             "commit-graph-segments".to_string(),
             // Inform client that we only support sha1 content addressing.
             "sha1-only".to_string(),
-        ])
+        ];
+        if matches!(self.format(), SerializationFormat::Git) {
+            caps.push("git-format".to_string());
+        }
+        Ok(caps)
     }
 
     async fn files(&self, keys: Vec<Key>) -> edenapi::Result<Response<FileResponse>> {
@@ -132,14 +149,14 @@ impl SaplingRemoteApi for EagerRepo {
         for key in keys {
             let id = key.hgid;
             let data = self.get_sha1_blob_for_api(id, "files")?;
-            let (p1, p2) = extract_p1_p2(&data);
-            let parents = Parents::new(p1, p2);
+
+            let (parents, body) = sha1_blob_to_parents_body(&data, self.format())?;
+
             let entry = FileEntry {
                 key: key.clone(),
                 parents,
-                // PERF: to_vec().into() converts minibytes::Bytes to bytes::Bytes.
                 content: Some(FileContent {
-                    hg_file_blob: extract_body(&data).to_vec().into(),
+                    hg_file_blob: body,
                     metadata: Default::default(),
                 }),
                 aux_data: None,
@@ -170,8 +187,8 @@ impl SaplingRemoteApi for EagerRepo {
             let key = spec.key;
             let id = key.hgid;
             let data = self.get_sha1_blob_for_api(id, "files_attrs")?;
-            let (p1, p2) = extract_p1_p2(&data);
-            let parents = Parents::new(p1, p2);
+
+            let (parents, body) = sha1_blob_to_parents_body(&data, self.format())?;
 
             let mut entry = FileEntry {
                 key: key.clone(),
@@ -180,16 +197,14 @@ impl SaplingRemoteApi for EagerRepo {
                 aux_data: None,
             };
 
-            // PERF: to_vec().into() converts minibytes::Bytes to bytes::Bytes.
-            let file_body = extract_body(&data).to_vec();
-
             if spec.attrs.aux_data {
-                entry.aux_data = Some(FileAuxData::from_content(&file_body));
+                // NOTE: "body" includes the hg filelog header. Is it right?
+                entry.aux_data = Some(FileAuxData::from_content(&body));
             }
 
             if spec.attrs.content {
                 entry.content = Some(FileContent {
-                    hg_file_blob: file_body.into(),
+                    hg_file_blob: body,
                     metadata: Default::default(),
                 });
             }
@@ -223,9 +238,11 @@ impl SaplingRemoteApi for EagerRepo {
                 continue;
             };
 
+            let (parents, body) = sha1_blob_to_parents_body(&data, self.format())?;
+
             // NOTE: Order of p1, p2 are not preserved, unlike revlog hg.
             // It should be okay correctness-wise.
-            let (p1, p2) = extract_p1_p2(&data);
+            let (p1, p2) = parents.into_nodes();
             let mut key1 = Key {
                 path: key.path.clone(),
                 hgid: p1,
@@ -234,7 +251,7 @@ impl SaplingRemoteApi for EagerRepo {
                 path: key.path.clone(),
                 hgid: p2,
             };
-            if let Some(renamed_from) = extract_rename(&extract_body(&data)) {
+            if let Some(renamed_from) = extract_rename(&body) {
                 if p1.is_null() {
                     key1 = renamed_from;
                 } else {
@@ -302,20 +319,18 @@ impl SaplingRemoteApi for EagerRepo {
             }
         } else {
             for key in keys {
-                let data = self.get_sha1_blob_for_api(key.hgid, "trees")?;
+                let sha1_blob = self.get_sha1_blob_for_api(key.hgid, "trees")?;
+                let (parents, body) = sha1_blob_to_parents_body(&sha1_blob, self.format())?;
                 let mut entry = TreeEntry {
                     key: key.clone(),
                     ..Default::default()
                 };
 
                 if attributes.manifest_blob {
-                    // PERF: to_vec().into() converts minibytes::Bytes to bytes::Bytes.
-                    entry.data = Some(extract_body(&data).to_vec().into());
+                    entry.data = Some(body.clone());
                 }
 
                 if attributes.parents {
-                    let (p1, p2) = extract_p1_p2(&data);
-                    let parents = Parents::new(p1, p2);
                     entry.parents = Some(parents);
                 }
 
@@ -323,8 +338,7 @@ impl SaplingRemoteApi for EagerRepo {
                     let mut children: Vec<Result<TreeChildEntry, SaplingRemoteApiServerError>> =
                         Vec::new();
 
-                    let tree_entry =
-                        manifest_tree::TreeEntry(extract_body(&data), SerializationFormat::Hg);
+                    let tree_entry = manifest_tree::TreeEntry(body, self.format());
                     for child in tree_entry.elements() {
                         let child = match child {
                             Ok(child) => child,
@@ -339,11 +353,16 @@ impl SaplingRemoteApi for EagerRepo {
 
                         match child.flag {
                             Flag::File(_) => {
-                                let file_with_parents =
+                                let file_sha1_blob =
                                     self.get_sha1_blob_for_api(child.hgid, "trees (aux)")?;
-                                let file_body_without_parents = extract_body(&file_with_parents);
+                                let (_file_parents, file_body) =
+                                    sha1_blob_to_parents_body(&file_sha1_blob, self.format())?;
+
                                 let (file_body, _copy_from) =
-                                    hgstore::split_hg_file_metadata(&file_body_without_parents);
+                                    file_body_to_file_content_and_copy_from(
+                                        &file_body,
+                                        self.format(),
+                                    );
 
                                 let aux_data = FileAuxData::from_content(&file_body);
                                 children.push(Ok(TreeChildEntry::File(TreeChildFileEntry {
@@ -380,8 +399,14 @@ impl SaplingRemoteApi for EagerRepo {
             let data = self.get_sha1_blob_for_api(id, "commit_revlog_data")?;
             let data = CommitRevlogData {
                 hgid: id,
-                // PERF: to_vec().into() converts minibytes::Bytes to bytes::Bytes.
-                revlog_data: data.to_vec().into(),
+                revlog_data: match self.format() {
+                    SerializationFormat::Hg => data,
+                    SerializationFormat::Git => {
+                        // For Git, just return the commit data without hesders.
+                        let git_commit_data = git_sha1_deserialize(&data)?.0;
+                        data.slice_to_bytes(git_commit_data)
+                    }
+                },
             };
             values.push(Ok(data));
         }
@@ -410,15 +435,10 @@ impl SaplingRemoteApi for EagerRepo {
 
         debug!("pull_lazy");
         self.refresh_for_api();
-        let common = to_vec_vertex(&common);
-        let missing = to_vec_vertex(&missing);
         let set = self
             .dag()
             .await
-            .only(
-                Set::from_static_names(missing),
-                Set::from_static_names(common),
-            )
+            .only(to_set(&missing), to_set(&common))
             .await
             .map_err(map_dag_err)?;
         let clone_data = self
@@ -546,8 +566,8 @@ impl SaplingRemoteApi for EagerRepo {
             debug_hgid_list(&common),
         );
         self.refresh_for_api();
-        let heads = Set::from_static_names(heads.iter().map(|v| Vertex::copy_from(v.as_ref())));
-        let common = Set::from_static_names(common.iter().map(|v| Vertex::copy_from(v.as_ref())));
+        let heads = to_set(&heads);
+        let common = to_set(&common);
         let graph = self
             .dag()
             .await
@@ -592,8 +612,8 @@ impl SaplingRemoteApi for EagerRepo {
             debug_hgid_list(&common),
         );
         self.refresh_for_api();
-        let heads = Set::from_static_names(heads.iter().map(|v| Vertex::copy_from(v.as_ref())));
-        let common = Set::from_static_names(common.iter().map(|v| Vertex::copy_from(v.as_ref())));
+        let heads = to_set(&heads);
+        let common = to_set(&common);
         let graph = self
             .dag()
             .await
@@ -820,10 +840,11 @@ impl SaplingRemoteApi for EagerRepo {
                 data.file_content_upload_token.data.id,
                 "upload_filesnodes_batch",
             )?;
-            let content = self.get_sha1_blob_for_api(content_sha1, "upload_filenodes_batch")?;
+            // NOTE: "raw_text" is pure content without hg/git SHA1 frames!
+            let raw_text = self.get_sha1_blob_for_api(content_sha1, "upload_filenodes_batch")?;
 
             let mut content_with_parents =
-                Vec::<u8>::with_capacity(content.len() + 40 + 4 + data.metadata.len());
+                Vec::<u8>::with_capacity(raw_text.len() + 40 + 4 + data.metadata.len());
             let (mut p1, mut p2) = data.parents.into_nodes();
             if p2 < p1 {
                 std::mem::swap(&mut p1, &mut p2);
@@ -832,12 +853,12 @@ impl SaplingRemoteApi for EagerRepo {
             content_with_parents.extend_from_slice(p2.as_ref());
 
             // see sapling.filelog.filelog.add
-            if content.starts_with(b"\x01\n") || !data.metadata.is_empty() {
+            if raw_text.starts_with(b"\x01\n") || !data.metadata.is_empty() {
                 content_with_parents.extend_from_slice(b"\x01\n");
                 content_with_parents.extend(data.metadata);
                 content_with_parents.extend_from_slice(b"\x01\n");
             }
-            content_with_parents.extend_from_slice(content.as_ref());
+            content_with_parents.extend_from_slice(raw_text.as_ref());
 
             self.add_sha1_blob_for_api(
                 data.node_id,
@@ -1181,6 +1202,257 @@ impl SaplingRemoteApi for EagerRepo {
         }
         Ok(convert_to_response(res))
     }
+
+    async fn land_stack(
+        &self,
+        bookmark: String,
+        head: HgId,
+        base: HgId,
+        pushvars: HashMap<String, String>,
+    ) -> Result<LandStackResponse, SaplingRemoteApiError> {
+        let _ = pushvars;
+        let latest_bookmark_id = match self.get_bookmark(&bookmark) {
+            Ok(Some(id)) => id,
+            _ => {
+                return Err(SaplingRemoteApiError::HttpError {
+                    status: StatusCode::NOT_FOUND,
+                    message: format!("bookmark {} was not found", bookmark),
+                    headers: Default::default(),
+                    url: self.url("land_stack"),
+                });
+            }
+        };
+
+        let roots = vec![base];
+        let heads = vec![head];
+
+        let source_commits = self
+            .dag()
+            .await
+            .only(to_set(&heads), to_set(&roots))
+            .await
+            .map_err(map_dag_err)?;
+        let commits_stream = source_commits.iter_rev().await.map_err(map_dag_err)?;
+        let commits_stream: BoxStream<edenapi::Result<HgId>> = commits_stream
+            .then(|v| async move {
+                let v = v?;
+                let hgid = HgId::from_slice(v.as_ref()).unwrap();
+                Ok(hgid)
+            })
+            .map_err(map_dag_err)
+            .boxed();
+        let commits: Vec<HgId> = commits_stream.try_collect().await?;
+
+        if latest_bookmark_id == base {
+            // no changes on server side, just move the bookmark
+            EagerRepo::set_bookmark(self, &bookmark, Some(head)).unwrap();
+            let mut old_to_new_hgids = HashMap::new();
+            for commit in commits {
+                old_to_new_hgids.insert(
+                    HgId::from_slice(commit.as_ref()).unwrap(),
+                    HgId::from_slice(commit.as_ref()).unwrap(),
+                );
+            }
+            let data = LandStackData {
+                new_head: head,
+                old_to_new_hgids,
+            };
+            self.flush_for_api("land_stack").await?;
+            return Ok(LandStackResponse { data: Ok(data) });
+        } else {
+            let head_manifest = self.commit_to_manifest(head).await.map_err(map_crate_err)?;
+            let base_manifest = self.commit_to_manifest(base).await.map_err(map_crate_err)?;
+            let bookmark_manifest = self
+                .commit_to_manifest(latest_bookmark_id)
+                .await
+                .map_err(map_crate_err)?;
+
+            let conflicts =
+                pushrebase_conflicts(&base_manifest, &bookmark_manifest, &head_manifest)?;
+            if !conflicts.is_empty() {
+                let e =
+                    ServerError::generic(format!("Conflicts while pushrebasing: {:?}", conflicts));
+
+                return Ok(LandStackResponse { data: Err(e) });
+            }
+
+            let mut old_to_new_hgids = HashMap::new();
+            let mut base_commit = base;
+            let mut dest_commit = latest_bookmark_id;
+            for commit in commits {
+                let new_commit = pushrebase_one(self, base_commit, commit, dest_commit).await?;
+                old_to_new_hgids.insert(commit, new_commit);
+
+                base_commit = commit;
+                dest_commit = new_commit;
+            }
+
+            let new_head = old_to_new_hgids[&head];
+            EagerRepo::set_bookmark(self, &bookmark, Some(new_head)).map_err(map_crate_err)?;
+            let data = LandStackData {
+                new_head,
+                old_to_new_hgids,
+            };
+            self.flush_for_api("land_stack").await?;
+            return Ok(LandStackResponse { data: Ok(data) });
+        }
+
+        async fn pushrebase_one(
+            repo: &EagerRepo,
+            base_commit: HgId,
+            source_commit: HgId,
+            dest_commit: HgId,
+        ) -> anyhow::Result<HgId> {
+            let base_manifest = repo.commit_to_manifest(base_commit).await?;
+            let source_manifest = repo.commit_to_manifest(source_commit).await?;
+            let dest_manifest = repo.commit_to_manifest(dest_commit).await?;
+
+            let mut new_manifest = dest_manifest.clone();
+            let matcher = AlwaysMatcher::new();
+
+            // generate new manifest
+            for e in base_manifest.diff(&source_manifest, &matcher)? {
+                let e = e?;
+                match e.diff_type {
+                    DiffType::LeftOnly(_) => {
+                        new_manifest.remove(&e.path)?;
+                    }
+                    DiffType::Changed(_, right) => {
+                        new_manifest.insert(e.path, right)?;
+                    }
+                    DiffType::RightOnly(right) => {
+                        new_manifest.insert(e.path.clone(), right)?;
+                    }
+                }
+            }
+
+            let new_tree_id = match repo.store.format {
+                SerializationFormat::Hg => {
+                    let new_parents = vec![&dest_manifest];
+                    let mut manifest_id: Option<HgId> = None;
+                    for (path, hgid, raw, p1, p2) in new_manifest.finalize(new_parents)? {
+                        let insert_opts = InsertOpts {
+                            parents: vec![p1, p2],
+                            kind: Kind::Tree,
+                            ..Default::default()
+                        };
+                        repo.store.insert_data(insert_opts, &path, &raw)?;
+                        if path.is_empty() {
+                            manifest_id = Some(hgid);
+                        }
+                    }
+                    match manifest_id {
+                        Some(manifest_id) => manifest_id,
+                        None => {
+                            return Err(anyhow!(
+                                "empty commit is not supported: {}",
+                                source_commit.to_hex()
+                            ));
+                        }
+                    }
+                }
+                SerializationFormat::Git => new_manifest.flush()?,
+            };
+
+            // generate new commit
+            let old_raw_text = match repo.store.get_content(source_commit)? {
+                None => {
+                    return Err(anyhow!(
+                        "commit content cannot be found: {}",
+                        source_commit.to_hex()
+                    ));
+                }
+                Some(raw_text) => raw_text,
+            };
+            let mut new_raw_text: Vec<u8> = Vec::new();
+            writeln!(new_raw_text, "{}", new_tree_id)?;
+            new_raw_text.extend_from_slice(&old_raw_text[HgId::hex_len()..]);
+
+            let commit_parents = vec![dest_commit];
+            let new_commit = repo.add_commit(&commit_parents, &new_raw_text).await?;
+
+            Ok(new_commit)
+        }
+
+        /// `left` and `right` are considerered to be conflit free, if none of the element
+        /// from `left` is prefix of element from `right`, and vice versa.
+        fn pushrebase_conflicts(
+            mbase: &TreeManifest,
+            mleft: &TreeManifest,
+            mright: &TreeManifest,
+        ) -> anyhow::Result<Vec<(RepoPathBuf, RepoPathBuf)>> {
+            let matcher = AlwaysMatcher::new();
+            let mut left = mbase
+                .diff(mleft, &matcher)?
+                .map(|e| e.map(|e| e.path))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            left.sort_unstable();
+            let mut left_iter = left.into_iter();
+
+            let mut right = mbase
+                .diff(mright, &matcher)?
+                .map(|e| e.map(|e| e.path))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            right.sort_unstable();
+            let mut right_iter = right.into_iter();
+
+            let mut conflicts = Vec::new();
+            let mut state = (left_iter.next(), right_iter.next());
+            let is_case_sensitive = true;
+            loop {
+                state = match state {
+                    (Some(l), Some(r)) => match l.cmp(&r) {
+                        Ordering::Equal => {
+                            conflicts.push((l.clone(), r.clone()));
+                            (left_iter.next(), right_iter.next())
+                        }
+                        Ordering::Less => {
+                            if r.starts_with(&l, is_case_sensitive) {
+                                conflicts.push((l.clone(), r.clone()));
+                            }
+                            (left_iter.next(), Some(r))
+                        }
+                        Ordering::Greater => {
+                            if l.starts_with(&r, is_case_sensitive) {
+                                conflicts.push((l.clone(), r.clone()));
+                            }
+                            (Some(l), right_iter.next())
+                        }
+                    },
+                    _ => break,
+                }
+            }
+
+            Ok(conflicts)
+        }
+    }
+}
+
+fn sha1_blob_to_parents_body(
+    data: &Bytes,
+    format: SerializationFormat,
+) -> anyhow::Result<(Parents, Bytes)> {
+    let (parents, body) = match format {
+        SerializationFormat::Hg => {
+            let (body, p2, p1) = hg_sha1_deserialize(data)?;
+            (Parents::new(p1, p2), data.slice_to_bytes(body))
+        }
+        SerializationFormat::Git => {
+            let body = git_sha1_deserialize(data)?.0;
+            (Parents::default(), data.slice_to_bytes(body))
+        }
+    };
+    Ok((parents, body))
+}
+
+fn file_body_to_file_content_and_copy_from(
+    body: &Bytes,
+    format: SerializationFormat,
+) -> (Bytes, Bytes) {
+    match format {
+        SerializationFormat::Hg => format_util::split_hg_file_metadata(body),
+        SerializationFormat::Git => (body.clone(), Bytes::new()),
+    }
 }
 
 fn edenapi_mutation_to_local(m: HgMutationEntryContent) -> MutationEntry {
@@ -1449,16 +1721,6 @@ fn default_response_meta() -> ResponseMeta {
     }
 }
 
-fn extract_body(data_with_p1p2_prefix: &minibytes::Bytes) -> minibytes::Bytes {
-    data_with_p1p2_prefix.slice(HgId::len() * 2..)
-}
-
-fn extract_p1_p2(data: &[u8]) -> (HgId, HgId) {
-    let p2 = HgId::from_slice(&data[..HgId::len()]).unwrap();
-    let p1 = HgId::from_slice(&data[HgId::len()..(HgId::len() * 2)]).unwrap();
-    (p1, p2)
-}
-
 /// Extract rename metadata from filelog header (if rename exists).
 /// data is not prefixed by hashes.
 ///
@@ -1505,6 +1767,11 @@ fn check_convert_to_hgid<'a>(vertexes: impl Iterator<Item = &'a Vertex>) -> eden
 
 fn to_vec_vertex(ids: &[HgId]) -> Vec<Vertex> {
     ids.iter().map(|i| Vertex::copy_from(i.as_ref())).collect()
+}
+
+fn to_set(ids: &[HgId]) -> Set {
+    let vertexes = to_vec_vertex(ids);
+    Set::from_static_names(vertexes)
 }
 
 fn convert_clone_data(clone_data: dag::CloneData<Vertex>) -> edenapi::Result<dag::CloneData<HgId>> {

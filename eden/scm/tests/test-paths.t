@@ -1,5 +1,3 @@
-#modern-config-incompatible
-
 #require no-eden
 
 

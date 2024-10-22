@@ -99,7 +99,7 @@ function gitimport_repos_a_b_c {
   # Commit that will be synced after the merge to change the commit sync mapping
   export GIT_REPO_A_HEAD;
   # Commit that will be used in the initial import and merged with large repo's
-  # master bookmark
+  # master_bookmark bookmark
   export GIT_REPO_A_HEAD_PARENT;
   print_section "Importing repos in reverse dependency order, C, B then A"
 
@@ -113,7 +113,7 @@ function gitimport_repos_a_b_c {
   REPOID="$SUBMODULE_REPO_ID" with_stripped_logs gitimport "$GIT_REPO_A" --bypass-derived-data-backfilling \
     --bypass-readonly --generate-bookmarks full-repo > "$TESTTMP/gitimport_output"
 
-  GIT_REPO_A_HEAD=$(rg ".*Ref: \"refs/heads/master\": Some\(ChangesetId\(Blake2\((\w+).+" -or '$1' "$TESTTMP/gitimport_output")
+  GIT_REPO_A_HEAD=$(rg ".*Ref: \"refs/heads/master_bookmark\": Some\(ChangesetId\(Blake2\((\w+).+" -or '$1' "$TESTTMP/gitimport_output")
 
   GIT_REPO_A_HEAD_PARENT=$(mononoke_newadmin fetch -R "$SUBMODULE_REPO_NAME" -i "$GIT_REPO_A_HEAD" --json | jq -r .parents[0])
 
@@ -125,7 +125,7 @@ function gitimport_repos_a_b_c {
 function merge_repo_a_to_large_repo {
   IMPORT_CONFIG_VERSION_NAME=${NOOP_CONFIG_VERSION_NAME:-$LATEST_CONFIG_VERSION_NAME}
   FINAL_CONFIG_VERSION_NAME=${CONFIG_VERSION_NAME:-$LATEST_CONFIG_VERSION_NAME}
-  MASTER_BOOKMARK_NAME=${MASTER_BOOKMARK:-master}
+  MASTER_BOOKMARK_NAME=${MASTER_BOOKMARK:-master_bookmark}
   SMALL_REPO_FOLDER=${REPO_A_FOLDER:-$SUBMODULE_REPO_NAME}
 
   print_section "Importing repo A commits into large repo"
@@ -279,7 +279,7 @@ function create_repo_b_commits_for_submodule_pointer_update {
   REPOID="$REPO_B_ID" with_stripped_logs gitimport "$GIT_REPO_B" --bypass-derived-data-backfilling  \
     --bypass-readonly --generate-bookmarks full-repo > "$TESTTMP/gitimport_output"
 
-  REPO_B_BONSAI=$(rg ".*Ref: \"refs/heads/master\": Some\(ChangesetId\(Blake2\((\w+).+" -or '$1' "$TESTTMP/gitimport_output")
+  REPO_B_BONSAI=$(rg ".*Ref: \"refs/heads/master_bookmark\": Some\(ChangesetId\(Blake2\((\w+).+" -or '$1' "$TESTTMP/gitimport_output")
   echo "REPO_B_BONSAI: $REPO_B_BONSAI"
   # GIT_REPO_B_HEAD: 3cd7a66e604714b2b96af41e9c595be692f1f5f0713af3f7b2dc3426b05407bd
 
@@ -313,7 +313,7 @@ function create_repo_a_commit {
   REPOID="$SUBMODULE_REPO_ID" with_stripped_logs gitimport "$GIT_REPO_A" --bypass-derived-data-backfilling  \
     --bypass-readonly --generate-bookmarks full-repo > "$TESTTMP/gitimport_repo_a_output"
 
-  GIT_REPO_A_HEAD=$(rg ".*Ref: \"refs/heads/master\": Some\(ChangesetId\(Blake2\((\w+).+" -or '$1' "$TESTTMP/gitimport_repo_a_output")
+  GIT_REPO_A_HEAD=$(rg ".*Ref: \"refs/heads/master_bookmark\": Some\(ChangesetId\(Blake2\((\w+).+" -or '$1' "$TESTTMP/gitimport_repo_a_output")
   echo "GIT_REPO_A_HEAD: $GIT_REPO_A_HEAD"
 
   REPO_A_GIT_HASH=$(mononoke_newadmin convert --repo-id "$SUBMODULE_REPO_ID" -f bonsai -t git "$GIT_REPO_A_HEAD")
@@ -339,7 +339,7 @@ function create_repo_c_commit {
   REPOID="$REPO_C_ID" with_stripped_logs gitimport "$GIT_REPO_C" --bypass-derived-data-backfilling  \
     --bypass-readonly --generate-bookmarks full-repo > "$TESTTMP/gitimport_repo_c_output"
 
-  GIT_REPO_C_HEAD=$(rg ".*Ref: \"refs/heads/master\": Some\(ChangesetId\(Blake2\((\w+).+" -or '$1' "$TESTTMP/gitimport_repo_c_output")
+  GIT_REPO_C_HEAD=$(rg ".*Ref: \"refs/heads/master_bookmark\": Some\(ChangesetId\(Blake2\((\w+).+" -or '$1' "$TESTTMP/gitimport_repo_c_output")
   echo "GIT_REPO_C_HEAD: $GIT_REPO_C_HEAD"
 
   REPO_C_GIT_HASH=$(mononoke_newadmin convert --repo-id "$REPO_C_ID" -f bonsai -t git "$GIT_REPO_C_HEAD")
@@ -367,7 +367,7 @@ function create_repo_c_and_repo_b_commits_for_submodule_pointer_update {
   REPOID="$REPO_B_ID" with_stripped_logs gitimport "$GIT_REPO_B" --bypass-derived-data-backfilling  \
     --bypass-readonly --generate-bookmarks full-repo > "$TESTTMP/gitimport_output"
 
-  GIT_REPO_B_HEAD=$(rg ".*Ref: \"refs/heads/master\": Some\(ChangesetId\(Blake2\((\w+).+" -or '$1' "$TESTTMP/gitimport_output")
+  GIT_REPO_B_HEAD=$(rg ".*Ref: \"refs/heads/master_bookmark\": Some\(ChangesetId\(Blake2\((\w+).+" -or '$1' "$TESTTMP/gitimport_output")
   echo "GIT_REPO_B_HEAD: $GIT_REPO_B_HEAD"
 
   REPO_B_GIT_COMMIT_HASH=$(mononoke_newadmin convert --repo-id "$REPO_B_ID" -f bonsai -t git "$GIT_REPO_B_HEAD")
@@ -403,24 +403,16 @@ function switch_source_of_truth_to_large_repo {
   local small_repo=$1
   local large_repo=$2
 
-  # Kill forward syncer job
-  killandwait "$XREPOSYNC_PID"
+  orig_pwd=$(pwd)
 
-  # Enable pushredirection for small repo, i.e. switch the source of truth to large repo
-  print_section "Enable push redirection for small repo"
-  enable_pushredirect "$small_repo" false true
-
+  # Set the backsyncer mutable counter
   print_section "Get current large repo bookmark update log id to set the backsyncer counter"
   LARGE_REPO_BOOKMARK_UPDATE_LOG_ID=$(mononoke_newadmin bookmarks \
     --repo-id "$large_repo" log "$MASTER_BOOKMARK_NAME" -S bonsai,hg -l1 \
     | cut -d " " -f1)
 
   echo "LARGE_REPO_BOOKMARK_UPDATE_LOG_ID: $LARGE_REPO_BOOKMARK_UPDATE_LOG_ID"
-
-  # Delete the forward syncer counter
-  print_section "Delete forward syncer counter and set backsyncer counter"
-  sqlite3 "$TESTTMP/monsql/sqlite_dbs" \
-    "DELETE FROM mutable_counters WHERE name = 'xreposync_from_$SUBMODULE_REPO_ID'";
+  print_section "Set backsyncer counter"
   sqlite3 "$TESTTMP/monsql/sqlite_dbs" \
     "INSERT INTO mutable_counters (repo_id, name, value) \
     VALUES ($small_repo, 'backsync_from_$LARGE_REPO_ID', $LARGE_REPO_BOOKMARK_UPDATE_LOG_ID)";
@@ -428,4 +420,62 @@ function switch_source_of_truth_to_large_repo {
   BACKSYNC_COUNTER=$(sqlite3 "$TESTTMP/monsql/sqlite_dbs" \
     "SELECT value FROM mutable_counters WHERE name = 'backsync_from_$LARGE_REPO_ID';")
   echo "BACKSYNC_COUNTER: $BACKSYNC_COUNTER"
+
+
+  # Start backsyncer in the background
+  REPOIDSMALL=$SUBMODULE_REPO_ID REPOIDLARGE=$LARGE_REPO_ID \
+    with_stripped_logs backsync_large_to_small_forever
+
+  # Enable pushredirection for small repo, i.e. switch the source of truth to large repo
+  print_section "Enable push redirection for small repo"
+  enable_pushredirect "$small_repo" false true
+
+  # Disable the deny_files hook in small repo
+  rm "$TESTTMP/mononoke-config/repos/$LARGE_REPO_NAME/server.toml"
+  mv "$TESTTMP/old_large_repo_config.toml" "$TESTTMP/mononoke-config/repos/$LARGE_REPO_NAME/server.toml"
+
+  if [[ -z "$SCS_PORT" ]]; then
+    start_and_wait_for_scs_server
+  fi
+
+  # Enable commit hook that ensures all commits are backsyncable (i.e. doesn't
+  # break submodule expansions)
+  cat >> "$TESTTMP/mononoke-config/repos/$LARGE_REPO_NAME/server.toml" << CONFIG
+[[bookmarks]]
+regex=".*"
+[[bookmarks.hooks]]
+hook_name="check_commit_is_backsyncable"
+[[hooks]]
+name="check_commit_is_backsyncable"
+config_json='''{
+  "sync_dir_to_repo_map": {"$SMALL_REPO_DIR": "$SUBMODULE_REPO_NAME"},
+  "target_scs": {
+    "HostPort": {
+      "host": "localhost",
+      "port": $SCS_PORT,
+      "cert_paths": {
+        "cert_path": "$TEST_CERTDIR/${OVERRIDE_CLIENT_CERT:-client0}.crt",
+        "key_path": "$TEST_CERTDIR/${OVERRIDE_CLIENT_CERT:-client0}.key",
+        "ca_path": "$TEST_CERTDIR/root-ca.crt"
+      }
+    }
+  }
+}'''
+CONFIG
+
+  # Restart Mononoke and Mononoke Git service to pick up the config change
+  killandwait "$MONONOKE_PID"
+  start_and_wait_for_mononoke_server
+
+  killandwait "$MONONOKE_GIT_SERVICE_PID"
+
+  mononoke_git_service
+
+  # Update the remote url on the small repo clone if the directory exists
+  if [ -d "$SUBMODULE_REPO_GIT" ]; then
+    cd "$SUBMODULE_REPO_GIT" || exit
+    git remote set-url origin "$MONONOKE_GIT_SERVICE_BASE_URL/$SUBMODULE_REPO_NAME.git"
+  fi
+
+  cd "$orig_pwd" || exit
 }

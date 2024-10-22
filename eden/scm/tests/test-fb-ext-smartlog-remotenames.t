@@ -11,7 +11,6 @@
   $ cat >> $HGRCPATH << 'EOF'
   > [extensions]
   > smartlog=
-  > remotenames=
   > [commitcloud]
   > enablestatus=false
   > EOF
@@ -69,7 +68,7 @@
   @  x1 mybook
   $ cat >> $HGRCPATH << 'EOF'
   > [smartlog]
-  > repos=default/
+  > repos=remote/
   > names=project/bookmark
   > EOF
   $ hg smartlog -T '{desc} {bookmarks} {remotebookmarks}'

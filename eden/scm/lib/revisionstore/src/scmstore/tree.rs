@@ -36,6 +36,8 @@ use minibytes::Bytes;
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
 use storemodel::BoxIterator;
+use storemodel::InsertOpts;
+use storemodel::KeyStore;
 use storemodel::SerializationFormat;
 use storemodel::TreeEntry;
 
@@ -52,6 +54,7 @@ use crate::scmstore::metrics::StoreLocation;
 use crate::scmstore::tree::types::LazyTree;
 use crate::scmstore::tree::types::StoreTree;
 use crate::scmstore::tree::types::TreeAttributes;
+use crate::trait_impls::sha1_digest;
 use crate::ContentDataStore;
 use crate::ContentMetadata;
 use crate::Delta;
@@ -118,6 +121,8 @@ pub struct TreeStore {
     pub fetch_tree_aux_data: bool,
 
     pub(crate) metrics: Arc<RwLock<TreeStoreMetrics>>,
+
+    pub format: SerializationFormat,
 }
 
 impl Drop for TreeStore {
@@ -247,6 +252,8 @@ impl TreeStore {
                 if let Some(tree_aux_store) = &tree_aux_store {
                     let mut wants_aux = TreeAttributes::AUX_DATA;
                     if cas_client.is_some() {
+                        // We need the tree aux data in order to fetch from CAS, so fetch
+                        // tree aux data for any key we want CONTENT for.
                         wants_aux |= TreeAttributes::CONTENT;
                     }
                     let pending: Vec<_> = state
@@ -368,6 +375,7 @@ impl TreeStore {
             fetch_tree_aux_data: false,
             metrics: Default::default(),
             prefetch_tree_parents: false,
+            format: SerializationFormat::Hg,
         }
     }
 
@@ -433,6 +441,7 @@ impl TreeStore {
             fetch_tree_aux_data: false,
             metrics: self.metrics.clone(),
             prefetch_tree_parents: false,
+            format: self.format(),
         }
     }
 
@@ -706,6 +715,28 @@ impl storemodel::KeyStore for TreeStore {
     fn refresh(&self) -> Result<()> {
         TreeStore::refresh(self)
     }
+
+    fn format(&self) -> SerializationFormat {
+        self.format
+    }
+
+    fn flush(&self) -> anyhow::Result<()> {
+        TreeStore::flush(self)
+    }
+
+    fn insert_data(&self, opts: InsertOpts, path: &RepoPath, data: &[u8]) -> anyhow::Result<HgId> {
+        let id = sha1_digest(&opts, data, self.format());
+
+        // PERF: Ideally there is no need to clone path or data.
+        let key = Key::new(path.to_owned(), id);
+        let data = Bytes::copy_from_slice(data);
+        self.write_batch(std::iter::once((key, data, Default::default())))?;
+        Ok(id)
+    }
+
+    fn clone_key_store(&self) -> Box<dyn KeyStore> {
+        Box::new(self.clone())
+    }
 }
 
 /// Extends a basic `TreeEntry` with aux data.
@@ -737,13 +768,13 @@ impl TreeEntry for ScmStoreTreeEntry {
     }
 
     fn file_aux_iter(&self) -> anyhow::Result<BoxIterator<anyhow::Result<(HgId, FileAuxData)>>> {
-        let maybe_iter = (|| -> Option<BoxIterator<anyhow::Result<(HgId, FileAuxData)>>> {
+        let maybe_iter = (move || -> Option<BoxIterator<anyhow::Result<(HgId, FileAuxData)>>> {
             let entry = match &self.tree {
-                LazyTree::SaplingRemoteApi(entry) => entry,
+                LazyTree::SaplingRemoteApi(entry) => entry.clone(),
                 _ => return None,
             };
-            let children = entry.children.as_ref()?;
-            let iter = children.iter().filter_map(|child| {
+            let children = entry.children?;
+            let iter = children.into_iter().filter_map(move |child| {
                 let child = child.as_ref().ok()?;
                 let file_entry = match child {
                     TreeChildEntry::File(v) => v,
@@ -764,12 +795,12 @@ impl TreeEntry for ScmStoreTreeEntry {
     ) -> anyhow::Result<BoxIterator<anyhow::Result<(HgId, TreeAuxData)>>> {
         let maybe_iter = (|| -> Option<BoxIterator<anyhow::Result<(HgId, TreeAuxData)>>> {
             let entry = match &self.tree {
-                LazyTree::SaplingRemoteApi(entry) => entry,
+                LazyTree::SaplingRemoteApi(entry) => entry.clone(),
                 // TODO: We should also support fetching tree metadata from local cache
                 _ => return None,
             };
-            let children = entry.children.as_ref()?;
-            let iter = children.iter().filter_map(|child| {
+            let children = entry.children?;
+            let iter = children.into_iter().filter_map(|child| {
                 let child = child.as_ref().ok()?;
                 let directory_entry = match child {
                     TreeChildEntry::Directory(v) => v,
@@ -842,5 +873,9 @@ impl storemodel::TreeStore for TreeStore {
                 Ok((key, aux))
             });
         Ok(Box::new(iter))
+    }
+
+    fn clone_tree_store(&self) -> Box<dyn storemodel::TreeStore> {
+        Box::new(self.clone())
     }
 }

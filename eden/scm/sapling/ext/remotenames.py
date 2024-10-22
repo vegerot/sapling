@@ -30,6 +30,7 @@ import typing
 
 from sapling import (
     bookmarks,
+    cmdutil,
     commands,
     discovery,
     encoding,
@@ -62,7 +63,6 @@ from sapling.bookmarks import (
 from sapling.ext.commitcloud import util as ccutil
 from sapling.i18n import _
 from sapling.node import bin, hex, short
-
 
 cmdtable = {}
 command = registrar.command(cmdtable)
@@ -235,7 +235,7 @@ def pullremotenames(repo, remote, bookmarks):
         saveremotenames(repo, {path: bookmarks})
 
         # repo.ui.paths.get(path) might be empty during clone.
-        if repo.ui.paths.get(path):
+        if repo.ui.paths.getpath(path):
             # Collect selected bookmarks that point to unknown commits. This
             # indicates a race condition.
             selected = set(selectivepullbookmarknames(repo, path))
@@ -412,8 +412,8 @@ def expaths(orig, ui, repo, *args, **opts):
     This is very hacky and only exists as an experimentation.
 
     """
-    delete = opts.get("delete")
-    add = opts.get("add")
+    delete = opts.pop("delete", None)
+    add = opts.pop("add", None)
     configrepofile = repo.localvfs.join(ui.identity.configrepofile())
     if delete:
         rcutil.editconfig(ui, configrepofile, "paths", delete, None)
@@ -436,7 +436,7 @@ def expaths(orig, ui, repo, *args, **opts):
         rcutil.editconfig(ui, configrepofile, "paths", add, path)
         return
 
-    return orig(ui, repo, *args)
+    return orig(ui, repo, *args, **opts)
 
 
 def exnowarnheads(orig, pushop):
@@ -711,6 +711,8 @@ def expullcmd(orig, ui, repo, source="default", **opts):
 
     if not opts.get("rebase"):
         return orig(ui, repo, source, **opts)
+
+    cmdutil.checkunfinished(repo)
 
     try:
         rebasemodule = extensions.find("rebase")
@@ -1394,18 +1396,12 @@ def activepath(ui, remote):
     return ui.paths.getname(rpath) or ""
 
 
-# memoization
-_renames = None
-
-
 def _getrenames(ui):
-    global _renames
-    if _renames is None:
-        _renames = {}
-        for k, v in ui.configitems("remotenames"):
-            if k.startswith("rename."):
-                _renames[k[7:]] = v
-    return _renames
+    renames = {}
+    for k, v in ui.configitems("remotenames"):
+        if k.startswith("rename."):
+            renames[k[7:]] = v
+    return renames
 
 
 def shareawarecachevfs(repo):

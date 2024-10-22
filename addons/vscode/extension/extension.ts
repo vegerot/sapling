@@ -10,17 +10,16 @@ import type {Logger} from 'isl-server/src/logger';
 import type {ServerPlatform} from 'isl-server/src/serverPlatform';
 import type {RepositoryContext} from 'isl-server/src/serverTypes';
 
-import packageJson from '../package.json';
 import {DeletedFileContentProvider} from './DeletedFileContentProvider';
 import {registerSaplingDiffContentProvider} from './DiffContentProvider';
 import {Internal} from './Internal';
 import {VSCodeReposList} from './VSCodeRepo';
 import {InlineBlameProvider} from './blame/blame';
 import {registerCommands} from './commands';
-import {InlineCommentsProvider} from './comments/InlineCommentsProvider';
 import {getCLICommand} from './config';
 import {ensureTranslationsLoaded} from './i18n';
 import {registerISLCommands} from './islWebviewPanel';
+import {extensionVersion} from './utils';
 import {getVSCodePlatform} from './vscodePlatform';
 import {makeServerSideTracker} from 'isl-server/src/analytics/serverSideTracker';
 import * as util from 'node:util';
@@ -33,7 +32,7 @@ export async function activate(context: vscode.ExtensionContext) {
   const extensionTracker = makeServerSideTracker(
     logger,
     platform as ServerPlatform,
-    packageJson.version,
+    extensionVersion,
   );
   try {
     const ctx: RepositoryContext = {
@@ -58,8 +57,17 @@ export async function activate(context: vscode.ExtensionContext) {
     }
     context.subscriptions.push(registerSaplingDiffContentProvider(ctx));
     context.subscriptions.push(new DeletedFileContentProvider());
-    if (enabledSCMApiFeatures.has('comments')) {
-      context.subscriptions.push(new InlineCommentsProvider(reposList, ctx));
+    let inlineCommentsProvider;
+    if (enabledSCMApiFeatures.has('comments') && Internal.inlineCommentsProvider) {
+      inlineCommentsProvider = Internal.inlineCommentsProvider(context, reposList, ctx);
+      context.subscriptions.push(inlineCommentsProvider);
+    }
+    if (Internal.SaplingISLUriHandler != null) {
+      context.subscriptions.push(
+        vscode.window.registerUriHandler(
+          new Internal.SaplingISLUriHandler(reposList, ctx, inlineCommentsProvider),
+        ),
+      );
     }
 
     context.subscriptions.push(...registerCommands(ctx));

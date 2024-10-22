@@ -19,6 +19,7 @@
   $ git add file1
   $ git commit -qam "Add file1"
   $ git tag -a -m "new tag" first_tag
+  $ git tag -a -m "new tag" tag_to_delete_ffonly
   $ echo "this is file2" > file2
   $ git add file2
   $ git commit -qam "Add file2"
@@ -62,8 +63,8 @@
   $ echo "bypass file2" > bypass_file2
   $ git add bypass_file2
   $ git commit -qam "Add bypass_file2"
-  $ git checkout master
-  Switched to branch 'master'
+  $ git checkout master_bookmark
+  Switched to branch 'master_bookmark'
 
   $ cd "$TESTTMP"
   $ git clone --mirror "$GIT_REPO_ORIGIN" repo-git
@@ -88,16 +89,17 @@
   28718e2ecb4aec6de586603f3338f439f5b843ac refs/remotes/origin/bypass_branch_ffonly
   33f84db74b1f57fe45ae0fc29edc65ae984b979d refs/remotes/origin/non_ffwd_branch
   8963e1f55d1346a07c3aec8c8fc72bf87d0452b1 refs/tags/first_tag
+  8f99a49657d7430c4943afce0a9331a59a0d6648 refs/tags/tag_to_delete_ffonly
   c47cf83db7aff6eb843f31a57d59f19670b69ed5 refs/remotes/origin/branch_for_delete_ffonly
-  e8615d6f149b876be0a2f30a1c5bf0c42bf8e136 refs/heads/master
+  e8615d6f149b876be0a2f30a1c5bf0c42bf8e136 refs/heads/master_bookmark
   e8615d6f149b876be0a2f30a1c5bf0c42bf8e136 refs/remotes/origin/HEAD
-  e8615d6f149b876be0a2f30a1c5bf0c42bf8e136 refs/remotes/origin/master
+  e8615d6f149b876be0a2f30a1c5bf0c42bf8e136 refs/remotes/origin/master_bookmark
   eb95862bb5d5c295844706cbb0d0e56fee405f5c refs/remotes/origin/branch_ffonly
 
-# Add some new commits to the master branch
+# Add some new commits to the master_bookmark branch
   $ echo "Just another file" > another_file
   $ git add .
-  $ git commit -qam "Another commit on master"
+  $ git commit -qam "Another commit on master_bookmark"
 # Try to do a non-ffwd push on branch_ffonly which should fail
   $ git checkout branch_ffonly
   Switched to a new branch 'branch_ffonly'
@@ -130,15 +132,44 @@
   error: failed to push some refs to 'https://localhost:$LOCAL_PORT/repos/git/ro/repo.git'
   [1]
 
-# Push all the changes made so far
-  $ git_client push origin master branch_ffonly non_ffwd_branch --force &> output
-  [1]
-  $ cat output | sort
-     e8615d6..4981a25  master -> master
-   ! [remote rejected] branch_ffonly -> branch_ffonly (Non fast-forward bookmark move of 'heads/branch_ffonly' from eb95862bb5d5c295844706cbb0d0e56fee405f5c to 3ea0687e31d7b65429c774526728dba90cbaabc0)
-   + 33f84db...676bc3c non_ffwd_branch -> non_ffwd_branch (forced update)
-  To https://*/repos/git/ro/repo.git (glob)
+# Trying to delete a branch with allow-tag-deletion should fail
+  $ git_client -c http.extraHeader="x-git-allow-tag-deletion: 1" push origin --delete branch_for_delete_ffonly
+  To https://localhost:$LOCAL_PORT/repos/git/ro/repo.git
+   ! [remote rejected] branch_for_delete_ffonly (invalid request: Deletion of 'heads/branch_for_delete_ffonly' is prohibited)
   error: failed to push some refs to 'https://localhost:$LOCAL_PORT/repos/git/ro/repo.git'
+  [1]
+# Trying to delete a branch with allow-branch-deletion should succeed 
+  $ git_client -c http.extraHeader="x-git-allow-branch-deletion: 1" push origin --delete branch_for_delete_ffonly
+  To https://localhost:$LOCAL_PORT/repos/git/ro/repo.git
+   - [deleted]         branch_for_delete_ffonly
+
+# Trying to delete a tag with no pushvar should fail
+  $ git_client push origin --delete tag_to_delete_ffonly
+  To https://localhost:$LOCAL_PORT/repos/git/ro/repo.git
+   ! [remote rejected] tag_to_delete_ffonly (invalid request: Deletion of 'tags/tag_to_delete_ffonly' is prohibited)
+  error: failed to push some refs to 'https://localhost:$LOCAL_PORT/repos/git/ro/repo.git'
+  [1]
+# Trying to delete a tag with allow-branch-deletion should fail
+  $ git_client -c http.extraHeader="x-git-allow-branch-deletion: 1" push origin --delete tag_to_delete_ffonly
+  To https://localhost:$LOCAL_PORT/repos/git/ro/repo.git
+   ! [remote rejected] tag_to_delete_ffonly (invalid request: Deletion of 'tags/tag_to_delete_ffonly' is prohibited)
+  error: failed to push some refs to 'https://localhost:$LOCAL_PORT/repos/git/ro/repo.git'
+  [1]
+# Trying to delete a tag with allow-tag-deletion should succeed
+  $ git_client -c http.extraHeader="x-git-allow-tag-deletion: 1" push origin --delete tag_to_delete_ffonly
+  To https://localhost:$LOCAL_PORT/repos/git/ro/repo.git
+   - [deleted]         tag_to_delete_ffonly
+
+# Push all the changes made so far
+  $ git_client push origin master_bookmark branch_ffonly non_ffwd_branch --force
+  To https://localhost:$LOCAL_PORT/repos/git/ro/repo.git
+     e8615d6..60fb9c7  master_bookmark -> master_bookmark
+   + 33f84db...676bc3c non_ffwd_branch -> non_ffwd_branch (forced update)
+   ! [remote rejected] branch_ffonly -> branch_ffonly (Non fast-forward bookmark move of 'heads/branch_ffonly' from eb95862bb5d5c295844706cbb0d0e56fee405f5c to 3ea0687e31d7b65429c774526728dba90cbaabc0
+  
+  For more information about hooks and bypassing, refer https://fburl.com/wiki/mb4wtk1j)
+  error: failed to push some refs to 'https://localhost:$LOCAL_PORT/repos/git/ro/repo.git'
+  [1]
 
 # Wait for the warm bookmark cache to catch up with the latest changes
   $ wait_for_git_bookmark_move HEAD $master_commit
@@ -149,13 +180,12 @@
   Cloning into 'new_repo'...
   $ cd new_repo
 
-# List all the known refs. Ensure that only master,non_ffwd_branch and bypass_branch_ffonly reflect a change
+# List all the known refs. Ensure that only master_bookmark,non_ffwd_branch and bypass_branch_ffonly reflect a change
   $ git show-ref | sort
-  4981a25180e49be096fce2ac3e68e455fc158449 refs/heads/master
-  4981a25180e49be096fce2ac3e68e455fc158449 refs/remotes/origin/HEAD
-  4981a25180e49be096fce2ac3e68e455fc158449 refs/remotes/origin/master
+  60fb9c7880e62a34d49662147f9af7ad50de3e99 refs/heads/master_bookmark
+  60fb9c7880e62a34d49662147f9af7ad50de3e99 refs/remotes/origin/HEAD
+  60fb9c7880e62a34d49662147f9af7ad50de3e99 refs/remotes/origin/master_bookmark
   676bc3cdd4bcc0b238223b6ca444c7ac50b59174 refs/remotes/origin/non_ffwd_branch
   7b248e999d14fbc53386479609031c21649c6598 refs/remotes/origin/bypass_branch_ffonly
   8963e1f55d1346a07c3aec8c8fc72bf87d0452b1 refs/tags/first_tag
-  c47cf83db7aff6eb843f31a57d59f19670b69ed5 refs/remotes/origin/branch_for_delete_ffonly
   eb95862bb5d5c295844706cbb0d0e56fee405f5c refs/remotes/origin/branch_ffonly

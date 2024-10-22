@@ -10,8 +10,6 @@ This overrides the dirstate to check with the eden daemon for modifications,
 instead of doing a normal scan of the filesystem.
 """
 
-import bindings
-
 from . import util
 
 from .node import nullid
@@ -34,7 +32,6 @@ class EdenThriftClient:
 
     @util.timefunction("edenclientstatus", 0, "_ui")
     def getStatus(self, parent, list_ignored):  # noqa: C901
-
         # If we are in a pending transaction the parent commit we are querying against
         # might not have been stored to disk yet.  Flush the pending transaction state
         # before asking Eden about the status.

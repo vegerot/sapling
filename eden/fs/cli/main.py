@@ -89,7 +89,6 @@ try:
         stop_internal_processes,
     )
 except ImportError:
-
     migration_restart_help = "This migrates ALL your mounts to a new mount protocol."
 
     # pyre-fixme[2]: Parameter must be annotated.
@@ -234,7 +233,6 @@ class InfoCmd(Subcmd):
 
 @subcmd("du", "Show disk space usage for a checkout")
 class DiskUsageCmd(Subcmd):
-
     # pyre-fixme[4]: Attribute must be annotated.
     isatty = sys.stdout and sys.stdout.isatty()
     # Escape sequence to move the cursor left to the start of the line
@@ -539,7 +537,6 @@ space by running:
         lfs_repos: Set[Path],
         backed_working_copy_repos: Set[Path],
     ) -> None:
-
         self.usage_for_dir(backing_repo, "backing")
 
         hg_dir = backing_repo / hg_util.sniff_dot_dir(backing_repo)
@@ -619,7 +616,6 @@ Legacy bind mount dirs listed above are unused and can be removed!
     def usage_for_mount(
         self, mount: str, args: argparse.Namespace, clean: bool, deep_clean: bool
     ) -> None:
-
         instance, checkout, _rel_path = require_checkout(args, mount)
 
         client_dir = checkout.state_dir
@@ -1290,6 +1286,11 @@ class FsckCmd(Subcmd):
             nargs="*",
             help="The path to an EdenFS checkout to verify.",
         )
+        parser.add_argument(
+            "--num-error-discovery-threads",
+            default=4,
+            help="Specifies the number of threads that the OverlayChecker will use for error discovery",
+        )
 
     def run(self, args: argparse.Namespace) -> int:
         if sys.platform == "win32":
@@ -1334,7 +1335,12 @@ class FsckCmd(Subcmd):
         instance = get_eden_instance(args)
         return_codes: List[int] = []
         for checkout in instance.get_checkouts():
-            result = self.check_one(args, instance, checkout.path, checkout.state_dir)
+            result = self.check_one(
+                args,
+                instance,
+                checkout.path,
+                checkout.state_dir,
+            )
             return_codes.append(result)
 
         return return_codes
@@ -1348,12 +1354,15 @@ class FsckCmd(Subcmd):
     ) -> int:
         print(f"Checking {checkout_path}...")
         overlay_path = state_dir / "local"
+        num_threads = args.num_error_discovery_threads
+        instance.get_config_int("fsck.num-error-discovery-threads", num_threads)
         return subprocess.call(
             [
                 get_fsck_command(),
                 overlay_path,
                 f"--dry-run={'true' if args.check_only else 'false'}",
                 f"--force={'true' if args.force else 'false'}",
+                f"--num_error_discovery_threads={num_threads}",
             ]
         )
 
@@ -1707,6 +1716,14 @@ Any uncommitted changes and shelves in this checkout will be lost forever."""
         exit_code = 0
         for mount, remove_type in mounts:
             print(f"Removing {mount}...")
+            # Removing reidrection targets from checkout config to allow deletion of redirected paths
+            instance, checkout, _rel_path = require_checkout(args, mount)
+            config = checkout.get_config()
+            config._replace(
+                redirection_targets={},
+            )
+            checkout.save_config(config)
+
             if remove_type == RemoveType.ACTIVE_MOUNT:
                 try:
                     # We don't bother complaining about removing redirections on Windows

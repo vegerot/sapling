@@ -11,7 +11,6 @@
 - source tinit.sh
 """
 
-import io
 import os
 import subprocess
 import sys
@@ -262,10 +261,9 @@ def hg(stdin: BinaryIO, stdout: BinaryIO, stderr: BinaryIO, env: Env) -> int:
             env, stdin=stdin, stdout=stdout, stderr=stderr
         ), extensions.wrappedfunction(
             util, "rawsystem", rawsystem
-        ), extensions.wrappedfunction(
-            subprocess, "run", _patchedsubprun
-        ):
+        ), extensions.wrappedfunction(subprocess, "run", _patchedsubprun):
             bindings.identity.resetdefault()
+            bindings.hgmetrics.reset()
 
             encoding.setfromenviron()
             pycompat.stdin = stdin

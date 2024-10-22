@@ -115,6 +115,16 @@ export class VSCodeReposList {
     return undefined;
   }
 
+  public repoForPhabricatorCallsign(callsign: string): VSCodeRepo | undefined {
+    for (const repo of this.vscodeRepos.values()) {
+      const system = repo.repo.info.codeReviewSystem;
+      if (system.type === 'phabricator' && system.callsign === callsign) {
+        return repo;
+      }
+    }
+    return undefined;
+  }
+
   private emitActiveRepos() {
     for (const cb of this.updateCallbacks) {
       cb(Array.from(this.vscodeRepos.values()));

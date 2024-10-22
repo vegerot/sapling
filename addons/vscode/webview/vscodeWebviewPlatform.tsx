@@ -5,14 +5,16 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {VSCodeAPI} from './vscodeApi';
 import type {Platform} from 'isl/src/platform';
 import type {ThemeColor} from 'isl/src/theme';
-import type {RepoRelativePath} from 'isl/src/types';
+import type {MessageBusStatus, RepoRelativePath} from 'isl/src/types';
 import type {Comparison} from 'shared/Comparison';
 import type {Json} from 'shared/typeUtils';
 
 import {Internal} from './Internal';
-import {browserPlatformImpl} from 'isl/src/platform/browerPlatformImpl';
+import {vscodeApi} from './vscodeApi';
+import {browserClipboardCopy} from 'isl/src/platform/browerPlatformImpl';
 import {registerCleanup} from 'isl/src/utils';
 import {lazy} from 'react';
 
@@ -25,9 +27,29 @@ declare global {
   }
 }
 
+class VSCodeMessageBus {
+  constructor(private vscode: VSCodeAPI) {}
+
+  onMessage(handler: (event: MessageEvent<string>) => void | Promise<void>): {dispose: () => void} {
+    window.addEventListener('message', handler);
+    const dispose = () => window.removeEventListener('message', handler);
+    return {dispose};
+  }
+
+  onChangeStatus(handler: (newStatus: MessageBusStatus) => unknown): {dispose: () => void} {
+    // VS Code connections don't close or change status (the webview would just be destroyed if closed)
+    handler({type: 'open'});
+    return {dispose: () => {}};
+  }
+
+  postMessage(message: string) {
+    this.vscode.postMessage(message);
+  }
+}
+
 const persistedState: Record<string, Json> = window.islInitialPersistedState ?? {};
 
-export const vscodeWebviewPlatform: Platform = {
+const vscodeWebviewPlatform: Platform = {
   platformName: 'vscode',
   confirm: (message: string, details?: string | undefined) => {
     window.clientToServerAPI?.postMessage({type: 'platform/confirm', message, details});
@@ -69,7 +91,7 @@ export const vscodeWebviewPlatform: Platform = {
     return true;
   },
 
-  clipboardCopy: browserPlatformImpl.clipboardCopy,
+  clipboardCopy: browserClipboardCopy,
 
   getPersistedState<T extends Json>(key: string): T | null {
     return persistedState[key] as T;
@@ -118,9 +140,10 @@ export const vscodeWebviewPlatform: Platform = {
   },
 
   AdditionalDebugContent: Internal.AdditionalDebugContent,
-  GettingStartedContent: Internal.GettingStartedContent,
   AddMoreCwdsHint,
   Settings: VSCodeSettings,
+
+  messageBus: new VSCodeMessageBus(vscodeApi),
 };
 
 function getTheme(): ThemeColor {
@@ -179,3 +202,21 @@ function isTextInputToPreserveFocusFor(el: Element | null) {
   }
   return false;
 }
+
+declare global {
+  interface NodeModule {
+    hot?: {
+      decline(): void;
+    };
+  }
+}
+
+// We can't allow this file to hot reload, since it creates global state.
+// If we did, we'd accumulate global `messageBus`es, which is buggy.
+if (import.meta.hot) {
+  import.meta.hot?.invalidate();
+}
+
+window.islPlatform = vscodeWebviewPlatform;
+
+export default vscodeWebviewPlatform;

@@ -6,7 +6,7 @@ load(
     "dott_test",
 )
 
-oncall("mononoke")
+oncall("scm_server_infra")
 
 buck_filegroup(
     name = "test_fixtures",
@@ -17,6 +17,7 @@ buck_filegroup(
         "commitsync/current.toml",
         "commitsync/flipped_config.json",
         "commitsync/flipped_config.toml",
+        "dbrtest_runner.py",
         "fixtures/repo_with_newline_author_commit.tar.xz",
         "gitexport_library.sh",
         "library.sh",
@@ -64,8 +65,8 @@ dott_test(
     dott_files = ["test-alias-verify.t"],
     deps = [
         "//eden/mononoke:aliasverify",
-        "//eden/mononoke:blobimport",
         "//eden/mononoke:mononoke",
+        "//eden/mononoke/tools/testtool:testtool",
     ],
 )
 
@@ -100,8 +101,9 @@ dott_test(
     name = "bonsai-verify",
     dott_files = ["test-bonsai-verify.t"],
     deps = [
-        "//eden/mononoke:blobimport",
         "//eden/mononoke:bonsai_verify",
+        "//eden/mononoke/tools/admin:newadmin",
+        "//eden/mononoke/tools/testtool:testtool",
     ],
 )
 
@@ -109,20 +111,20 @@ dott_test(
     name = "check-git-wc",
     dott_files = ["test-check-git-wc.t"],
     deps = [
-        "//eden/mononoke:blobimport",
         "//eden/mononoke:check_git_wc",
+        "//eden/mononoke/tools/testtool:testtool",
     ],
 )
 
 dott_test(
     name = "filenodes",
-    dott_files = ["test-db-filenodes.t"] + glob([
+    dott_files = glob([
         "test-filenodes*.t",
     ]),
     deps = [
-        "//eden/mononoke:admin",
-        "//eden/mononoke:blobimport",
         "//eden/mononoke:mononoke",
+        "//eden/mononoke/tools/admin:newadmin",
+        "//eden/mononoke/tools/testtool:testtool",
     ],
 )
 
@@ -153,10 +155,10 @@ dott_test(
             "test-cache-warmup-microwave.t",
         ],
     deps = [
-        "//eden/mononoke:blobimport",
         "//eden/mononoke:mononoke",
         "//eden/mononoke/microwave:builder",
         "//eden/mononoke/tools/admin:newadmin",
+        "//eden/mononoke/tools/testtool:testtool",
     ],
 )
 
@@ -184,7 +186,6 @@ dott_test(
     name = "redaction",
     dott_files = glob(["test-redaction*.t"]),
     deps = [
-        "//eden/mononoke:admin",
         "//eden/mononoke:blobimport",
         "//eden/mononoke:mononoke",
         "//eden/mononoke/tools/admin:newadmin",
@@ -195,7 +196,6 @@ dott_test(
     name = "restore-keys",
     dott_files = glob(["test-restore-keys*.t"]),
     deps = [
-        "//eden/mononoke:admin",
         "//eden/mononoke:blobimport",
         "//eden/mononoke/cmds/copy_blobstore_keys:copy_blobstore_keys",
         "//eden/mononoke/walker:walker",

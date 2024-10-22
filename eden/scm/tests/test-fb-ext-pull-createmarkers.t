@@ -4,10 +4,11 @@
 
 #inprocess-hg-incompatible
 
+
 Setup
 
   $ configure mutation-norecord dummyssh
-  $ enable amend fbcodereview pushrebase rebase remotenames
+  $ enable amend fbcodereview pushrebase rebase
   $ setconfig ui.username="nobody <no.reply@fb.com>" experimental.rebaseskipobsolete=true
   $ setconfig remotenames.allownonfastforward=true
 
@@ -62,10 +63,10 @@ The first client works on several diffs while the second client lands one of her
   o  "add c
   │
   │  Differential Revision: https://phabricator.fb.com/D123"
-  o  "add secondcommit" default/master
+  o  "add secondcommit" remote/master
   │
   o  "add initial"
-  
+
   $ hg push --to master
   pushing rev d5895ab36037 to destination ssh://user@dummy/server bookmark master
   searching for changes
@@ -94,20 +95,17 @@ We update to commit 1 to avoid keeping 2, 3, and 4 visible with inhibit
 Here pull should mark 2, 3, and 4 as obsolete since they landed as 6, 7, 8 on
 the remote
   $ hg log -G -T '"{desc}" {remotebookmarks}'
+  o  "add b" remote/master
+  │
   @  "add secondcommit"
   │
   o  "add initial"
-  
-  $ hg pull
-  pulling from ssh://user@dummy/server
-  searching for changes
-  adding changesets
-  adding manifests
-  adding file changes
+
+  $ hg pull -q
   $ hg log -G -T '"{desc}" {remotebookmarks}'
   o  "add e
   │
-  │  Differential Revision: https://phabricator.fb.com/D131" default/master
+  │  Differential Revision: https://phabricator.fb.com/D131" remote/master
   o  "add d
   │
   │  Differential Revision: https://phabricator.intern.facebook.com/D124"
@@ -119,17 +117,17 @@ the remote
   @  "add secondcommit"
   │
   o  "add initial"
-  
+
 Rebasing a stack containing landed changesets should only rebase the non-landed
 changesets
 
   $ hg up --hidden d5895ab3603770985bf7ab04bf25c0da2d7e08ab # --hidden because directaccess works only with hashes
   3 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ mkcommit k 202
-  $ hg rebase -d default/master
+  $ hg rebase -d remote/master
   note: not rebasing 1a07332e9fa1 "add c", already in destination as d446b1b2be43 "add c"
   note: not rebasing ee96b78ae17d "add d", already in destination as 1f539cc6f364 "add d"
-  note: not rebasing d5895ab36037 "add e", already in destination as 461a5b25b3dc "add e" (default/master master)
+  note: not rebasing d5895ab36037 "add e", already in destination as 461a5b25b3dc "add e" (remote/master master)
   rebasing 7dcd118e395a "add k"
 
   $ echo more >> k
@@ -139,12 +137,7 @@ changesets
   $ cd ../server
   $ mkcommit k 202
   $ cd ../client
-  $ hg pull
-  pulling from ssh://user@dummy/server
-  searching for changes
-  adding changesets
-  adding manifests
-  adding file changes
+  $ hg pull -q
 
 (Note: pullcreatemarkers created two markers, however only one of them was
 counted in the message as the first commit had previously been obsoleted

@@ -1032,6 +1032,7 @@ class localrepository:
         quiet=True,
         visible=True,
         remotebookmarks=None,
+        force=False,
     ):
         """Pull specified revisions and remote bookmarks.
 
@@ -1042,8 +1043,10 @@ class localrepository:
           new nodes of those remote bookmarks from server, we just use the value
           from this map.
 
-        visible=False can disable updating visible heads. This means the pulled
+        - visible=False can disable updating visible heads. This means the pulled
         commit hashes will not be visible, although bookmarks are still updated.
+
+        - force=true allows pulling unrelated heads (i.e. empty common)
 
         If a remote bookmark no longer exists on the server-side, it will be
         removed.
@@ -1227,10 +1230,10 @@ class localrepository:
                     self.ui.status(
                         _("imported commit graph for %s (%s)\n")
                         % (
-                            _n("%s commit" % commits, "%s commits" % commits, commits),
+                            _n(f"{commits:,} commit", f"{commits:,} commits", commits),
                             _n(
-                                "%s segment" % segments,
-                                "%s segments" % segments,
+                                f"{segments:,} segment",
+                                f"{segments:,} segments",
                                 segments,
                             ),
                         )
@@ -1281,19 +1284,27 @@ class localrepository:
                 }
                 opargs = {"extras": extras, "newpull": True}
                 pullheads = sorted(pullheads)
-                exchange.pull(self, remote, pullheads, opargs=opargs)
+                exchange.pull(
+                    self,
+                    remote,
+                    pullheads,
+                    force=force,
+                    opargs=opargs,
+                )
 
             # Update remotenames.
             if remotenamechanges:
                 remotename = bookmarks.remotenameforurl(
                     self.ui, remote.url()
                 )  # ex. 'default' or 'remote'
-                # saveremotenames will invalidate self.heads by bumping
-                # _remotenames.changecount, and invalidate phase sets
-                # like `public()` by calling invalidatevolatilesets.
-                bookmarks.saveremotenames(
-                    self, {remotename: remotenamechanges}, override=False
-                )
+                # `remotename` can be None when source is a filesystem path
+                if remotename is not None:
+                    # saveremotenames will invalidate self.heads by bumping
+                    # _remotenames.changecount, and invalidate phase sets
+                    # like `public()` by calling invalidatevolatilesets.
+                    bookmarks.saveremotenames(
+                        self, {remotename: remotenamechanges}, override=False
+                    )
 
             # Update visibleheads:
             if visible and heads:
@@ -1879,9 +1890,7 @@ class localrepository:
                 # "lazychangelog" assumes commits in the master group are lazy
                 # and resolvable by the server, which is no longer true if we
                 # force local "hg commit" commits in the master group.
-                assert (
-                    util.istest()
-                ), "devel.segmented-changelog-rev-compat should not be used outside tests"
+                assert util.istest(), "devel.segmented-changelog-rev-compat should not be used outside tests"
                 cl.inner.flush(list(cl.dag.dirty().iterrev()))
                 return
 
@@ -2655,7 +2664,12 @@ class localrepository:
         fnode = git.submodule_node_from_fctx(fctx)
         if fnode is not None:
             return fnode
-        return self.fileslog.filestore.writeobj("blob", fctx.data())
+        store = self.fileslog.abstracted_file_store()
+        opts = {}
+        data = fctx.data()
+        path = ""  # git does not need a path
+        fnode = store.insert_file(opts, path, data)
+        return fnode
 
     def checkcommitpatterns(self, wctx, match, status, fail):
         """check for commit arguments that aren't committable"""

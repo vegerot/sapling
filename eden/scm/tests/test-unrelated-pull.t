@@ -4,11 +4,13 @@
 
 #inprocess-hg-incompatible
 
+
   $ hg init a
   $ cd a
   $ echo 123 > a
   $ hg add a
   $ hg commit -m "a" -u a
+  $ hg book master
 
   $ cd ..
   $ hg init b
@@ -27,7 +29,6 @@
   pulling from ../a
   searching for changes
   warning: repository is unrelated
-  requesting all changes
   adding changesets
   adding manifests
   adding file changes

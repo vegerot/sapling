@@ -17,7 +17,7 @@
   > CONF
   > )
 
-
+  $ setconfig remotenames.selectivepulldefault=master_bookmark,feature_bookmark
 
 
   $ hg up -q tip

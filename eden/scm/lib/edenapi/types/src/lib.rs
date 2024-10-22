@@ -5,6 +5,8 @@
  * GNU General Public License version 2.
  */
 
+#![allow(unexpected_cfgs)]
+
 //! Types shared between the SaplingRemoteAPI client and server.
 //!
 //! This crate exists primarily to provide a lightweight place to
@@ -35,6 +37,7 @@ pub mod commit;
 pub mod commitid;
 pub mod errors;
 pub mod file;
+pub mod git_objects;
 pub mod history;
 pub mod land;
 pub mod metadata;
@@ -152,6 +155,9 @@ pub use crate::file::FileSpec;
 pub use crate::file::HgFilenodeData;
 pub use crate::file::UploadHgFilenodeRequest;
 pub use crate::file::UploadTokensResponse;
+pub use crate::git_objects::GitObjectBytes;
+pub use crate::git_objects::GitObjectsRequest;
+pub use crate::git_objects::GitObjectsResponse;
 pub use crate::history::HistoryEntry;
 pub use crate::history::HistoryRequest;
 pub use crate::history::HistoryResponse;

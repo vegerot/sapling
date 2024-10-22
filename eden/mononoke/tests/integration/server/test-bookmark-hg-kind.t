@@ -13,7 +13,7 @@ Disable boookmarks cache because we manually modify bookmarks table
 
 setup common configuration for these tests
 
-  $ enable amend infinitepush infinitepushbackup remotenames commitcloud
+  $ enable amend infinitepush infinitepushbackup commitcloud
 
 setup repo
 
@@ -43,10 +43,6 @@ start mononoke
   $ start_and_wait_for_mononoke_server
 create new bookmarks, then update their properties
   $ cd repo-push
-  $ cat >> .hg/hgrc <<EOF
-  > [extensions]
-  > remotenames=
-  > EOF
   $ hg up tip
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ touch b && hg addremove && hg ci -q -m 'add b'
@@ -69,24 +65,21 @@ create new bookmarks, then update their properties
   not_pull_default|publishing
   scratch|scratch
   $ tglogpnr
-  @  b2d646f64a99 public 'add c'  default/scratch
+  @  b2d646f64a99 draft 'add c'
   │
-  o  907767d421e4 public 'add b'  default/not_pull_default
+  o  907767d421e4 draft 'add b'
   │
-  o  ac82d8b1f7c4 public 'add a'  default/master_bookmark
+  o  ac82d8b1f7c4 public 'add a'  remote/master_bookmark
   
 test publishing
   $ cd "$TESTTMP/repo-pull"
   $ tglogpnr
-  o  ac82d8b1f7c4 public 'add a'  default/master_bookmark
+  o  ac82d8b1f7c4 public 'add a'  remote/master_bookmark
   
   $ hg pull
   pulling from mono:repo
-  searching for changes
-  adding changesets
-  adding manifests
-  adding file changes
   $ hg up 907767d421e4cb28c7978bedef8ccac7242b155e
+  pulling '907767d421e4cb28c7978bedef8ccac7242b155e' from 'mono:repo'
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ hg up b2d646f64a9978717516887968786c6b7a33edf9
   pulling 'b2d646f64a9978717516887968786c6b7a33edf9' from 'mono:repo'
@@ -96,7 +89,7 @@ test publishing
   │
   o  907767d421e4 draft 'add b'
   │
-  o  ac82d8b1f7c4 public 'add a'  default/master_bookmark
+  o  ac82d8b1f7c4 public 'add a'  remote/master_bookmark
   
   $ hg bookmarks
   no bookmarks set

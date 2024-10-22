@@ -86,7 +86,6 @@ Push a few new commits and update streaming clone
   $ cd "$TESTTMP"
   $ hg clone -q mono:repo repo-push --noupdate
   $ cd repo-push
-  $ enableextension remotenames
   $ hg up tip
   3 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ echo 1 > 1
@@ -110,7 +109,7 @@ Push a few new commits and update streaming clone
   updating bookmark master_bookmark
   $ hg log -r tip
   commit:      9e0f64de2fee
-  bookmark:    default/master_bookmark
+  bookmark:    remote/master_bookmark
   hoistedname: master_bookmark
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000
@@ -160,7 +159,7 @@ Clone it again to make sure saved streaming chunks are valid
   $ cd repo-streamclone-3
   $ hg log -r tip
   commit:      9e0f64de2fee
-  bookmark:    default/master_bookmark
+  bookmark:    remote/master_bookmark
   hoistedname: master_bookmark
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000

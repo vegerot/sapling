@@ -45,7 +45,7 @@
 #include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/store/TreeCache.h"
 #include "eden/fs/telemetry/EdenStats.h"
-#include "eden/fs/telemetry/IHiveLogger.h"
+#include "eden/fs/telemetry/IScribeLogger.h"
 #include "eden/fs/testharness/FakeBackingStore.h"
 #include "eden/fs/testharness/FakeClock.h"
 #include "eden/fs/testharness/FakeFuse.h"
@@ -117,13 +117,14 @@ TestMount::TestMount(bool enableActivityBuffer, CaseSensitivity caseSensitivity)
   serverState_ = make_shared<ServerState>(
       UserInfo::lookup(),
       makeRefPtr<EdenStats>(),
+      SessionInfo{},
       privHelper_,
       make_shared<UnboundedQueueExecutor>(serverExecutor_),
       serverExecutor_,
       clock_,
       make_shared<ProcessInfoCache>(),
       make_shared<NullStructuredLogger>(),
-      make_shared<NullHiveLogger>(),
+      make_shared<NullScribeLogger>(),
       reloadableConfig,
       *edenConfig_,
       nullptr,

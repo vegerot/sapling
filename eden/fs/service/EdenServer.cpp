@@ -25,7 +25,11 @@
 #include <folly/Exception.h>
 #include <folly/FileUtil.h>
 #include <folly/SocketAddress.h>
-#include <folly/String.h>
+
+#include <folly/json/json.h>
+#ifdef __APPLE__
+#include <folly/Subprocess.h> // @manual
+#endif
 #include <folly/chrono/Conv.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/thread_factory/NamedThreadFactory.h>
@@ -61,6 +65,7 @@
 #include "eden/fs/config/MountProtocol.h"
 #include "eden/fs/config/TomlConfig.h"
 #include "eden/fs/inodes/EdenMount.h"
+#include "eden/fs/inodes/FileAccessLogger.h"
 #include "eden/fs/inodes/InodeBase.h"
 #include "eden/fs/inodes/InodeMap.h"
 #include "eden/fs/inodes/ServerState.h"
@@ -90,7 +95,7 @@
 #include "eden/fs/takeover/TakeoverData.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/EdenStructuredLogger.h"
-#include "eden/fs/telemetry/IHiveLogger.h"
+#include "eden/fs/telemetry/IScribeLogger.h"
 #include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/Clock.h"
 #include "eden/fs/utils/EdenError.h"
@@ -217,6 +222,9 @@ constexpr StringPiece kSlStorePrefix{"store.sapling"};
 #ifndef _WIN32
 constexpr StringPiece kFuseRequestPrefix{"fuse"};
 #endif
+#ifdef __APPLE__
+constexpr StringPiece kNFSStatPrefix{"nfs"};
+#endif
 constexpr StringPiece kStateConfig{"config.toml"};
 
 std::optional<std::string> getUnixDomainSocketPath(
@@ -224,6 +232,23 @@ std::optional<std::string> getUnixDomainSocketPath(
   return AF_UNIX == address.getFamily() ? std::make_optional(address.getPath())
                                         : std::nullopt;
 }
+
+#ifdef __APPLE__
+folly::Try<folly::dynamic> collectNFSUtilStats() {
+  try {
+    SpawnedProcess::Options opts;
+    opts.pipeStdout();
+    opts.pipeStderr();
+    auto nfsStatProc =
+        SpawnedProcess({"nfsstat", "-f", "JSON"}, std::move(opts));
+    std::string nfsStatOutputString = nfsStatProc.communicate().first;
+    nfsStatProc.waitTimeout(1s);
+    return folly::Try<folly::dynamic>(folly::parseJson(nfsStatOutputString));
+  } catch (const std::exception& e) {
+    return folly::Try<folly::dynamic>(e);
+  }
+}
+#endif
 
 std::string getCounterNameForImportMetric(
     RequestMetricsScope::RequestStage stage,
@@ -412,7 +437,7 @@ EdenServer::EdenServer(
     std::shared_ptr<const EdenConfig> edenConfig,
     ActivityRecorderFactory activityRecorderFactory,
     BackingStoreFactory* backingStoreFactory,
-    std::shared_ptr<IHiveLogger> hiveLogger,
+    std::shared_ptr<IScribeLogger> scribeLogger,
     std::shared_ptr<StartupStatusChannel> startupStatusChannel,
     std::string version)
     : originalCommandLine_{std::move(originalCommandLine)},
@@ -430,18 +455,19 @@ EdenServer::EdenServer(
           makeDefaultStructuredLogger<EdenStructuredLogger, EdenStatsPtr>(
               edenConfig->scribeLogger.getValue(),
               edenConfig->scribeCategory.getValue(),
-              std::move(sessionInfo),
+              sessionInfo,
               edenStats.copy())},
       serverState_{make_shared<ServerState>(
           std::move(userInfo),
           std::move(edenStats),
+          std::move(sessionInfo),
           std::move(privHelper),
           std::make_shared<EdenCPUThreadPool>(),
           makeFsChannelThreads(edenConfig),
           std::make_shared<UnixClock>(),
           std::make_shared<ProcessInfoCache>(),
           structuredLogger_,
-          std::move(hiveLogger),
+          std::move(scribeLogger),
           config_,
           *edenConfig,
           mainEventBase_,
@@ -508,6 +534,48 @@ EdenServer::EdenServer(
     }
     return (size_t)0;
   });
+
+#ifdef __APPLE__
+  // On macOS, export the NFS clients/servers counters
+  if (config_->getEdenConfig()->updateNFSStatsInterval.getValue() > 0ms) {
+    auto result = collectNFSUtilStats();
+    if (result.hasValue()) {
+      for (const auto& nfsStatsCounter : kNfsStatsToEdenStatsMap_) {
+        auto counterName = mapCounterNameForNFSStat(nfsStatsCounter);
+        if (counterName.has_value()) {
+          counters->registerCallback(
+              counterName.value(), [this, nfsStatsCounter] {
+                auto result =
+                    this->getNFSStatCounterValue(nfsStatsCounter.first);
+                if (result.has_value()) {
+                  return result.value();
+                } else {
+                  return 0LL;
+                }
+              });
+        } else {
+          // This is not an error, just log it and continue.
+          // This only happen on registration time, not during runtime per
+          // counter. It notify us that we have a NFS counter in the map that
+          // is not reported by Apple.
+          XLOGF(
+              DFATAL,
+              "macOS doesn't report any stat for: {}",
+              nfsStatsCounter.first);
+        }
+      }
+    } else {
+      auto error = result.exception();
+      // This is not a fatal error, just log it and continue.
+      // This only happen on registration time, not during runtime per
+      // counter.
+      XLOGF(
+          ERR,
+          "Failed to collect NFS clients/servers counters: {}",
+          error.what());
+    }
+  }
+#endif
 }
 
 EdenServer::~EdenServer() {
@@ -526,7 +594,60 @@ EdenServer::~EdenServer() {
     }
   }
   counters->unregisterCallback(kFsChannelTaskCount);
+#ifdef __APPLE__
+  for (const auto& nfsStatsCounter : kNfsStatsToEdenStatsMap_) {
+    auto counterName = mapCounterNameForNFSStat(nfsStatsCounter);
+    if (counterName.has_value()) {
+      counters->unregisterCallback(counterName.value());
+    }
+  }
+#endif
 }
+
+#ifdef __APPLE__
+std::optional<std::string> EdenServer::mapCounterNameForNFSStat(
+    std::pair<std::string, std::string> nfsStatsCounter) {
+  auto result = this->getNFSStatCounterValue(nfsStatsCounter.first);
+  if (result.has_value()) {
+    return fmt::format(
+        fmt::runtime(kNFSStatPrefix.str() + ".{}"),
+        nfsStatsCounter.second); // e.g. "nfs.requests"
+  } else {
+    return std::nullopt;
+  }
+}
+
+std::optional<long long> EdenServer::getNFSStatCounterValue(
+    std::string nfsStatsCounterMacOSName) {
+  if (!this->updateNFSStatsIfNeeded()) {
+    // Unable to collect NFS stats
+    return std::nullopt;
+  }
+  try {
+    std::vector<std::string> tokens;
+    folly::split('.', nfsStatsCounterMacOSName, tokens);
+    return nfsStatOutput_[tokens[0]][tokens[1]][tokens[2]].asInt();
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+bool EdenServer::updateNFSStatsIfNeeded() {
+  auto now = std::chrono::steady_clock::now();
+  auto last = lastTimeUpdatedNfsStat_.wlock();
+  if (now >=
+      *last + config_->getEdenConfig()->updateNFSStatsInterval.getValue()) {
+    auto result = collectNFSUtilStats();
+    *last = std::chrono::steady_clock::now();
+    if (!result.hasValue()) {
+      // Unable to collect NFS stats
+      return false;
+    }
+    nfsStatOutput_ = result.value();
+  }
+  return true;
+}
+#endif
 
 namespace cursor_helper {
 
@@ -1753,29 +1874,25 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
               }
             })
             .thenTry([this, mountStopWatch, doTakeover, edenMount](auto&& t) {
-              FinishedMount event;
-              event.repo_type = edenMount->getCheckoutConfig()->getRepoType();
-              event.backing_store_type = toBackingStoreString(
-                  edenMount->getCheckoutConfig()->getRepoBackingStoreType());
-              event.repo_source =
-                  basename(edenMount->getCheckoutConfig()->getRepoSource());
               auto* fsChannel = edenMount->getFsChannel();
-              event.fs_channel_type =
-                  fsChannel ? fsChannel->getName() : "unknown";
-              event.is_takeover = doTakeover;
-              event.duration =
-                  std::chrono::duration<double>{mountStopWatch.elapsed()}
-                      .count();
-              event.success = !t.hasException();
-              event.clean = edenMount->getOverlay()->hadCleanStartup();
-
               auto inodeCatalogType =
                   edenMount->getCheckoutConfig()->getInodeCatalogType();
-              if (inodeCatalogType.has_value()) {
-                event.inode_catalog_type =
-                    static_cast<int64_t>(inodeCatalogType.value());
-              }
-              serverState_->getStructuredLogger()->logEvent(event);
+              serverState_->getStructuredLogger()->logEvent(FinishedMount{
+                  std::string{
+                      toBackingStoreString(edenMount->getCheckoutConfig()
+                                               ->getRepoBackingStoreType())},
+                  edenMount->getCheckoutConfig()->getRepoType(),
+                  std::string{basename(
+                      edenMount->getCheckoutConfig()->getRepoSource())},
+                  fsChannel ? fsChannel->getName() : "unknown",
+                  doTakeover,
+                  std::chrono::duration<double>{mountStopWatch.elapsed()}
+                      .count(),
+                  !t.hasException(),
+                  edenMount->getOverlay()->hadCleanStartup(),
+                  inodeCatalogType.has_value()
+                      ? static_cast<int64_t>(inodeCatalogType.value())
+                      : 0});
               return makeFuture(std::move(t));
             });
       });
@@ -2305,7 +2422,7 @@ folly::Future<TakeoverData> EdenServer::startTakeoverShutdown() {
   return serverState_->getFaultInjector()
       .checkAsync("takeover", "server_shutdown")
       .semi()
-      .via(serverState_->getThreadPool().get())
+      .via(getMainEventBase())
       .thenValue([this](auto&&) {
         // Compact storage for all key spaces in order to speed up the
         // takeover start of the new process. We could potentially test this
@@ -2642,13 +2759,32 @@ void EdenServer::runEdenDoctor() {
   // than reusing it. Explanation on why CPUThreadPoolExecutor-
   // https://www.internalfb.com/intern/staticdocs/fbcref/guides/Executors/.
   folly::CPUThreadPoolExecutor executor(1);
-  executor.add([] {
+  auto systemConfigDir = config_->getEdenConfig()->getSystemConfigDir();
+  auto edenDir = getEdenDir();
+  executor.add([systemConfigDir, edenDir] {
     try {
       XLOG(INFO, "Running periodic eden doctor dry-run.");
+      // Not passing Options field cause "0x57" error. ref: D59783277
+      SpawnedProcess::Options opts;
+#ifdef _WIN32
+      opts.creationFlags(CREATE_NO_WINDOW);
+      opts.nullStderr();
+      opts.nullStdin();
+      opts.nullStdout();
+#endif // _WIN32
       // Assuming, this will only be run from windows user's system,
       // we are using the plain vanilla version of eden doctor dry run.
       // This can be modified in the future to pass config-dir param.
-      auto proc = SpawnedProcess({"edenfsctl", "doctor", "--dry-run"});
+      auto proc = SpawnedProcess(
+          {"c:\\tools\\eden\\bin\\edenfsctl.exe",
+           "--etc-eden-dir",
+           systemConfigDir.c_str(),
+           "--config-dir",
+           edenDir.asString(),
+           "doctor",
+           "--dry-run",
+           "--fast"},
+          std::move(opts));
       XLOG(INFO, "Checking status for eden doctor dry-run.");
       // Setting the timeout to terminate process to 2.5 minutes.
       // P99.9 to run eden doctor dry-run is ~2 minutes.

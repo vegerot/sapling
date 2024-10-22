@@ -3,12 +3,10 @@
 #require no-eden
 
 
-
   $ CACHEDIR=`pwd`/hgcache
 
   $ . "$TESTDIR/library.sh"
 
-  $ enable remotenames
   $ hginit master
   $ cd master
   $ cat >> .hg/hgrc <<EOF
@@ -85,15 +83,12 @@ Test prefetching when a draft commit is marked public
   o  public 287ee6e53d4fbc5fab2157eb0383fdff1c3277c8
   
 - Add remotenames for the remote heads
-  $ hg pull --config extensions.remotenames=
-  pulling from ssh://user@dummy/master
-  searching for changes
-  no changes found
+  $ hg pull -q
 
 - Attempt to download the latest server commit. Verify there's no error about a
 - missing manifest from the server.
   $ clearcache
-  $ hg status --change 'desc("modify x")' --config extensions.remotenames=
+  $ hg status --change 'desc("modify x")'
   M dir/x
   $ hg debugstrip -r 'desc("add foo")'
   0 files updated, 0 files merged, 1 files removed, 0 files unresolved
@@ -110,7 +105,8 @@ Test auto prefetch during normal access
   $ hg log -r tip --stat --pager=off
   2 files fetched over 1 fetches - (2 misses, 0.00% hit ratio) over * (glob) (?)
   commit:      311cac64787d
-  bookmark:    default/master
+  bookmark:    public/0bcf7fbaf4e603953fe5af7ffc26b3568512046c
+  bookmark:    remote/master
   hoistedname: master
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000
@@ -118,7 +114,6 @@ Test auto prefetch during normal access
   
    dir/x |  1 +
    1 files changed, 1 insertions(+), 0 deletions(-)
-  
 TODO(meyer): Fix debugindexedlogdatastore and debugindexedloghistorystore and add back output here.
 Test that auto prefetch scans up the changelog for base trees
   $ rm -rf $CACHEDIR/master
@@ -139,8 +134,6 @@ Test auto prefetch during pull
   $ rm -rf $CACHEDIR/master
   $ hg pull --config treemanifest.pullprefetchcount=10 --traceback
   pulling from ssh://user@dummy/master
-  searching for changes
-  no changes found
   prefetching trees for 3 commits
 TODO(meyer): Fix debugindexedlogdatastore and debugindexedloghistorystore and add back output here.
 
@@ -150,8 +143,6 @@ TODO(meyer): Fix debugindexedlogdatastore and debugindexedloghistorystore and ad
   $ rm -rf $CACHEDIR/master
   $ hg pull --config treemanifest.pullprefetchcount=1 --traceback
   pulling from ssh://user@dummy/master
-  searching for changes
-  no changes found
   prefetching tree for 311cac64787d
 TODO(meyer): Fix debugindexedlogdatastore and debugindexedloghistorystore and add back output here.
 
@@ -161,8 +152,6 @@ TODO(meyer): Fix debugindexedlogdatastore and debugindexedloghistorystore and ad
   2 files fetched over 1 fetches - (2 misses, 0.00% hit ratio) over * (glob) (?)
   $ hg pull --config treemanifest.pullprefetchcount=1 --traceback
   pulling from ssh://user@dummy/master
-  searching for changes
-  no changes found
   prefetching tree for 311cac64787d
 TODO(meyer): Fix debugindexedlogdatastore and debugindexedloghistorystore and add back output here.
 
@@ -177,10 +166,7 @@ Test prefetching certain revs during pull
   $ rm -rf $CACHEDIR/master
   $ hg pull --config treemanifest.pullprefetchrevs='tip~2'
   pulling from ssh://user@dummy/master
-  searching for changes
-  adding changesets
-  adding manifests
-  adding file changes
+  imported commit graph for 2 commits (1 segment)
   prefetching tree for 311cac64787d
 TODO(meyer): Fix debugindexedlogdatastore and debugindexedloghistorystore and add back output here.
 
@@ -188,8 +174,6 @@ TODO(meyer): Fix debugindexedlogdatastore and debugindexedloghistorystore and ad
 - downloaded already. Note that subdir/z was not downloaded this time.
   $ hg pull --config treemanifest.pullprefetchrevs='tip'
   pulling from ssh://user@dummy/master
-  searching for changes
-  no changes found
   prefetching tree for 47bb1c5075af
 TODO(meyer): Fix debugindexedlogdatastore and debugindexedloghistorystore and add back output here.
 

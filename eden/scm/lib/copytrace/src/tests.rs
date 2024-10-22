@@ -187,7 +187,11 @@ impl ReadRootTreeIds for CopyTraceTestCase {
 }
 
 #[async_trait]
-impl KeyStore for CopyTraceTestCase {}
+impl KeyStore for CopyTraceTestCase {
+    fn clone_key_store(&self) -> Box<dyn KeyStore> {
+        Box::new(self.clone())
+    }
+}
 
 #[async_trait]
 impl FileStore for CopyTraceTestCase {
@@ -195,10 +199,15 @@ impl FileStore for CopyTraceTestCase {
         &self,
         keys: Vec<Key>,
     ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, Key)>>> {
+        let store = self.clone();
         let iter = keys
             .into_iter()
-            .filter_map(|k| self.inner.copies.get(&k).cloned().map(|v| Ok((k, v))));
+            .filter_map(move |k| store.inner.copies.get(&k).cloned().map(|v| Ok((k, v))));
         Ok(Box::new(iter))
+    }
+
+    fn clone_file_store(&self) -> Box<dyn FileStore> {
+        Box::new(self.clone())
     }
 }
 

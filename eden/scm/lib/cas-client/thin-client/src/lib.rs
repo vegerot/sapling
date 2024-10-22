@@ -28,6 +28,7 @@ pub struct ThinCasClient {
     verbose: bool,
     log_dir: Option<String>,
     fetch_limit: ByteCount,
+    fetch_concurrency: usize,
 }
 
 pub fn init() {
@@ -66,6 +67,8 @@ impl ThinCasClient {
                         log_dir = Some(std::env::temp_dir().to_string_lossy().to_string());
                     }
                 }
+            } else {
+                log_dir = Some(std::env::temp_dir().to_string_lossy().to_string());
             }
         }
 
@@ -84,6 +87,7 @@ impl ThinCasClient {
             log_dir,
             fetch_limit: config
                 .get_or::<ByteCount>("cas", "max-batch-bytes", || default_fetch_limit)?,
+            fetch_concurrency: config.get_or("cas", "fetch-concurrency", || 4)?,
         })
     }
 
@@ -96,6 +100,7 @@ impl ThinCasClient {
         re_config.features_config_path = "remote_execution/features/client_sapling".to_string();
         re_config.enable_ods_logging = false;
         re_config.enable_scuba_logging = false;
+        re_config.enable_cancellation = true;
 
         let mut builder = REClientBuilder::new(fbinit::expect_init()).with_config(re_config);
 

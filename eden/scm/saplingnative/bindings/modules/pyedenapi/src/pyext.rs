@@ -72,8 +72,8 @@ use edenapi_types::UploadHgChangeset;
 use edenapi_types::UploadToken;
 use edenapi_types::WorkspaceDataResponse;
 use edenapi_types::WorkspacesDataResponse;
+use format_util::split_hg_file_metadata;
 use futures::prelude::*;
-use hgstore::split_hg_file_metadata;
 use progress_model::ProgressBar;
 use pyrevisionstore::filescmstore;
 use revisionstore::HgIdDataStore;
@@ -324,7 +324,7 @@ pub trait SaplingRemoteApiPyExt: SaplingRemoteApi {
         Ok(Serde(responses))
     }
 
-    fn commit_graph2_py(
+    fn commit_graph_py(
         &self,
         py: Python,
         heads: Vec<HgId>,

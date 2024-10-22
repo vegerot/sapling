@@ -12,7 +12,7 @@
   $ start_and_wait_for_mononoke_server
   $ hg clone -q mono:repo repo
   $ cd repo
-  $ drawdag << 'EOF'
+  $ drawdag --parent-order=name << 'EOF'
   > F        # F/quux = random:30
   > |\       # D/qux  = random:30
   > B D      # C/baz  = random:30
@@ -23,9 +23,9 @@
   $ hg log -r "p1($F)" -T "{node}" | grep $D > /dev/null
   [1]
   $ hg log -r "p2($F)" -T "{node}" | grep $D > /dev/null
-  $ hg push -r $B --to master -q --create
+  $ hg push -r $B --to master_bookmark -q --create
   $ hg push -r $D --allow-anon -q
-  $ hg push -r $F --to master -q
+  $ hg push -r $F --to master_bookmark -q
   $ hg goto $F -q
   $ ls | sort
   bar

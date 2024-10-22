@@ -4,7 +4,8 @@
 
 #inprocess-hg-incompatible
 
-  $ enable infinitepush remotenames
+
+  $ enable infinitepush
   $ . "$TESTDIR/library.sh"
 
   $ mkcommit() {
@@ -75,9 +76,4 @@ expanding an unknown scheme emits the input
   remote: pushing 1 commit:
   remote:     6e16a5f9c216  something
 
-  $ hg pull -r 6e16a5f9c216
-  pulling from dotdot://server/
-  no changes found
-  adding changesets
-  adding manifests
-  adding file changes
+  $ hg pull -qr 6e16a5f9c216

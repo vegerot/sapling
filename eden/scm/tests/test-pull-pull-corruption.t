@@ -52,10 +52,6 @@ start a pull...
   $ hg pull ../source2 2>/dev/null
   $ cat pull.out
   pulling from ../source1
-  requesting all changes
-  adding changesets
-  adding manifests
-  adding file changes
 
 see the result
 

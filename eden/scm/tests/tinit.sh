@@ -8,7 +8,7 @@
 
 _repocount=0
 
-if [ -n "$USE_MONONOKE" ] ; then
+if [ -n "$USE_MONONOKE" ] && [ -z "$DEBUGRUNTEST_ENABLED" ] ; then
   . "$TESTDIR/../../mononoke/tests/integration/library.sh"
 fi
 
@@ -49,9 +49,20 @@ newclientrepo() {
     reponame=repo$_repocount
   fi
   if [ -z "$server" ]; then
+    if [ -n "$USE_MONONOKE" ] ; then
+      servername="${reponame}"
+      newserver "${servername}"
+      server="mononoke://$(mononoke_address)/${servername}"
+    else
       server="test:${reponame}_server"
+    fi
   fi
-  hg clone --config "clone.use-rust=True" --config "remotefilelog.reponame=$reponame" --shallow -q "$server" "$TESTTMP/$reponame"
+  if [ -z "$USE_MONONOKE" ] ; then
+    remflog="--config remotefilelog.reponame=${reponame}"
+  else
+    remflog=""
+  fi
+  hg clone --config "clone.use-rust=True" $remflog --shallow -q "$server" "$TESTTMP/$reponame"
 
   local drawdaginput=""
   while IFS= read line
@@ -75,7 +86,7 @@ newclientrepo() {
 newremoterepo() {
   newrepo "$@"
   echo remotefilelog >> .hg/requires
-  enable pushrebase remotenames
+  enable pushrebase
   if [ -n "$USE_MONONOKE" ] ; then
     setconfig paths.default=mononoke://$(mononoke_address)/server
   else
@@ -89,6 +100,8 @@ newserver() {
     REPONAME=$reponame setup_common_config
     mononoke
     MONONOKE_START_TIMEOUT=60 wait_for_mononoke "$TESTTMP/$reponame"
+    REPOID=${REPOID:-0}
+    export REPOID=$((REPOID+1))
   elif [ -f "$TESTTMP/.eagerepo" ] ; then
     hg init "$TESTTMP/$reponame" --config format.use-eager-repo=true
     cd "$TESTTMP/$reponame"
@@ -98,7 +111,6 @@ newserver() {
     hg --config experimental.narrow-heads=false \
       --config visibility.enabled=false \
       init
-    enable remotenames
     setconfig \
        remotefilelog.reponame="$reponame" remotefilelog.server=True \
        infinitepush.server=yes infinitepush.reponame="$reponame" \
@@ -122,15 +134,11 @@ clone() {
   fi
 
   hg clone -q --shallow "$serverurl" "$clientname" "$@" \
-    --config "extensions.remotenames=" \
     --config "remotefilelog.reponame=$servername" \
     --config "ui.ssh=$(dummysshcmd)" \
     --config "ui.remotecmd=$remotecmd"
 
   cat >> $clientname/.hg/hgrc <<EOF
-[extensions]
-remotenames=
-
 [phases]
 publish=False
 
@@ -198,17 +206,12 @@ configure() {
         configure noevolution mutation-norecord
         setconfig experimental.narrow-heads=true
         ;;
-      selectivepull)
-        enable remotenames
-        setconfig remotenames.selectivepull=True
-        setconfig remotenames.selectivepulldefault=master
-        ;;
       modern)
         enable amend
         setconfig remotenames.rename.default=remote
         setconfig remotenames.hoist=remote
         setconfig experimental.changegroup3=True
-        configure dummyssh commitcloud narrowheads selectivepull
+        configure dummyssh commitcloud narrowheads
         ;;
       modernclient)
         touch $TESTTMP/.eagerepo
@@ -271,7 +274,7 @@ setglobalconfig() {
 
 # Set config items that enable modern features.
 setmodernconfig() {
-  enable remotenames amend
+  enable amend
   setconfig experimental.narrow-heads=true visibility.enabled=true mutation.record=true mutation.enabled=true experimental.evolution=obsolete remotenames.rename.default=remote
 }
 

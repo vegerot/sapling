@@ -1,11 +1,9 @@
 #modern-config-incompatible
-#inprocess-hg-incompatible
 
 #require no-eden
 
 
 Pushrebase still needs filepeer.
-
 
   $ configure modern
   $ enable pushrebase

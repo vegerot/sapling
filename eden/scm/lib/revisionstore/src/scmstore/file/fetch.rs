@@ -26,12 +26,14 @@ use futures::StreamExt;
 use futures::TryFutureExt;
 use minibytes::Bytes;
 use progress_model::AggregatingProgressBar;
+use storemodel::SerializationFormat;
 use tracing::debug;
 use tracing::field;
 use types::errors::NetworkError;
 use types::fetch_mode::FetchMode;
 use types::CasDigest;
 use types::CasDigestType;
+use types::CasFetchedStats;
 use types::Key;
 use types::Sha256;
 
@@ -81,6 +83,8 @@ pub struct FetchState {
     lfs_enabled: bool,
 
     fetch_mode: FetchMode,
+
+    format: SerializationFormat,
 }
 
 impl FetchState {
@@ -102,6 +106,7 @@ impl FetchState {
             compute_aux_data: file_store.compute_aux_data,
             lfs_progress: file_store.lfs_progress.clone(),
             lfs_enabled,
+            format: file_store.format(),
             fetch_mode,
         }
     }
@@ -116,6 +121,10 @@ impl FetchState {
 
     pub(crate) fn metrics(&self) -> &FileStoreFetchMetrics {
         &self.metrics
+    }
+
+    pub(crate) fn format(&self) -> SerializationFormat {
+        self.format
     }
 
     /// Returns all incomplete requested Keys for which we haven't discovered an LFS pointer, and for which additional attributes may be gathered by querying a store which provides the specified attributes.
@@ -164,6 +173,7 @@ impl FetchState {
         key: Key,
         file: LazyFile,
         indexedlog_cache: &IndexedLogHgIdDataStore,
+        format: SerializationFormat,
     ) -> Result<LazyFile> {
         let cache_entry = file.indexedlog_cache_entry(key.clone())?.ok_or_else(|| {
             anyhow!(
@@ -174,7 +184,7 @@ impl FetchState {
         let mmap_entry = indexedlog_cache
             .get_entry(key)?
             .ok_or_else(|| anyhow!("failed to read entry back from indexedlog after writing"))?;
-        Ok(LazyFile::IndexedLog(mmap_entry))
+        Ok(LazyFile::IndexedLog(mmap_entry, format))
     }
 
     pub(crate) fn fetch_indexedlog(&mut self, store: &IndexedLogHgIdDataStore, loc: StoreLocation) {
@@ -205,6 +215,7 @@ impl FetchState {
         let mut error: Option<String> = None;
 
         self.metrics.indexedlog.store(loc).fetch(pending.len());
+        let format = self.format();
 
         self.common
             .iter_pending(FileAttributes::CONTENT, self.compute_aux_data, |key| {
@@ -231,7 +242,7 @@ impl FetchState {
                         if entry.metadata().is_lfs() && self.lfs_enabled {
                             return None;
                         } else {
-                            return Some(LazyFile::IndexedLog(entry).into());
+                            return Some(LazyFile::IndexedLog(entry, format).into());
                         }
                     }
                     Ok(None) => {
@@ -460,6 +471,7 @@ impl FetchState {
         indexedlog_cache: Option<Arc<IndexedLogHgIdDataStore>>,
         lfs_cache: Option<Arc<LfsStore>>,
         aux_cache: Option<Arc<AuxStore>>,
+        format: SerializationFormat,
     ) -> Result<(StoreFile, Option<LfsPointersEntry>)> {
         let entry = entry.result?;
 
@@ -485,11 +497,12 @@ impl FetchState {
             } else if let Some(indexedlog_cache) = indexedlog_cache.as_ref() {
                 file.content = Some(Self::evict_to_cache(
                     key,
-                    LazyFile::SaplingRemoteApi(entry),
+                    LazyFile::SaplingRemoteApi(entry, format),
                     indexedlog_cache,
+                    format,
                 )?);
             } else {
-                file.content = Some(LazyFile::SaplingRemoteApi(entry));
+                file.content = Some(LazyFile::SaplingRemoteApi(entry, format));
             }
         }
 
@@ -551,6 +564,7 @@ impl FetchState {
             }
         };
 
+        let format = self.format();
         let entries = response
             .entries
             .map(move |res_entry| {
@@ -561,7 +575,13 @@ impl FetchState {
                     res_entry.map(move |entry| {
                         (
                             entry.key.clone(),
-                            Self::found_edenapi(entry, indexedlog_cache, lfs_cache, aux_cache),
+                            Self::found_edenapi(
+                                entry,
+                                indexedlog_cache,
+                                lfs_cache,
+                                aux_cache,
+                                format,
+                            ),
                         )
                     })
                 })
@@ -694,7 +714,7 @@ impl FetchState {
 
         let fetchable = FileAttributes::PURE_CONTENT;
 
-        let mut digest_to_key: HashMap<CasDigest, Key> = self
+        let digest_with_keys: Vec<(CasDigest, Key)> = self
             // TODO: fetch LFS files
             .pending_nonlfs(fetchable)
             .into_iter()
@@ -732,51 +752,73 @@ impl FetchState {
             })
             .collect();
 
+        // Include the duplicates in the count.
+        span.record("keys", digest_with_keys.len());
+
+        let mut digest_to_key: HashMap<CasDigest, Vec<Key>> = HashMap::default();
+
+        for (digest, key) in digest_with_keys {
+            digest_to_key.entry(digest).or_default().push(key);
+        }
+
         if digest_to_key.is_empty() {
             return;
         }
 
         let digests: Vec<CasDigest> = digest_to_key.keys().cloned().collect();
 
-        span.record("keys", digests.len());
-
         let mut found = 0;
         let mut error = 0;
         let mut reqs = 0;
 
         let start_time = Instant::now();
+        let mut total_stats = CasFetchedStats::default();
 
         block_on(async {
             cas_client.fetch(&digests, CasDigestType::File).await.for_each(|results| match results {
-                Ok(results) => {
+                Ok((stats, results)) => {
                     reqs += 1;
+                    total_stats.add(&stats);
                     for (digest, data) in results {
-                        let Some(key) = digest_to_key.remove(&digest) else {
+                        let Some(mut keys) = digest_to_key.remove(&digest) else {
                             tracing::error!("got CAS result for unrequested digest {:?}", digest);
                             continue;
                         };
 
                         match data {
                             Err(err) => {
-                                tracing::error!(?err, ?key, ?digest, "CAS fetch error");
-                                tracing::error!(target: "cas", ?err, ?key, ?digest, "file fetch error");
-                                error += 1;
-                                self.errors.keyed_error(key, err);
+                                tracing::error!(?err, ?keys, ?digest, "CAS fetch error");
+                                tracing::error!(target: "cas", ?err, ?keys, ?digest, "file(s) fetch error");
+                                error += keys.len();
+                                self.errors.multiple_keyed_error(keys, "CAS fetch error", err);
                             }
                             Ok(None) => {
-                                tracing::trace!(target: "cas", ?key, ?digest, "file not in cas");
+                                tracing::trace!(target: "cas", ?keys, ?digest, "file(s) not in cas");
                                 // miss
                             }
                             Ok(Some(data)) => {
-                                found += 1;
-                                tracing::trace!(target: "cas", ?key, ?digest, "file found in cas");
-                                self.found_attributes(
-                                    key,
-                                    StoreFile {
-                                        content: Some(LazyFile::Cas(data.into())),
-                                        aux_data: None,
-                                    },
-                                );
+                                found += keys.len();
+                                tracing::trace!(target: "cas", ?keys, ?digest, "file(s) found in cas");
+                                if !keys.is_empty() {
+                                    let last = keys.pop().unwrap();
+                                    for key in keys {
+                                        self.found_attributes(
+                                            key,
+                                            StoreFile {
+                                                content: Some(LazyFile::Cas(data.clone().into())),
+                                                aux_data: None,
+                                            },
+                                        );
+                                    }
+                                    // zero copy here
+                                    self.found_attributes(
+                                        last,
+                                        StoreFile {
+                                            content: Some(LazyFile::Cas(data.into())),
+                                            aux_data: None,
+                                        },
+                                    );
+                                }
                             }
                         }
                     }
@@ -801,6 +843,30 @@ impl FetchState {
         self.metrics.cas.fetch(digests.len());
         self.metrics.cas.err(error);
         self.metrics.cas.hit(found);
+        self.metrics
+            .cas_backend
+            .zdb_bytes(total_stats.total_bytes_zdb);
+        self.metrics
+            .cas_backend
+            .zgw_bytes(total_stats.total_bytes_zgw);
+        self.metrics
+            .cas_backend
+            .manifold_bytes(total_stats.total_bytes_manifold);
+        self.metrics
+            .cas_backend
+            .hedwig_bytes(total_stats.total_bytes_hedwig);
+        self.metrics
+            .cas_backend
+            .zdb_queries(total_stats.queries_zdb);
+        self.metrics
+            .cas_backend
+            .zgw_queries(total_stats.queries_zgw);
+        self.metrics
+            .cas_backend
+            .manifold_queries(total_stats.queries_manifold);
+        self.metrics
+            .cas_backend
+            .hedwig_queries(total_stats.queries_hedwig);
     }
 
     pub(crate) fn fetch_lfs_remote(

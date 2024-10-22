@@ -20,7 +20,7 @@ bookmarks_movement = { version = "0.1.0", path = "../bookmarks/bookmarks_movemen
 borrowed = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 bulk_derivation = { version = "0.1.0", path = "../derived_data/bulk_derivation" }
 changesets_creation = { version = "0.1.0", path = "../changesets/changesets_creation" }
-clap = { version = "4.5.11", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.5.20", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 cmdlib_cross_repo = { version = "0.1.0", path = "../cmdlib/cross_repo" }
 commit_graph = { version = "0.1.0", path = "../repo_attributes/commit_graph/commit_graph" }
 context = { version = "0.1.0", path = "../server/context" }
@@ -31,10 +31,10 @@ fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rus
 filenodes = { version = "0.1.0", path = "../filenodes" }
 filestore = { version = "0.1.0", path = "../filestore" }
 futures = { version = "0.3.30", features = ["async-await", "compat"] }
-gix-hash = "0.14.2"
+gix-hash = { git = "https://github.com/pierrechevalier83/gitoxide", rev = "a080348c2fefb7a300ec80f4481617f870065589" }
 import_direct = { version = "0.1.0", path = "../git/import_direct" }
 import_tools = { version = "0.1.0", path = "../git/import_tools" }
-itertools = "0.11.0"
+itertools = "0.13.0"
 live_commit_sync_config = { version = "0.1.0", path = "../commit_rewriting/live_commit_sync_config" }
 manifest = { version = "0.1.0", path = "../manifest" }
 maplit = "1.0"
@@ -57,7 +57,7 @@ repo_cross_repo = { version = "0.1.0", path = "../repo_attributes/repo_cross_rep
 repo_derived_data = { version = "0.1.0", path = "../repo_attributes/repo_derived_data" }
 repo_identity = { version = "0.1.0", path = "../repo_attributes/repo_identity" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
-serde_json = { version = "1.0.100", features = ["float_roundtrip", "unbounded_depth"] }
+serde_json = { version = "1.0.125", features = ["float_roundtrip", "unbounded_depth"] }
 slog = { version = "2.7", features = ["max_level_trace", "nested-values"] }
 sql_query_config = { version = "0.1.0", path = "../repo_attributes/sql_query_config" }
 synced_commit_mapping = { version = "0.1.0", path = "../commit_rewriting/synced_commit_mapping" }

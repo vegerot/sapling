@@ -10,13 +10,12 @@ import type {
   SyntaxWorkerResponse,
   TokenizedDiffHunks,
   TokenizedHunk,
+  ThemeColor,
 } from './syntaxHighlightingTypes';
 import type {ParsedDiff} from 'shared/patch/parse';
 
-import foundPlatform from '../../platform';
-import {themeState} from '../../theme';
+import {isVscode} from '../../environment';
 import {SynchronousWorker, WorkerApi} from './workerApi';
-import {useAtomValue} from 'jotai';
 import {useEffect, useState} from 'react';
 import {CancellationToken} from 'shared/CancellationToken';
 import {updateTextMateGrammarCSS} from 'shared/textmate-lib/textmateStyles';
@@ -36,7 +35,7 @@ function getWorker(): Promise<WorkerApi<SyntaxWorkerRequest, SyntaxWorkerRespons
   }
   cachedWorkerPromise = (async () => {
     let worker: WorkerApi<SyntaxWorkerRequest, SyntaxWorkerResponse>;
-    if (foundPlatform.platformName === 'vscode') {
+    if (isVscode()) {
       if (process.env.NODE_ENV === 'development') {
         // NOTE: when using vscode in dev mode, because the web worker is not compiled to a single file,
         // the webview can't use it properly.
@@ -93,8 +92,9 @@ function getWorker(): Promise<WorkerApi<SyntaxWorkerRequest, SyntaxWorkerRespons
 export function useTokenizedHunks(
   path: string,
   hunks: ParsedDiff['hunks'],
+  useThemeHoook: () => ThemeColor,
 ): TokenizedDiffHunks | undefined {
-  const theme = useAtomValue(themeState);
+  const theme = useThemeHoook();
 
   const [tokenized, setTokenized] = useState<TokenizedDiffHunks | undefined>(undefined);
 
@@ -118,8 +118,9 @@ export function useTokenizedHunks(
 export function useTokenizedContents(
   path: string,
   content: Array<string> | undefined,
+  useThemeHoook: () => ThemeColor,
 ): TokenizedHunk | undefined {
-  const theme = useAtomValue(themeState);
+  const theme = useThemeHoook();
 
   const [tokenized, setTokenized] = useState<TokenizedHunk | undefined>(undefined);
 
@@ -152,8 +153,9 @@ export function useTokenizedContentsOnceVisible(
   contentBefore: Array<string> | undefined,
   contentAfter: Array<string> | undefined,
   parentNode: React.MutableRefObject<HTMLElement | null>,
+  useThemeHoook: () => ThemeColor,
 ): [TokenizedHunk, TokenizedHunk] | undefined {
-  const theme = useAtomValue(themeState);
+  const theme = useThemeHoook();
   const [tokenized, setTokenized] = useState<[TokenizedHunk, TokenizedHunk] | undefined>(undefined);
   const [hasBeenVisible, setHasBeenVisible] = useState(false);
 

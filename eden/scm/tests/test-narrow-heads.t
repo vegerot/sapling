@@ -5,8 +5,8 @@
 'narrow-heads' requires remotenames and visibility
 
   $ configure dummyssh modernclient
-  $ enable remotenames amend
-  $ setconfig experimental.narrow-heads=true visibility.enabled=true mutation.record=true mutation.enabled=true experimental.evolution= remotenames.rename.default=remote
+  $ enable amend
+  $ setconfig visibility.enabled=true mutation.record=true mutation.enabled=true experimental.evolution= remotenames.rename.default=remote
   $ setconfig 'infinitepush.branchpattern=re:(^hack/.*)'
   $ shorttraceback
 

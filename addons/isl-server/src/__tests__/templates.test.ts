@@ -5,8 +5,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {ChangedFile} from 'isl/src/types';
-
 import {COMMIT_END_MARK, findMaxCommonPathPrefix, parseCommitInfoOutput} from '../templates';
 import path from 'path';
 import {mockLogger} from 'shared/testUtils';
@@ -26,9 +24,7 @@ draft
 
 3f41d88ab69446763404eccd0f3e579352ba2753\x00
 
-[]
-["sapling/addons/isl/README.md"]
-[]
+sapling/addons/isl/README.md
 1
 
 
@@ -49,9 +45,7 @@ draft
 
 2934650733c9181bdf64b7d00f5e0c7ca93d7ed7\x00
 
-["sapling/addons/isl/README.md"]
-[]
-[]
+sapling/addons/isl/README.md\x00sapling/addons/isl/package.json
 1
 
 9637166dabea9ac50ccb93902f3f41df4d8a15c4,
@@ -70,12 +64,7 @@ Commit B
         date: new Date('2024-04-24T21:16:24.000Z'),
         description: 'Summary:\nthis is my summary',
         diffId: '1',
-        filesSample: [
-          {
-            path: 'sapling/addons/isl/README.md',
-            status: 'M',
-          },
-        ],
+        filePathsSample: ['sapling/addons/isl/README.md'],
         hash: '77fdcef8759fb65da46a7a6431310829f12cef5b',
         isDot: false,
         isFollower: false,
@@ -95,12 +84,7 @@ Commit B
         date: new Date('2024-04-24T19:19:08.000Z'),
         description: '',
         diffId: undefined,
-        filesSample: [
-          {
-            path: 'sapling/addons/isl/README.md',
-            status: 'A',
-          },
-        ],
+        filePathsSample: ['sapling/addons/isl/README.md', 'sapling/addons/isl/package.json'],
         hash: 'e4594714fb9b3410a0ef4affc955f9d76d61c8a7',
         isDot: false,
         isFollower: false,
@@ -130,9 +114,7 @@ draft
 
 3f41d88ab69446763404eccd0f3e579352ba2753\x00
 
-[]
-["sapling/addons/isl/README.md"]
-[]
+sapling/addons/isl/README.md
 1
 
 
@@ -151,12 +133,7 @@ ${COMMIT_END_MARK}
         date: new Date('2024-04-24T21:16:24.000Z'),
         description: '',
         diffId: '1',
-        filesSample: [
-          {
-            path: 'sapling/addons/isl/README.md',
-            status: 'M',
-          },
-        ],
+        filePathsSample: ['sapling/addons/isl/README.md'],
         hash: '77fdcef8759fb65da46a7a6431310829f12cef5b',
         isDot: false,
         isFollower: false,
@@ -174,44 +151,32 @@ ${COMMIT_END_MARK}
 });
 
 describe('max common path prefix', () => {
-  const FILE = (path: string): ChangedFile => ({
-    path,
-    status: 'M',
-  });
   it('extracts common prefix', () => {
-    expect(findMaxCommonPathPrefix([FILE('a/b/c'), FILE('a/b/d'), FILE('a/b/d/e')])).toEqual(
-      'a/b/',
-    );
+    expect(findMaxCommonPathPrefix(['a/b/c', 'a/b/d', 'a/b/d/e'])).toEqual('a/b/');
     expect(
-      findMaxCommonPathPrefix([
-        FILE('a/b/c1'),
-        FILE('a/b/c2'),
-        FILE('a/b/d/e/f'),
-        FILE('a/b/d/e/f/g/h/i'),
-        FILE('a/b/q'),
-      ]),
+      findMaxCommonPathPrefix(['a/b/c1', 'a/b/c2', 'a/b/d/e/f', 'a/b/d/e/f/g/h/i', 'a/b/q']),
     ).toEqual('a/b/');
     expect(
       findMaxCommonPathPrefix([
-        FILE('addons/isl/src/file.ts'),
-        FILE('addons/isl/README.md'),
-        FILE('addons/isl/src/another.ts'),
+        'addons/isl/src/file.ts',
+        'addons/isl/README.md',
+        'addons/isl/src/another.ts',
       ]),
     ).toEqual('addons/isl/');
   });
   it('handles root as common', () => {
-    expect(findMaxCommonPathPrefix([FILE('a/b/c'), FILE('d/e/f')])).toEqual('');
-    expect(findMaxCommonPathPrefix([FILE('www/README'), FILE('fbcode/foo')])).toEqual('');
-    expect(findMaxCommonPathPrefix([FILE('subdir/some/file'), FILE('toplevel')])).toEqual('');
+    expect(findMaxCommonPathPrefix(['a/b/c', 'd/e/f'])).toEqual('');
+    expect(findMaxCommonPathPrefix(['www/README', 'fbcode/foo'])).toEqual('');
+    expect(findMaxCommonPathPrefix(['subdir/some/file', 'toplevel'])).toEqual('');
   });
   it('acts on full dir names', () => {
-    expect(findMaxCommonPathPrefix([FILE('a/foo1/a'), FILE('a/foo2/b'), FILE('a/foo3/c')])).toEqual(
+    expect(findMaxCommonPathPrefix(['a/foo1/a', 'a/foo2/b', 'a/foo3/c'])).toEqual(
       'a/', // not a/foo
     );
-    expect(findMaxCommonPathPrefix([FILE('foo/bananaspoon'), FILE('foo/banana')])).toEqual(
+    expect(findMaxCommonPathPrefix(['foo/bananaspoon', 'foo/banana'])).toEqual(
       'foo/', // not foo/banana
     );
-    expect(findMaxCommonPathPrefix([FILE('foo/banana'), FILE('foo/bananaspoon')])).toEqual(
+    expect(findMaxCommonPathPrefix(['foo/banana', 'foo/bananaspoon'])).toEqual(
       'foo/', // not foo/banana
     );
   });
@@ -227,9 +192,9 @@ describe('max common path prefix', () => {
     it('handles windows paths', () => {
       expect(
         findMaxCommonPathPrefix([
-          FILE('addons\\isl\\src\\file.ts'),
-          FILE('addons\\isl\\README.md'),
-          FILE('addons\\isl\\src\\another.ts'),
+          'addons\\isl\\src\\file.ts',
+          'addons\\isl\\README.md',
+          'addons\\isl\\src\\another.ts',
         ]),
       ).toEqual('addons\\isl\\');
     });

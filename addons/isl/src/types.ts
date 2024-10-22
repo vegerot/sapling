@@ -85,10 +85,21 @@ export type DiffCommentReaction = {
     | 'THUMBS_UP';
 };
 
+export enum SuggestedChangeStatus {
+  Accepted = 'ACCEPTED',
+  Active = 'ACTIVE',
+  ClosedDeprecated = 'CLOSED_DEPRECATED',
+  Draft = 'DRAFT',
+  Rejected = 'REJECTED',
+}
+
 export type DiffComment = {
+  id?: string;
   author: string;
+  authorName?: string;
   authorAvatarUri?: string;
   html: string;
+  content?: string;
   created: Date;
   /** If it's an inline comment, this is the file path with the comment */
   filename?: string;
@@ -96,8 +107,15 @@ export type DiffComment = {
   line?: number;
   reactions: Array<DiffCommentReaction>;
   /** Suggestion for how to change the code, as a patch */
-  suggestedChange?: ParsedDiff;
+  suggestedChange?: {
+    id?: string;
+    status?: SuggestedChangeStatus;
+    patch?: ParsedDiff;
+  };
+  codePatchSuggestedChange?: ParsedDiff;
   replies: Array<DiffComment>;
+  /** If this comment has been resolved. true => "resolved", false => "unresolved", null => the comment is not resolvable, don't show any UI for it */
+  isResolved?: boolean;
 };
 
 /**
@@ -195,6 +213,7 @@ export type CodeReviewSystem =
   | {
       type: 'phabricator';
       repo: string;
+      callsign?: string;
     }
   | {
       type: 'none';
@@ -282,8 +301,10 @@ export type CommitInfo = {
    * This is only valid after the operation which creates this commit has completed.
    */
   optimisticRevset?: Revset;
-  /** only a subset of the total files for this commit */
-  filesSample: ReadonlyArray<ChangedFile>;
+  /** only a subset of the total changed file paths for this commit.
+   * File statuses must be fetched separately for performance.
+   */
+  filePathsSample: ReadonlyArray<RepoRelativePath>;
   totalFileCount: number;
   /** @see {@link DiffId} */
   diffId?: DiffId;
@@ -575,7 +596,7 @@ export type PlatformSpecificClientToServerMessages =
   | {type: 'platform/openFile'; path: RepoRelativePath; options?: {line?: OneIndexedLineNumber}}
   | {
       type: 'platform/openFiles';
-      paths: Array<RepoRelativePath>;
+      paths: ReadonlyArray<RepoRelativePath>;
       options?: {line?: OneIndexedLineNumber};
     }
   | {type: 'platform/openContainingFolder'; path: RepoRelativePath}
@@ -649,7 +670,6 @@ export const allConfigNames = [
   // these config names are for compatibility.
   'isl.submitAsDraft',
   'isl.changedFilesDisplayType',
-  'isl.hasShownGettingStarted',
   // sapling config prefers foo-bar naming.
   'isl.pull-button-choice',
   'isl.show-stack-submit-confirmation',
@@ -680,7 +700,6 @@ export type ConfigName = (typeof allConfigNames)[number];
 export const settableConfigNames = [
   'isl.submitAsDraft',
   'isl.changedFilesDisplayType',
-  'isl.hasShownGettingStarted',
   'isl.pull-button-choice',
   'isl.show-stack-submit-confirmation',
   'isl.show-diff-number',
@@ -783,10 +802,11 @@ export type ClientToServerMessage =
   | {type: 'fetchFeatureFlag'; name: string}
   | {type: 'fetchInternalUserInfo'}
   | {
-      type: 'generateAICommitMessage';
+      type: 'generateSuggestionWithAI';
       id: string;
-      title: string;
       comparison: Comparison;
+      fieldName: string;
+      title: string;
     }
   | {type: 'gotUiState'; state: string}
   | CodeReviewProviderSpecificClientToServerMessages
@@ -875,7 +895,7 @@ export type ServerToClientMessage =
   | {type: 'fetchedFeatureFlag'; name: string; passes: boolean}
   | {type: 'fetchedInternalUserInfo'; info: Serializable}
   | {
-      type: 'generatedAICommitMessage';
+      type: 'generatedSuggestionWithAI';
       message: Result<string>;
       id: string;
     }

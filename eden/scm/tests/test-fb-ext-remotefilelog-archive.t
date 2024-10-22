@@ -20,6 +20,7 @@
   $ hg commit -qAm z
   $ echo z >> dir/z2
   $ hg commit -qAm z2
+  $ hg book master
 
   $ cd ..
 

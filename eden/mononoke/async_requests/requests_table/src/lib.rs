@@ -18,6 +18,7 @@ pub use crate::store::SqlLongRunningRequestsQueue;
 pub use crate::types::BlobstoreKey;
 pub use crate::types::ClaimedBy;
 pub use crate::types::LongRunningRequestEntry;
+pub use crate::types::QueueStats;
 pub use crate::types::RequestId;
 pub use crate::types::RequestStatus;
 pub use crate::types::RequestType;
@@ -128,10 +129,18 @@ pub trait LongRunningRequestsQueue: Send + Sync {
         req_id: &RequestId,
     ) -> Result<Option<(bool, LongRunningRequestEntry)>>;
 
+    /// List all requests, optionally filtered by repo_id and/or date.
     async fn list_requests(
         &self,
         ctx: &CoreContext,
         repo_ids: Option<&[RepositoryId]>,
         last_update_newer_than: Option<&Timestamp>,
     ) -> Result<Vec<LongRunningRequestEntry>>;
+
+    /// Retrieve stats on the queue, optionally filtered by repo_id.
+    async fn get_queue_stats(
+        &self,
+        ctx: &CoreContext,
+        repo_ids: Option<&[RepositoryId]>,
+    ) -> Result<QueueStats>;
 }

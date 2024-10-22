@@ -1,6 +1,6 @@
 load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
 
-oncall("mononoke")
+oncall("scm_server_infra")
 
 rust_library(
     name = "repo_factory",
@@ -88,6 +88,7 @@ rust_library(
         "//eden/mononoke/repo_stats_logger:repo_stats_logger",
         "//eden/mononoke/server/context:context",
         "//eden/mononoke/wireproto_handler:wireproto_handler",
+        "//eden/scm/lib/clientinfo:clientinfo",
     ],
 )
 

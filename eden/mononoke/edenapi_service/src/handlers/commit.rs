@@ -15,6 +15,7 @@ use anyhow::Error;
 use async_stream::try_stream;
 use async_trait::async_trait;
 use blobstore::Loadable;
+use dag_types::Location;
 use edenapi_types::wire::WireCommitHashToLocationRequestBatch;
 use edenapi_types::AlterSnapshotRequest;
 use edenapi_types::AlterSnapshotResponse;
@@ -52,6 +53,7 @@ use edenapi_types::UploadTokensResponse;
 use ephemeral_blobstore::BubbleId;
 use futures::stream;
 use futures::try_join;
+use futures::FutureExt;
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
@@ -60,6 +62,7 @@ use gotham::state::State;
 use gotham_derive::StateData;
 use gotham_derive::StaticResponseExtender;
 use gotham_ext::error::HttpError;
+use gotham_ext::handler::SlapiCommitIdentityScheme;
 use gotham_ext::middleware::request_context::RequestContext;
 use gotham_ext::middleware::scuba::ScubaMiddlewareState;
 use gotham_ext::response::TryIntoResponse;
@@ -69,10 +72,12 @@ use mononoke_api::CreateInfo;
 use mononoke_api::MononokeError;
 use mononoke_api::MononokeRepo;
 use mononoke_api::Repo;
+use mononoke_api::RepoContext;
 use mononoke_api::XRepoLookupExactBehaviour;
 use mononoke_api::XRepoLookupSyncBehaviour;
 use mononoke_api_hg::HgRepoContext;
 use mononoke_types::hash::GitSha1;
+use mononoke_types::sha1_hash::Sha1;
 use mononoke_types::ChangesetId;
 use mononoke_types::DateTime;
 use mononoke_types::FileChange;
@@ -88,6 +93,7 @@ use super::SaplingRemoteApiHandler;
 use super::SaplingRemoteApiMethod;
 use crate::context::ServerContext;
 use crate::errors::ErrorKind;
+use crate::handlers::git_objects::fetch_git_object;
 use crate::middleware::request_dumper::RequestDumper;
 use crate::utils::cbor_stream_filtered_errors;
 use crate::utils::custom_cbor_stream;
@@ -124,13 +130,37 @@ pub struct LocationToHashHandler;
 
 async fn translate_location<R: MononokeRepo>(
     hg_repo_ctx: HgRepoContext<R>,
+    slapi_flavour: SlapiCommitIdentityScheme,
     request: CommitLocationToHashRequest,
 ) -> Result<CommitLocationToHashResponse, Error> {
+    // TODO(mbthomas): refactor HgId to Id20 (and related)
     let location = request.location.map_descendant(|x| x.into());
-    let ancestors: Vec<HgChangesetId> = hg_repo_ctx
-        .location_to_hg_changeset_id(location, request.count)
-        .await
-        .context(ErrorKind::CommitLocationToHashRequestFailed)?;
+    let ancestors: Vec<HgChangesetId> = match slapi_flavour {
+        SlapiCommitIdentityScheme::Hg => hg_repo_ctx
+            .location_to_hg_changeset_id(location, request.count)
+            .await
+            .context(ErrorKind::CommitLocationToHashRequestFailed)?,
+        SlapiCommitIdentityScheme::Git => {
+            let repo_ctx = hg_repo_ctx.repo_ctx();
+            // TODO(mbthomas): This is a working around HgId/HgChangesetId not being "generic".
+            // This should be cleaned up when we have a generic Id20 type
+            repo_ctx
+                .location_to_git_changeset_id(
+                    Location::new(
+                        GitSha1::from(location.descendant.into_nodehash().sha1().into_byte_array()),
+                        location.distance,
+                    ),
+                    request.count,
+                )
+                .await
+                .context(ErrorKind::CommitLocationToHashRequestFailed)?
+                .into_iter()
+                .map(|id| {
+                    HgChangesetId::new(HgNodeHash::new(Sha1::from_byte_array(id.into_inner())))
+                })
+                .collect()
+        }
+    };
     let hgids = ancestors.into_iter().map(|x| x.into()).collect();
     let answer = CommitLocationToHashResponse {
         location: request.location,
@@ -158,23 +188,24 @@ impl SaplingRemoteApiHandler for LocationToHashHandler {
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
+        let slapi_flavour = ectx.slapi_flavour();
         let hgid_list = request
             .requests
             .into_iter()
-            .map(move |location| translate_location(repo.clone(), location));
+            .map(move |location| translate_location(repo.clone(), slapi_flavour, location));
         let response = stream::iter(hgid_list).buffer_unordered(MAX_CONCURRENT_FETCHES_PER_REQUEST);
         Ok(response.boxed())
     }
 }
 
 pub async fn hash_to_location(state: &mut State) -> Result<impl TryIntoResponse, HttpError> {
-    async fn hash_to_location_chunk<R: MononokeRepo>(
+    async fn hg_hash_to_location_chunk<R: MononokeRepo>(
         hg_repo_ctx: HgRepoContext<R>,
         master_heads: Vec<HgChangesetId>,
         hg_cs_ids: Vec<HgChangesetId>,
     ) -> impl Stream<Item = CommitHashToLocationResponse> {
         let hgcsid_to_location = hg_repo_ctx
-            .many_changeset_ids_to_locations(master_heads, hg_cs_ids.clone())
+            .many_hg_changeset_ids_to_locations(master_heads, hg_cs_ids.clone())
             .await;
         let responses = hg_cs_ids.into_iter().map(move |hgcsid| {
             let result = match hgcsid_to_location.as_ref() {
@@ -187,6 +218,31 @@ pub async fn hash_to_location(state: &mut State) -> Result<impl TryIntoResponse,
             };
             CommitHashToLocationResponse {
                 hgid: hgcsid.into(),
+                result,
+            }
+        });
+        stream::iter(responses)
+    }
+
+    async fn git_hash_to_location_chunk<R: MononokeRepo>(
+        repo_ctx: RepoContext<R>,
+        master_heads: Vec<GitSha1>,
+        git_commit_ids: Vec<GitSha1>,
+    ) -> impl Stream<Item = CommitHashToLocationResponse> {
+        let git_commit_id_to_location = repo_ctx
+            .many_git_commit_ids_to_locations(master_heads, git_commit_ids.clone())
+            .await;
+        let responses = git_commit_ids.into_iter().map(move |git_commit_id| {
+            let result = match git_commit_id_to_location.as_ref() {
+                Ok(hsh) => match hsh.get(&git_commit_id) {
+                    Some(Ok(l)) => Ok(Some(l.map_descendant(|x| HgId::from(x.into_inner())))),
+                    Some(Err(e)) => Err(e.into()),
+                    None => Ok(None),
+                },
+                Err(e) => Err(e.into()),
+            };
+            CommitHashToLocationResponse {
+                hgid: HgId::from(git_commit_id.into_inner()),
                 result,
             }
         });
@@ -218,16 +274,43 @@ pub async fn hash_to_location(state: &mut State) -> Result<impl TryIntoResponse,
         .into_iter()
         .map(|x| x.into())
         .collect::<Vec<_>>();
-
-    let response = stream::iter(batch.hgids)
-        .chunks(HASH_TO_LOCATION_BATCH_SIZE)
-        .map(|chunk| chunk.into_iter().map(|x| x.into()).collect::<Vec<_>>())
-        .map({
-            let ctx = hg_repo_ctx.clone();
-            move |chunk| hash_to_location_chunk(ctx.clone(), master_heads.clone(), chunk)
-        })
-        .buffer_unordered(3)
-        .flatten();
+    let response = match SlapiCommitIdentityScheme::try_take_from(state) {
+        Some(SlapiCommitIdentityScheme::Hg) | None => stream::iter(batch.hgids)
+            .chunks(HASH_TO_LOCATION_BATCH_SIZE)
+            .map(|chunk| chunk.into_iter().map(|x| x.into()).collect::<Vec<_>>())
+            .map({
+                let ctx = hg_repo_ctx.clone();
+                move |chunk| hg_hash_to_location_chunk(ctx.clone(), master_heads.clone(), chunk)
+            })
+            .buffer_unordered(3)
+            .flatten()
+            .left_stream(),
+        Some(SlapiCommitIdentityScheme::Git) => {
+            // TODO(mbthomas): This is a working around HgId/HgChangesetId not being "generic".
+            // This should be cleaned up when we have a generic Id20 type
+            stream::iter(batch.hgids)
+                .chunks(HASH_TO_LOCATION_BATCH_SIZE)
+                .map(|chunk| {
+                    chunk
+                        .into_iter()
+                        .map(|x| GitSha1::from(x.into_byte_array()))
+                        .collect::<Vec<_>>()
+                })
+                .map({
+                    let ctx = hg_repo_ctx.repo_ctx().clone();
+                    let master_heads = master_heads
+                        .into_iter()
+                        .map(|x| GitSha1::from(x.into_nodehash().sha1().into_byte_array()))
+                        .collect::<Vec<_>>();
+                    move |chunk| {
+                        git_hash_to_location_chunk(ctx.clone(), master_heads.clone(), chunk)
+                    }
+                })
+                .buffer_unordered(3)
+                .flatten()
+                .right_stream()
+        }
+    };
     let cbor_response = custom_cbor_stream(super::monitor_request(state, response), |t| {
         t.result.as_ref().err()
     });
@@ -244,6 +327,7 @@ pub async fn revlog_data(state: &mut State) -> Result<impl TryIntoResponse, Http
 
     let sctx = ServerContext::borrow_from(state);
     let rctx = RequestContext::borrow_from(state).clone();
+    let slapi_flavour = SlapiCommitIdentityScheme::borrow_from(state).clone();
 
     let hg_repo_ctx: HgRepoContext<Repo> = get_repo(sctx, &rctx, &params.repo, None).await?;
 
@@ -251,7 +335,14 @@ pub async fn revlog_data(state: &mut State) -> Result<impl TryIntoResponse, Http
     let revlog_commits = request
         .hgids
         .into_iter()
-        .map(move |hg_id| commit_revlog_data(hg_repo_ctx.clone(), hg_id));
+        .map(move |hg_id| match slapi_flavour {
+            SlapiCommitIdentityScheme::Git => {
+                fetch_git_object_as_revlog_data(hg_id, hg_repo_ctx.clone()).left_future()
+            }
+            SlapiCommitIdentityScheme::Hg => {
+                commit_revlog_data(hg_repo_ctx.clone(), hg_id).right_future()
+            }
+        });
     let response =
         stream::iter(revlog_commits).buffer_unordered(MAX_CONCURRENT_FETCHES_PER_REQUEST);
     Ok(cbor_stream_filtered_errors(super::monitor_request(
@@ -270,6 +361,20 @@ async fn commit_revlog_data<R: MononokeRepo>(
         .ok_or(ErrorKind::HgIdNotFound(hg_id))?;
     let answer = CommitRevlogData::new(hg_id, bytes.into());
     Ok(answer)
+}
+
+// Sapling wants to use revlog_data the same way for Hg and Git, so shaping somehow
+// the git object to fit within the defined CommitRevlogData
+async fn fetch_git_object_as_revlog_data<R: MononokeRepo>(
+    id: HgId,
+    repo: HgRepoContext<R>,
+) -> Result<CommitRevlogData, Error> {
+    Ok(CommitRevlogData {
+        hgid: id,
+        revlog_data: fetch_git_object(id, &repo)
+            .await
+            .map(|bytes| bytes.bytes.into())?,
+    })
 }
 
 pub struct HashLookupHandler;
@@ -650,32 +755,24 @@ impl SaplingRemoteApiHandler for GraphHandlerV2 {
             ))?
         }
 
-        if justknobs::eval(
-            "scm/mononoke:enable_streaming_commit_graph_edenapi_endpoint",
-            None,
-            None,
-        )
-        .unwrap_or_default()
-        {
-            // If all the requested heads are public, return stream.
-            if heads.len() < PHASES_CHECK_LIMIT && repo.is_all_public(&heads).await? {
-                let graph_stream = repo
-                    .get_graph_mapping_stream(common, heads)
-                    .await?
-                    .err_into::<Error>()
-                    .and_then(|(hgid, parents)| async move {
-                        Ok(CommitGraphEntry {
-                            hgid: HgId::from(hgid.into_nodehash()),
-                            parents: parents
-                                .into_iter()
-                                .map(|p_hgid| HgId::from(p_hgid.into_nodehash()))
-                                .collect(),
-                            is_draft: Some(false),
-                        })
+        // If all the requested heads are public, return stream.
+        if heads.len() < PHASES_CHECK_LIMIT && repo.is_all_public(&heads).await? {
+            let graph_stream = repo
+                .get_graph_mapping_stream(common, heads)
+                .await?
+                .err_into::<Error>()
+                .and_then(|(hgid, parents)| async move {
+                    Ok(CommitGraphEntry {
+                        hgid: HgId::from(hgid.into_nodehash()),
+                        parents: parents
+                            .into_iter()
+                            .map(|p_hgid| HgId::from(p_hgid.into_nodehash()))
+                            .collect(),
+                        is_draft: Some(false),
                     })
-                    .boxed();
-                return Ok(graph_stream);
-            }
+                })
+                .boxed();
+            return Ok(graph_stream);
         }
 
         let graph_entries = repo
@@ -706,42 +803,68 @@ impl SaplingRemoteApiHandler for GraphSegmentsHandler {
     const HTTP_METHOD: hyper::Method = hyper::Method::POST;
     const API_METHOD: SaplingRemoteApiMethod = SaplingRemoteApiMethod::CommitGraphSegments;
     const ENDPOINT: &'static str = "/commit/graph_segments";
+    const SUPPORTED_FLAVOURS: &'static [SlapiCommitIdentityScheme] = &[
+        SlapiCommitIdentityScheme::Hg,
+        SlapiCommitIdentityScheme::Git,
+    ];
 
     async fn handler(
         ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor, Repo>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
+        let slapi_flavour = ectx.slapi_flavour();
         let repo = ectx.repo();
-        let heads: Vec<_> = request
-            .heads
-            .into_iter()
-            .map(|hg_id| HgChangesetId::new(HgNodeHash::from(hg_id)))
-            .collect();
-        let common: Vec<_> = request
-            .common
-            .into_iter()
-            .map(|hg_id| HgChangesetId::new(HgNodeHash::from(hg_id)))
-            .collect();
 
         Ok(try_stream! {
-            let graph_segments = repo.graph_segments(common, heads).await?;
+            let graph_segments = match slapi_flavour {
+                SlapiCommitIdentityScheme::Hg => {
+                    let heads: Vec<_> = request
+                        .heads
+                        .into_iter()
+                        .map(|hg_id| HgChangesetId::new(HgNodeHash::from(hg_id)))
+                        .collect();
+                    let common: Vec<_> = request
+                        .common
+                        .into_iter()
+                        .map(|hg_id| HgChangesetId::new(HgNodeHash::from(hg_id)))
+                        .collect();
+                    repo.repo_ctx()
+                        .graph_segments_hg(common, heads)
+                        .await?
+                        .map_ok(|segment| segment.map_ids(|id| HgId::from(id.into_nodehash())))
+                        .left_stream()
+                }
+                SlapiCommitIdentityScheme::Git => {
+                    let heads: Vec<_> = request
+                        .heads
+                        .into_iter()
+                        .map(|id| GitSha1::from(id.into_byte_array()))
+                        .collect();
+                    let common: Vec<_> = request
+                        .common
+                        .into_iter()
+                        .map(|id| GitSha1::from(id.into_byte_array()))
+                        .collect();
+                    repo.repo_ctx()
+                        .graph_segments_git(common, heads)
+                        .await?
+                        .map_ok(|segment| segment.map_ids(|id| HgId::from(id.into_inner())))
+                        .right_stream()
+                }
+            };
 
             for await segment in graph_segments {
                 let segment = segment?;
                 yield CommitGraphSegmentsEntry {
-                    head: HgId::from(segment.head.into_nodehash()),
-                    base: HgId::from(segment.base.into_nodehash()),
+                    head: segment.head,
+                    base: segment.base,
                     length: segment.length,
                     parents: segment
                         .parents
                         .into_iter()
                         .map(|parent| CommitGraphSegmentParent {
-                            hgid: HgId::from(parent.hgid.into_nodehash()),
-                            location: parent.location.map(|location| {
-                                location.map_descendant(|descendant| {
-                                    HgId::from(descendant.into_nodehash())
-                                })
-                            }),
+                            hgid: parent.id,
+                            location: parent.location,
                         })
                         .collect(),
                 }

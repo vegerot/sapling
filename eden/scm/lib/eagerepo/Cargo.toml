@@ -14,20 +14,22 @@ dag = { version = "0.1.0", path = "../dag" }
 edenapi_trait = { version = "0.1.0", path = "../edenapi/trait" }
 factory = { version = "0.1.0", path = "../util/factory" }
 fail = { version = "0.4", features = ["failpoints"] }
+format-util = { version = "0.1.0", path = "../util/format-util" }
 futures = { version = "0.3.30", features = ["async-await", "compat"] }
-hgstore = { version = "0.1.0", path = "../storemodel/hgstore" }
 http = "0.2"
 identity = { version = "0.1.0", path = "../identity" }
+manifest = { version = "0.1.0", path = "../manifest" }
 manifest-tree = { version = "0.1.0", path = "../manifest-tree" }
 metalog = { version = "0.1.0", path = "../metalog" }
 minibytes = { version = "0.1.0", path = "../minibytes" }
 mutationstore = { version = "0.1.0", path = "../mutationstore" }
 nonblocking = { version = "0.1.0", path = "../nonblocking" }
 parking_lot = { version = "0.12.1", features = ["send_guard"] }
+pathmatcher = { version = "0.1.0", path = "../pathmatcher" }
 repourl = { version = "0.1.0", path = "../repo/url" }
 sha1 = "0.10.5"
 storemodel = { version = "0.1.0", path = "../storemodel" }
-thiserror = "1.0.49"
+thiserror = "1.0.64"
 tracing = { version = "0.1.40", features = ["attributes", "valuable"] }
 zstore = { version = "0.1.0", path = "../zstore" }
 

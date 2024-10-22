@@ -3,7 +3,6 @@
 #require no-eden
 
 # coding=utf-8
-#inprocess-hg-incompatible
 
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Copyright (c) Mercurial Contributors.
@@ -11,6 +10,7 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2 or any later version.
 
+  $ setconfig remotenames.selectivepulldefault=master,norebase
   $ setconfig devel.segmented-changelog-rev-compat=true
   $ cat >> $HGRCPATH << 'EOF'
   > [extensions]
@@ -32,13 +32,15 @@
   $ hg ci -Am C2
   adding C2
 
+  $ hg book master
+
   $ cd ..
 
-  $ hg clone --no-shallow a b
+  $ hg clone a b
   updating to tip
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
-  $ hg clone --no-shallow a c
+  $ hg clone a c
   updating to tip
   2 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
@@ -79,14 +81,12 @@
 
   $ hg pull --rebase -d tip
   pulling from $TESTTMP/a
-  searching for changes
-  no changes found
   nothing to rebase - working directory parent is also destination
 
 # Abort pull early if working dir is not clean:
 
   $ echo L1-mod > L1
-  $ hg pull --rebase -d tip
+  $ hg pull -q --rebase -d tip
   abort: uncommitted changes
   [255]
   $ hg goto --clean --quiet .
@@ -109,10 +109,10 @@
 # Abort pull early with pending uncommitted merge:
 
   $ cd ..
-  $ hg clone --noupdate c d
+  $ hg clone -q c d
   $ cd d
   $ tglog
-  o  783333faa078 'C2'
+  @  783333faa078 'C2'
   │
   o  05d58a0c15dd 'C1'
   $ hg goto --quiet 0
@@ -122,7 +122,7 @@
   $ hg merge 2
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   (branch merge, don't forget to commit)
-  $ hg pull --rebase -d tip
+  $ hg pull -q --rebase -d tip
   abort: outstanding uncommitted merge
   [255]
   $ hg goto --clean --quiet .
@@ -146,20 +146,12 @@
   │
   ~
 
-# pull --rebase --update should ignore --update:
-
-  $ hg pull --rebase --update
-  abort: missing rebase destination - supply --dest / -d
-  [255]
-
 # pull --rebase doesn't update if nothing has been pulled:
 
   $ hg up -q 1
 
   $ hg pull --rebase -d tip
   pulling from $TESTTMP/a
-  searching for changes
-  no changes found
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   nothing to rebase - fast-forwarded to tip
 
@@ -170,11 +162,9 @@
 
   $ cd ..
 
-# pull --rebase works when a specific revision is pulled (issue3619)
-
   $ cd a
   $ tglog
-  @  77ae9631bcca 'R1'
+  @  77ae9631bcca 'R1' master
   │
   o  783333faa078 'C2'
   │
@@ -192,20 +182,10 @@
   o  783333faa078 'C2'
   │
   o  05d58a0c15dd 'C1'
+  $ hg co -q norebase
   $ echo L1 > L1
   $ hg ci -Am L1
   adding L1
-  $ hg pull --rev tip --rebase
-  abort: missing rebase destination - supply --dest / -d
-  [255]
-  $ tglog
-  @  e6e5bf5749a8 'L1'
-  │
-  o  77ae9631bcca 'R1' norebase
-  │
-  o  783333faa078 'C2'
-  │
-  o  05d58a0c15dd 'C1'
 
 # pull --rebase works with bundle2 turned on
 
@@ -214,7 +194,7 @@
   $ hg ci -Am R4
   adding R4
   $ tglog
-  @  00e3b7781125 'R4'
+  @  00e3b7781125 'R4' master
   │
   o  770a61882ace 'R3'
   │
@@ -232,9 +212,9 @@
   adding changesets
   adding manifests
   adding file changes
-  rebasing e6e5bf5749a8 "L1"
+  rebasing e6e5bf5749a8 "L1" (norebase)
   $ tglog
-  @  72a2b49a3265 'L1'
+  @  72a2b49a3265 'L1' norebase
   │
   o  00e3b7781125 'R4'
   │
@@ -242,7 +222,7 @@
   │
   o  31cd3a05214e 'R2'
   │
-  o  77ae9631bcca 'R1' norebase
+  o  77ae9631bcca 'R1'
   │
   o  783333faa078 'C2'
   │
@@ -255,7 +235,7 @@
   $ hg ci -Am R5
   adding R5
   $ tglog
-  @  88dd24261747 'R5'
+  @  88dd24261747 'R5' master
   │
   o  00e3b7781125 'R4'
   │
@@ -274,6 +254,7 @@
   adding L2
   $ hg up 'desc(L1)'
   0 files updated, 0 files merged, 1 files removed, 0 files unresolved
+  (leaving bookmark norebase)
   $ hg pull --rebase -d tip
   pulling from $TESTTMP/a
   searching for changes
@@ -281,9 +262,9 @@
   adding manifests
   adding file changes
   rebasing 72a2b49a3265 "L1"
-  rebasing 43ae73471a3f "L2"
+  rebasing 43ae73471a3f "L2" (norebase)
   $ tglog
-  o  7ca39666ab9f 'L2'
+  o  7ca39666ab9f 'L2' norebase
   │
   @  d8edd0f176f6 'L1'
   │
@@ -295,7 +276,7 @@
   │
   o  31cd3a05214e 'R2'
   │
-  o  77ae9631bcca 'R1' norebase
+  o  77ae9631bcca 'R1'
   │
   o  783333faa078 'C2'
   │
@@ -322,7 +303,7 @@
   $ tglog
   @  65bc164c1d9b 'R6'
   │
-  │ o  7ca39666ab9f 'L2'
+  │ o  7ca39666ab9f 'L2' norebase
   │ │
   │ o  d8edd0f176f6 'L1'
   ├─╯
@@ -334,7 +315,7 @@
   │
   o  31cd3a05214e 'R2'
   │
-  o  77ae9631bcca 'R1' norebase
+  o  77ae9631bcca 'R1'
   │
   o  783333faa078 'C2'
   │

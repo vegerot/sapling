@@ -121,12 +121,7 @@ Do a manual move
 
   $ cd "$TESTTMP/backup"
   $ REPONAME=backup
-  $ hg pull
-  pulling from mono:backup
-  searching for changes
-  adding changesets
-  adding manifests
-  adding file changes
+  $ hg pull -q
   $ hg log -r master_bookmark -T '{node}\n'
   f5fb745185a2d197d092e7dfffe147f36de1af76
   $ echo "$TIP_PARENT"
@@ -143,12 +138,7 @@ Move forward to a commit that's already present in the destination
 
   $ cd "$TESTTMP/backup"
   $ REPONAME=backup
-  $ hg pull
-  pulling from mono:backup
-  searching for changes
-  adding changesets
-  adding manifests
-  adding file changes
+  $ hg pull -q
   $ hg log -r master_bookmark -T '{node}\n'
   bcf523b814e2cbae2d4d2d5b1cbbe3e391f4b4d8
   $ echo "$TIP"

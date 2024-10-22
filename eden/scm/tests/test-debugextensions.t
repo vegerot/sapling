@@ -2,8 +2,10 @@
 
 #require no-fsmonitor no-eden
 
+
   $ disable copytrace
   $ hg debugextensions --excludedefault
+  remotenames (untested!)
   treemanifest (untested!)
 
   $ enable histedit rebase
@@ -22,6 +24,7 @@
   histedit
   hotfix1 (untested!)
   rebase
+  remotenames (untested!)
   treemanifest (untested!)
 
   $ hg debugextensions -v --excludedefault
@@ -42,6 +45,9 @@
   rebase
     location: *rebase* (glob)
     bundled: yes
+  remotenames
+    location: *remotenames* (glob)
+    bundled: no
   treemanifest
     location: *treemanifest* (glob)
     bundled: no
@@ -81,6 +87,13 @@
     "bundled": true,
     "name": "rebase",
     "source": "*rebase*", (glob)
+    "testedwith": []
+   },
+   {
+    "buglink": "",
+    "bundled": false,
+    "name": "remotenames",
+    "source": "*remotenames*", (glob)
     "testedwith": []
    },
    {

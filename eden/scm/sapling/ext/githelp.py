@@ -14,10 +14,11 @@ The translation is best effort, and if an unknown command or parameter
 combination is detected, it simply returns an error.
 
 """
+
 import re
 
 from bindings import cliparser, identity
-from sapling import error, extensions, pycompat, registrar, util
+from sapling import error, extensions, registrar, util
 from sapling.i18n import _
 
 

@@ -4,8 +4,9 @@
 
 #inprocess-hg-incompatible
 
+
   $ configure dummyssh
-  $ enable remotenames rebase
+  $ enable rebase
 
   $ hg init master
   $ cd master
@@ -16,28 +17,19 @@
   $ hg book foo
 
   $ cd ..
-  $ hg clone ssh://user@dummy/master client -r 0
-  adding changesets
-  adding manifests
-  adding file changes
-  updating to cb9a9f314b8b07ba71012fcdbc544b5a4d82ff5b
-  1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ hg clone -q ssh://user@dummy/master client -r 0
 
 Verify pulling only some commits does not cause errors from the unpulled
 remotenames
   $ cd client
   $ hg pull -r 0
   pulling from ssh://user@dummy/master
-  no changes found
   $ hg book --remote
-     default/master            cb9a9f314b8b
+     remote/foo                       d2ae7f538514cd87c17547b0de4cea71fe1af9fb
+     remote/master                    cb9a9f314b8b07ba71012fcdbc544b5a4d82ff5b
   $ hg dbsh -c 'ui.write(repo.svfs.readutf8("remotenames"))'
-  cb9a9f314b8b07ba71012fcdbc544b5a4d82ff5b bookmarks default/master
+  cb9a9f314b8b07ba71012fcdbc544b5a4d82ff5b bookmarks remote/master
 
   $ hg pull --rebase -d master
   pulling from ssh://user@dummy/master
-  searching for changes
-  adding changesets
-  adding manifests
-  adding file changes
   nothing to rebase - working directory parent is also destination

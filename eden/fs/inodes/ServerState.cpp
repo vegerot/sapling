@@ -10,13 +10,17 @@
 #include <folly/logging/xlog.h>
 #include <folly/portability/GFlags.h>
 
+#include "eden/common/telemetry/SessionInfo.h"
+#include "eden/common/telemetry/StructuredLoggerFactory.h"
 #include "eden/common/utils/FaultInjector.h"
 #include "eden/common/utils/UnboundedQueueExecutor.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/ReloadableConfig.h"
+#include "eden/fs/inodes/FileAccessLogger.h"
 #include "eden/fs/model/git/TopLevelIgnores.h"
 #include "eden/fs/nfs/NfsServer.h"
 #include "eden/fs/telemetry/EdenStats.h"
+#include "eden/fs/telemetry/FileAccessStructuredLogger.h"
 #include "eden/fs/telemetry/FsEventLogger.h"
 #include "eden/fs/utils/Clock.h"
 
@@ -42,13 +46,14 @@ constexpr std::chrono::seconds kSystemIgnoreMinPollSeconds{5};
 ServerState::ServerState(
     UserInfo userInfo,
     EdenStatsPtr edenStats,
+    SessionInfo sessionInfo,
     std::shared_ptr<PrivHelper> privHelper,
     std::shared_ptr<UnboundedQueueExecutor> threadPool,
     std::shared_ptr<folly::Executor> fsChannelThreadPool,
     std::shared_ptr<Clock> clock,
     std::shared_ptr<ProcessInfoCache> processInfoCache,
     std::shared_ptr<StructuredLogger> structuredLogger,
-    std::shared_ptr<IHiveLogger> hiveLogger,
+    std::shared_ptr<IScribeLogger> scribeLogger,
     std::shared_ptr<ReloadableConfig> reloadableConfig,
     const EdenConfig& initialConfig,
     [[maybe_unused]] folly::EventBase* mainEventBase,
@@ -62,7 +67,7 @@ ServerState::ServerState(
       clock_{std::move(clock)},
       processInfoCache_{std::move(processInfoCache)},
       structuredLogger_{std::move(structuredLogger)},
-      hiveLogger_{std::move(hiveLogger)},
+      scribeLogger_{std::move(scribeLogger)},
       faultInjector_{std::make_unique<FaultInjector>(enableFaultDetection)},
       nfs_{
           initialConfig.enableNfsServer.getValue()
@@ -83,9 +88,16 @@ ServerState::ServerState(
           initialConfig.systemIgnoreFile.getValue(),
           kSystemIgnoreMinPollSeconds}},
       notifier_{std::move(notifier)},
+      fileAccessLogger_{std::make_shared<FileAccessLogger>(
+          config_,
+          makeDefaultStructuredLogger<FileAccessStructuredLogger, EdenStatsPtr>(
+              config_->getEdenConfig()->scribeLogger.getValue(),
+              config_->getEdenConfig()->fileAccessScribeCategory.getValue(),
+              std::move(sessionInfo),
+              edenStats_.copy()))},
       fsEventLogger_{
           initialConfig.requestSamplesPerMinute.getValue()
-              ? std::make_shared<FsEventLogger>(config_, hiveLogger_)
+              ? std::make_shared<FsEventLogger>(config_, scribeLogger_)
               : nullptr} {
   // It would be nice if we eventually built a more generic mechanism for
   // defining faults to be configured on start up.  (e.g., loading this from

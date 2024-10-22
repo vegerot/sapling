@@ -47,14 +47,13 @@ Backsync to a small repo
   $ backsync_large_to_small 2>&1 | grep "syncing bookmark"
   * syncing bookmark master_bookmark to * (glob)
   * syncing bookmark master_bookmark to * (glob)
-  $ flush_mononoke_bookmarks
 
 Pull from a small repo. Check that both merges are synced
 although the second one became non-merge commit
   $ cd "$TESTTMP/small-hg-client"
   $ hg pull -q
   $ log -r :
-  o  merge commit no new files [public;rev=4;534a740cd266] default/master_bookmark
+  o  merge commit no new files [public;rev=4;534a740cd266] remote/master_bookmark
   │
   o    merge commit from large repo [public;rev=3;246c2e616e99]
   ├─╮
@@ -67,7 +66,7 @@ although the second one became non-merge commit
   $ hg up -q master_bookmark
   $ hg show master_bookmark
   commit:      534a740cd266
-  bookmark:    default/master_bookmark
+  bookmark:    remote/master_bookmark
   hoistedname: master_bookmark
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000

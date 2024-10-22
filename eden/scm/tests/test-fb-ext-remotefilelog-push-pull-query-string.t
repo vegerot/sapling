@@ -3,11 +3,6 @@
 
   $ . "$TESTDIR/library.sh"
 
-  $ cat >> $HGRCPATH << EOF
-  > [extensions]
-  > remotenames=
-  > EOF
-
   $ hg init repo
   $ cd repo
   $ cat >> .hg/hgrc <<EOF
@@ -37,7 +32,7 @@ as well
   default-push = ssh://user@dummy/repo?write
   $ hg log -r .
   commit:      a89d614e2364
-  bookmark:    default/master
+  bookmark:    remote/master
   hoistedname: master
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000
@@ -54,7 +49,7 @@ as well
   remote: adding file changes
   $ hg log -r .
   commit:      421535db10b6
-  bookmark:    default/master
+  bookmark:    remote/master
   hoistedname: master
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000
@@ -62,11 +57,9 @@ as well
   
   $ hg pull
   pulling from ssh://user@dummy/repo?read
-  searching for changes
-  no changes found
   $ hg log -r .
   commit:      421535db10b6
-  bookmark:    default/master
+  bookmark:    remote/master
   hoistedname: master
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000

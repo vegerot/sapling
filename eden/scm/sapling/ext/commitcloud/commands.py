@@ -24,13 +24,12 @@ from sapling import (
     util,
     visibility,
 )
-from sapling.i18n import _, _n
+from sapling.i18n import _
 
 from . import (
     background,
     backuplock,
     backupstate,
-    dependencies,
     error as ccerror,
     interactivehistory,
     megarepoimport,
@@ -44,7 +43,6 @@ from . import (
     util as ccutil,
     workspace,
 )
-
 
 cmdtable = {}
 command = registrar.command(cmdtable)

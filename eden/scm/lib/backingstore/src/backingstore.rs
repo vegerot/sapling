@@ -26,6 +26,7 @@ use edenapi::configmodel::config::ContentHash;
 use edenapi::configmodel::ConfigExt;
 use edenapi::types::CommitId;
 use edenapi::BlockingResponse;
+use edenapi::RECENT_DOGFOODING_REQUESTS;
 use log::warn;
 use repo::repo::Repo;
 use repo::RepoMinimalInfo;
@@ -247,6 +248,10 @@ impl BackingStore {
         self.maybe_reload()
             .treestore
             .batch_with_callback(keys, fetch_mode, resolve)
+    }
+
+    pub fn dogfooding_host(&self) -> Result<bool> {
+        Ok(RECENT_DOGFOODING_REQUESTS.get())
     }
 
     /// Forces backing store to rescan pack files or local indexes

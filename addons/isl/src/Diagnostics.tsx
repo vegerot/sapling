@@ -7,6 +7,7 @@
 
 import type {UseUncommittedSelection} from './partialSelection';
 import type {CommitInfo, Diagnostic} from './types';
+import type {Tracker} from 'isl-server/src/analytics/tracker';
 
 import {spacing} from '../../components/theme/tokens.stylex';
 import serverAPI from './ClientToServerAPI';
@@ -16,7 +17,7 @@ import {tracker} from './analytics';
 import {getFeatureFlag} from './featureFlags';
 import {T, t} from './i18n';
 import {localStorageBackedAtom, readAtom} from './jotaiUtils';
-import foundPlatform from './platform';
+import platform from './platform';
 import {uncommittedChangesWithPreviews} from './previews';
 import {showModal} from './useModal';
 import * as stylex from '@stylexjs/stylex';
@@ -64,6 +65,42 @@ const styles = stylex.create({
   },
 });
 
+/** Many diagnostics are low-quality and don't reflect what would appear on CI.
+ * Start with an allowlist while we validate which signals are worthwhile. */
+const allowlistedCodesBySource = Internal.allowlistedDiagnosticCodes ?? undefined;
+
+function isBlockingDiagnostic(d: Diagnostic): boolean {
+  if (d.source == null || d.code == null) {
+    return true;
+  }
+  if (allowlistedCodesBySource == null) {
+    // In OSS, let's assume all errors are blocking.
+    return true;
+  }
+  if (d.severity !== 'error' && d.severity !== 'warning') {
+    return false;
+  }
+  if (allowlistedCodesBySource == null) {
+    return true;
+  }
+  const relevantAllowlist = allowlistedCodesBySource.get(d.severity)?.get(d.source);
+  return (
+    relevantAllowlist != null &&
+    (relevantAllowlist.has(d.code) === true || relevantAllowlist.has('*') === true)
+  );
+}
+
+function isErrorDiagnosticToLog(d: Diagnostic): boolean {
+  return d.severity === 'error';
+}
+
+/** Render diagnostic to a string, in the format `Source(Code): Snippet of error message` */
+function previewDiagnostic(diagnostic: Diagnostic | undefined) {
+  return diagnostic != null
+    ? `${diagnostic.source}(${diagnostic.code}): ${diagnostic?.message.slice(0, 100)}`
+    : undefined;
+}
+
 /**
  * Check IDE diagnostics for files that will be commit/amended/submitted,
  * to confirm if they intended the errors.
@@ -77,15 +114,15 @@ export async function confirmNoBlockingDiagnostics(
   if (!readAtom(shouldWarnAboutDiagnosticsAtom)) {
     return true;
   }
-  if (foundPlatform.platformName === 'vscode') {
+  if (platform.platformName === 'vscode') {
     const allFiles = new Set<string>();
     for (const file of readAtom(uncommittedChangesWithPreviews)) {
       if (selection.isFullyOrPartiallySelected(file.path)) {
         allFiles.add(file.path);
       }
     }
-    for (const file of commit?.filesSample ?? []) {
-      allFiles.add(file.path);
+    for (const filePath of commit?.filePathsSample ?? []) {
+      allFiles.add(filePath);
     }
 
     serverAPI.postMessage({
@@ -101,17 +138,29 @@ export async function confirmNoBlockingDiagnostics(
     ]);
     if (result.diagnostics.size > 0) {
       const allDiagnostics = [...result.diagnostics.values()];
-      const totalErrors = allDiagnostics
-        .map(value => value.filter(d => d.severity === 'error').length)
-        .reduce((a, b) => a + b, 0);
+      const allBlockingErrors = allDiagnostics
+        .map(value => value.filter(isBlockingDiagnostic))
+        .flat();
+      const totalErrors = allBlockingErrors.length;
 
-      const allSources = [...new Set(allDiagnostics.flat().map(d => d.source))];
+      // It's useful to track even the diagnostics that are filtered out, to refine the allowlist in the future
+      const unfilteredErrors = allDiagnostics
+        .map(value => value.filter(isErrorDiagnosticToLog))
+        .flat();
+
       const totalDiagnostics = allDiagnostics.flat().length;
+
+      const firstError = allBlockingErrors[0];
+      const firstUnfilteredError = unfilteredErrors[0];
 
       const childTracker = tracker.trackAsParent('DiagnosticsConfirmationOpportunity', {
         extras: {
           shown: enabled,
-          sources: allSources,
+          unfilteredErrorCodes: [...new Set(unfilteredErrors.map(d => `${d.source}(${d.code})`))],
+          filteredErrorCodes: [...new Set(allBlockingErrors.map(d => `${d.source}(${d.code})`))],
+          sampleMessage: previewDiagnostic(firstError),
+          unfilteredSampleMessage: previewDiagnostic(firstUnfilteredError),
+          totalUnfilteredErrors: unfilteredErrors.length,
           totalErrors,
           totalDiagnostics,
         },
@@ -126,8 +175,24 @@ export async function confirmNoBlockingDiagnostics(
         const shouldContinue =
           (await showModal({
             type: 'confirm',
-            title: t('codeIssuesFound', {count: totalErrors}),
-            message: <DiagnosticsList diagnostics={[...result.diagnostics.entries()]} />,
+            title: (
+              <Row>
+                <T count={totalErrors}>codeIssuesFound</T>
+                <Tooltip
+                  title={t(
+                    'Error-severity issues are typically land blocking and should be resolved before submitting for code review.\n\n' +
+                      'Errors shown here are best-effort and not necessarily comprehensive.',
+                  )}>
+                  <Icon icon="info" />
+                </Tooltip>
+              </Row>
+            ),
+            message: (
+              <DiagnosticsList
+                diagnostics={[...result.diagnostics.entries()]}
+                tracker={childTracker}
+              />
+            ),
             buttons,
           })) === buttons[1];
 
@@ -144,18 +209,28 @@ export async function confirmNoBlockingDiagnostics(
   return true;
 }
 
-function DiagnosticsList({diagnostics}: {diagnostics: Array<[string, Array<Diagnostic>]>}) {
+function DiagnosticsList({
+  diagnostics,
+  tracker,
+}: {
+  diagnostics: Array<[string, Array<Diagnostic>]>;
+  tracker: Tracker<{parentId: string}>;
+}) {
   const [hideNonBlocking, setHideNonBlocking] = useAtom(hideNonBlockingDiagnosticsAtom);
   const [shouldWarn, setShouldWarn] = useAtom(shouldWarnAboutDiagnosticsAtom);
   return (
     <>
       <Column alignStart xstyle={styles.allDiagnostics}>
         {diagnostics.map(([filepath, diagnostics]) => {
-          const sortedDiagnostics = [...diagnostics]
-            .filter(d => (hideNonBlocking ? d.severity === 'error' : true))
-            .sort((a, b) => {
-              return severityComparator(a) - severityComparator(b);
-            });
+          const sortedDiagnostics = [...diagnostics].filter(d =>
+            hideNonBlocking ? isBlockingDiagnostic(d) : true,
+          );
+          sortedDiagnostics.sort((a, b) => {
+            return severityComparator(a) - severityComparator(b);
+          });
+          if (sortedDiagnostics.length === 0) {
+            return null;
+          }
           return (
             <Column key={filepath} alignStart>
               <Collapsable
@@ -167,14 +242,17 @@ function DiagnosticsList({diagnostics}: {diagnostics: Array<[string, Array<Diagn
                   </Row>
                 }>
                 <Column alignStart xstyle={styles.diagnosticList}>
-                  {sortedDiagnostics.map(d => (
+                  {sortedDiagnostics.map((d, i) => (
                     <Row
                       role="button"
                       tabIndex={0}
-                      key={d.source}
+                      key={i}
                       xstyle={styles.diagnosticRow}
                       onClick={() => {
-                        foundPlatform.openFile(filepath, {line: d.range.startLine + 1});
+                        platform.openFile(filepath, {line: d.range.startLine + 1});
+                        tracker.track('DiagnosticsConfirmationAction', {
+                          extras: {action: 'openFile'},
+                        });
                       }}>
                       {iconForDiagnostic(d)}
                       <span>{d.message}</span>
@@ -196,12 +274,19 @@ function DiagnosticsList({diagnostics}: {diagnostics: Array<[string, Array<Diagn
         })}
       </Column>
       <Row xstyle={styles.confirmCheckbox}>
-        <Checkbox checked={!shouldWarn} onChange={checked => setShouldWarn(!checked)}>
+        <Checkbox
+          checked={!shouldWarn}
+          onChange={checked => {
+            setShouldWarn(!checked);
+            if (checked) {
+              tracker.track('DiagnosticsConfirmationAction', {extras: {action: 'dontAskAgain'}});
+            }
+          }}>
           <T>Don't ask again</T>
         </Checkbox>
         <Tooltip
           title={t(
-            "Only 'error' severity issues will cause this dialog to appear, but less severe issues can still be shown here. This option hides these non-blocking issues.",
+            "Only 'error' severity issues known to cause problems will cause this dialog to appear, but less severe issues can still be shown here. This option hides these non-blocking issues.",
           )}>
           <Checkbox checked={hideNonBlocking} onChange={setHideNonBlocking}>
             <T>Hide non-blocking issues</T>

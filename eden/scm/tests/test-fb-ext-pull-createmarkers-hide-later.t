@@ -4,7 +4,7 @@
 Setup
 
   $ configure mutation-norecord dummyssh
-  $ enable amend fbcodereview pushrebase rebase remotenames
+  $ enable amend fbcodereview pushrebase rebase
   $ setconfig ui.username="nobody <no.reply@fb.com>" experimental.rebaseskipobsolete=true
   $ setconfig remotenames.allownonfastforward=true
   $ setconfig extensions.arcconfig="$TESTDIR/../sapling/ext/extlib/phabricator/arcconfig.py"
@@ -60,7 +60,7 @@ Set up a client repository, and work on 3 diffs
   o  "add b
   │
   │  Differential Revision: https://phabricator.fb.com/D123"
-  o  "add secondcommit" default/master
+  o  "add secondcommit" remote/master
   │
   o  "add initial"
   
@@ -96,13 +96,7 @@ Strip the commits we just landed.
 Here pull should now detect commits 2 and 3 as landed, but it won't be able to
 hide them since there is a non-hidden successor.
 
-  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit hg pull
-  pulling from ssh://user@dummy/server
-  searching for changes
-  adding changesets
-  adding manifests
-  adding file changes
-  marked 2 commits as landed
+  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit hg pull -q
   $ hg log -G -T '"{desc}" {remotebookmarks}' -r 'all()'
   o  "add d
   │
@@ -116,7 +110,7 @@ hide them since there is a non-hidden successor.
   │ o  "add c
   │ │
   │ │  Differential Revision: https://phabricator.fb.com/D124
-  │ │  Reviewed By: someone" default/master
+  │ │  Reviewed By: someone" remote/master
   │ o  "add b
   ├─╯
   │    Differential Revision: https://phabricator.fb.com/D123
@@ -158,16 +152,12 @@ Here pull should now detect commit 4 has been landed.  It should hide this
 commit, and should also hide 3 and 2, which were previously landed, but up
 until now had non-hidden successors.
 
-  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit hg pull
-  pulling from ssh://user@dummy/server
-  searching for changes
-  no changes found
-  marked 1 commit as landed
+  $ HG_ARC_CONDUIT_MOCK=$TESTTMP/mockduit hg pull -q
   $ hg log -G -T '"{desc}" {remotebookmarks}' -r 'all()'
   o  "add d
   │
   │  Differential Revision: https://phabricator.fb.com/D131
-  │  Reviewed By: someone" default/master
+  │  Reviewed By: someone" remote/master
   @  "add c
   │
   │  Differential Revision: https://phabricator.fb.com/D124

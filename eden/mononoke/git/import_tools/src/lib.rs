@@ -298,9 +298,13 @@ pub async fn gitimport<Uploader: GitUploader>(
 ) -> Result<LinkedHashMap<ObjectId, ChangesetId>> {
     let repo_name = repo_name(prefs, path);
     let reader = Arc::new(
-        GitRepoReader::new(&prefs.git_command_path, path)
-            .await
-            .context("GitRepoReader::new")?,
+        GitRepoReader::new(
+            &prefs.git_command_path,
+            path,
+            prefs.allow_non_standard_file_mode,
+        )
+        .await
+        .context("GitRepoReader::new")?,
     );
     let acc = GitimportAccumulator::from_roots(target.get_roots().clone());
     let all_commits = target
@@ -473,7 +477,7 @@ pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
     let mut commits_with_file_changes = stream::iter(relevant_commits)
         .map(Ok)
         .map_ok(|oid| {
-            cloned!(ctx, reader, uploader, prefs.lfs, prefs.submodules);
+            cloned!(ctx, reader, uploader, prefs.lfs, prefs.submodules, prefs.stream_for_changed_trees);
             async move {
                 task::spawn({
                     async move {
@@ -489,8 +493,15 @@ pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
                         let oid = extracted_commit.metadata.oid;
                         // Before generating the corresponding changeset at Mononoke end, upload the raw git commit
                         // and the git tree pointed to by the git commit.
-                        extracted_commit
+                        let entries_stream = if !stream_for_changed_trees {
+                            stream::iter(extracted_commit
                             .changed_trees(&ctx, &reader)
+                            .try_collect::<Vec<_>>()
+                            .await?).map(Ok).boxed()
+                        } else {
+                            extracted_commit.changed_trees(&ctx, &reader).boxed()
+                        };
+                        entries_stream
                             .map_ok(|entry| {
                                 cloned!(oid, uploader, reader, ctx);
                                 async move {
@@ -536,7 +547,7 @@ pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
                                 }
                             })
                             .try_buffer_unordered(100)
-                            .try_collect()
+                            .try_collect::<()>()
                             .await?;
                         // Upload packfile base item for Git commit and the raw Git commit
                         let packfile_item_upload = async {
@@ -682,7 +693,12 @@ pub async fn read_git_refs(
     path: &Path,
     prefs: &GitimportPreferences,
 ) -> Result<BTreeMap<GitRef, ObjectId>> {
-    let reader = GitRepoReader::new(&prefs.git_command_path, path).await?;
+    let reader = GitRepoReader::new(
+        &prefs.git_command_path,
+        path,
+        prefs.allow_non_standard_file_mode,
+    )
+    .await?;
 
     let mut command = Command::new(&prefs.git_command_path)
         .current_dir(path)
@@ -747,7 +763,14 @@ pub async fn import_tree_as_single_bonsai_changeset<Uploader: GitUploader>(
     prefs: &GitimportPreferences,
 ) -> Result<ChangesetId> {
     let acc = GitimportAccumulator::from_roots(HashMap::new());
-    let reader = Arc::new(GitRepoReader::new(&prefs.git_command_path, path).await?);
+    let reader = Arc::new(
+        GitRepoReader::new(
+            &prefs.git_command_path,
+            path,
+            prefs.allow_non_standard_file_mode,
+        )
+        .await?,
+    );
 
     let sha1 = oid_to_sha1(&git_cs_id)?;
 

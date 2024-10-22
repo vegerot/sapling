@@ -20,6 +20,7 @@ use fn_error_context::context;
 use hgtime::HgTime;
 use parking_lot::Mutex;
 use progress_model::AggregatingProgressBar;
+use storemodel::SerializationFormat;
 
 use crate::indexedlogauxstore::AuxStore;
 use crate::indexedlogdatastore::IndexedLogHgIdDataStore;
@@ -58,6 +59,7 @@ pub struct FileStoreBuilder<'a> {
 
     edenapi: Option<Arc<SaplingRemoteApiFileStore>>,
     cas_client: Option<Arc<dyn CasClient>>,
+    format: Option<SerializationFormat>,
 }
 
 impl<'a> FileStoreBuilder<'a> {
@@ -73,6 +75,7 @@ impl<'a> FileStoreBuilder<'a> {
             lfs_cache: None,
             edenapi: None,
             cas_client: None,
+            format: None,
         }
     }
 
@@ -121,6 +124,11 @@ impl<'a> FileStoreBuilder<'a> {
         self
     }
 
+    pub fn format(mut self, format: SerializationFormat) -> Self {
+        self.format = Some(format);
+        self
+    }
+
     #[context("unable to get LFS threshold")]
     fn get_lfs_threshold(&self) -> Result<Option<ByteCount>> {
         let enable_lfs = self.config.get_or_default::<bool>("remotefilelog", "lfs")?;
@@ -137,6 +145,10 @@ impl<'a> FileStoreBuilder<'a> {
         self.config
             .get_or_default::<i32>("scmstore", "retries")
             .unwrap_or_default()
+    }
+
+    fn get_format(&self) -> SerializationFormat {
+        self.format.unwrap_or(SerializationFormat::Hg)
     }
 
     #[context("unable to determine whether use edenapi")]
@@ -174,6 +186,7 @@ impl<'a> FileStoreBuilder<'a> {
                 get_indexedlogdatastore_path(local_path)?,
                 &config,
                 StoreType::Permanent,
+                self.get_format(),
             )?))
         } else {
             None
@@ -206,6 +219,7 @@ impl<'a> FileStoreBuilder<'a> {
             get_indexedlogdatastore_path(cache_path)?,
             &config,
             StoreType::Rotated,
+            self.get_format(),
         )?)))
     }
 
@@ -263,6 +277,8 @@ impl<'a> FileStoreBuilder<'a> {
         let lfs_threshold_bytes = self.get_lfs_threshold()?.map(|b| b.value());
 
         let edenapi_retries = self.get_edenapi_retries();
+
+        let format: SerializationFormat = self.get_format();
 
         tracing::trace!(target: "revisionstore::filestore", "processing local");
         let indexedlog_local = if let Some(indexedlog_local) = self.indexedlog_local.take() {
@@ -393,6 +409,7 @@ impl<'a> FileStoreBuilder<'a> {
 
             lfs_progress: AggregatingProgressBar::new("fetching", "LFS"),
             flush_on_drop: true,
+            format,
         })
     }
 }
@@ -409,6 +426,7 @@ pub struct TreeStoreBuilder<'a> {
     tree_aux_store: Option<Arc<TreeAuxStore>>,
     filestore: Option<Arc<FileStore>>,
     cas_client: Option<Arc<dyn CasClient>>,
+    format: Option<SerializationFormat>,
 }
 
 impl<'a> TreeStoreBuilder<'a> {
@@ -424,6 +442,7 @@ impl<'a> TreeStoreBuilder<'a> {
             tree_aux_store: None,
             filestore: None,
             cas_client: None,
+            format: None,
         }
     }
 
@@ -477,6 +496,11 @@ impl<'a> TreeStoreBuilder<'a> {
         self
     }
 
+    pub fn format(mut self, format: SerializationFormat) -> Self {
+        self.format = Some(format);
+        self
+    }
+
     #[context("failed to determine whether to use edenapi")]
     fn use_edenapi(&self) -> Result<bool> {
         Ok(if let Some(use_edenapi) = self.override_edenapi {
@@ -493,6 +517,10 @@ impl<'a> TreeStoreBuilder<'a> {
         Ok(SaplingRemoteApiTreeStore::new(client))
     }
 
+    fn get_format(&self) -> SerializationFormat {
+        self.format.unwrap_or(SerializationFormat::Hg)
+    }
+
     #[context("failed to build local indexedlog")]
     pub fn build_indexedlog_local(&self) -> Result<Option<Arc<IndexedLogHgIdDataStore>>> {
         Ok(if let Some(local_path) = self.local_path.clone() {
@@ -507,6 +535,7 @@ impl<'a> TreeStoreBuilder<'a> {
                 get_indexedlogdatastore_path(local_path)?,
                 &config,
                 StoreType::Permanent,
+                self.get_format(),
             )?))
         } else {
             None
@@ -540,6 +569,7 @@ impl<'a> TreeStoreBuilder<'a> {
             get_indexedlogdatastore_path(cache_path)?,
             &config,
             StoreType::Rotated,
+            self.get_format(),
         )?)))
     }
 
@@ -601,6 +631,8 @@ impl<'a> TreeStoreBuilder<'a> {
         if let Some(cache_path) = get_cache_path(self.config, &self.suffix)? {
             check_cache_buster(&self.config, &cache_path);
         }
+
+        let format = self.get_format();
 
         tracing::trace!(target: "revisionstore::treestore", "processing local");
         let indexedlog_local = if let Some(indexedlog_local) = self.indexedlog_local.take() {
@@ -704,6 +736,7 @@ impl<'a> TreeStoreBuilder<'a> {
             fetch_tree_aux_data,
             flush_on_drop: true,
             metrics: Default::default(),
+            format,
         })
     }
 }

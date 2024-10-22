@@ -28,6 +28,7 @@ use requests_table::BlobstoreKey;
 pub use requests_table::ClaimedBy;
 use requests_table::LongRunningRequestEntry;
 use requests_table::LongRunningRequestsQueue;
+use requests_table::QueueStats;
 pub use requests_table::RequestId;
 use requests_table::RequestType;
 pub use requests_table::RowId;
@@ -36,7 +37,6 @@ use sql_construct::SqlConstruct;
 use stats::define_stats;
 use stats::prelude::TimeseriesStatic;
 
-use crate::error::AsyncRequestsError;
 use crate::types::AsynchronousRequestParams;
 use crate::types::AsynchronousRequestResult;
 use crate::types::Request;
@@ -107,13 +107,11 @@ impl AsyncMethodRequestQueue {
         let rust_params = thrift_params.into();
         self.enqueue_inner::<P>(ctx, repo_id, request_type, rust_params)
             .await
-            .map(|token| {
+            .inspect(|_token| {
                 STATS::enqueue_success.add_value(1);
-                token
             })
-            .map_err(|err| {
+            .inspect_err(|_err| {
                 STATS::enqueue_error.add_value(1);
-                err
             })
     }
 
@@ -138,17 +136,15 @@ impl AsyncMethodRequestQueue {
         &self,
         ctx: &CoreContext,
         claimed_by: &ClaimedBy,
-    ) -> Result<Option<(RequestId, AsynchronousRequestParams)>, AsyncRequestsError> {
+    ) -> Result<Option<(RequestId, AsynchronousRequestParams)>, Error> {
         STATS::dequeue_called.add_value(1);
         self.dequeue_inner(ctx, claimed_by)
             .await
-            .map(|token| {
+            .inspect(|_token| {
                 STATS::dequeue_success.add_value(1);
-                token
             })
-            .map_err(|err| {
+            .inspect_err(|_err| {
                 STATS::dequeue_error.add_value(1);
-                err
             })
     }
 
@@ -156,7 +152,7 @@ impl AsyncMethodRequestQueue {
         &self,
         ctx: &CoreContext,
         claimed_by: &ClaimedBy,
-    ) -> Result<Option<(RequestId, AsynchronousRequestParams)>, AsyncRequestsError> {
+    ) -> Result<Option<(RequestId, AsynchronousRequestParams)>, Error> {
         let entry = self
             .table
             .claim_and_get_new_request(ctx, claimed_by, self.repos.as_deref())
@@ -182,17 +178,15 @@ impl AsyncMethodRequestQueue {
         ctx: &CoreContext,
         req_id: &RequestId,
         result: AsynchronousRequestResult,
-    ) -> Result<bool, AsyncRequestsError> {
+    ) -> Result<bool, Error> {
         STATS::complete_called.add_value(1);
         self.complete_inner(ctx, req_id, result)
             .await
-            .map(|token| {
+            .inspect(|_token| {
                 STATS::complete_success.add_value(1);
-                token
             })
-            .map_err(|err| {
+            .inspect_err(|_err| {
                 STATS::complete_error.add_value(1);
-                err
             })
     }
 
@@ -201,17 +195,17 @@ impl AsyncMethodRequestQueue {
         ctx: &CoreContext,
         req_id: &RequestId,
         result: AsynchronousRequestResult,
-    ) -> Result<bool, AsyncRequestsError> {
+    ) -> Result<bool, Error> {
         let result_object_id = result.store(ctx, &self.blobstore).await?;
         let blobstore_key = BlobstoreKey(result_object_id.blobstore_key());
-        Ok(self.table.mark_ready(ctx, req_id, blobstore_key).await?)
+        self.table.mark_ready(ctx, req_id, blobstore_key).await
     }
 
     async fn poll_once<R: Request>(
         &self,
         ctx: &CoreContext,
         req_id: &RequestId,
-    ) -> Result<Option<<R as Request>::ThriftResult>, AsyncRequestsError> {
+    ) -> Result<Option<<R as Request>::ThriftResult>, Error> {
         let maybe_result_blobstore_key = match self.table.poll(ctx, req_id).await? {
             None => return Ok(None),
             Some((_, entry)) => entry.result_blobstore_key,
@@ -220,10 +214,10 @@ impl AsyncMethodRequestQueue {
         let result_blobstore_key = match maybe_result_blobstore_key {
             Some(rbk) => rbk,
             None => {
-                return Err(AsyncRequestsError::internal(anyhow!(
+                return Err(anyhow!(
                     "Programming error: successful poll with empty result_blobstore_key for {:?}",
                     req_id
-                )));
+                ));
             }
         };
 
@@ -237,14 +231,13 @@ impl AsyncMethodRequestQueue {
         &self,
         ctx: &CoreContext,
         token: T,
-    ) -> Result<<T::R as Request>::PollResponse, AsyncRequestsError> {
+    ) -> Result<<T::R as Request>::PollResponse, Error> {
         STATS::poll_called.add_value(1);
         self.poll_inner(ctx, token)
             .await
             // we don't bump poll_success here, we do it in poll_inner
-            .map_err(|err| {
+            .inspect_err(|_err| {
                 STATS::poll_error.add_value(1);
-                err
             })
     }
 
@@ -252,7 +245,7 @@ impl AsyncMethodRequestQueue {
         &self,
         ctx: &CoreContext,
         token: T,
-    ) -> Result<<T::R as Request>::PollResponse, AsyncRequestsError> {
+    ) -> Result<<T::R as Request>::PollResponse, Error> {
         let mut backoff_ms = INITIAL_POLL_DELAY_MS;
         let before = Instant::now();
         let row_id = token.to_db_id()?;
@@ -289,19 +282,18 @@ impl AsyncMethodRequestQueue {
         &self,
         ctx: &CoreContext,
         req_id: &RequestId,
-    ) -> Result<bool, AsyncRequestsError> {
-        Ok(self.table.update_in_progress_timestamp(ctx, req_id).await?)
+    ) -> Result<bool, Error> {
+        self.table.update_in_progress_timestamp(ctx, req_id).await
     }
 
     pub async fn find_abandoned_requests(
         &self,
         ctx: &CoreContext,
         abandoned_timestamp: Timestamp,
-    ) -> Result<Vec<RequestId>, AsyncRequestsError> {
-        Ok(self
-            .table
+    ) -> Result<Vec<RequestId>, Error> {
+        self.table
             .find_abandoned_requests(ctx, self.repos.as_deref(), abandoned_timestamp)
-            .await?)
+            .await
     }
 
     pub async fn mark_abandoned_request_as_new(
@@ -309,19 +301,14 @@ impl AsyncMethodRequestQueue {
         ctx: &CoreContext,
         request_id: RequestId,
         abandoned_timestamp: Timestamp,
-    ) -> Result<bool, AsyncRequestsError> {
-        Ok(self
-            .table
+    ) -> Result<bool, Error> {
+        self.table
             .mark_abandoned_request_as_new(ctx, request_id, abandoned_timestamp)
-            .await?)
+            .await
     }
 
-    pub async fn requeue(
-        &self,
-        ctx: &CoreContext,
-        request_id: RequestId,
-    ) -> Result<bool, AsyncRequestsError> {
-        Ok(self.table.mark_new(ctx, &request_id).await?)
+    pub async fn requeue(&self, ctx: &CoreContext, request_id: RequestId) -> Result<bool, Error> {
+        self.table.mark_new(ctx, &request_id).await
     }
 
     pub async fn list_requests(
@@ -335,7 +322,7 @@ impl AsyncMethodRequestQueue {
             LongRunningRequestEntry,
             AsynchronousRequestParams,
         )>,
-        AsyncRequestsError,
+        Error,
     > {
         let entries = self
             .table
@@ -353,7 +340,7 @@ impl AsyncMethodRequestQueue {
                 .await
                 .context("deserializing")?;
                 let req_id = RequestId(entry.id.clone(), entry.request_type.clone());
-                Ok::<_, AsyncRequestsError>((req_id, entry, thrift_params))
+                Ok::<_, Error>((req_id, entry, thrift_params))
             })
             .buffer_unordered(10);
 
@@ -384,7 +371,7 @@ impl AsyncMethodRequestQueue {
             AsynchronousRequestParams,
             Option<AsynchronousRequestResult>,
         )>,
-        AsyncRequestsError,
+        Error,
     > {
         let entry = self.table.test_get_request_entry_by_id(ctx, row_id).await?;
 
@@ -413,6 +400,10 @@ impl AsyncMethodRequestQueue {
             // empty queue
             Ok(None)
         }
+    }
+
+    pub async fn get_queue_stats(&self, ctx: &CoreContext) -> Result<QueueStats, Error> {
+        self.table.get_queue_stats(ctx, self.repos.as_deref()).await
     }
 }
 

@@ -1,6 +1,5 @@
   $ setconfig push.edenapi=true
   $ setconfig scmstore.fetch-from-cas=true scmstore.fetch-tree-aux-data=true scmstore.tree-metadata-mode=always
-  $ setconfig scmstore.contentstorefallback=false
 
 First sanity check eagerepo works as CAS store
   $ newclientrepo client1 test:server
@@ -88,7 +87,7 @@ Empty shared caches.
 
 scmstore can fetch trees from CAS:
 
-First fetch root tree to trigger fetching "dir" aux data":
+First fetch root tree to trigger fetching "dir" aux data:
   $ hg debugscmstore -r $A --mode tree "" >/dev/null
 
 Then fetch "dir" from CAS:
@@ -151,3 +150,10 @@ Make sure prefetch uses CAS:
 Don't rewrite aux data to cache:
   $ LOG=revisionstore=trace hg prefetch -r $A . 2>&1 | grep "writing to"
   [1]
+
+
+FIXME - we try fetching from local cache unnecessarily
+  $ hg debugscmstore -r $A --mode tree "dir" --config devel.print-metrics=scmstore.tree.fetch.indexedlog.cache.keys >/dev/null
+  scmstore.tree.fetch.indexedlog.cache.keys: 1
+  $ hg debugscmstore -r $A --mode file "dir/file" --config devel.print-metrics=scmstore.file.fetch.indexedlog.cache.keys >/dev/null
+  scmstore.file.fetch.indexedlog.cache.keys: 1

@@ -80,7 +80,7 @@ from .. import (
     visibility,
 )
 from ..i18n import _, _n, _x
-from ..node import bin, hex, nullhex, nullid, nullrev, short
+from ..node import bin, hex, nullid, nullrev, short
 from ..pycompat import decodeutf8, range
 from . import migratesymlinks
 from .cmdtable import command
@@ -3180,18 +3180,16 @@ def debugsuccessorssets(ui, repo, *revs, **opts) -> None:
     """
     # passed to successorssets caching computation from one call to another
     cache = {}
-    ctx2str = str
-    node2str = short
     if mutation.enabled(repo):
         successorssets = mutation.successorssets
     else:
         successorssets = []
     if ui.debug():
-
-        def ctx2str(ctx):
-            return ctx.hex()
-
+        ctx2str = lambda ctx: ctx.hex()
         node2str = hex
+    else:
+        ctx2str = str
+        node2str = short
     for rev in scmutil.revrange(repo, revs):
         ctx = repo[rev]
         ui.write("%s\n" % ctx2str(ctx))
@@ -3326,6 +3324,12 @@ def debugwireargs(ui, repopath, *vals, **opts) -> None:
         ("p", "print", False, _("print name to hash mapping of created nodes")),
         ("b", "bookmarks", True, _("create bookmarks")),
         ("f", "files", True, _("create files")),
+        (
+            "",
+            "parent-order",
+            "",
+            _("parent order, one of: hash, name, hash-reverse, name-reverse"),
+        ),
         ("", "write-env", "", _("write NAME=HEX per line to a given file (ADVANCED)")),
     ],
 )

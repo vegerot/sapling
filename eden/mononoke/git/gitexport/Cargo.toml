@@ -24,7 +24,7 @@ blobstore = { version = "0.1.0", path = "../../blobstore" }
 bookmarks_types = { version = "0.1.0", path = "../../bookmarks/bookmarks_types" }
 borrowed = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 changeset_info = { version = "0.1.0", path = "../../derived_data/changeset_info" }
-clap = { version = "4.5.11", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.5.20", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cmdlib_logging = { version = "0.1.0", path = "../../cmdlib/log" }
 commit_id = { version = "0.1.0", path = "../../cmdlib/commit_id" }
@@ -38,7 +38,7 @@ futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimen
 git_symbolic_refs = { version = "0.1.0", path = "../../git_symbolic_refs" }
 git_types = { version = "0.1.0", path = "../git_types" }
 indicatif = { version = "0.17.6", features = ["futures", "improved_unicode", "rayon", "tokio"] }
-itertools = "0.11.0"
+itertools = "0.13.0"
 maplit = "1.0"
 metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
 mononoke_api = { version = "0.1.0", path = "../../mononoke_api" }
@@ -55,7 +55,7 @@ repo_derived_data = { version = "0.1.0", path = "../../repo_attributes/repo_deri
 repo_factory = { version = "0.1.0", path = "../../repo_factory" }
 scuba_ext = { version = "0.1.0", path = "../../common/scuba_ext" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
-serde_json = { version = "1.0.100", features = ["float_roundtrip", "unbounded_depth"] }
+serde_json = { version = "1.0.125", features = ["float_roundtrip", "unbounded_depth"] }
 slog = { version = "2.7", features = ["max_level_trace", "nested-values"] }
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 test_repo_factory = { version = "0.1.0", path = "../../repo_factory/test_repo_factory" }

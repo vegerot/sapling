@@ -13,7 +13,7 @@ async-trait = "0.1.71"
 blobstore = { version = "0.1.0", path = "../blobstore" }
 bytes = { version = "1.6.0", features = ["serde"] }
 cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-clap = { version = "4.5.11", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.5.20", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 clientinfo = { version = "0.1.0", path = "../../scm/lib/clientinfo" }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cmdlib_caching = { version = "0.1.0", path = "../cmdlib/caching" }
@@ -56,10 +56,10 @@ repo_permission_checker = { version = "0.1.0", path = "../repo_attributes/repo_p
 scuba_ext = { version = "0.1.0", path = "../common/scuba_ext" }
 secure_utils = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
-serde_json = { version = "1.0.100", features = ["float_roundtrip", "unbounded_depth"] }
+serde_json = { version = "1.0.125", features = ["float_roundtrip", "unbounded_depth"] }
 slog = { version = "2.7", features = ["max_level_trace", "nested-values"] }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-thiserror = "1.0.49"
+thiserror = "1.0.64"
 time_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 time_window_counter = { version = "0.1.0", path = "../time_window_counter" }
 tokio = { version = "1.37.0", features = ["full", "test-util", "tracing"] }

@@ -6,14 +6,15 @@
 
   $ . "${TEST_FIXTURES}/library.sh"
 
-  $ enable pushrebase remotenames
+  $ enable pushrebase
   $ export COMMIT_SCRIBE_CATEGORY=public_commit
   $ export MONONOKE_TEST_SCRIBE_LOGGING_DIRECTORY=$TESTTMP/scribe_logs/
   $ setconfig push.edenapi=true
   $ setup_common_config
+
   $ testtool_drawdag -R repo --derive-all --print-hg-hashes <<EOF
   > A-B-C
-  > # bookmark: C main
+  > # bookmark: C master_bookmark
   > EOF
   A=20ca2a4749a439b459125ef0f6a4f26e88ee7538
   B=80521a640a0c8f51dcc128c2658b224d595840ac
@@ -42,7 +43,7 @@ Push the commits
   ├─╯
   o  20ca2a4749a4 'A'
   
-  $ hg push -q -r . --to main
+  $ hg push -q -r . --to master_bookmark
 
   $ tglog
   @  d6637437d715 'commit2'

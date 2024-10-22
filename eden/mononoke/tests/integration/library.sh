@@ -6,93 +6,32 @@
 
 # Library routines and initial setup for Mononoke-related tests.
 
+# This runs the Python version of functions on debugruntest. It's also
+# capable of importing the env vars that would be modified if the function
+# was written in Bash.
+function python_fn() {
+  echo -n "" > "$TESTTMP/.dbrtest_envs"
+  CHGDISABLE=1 hg debugpython "$TEST_FIXTURES/dbrtest_runner.py" "$@"
+  local rv=$?
+  # shellcheck disable=SC1091
+  . "$TESTTMP/.dbrtest_envs"
+  return $rv
+}
+
 if [ -n "$FB_TEST_FIXTURES" ] && [ -f "$FB_TEST_FIXTURES/fb_library.sh" ]; then
   # shellcheck source=fbcode/eden/mononoke/tests/integration/facebook/fb_library.sh
   . "$FB_TEST_FIXTURES/fb_library.sh"
 fi
 
-PROXY_ID_TYPE="${FB_PROXY_ID_TYPE:-X509_SUBJECT_NAME}"
-PROXY_ID_DATA="${FB_PROXY_ID_DATA:-CN=proxy,O=Mononoke,C=US,ST=CA}"
-CLIENT0_ID_TYPE="${FB_CLIENT0_ID_TYPE:-X509_SUBJECT_NAME}"
-CLIENT0_ID_DATA="${FB_CLIENT0_ID_DATA:-CN=client0,O=Mononoke,C=US,ST=CA}"
-# shellcheck disable=SC2034
-CLIENT1_ID_TYPE="${FB_CLIENT1_ID_TYPE:-X509_SUBJECT_NAME}"
-# shellcheck disable=SC2034
-CLIENT1_ID_DATA="${FB_CLIENT1_ID_DATA:-CN=client1,O=Mononoke,C=US,ST=CA}"
-# shellcheck disable=SC2034
-CLIENT2_ID_TYPE="${FB_CLIENT2_ID_TYPE:-X509_SUBJECT_NAME}"
-# shellcheck disable=SC2034
-CLIENT2_ID_DATA="${FB_CLIENT2_ID_DATA:-CN=client2,O=Mononoke,C=US,ST=CA}"
-# shellcheck disable=SC2034
-JSON_CLIENT_ID="${FB_JSON_CLIENT_ID:-[\"X509_SUBJECT_NAME:CN=client0,O=Mononoke,C=US,ST=CA\"]}"
-
-SCRIBE_LOGS_DIR="$TESTTMP/scribe_logs"
-
-if [[ -n "$DB_SHARD_NAME" ]]; then
-  MONONOKE_DEFAULT_START_TIMEOUT=600
-  MONONOKE_LFS_DEFAULT_START_TIMEOUT=60
-  MONONOKE_GIT_SERVICE_DEFAULT_START_TIMEOUT=60
-  MONONOKE_SCS_DEFAULT_START_TIMEOUT=300
-  MONONOKE_LAND_SERVICE_DEFAULT_START_TIMEOUT=120
-else
-  MONONOKE_DEFAULT_START_TIMEOUT=60
-  MONONOKE_LFS_DEFAULT_START_TIMEOUT=60
-  MONONOKE_GIT_SERVICE_DEFAULT_START_TIMEOUT=60
-  # First scsc call takes a while as scs server is doing derivation
-  MONONOKE_SCS_DEFAULT_START_TIMEOUT=300
-  MONONOKE_LAND_SERVICE_DEFAULT_START_TIMEOUT=120
-  MONONOKE_DDS_DEFAULT_START_TIMEOUT=120
-fi
-VI_SERVICE_DEFAULT_START_TIMEOUT=60
+python_fn setup_environment_variables
 
 function urlencode {
-  "$URLENCODE" "$@"
+  python_fn urlencode "$@"
 }
-
-REPOID=0
-REPONAME=${REPONAME:-repo}
-
-# Where we write host:port information after servers bind to :0
-MONONOKE_SERVER_ADDR_FILE="$TESTTMP/mononoke_server_addr.txt"
-DDS_SERVER_ADDR_FILE="$TESTTMP/dds_server_addr.txt"
-
-export LOCAL_CONFIGERATOR_PATH="$TESTTMP/configerator"
-mkdir -p "${LOCAL_CONFIGERATOR_PATH}"
-
-export ACL_FILE="$TESTTMP/acls.json"
-
-export MONONOKE_JUST_KNOBS_OVERRIDES_PATH="${LOCAL_CONFIGERATOR_PATH}/just_knobs.json"
-cp "${JUST_KNOBS_DEFAULTS}/just_knobs_defaults/just_knobs.json" "$MONONOKE_JUST_KNOBS_OVERRIDES_PATH"
 
 function get_configerator_relative_path {
   realpath --relative-to "${LOCAL_CONFIGERATOR_PATH}" "$1"
 }
-
-if [[ -n "$ENABLE_LOCAL_CACHE" ]]; then
-  CACHE_ARGS=(
-    --cache-mode=local-only
-    --cache-size-gb=1
-    --cachelib-disable-cacheadmin
-  )
-else
-  CACHE_ARGS=( --cache-mode=disabled )
-fi
-
-COMMON_ARGS=(
-  --mysql-master-only
-  --just-knobs-config-path "$(get_configerator_relative_path "${MONONOKE_JUST_KNOBS_OVERRIDES_PATH}")"
-  --local-configerator-path "${LOCAL_CONFIGERATOR_PATH}"
-  --log-exclude-tag "futures_watchdog"
-  --with-test-megarepo-configs-client=true
-  --acl-file "${ACL_FILE}"
-)
-
-export TEST_CERTDIR
-TEST_CERTDIR="${HGTEST_CERTDIR:-"$TEST_CERTS"}"
-if [[ -z "$TEST_CERTDIR" ]]; then
-  echo "TEST_CERTDIR is not set" 1>&2
-  exit 1
-fi
 
 case "$(uname -s)" in
   # Workarounds for running tests on MacOS
@@ -110,7 +49,7 @@ esac
 function killandwait {
   # sends KILL to the given process and waits for it so that nothing is printed
   # to the terminal on MacOS
-  { kill -9 "$1" && wait "$1"; } > /dev/null 2>&1
+  { kill -9 "$1" && tail --pid="$1" -f /dev/null; } > /dev/null 2>&1
   # We don't care for wait exit code
   true
 }
@@ -120,25 +59,16 @@ function get_free_socket {
 }
 
 ZELOS_PORT=$(get_free_socket)
+export ZELOS_PORT
 
 CAS_SERVER_SOCKET=$(get_free_socket)
 
 function mononoke_host {
-  if [[ $LOCALIP == *":"* ]]; then
-    # ipv6, surround in brackets
-    echo -n "[$LOCALIP]"
-  else
-    echo -n "$LOCALIP"
-  fi
+  python_fn mononoke_host "$@"
 }
 
 function mononoke_address {
-  if [[ $LOCALIP == *":"* ]]; then
-    # ipv6, surround in brackets
-    echo -n "[$LOCALIP]:$MONONOKE_SOCKET"
-  else
-    echo -n "$LOCALIP:$MONONOKE_SOCKET"
-  fi
+  python_fn mononoke_address "$@"
 }
 
 function cas_server_address {
@@ -179,13 +109,11 @@ function random_int() {
 }
 
 function sslcurlas {
-  local name="$1"
-  shift
-  curl --noproxy localhost -H 'x-client-info: {"request_info": {"entry_point": "CurlTest", "correlator": "test"}}' --cert "$TEST_CERTDIR/$name.crt" --cacert "$TEST_CERTDIR/root-ca.crt" --key "$TEST_CERTDIR/$name.key" "$@"
+  python_fn sslcurlas "$@"
 }
 
 function sslcurl {
-  sslcurlas proxy "$@"
+  python_fn sslcurl "$@"
 }
 
 function sslcurl_noclientinfo_test {
@@ -197,43 +125,7 @@ function curltest {
 }
 
 function mononoke {
-  if [[ ! -d "$SCRIBE_LOGS_DIR" ]]; then
-    mkdir "$SCRIBE_LOGS_DIR"
-  fi
-
-  setup_configerator_configs
-
-  local BIND_ADDR
-  if [[ $LOCALIP == *":"* ]]; then
-    # ipv6, surround in brackets
-    BIND_ADDR="[$LOCALIP]:0"
-  else
-    BIND_ADDR="$LOCALIP:0"
-  fi
-
-  # Stop any confusion from previous runs
-  rm -f "$MONONOKE_SERVER_ADDR_FILE"
-
-  # Ignore specific Python warnings to make tests predictable.
-  PYTHONWARNINGS="ignore:::requests,ignore::SyntaxWarning" \
-  GLOG_minloglevel=5 \
-    "$MONONOKE_SERVER" "$@" \
-    --scribe-logging-directory "$TESTTMP/scribe_logs" \
-    --tls-ca "$TEST_CERTDIR/root-ca.crt" \
-    --tls-private-key "$TEST_CERTDIR/localhost.key" \
-    --tls-certificate "$TEST_CERTDIR/localhost.crt" \
-    --tls-ticket-seeds "$TEST_CERTDIR/server.pem.seeds" \
-    --land-service-client-cert="$TEST_CERTDIR/proxy.crt" \
-    --land-service-client-private-key="$TEST_CERTDIR/proxy.key" \
-    --debug \
-    --listening-host-port "$BIND_ADDR" \
-    --bound-address-file "$MONONOKE_SERVER_ADDR_FILE" \
-    --mononoke-config-path "$TESTTMP/mononoke-config" \
-    --no-default-scuba-dataset \
-    "${CACHE_ARGS[@]}" \
-    "${COMMON_ARGS[@]}" >> "$TESTTMP/mononoke.out" 2>&1 &
-  export MONONOKE_PID=$!
-  echo "$MONONOKE_PID" >> "$DAEMON_PIDS"
+  python_fn mononoke "$@"
 }
 
 function mononoke_hg_sync {
@@ -437,14 +329,6 @@ function mononoke_hg_sync_loop_regenerate {
     ssh://user@dummy/"$repo" sync-loop --start-id "$start_id" "$@"
 }
 
-function mononoke_admin {
-  GLOG_minloglevel=5 "$MONONOKE_ADMIN" \
-    "${CACHE_ARGS[@]}" \
-    "${COMMON_ARGS[@]}" \
-    --repo-id $REPOID \
-    --mononoke-config-path "$TESTTMP"/mononoke-config "$@"
-}
-
 function mononoke_newadmin {
   GLOG_minloglevel=5 "$MONONOKE_NEWADMIN" \
     "${CACHE_ARGS[@]}" \
@@ -481,23 +365,10 @@ function repo_metadata_logger {
     --mononoke-config-path "$TESTTMP"/mononoke-config "$@"
 }
 
-function mononoke_admin_source_target {
-  local source_repo_id=$1
-  shift
-  local target_repo_id=$1
-  shift
-  GLOG_minloglevel=5 "$MONONOKE_ADMIN" \
-    "${CACHE_ARGS[@]}" \
-    "${COMMON_ARGS[@]}" \
-    --source-repo-id "$source_repo_id" \
-    --target-repo-id "$target_repo_id" \
-    --mononoke-config-path "$TESTTMP"/mononoke-config "$@"
-}
-
 # Remove the glog prefix
 function strip_glog {
   # based on https://our.internmc.facebook.com/intern/wiki/LogKnock/Log_formats/#regex-for-glog
-  sed -E -e 's%^[VDIWECF][[:digit:]]{4} [[:digit:]]{2}:?[[:digit:]]{2}:?[[:digit:]]{2}(\.[[:digit:]]+)?\s+(([0-9a-f]+)\s+)?(\[([^]]+)\]\s+)?(\(([^\)]+)\)\s+)?(([a-zA-Z0-9_./-]+):([[:digit:]]+))\]\s+%%' \
+  sed -E -e 's%^[VDIWECFT][[:digit:]]{4} [[:digit:]]{2}:?[[:digit:]]{2}:?[[:digit:]]{2}(\.[[:digit:]]+)?\s+(([0-9a-f]+)\s+)?(\[([^]]+)\]\s+)?(\(([^\)]+)\)\s+)?(([a-zA-Z0-9_./-]+):([[:digit:]]+))\]\s+%%' \
   | grep -v "ODS3 SDK has dropped some samples." || true
 }
 
@@ -526,6 +397,7 @@ function wait_for_json_record_count {
 }
 
 function wait_for_server {
+  # TODO: Delete the shell version of this function once we can totally replace it with the Python version
   local service_description port_env_var log_file timeout_secs bound_addr_file
   service_description="$1"; shift
   port_env_var="$1"; shift
@@ -563,25 +435,12 @@ function wait_for_server {
 }
 
 function mononoke_health {
-  sslcurl -q "https://localhost:$MONONOKE_SOCKET/health_check"
+  python_fn mononoke_health "$@"
 }
 
 # Wait until a Mononoke server is available for this repo.
 function wait_for_mononoke {
-  export MONONOKE_SOCKET
-  wait_for_server "Mononoke" MONONOKE_SOCKET "$TESTTMP/mononoke.out" \
-    "${MONONOKE_START_TIMEOUT:-"$MONONOKE_DEFAULT_START_TIMEOUT"}" "$MONONOKE_SERVER_ADDR_FILE" \
-    mononoke_health
-
-  # Now that we have started, write out a Sapling "mono" scheme that references our current IP/port,
-  # and configure the SLAPI URL.
-  cat >> "$HGRCPATH" <<EOF
-[schemes]
-mono=mononoke://$(mononoke_address)/{1}
-
-[edenapi]
-url=https://localhost:$MONONOKE_SOCKET/edenapi/
-EOF
+  python_fn wait_for_mononoke "$@"
 }
 
 function flush_mononoke_bookmarks {
@@ -623,70 +482,13 @@ function wait_for_mononoke_cache_warmup {
 }
 
 function setup_common_hg_configs {
-  cat >> "$HGRCPATH" <<EOF
-[ui]
-ssh="$DUMMYSSH"
-
-[devel]
-segmented-changelog-rev-compat=True
-
-[extensions]
-commitextras=
-remotenames=
-smartlog=
-clienttelemetry=
-
-[remotefilelog]
-cachepath=$TESTTMP/cachepath
-shallowtrees=True
-
-[hint]
-ack=*
-
-[experimental]
-changegroup3=True
-
-[mutation]
-record=False
-
-[web]
-cacerts=$TEST_CERTDIR/root-ca.crt
-
-[auth]
-mononoke.prefix=*
-mononoke.schemes=https mononoke
-mononoke.cert=$TEST_CERTDIR/${OVERRIDE_CLIENT_CERT:-client0}.crt
-mononoke.key=$TEST_CERTDIR/${OVERRIDE_CLIENT_CERT:-client0}.key
-mononoke.cn=localhost
-
-[checkout]
-use-rust=false
-
-[workingcopy]
-rust-checkout=false
-
-[schemes]
-hg=ssh://user@dummy/{1}
-
-[cas]
-use-case=source-control-testing
-log-dir=$TESTTMP
-EOF
-
-  # Only set the dummy ssh "mono" scheme the first time. If we are called again after
-  # Mononoke starts, we don't want to override the scheme.
-  if ! hg config schemes.mono > /dev/null; then
-    cat >> "$HGRCPATH" <<EOF
-[schemes]
-mono=ssh://user@dummy/{1}
-EOF
-  fi
+  python_fn setup_common_hg_configs "$@"
 }
 
 function setup_common_config {
-    setup_mononoke_config "$@"
-    setup_common_hg_configs
-    setup_configerator_configs
+    python_fn setup_common_config "$@"
+    # TODO: get rid of the cd once python_fn can properly switch cd
+    cd "$TESTTMP/mononoke-config" || exit 1
 }
 
 function get_bonsai_svnrev_mapping {
@@ -713,196 +515,33 @@ function set_bonsai_globalrev_mapping {
 }
 
 function set_mononoke_as_source_of_truth_for_git {
-  sqlite3 "$TESTTMP/monsql/sqlite_dbs" "REPLACE INTO git_repositories_source_of_truth (repo_id, repo_name, source_of_truth) VALUES (${REPO_ID:-0}, '${REPONAME}', 'mononoke')"
+  REPO_NAME_HEX=$(echo -n "${REPONAME}" | xxd -p)
+  sqlite3 "$TESTTMP/monsql/sqlite_dbs" "REPLACE INTO git_repositories_source_of_truth (repo_id, repo_name, source_of_truth) VALUES (${REPO_ID:-0}, X'${REPO_NAME_HEX}', 'mononoke')"
 }
 
 function setup_mononoke_config {
-  cd "$TESTTMP" || exit
-
-  mkdir -p mononoke-config
-  REPOTYPE="blob_sqlite"
-  if [[ $# -gt 0 ]]; then
-    REPOTYPE="$1"
-    shift
-  fi
-  local blobstorename=blobstore
-  if [[ $# -gt 0 ]]; then
-    blobstorename="$1"
-    shift
-  fi
-
-  cd mononoke-config || exit 1
-  mkdir -p common
-  touch common/common.toml
-  touch common/commitsyncmap.toml
-
-  # We have some tests that call this twice...
-  truncate -s 0 common/common.toml
-
-  if [[ -n "$SCUBA_CENSORED_LOGGING_PATH" ]]; then
-  cat > common/common.toml <<CONFIG
-scuba_local_path_censored="$SCUBA_CENSORED_LOGGING_PATH"
-CONFIG
-  fi
-
-  if [[ -z "$DISABLE_HTTP_CONTROL_API" ]]; then
-  cat >> common/common.toml <<CONFIG
-enable_http_control_api=true
-CONFIG
-  fi
-
-  cat >> common/common.toml <<CONFIG
-[async_requests_config]
-db_config = { local = { local_db_path="$TESTTMP/monsql" } }
-blobstore_config = { blob_files = { path = "$TESTTMP/async_requests.blobstore" } }
-
-[internal_identity]
-identity_type = "SERVICE_IDENTITY"
-identity_data = "proxy"
-
-[redaction_config]
-blobstore = "$blobstorename"
-darkstorm_blobstore = "$blobstorename"
-redaction_sets_location = "scm/mononoke/redaction/redaction_sets"
-
-[[trusted_parties_allowlist]]
-identity_type = "$PROXY_ID_TYPE"
-identity_data = "$PROXY_ID_DATA"
-CONFIG
-
-  cat >> common/common.toml <<CONFIG
-${ADDITIONAL_MONONOKE_COMMON_CONFIG}
-CONFIG
-
-  echo "# Start new config" > common/storage.toml
-  setup_mononoke_storage_config "$REPOTYPE" "$blobstorename"
-
-  setup_mononoke_repo_config "$REPONAME" "$blobstorename"
-
-  setup_acls
+  python_fn setup_mononoke_config "$@"
+  cd "$TESTTMP/mononoke-config" || exit 1
 }
 
 function setup_acls() {
-  if [[ ! -f "$ACL_FILE" ]]; then
-    cat > "$ACL_FILE" <<ACLS
-{
-  "repos": {
-    "default": {
-      "actions": {
-        "read": ["$CLIENT0_ID_TYPE:$CLIENT0_ID_DATA"],
-        "write": ["$CLIENT0_ID_TYPE:$CLIENT0_ID_DATA"]
-      }
-    }
-  }
-}
-ACLS
-  fi
+  python_fn setup_acls "$@"
 }
 
 function db_config() {
-  local blobstorename="$1"
-  if [[ -n "$DB_SHARD_NAME" ]]; then
-    echo "[$blobstorename.metadata.remote]"
-    echo "primary = { db_address = \"$DB_SHARD_NAME\" }"
-    echo "filenodes = { unsharded = { db_address = \"$DB_SHARD_NAME\" } }"
-    echo "mutation = { db_address = \"$DB_SHARD_NAME\" }"
-    echo "commit_cloud = { db_address = \"$DB_SHARD_NAME\" }"
-  else
-    echo "[$blobstorename.metadata.local]"
-    echo "local_db_path = \"$TESTTMP/monsql\""
-  fi
+  python_fn db_config "$@"
 }
 
 function ephemeral_db_config() {
-  local blobstorename="$1"
-  if [[ -n "$DB_SHARD_NAME" ]]; then
-    echo "[$blobstorename.metadata.remote]"
-    echo "db_address = \"$DB_SHARD_NAME\""
-  else
-    echo "[$blobstorename.metadata.local]"
-    echo "local_db_path = \"$TESTTMP/monsql\""
-  fi
+  python_fn ephemeral_db_config "$@"
 }
 
 function blobstore_db_config() {
-  if [[ -n "$DB_SHARD_NAME" ]]; then
-    echo "queue_db = { unsharded = { db_address = \"$DB_SHARD_NAME\" } }"
-  else
-    local blobstore_db_path="$TESTTMP/blobstore_sync_queue"
-    mkdir -p "$blobstore_db_path"
-    echo "queue_db = { local = { local_db_path = \"$blobstore_db_path\" } }"
-  fi
+  python_fn blobstore_db_config
 }
 
 function setup_mononoke_storage_config {
-  local underlyingstorage="$1"
-  local blobstorename="$2"
-  local blobstorepath="$TESTTMP/$blobstorename"
-  local bubble_deletion_mode=0 # Bubble deletion is disabled by default
-  if [[ -n ${BUBBLE_DELETION_MODE:-} ]]; then
-    bubble_deletion_mode=${BUBBLE_DELETION_MODE}
-  fi
-  local bubble_lifespan_secs=1000
-  if [[ -n ${BUBBLE_LIFESPAN_SECS:-} ]]; then
-    bubble_lifespan_secs=${BUBBLE_LIFESPAN_SECS}
-  fi
-  local bubble_expiration_secs=1000
-  if [[ -n ${BUBBLE_EXPIRATION_SECS:-} ]]; then
-    bubble_expiration_secs=${BUBBLE_EXPIRATION_SECS}
-  fi
-
-  if [[ -n "${MULTIPLEXED:-}" ]]; then
-    local quorum
-    local btype
-    local scuba
-    quorum="write_quorum"
-    btype="multiplexed_wal"
-    scuba="multiplex_scuba_table = \"file://$TESTTMP/blobstore_trace_scuba.json\""
-    cat >> common/storage.toml <<CONFIG
-$(db_config "$blobstorename")
-
-[$blobstorename.blobstore.${btype}]
-multiplex_id = 1
-$(blobstore_db_config)
-${quorum} = ${MULTIPLEXED}
-${scuba}
-components = [
-CONFIG
-
-    local i
-    for ((i=0; i<=MULTIPLEXED; i++)); do
-      mkdir -p "$blobstorepath/$i/blobs"
-      if [[ -n "${PACK_BLOB:-}" && $i -le "$PACK_BLOB" ]]; then
-        echo "  { blobstore_id = $i, blobstore = { pack = { blobstore = { $underlyingstorage = { path = \"$blobstorepath/$i\" } } } } }," >> common/storage.toml
-      else
-        echo "  { blobstore_id = $i, blobstore = { $underlyingstorage = { path = \"$blobstorepath/$i\" } } }," >> common/storage.toml
-      fi
-    done
-    echo ']' >> common/storage.toml
-  else
-    mkdir -p "$blobstorepath/blobs"
-    # Using FileBlob instead of SqlBlob as the backing blobstore for ephemeral
-    # store since SqlBlob current doesn't support enumeration.
-    cat >> common/storage.toml <<CONFIG
-$(db_config "$blobstorename")
-
-[$blobstorename.ephemeral_blobstore]
-initial_bubble_lifespan_secs = $bubble_lifespan_secs
-bubble_expiration_grace_secs = $bubble_expiration_secs
-bubble_deletion_mode = $bubble_deletion_mode
-blobstore = { blob_files = { path = "$blobstorepath" } }
-
-$(ephemeral_db_config "$blobstorename.ephemeral_blobstore")
-
-
-[$blobstorename.blobstore]
-CONFIG
-    if [[ -n "${PACK_BLOB:-}" ]]; then
-      echo "  pack = { blobstore = { $underlyingstorage = { path = \"$blobstorepath\" } } }" >> common/storage.toml
-    else
-      echo "  $underlyingstorage = { path = \"$blobstorepath\" }" >> common/storage.toml
-    fi
-  fi
+  python_fn setup_mononoke_storage_config "$@"
 }
 
 function setup_commitsyncmap {
@@ -910,483 +549,18 @@ function setup_commitsyncmap {
 }
 
 function setup_configerator_configs {
-  export RATE_LIMIT_CONF
-  RATE_LIMIT_CONF="${LOCAL_CONFIGERATOR_PATH}/scm/mononoke/ratelimiting"
-  mkdir -p "$RATE_LIMIT_CONF"
-
-  if [[ ! -f "$RATE_LIMIT_CONF/ratelimits" ]]; then
-    cat >> "$RATE_LIMIT_CONF/ratelimits" <<EOF
-{
-  "rate_limits": [],
-  "load_shed_limits": [],
-  "datacenter_prefix_capacity": {},
-  "commits_per_author": {
-    "status": 0,
-    "limit": 300,
-    "window": 1800
-  },
-  "total_file_changes": {
-    "status": 0,
-    "limit": 80000,
-    "window": 5
-  }
-}
-EOF
-  fi
-
-  COMMIT_SYNC_CONF="${LOCAL_CONFIGERATOR_PATH}/scm/mononoke/repos/commitsyncmaps"
-  mkdir -p "$COMMIT_SYNC_CONF"
-  export COMMIT_SYNC_CONF
-  if [[ -n $SKIP_CROSS_REPO_CONFIG ]]; then
-    cat > "$COMMIT_SYNC_CONF/all" <<EOF
-{
-}
-EOF
-    cat > "$COMMIT_SYNC_CONF/current" <<EOF
-{
-}
-EOF
-  else
-    if [[ ! -f "$COMMIT_SYNC_CONF/all" ]]; then
-      cp "$TEST_FIXTURES/commitsync/all.json" "$COMMIT_SYNC_CONF/all"
-    fi
-    if [[ ! -f "$COMMIT_SYNC_CONF/current" ]]; then
-      cp "$TEST_FIXTURES/commitsync/current.json" "$COMMIT_SYNC_CONF/current"
-    fi
-  fi
-
-  export XDB_GC_CONF
-  XDB_GC_CONF="${LOCAL_CONFIGERATOR_PATH}/scm/mononoke/xdb_gc"
-  mkdir -p "$XDB_GC_CONF"
-  if [[ ! -f "$XDB_GC_CONF/default" ]]; then
-    cat >> "$XDB_GC_CONF/default" <<EOF
-{
-  "put_generation": 2,
-  "mark_generation": 1,
-  "delete_generation": 0
-}
-EOF
-  fi
-
-  export OBSERVABILITY_CONF
-  OBSERVABILITY_CONF="${LOCAL_CONFIGERATOR_PATH}/scm/mononoke/observability"
-  mkdir -p "$OBSERVABILITY_CONF"
-  if [[ ! -f "$OBSERVABILITY_CONF/observability_config" ]]; then
-  cat >> "$OBSERVABILITY_CONF/observability_config" <<EOF
-{
-  "slog_config": {
-    "level": 4
-  },
-  "scuba_config": {
-    "level": 1,
-    "verbose_sessions": [],
-    "verbose_unixnames": [],
-    "verbose_source_hostnames": []
-  }
-}
-EOF
-  fi
-
-  export REDACTION_CONF
-  REDACTION_CONF="${LOCAL_CONFIGERATOR_PATH}/scm/mononoke/redaction"
-  mkdir -p "$REDACTION_CONF"
-
-  if [[ ! -f "$REDACTION_CONF/redaction_sets" ]]; then
-    cat >> "$REDACTION_CONF/redaction_sets" <<EOF
-{
-  "all_redactions": []
-}
-EOF
-  fi
-
-
-  export REPLICATION_LAG_CONF
-  REPLICATION_LAG_CONF="${LOCAL_CONFIGERATOR_PATH}/scm/mononoke/mysql/replication_lag/config"
-  mkdir -p "$REPLICATION_LAG_CONF"
-  for CONF in "healer" "derived_data_backfiller" "derived_data_tailer"; do
-    if [[ ! -f "$REPLICATION_LAG_CONF/$CONF" ]]; then
-      cat >> "$REPLICATION_LAG_CONF/$CONF" <<EOF
- {
- }
-EOF
-    fi
-  done
+  python_fn setup_configerator_configs "$@"
 }
 
 function setup_mononoke_repo_config {
+  # TODO: get rid of the cd once python_fn can properly switch cd
   cd "$TESTTMP/mononoke-config" || exit
-  local reponame="$1"
-  local reponame_urlencoded
-  reponame_urlencoded="$(urlencode encode "$reponame")"
-  everstore_local_path="$TESTTMP/everstore_${reponame_urlencoded}"
-  local storageconfig="$2"
-  mkdir -p "repos/$reponame_urlencoded"
-  mkdir -p "repo_definitions/$reponame_urlencoded"
-  mkdir -p "$TESTTMP/monsql"
-  mkdir -p "$everstore_local_path"
-  cat > "repos/$reponame_urlencoded/server.toml" <<CONFIG
-hash_validation_percentage=100
-everstore_local_path="$everstore_local_path"
-CONFIG
 
-  cat > "repo_definitions/$reponame_urlencoded/server.toml" <<CONFIG
-repo_id=$REPOID
-repo_name="$reponame"
-repo_config="$reponame"
-enabled=${ENABLED:-true}
-hipster_acl="${ACL_NAME:-default}"
-CONFIG
-
-
-if [[ -n "${READ_ONLY_REPO:-}" ]]; then
-  cat >> "repo_definitions/$reponame_urlencoded/server.toml" <<CONFIG
-readonly=true
-CONFIG
-fi
-
-if [[ -n "${COMMIT_IDENTITY_SCHEME:-}" ]]; then
-  cat >> "repo_definitions/$reponame_urlencoded/server.toml" <<CONFIG
-default_commit_identity_scheme=$COMMIT_IDENTITY_SCHEME
-CONFIG
-fi
-
-if [[ -n "${SCUBA_LOGGING_PATH:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-scuba_local_path="$SCUBA_LOGGING_PATH"
-CONFIG
-fi
-
-if [[ -n "${HOOKS_SCUBA_LOGGING_PATH:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-scuba_table_hooks="file://$HOOKS_SCUBA_LOGGING_PATH"
-CONFIG
-fi
-
-if [[ -n "${ENFORCE_LFS_ACL_CHECK:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-enforce_lfs_acl_check=true
-CONFIG
-fi
-
-if [[ -n "${REPO_CLIENT_USE_WARM_BOOKMARKS_CACHE:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-repo_client_use_warm_bookmarks_cache=true
-CONFIG
-fi
-
-if [ "$GIT_LFS_INTERPRET_POINTERS" == "1" ]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-git_configs.git_lfs_interpret_pointers = true
-CONFIG
-fi
-
-# Normally point to common storageconfig, but if none passed, create per-repo
-if [[ -z "$storageconfig" ]]; then
-  storageconfig="blobstore_$reponame_urlencoded"
-  setup_mononoke_storage_config "$REPOTYPE" "$storageconfig"
-fi
-cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-storage_config = "$storageconfig"
-
-CONFIG
-
-if [[ -n "${FILESTORE:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[filestore]
-chunk_size = ${FILESTORE_CHUNK_SIZE:-10}
-concurrency = 24
-CONFIG
-fi
-
-if [[ -n "${REDACTION_DISABLED:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-redaction=false
-CONFIG
-fi
-
-if [[ -n "${LIST_KEYS_PATTERNS_MAX:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-list_keys_patterns_max=$LIST_KEYS_PATTERNS_MAX
-CONFIG
-fi
-
-if [[ -n "${ONLY_FAST_FORWARD_BOOKMARK:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[[bookmarks]]
-name="$ONLY_FAST_FORWARD_BOOKMARK"
-only_fast_forward=true
-CONFIG
-fi
-
-if [[ -n "${ONLY_FAST_FORWARD_BOOKMARK_REGEX:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[[bookmarks]]
-regex="$ONLY_FAST_FORWARD_BOOKMARK_REGEX"
-only_fast_forward=true
-CONFIG
-fi
-
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[metadata_logger_config]
-bookmarks=["master"]
-CONFIG
-
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[mononoke_cas_sync_config]
-main_bookmark_to_sync="master"
-sync_all_bookmarks=true
-CONFIG
-
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[commit_cloud_config]
-mocked_employees=["myusername0@fb.com","anotheruser@fb.com"]
-disable_interngraph_notification=true
-CONFIG
-
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[pushrebase]
-forbid_p2_root_rebases=false
-CONFIG
-
-if [[ -n "${ALLOW_CASEFOLDING:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-casefolding_check=false
-CONFIG
-fi
-
-if [[ -n "${BLOCK_MERGES:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-block_merges=true
-CONFIG
-fi
-
-if [[ -n "${PUSHREBASE_REWRITE_DATES:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-rewritedates=true
-CONFIG
-else
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-rewritedates=false
-CONFIG
-fi
-
-if [[ -n "${EMIT_OBSMARKERS:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-emit_obsmarkers=true
-CONFIG
-fi
-
-if [[ -n "${GLOBALREVS_PUBLISHING_BOOKMARK:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-globalrevs_publishing_bookmark = "${GLOBALREVS_PUBLISHING_BOOKMARK}"
-CONFIG
-fi
-
-if [[ -n "${GLOBALREVS_SMALL_REPO_ID:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-globalrevs_small_repo_id = ${GLOBALREVS_SMALL_REPO_ID}
-CONFIG
-fi
-
-if [[ -n "${POPULATE_GIT_MAPPING:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-populate_git_mapping=true
-CONFIG
-fi
-
-if [[ -n "${ALLOW_CHANGE_XREPO_MAPPING_EXTRA:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-allow_change_xrepo_mapping_extra=true
-CONFIG
-fi
-
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-
-[hook_manager_params]
-disable_acl_checker=true
-CONFIG
-
-if [[ -n "${DISALLOW_NON_PUSHREBASE:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[push]
-pure_push_allowed = false
-CONFIG
-else
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[push]
-pure_push_allowed = true
-CONFIG
-fi
-
-if [[ -n "${UNBUNDLE_COMMIT_LIMIT}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-unbundle_commit_limit = ${UNBUNDLE_COMMIT_LIMIT}
-CONFIG
-fi
-
-if [[ -n "${CACHE_WARMUP_BOOKMARK:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[cache_warmup]
-bookmark="$CACHE_WARMUP_BOOKMARK"
-CONFIG
-
-  if [[ -n "${CACHE_WARMUP_MICROWAVE:-}" ]]; then
-    cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-microwave_preload = true
-CONFIG
-  fi
-fi
-
-
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[lfs]
-CONFIG
-if [[ -n "${LFS_THRESHOLD:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-threshold=$LFS_THRESHOLD
-rollout_percentage=${LFS_ROLLOUT_PERCENTAGE:-100}
-generate_lfs_blob_in_hg_sync_job=${LFS_BLOB_HG_SYNC_JOB:-true}
-CONFIG
-fi
-if [[ -n "${LFS_USE_UPSTREAM:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-use_upstream_lfs_server = true
-CONFIG
-fi
-
-write_infinitepush_config "$reponame"
-
-cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-  [derived_data_config]
-  enabled_config_name = "default"
-  scuba_table = "file://$TESTTMP/derived_data_scuba.json"
-CONFIG
-
-if [[ -n "${ENABLED_DERIVED_DATA:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[derived_data_config.available_configs.default]
-types = $ENABLED_DERIVED_DATA
-git_delta_manifest_version = 2
-git_delta_manifest_v2_config.max_inlined_object_size = 20
-git_delta_manifest_v2_config.max_inlined_delta_size = 20
-git_delta_manifest_v2_config.delta_chunk_size = 1000
-CONFIG
-else
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[derived_data_config.available_configs.default]
-types=[
-  "blame",
-  "changeset_info",
-  "deleted_manifest",
-  "fastlog",
-  "filenodes",
-  "fsnodes",
-  "git_commits",
-  "git_delta_manifests_v2",
-  "git_trees",
-  "unodes",
-  "hgchangesets",
-  "hg_augmented_manifests",
-  "skeleton_manifests",
-  "skeleton_manifests_v2",
-  "bssm_v3",
-  "ccsm",
-  "test_manifests",
-  "test_sharded_manifests"
-]
-git_delta_manifest_version = 2
-git_delta_manifest_v2_config.max_inlined_object_size = 20
-git_delta_manifest_v2_config.max_inlined_delta_size = 20
-git_delta_manifest_v2_config.delta_chunk_size = 1000
-CONFIG
-fi
-
-if [[ -n "${OTHER_DERIVED_DATA:-}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[derived_data_config.available_configs.other]
-types = $OTHER_DERIVED_DATA
-CONFIG
-fi
-
-if [[ -n "${BLAME_VERSION}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-blame_version = $BLAME_VERSION
-CONFIG
-fi
-
-if [[ -n "${HG_SET_COMMITTER_EXTRA}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-hg_set_committer_extra = true
-CONFIG
-fi
-
-if [[ -n "${BACKUP_FROM:-}" ]]; then
-  cat >> "repo_definitions/$reponame_urlencoded/server.toml" <<CONFIG
-backup_source_repo_name="$BACKUP_FROM"
-CONFIG
-fi
-
-cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[source_control_service]
-permit_writes = ${SCS_PERMIT_WRITES:-true}
-permit_service_writes = ${SCS_PERMIT_SERVICE_WRITES:-true}
-permit_commits_without_parents = ${SCS_PERMIT_COMMITS_WITHOUT_PARENTS:-true}
-CONFIG
-
-if [[ -n "${SPARSE_PROFILES_LOCATION}" ]]; then
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[sparse_profiles_config]
-sparse_profiles_location="$SPARSE_PROFILES_LOCATION"
-CONFIG
-fi
-
-if [[ -n "${COMMIT_SCRIBE_CATEGORY:-${BOOKMARK_SCRIBE_CATEGORY:-}}" ]]; then
-  cat >> "repos/$reponame/server.toml" <<CONFIG
-[update_logging_config]
-CONFIG
-fi
-
-if [[ -n "${BOOKMARK_SCRIBE_CATEGORY:-}" ]]; then
-  cat >> "repos/$reponame/server.toml" <<CONFIG
-bookmark_logging_destination = { scribe = { scribe_category = "$BOOKMARK_SCRIBE_CATEGORY" } }
-CONFIG
-fi
-if [[ -n "${COMMIT_SCRIBE_CATEGORY:-}" ]]; then
-    cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-new_commit_logging_destination = { scribe = { scribe_category = "$COMMIT_SCRIBE_CATEGORY" } }
-CONFIG
-fi
-
-cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-  [zelos_config]
-  local_zelos_port = $ZELOS_PORT
-CONFIG
-
-
+  python_fn setup_mononoke_repo_config "$@"
 }
 
 function write_infinitepush_config {
-  local reponame="$1"
-  local reponame_urlencoded
-  reponame_urlencoded=$(urlencode encode "$reponame")
-
-  cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-[infinitepush]
-CONFIG
-
-  if [[ -n "${INFINITEPUSH_ALLOW_WRITES:-}" ]] || \
-     [[ -n "${INFINITEPUSH_NAMESPACE_REGEX:-}" ]];
-  then
-    namespace=""
-    if [[ -n "${INFINITEPUSH_NAMESPACE_REGEX:-}" ]]; then
-      namespace="namespace_pattern=\"$INFINITEPUSH_NAMESPACE_REGEX\""
-    fi
-
-    cat >> "repos/$reponame_urlencoded/server.toml" <<CONFIG
-allow_writes = ${INFINITEPUSH_ALLOW_WRITES:-true}
-${namespace}
-CONFIG
-  fi
+  python_fn write_infinitepush_config "$@"
 }
 
 function register_hook {
@@ -1488,6 +662,12 @@ function scs {
     mkdir "$SCRIBE_LOGS_DIR"
   fi
 
+  # Disable bookmark cache unless test opts in with ENABLE_BOOKMARK_CACHE=1.
+  local BOOKMARK_CACHE_FLAG
+  if [ -z "$ENABLE_BOOKMARK_CACHE" ]; then
+    BOOKMARK_CACHE_FLAG="--disable-bookmark-cache-warming"
+  fi
+
   rm -f "$TESTTMP/scs_server_addr.txt"
   GLOG_minloglevel=5 \
     THRIFT_TLS_SRV_CERT="$TEST_CERTDIR/localhost.crt" \
@@ -1503,6 +683,7 @@ function scs {
     --mononoke-config-path "$TESTTMP/mononoke-config" \
     --bound-address-file "$TESTTMP/scs_server_addr.txt" \
     --scribe-logging-directory "$TESTTMP/scribe_logs" \
+    $BOOKMARK_CACHE_FLAG \
     "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" >> "$TESTTMP/scs_server.out" 2>&1 &
   export SCS_SERVER_PID=$!
@@ -2137,7 +1318,7 @@ function crossrepo_verify_bookmarks() {
   shift
   large_repo_id="$1"
   shift
-  mononoke_admin_source_target "$small_repo_id" "$large_repo_id" crossrepo verify-bookmarks "$@"
+  mononoke_newadmin cross-repo --source-repo-id "$small_repo_id" --target-repo-id "$large_repo_id" verify-bookmarks "$@"
 }
 
 function read_blobstore_wal_queue_size() {
@@ -2222,6 +1403,30 @@ pushrebase =
 EOF
 }
 
+function default_setup_drawdag() {
+  setup_common_config "$BLOB_TYPE"
+
+  testtool_drawdag -R repo --derive-all <<EOF
+C
+|
+B
+|
+A
+# bookmark: C "${MASTER_BOOKMARK:-master_bookmark}"
+EOF
+
+  start_and_wait_for_mononoke_server "$@"
+  hg clone -q "mono:repo" "$REPONAME" --noupdate
+  cd $REPONAME || exit 1
+  cat >> .hg/hgrc <<EOF
+[ui]
+ssh ="$DUMMYSSH"
+[extensions]
+amend =
+pushrebase =
+EOF
+}
+
 function gitexport() {
   log="$TESTTMP/gitexport.out"
 
@@ -2275,7 +1480,7 @@ function git() {
   GIT_AUTHOR_DATE="${GIT_AUTHOR_DATE:-$date}" \
   GIT_AUTHOR_NAME="$name" \
   GIT_AUTHOR_EMAIL="$email" \
-  command git -c init.defaultBranch=master -c protocol.file.allow=always "$@"
+  command git -c init.defaultBranch=master_bookmark -c protocol.file.allow=always "$@"
 }
 
 function git_set_only_author() {
@@ -2286,7 +1491,7 @@ function git_set_only_author() {
   GIT_AUTHOR_DATE="$date" \
   GIT_AUTHOR_NAME="$name" \
   GIT_AUTHOR_EMAIL="$email" \
-  command git -c init.defaultBranch=master -c protocol.file.allow=always "$@"
+  command git -c init.defaultBranch=master_bookmark -c protocol.file.allow=always "$@"
 }
 
 function summarize_scuba_json() {
@@ -2479,7 +1684,7 @@ function derived_data_service() {
   THRIFT_TLS_SRV_KEY="$TEST_CERTDIR/localhost.key" \
   THRIFT_TLS_CL_CA_PATH="$TEST_CERTDIR/root-ca.crt" \
   THRIFT_TLS_TICKETS="$TEST_CERTDIR/server.pem.seeds" \
-  GLOG_minloglevel=1 "$DERIVED_DATA_SERVICE" "$@" \
+  GLOG_minloglevel=5 "$DERIVED_DATA_SERVICE" "$@" \
     -p 0 \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
     --bound-address-file "$DDS_SERVER_ADDR_FILE" \
@@ -2592,4 +1797,23 @@ EOF
 
 function async_requests_clear_queue() {
   sqlite3 "$TESTTMP/monsql/sqlite_dbs" 'delete from long_running_request_queue;'
+}
+
+# Wait for bookmark to move to a commit with a certain title
+function wait_for_bookmark_move_to_commit {
+  local commit_title=$1
+  local repo=$2
+  local bookmark=${3-master_bookmark}
+
+
+
+  local attempts=150
+  for _ in $(seq 1 $attempts); do
+    mononoke_newadmin fetch -R "$repo" -B "$bookmark" | rg -q "$commit_title" && return
+    sleep 0.1
+  done
+
+  echo "bookmark didn't move to commit $commit_title" >&2
+  exit 1
+
 }

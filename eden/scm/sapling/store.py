@@ -20,7 +20,6 @@ import bindings
 parsers = bindings.cext.parsers
 
 from . import error, pycompat, util, vfs as vfsmod
-from .i18n import _
 from .pycompat import decodeutf8, encodeutf8, inttobyte, range
 
 
@@ -366,7 +365,7 @@ class metavfs(util.proxy_wrapper, vfsmod.abstractvfs):
         return self.inner(path, mode, *args, **kw)
 
     def join(self, path: "Optional[str]", *insidef: str) -> str:
-        return self.inner.join(path)
+        return self.inner.join(path, *insidef)
 
 
 class readablestream:

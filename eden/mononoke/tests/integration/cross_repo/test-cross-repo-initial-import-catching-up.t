@@ -92,7 +92,7 @@ Create small repo commits
   
   
   
-  Running mononoke_admin to verify mapping
+  Running mononoke_newadmin to verify mapping
   
   RewrittenAs([(ChangesetId(Blake2(2999dcf517994fe94506b62e5a9c54f851abd4c4964f98fdd701c013abd9c0c3)), CommitSyncConfigVersion("INITIAL_IMPORT_SYNC_CONFIG"))])
   
@@ -148,7 +148,6 @@ Add more commits to small repo
   X Repo Sync execution finished from small repo small_repo to large repo large_repo
 
   $ clone_and_log_large_repo "ccfdf094e4710a77de7b36c4324fa7ee64dafba4067726e383db62273553466b"
-  abort: destination 'large_repo' is not empty
   o  71fdac6141e7 D
   │   smallrepofolder1/bar/c.txt |  2 +-
   │   1 files changed, 1 insertions(+), 1 deletions(-)
@@ -173,7 +172,7 @@ Add more commits to small repo
   
   
   
-  Running mononoke_admin to verify mapping
+  Running mononoke_newadmin to verify mapping
   
   RewrittenAs([(ChangesetId(Blake2(d2ba11302a912b679610fd60d7e56dd8f01372c130faa3ae72816d5568b25f3a)), CommitSyncConfigVersion("INITIAL_IMPORT_SYNC_CONFIG"))])
   

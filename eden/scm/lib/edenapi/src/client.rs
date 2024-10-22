@@ -11,6 +11,8 @@ use std::fmt::Debug;
 use std::fs::create_dir_all;
 use std::future::ready;
 use std::num::NonZeroU64;
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -120,6 +122,7 @@ use metrics::Counter;
 use metrics::EntranceGuard;
 use minibytes::Bytes as RawBytes;
 use minibytes::Bytes;
+use once_cell::sync::Lazy;
 use parking_lot::Once;
 use progress_model::AggregatingProgressBar;
 use progress_model::ProgressBar;
@@ -152,36 +155,14 @@ const MAX_ERROR_MSG_LEN: usize = 500;
 static REQUESTS_INFLIGHT: Counter = Counter::new_counter("edenapi.req_inflight");
 static FILES_ATTRS_INFLIGHT: Counter = Counter::new_counter("edenapi.files_attrs_inflight");
 
+pub static RECENT_DOGFOODING_REQUESTS: Lazy<ExpiringBool> =
+    Lazy::new(|| ExpiringBool::new(Duration::from_secs(5)));
+
 mod paths {
-    pub const HEALTH_CHECK: &str = "health_check";
-    pub const FILES2: &str = "files2";
-    pub const HISTORY: &str = "history";
-    pub const TREES: &str = "trees";
-    pub const COMMIT_REVLOG_DATA: &str = "commit/revlog_data";
-    pub const CLONE_DATA: &str = "clone";
-    pub const PULL_FAST_FORWARD: &str = "pull_fast_forward_master";
-    pub const PULL_LAZY: &str = "pull_lazy";
-    pub const COMMIT_LOCATION_TO_HASH: &str = "commit/location_to_hash";
-    pub const COMMIT_HASH_TO_LOCATION: &str = "commit/hash_to_location";
-    pub const COMMIT_HASH_LOOKUP: &str = "commit/hash_lookup";
-    pub const COMMIT_GRAPH_V2: &str = "commit/graph_v2";
-    pub const COMMIT_GRAPH_SEGMENTS: &str = "commit/graph_segments";
-    pub const COMMIT_MUTATIONS: &str = "commit/mutations";
-    pub const COMMIT_TRANSLATE_ID: &str = "commit/translate_id";
-    pub const BOOKMARKS: &str = "bookmarks";
-    pub const SET_BOOKMARK: &str = "bookmarks/set";
-    pub const LAND_STACK: &str = "land";
-    pub const LOOKUP: &str = "lookup";
-    pub const UPLOAD: &str = "upload/";
-    pub const UPLOAD_FILENODES: &str = "upload/filenodes";
-    pub const UPLOAD_TREES: &str = "upload/trees";
-    pub const UPLOAD_CHANGESETS: &str = "upload/changesets";
-    pub const UPLOAD_BONSAI_CHANGESET: &str = "upload/changeset/bonsai";
-    pub const EPHEMERAL_PREPARE: &str = "ephemeral/prepare";
-    pub const FETCH_SNAPSHOT: &str = "snapshot";
     pub const ALTER_SNAPSHOT: &str = "snapshot/alter";
-    pub const DOWNLOAD_FILE: &str = "download/file";
     pub const BLAME: &str = "blame";
+    pub const BOOKMARKS: &str = "bookmarks";
+    pub const CLONE_DATA: &str = "clone";
     pub const CLOUD_HISTORICAL_VERSIONS: &str = "cloud/historical_versions";
     pub const CLOUD_REFERENCES: &str = "cloud/references";
     pub const CLOUD_RENAME_WORKSPACE: &str = "cloud/rename_workspace";
@@ -192,7 +173,32 @@ mod paths {
     pub const CLOUD_UPDATE_REFERENCES: &str = "cloud/update_references";
     pub const CLOUD_WORKSPACE: &str = "cloud/workspace";
     pub const CLOUD_WORKSPACES: &str = "cloud/workspaces";
+    pub const COMMIT_GRAPH_SEGMENTS: &str = "commit/graph_segments";
+    pub const COMMIT_GRAPH_V2: &str = "commit/graph_v2";
+    pub const COMMIT_HASH_LOOKUP: &str = "commit/hash_lookup";
+    pub const COMMIT_HASH_TO_LOCATION: &str = "commit/hash_to_location";
+    pub const COMMIT_LOCATION_TO_HASH: &str = "commit/location_to_hash";
+    pub const COMMIT_MUTATIONS: &str = "commit/mutations";
+    pub const COMMIT_REVLOG_DATA: &str = "commit/revlog_data";
+    pub const COMMIT_TRANSLATE_ID: &str = "commit/translate_id";
+    pub const DOWNLOAD_FILE: &str = "download/file";
+    pub const EPHEMERAL_PREPARE: &str = "ephemeral/prepare";
+    pub const FETCH_SNAPSHOT: &str = "snapshot";
+    pub const FILES2: &str = "files2";
+    pub const HEALTH_CHECK: &str = "health_check";
+    pub const HISTORY: &str = "history";
+    pub const LAND_STACK: &str = "land";
+    pub const LOOKUP: &str = "lookup";
+    pub const PULL_FAST_FORWARD: &str = "pull_fast_forward_master";
+    pub const PULL_LAZY: &str = "pull_lazy";
+    pub const SET_BOOKMARK: &str = "bookmarks/set";
     pub const SUFFIXQUERY: &str = "suffix_query";
+    pub const TREES: &str = "trees";
+    pub const UPLOAD_BONSAI_CHANGESET: &str = "upload/changeset/bonsai";
+    pub const UPLOAD_CHANGESETS: &str = "upload/changesets";
+    pub const UPLOAD_FILENODES: &str = "upload/filenodes";
+    pub const UPLOAD_TREES: &str = "upload/trees";
+    pub const UPLOAD: &str = "upload/";
 }
 
 #[derive(Clone)]
@@ -205,6 +211,38 @@ pub struct ClientInner {
     client: HttpClient,
     tree_progress: Arc<AggregatingProgressBar>,
     file_progress: Arc<AggregatingProgressBar>,
+}
+
+pub struct ExpiringBool {
+    inner: AtomicI64,
+    origin: std::time::Instant,
+    timeout: Duration,
+}
+
+impl ExpiringBool {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            inner: AtomicI64::new(-1),
+            origin: std::time::Instant::now(),
+            timeout,
+        }
+    }
+
+    fn set(&self) {
+        let t = std::time::Instant::now().duration_since(self.origin);
+        self.inner.store(t.as_secs() as i64, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> bool {
+        let val = self.inner.load(Ordering::Relaxed);
+        if val >= 0 {
+            let val = Duration::from_secs(val as u64);
+            let now = self.origin.elapsed();
+            (now - val) <= self.timeout
+        } else {
+            false
+        }
+    }
 }
 
 static LOG_SERVER_INFO_ONCE: Once = Once::new();
@@ -339,13 +377,17 @@ impl Client {
                 let res = raise_for_status(fut.await?).await?;
                 tracing::debug!("{:?}", ResponseMeta::from(&res));
 
+                let res_meta = ResponseMeta::from(&res);
+                let is_dogfooding = res_meta.tw_task_handle.map_or(false, |handle| { handle.contains("dogfooding") });
+                if is_dogfooding {
+                    RECENT_DOGFOODING_REQUESTS.set();
+                }
+
                 LOG_SERVER_INFO_ONCE.call_once(|| {
-                    let res_meta = ResponseMeta::from(&res);
-                    tracing::debug!(target: "mononoke_info", mononoke_host=res_meta.mononoke_host.unwrap_or_default());
+                    tracing::info!(target: "mononoke_info", mononoke_host=res_meta.mononoke_host.unwrap_or_default(), dogfooding=is_dogfooding);
                 });
 
                 Ok::<_, SaplingRemoteApiError>(res.into_body().cbor::<T>().err_into())
-
             })
             .try_flatten()
             .boxed()
@@ -2055,6 +2097,9 @@ async fn with_retry<'t, T>(
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Duration;
+
     use anyhow::Result;
 
     use crate::builder::HttpClientBuilder;
@@ -2104,5 +2149,15 @@ mod tests {
         assert_eq!(&url, &expected);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_expiring_bool() {
+        let expiring = crate::client::ExpiringBool::new(Duration::from_secs(1));
+        assert!(!expiring.get());
+        expiring.set();
+        assert!(expiring.get());
+        thread::sleep(Duration::from_secs(1));
+        assert!(!expiring.get());
     }
 }

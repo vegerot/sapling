@@ -68,8 +68,8 @@ ENV = {
     "RUNTESTDIR": "$(location :test_files)",
     "HGTEST_DUMMYSSH": "$(location :dummyssh3)",
     "HGTEST_GETDB_SH": "$(location //eden/scm/fb/tests:getdb_sh)",
-    "HGTEST_HG": "$(location //eden/scm:hg)",
-    "HGEXECUTABLEPATH": "$(location //eden/scm:hg)",
+    "HGTEST_HG": "$(location //eden/scm:hg_test)",
+    "HGEXECUTABLEPATH": "$(location //eden/scm:hg_test)",
     "URLENCODE": "$(location //eden/mononoke/tests/integration:urlencode)",
     "HGTEST_NORMAL_LAYOUT": "0",
     "HGRUNTEST_SKIP_ENV": "1",
@@ -93,15 +93,12 @@ python_unittest(
     env = ENV,
     resources = {
         "//eden/scm/tests:dummyssh3": "dummyssh3.par",
-        "//eden/scm:hg": "hg.sh",
-        "//eden/scm:hgpython": "hgpython.sh",
+        "//eden/scm:hg_test": "hg.sh",
+        "//eden/scm:hgpython_test": "hgpython.sh",
     },
     supports_static_listing = False,
     runtime_deps = [
         "//eden/mononoke/tests/integration/certs/facebook:test_certs",
-    ],
-    deps = [
-        "//libfb/py:parutil",
     ],
 )
 
@@ -119,14 +116,11 @@ python_unittest(
     env = W_ENV,
     resources = {
         "//eden/scm/tests:dummyssh3": "dummyssh3.par",
-        "//eden/scm:hg": "hg.sh",
-        "//eden/scm:hgpython": "hgpython.sh",
+        "//eden/scm:hg_test": "hg.sh",
+        "//eden/scm:hgpython_test": "hgpython.sh",
         "//watchman:watchman": "watchman",
     },
     supports_static_listing = False,
-    deps = [
-        "//libfb/py:parutil",
-    ],
 )
 
 artifacts = get_integration_test_env_and_deps()
@@ -145,14 +139,11 @@ python_unittest(
     env = E_ENV,
     resources = {
         "//eden/scm/tests:dummyssh3": "dummyssh3.par",
-        "//eden/scm:hg": "hg.sh",
-        "//eden/scm:hgpython": "hgpython.sh",
+        "//eden/scm:hg_test": "hg.sh",
+        "//eden/scm:hgpython_test": "hgpython.sh",
     },
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],
-    deps = [
-        "//libfb/py:parutil",
-    ],
 )
 
 # Order is important, we want HGTEST_RUN_TESTS_PY from the Eden env var dict
@@ -168,15 +159,12 @@ python_unittest(
     env = EW_ENV,
     resources = {
         "//eden/scm/tests:dummyssh3": "dummyssh3.par",
-        "//eden/scm:hg": "hg.sh",
-        "//eden/scm:hgpython": "hgpython.sh",
+        "//eden/scm:hg_test": "hg.sh",
+        "//eden/scm:hgpython_test": "hgpython.sh",
         "//watchman:watchman": "watchman",
     },
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],
-    deps = [
-        "//libfb/py:parutil",
-    ],
 )
 
 buck_command_alias(
@@ -199,8 +187,6 @@ M_ENV.pop("HGTEST_EXCLUDED")
 
 M_ENV.pop("HGTEST_BLOCKLIST")
 
-M_ENV["DEBUGRUNTEST_DEFAULT_DISABLED"] = "1"
-
 M_ENV["HGTEST_INCLUDED"] = "test_(fb_ext_remotefilelog_(log|getpackv2|worker|rust_lfs|ruststores_lfs_duplicated)|edenapi.*)_t"
 
 M_ENV["TEST_FIXTURES"] = "$(location //eden/mononoke/tests/integration:test_fixtures)"
@@ -221,12 +207,57 @@ python_unittest(
         "//eden/mononoke/tests/integration:get_free_socket": "get_free_socket.par",
         "//eden/mononoke:mononoke": "mononoke",
         "//eden/scm/tests:dummyssh3": "dummyssh3.par",
-        "//eden/scm:hg": "hg.sh",
-        "//eden/scm:hgpython": "hgpython.sh",
+        "//eden/scm:hg_test": "hg.sh",
+        "//eden/scm:hgpython_test": "hgpython.sh",
         "//watchman:watchman": "watchman",
     },
     supports_static_listing = False,
     runtime_deps = [
+        "//eden/mononoke/tests/integration/certs/facebook:test_certs",
+        "//eden/mononoke/tests/integration:test_fixtures",
+    ],
+)
+
+MEW_ENV = dict(EW_ENV)
+
+MEW_ENV["USE_MONONOKE"] = "1"
+
+MEW_ENV["HGTEST_MONONOKE_SERVER"] = "$(location //eden/mononoke:mononoke)"
+
+MEW_ENV["HGTEST_GET_FREE_SOCKET"] = "$(location //eden/mononoke/tests/integration:get_free_socket)"
+
+MEW_ENV["HGTEST_CERTDIR"] = "$(location //eden/mononoke/tests/integration/certs/facebook:test_certs)"
+
+MEW_ENV.pop("HGTEST_EXCLUDED")
+
+MEW_ENV.pop("HGTEST_BLOCKLIST")
+
+MEW_ENV["HGTEST_INCLUDED"] = "test_(e2e_clone)_t"
+
+MEW_ENV["TEST_FIXTURES"] = "$(location //eden/mononoke/tests/integration:test_fixtures)"
+
+MEW_ENV["JUST_KNOBS_DEFAULTS"] = "$(location //eden/mononoke/mononoke_macros:just_knobs_defaults)"
+
+MEW_ENV["FB_TEST_FIXTURES"] = "$(location //eden/mononoke/tests/integration/facebook:facebook_test_fixtures)"
+
+python_unittest(
+    name = "trinity_tests",
+    srcs = SRCS,
+    compatible_with = [
+        "ovr_config//os:linux",
+    ],
+    env = MEW_ENV,
+    resources = {
+        "//eden/mononoke/tests/integration/certs/facebook:test_certs": "certs",
+        "//eden/mononoke/tests/integration:get_free_socket": "get_free_socket.par",
+        "//eden/mononoke:mononoke": "mononoke",
+        "//eden/scm/tests:dummyssh3": "dummyssh3.par",
+        "//eden/scm:hg_test": "hg.sh",
+        "//eden/scm:hgpython_test": "hgpython.sh",
+        "//watchman:watchman": "watchman",
+    },
+    supports_static_listing = False,
+    runtime_deps = artifacts["deps"] + [
         "//eden/mononoke/tests/integration/certs/facebook:test_certs",
         "//eden/mononoke/tests/integration:test_fixtures",
     ],

@@ -21,6 +21,7 @@
 
 -- setup hg client repos
   $ cd "$TESTTMP"
+  $ setconfig remotenames.selectivepulldefault=master_bookmark,somebook,fbsource/somebook
   $ hg clone -q mono:fbs-mon fbs-hg-cnt --noupdate
   $ hg clone -q mono:ovr-mon ovr-hg-cnt --noupdate
   $ hg clone -q mono:meg-mon meg-hg-cnt --noupdate
@@ -107,9 +108,6 @@
   $ hg push -r . --to master_bookmark -q
   $ mononoke_x_repo_sync 1 0  --pushrebase-rewrite-dates tail --catch-up-once |& grep processing
   * processing log entry * (glob)
-  $ flush_mononoke_bookmarks
-
-  $ flush_mononoke_bookmarks
 
   $ cd "$TESTTMP/meg-hg-cnt"
   $ hg pull -q
@@ -126,8 +124,8 @@
    b0474d400edddcabef0a27ead293a6b99ae59490 1970-01-01 ovrsource commit 2
    b06de5da9e40e0da6eda1f7b5c891711106d707b 1970-01-01 fbsource commit 3
    e0cb430152c2dcc47b93a516344e3814ece60d4b 1970-01-01 fbsource commit 10
-  default/fbsource/somebook d692e38644b938ccccc4192bd2f507955f3888c5 1970-01-01 non-master commit
-  default/master_bookmark * 20*-*-* fbsource commit resume (glob)
+  remote/fbsource/somebook d692e38644b938ccccc4192bd2f507955f3888c5 1970-01-01 non-master commit
+  remote/master_bookmark * 20*-*-* fbsource commit resume (glob)
   $ export FORGOTTEN_PARENT=$(hg log -T "{node}" -r b0474d400edddcabef0a27ead293a6b99ae59490^)
 
 -- Validate the synced entries
@@ -153,8 +151,6 @@ Query synced commit mapping, check that automatically inserted mappings have ver
 
 fbsource should be fully in sync
   $ crossrepo_verify_bookmarks 0 1
-  * using repo "meg-mon" repoid RepositoryId(0) (glob)
-  * using repo "fbs-mon" repoid RepositoryId(1) (glob)
   * all is well! (glob)
 
 ovrsource has two problems
@@ -204,8 +200,6 @@ and tried again
 
 now the verfication shouldn't return that error
   $ crossrepo_verify_bookmarks 0 2
-  * using repo "meg-mon" repoid RepositoryId(0) (glob)
-  * using repo "ovr-mon" repoid RepositoryId(2) (glob)
   * 'ovr-mon' has a bookmark master_bookmark but it points to a commit that has no equivalent in 'meg-mon'. If it's a shared bookmark (e.g. master) that might mean that it points to a commit from another repository (glob)
   * found 1 inconsistencies (glob)
   [1]

@@ -1,5 +1,4 @@
 #modern-config-incompatible
-#inprocess-hg-incompatible
 
 #require no-eden
 
@@ -9,7 +8,6 @@
 Setup
 
   $ configure dummyssh
-  $ enable remotenames
   $ setconfig ui.username="nobody <no.reply@fb.com>"
 
   $ log() {
@@ -32,7 +30,6 @@ Clone client repository
   $ hg clone ssh://user@dummy/server client -q
   $ cd client
   $ setconfig extensions.pushrebase=
-  $ setconfig extensions.remotenames=
 
 Add new commit
   $ cd ../server
@@ -44,7 +41,7 @@ Create a merge commit that merges executable file in
   $ cd ../client
   $ hg up -q tip
   $ log -r .
-  @  initial [public:2bb9d20e471c] default/master
+  @  initial [public:2bb9d20e471c] remote/master
   
   $ hg up -q null
   $ echo ex > ex

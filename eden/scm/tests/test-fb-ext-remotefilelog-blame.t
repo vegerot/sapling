@@ -19,6 +19,7 @@
   $ hg commit -qAm z
   $ echo a > a
   $ hg commit -qAm a
+  $ hg book master
 
   $ cd ..
 

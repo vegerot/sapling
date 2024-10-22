@@ -22,6 +22,7 @@ use metaconfig_types::BackupRepoConfig;
 use metaconfig_types::BlobConfig;
 use metaconfig_types::CensoredScubaParams;
 use metaconfig_types::CommonConfig;
+use metaconfig_types::ObjectsCountMultiplier;
 use metaconfig_types::Redaction;
 use metaconfig_types::RedactionConfig;
 use metaconfig_types::RepoConfig;
@@ -237,6 +238,8 @@ fn parse_with_repo_definition(
         zelos_config,
         bookmark_name_for_objects_count,
         default_objects_count,
+        override_objects_count,
+        objects_count_multiplier,
         x_repo_sync_source_mapping,
         mononoke_cas_sync_config,
         git_configs,
@@ -363,6 +366,9 @@ fn parse_with_repo_definition(
 
     let commit_cloud_config = commit_cloud_config.convert()?.unwrap_or_default();
     let mononoke_cas_sync_config = mononoke_cas_sync_config.convert()?;
+
+    let objects_count_multiplier = objects_count_multiplier.map(ObjectsCountMultiplier::new);
+
     Ok(RepoConfig {
         enabled,
         storage_config,
@@ -408,6 +414,8 @@ fn parse_with_repo_definition(
         zelos_config,
         bookmark_name_for_objects_count,
         default_objects_count,
+        override_objects_count,
+        objects_count_multiplier,
         x_repo_sync_source_mapping,
         commit_cloud_config,
         mononoke_cas_sync_config,
@@ -1299,6 +1307,7 @@ mod test {
 
                     },],
                     scuba_table: None,
+                    derivation_queue_scuba_table: None,
                 },
                 enforce_lfs_acl_check: false,
                 repo_client_use_warm_bookmarks_cache: true,
@@ -1381,6 +1390,8 @@ mod test {
                 zelos_config: None,
                 bookmark_name_for_objects_count: None,
                 default_objects_count: None,
+                override_objects_count: None,
+                objects_count_multiplier: None,
                 commit_cloud_config: CommitCloudConfig {
                     mocked_employees: Vec::new(),
                     disable_interngraph_notification: false,
@@ -1463,6 +1474,8 @@ mod test {
                 zelos_config: None,
                 bookmark_name_for_objects_count: None,
                 default_objects_count: None,
+                override_objects_count: None,
+                objects_count_multiplier: None,
                 x_repo_sync_source_mapping: None,
                 commit_cloud_config: CommitCloudConfig::default(),
                 mononoke_cas_sync_config: None,

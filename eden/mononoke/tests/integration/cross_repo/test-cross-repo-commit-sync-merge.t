@@ -16,6 +16,9 @@ setup configuration
   ls: cannot access *: No such file or directory (glob)
   [2]
 
+FIXME: enable selective pull
+  $ setconfig remotenames.selectivepull=false
+
 setup hg server repos
   $ function createfile { mkdir -p "$(dirname  $1)" && echo "$1" > "$1" && hg add -q "$1"; }
 
@@ -97,7 +100,7 @@ check that the changes are synced
   A .fbsource-rest/arvr/tomerge
   $ hg log -G
   o    commit:      9c3b218de12e
-  ├─╮  bookmark:    default/master_bookmark
+  ├─╮  bookmark:    remote/master_bookmark
   │ │  hoistedname: master_bookmark
   │ │  user:        test
   │ │  date:        Thu Jan 01 00:00:00 1970 +0000

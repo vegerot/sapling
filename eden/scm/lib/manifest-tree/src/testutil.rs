@@ -14,7 +14,6 @@ use anyhow::Result;
 use manifest::testutil::*;
 use manifest::Manifest;
 use minibytes::Bytes;
-use parking_lot::Mutex;
 use parking_lot::RwLock;
 use sha1::Digest;
 use sha1::Sha1;
@@ -55,12 +54,18 @@ pub fn make_tree_manifest_from_meta(
 }
 
 /// An in memory `Store` implementation backed by HashMaps. Primarily intended for tests.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TestStore {
-    entries: RwLock<HashMap<RepoPathBuf, HashMap<HgId, Bytes>>>,
-    pub prefetched: Mutex<Vec<Vec<Key>>>,
+    inner: Arc<RwLock<TestStoreInner>>,
+}
+
+#[derive(Default)]
+pub struct TestStoreInner {
+    entries: HashMap<RepoPathBuf, HashMap<HgId, Bytes>>,
+    pub prefetched: Vec<Vec<Key>>,
     format: SerializationFormat,
     key_fetch_count: AtomicU64,
+    insert_count: AtomicU64,
 }
 
 impl TestStore {
@@ -68,18 +73,22 @@ impl TestStore {
         Self::default()
     }
 
-    pub fn with_format(mut self, format: SerializationFormat) -> Self {
-        self.format = format;
+    pub fn with_format(self, format: SerializationFormat) -> Self {
+        self.inner.write().format = format;
         self
     }
 
     #[allow(unused)]
     pub fn fetches(&self) -> Vec<Vec<Key>> {
-        self.prefetched.lock().clone()
+        self.inner.read().prefetched.clone()
     }
 
     pub fn key_fetch_count(&self) -> u64 {
-        self.key_fetch_count.load(Ordering::Relaxed)
+        self.inner.read().key_fetch_count.load(Ordering::Relaxed)
+    }
+
+    pub fn insert_count(&self) -> u64 {
+        self.inner.read().insert_count.load(Ordering::Relaxed)
     }
 }
 
@@ -92,8 +101,9 @@ fn compute_sha1(content: &[u8]) -> HgId {
 
 impl KeyStore for TestStore {
     fn get_local_content(&self, path: &RepoPath, hgid: HgId) -> anyhow::Result<Option<Bytes>> {
-        self.key_fetch_count.fetch_add(1, Ordering::Relaxed);
-        let underlying = self.entries.read();
+        let mut inner = self.inner.write();
+        inner.key_fetch_count.fetch_add(1, Ordering::Relaxed);
+        let underlying = &mut inner.entries;
         let result = underlying
             .get(path)
             .and_then(|hgid_hash| hgid_hash.get(&hgid))
@@ -102,7 +112,9 @@ impl KeyStore for TestStore {
     }
 
     fn insert_data(&self, opts: InsertOpts, path: &RepoPath, data: &[u8]) -> anyhow::Result<HgId> {
-        let mut underlying = self.entries.write();
+        let mut inner = self.inner.write();
+        inner.insert_count.fetch_add(1, Ordering::Relaxed);
+        let underlying = &mut inner.entries;
         let hgid = match opts.forced_id {
             Some(id) => *id,
             None => compute_sha1(data),
@@ -115,15 +127,25 @@ impl KeyStore for TestStore {
     }
 
     fn prefetch(&self, keys: Vec<Key>) -> Result<()> {
-        self.key_fetch_count
+        let mut inner = self.inner.write();
+        inner
+            .key_fetch_count
             .fetch_add(keys.len() as u64, Ordering::Relaxed);
-        self.prefetched.lock().push(keys);
+        inner.prefetched.push(keys);
         Ok(())
     }
 
     fn format(&self) -> SerializationFormat {
-        self.format
+        self.inner.read().format
+    }
+
+    fn clone_key_store(&self) -> Box<dyn KeyStore> {
+        Box::new(self.clone())
     }
 }
 
-impl TreeStore for TestStore {}
+impl TreeStore for TestStore {
+    fn clone_tree_store(&self) -> Box<dyn TreeStore> {
+        Box::new(self.clone())
+    }
+}

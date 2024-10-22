@@ -1,7 +1,7 @@
 #modern-config-incompatible
-#modern-config-incompatible
 
 #require no-eden
+
 
   $ configure modern
   $ enable smartlog

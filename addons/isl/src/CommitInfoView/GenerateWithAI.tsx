@@ -30,6 +30,7 @@ import {Tooltip} from 'isl-components/Tooltip';
 import {atom, useAtom, useAtomValue, useSetAtom} from 'jotai';
 import {useCallback} from 'react';
 import {ComparisonType} from 'shared/Comparison';
+import {InternalFieldName} from 'shared/constants';
 import {useThrottledEffect} from 'shared/hooks';
 import {randomId, nullthrows} from 'shared/utils';
 
@@ -49,7 +50,11 @@ export function GenerateAIButton({
 }) {
   const currentCommit = useAtomValue(commitInfoViewCurrentCommits)?.[0];
   const mode = useAtomValue(commitMode);
-  const featureEnabled = useFeatureFlagSync(Internal.featureFlags?.GeneratedAICommitMessages);
+  const featureEnabled = useFeatureFlagSync(
+    fieldName === InternalFieldName.TestPlan
+      ? Internal.featureFlags?.GeneratedAITestPlan
+      : Internal.featureFlags?.GeneratedAICommitMessages,
+  );
 
   const hashKey: HashKey | undefined =
     currentCommit == null
@@ -61,7 +66,10 @@ export function GenerateAIButton({
   useThrottledEffect(
     () => {
       if (currentCommit != null && featureEnabled && hashKey != null) {
-        FunnelTracker.get(hashKey)?.track(GeneratedMessageTrackEventName.ButtonImpression);
+        FunnelTracker.get(hashKey)?.track(
+          GeneratedMessageTrackEventName.ButtonImpression,
+          fieldName,
+        );
       }
     },
     100,
@@ -74,9 +82,9 @@ export function GenerateAIButton({
       if (hasAcceptedState === true) {
         return;
       }
-      FunnelTracker.get(hashKey)?.track(GeneratedMessageTrackEventName.Dismiss);
+      FunnelTracker.get(hashKey)?.track(GeneratedMessageTrackEventName.Dismiss, fieldName);
     }
-  }, [hashKey]);
+  }, [hashKey, fieldName]);
 
   const fieldKey = convertFieldNameToKey(fieldName);
 
@@ -113,13 +121,18 @@ const cachedSuggestions = new Map<
 >();
 const ONE_HOUR = 60 * 60 * 1000;
 const MAX_SUGGESTION_CACHE_AGE = 24 * ONE_HOUR; // cache aggressively since we have an explicit button to invalidate
-const generatedCommitMessages = atomFamilyWeak((hashKey: string | undefined) =>
+const generatedSuggestions = atomFamilyWeak((fieldNameAndHashKey: string) =>
   atomLoadableWithRefresh((get): Promise<Result<string>> => {
-    if (hashKey == null || Internal.generateAICommitMessage == null) {
+    if (Internal.generateSuggestionWithAI == null) {
       return Promise.resolve({value: ''});
     }
 
-    const cached = cachedSuggestions.get(hashKey);
+    const fieldNameAndHashKeyArray = fieldNameAndHashKey.split('+');
+
+    const fieldName = fieldNameAndHashKeyArray[0];
+    const hashKey = fieldNameAndHashKeyArray[1];
+
+    const cached = cachedSuggestions.get(fieldNameAndHashKey);
     if (cached && Date.now() - cached.lastFetch < MAX_SUGGESTION_CACHE_AGE) {
       return cached.messagePromise;
     }
@@ -134,7 +147,7 @@ const generatedCommitMessages = atomFamilyWeak((hashKey: string | undefined) =>
         const uncommittedChanges = get(uncommittedChangesWithPreviews);
         fileChanges.push(...uncommittedChanges.slice(0, 10).map(change => change.path));
       }
-      fileChanges.push(...(commit?.filesSample.slice(0, 10).map(change => change.path) ?? []));
+      fileChanges.push(...(commit?.filePathsSample.slice(0, 10) ?? []));
     }
 
     const hashOrHead = hashKey.startsWith('commit/') ? 'head' : hashKey;
@@ -144,15 +157,16 @@ const generatedCommitMessages = atomFamilyWeak((hashKey: string | undefined) =>
     // Note: we don't use the FunnelTracker because this event is not needed for funnel analysis,
     // only for our own duration / error rate tracking.
     const resultPromise = tracker.operation(
-      'GenerateAICommitMessage',
+      fieldName === InternalFieldName.TestPlan ? 'GenerateAITestPlan' : 'GenerateAICommitMessage',
       'FetchError',
       {},
       async () => {
         const comparison: Comparison = hashKey.startsWith('commit/')
           ? {type: ComparisonType.UncommittedChanges}
           : {type: ComparisonType.Committed, hash: hashKey};
-        const response = await nullthrows(Internal.generateAICommitMessage)({
+        const response = await nullthrows(Internal.generateSuggestionWithAI)({
           comparison,
+          fieldName,
           title: latestWrittenTitle,
         });
 
@@ -160,7 +174,7 @@ const generatedCommitMessages = atomFamilyWeak((hashKey: string | undefined) =>
       },
     );
 
-    cachedSuggestions.set(hashKey, {
+    cachedSuggestions.set(fieldNameAndHashKey, {
       lastFetch: Date.now(),
       messagePromise: resultPromise,
     });
@@ -183,7 +197,9 @@ function GenerateAIModal({
   appendToTextArea: (toAdd: string) => unknown;
   fieldName: string;
 }) {
-  const [content, refetch] = useAtom(generatedCommitMessages(hashKey));
+  const fieldNameAndHashKey = `${fieldName}+${hashKey}`;
+
+  const [content, refetch] = useAtom(generatedSuggestions(fieldNameAndHashKey));
 
   const setHasAccepted = useSetAtom(hasAcceptedAIMessageSuggestion(hashKey));
 
@@ -197,7 +213,10 @@ function GenerateAIModal({
 
   useThrottledEffect(
     () => {
-      FunnelTracker.get(hashKey)?.track(GeneratedMessageTrackEventName.SuggestionRequested);
+      FunnelTracker.get(hashKey)?.track(
+        GeneratedMessageTrackEventName.SuggestionRequested,
+        fieldName,
+      );
     },
     100,
     [suggestionId], // ensure we track again if the hash key hasn't changed but a new suggestionID was generated
@@ -206,7 +225,10 @@ function GenerateAIModal({
   useThrottledEffect(
     () => {
       if (content.state === 'hasData' && content.data.value != null) {
-        FunnelTracker.get(hashKey)?.track(GeneratedMessageTrackEventName.ResponseImpression);
+        FunnelTracker.get(hashKey)?.track(
+          GeneratedMessageTrackEventName.ResponseImpression,
+          fieldName,
+        );
       }
     },
     100,
@@ -239,8 +261,8 @@ function GenerateAIModal({
         <Button
           disabled={content.state === 'loading' || error != null}
           onClick={() => {
-            FunnelTracker.get(hashKey)?.track(GeneratedMessageTrackEventName.RetryClick);
-            cachedSuggestions.delete(hashKey); // make sure we don't re-use cached value
+            FunnelTracker.get(hashKey)?.track(GeneratedMessageTrackEventName.RetryClick, fieldName);
+            cachedSuggestions.delete(fieldNameAndHashKey); // make sure we don't re-use cached value
             setHasAccepted(false);
             FunnelTracker.restartFunnel(hashKey);
             refetch();
@@ -256,7 +278,10 @@ function GenerateAIModal({
             if (value) {
               appendToTextArea(value);
             }
-            FunnelTracker.get(hashKey)?.track(GeneratedMessageTrackEventName.InsertClick);
+            FunnelTracker.get(hashKey)?.track(
+              GeneratedMessageTrackEventName.InsertClick,
+              fieldName,
+            );
             setHasAccepted(true);
             dismiss();
           }}>
@@ -286,7 +311,7 @@ export enum GeneratedMessageTrackEventName {
 /**
  * Manage tracking events and including a suggestion identifier according to the analytics funnel:
  *
- * (O) Opporunity - The dropdown has rendered and a suggestion has begun being rendered
+ * (O) Opportunity - The dropdown has rendered and a suggestion has begun being rendered
  * (S) Shown - A complete suggestion has been rendered
  * (A) Accepted - The suggestion was accepted
  * (R) Rejected - The suggestion was rejected, retried, or dismissed
@@ -333,7 +358,7 @@ class FunnelTracker {
   private alreadyTrackedFunnelEvents = new Set<FunnelEvent>();
   private suggestionId = randomId();
 
-  public track(eventName: GeneratedMessageTrackEventName) {
+  public track(eventName: GeneratedMessageTrackEventName, fieldName: string) {
     let funnelEventName: FunnelEvent | undefined = this.mapToFunnelEvent(eventName);
     if (funnelEventName != null && !this.alreadyTrackedFunnelEvents.has(funnelEventName)) {
       // prevent tracking this funnel event again for this suggestion ID
@@ -343,13 +368,18 @@ class FunnelTracker {
     }
 
     // log all events into the same event, which can be extracted for funnel analysis
-    Internal?.trackerWithUserInfo?.track('GenerateAICommitMessageFunnelEvent', {
-      extras: {
-        eventName,
-        suggestionIdentifier: this.suggestionId,
-        funnelEventName,
+    Internal?.trackerWithUserInfo?.track(
+      fieldName === InternalFieldName.TestPlan
+        ? 'GenerateAITestPlanFunnelEvent'
+        : 'GenerateAICommitMessageFunnelEvent',
+      {
+        extras: {
+          eventName,
+          suggestionIdentifier: this.suggestionId,
+          funnelEventName,
+        },
       },
-    });
+    );
   }
 
   /** Convert from our internal names to the funnel event names */

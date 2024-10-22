@@ -14,7 +14,7 @@
   $ mkdir -p "$GIT_REPO_ORIGIN"
   $ cd "$GIT_REPO_ORIGIN"
   $ git init -q
-# Create dummy commit on master
+# Create dummy commit on master_bookmark
   $ git commit -q --allow-empty -m "initial commit" 
 # Create branches R1 and R2
   $ git branch R1
@@ -38,7 +38,7 @@
   * 47156f5 (R1) Adding fileA and fileB
   | * a9ff5f9 (HEAD -> R2) Adding fileC and fileD
   |/  
-  * 83ef99f (master) initial commit
+  * 83ef99f (master_bookmark) initial commit
 
 # Clone the repo with the changes made so far
   $ cd "$TESTTMP"
@@ -85,7 +85,7 @@
   | * 47156f5 (R1) Adding fileA and fileB
   * | a9ff5f9 Adding fileC and fileD
   |/  
-  * 83ef99f (master) initial commit
+  * 83ef99f (master_bookmark) initial commit
 
 # Perform a shallow pull of the repo with depth = 2 and list the commits. Commit 12a34ee should NOT be present
 # since it exists at depth=3 and the client did not already have it after the clone
@@ -103,8 +103,6 @@
 
 # Pull the latest changes from Mononoke and verify we get the same end state
   $ cd $GIT_REPO
-# Wait for the warm bookmark cache to catch up with the latest changes
-  $ wait_for_git_bookmark_move HEAD $prev_head
   $ quiet git_client pull --depth=2
   $ git rev-list --objects --all | git cat-file --batch-check='%(objectname) %(objecttype) %(rest)' | grep commit | sort
   18a6f40de35ce474e240faa7298ae2b5979751c8 commit 

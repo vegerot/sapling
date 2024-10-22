@@ -8,7 +8,6 @@ Default config file for testing
 """
 
 import os
-
 from typing import Optional
 
 
@@ -56,19 +55,14 @@ cachepath=$TESTTMP/default-hgcache
 [mutation]
 record=False
 
-[pull]
-httpcommitgraph2=true
-
 [hint]
 ack-match-full-traversal=True
-ack = smartlog-default-command
-
-[scmstore]
-contentstorefallback=False
+ack = smartlog-default-command commitcloud-update-on-move
 
 [experimental]
 use-rust-changelog=True
 windows-symlinks=True
+narrow-heads=true
 
 [tweakdefaults]
 graftkeepdate=True
@@ -83,6 +77,16 @@ dagcopytrace=True
 [committemplate]
 commit-message-fields=Summary,"Test Plan",Reviewers,Subscribers,Tasks,Tags,"Differential Revision","Reviewed By"
 summary-field=Summary
+
+[templatealias]
+sl_hash_minlen=9
+
+[cas]
+disable=true
+
+[remotenames]
+rename.default=remote
+hoist=remote
 """
     if use_watchman:
         content += """
@@ -114,13 +118,11 @@ remotebookmarkssync=True
 [experimental]
 changegroup3=True
 evolution=obsolete
-narrow-heads=true
 
 [extensions]
 amend=
 commitcloud=
 infinitepush=
-remotenames=
 
 [mutation]
 enabled=true
@@ -129,12 +131,6 @@ date=0 0
 
 [remotefilelog]
 http=True
-
-[remotenames]
-rename.default=remote
-hoist=remote
-selectivepull=True
-selectivepulldefault=master
 
 [treemanifest]
 http=True

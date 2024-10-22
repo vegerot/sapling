@@ -104,13 +104,14 @@ impl SqlConstructFromMetadataDatabaseConfig for SqlPushRedirectionConfigBuilder 
 impl PushRedirectionConfig for SqlPushRedirectionConfig {
     async fn set(
         &self,
-        _ctx: &CoreContext,
+        ctx: &CoreContext,
         repo_id: RepositoryId,
         draft_push: bool,
         public_push: bool,
     ) -> Result<()> {
-        Set::query(
+        Set::maybe_traced_query(
             &self.connections.write_connection,
+            ctx.client_request_info(),
             &repo_id,
             &draft_push,
             &public_push,
@@ -121,12 +122,21 @@ impl PushRedirectionConfig for SqlPushRedirectionConfig {
 
     async fn get(
         &self,
-        _ctx: &CoreContext,
+        ctx: &CoreContext,
         repo_id: RepositoryId,
     ) -> Result<Option<PushRedirectionConfigEntry>> {
-        let rows = Get::query(
+        let ttl =
+            justknobs::get_as::<u64>("scm/mononoke:pushredirection_config_cache_ttl_secs", None)?;
+
+        let rows = Get::maybe_traced_query(
             self.sql_query_config.as_ref(),
+            if ttl == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs(ttl))
+            },
             &self.connections.read_connection,
+            ctx.client_request_info(),
             &repo_id,
         )
         .await?;

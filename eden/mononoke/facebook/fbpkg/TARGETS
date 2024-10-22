@@ -2,7 +2,7 @@ load("//eden/mononoke/facebook/fbpkg:lib.bzl", "mononoke_fbpkg")
 load("//tupperware/cm/antlir2/bzl:buck2_container.bzl", "tw")
 load("//tupperware/config/common:tw.mixin.zkdaemon.bzl", zkdaemon_mixin = "mixin")
 
-oncall("mononoke")
+oncall("scm_server_infra")
 
 mononoke_fbpkg(
     name = "mononoke.server",
@@ -19,7 +19,7 @@ mononoke_fbpkg(
         "oncalls": "fbcode//oncall/py:oncalls",
         "scmadmin": "fbcode//scm/scmadmin:client",
         # actual scs server binary
-        "scs_server": "fbcode//eden/mononoke/scs_server:scs_server",
+        "scs_server": "fbcode//eden/mononoke/scs/scs_server:scs_server",
     },
 )
 
@@ -27,7 +27,6 @@ mononoke_fbpkg(
     name = "mononoke.admin",
     compress_type = None,
     path_actions = {
-        "admin": "//eden/mononoke:admin",
         "newadmin": "//eden/mononoke/tools/admin:newadmin",
     },
 )
@@ -65,7 +64,7 @@ mononoke_fbpkg(
 mononoke_fbpkg(
     name = "mononoke.megarepo_async_requests_worker",
     path_actions = {
-        "async_requests_worker": "//eden/mononoke/async_requests:worker",
+        "async_requests_worker": "//eden/mononoke/async_requests/worker:worker",
     },
 )
 
@@ -114,13 +113,6 @@ mononoke_fbpkg(
     name = "mononoke.statistics_collector",
     path_actions = {
         "statistics_collector": "//eden/mononoke:statistics_collector",
-    },
-)
-
-mononoke_fbpkg(
-    name = "mononoke.streaming_clone_warmup",
-    path_actions = {
-        "streaming_clone_warmup": "//eden/mononoke:streaming_clone_warmup",
     },
 )
 
@@ -179,6 +171,19 @@ mononoke_fbpkg(
     path_actions = {
         "fbsource_commit_tailer.par": "//eden/mononoke/facebook/fbsource_commit_tailer:fbsource_commit_tailer",
         "swift": "//scribeutil/swift:swift",
+    },
+)
+
+mononoke_fbpkg(
+    name = "mononoke.whatsapp_commit_tailer",
+    compress_type = None,
+    override_log_paths = [
+        "eden/mononoke/facebook/post_commit_tailer",
+        "eden/mononoke/facebook/whatsapp_commit_tailer",
+    ],
+    path_actions = {
+        "swift": "//scribeutil/swift:swift",
+        "whatsapp_commit_tailer.par": "//eden/mononoke/facebook/whatsapp_commit_tailer:whatsapp_commit_tailer",
     },
 )
 

@@ -14,17 +14,18 @@ import serverAPI from '../ClientToServerAPI';
 import {SplitDiffTable} from '../ComparisonView/SplitDiffView/SplitDiffHunk';
 import {Column, Row} from '../ComponentUtils';
 import {Link} from '../Link';
-import {t} from '../i18n';
+import {T, t} from '../i18n';
 import {atomFamilyWeak, atomLoadableWithRefresh} from '../jotaiUtils';
-import foundPlatform from '../platform';
+import platform from '../platform';
 import {RelativeDate} from '../relativeDate';
 import {layout} from '../stylexUtils';
+import {themeState} from '../theme';
 import * as stylex from '@stylexjs/stylex';
 import {ErrorNotice} from 'isl-components/ErrorNotice';
 import {Icon} from 'isl-components/Icon';
 import {Subtle} from 'isl-components/Subtle';
 import {Tooltip} from 'isl-components/Tooltip';
-import {useAtom} from 'jotai';
+import {useAtom, useAtomValue} from 'jotai';
 import {useEffect} from 'react';
 import {ComparisonType} from 'shared/Comparison';
 import {group} from 'shared/utils';
@@ -87,7 +88,8 @@ const styles = stylex.create({
   byline: {
     display: 'flex',
     flexDirection: 'row',
-    gap: spacing.half,
+    gap: spacing.pad,
+    alignItems: 'center',
   },
   diffView: {
     marginBlock: spacing.pad,
@@ -107,7 +109,7 @@ function Comment({comment, isTopLevel}: {comment: DiffComment; isTopLevel?: bool
             <Link
               xstyle={styles.inlineCommentFilename}
               onClick={() =>
-                comment.filename && foundPlatform.openFile(comment.filename, {line: comment.line})
+                comment.filename && platform.openFile(comment.filename, {line: comment.line})
               }>
               {comment.filename}
               {comment.line == null ? '' : ':' + comment.line}
@@ -116,11 +118,22 @@ function Comment({comment, isTopLevel}: {comment: DiffComment; isTopLevel?: bool
           <div {...stylex.props(styles.commentContent)}>
             <div className="rendered-markup" dangerouslySetInnerHTML={{__html: comment.html}} />
           </div>
-          {comment.suggestedChange != null && <InlineDiff patch={comment.suggestedChange} />}
+          {comment.suggestedChange != null && comment.suggestedChange.patch != null && (
+            <InlineDiff patch={comment.suggestedChange.patch} />
+          )}
         </div>
         <Subtle {...stylex.props(styles.byline)}>
           <RelativeDate date={comment.created} />
           <Reactions reactions={comment.reactions} />
+          {comment.isResolved === true ? (
+            <span>
+              <T>Resolved</T>
+            </span>
+          ) : comment.isResolved === false ? (
+            <span>
+              <T>Unresolved</T>
+            </span>
+          ) : null}
         </Subtle>
         {comment.replies.map((reply, i) => (
           <Comment key={i} comment={reply} />
@@ -129,6 +142,8 @@ function Comment({comment, isTopLevel}: {comment: DiffComment; isTopLevel?: bool
     </Row>
   );
 }
+
+const useThemeHook = () => useAtomValue(themeState);
 
 function InlineDiff({patch}: {patch: ParsedDiff}) {
   const path = patch.newFileName ?? '';
@@ -145,9 +160,8 @@ function InlineDiff({patch}: {patch: ParsedDiff}) {
               path,
             },
             setCollapsed: () => null,
-            // we don't have the rest of the contents of the suggestion
-            supportsExpandingContext: false,
             display: 'unified',
+            useThemeHook,
           }}
         />
       </div>

@@ -17,8 +17,7 @@
   > CONF
   > )
 
-
-
+  $ setconfig remotenames.selectivepulldefault=master_bookmark,feature_bookmark
 
   $ hg up -q tip
   $ echo file1 > file1 && hg -q addremove && hg commit -m "file1"

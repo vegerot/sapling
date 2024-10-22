@@ -1,5 +1,4 @@
 #modern-config-incompatible
-#inprocess-hg-incompatible
 
 #require no-eden
 
@@ -15,7 +14,7 @@ Push treeonly commits from a treeonly shallow repo to a treeonly server
   $ newrepo client
   $ setconfig paths.default=ssh://user@dummy/server
   $ echo remotefilelog >> .hg/requires
-  $ enable pushrebase remotenames
+  $ enable pushrebase
   $ drawdag <<'EOS'
   > B
   > |

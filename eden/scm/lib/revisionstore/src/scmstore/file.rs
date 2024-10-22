@@ -30,6 +30,7 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 use progress_model::AggregatingProgressBar;
 use rand::Rng;
+use storemodel::SerializationFormat;
 use tracing::debug;
 
 pub(crate) use self::fetch::FetchState;
@@ -106,6 +107,9 @@ pub struct FileStore {
 
     // Don't flush on drop when we're using FileStore in a "disposable" context, like backingstore
     pub flush_on_drop: bool,
+
+    // The serialization format that the store should use
+    pub format: SerializationFormat,
 }
 
 impl Drop for FileStore {
@@ -171,6 +175,7 @@ impl FileStore {
         let lfs_remote = self.lfs_remote.clone();
         let metrics = self.metrics.clone();
         let activity_logger = self.activity_logger.clone();
+        let format = self.format();
 
         let fetch_local = fetch_mode.contains(FetchMode::LOCAL);
         let fetch_remote = fetch_mode.contains(FetchMode::REMOTE);
@@ -212,10 +217,18 @@ impl FileStore {
                 }
 
                 if let Some(ref lfs_cache) = lfs_cache {
+                    assert!(
+                        format == SerializationFormat::Hg,
+                        "LFS cannot be used with non-Hg serialization format"
+                    );
                     state.fetch_lfs(lfs_cache, StoreLocation::Cache);
                 }
 
                 if let Some(ref lfs_local) = lfs_local {
+                    assert!(
+                        format == SerializationFormat::Hg,
+                        "LFS cannot be used with non-Hg serialization format"
+                    );
                     state.fetch_lfs(lfs_local, StoreLocation::Local);
                 }
             }
@@ -235,6 +248,10 @@ impl FileStore {
                 }
 
                 if let Some(ref lfs_remote) = lfs_remote {
+                    assert!(
+                        format == SerializationFormat::Hg,
+                        "LFS cannot be used with non-Hg serialization format"
+                    );
                     state.fetch_lfs_remote(
                         &lfs_remote.remote,
                         lfs_local.clone(),
@@ -285,6 +302,10 @@ impl FileStore {
                 "writing LFS pointers directly is not allowed outside of tests"
             );
         }
+        ensure!(
+            self.format() == SerializationFormat::Hg,
+            "LFS cannot be used with non-Hg serialization format"
+        );
         let lfs_local = self.lfs_local.as_ref().ok_or_else(|| {
             anyhow!("trying to write LFS pointer but no local LfsStore is available")
         })?;
@@ -297,6 +318,10 @@ impl FileStore {
         let lfs_local = self.lfs_local.as_ref().ok_or_else(|| {
             anyhow!("trying to write LFS file but no local LfsStore is available")
         })?;
+        ensure!(
+            self.format() == SerializationFormat::Hg,
+            "LFS cannot be used with non-Hg serialization format"
+        );
         let (lfs_pointer, lfs_blob) = lfs_from_hg_file_blob(key.hgid, &bytes)?;
         let sha256 = lfs_pointer.sha256();
 
@@ -306,7 +331,7 @@ impl FileStore {
         Ok(())
     }
 
-    fn write_nonlfs(&self, key: Key, bytes: Bytes, meta: Metadata) -> Result<()> {
+    pub(crate) fn write_nonlfs(&self, key: Key, bytes: Bytes, meta: Metadata) -> Result<()> {
         let indexedlog_local = self.indexedlog_local.as_ref().ok_or_else(|| {
             anyhow!("trying to write non-LFS file but no local non-LFS IndexedLog is available")
         })?;
@@ -426,6 +451,7 @@ impl FileStore {
 
             lfs_progress: AggregatingProgressBar::new("fetching", "LFS"),
             flush_on_drop: true,
+            format: SerializationFormat::Hg,
         }
     }
 
@@ -474,6 +500,7 @@ impl FileStore {
 
             // Conservatively flushing on drop here, didn't see perf problems and might be needed by Python
             flush_on_drop: true,
+            format: self.format(),
         }
     }
 
@@ -485,6 +512,10 @@ impl FileStore {
         } else {
             Ok(keys.to_vec())
         }
+    }
+
+    pub fn format(&self) -> SerializationFormat {
+        self.format
     }
 }
 

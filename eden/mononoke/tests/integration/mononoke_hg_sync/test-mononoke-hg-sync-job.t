@@ -222,7 +222,7 @@ Verify that repo-2 is locked for normal pushes
   $ cd $TESTTMP/client-push
   $ hg up 0 -q
   $ echo >> ababagalamaga && hg ci -qAm ababagalamaga
-  $ hg push -r . --to master_bookmark ssh://user@dummy/repo-2
+  $ hg push -r . --to master_bookmark --config paths.default=ssh://user@dummy/repo-2
   pushing rev 24e27c11427d to destination ssh://user@dummy/repo-2 bookmark master_bookmark
   searching for changes
   remote: pushing 1 changeset:
@@ -269,9 +269,7 @@ Test bookmark deletion sync
   $ hg -q push --rev . --to book_to_delete --create
   $ hg log -r master_bookmark
   commit:      6f24f1b38581
-  bookmark:    default/book_to_delete
-  bookmark:    default/master_bookmark
-  hoistedname: book_to_delete
+  bookmark:    remote/master_bookmark
   hoistedname: master_bookmark
   user:        test
   date:        * (glob)
@@ -289,7 +287,7 @@ Test bookmark deletion sync
   [1]
   $ hg log -r master_bookmark
   commit:      6f24f1b38581
-  bookmark:    default/master_bookmark
+  bookmark:    remote/master_bookmark
   hoistedname: master_bookmark
   user:        test
   date:        * (glob)
@@ -323,7 +321,7 @@ Test force pushrebase sync
 -- master should now point to it
   $ hg log -r .
   commit:      cc83c88b72d3
-  bookmark:    default/master_bookmark
+  bookmark:    remote/master_bookmark
   hoistedname: master_bookmark
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000

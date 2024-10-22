@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {MessageBus} from './MessageBus';
 import type {ThemeColor} from './theme';
 import type {
   Disposable,
@@ -28,7 +29,7 @@ export interface Platform {
   platformName: PlatformName;
   confirm(message: string, details?: string): Promise<boolean>;
   openFile(path: RepoRelativePath, options?: {line?: OneIndexedLineNumber}): void;
-  openFiles(paths: Array<RepoRelativePath>, options?: {line?: OneIndexedLineNumber}): void;
+  openFiles(paths: ReadonlyArray<RepoRelativePath>, options?: {line?: OneIndexedLineNumber}): void;
   canCustomizeFileOpener: boolean;
   openContainingFolder?(path: RepoRelativePath): void;
   openDiff?(path: RepoRelativePath, comparison: Comparison): void;
@@ -60,12 +61,7 @@ export interface Platform {
    * may import any files without worrying about the platform being set up yet or not.
    */
   AdditionalDebugContent?: LazyExoticComponent<() => JSX.Element>;
-  /**
-   * Content to show in splash screen when starting ISL for the first time.
-   * Note: This should be lazy-loaded via `React.lazy()` so that implementations
-   * may import any files without worrying about the platform being set up yet or not.
-   */
-  GettingStartedContent?: LazyExoticComponent<({dismiss}: {dismiss: () => void}) => JSX.Element>;
+
   /**
    * Component representing additional buttons/info in the cwd menu,
    * used to show a button or hint about how to add more cwds.
@@ -83,6 +79,10 @@ export interface Platform {
     onDidChangeTheme(callback: (theme: ThemeColor) => unknown): Disposable;
     resetCSS?: string;
   };
+
+  messageBus: MessageBus;
+  /** In browser-like platforms, some ISL parameters are passed via URL query params */
+  initialUrlParams?: Map<InitialParamKeys, string>;
 }
 
 declare global {
@@ -91,9 +91,15 @@ declare global {
   }
 }
 
-// Non-browser platforms are defined by setting window.islPlatform
-// before the main ISL script loads.
-const foundPlatform = window.islPlatform ?? browserPlatform;
-window.islPlatform = foundPlatform;
+// [!] NOTE: On some platforms (vscode), this file is replaced at bundle time with a platform-specific implementation
+// of the Platform interface.
+// This file should have no other side effects than exporting the platform.
 
-export default foundPlatform;
+// However, non-vscode but non-browser platforms are defined by setting window.islPlatform
+// before the main ISL script loads.
+
+/** The ISL client Platform. This may be BrowserPlatform, VSCodeWebviewPlatform, or another platforms, determined at runtime.  */
+const platform = window.islPlatform ?? browserPlatform;
+window.islPlatform = platform;
+
+export default platform;

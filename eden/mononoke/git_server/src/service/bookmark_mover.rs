@@ -21,20 +21,24 @@ use import_tools::bookmark::BookmarkOperationErrorReporting;
 use import_tools::git_reader::GitReader;
 use import_tools::set_bookmark;
 use import_tools::BookmarkOperation;
+use mononoke_api::repo::push_redirector_enabled;
 use mononoke_api::repo::RepoContextBuilder;
 use mononoke_api::BookmarkKey;
 use mononoke_api::MononokeError;
 use mononoke_types::ChangesetId;
 use protocol::bookmarks_provider::wait_for_bookmark_move;
 use repo_authorization::AuthorizationContext;
+use repo_identity::RepoIdentityRef;
 
 use super::GitMappingsStore;
 use super::GitObjectStore;
 use crate::command::RefUpdate;
 use crate::model::RepositoryRequestContext;
 use crate::service::uploader::peel_tag_target;
+use crate::util::mononoke_source_of_truth;
 
 const HOOK_WIKI_LINK: &str = "https://fburl.com/wiki/mb4wtk1j";
+const COMMIT_CLOUD_REF: &str = "refs/commitcloud/upload";
 
 /// Struct representing a ref update (create, move, delete) operation
 pub struct RefUpdateOperation {
@@ -120,6 +124,12 @@ pub async fn set_refs(
             }
         })
         .collect::<Vec<_>>();
+    // Do one final check of SoT to ensure that we don't update the bookmark if the repo is locked or sourced in Metagit
+    if !mononoke_source_of_truth(&ctx, repo.clone()).await? {
+        return Err(anyhow::anyhow!(
+            "Mononoke is not the source of truth for this repo"
+        ));
+    }
     // Flag for client side expectation of allow non fast forward updates. Git clients by default
     // prevent users from pushing non-ffwd updates. If the request reaches the server, then that
     // means the client has explicitly requested for a non-ffwd update and the final result will be
@@ -157,6 +167,19 @@ async fn set_ref_inner(
         request_context.repo.clone(),
         request_context.mononoke_repos.clone(),
     );
+    // Check if the push is to a commit cloud ref, if yes then reject it with proper message
+    if ref_update_op.ref_update.ref_name == COMMIT_CLOUD_REF {
+        return Err(anyhow::anyhow!(
+            "Commit-cloud upload succeeded. Your commit is now backed up in Mononoke"
+        ));
+    }
+    // Check if push redirector is enabled, if it is then reject the push
+    if push_redirector_enabled(&ctx, repo.clone()).await? {
+        return Err(anyhow::anyhow!(
+            "Pushes to repo {0} are disallowed because its source of truth has been moved. Use `git pushrebase` or make changes directly in the repo where the source of truth was moved.",
+            repo.repo_identity().name()
+        ));
+    }
     // Create the repo context which is the pre-requisite for moving bookmarks
     let repo_context = RepoContextBuilder::new(ctx.clone(), repo.clone(), repos)
         .await
@@ -184,6 +207,12 @@ async fn set_ref_inner(
     )?;
     let bookmark_operation =
         BookmarkOperation::new(bookmark_key.clone(), old_changeset, new_changeset)?;
+    // Do one final check of SoT to ensure that we don't update the bookmark if the repo is locked or sourced in Metagit
+    if !mononoke_source_of_truth(&ctx, repo.clone()).await? {
+        return Err(anyhow::anyhow!(
+            "Mononoke is not the source of truth for this repo"
+        ));
+    }
     // Flag for client side expectation of allow non fast forward updates. Git clients by default
     // prevent users from pushing non-ffwd updates. If the request reaches the server, then that
     // means the client has explicitly requested for a non-ffwd update and the final result will be
@@ -244,7 +273,10 @@ async fn update_error(mappings_store: &GitMappingsStore, err: MononokeError) -> 
         MononokeError::NonFastForwardMove { bookmark, from, to } => {
             let from = git_sha_str(mappings_store, &from).await;
             let to = git_sha_str(mappings_store, &to).await;
-            anyhow::anyhow!("Non fast-forward bookmark move of '{bookmark}' from {from} to {to}")
+            anyhow::anyhow!(
+                "Non fast-forward bookmark move of '{bookmark}' from {from} to {to}\
+            \n\nFor more information about hooks and bypassing, refer {HOOK_WIKI_LINK}"
+            )
         }
         MononokeError::HookFailure(hook_rejections) => {
             let mut hook_msgs = vec![];

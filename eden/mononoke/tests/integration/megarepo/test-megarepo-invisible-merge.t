@@ -14,9 +14,9 @@ Setup repositories
   $ FBS_REPOID=1
   $ OVR_REPOID=2
 
-  $ NO_BOOKMARKS_CACHE=1 REPOID=$MEG_REPOID REPONAME=meg-mon setup_common_config $REPOTYPE
-  $ NO_BOOKMARKS_CACHE=1 REPOID=$FBS_REPOID REPONAME=fbs-mon setup_common_config $REPOTYPE
-  $ NO_BOOKMARKS_CACHE=1 REPOID=$OVR_REPOID REPONAME=ovr-mon setup_common_config $REPOTYPE
+  $ REPOID=$MEG_REPOID REPONAME=meg-mon setup_common_config $REPOTYPE
+  $ REPOID=$FBS_REPOID REPONAME=fbs-mon setup_common_config $REPOTYPE
+  $ REPOID=$OVR_REPOID REPONAME=ovr-mon setup_common_config $REPOTYPE
 
   $ setup_commitsyncmap
   $ setup_configerator_configs
@@ -39,11 +39,12 @@ Setup repositories
   > [extensions]
   > amend=
   > pushrebase=
-  > remotenames=
   > EOF
 
   $ function createfile { mkdir -p "$(dirname  $1)" && echo "$1" > "$1" && hg add -q "$1"; }
   $ function createfile_with_content { mkdir -p "$(dirname  $1)" && echo "$2" > "$1" && hg add -q "$1"; }
+
+  $ cd $TESTTMP
 
 -- init hg fbsource server repo
   $ cd $TESTTMP
@@ -121,14 +122,14 @@ Perform ovrsource pushrebase, make sure it is push-redirected into Megarepo
   updating bookmark master_bookmark
 -- pushredirected_1 was correctly pushed to master_bookmark in ovrsource
   $ log -r master_bookmark
-  @  pushredirected_1 [public;rev=1;bb12ff0dc64f] default/master_bookmark
+  @  pushredirected_1 [public;rev=1;bb12ff0dc64f] remote/master_bookmark
   │
   ~
 -- pushredirected_1 is also present in megarepo
   $ cd "$TESTTMP"/meg-hg-cnt
   $ hg pull -q
   $ log -r master_bookmark
-  o  pushredirected_1 [public;rev=1;4358fa9b678c] default/master_bookmark
+  o  pushredirected_1 [public;rev=1;4358fa9b678c] remote/master_bookmark
   │
   ~
 -- ensure that ovrsource root path ends up in megarepo's arvr-legacy
@@ -152,14 +153,14 @@ Perform ovrsource pushrebase, make sure it is push-redirected into Megarepo
   updating bookmark master_bookmark
 -- pushredirected_2 was correctly pushed to master_bookmark
   $ log -r master_bookmark
-  @  pushredirected_2 [public;rev=2;2d72ff1821dd] default/master_bookmark
+  @  pushredirected_2 [public;rev=2;2d72ff1821dd] remote/master_bookmark
   │
   ~
 -- pushredirected_2 is also present in the megarepo
   $ cd "$TESTTMP"/meg-hg-cnt
   $ hg pull -q
   $ log -r master_bookmark
-  o  pushredirected_2 [public;rev=2;538143697725] default/master_bookmark
+  o  pushredirected_2 [public;rev=2;538143697725] remote/master_bookmark
   │
   ~
 -- let's see what's where in megarepo
@@ -194,12 +195,12 @@ Add a new config version to "all" configs, this new version has fbsource as larg
 Prepare for the invisible merge
 1. Create an independent ovrsource DAG in fbsource
   $ cd "$TESTTMP/ovr-hg-cnt"
-# edenapi uses repo name from paths.default - wrong! disable for now.
   $ hg push -q \
+  >     --config experimental.narrow-heads=true \
+  >     --config pull.httpbookmarks=false \
   >     --config extensions.pushrebase=! \
   >     --to ovrsource/pre_move_master \
   >     --create --force -r . \
-  >     --config edenapi.url= \
   >     mono:fbs-mon
   warning: repository is unrelated
 1.5. Mark independent ovrsource DAG in fbsource as preserved
@@ -212,7 +213,7 @@ Prepare for the invisible merge
 
 2. Move files on top of the intermediate DAG
   $ cd "$TESTTMP/fbs-hg-cnt"
-  $ hg pull -q
+  $ hg pull -q -B ovrsource/pre_move_master
   $ hg up -q ovrsource/pre_move_master
   $ mkdir arvr-legacy .ovrsource-rest
   $ hg mv fbcode .ovrsource-rest/
@@ -354,7 +355,7 @@ Perform ovrsource pushrebase, make sure it is push-redirected into Fbsource
   updating bookmark master_bookmark
 -- pushredirected_3 was correctly pushed to master_bookmark in ovrsource
   $ log -r master_bookmark
-  @  pushredirected_3 [public;rev=4;4355e6b9eafb] default/master_bookmark
+  @  pushredirected_3 [public;rev=4;4355e6b9eafb] remote/master_bookmark
   │
   ~
 -- make the bookmark change visible to other repos. the cache invalidates
@@ -364,7 +365,7 @@ Perform ovrsource pushrebase, make sure it is push-redirected into Fbsource
   $ cd "$TESTTMP"/fbs-hg-cnt
   $ hg pull -q
   $ log -r master_bookmark
-  o  pushredirected_3 [public;rev=14;223e2529a7b8] default/master_bookmark
+  o  pushredirected_3 [public;rev=14;223e2529a7b8] remote/master_bookmark
   │
   ~
 -- ensure that ovrsource root path ends up in megarepo's arvr-legacy

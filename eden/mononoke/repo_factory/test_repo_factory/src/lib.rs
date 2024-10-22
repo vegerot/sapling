@@ -188,6 +188,7 @@ pub fn default_test_repo_config() -> RepoConfig {
                 "default".to_string() => derived_data_types_config.clone(),
                 "backfilling".to_string() => derived_data_types_config
             ],
+            derivation_queue_scuba_table: None,
         },
         infinitepush: InfinitepushParams {
             namespace: Some(InfinitepushNamespace::new(
@@ -639,20 +640,25 @@ impl TestRepoFactory {
     }
 
     /// Cross-repo sync manager for this repo
-    pub fn repo_cross_repo(
+    pub async fn repo_cross_repo(
         &self,
         synced_commit_mapping: &ArcSyncedCommitMapping,
+        repo_identity: &ArcRepoIdentity,
     ) -> Result<ArcRepoCrossRepo> {
         let live_commit_sync_config = self
             .live_commit_sync_config
             .clone()
             .unwrap_or_else(|| Arc::new(TestLiveCommitSyncConfig::new_empty()));
         let sync_lease = Arc::new(InProcessLease::new());
-        Ok(Arc::new(RepoCrossRepo::new(
+        let repo_xrepo = RepoCrossRepo::new(
             synced_commit_mapping.clone(),
             live_commit_sync_config,
             sync_lease,
-        )))
+            repo_identity.id(),
+        )
+        .await?;
+
+        Ok(Arc::new(repo_xrepo))
     }
 
     /// Test repo-handler-base

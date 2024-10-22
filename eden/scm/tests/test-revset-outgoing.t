@@ -57,6 +57,8 @@
   $ echo blue >> a
   $ hg ci -qm4
 
+  $ hg pull -q -r 3560197d8331
+
   $ tglog
   @  acadbdc73b28 '4'
   │

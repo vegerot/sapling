@@ -1726,7 +1726,6 @@ class Test(unittest.TestCase):
         # to give some division of output.
         output = output.split(b"\x1b[J")
         for i in range(len(output) - 1):
-
             output[i] += b" (clear)"
 
         return ret, [l for part in output for l in part.splitlines(True)]
@@ -1774,7 +1773,7 @@ class PythonTest(Test):
         debugargs = ""
         if self._options.debug:
             try:
-                import ipdb
+                pass
             except ImportError:
                 print(
                     "WARNING: ipdb is not available, not running %s under debug mode"
@@ -2326,6 +2325,8 @@ class DebugRunTestTest(Test):
             "-o",
             self.errpath,
         ]
+        if env.get("USE_MONONOKE"):
+            cmdargs += ["--ext", "sapling.testing.ext.mononoke"]
         vlog("# Running", shlex.join(cmdargs))
         exitcode, out = self._runcommand(cmdargs, env)
 
@@ -3140,7 +3141,7 @@ class TextTestRunner(unittest.TextTestRunner):
             return data
 
         for test in tests:
-            pread(bisectcmd + ["--reset"]),
+            (pread(bisectcmd + ["--reset"]),)
             pread(bisectcmd + ["--bad", "."])
             pread(bisectcmd + ["--good", self._runner.options.known_good_rev])
             # TODO: we probably need to forward more options

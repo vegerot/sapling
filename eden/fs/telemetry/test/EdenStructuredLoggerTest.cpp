@@ -11,6 +11,7 @@
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 
+#include "eden/common/telemetry/LogEvent.h"
 #include "eden/common/telemetry/ScribeLogger.h"
 
 using namespace facebook::eden;
@@ -26,13 +27,31 @@ struct TestScribeLogger : public ScribeLogger {
   }
 };
 
-struct TestLogEvent {
-  static constexpr const char* type = "test_event";
-
+struct TestLogEvent : public TestEvent {
   std::string str;
   int number = 0;
 
-  void populate(DynamicEvent& event) const {
+  TestLogEvent(std::string str, int number)
+      : str(std::move(str)), number(number) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addString("str", str);
+    event.addInt("number", number);
+  }
+
+  char const* getType() const override {
+    return "test_event";
+  }
+};
+
+struct TypelessTestLogEvent : public TypelessTestEvent {
+  std::string str;
+  int number = 0;
+
+  TypelessTestLogEvent(std::string str, int number)
+      : str(std::move(str)), number(number) {}
+
+  void populate(DynamicEvent& event) const override {
     event.addString("str", str);
     event.addInt("number", number);
   }
@@ -97,5 +116,42 @@ TEST_F(EdenStructuredLoggerTest, json_contains_types_at_top_level_and_values) {
           "os",
           "user",
           "type"));
+#endif
+}
+
+TEST_F(
+    EdenStructuredLoggerTest,
+    typeless_json_doesnt_contain_type_at_top_level) {
+  logger.logEvent(TypelessTestLogEvent{"another name", 12});
+  EXPECT_EQ(1, scribe->lines.size());
+  const auto& line = scribe->lines[0];
+  auto doc = folly::parseJson(line);
+  EXPECT_TRUE(doc.isObject());
+  EXPECT_THAT(keysOf(doc), UnorderedElementsAre("int", "normal"));
+
+  auto ints = doc["int"];
+  EXPECT_TRUE(ints.isObject());
+  EXPECT_THAT(
+      keysOf(ints), UnorderedElementsAre("time", "number", "session_id"));
+
+  auto normals = doc["normal"];
+  EXPECT_TRUE(normals.isObject());
+#if defined(__APPLE__)
+  EXPECT_THAT(
+      keysOf(normals),
+      UnorderedElementsAre(
+          "str",
+          "logged_by",
+          "edenver",
+          "host",
+          "osver",
+          "os",
+          "user",
+          "system_architecture"));
+#else
+  EXPECT_THAT(
+      keysOf(normals),
+      UnorderedElementsAre(
+          "str", "logged_by", "edenver", "host", "osver", "os", "user"));
 #endif
 }

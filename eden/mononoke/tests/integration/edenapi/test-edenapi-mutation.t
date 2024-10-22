@@ -8,7 +8,7 @@
   $ configure modern
   $ setconfig ui.ignorerevnum=false
 
-  $ setconfig pull.httpcommitgraph2=true pull.use-commit-graph=true clone.use-rust=true clone.use-commit-graph=true
+  $ setconfig pull.use-commit-graph=true clone.use-rust=true clone.use-commit-graph=true
 
 Set up local hgrc and Mononoke config, with commit cloud, http pull and upload.
   $ export READ_ONLY_REPO=1
@@ -62,7 +62,7 @@ Import and start mononoke
 Test mutations on client 1
   $ cd client1
   $ hg up 8b2dca0c8a72 -q
-  DEBUG pull::httpbookmarks: edenapi fetched bookmarks: {'master': None}
+  DEBUG pull::httpbookmarks: edenapi fetched bookmarks: {'master_bookmark': None}
   DEBUG pull::httphashlookup: edenapi hash lookups: ['8b2dca0c8a726d66bf26d47835a356cc4286facd']
   DEBUG pull::httpgraph: edenapi fetched 1 graph nodes
   DEBUG pull::httpgraph: edenapi fetched graph with known 0 draft commits
@@ -92,7 +92,7 @@ Test mutations on client 1
   $ hg debugapi -e commitmutations -i '["929f2b9071cf032d9422b3cce9773cbe1c574822"]'
   []
 Test phases from commitgraph
-  $ hg debugapi -e commitgraph2 -i '["f643b098cd183f085ba3e6107b6867ca472e87d1", "929f2b9071cf032d9422b3cce9773cbe1c574822"]' -i '[]' --sort
+  $ hg debugapi -e commitgraph -i '["f643b098cd183f085ba3e6107b6867ca472e87d1", "929f2b9071cf032d9422b3cce9773cbe1c574822"]' -i '[]' --sort
   [{"hgid": bin("8b2dca0c8a726d66bf26d47835a356cc4286facd"),
     "parents": [],
     "is_draft": False},
@@ -126,12 +126,12 @@ Test how they are propagated to client 2
   $ cd ../client2
   $ hg debugchangelog --migrate lazy
   $ hg pull -r f643b098cd18 -q
-  DEBUG pull::httpbookmarks: edenapi fetched bookmarks: {'master': None}
+  DEBUG pull::httpbookmarks: edenapi fetched bookmarks: {'master_bookmark': None}
   DEBUG pull::httphashlookup: edenapi hash lookups: ['f643b098cd183f085ba3e6107b6867ca472e87d1']
   DEBUG pull::httpgraph: edenapi fetched 2 graph nodes
   DEBUG pull::httpgraph: edenapi fetched graph with known 1 draft commits
   $ hg pull -r 929f2b9071cf -q
-  DEBUG pull::httpbookmarks: edenapi fetched bookmarks: {'master': None}
+  DEBUG pull::httpbookmarks: edenapi fetched bookmarks: {'master_bookmark': None}
   DEBUG pull::httphashlookup: edenapi hash lookups: ['929f2b9071cf032d9422b3cce9773cbe1c574822']
   DEBUG pull::httpgraph: edenapi fetched 1 graph nodes
   DEBUG pull::httpgraph: edenapi fetched graph with known 1 draft commits

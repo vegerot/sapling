@@ -46,6 +46,7 @@ use revsets::errors::RevsetLookupError;
 use revsets::utils as revset_utils;
 use rewrite_macros::cached_field;
 use storemodel::FileStore;
+use storemodel::SerializationFormat;
 use storemodel::StoreInfo;
 use storemodel::StoreOutput;
 use storemodel::TreeStore;
@@ -299,11 +300,22 @@ impl Repo {
 
     /// Private API used by `optional_eden_api` that bypasses checks about whether
     /// SaplingRemoteAPI should be used or not.
-    fn force_construct_eden_api(&self) -> Result<Arc<dyn SaplingRemoteApi>, SaplingRemoteApiError> {
+    fn force_construct_eden_api(
+        &self,
+        maybe_repo_url: Option<RepoUrl>,
+    ) -> Result<Arc<dyn SaplingRemoteApi>, SaplingRemoteApiError> {
         let eden_api = self.eden_api.get_or_try_init(
             || -> Result<Arc<dyn SaplingRemoteApi>, SaplingRemoteApiError> {
                 tracing::trace!(target: "repo::eden_api", "creating edenapi");
-                let eden_api = Builder::from_config(&self.config)?.build()?;
+                let mut builder = Builder::from_config(&self.config)?;
+                if let Some(path) = maybe_repo_url {
+                    if path.is_sapling_git() {
+                        if let Ok(url) = path.into_https_url() {
+                            builder = builder.server_url(Some(url));
+                        }
+                    }
+                }
+                let eden_api = builder.build()?;
                 tracing::info!(url=eden_api.url(), path=?self.path, "SaplingRemoteApi built");
                 Ok(eden_api)
             },
@@ -341,7 +353,7 @@ impl Repo {
                 // EagerRepo URLs (test:, eager: file path, dummyssh).
                 if EagerRepo::url_to_dir(&path).is_some() {
                     tracing::trace!(target: "repo::eden_api", "using EagerRepo at {}", &path);
-                    return Ok(Some(self.force_construct_eden_api()?));
+                    return Ok(Some(self.force_construct_eden_api(Some(path))?));
                 }
                 // Legacy tests are incompatible with SaplingRemoteAPI.
                 // They use None or file or ssh scheme with dummyssh.
@@ -370,9 +382,9 @@ impl Repo {
                 }
 
                 tracing::trace!(target: "repo::eden_api", "proceeding with path {}, reponame {:?}", path, self.config.get("remotefilelog", "reponame"));
+                Ok(Some(self.force_construct_eden_api(Some(path))?))
             }
         }
-        Ok(Some(self.force_construct_eden_api()?))
     }
 
     pub fn cas_client(&self) -> Result<Option<Arc<dyn CasClient>>> {
@@ -466,6 +478,14 @@ impl Repo {
             tracing::trace!(target: "repo::file_store", "no cas client");
         }
 
+        // Note: This currently does nothing, since the "git" repo requirement makes
+        // try_construct_file_tree_store return a GitStore. Therefore we never hit this code path.
+        let info: &dyn StoreInfo = self;
+        if info.has_requirement("git") {
+            tracing::trace!(target: "repo::file_store", "enabling git serialization");
+            file_builder = file_builder.format(SerializationFormat::Git);
+        }
+
         tracing::trace!(target: "repo::file_store", "building file store");
         let file_store = file_builder.build().context("when building FileStore")?;
 
@@ -524,6 +544,14 @@ impl Repo {
             tree_builder = tree_builder.filestore(file_store);
         } else {
             tracing::trace!(target: "repo::tree_store", "no filestore for aux fetching");
+        }
+
+        // Note: This currently does nothing, since the "git" repo requirement makes
+        // try_construct_file_tree_store return a GitStore. Therefore we never hit this code path.
+        let info: &dyn StoreInfo = self;
+        if info.has_requirement("git") {
+            tracing::trace!(target: "repo::tree_store", "enabling git serialization");
+            tree_builder = tree_builder.format(SerializationFormat::Git);
         }
 
         let ts = Arc::new(tree_builder.build()?);

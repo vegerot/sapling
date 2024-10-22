@@ -11,7 +11,10 @@ license = "GPLv2+"
 anyhow = "1.0.86"
 async-stream = "0.3"
 async_requests = { version = "0.1.0", path = "../../async_requests/lib" }
+async_requests_client = { version = "0.1.0", path = "../../async_requests/async_requests_client" }
 backsyncer = { version = "0.1.0", path = "../../commit_rewriting/backsyncer" }
+blame = { version = "0.1.0", path = "../../derived_data/blame" }
+blobrepo_hg = { version = "0.1.0", path = "../../blobrepo/blobrepo_hg" }
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 blobstore_factory = { version = "0.1.0", path = "../../blobstore/factory" }
 bonsai_blob_mapping = { version = "0.1.0", path = "../../repo_attributes/bonsai_blob_mapping" }
@@ -34,8 +37,7 @@ changeset_info = { version = "0.1.0", path = "../../derived_data/changeset_info"
 changesets_creation = { version = "0.1.0", path = "../../changesets/changesets_creation" }
 changesets_uploader = { version = "0.1.0", path = "../../cas_client/changesets_uploader" }
 chrono = { version = "0.4", features = ["clock", "serde", "std"], default-features = false }
-clap = { version = "4.5.11", features = ["derive", "env", "string", "unicode", "wrap_help"] }
-client = { version = "0.1.0", path = "../../async_requests/client" }
+clap = { version = "4.5.20", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cmdlib_cross_repo = { version = "0.1.0", path = "../../cmdlib/cross_repo" }
 cmdlib_displaying = { version = "0.1.0", path = "../../cmdlib/displaying" }
@@ -64,10 +66,12 @@ futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimen
 git_source_of_truth = { version = "0.1.0", path = "../../git_source_of_truth" }
 git_symbolic_refs = { version = "0.1.0", path = "../../git_symbolic_refs" }
 git_types = { version = "0.1.0", path = "../../git/git_types" }
-gix-hash = "0.14.2"
-gix-object = "0.44.0"
-itertools = "0.11.0"
+gix-hash = { git = "https://github.com/pierrechevalier83/gitoxide", rev = "a080348c2fefb7a300ec80f4481617f870065589" }
+gix-object = { git = "https://github.com/pierrechevalier83/gitoxide", rev = "a080348c2fefb7a300ec80f4481617f870065589" }
+itertools = "0.13.0"
+justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 manifest = { version = "0.1.0", path = "../../manifest" }
+maplit = "1.0"
 megarepo_error = { version = "0.1.0", path = "../../megarepo_api/megarepo_error" }
 mercurial_derivation = { version = "0.1.0", path = "../../derived_data/mercurial_derivation" }
 mercurial_types = { version = "0.1.0", path = "../../mercurial/types" }
@@ -98,9 +102,10 @@ repo_factory = { version = "0.1.0", path = "../../repo_factory" }
 repo_identity = { version = "0.1.0", path = "../../repo_attributes/repo_identity" }
 repo_lock = { version = "0.1.0", path = "../../repo_attributes/repo_lock/repo_lock" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
-serde_json = { version = "1.0.100", features = ["float_roundtrip", "unbounded_depth"] }
+serde_json = { version = "1.0.125", features = ["float_roundtrip", "unbounded_depth"] }
 skeleton_manifest = { version = "0.1.0", path = "../../derived_data/skeleton_manifest" }
 slog = { version = "2.7", features = ["max_level_trace", "nested-values"] }
+sorted_vector_map = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 source_control = { version = "0.1.0", path = "../../scs/if" }
 sql_commit_graph_storage = { version = "0.1.0", path = "../../repo_attributes/commit_graph/sql_commit_graph_storage" }
 sql_query_config = { version = "0.1.0", path = "../../repo_attributes/sql_query_config" }
@@ -112,7 +117,6 @@ walkdir = "2.3"
 
 [dev-dependencies]
 fbinit-tokio = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-maplit = "1.0"
 mononoke_macros = { version = "0.1.0", path = "../../mononoke_macros" }
 test_repo_factory = { version = "0.1.0", path = "../../repo_factory/test_repo_factory" }
 tests_utils = { version = "0.1.0", path = "../../tests/utils" }

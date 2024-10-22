@@ -45,7 +45,6 @@ from sapling import (
     progress,
     pycompat,
     registrar,
-    revset,
     revsetlang,
     scmutil,
     simplemerge,
@@ -56,6 +55,7 @@ from sapling import (
 )
 from sapling.i18n import _
 from sapling.node import hex, nullid, nullrev, short
+from sapling.utils import subtreeutil
 
 
 release = lock.release
@@ -705,6 +705,7 @@ class rebaseruntime:
 
         commitmsg = ctx.description()
         extra = {"rebase_source": ctx.hex()}
+        extra.update(subtreeutil.get_subtree_metadata(ctx.extra()))
         mutinfo = None
         if not self.keepf:
             mutop = "rebase"
@@ -1640,6 +1641,7 @@ def concludememorynode(
     if commitmsg is None:
         commitmsg = ctx.description()
     extra = {"rebase_source": ctx.hex()}
+    extra.update(subtreeutil.get_subtree_metadata(ctx.extra()))
     mutinfo = None
     if not keepf:
         mutop = "rebase"
@@ -1704,6 +1706,7 @@ def concludenode(
         if commitmsg is None:
             commitmsg = ctx.description()
         extra = {"rebase_source": ctx.hex()}
+        extra.update(subtreeutil.get_subtree_metadata(ctx.extra()))
         mutinfo = None
         if not keepf:
             mutop = "rebase"

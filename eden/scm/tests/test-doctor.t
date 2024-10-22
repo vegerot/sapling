@@ -12,9 +12,8 @@ Test indexedlogdatapack
   $ setconfig remotefilelog.server=true remotefilelog.serverexpiration=-1
 
   $ cd $TESTTMP
-  $ enable remotenames
   $ setconfig remotefilelog.debug=false remotefilelog.fetchpacks=true
-  $ setconfig diff.git=true experimental.narrow-heads=true mutation.record=true mutation.enabled=true visibility.enabled=1
+  $ setconfig diff.git=true mutation.record=true mutation.enabled=true visibility.enabled=1
 
 # prefer-edenapi-clonedata=false avoids metalog compaction that messes w/ metalog file layout
   $ hgcloneshallow ssh://user@dummy/master shallow -q --config clone.prefer-edenapi-clonedata=false

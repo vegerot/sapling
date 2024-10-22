@@ -9,7 +9,7 @@
 Set up local hgrc and Mononoke config.
   $ setup_common_config
   $ setup_configerator_configs
-  $ enable remotenames
+  $ setconfig remotenames.selectivepulldefault=master_bookmark,to_delete,create_bookmark
   $ cd $TESTTMP
 
 Initialize test repo.
@@ -61,7 +61,7 @@ Test move bookmark
 Inspect results
   $ hg pull -q
   $ hg log -G -T '{node} {desc} {remotenames}\n' -r "all()"
-  o  9bc730a19041f9ec7cb33c626e811aa233efb18c E default/master_bookmark default/to_delete
+  o  9bc730a19041f9ec7cb33c626e811aa233efb18c E remote/master_bookmark remote/to_delete
   │
   o  f585351a92f85104bff7c284233c338b10eb1df7 D
   │
@@ -79,7 +79,7 @@ Test delete bookmark
 Inspect results
   $ hg pull -q
   $ hg log -G -T '{node} {desc} {remotenames}\n' -r "all()"
-  o  9bc730a19041f9ec7cb33c626e811aa233efb18c E default/master_bookmark
+  o  9bc730a19041f9ec7cb33c626e811aa233efb18c E remote/master_bookmark
   │
   o  f585351a92f85104bff7c284233c338b10eb1df7 D
   │
@@ -97,13 +97,13 @@ Test create bookmark
 Inspect results
   $ hg pull -q
   $ hg log -G -T '{node} {desc} {remotenames}\n' -r "all()"
-  o  9bc730a19041f9ec7cb33c626e811aa233efb18c E default/master_bookmark
+  o  9bc730a19041f9ec7cb33c626e811aa233efb18c E remote/master_bookmark
   │
   o  f585351a92f85104bff7c284233c338b10eb1df7 D
   │
   o  26805aba1e600a82e93661149f2313866a221a7b C
   │
-  o  112478962961147124edd43549aedd1a335e44bf B default/create_bookmark
+  o  112478962961147124edd43549aedd1a335e44bf B remote/create_bookmark
   │
   o  426bada5c67598ca65036d57d9e4b64b0c1ce7a0 A
   
@@ -121,13 +121,13 @@ Test move bookmark failure (invalid from)
 Inspect results
   $ hg pull -q
   $ hg log -G -T '{node} {desc} {remotenames}\n' -r "all()"
-  o  9bc730a19041f9ec7cb33c626e811aa233efb18c E default/master_bookmark
+  o  9bc730a19041f9ec7cb33c626e811aa233efb18c E remote/master_bookmark
   │
   o  f585351a92f85104bff7c284233c338b10eb1df7 D
   │
   o  26805aba1e600a82e93661149f2313866a221a7b C
   │
-  o  112478962961147124edd43549aedd1a335e44bf B default/create_bookmark
+  o  112478962961147124edd43549aedd1a335e44bf B remote/create_bookmark
   │
   o  426bada5c67598ca65036d57d9e4b64b0c1ce7a0 A
   
@@ -141,13 +141,13 @@ Test delete bookmark failure (invalid from)
 Inspect results
   $ hg pull -q
   $ hg log -G -T '{node} {desc} {remotenames}\n' -r "all()"
-  o  9bc730a19041f9ec7cb33c626e811aa233efb18c E default/master_bookmark
+  o  9bc730a19041f9ec7cb33c626e811aa233efb18c E remote/master_bookmark
   │
   o  f585351a92f85104bff7c284233c338b10eb1df7 D
   │
   o  26805aba1e600a82e93661149f2313866a221a7b C
   │
-  o  112478962961147124edd43549aedd1a335e44bf B default/create_bookmark
+  o  112478962961147124edd43549aedd1a335e44bf B remote/create_bookmark
   │
   o  426bada5c67598ca65036d57d9e4b64b0c1ce7a0 A
   
@@ -161,13 +161,13 @@ Test create bookmark failure (already exists)
 Inspect results
   $ hg pull -q
   $ hg log -G -T '{node} {desc} {remotenames}\n' -r "all()"
-  o  9bc730a19041f9ec7cb33c626e811aa233efb18c E default/master_bookmark
+  o  9bc730a19041f9ec7cb33c626e811aa233efb18c E remote/master_bookmark
   │
   o  f585351a92f85104bff7c284233c338b10eb1df7 D
   │
   o  26805aba1e600a82e93661149f2313866a221a7b C
   │
-  o  112478962961147124edd43549aedd1a335e44bf B default/create_bookmark
+  o  112478962961147124edd43549aedd1a335e44bf B remote/create_bookmark
   │
   o  426bada5c67598ca65036d57d9e4b64b0c1ce7a0 A
   

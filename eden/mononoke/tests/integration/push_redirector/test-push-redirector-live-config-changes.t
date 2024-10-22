@@ -165,19 +165,19 @@ Normal pushrebase with one commit
   updated remote bookmark master_bookmark to 6989db12d1e5
 -- newcommit was correctly pushed to master_bookmark
   $ log -r master_bookmark
-  @  newcommit [public;rev=2;6989db12d1e5] default/master_bookmark
+  @  newcommit [public;rev=2;6989db12d1e5] remote/master_bookmark
   │
   ~
 
 -- newcommit is also present in the large repo (after a pull)
   $ cd "$TESTTMP"/large-hg-client
   $ log -r master_bookmark
-  o  first post-move commit [public;rev=3;bca7e9574548] default/master_bookmark
+  o  first post-move commit [public;rev=3;bca7e9574548] remote/master_bookmark
   │
   ~
   $ hg pull -q
   $ log -r master_bookmark
-  o  newcommit [public;rev=4;7c9a729ceb57] default/master_bookmark
+  o  newcommit [public;rev=4;7c9a729ceb57] remote/master_bookmark
   │
   ~
 
@@ -197,7 +197,7 @@ Live change of the config, without Mononoke restart
   * all is well! (glob)
   $ quiet_grep "all is well" -- megarepo_tool_multirepo --source-repo-id $REPOIDLARGE --target-repo-id $REPOIDSMALL1 check-push-redirection-prereqs master_bookmark master_bookmark TEST_VERSION_NAME_LIVE_V2
   * all is well! (glob)
-  $ mononoke_admin_source_target $REPOIDLARGE $REPOIDSMALL1 crossrepo pushredirection change-mapping-version \
+  $ mononoke_newadmin cross-repo --source-repo-id $REPOIDLARGE --target-repo-id $REPOIDSMALL1 pushredirection change-mapping-version \
   > --author author \
   > --large-repo-bookmark master_bookmark \
   > --version-name TEST_VERSION_NAME_LIVE_V2 \
@@ -238,7 +238,7 @@ Again, normal pushrebase with one commit
   $ hg up -q master_bookmark
   $ hg log -r master_bookmark
   commit:      * (glob)
-  bookmark:    default/master_bookmark
+  bookmark:    remote/master_bookmark
   hoistedname: master_bookmark
   user:        author
   date:        * (glob)

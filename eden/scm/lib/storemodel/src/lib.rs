@@ -40,13 +40,14 @@ pub use types;
 use types::fetch_mode::FetchMode;
 pub use types::tree::TreeItemFlag;
 use types::HgId;
+use types::Id20;
 use types::Key;
 use types::PathComponent;
 use types::PathComponentBuf;
 use types::RepoPath;
 
 /// Boxed dynamic iterator. Similar to `BoxStream`.
-pub type BoxIterator<'a, T> = Box<dyn Iterator<Item = T> + Send + 'a>;
+pub type BoxIterator<T> = Box<dyn Iterator<Item = T> + Send + 'static>;
 
 /// A store where content is indexed by "(path, hash)", aka "Key".
 pub trait KeyStore: Send + Sync {
@@ -64,9 +65,10 @@ pub trait KeyStore: Send + Sync {
         keys: Vec<Key>,
         _fetch_mode: FetchMode,
     ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, Bytes)>>> {
+        let store = self.clone_key_store();
         let iter = keys
             .into_iter()
-            .map(|k| match self.get_local_content(&k.path, k.hgid) {
+            .map(move |k| match store.get_local_content(&k.path, k.hgid) {
                 Err(e) => Err(e),
                 Ok(None) => Err(anyhow::format_err!(
                     "{}@{}: not found locally",
@@ -160,6 +162,7 @@ pub trait KeyStore: Send + Sync {
 
     /// Decides whether the store uses git or hg format.
     fn format(&self) -> SerializationFormat {
+        // TODO(cuev): Allow Git serialization format
         SerializationFormat::Hg
     }
 
@@ -173,6 +176,11 @@ pub trait KeyStore: Send + Sync {
     fn maybe_as_any(&self) -> Option<&dyn Any> {
         None
     }
+
+    /// Obtains a snapshot of the store state.
+    /// Usually it is just `Arc::clone` under the hood.
+    /// Used to relax lifetime requirements for various `BoxIterator` outputs.
+    fn clone_key_store(&self) -> Box<dyn KeyStore>;
 }
 
 /// A store for files.
@@ -259,12 +267,28 @@ pub trait FileStore: KeyStore + 'static {
         Ok(())
     }
 
+    /// Similar to `KeyStore::insert_data` with `opts.kind` set to `Kind::File`.
+    fn insert_file(
+        &self,
+        mut opts: InsertOpts,
+        path: &RepoPath,
+        data: &[u8],
+    ) -> anyhow::Result<HgId> {
+        opts.kind = Kind::File;
+        KeyStore::insert_data(self, opts, path, data)
+    }
+
     fn as_key_store(&self) -> &dyn KeyStore
     where
         Self: Sized,
     {
         self
     }
+
+    /// Obtains a snapshot of the store state.
+    /// Usually it is just `Arc::clone` under the hood.
+    /// Used to relax lifetime requirements for various `BoxIterator` outputs.
+    fn clone_file_store(&self) -> Box<dyn FileStore>;
 }
 
 #[async_trait]
@@ -350,9 +374,10 @@ pub trait TreeStore: KeyStore {
         keys: Vec<Key>,
         _fetch_mode: FetchMode,
     ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, Box<dyn TreeEntry>)>>> {
+        let store = self.clone_tree_store();
         let iter = keys
             .into_iter()
-            .map(|k| match self.get_local_tree(&k.path, k.hgid) {
+            .map(move |k| match store.get_local_tree(&k.path, k.hgid) {
                 Err(e) => Err(e),
                 Ok(None) => Err(anyhow::format_err!(
                     "{}@{}: not found locally",
@@ -374,17 +399,19 @@ pub trait TreeStore: KeyStore {
         keys: Vec<Key>,
         _fetch_mode: FetchMode,
     ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, TreeAuxData)>>> {
-        let iter = keys
-            .into_iter()
-            .map(|k| match self.get_local_tree_aux_data(&k.path, k.hgid) {
-                Err(e) => Err(e),
-                Ok(None) => Err(anyhow::format_err!(
-                    "{}@{}: not found locally",
-                    k.path,
-                    k.hgid
-                )),
-                Ok(Some(data)) => Ok((k, data)),
-            });
+        let store = self.clone_tree_store();
+        let iter =
+            keys.into_iter().map(
+                move |k| match store.get_local_tree_aux_data(&k.path, k.hgid) {
+                    Err(e) => Err(e),
+                    Ok(None) => Err(anyhow::format_err!(
+                        "{}@{}: not found locally",
+                        k.path,
+                        k.hgid
+                    )),
+                    Ok(Some(data)) => Ok((k, data)),
+                },
+            );
         Ok(Box::new(iter))
     }
 
@@ -428,13 +455,43 @@ pub trait TreeStore: KeyStore {
             Some(Ok((_k, aux))) => Ok(aux),
         }
     }
+
+    /// Similar to `KeyStore::insert_data` with `opts.kind` set to `Kind::Tree`.
+    fn insert_tree(
+        &self,
+        mut opts: InsertOpts,
+        path: &RepoPath,
+        items: Vec<(PathComponentBuf, Id20, TreeItemFlag)>,
+    ) -> anyhow::Result<Id20> {
+        opts.kind = Kind::Tree;
+        let data = basic_serialize_tree(items, self.format())?;
+        KeyStore::insert_data(self, opts, path, &data)
+    }
+
+    /// Obtains a snapshot of the store state.
+    /// Usually it is just `Arc::clone` under the hood.
+    /// Used to relax lifetime requirements for various `BoxIterator` outputs.
+    fn clone_tree_store(&self) -> Box<dyn TreeStore>;
 }
 
 /// Decides the serialization format. This exists so different parts of the code
 /// base can agree on how to generate a SHA1, how to lookup in a tree, etc.
 /// Ideally this information is private and the differences are behind
 /// abstractions too.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Default)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Hash,
+    Ord,
+    PartialOrd,
+    Default,
+    Serialize,
+    Deserialize
+)]
+#[serde(rename_all = "snake_case")]
 pub enum SerializationFormat {
     // Hg SHA1:
     //   SORTED_PARENTS CONTENT
@@ -469,10 +526,12 @@ pub struct InsertOpts {
     /// Parent hashes.
     /// For Hg it's required and affects SHA1.
     /// For Git it's a hint about the delta bases.
+    #[serde(default)]
     pub parents: Vec<HgId>,
 
     /// Whether this is a file or a tree.
     /// For Hg it's ignored. For Git it affects SHA1.
+    #[serde(default)]
     pub kind: Kind,
 
     /// Forced SHA1 to use. Mainly for testing purpose.
@@ -534,6 +593,10 @@ impl<T: FileStore + TreeStore> StoreOutput for Arc<T> {
 pub type StaticSerializedTreeParseFunc =
     fn(Bytes, SerializationFormat) -> anyhow::Result<Box<dyn TreeEntry>>;
 
+#[doc(hidden)]
+pub type StaticSerializeTreeFunc =
+    fn(Vec<(PathComponentBuf, Id20, TreeItemFlag)>, SerializationFormat) -> anyhow::Result<Bytes>;
+
 /// Parse a serialized git or hg tree into `TreeEntry`.
 /// This is basic parsing that does not provide `FileAuxData`.
 /// The actual implementation is elsewhere to avoid cyclic dependencies.
@@ -546,4 +609,16 @@ pub fn basic_parse_tree(
     let parse = TREE_PARSER
         .get_or_try_init(|| factory::call_constructor::<(), StaticSerializedTreeParseFunc>(&()))?;
     parse(data, format)
+}
+
+/// Serialize tree items to bytes.
+pub fn basic_serialize_tree(
+    items: Vec<(PathComponentBuf, Id20, TreeItemFlag)>,
+    format: SerializationFormat,
+) -> anyhow::Result<Bytes> {
+    // Only call `call_constructor` once to avoid overhead in `factory`.
+    static TREE_SERIALIZER: OnceCell<StaticSerializeTreeFunc> = OnceCell::new();
+    let serialize = TREE_SERIALIZER
+        .get_or_try_init(|| factory::call_constructor::<(), StaticSerializeTreeFunc>(&()))?;
+    serialize(items, format)
 }

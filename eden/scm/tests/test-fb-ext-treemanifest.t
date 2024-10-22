@@ -4,6 +4,7 @@
 
 #chg-compatible
 
+
   $ . "$TESTDIR/library.sh"
 
 
@@ -15,6 +16,7 @@
   > EOF
   $ echo x > x
   $ hg commit -qAm 'add x'
+  $ hg book master
   $ cd ..
 
   $ hgcloneshallow ssh://user@dummy/master client -q --noupdate
@@ -39,7 +41,6 @@ Test autocreatetrees
 TODO(meyer): Fix debugindexedlogdatastore and debugindexedloghistorystore and add back output here.
 
 Test that commit creates local trees
-  $ hg up -q tip
   $ echo z >> subdir/z
   $ hg commit -qAm 'modify subdir/z'
 TODO(meyer): Fix debugindexedlogdatastore and debugindexedloghistorystore and add back output here.

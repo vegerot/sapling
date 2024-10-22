@@ -1,11 +1,13 @@
-#modern-config-incompatible
-#inprocess-hg-incompatible
-
 #require no-eden
 
+Dummy SSH issues on Windows
+#inprocess-hg-incompatible
+
+Eagerepo doesn't support pushrebase yet.
+  $ rm $TESTTMP/.eagerepo
 
   $ configure dummyssh
-  $ enable pushrebase amend remotenames
+  $ enable pushrebase amend
   $ setconfig experimental.evolution=obsolete
   $ setconfig experimental.narrow-heads=true
   $ setconfig visibility.enabled=true

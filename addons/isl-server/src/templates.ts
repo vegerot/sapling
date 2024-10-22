@@ -43,10 +43,9 @@ export const FIELDS = {
   remoteBookmarks: `{remotenames % '{remotename}${ESCAPED_NULL_CHAR}'}`,
   parents: `{parents % "{node}${ESCAPED_NULL_CHAR}"}`,
   isDot: `{ifcontains(rev, revset('.'), '${WDIR_PARENT_MARKER}')}`,
-  // Getting file statuses can be expensive. We don't really need files sample for public commits, so just skip those.
-  filesAdded: `{ifeq(phase, 'draft', file_adds|json, '[]')}`,
-  filesModified: `{ifeq(phase, 'draft', file_mods|json, '[]')}`,
-  filesRemoved: `{ifeq(phase, 'draft', file_dels|json, '[]')}`,
+  // We don't need files for public commits, and public commits are sometimes gigantic codemods without you realizing.
+  // No need to fetch if not draft.
+  files: `{ifeq(phase, 'draft', join(files,'${ESCAPED_NULL_CHAR}'), '')}`,
   totalFileCount: '{files|count}', // We skip getting files for public commits, but we still want to know how many files there would be
   successorInfo: '{mutations % "{operation}:{successors % "{node}"},"}',
   closestPredecessors: '{predecessors % "{node},"}',
@@ -79,20 +78,7 @@ export function parseCommitInfoOutput(
       if (lines.length < Object.keys(FIELDS).length) {
         continue;
       }
-      const files: Array<ChangedFile> = [
-        ...(JSON.parse(lines[FIELD_INDEX.filesModified]) as Array<string>).map(path => ({
-          path,
-          status: 'M' as const,
-        })),
-        ...(JSON.parse(lines[FIELD_INDEX.filesAdded]) as Array<string>).map(path => ({
-          path,
-          status: 'A' as const,
-        })),
-        ...(JSON.parse(lines[FIELD_INDEX.filesRemoved]) as Array<string>).map(path => ({
-          path,
-          status: 'R' as const,
-        })),
-      ];
+      const files = lines[FIELD_INDEX.files].split(NULL_CHAR).filter(e => e.length > 0);
 
       // Find if the commit is entirely within the cwd and therefore mroe relevant to the user.
       // Note: this must be done on the server using the full list of files, not just the sample that the client gets.
@@ -109,7 +95,7 @@ export function parseCommitInfoOutput(
         bookmarks: splitLine(lines[FIELD_INDEX.bookmarks]),
         remoteBookmarks: splitLine(lines[FIELD_INDEX.remoteBookmarks]),
         isDot: lines[FIELD_INDEX.isDot] === WDIR_PARENT_MARKER,
-        filesSample: files.slice(0, MAX_FETCHED_FILES_PER_COMMIT),
+        filePathsSample: files.slice(0, MAX_FETCHED_FILES_PER_COMMIT),
         totalFileCount: parseInt(lines[FIELD_INDEX.totalFileCount], 10),
         successorInfo: parseSuccessorData(lines[FIELD_INDEX.successorInfo]),
         closestPredecessors: splitLine(lines[FIELD_INDEX.closestPredecessors], ','),
@@ -137,22 +123,22 @@ export function parseCommitInfoOutput(
  * See {@link CommitInfo}.maxCommonPathPrefix
  * TODO: This could be cached by commit hash
  */
-export function findMaxCommonPathPrefix(files: Array<ChangedFile>): RepoRelativePath {
+export function findMaxCommonPathPrefix(filePaths: Array<RepoRelativePath>): RepoRelativePath {
   let max: null | Array<string> = null;
   let maxLength = 0;
 
   // Path module separator should match what `sl` gives us
   const sep = path.sep;
 
-  for (const file of files) {
+  for (const path of filePaths) {
     if (max == null) {
-      max = file.path.split(sep);
+      max = path.split(sep);
       max.pop(); // ignore file part, only care about directory
       maxLength = max.reduce((acc, part) => acc + part.length + 1, 0); // +1 for slash
       continue;
     }
     // small optimization: we only need to look as long as the max so far, max common path will always be shorter
-    const parts = file.path.slice(0, maxLength).split(sep);
+    const parts = path.slice(0, maxLength).split(sep);
     for (const [i, part] of parts.entries()) {
       if (part !== max[i]) {
         max = max.slice(0, i);

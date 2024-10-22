@@ -3,7 +3,6 @@
 #require no-eden
 
 
-
   $ . "$TESTDIR/library.sh"
 
 Set up the server
@@ -13,7 +12,6 @@ Set up the server
   $ cat >> .hg/hgrc <<EOF
   > [extensions]
   > pushrebase=
-  > remotenames=
   > [remotefilelog]
   > server=true
   > shallowtrees=true
@@ -21,6 +19,7 @@ Set up the server
 
   $ echo 1 > x
   $ hg commit -Aqm x1
+  $ hg book master
 
 Create client
   $ cd ..
@@ -31,7 +30,6 @@ Create client
   > [extensions]
   > amend=
   > pushrebase=
-  > remotenames=
   > EOF
 
 Create a commit, and then amend the message twice.  All three should share a manifest.

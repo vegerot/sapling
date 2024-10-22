@@ -277,9 +277,17 @@ impl KeyStore for TestHistory {
     fn format(&self) -> SerializationFormat {
         SerializationFormat::Git
     }
+
+    fn clone_key_store(&self) -> Box<dyn KeyStore> {
+        Box::new(self.clone())
+    }
 }
 
-impl TreeStore for TestHistory {}
+impl TreeStore for TestHistory {
+    fn clone_tree_store(&self) -> Box<dyn TreeStore> {
+        Box::new(self.clone())
+    }
+}
 
 #[async_trait]
 impl ReadRootTreeIds for TestHistory {

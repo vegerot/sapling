@@ -19,7 +19,6 @@ import re
 import socket
 import tempfile
 import time
-from collections import defaultdict
 
 import bindings
 
@@ -34,7 +33,6 @@ from . import (
     revsetlang,
     similar,
     smartset,
-    url,
     util,
     vfs,
     visibility,
@@ -69,7 +67,6 @@ class status(tuple):
         clean,
         invalid_path=None,
     ):
-
         for files in (modified, added, removed, deleted, unknown, ignored, clean):
             assert all(isinstance(f, str) for f in files)
 
@@ -1569,30 +1566,12 @@ def rootrelpaths(ctx, paths):
     return [rootrelpath(ctx, path) for path in paths]
 
 
-def validate_path_exist(ui, ctx, paths, abort_on_missing=False):
-    """Validate that the given path exists in the given context."""
-    for p in paths:
-        if not (p in ctx or ctx.hasdir(p)):
-            msg = _("path '%s' does not exist in commit %s") % (p, ctx)
-            if abort_on_missing:
-                raise error.Abort(msg)
-            else:
-                ui.status(msg + "\n")
-
-
-def validate_path_size(from_paths, to_paths, abort_on_empty=False):
-    if len(from_paths) != len(to_paths):
-        raise error.Abort(_("must provide same number of --from-path and --to-path"))
-
-    if abort_on_empty and not from_paths:
-        raise error.Abort(_("must provide --from-path and --to-path"))
-
-
-def validate_path_overlap(to_paths):
-    # Disallow overlapping --to-path to keep things simple.
-    to_dirs = util.dirs(to_paths)
-    seen = set()
-    for p in to_paths:
-        if p in to_dirs or p in seen:
-            raise error.Abort(_("overlapping --to-path entries"))
-        seen.add(p)
+def walkfiles(repo, walkctx, matcher, base=None):
+    """Return a list (path, filenode) pairs that match the matcher in the given context."""
+    mf = walkctx.manifest()
+    if base is None and hasattr(mf, "walkfiles"):
+        # If there is no base, skip diff and use more efficient walk.
+        return mf.walkfiles(matcher)
+    else:
+        basemf = repo[base or nullid].manifest()
+        return [(p, n[0]) for p, (n, _o) in mf.diff(basemf, matcher).items() if n[0]]

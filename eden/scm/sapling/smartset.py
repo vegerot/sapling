@@ -19,7 +19,7 @@ import bindings
 
 from . import error, parser, streams, util
 from .i18n import _
-from .node import nullrev, wdirrev
+from .node import nullrev
 from .pycompat import range
 
 
@@ -574,7 +574,7 @@ class nameset(abstractsmartset):
         datarepr=None,
         istopo=False,
         preserve_order=None,
-        repo=None
+        repo=None,
     ):
         """Initialize nameset (Rust ``dag::Set`` wrapper) for Python smartset.
 

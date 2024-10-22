@@ -7,7 +7,7 @@
   $ . "$TESTDIR/infinitepush/library.sh"
   $ setupcommon
 
-  $ enable crdump remotenames
+  $ enable crdump
   $ setconfig crdump.commitcloud=true
 
 Setup server
@@ -23,7 +23,7 @@ Setup server
 
 commit_cloud should be false when commitcloud is broken
   $ setconfig treemanifest.http=0
-  $ hg debugcrdump -r . --config paths.default=xxxxx | grep commit_cloud
+  $ hg debugcrdump -r . --config experimental.upload-mutations=invalid | grep commit_cloud
               "commit_cloud": false,
 
 debugcrdump should upload the commit and commit_cloud should be true when

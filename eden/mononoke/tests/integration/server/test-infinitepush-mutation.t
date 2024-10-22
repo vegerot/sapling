@@ -11,7 +11,7 @@ setup configuration
   $ cd $TESTTMP
 
 setup common configuration for these tests
-  $ enable amend infinitepush commitcloud remotenames
+  $ enable amend infinitepush commitcloud
   $ setconfig ui.ssh="\"$DUMMYSSH\""
   $ setconfig mutation.date="0 0" mutation.enabled=true mutation.record=true visibility.enabled=true
   $ setconfig experimental.evolution=obsolete
@@ -43,11 +43,9 @@ start mononoke
 
   $ start_and_wait_for_mononoke_server
   $ cd $TESTTMP/repo-push
-  $ enable remotenames
   $ setconfig infinitepush.server=false infinitepush.branchpattern="re:scratch/.+"
 
   $ cd $TESTTMP/repo-pull
-  $ enable remotenames
   $ setconfig infinitepush.server=false infinitepush.branchpattern="re:scratch/.+"
 
 Do initial infinitepush of a small stack
@@ -100,9 +98,6 @@ Pull the amended stack to the other repo
   $ hg pull -r a24671c3bce2
   pulling from mono:repo
   searching for changes
-  adding changesets
-  adding manifests
-  adding file changes
   $ tglogp
   o  a24671c3bce2 draft 'B1'
   │
@@ -138,9 +133,6 @@ Pull the amended stack to the other repo.
   $ hg pull -r 647398
   pulling from mono:repo
   searching for changes
-  adding changesets
-  adding manifests
-  adding file changes
   $ tglogm
   o  6473983c899c 'B1'
   │
@@ -187,9 +179,6 @@ Pull the modified stack to the other repo.
   $ hg pull -r 853e5ba9bd35
   pulling from mono:repo
   searching for changes
-  adding changesets
-  adding manifests
-  adding file changes
   $ tglogm
   o  853e5ba9bd35 'B1'
   │

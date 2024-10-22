@@ -2702,7 +2702,7 @@ def _dograft(ui, repo, *revs, **opts):
         if node is None:
             # users might provide wrong from paths, this validate function will
             # provide more info for users to understand why no changes to commit
-            scmutil.validate_path_exist(ui, ctx, from_paths)
+            subtreeutil.validate_path_exist(ui, ctx, from_paths)
             ui.warn(_("note: graft of %s created no changes to commit\n") % (ctx))
 
     # remove state when we complete successfully
@@ -4919,6 +4919,7 @@ def _newpull(ui, repo, source, **opts):
         bookmarknames=bmarks,
         headnames=revs,
         quiet=False,
+        force=opts.get("force"),
     )
     newlen = len(repo)
 
@@ -5234,7 +5235,7 @@ def remove(ui, repo, *pats, **opts):
         raise error.Abort(_("no files specified"))
 
     m = scmutil.match(repo[None], pats, opts)
-    return cmdutil.remove(ui, repo, m, "", mark, force)
+    return cmdutil.remove(ui, repo, m, mark, force)
 
 
 @command(

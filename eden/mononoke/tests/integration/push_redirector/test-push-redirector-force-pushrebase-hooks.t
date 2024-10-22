@@ -39,6 +39,8 @@
   Starting Mononoke server
   $ init_local_large_small_clones
 
+  $ setconfig remotenames.selectivepulldefault=master_bookmark,bookprefix/test_bookmark,test_bookmark
+
 We can't force pushrebase to a shared bookmark, so create a test bookmark that only belongs
 to the small repo
   $ cd "$TESTTMP/small-hg-client"
@@ -54,7 +56,7 @@ blocked by deny_files
   moving remote bookmark test_bookmark from 11f848659bfc to ce81c7d38286
 -- newcommit was correctly pushed to test_bookmark
   $ log -r test_bookmark
-  @  newcommit [public;rev=2;ce81c7d38286] default/test_bookmark
+  @  newcommit [public;rev=2;ce81c7d38286] remote/test_bookmark
   │
   ~
 
@@ -62,7 +64,7 @@ blocked by deny_files
   $ cd "$TESTTMP"/large-hg-client
   $ hg pull -q
   $ log -r bookprefix/test_bookmark
-  o  newcommit [public;rev=3;819e91b238b7] default/bookprefix/test_bookmark
+  o  newcommit [public;rev=3;819e91b238b7] remote/bookprefix/test_bookmark
   │
   ~
 - compare the working copies
@@ -118,7 +120,7 @@ Commit has been backsynced
   $ cd "$TESTTMP"/small-hg-client
   $ hg pull -q
   $ log -r master_bookmark
-  o  backsync [public;rev=4;cd9bfa9f25eb] default/master_bookmark
+  o  backsync [public;rev=4;cd9bfa9f25eb] remote/master_bookmark
   │
   ~
 

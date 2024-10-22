@@ -47,8 +47,6 @@ start mononoke
 Do infinitepush (aka commit cloud) push
   $ cd repo-push
   $ cat >> .hg/hgrc <<EOF
-  > [extensions]
-  > remotenames=
   > [infinitepush]
   > server=False
   > branchpattern=re:scratch/.+
@@ -102,8 +100,6 @@ Bookmark push should have been ignored
 Commit should have been accepted
   $ cd ../repo-pull
   $ cat >> .hg/hgrc <<EOF
-  > [extensions]
-  > remotenames=
   > [infinitepush]
   > server=False
   > branchpattern=re:scratch/.+
@@ -111,6 +107,3 @@ Commit should have been accepted
   $ hg pull -r 47da8b81097c5534f3eb7947a8764dd323cffe3d
   pulling from mono:repo
   searching for changes
-  adding changesets
-  adding manifests
-  adding file changes

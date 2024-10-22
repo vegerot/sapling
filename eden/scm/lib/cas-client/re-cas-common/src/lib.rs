@@ -14,6 +14,7 @@ pub use tracing;
 pub use types::Blake3;
 pub use types::CasDigest;
 pub use types::CasDigestType;
+pub use types::CasFetchedStats;
 
 #[macro_export]
 macro_rules! re_client {
@@ -26,6 +27,8 @@ macro_rules! re_client {
         use re_client_lib::TCode;
         use re_client_lib::TDigest;
         use re_client_lib::THashAlgo;
+        use re_client_lib::TStorageBackendType;
+        use re_client_lib::TStorageBackendStats;
 
         impl $struct {
             fn client(&self) -> Result<&REClient> {
@@ -49,16 +52,30 @@ macro_rules! re_client {
             })
         }
 
+        fn parse_stats(stats_entries: impl Iterator<Item=(TStorageBackendType, TStorageBackendStats)>) -> $crate::CasFetchedStats {
+            let mut stats = $crate::CasFetchedStats::default();
+            for (backend, dstats) in stats_entries {
+                match backend {
+                        TStorageBackendType::ZDB => {stats.total_bytes_zdb += dstats.bytes as u64; stats.queries_zdb += dstats.queries_count as u64}
+                        TStorageBackendType::ZGATEWAY => {stats.total_bytes_zgw += dstats.bytes as u64; stats.queries_zgw += dstats.queries_count as u64}
+                        TStorageBackendType::MANIFOLD => {stats.total_bytes_manifold += dstats.bytes as u64; stats.queries_manifold += dstats.queries_count as u64}
+                        TStorageBackendType::HEDWIG => {stats.total_bytes_hedwig += dstats.bytes as u64; stats.queries_hedwig += dstats.queries_count as u64 }
+                        _ => {}
+                }
+            }
+            stats
+        }
+
         #[$crate::async_trait]
         impl $crate::CasClient for $struct {
             async fn fetch<'a>(
                 &'a self,
                 digests: &'a [$crate::CasDigest],
                 log_name: $crate::CasDigestType,
-            ) -> BoxStream<'a, $crate::Result<Vec<($crate::CasDigest, Result<Option<Vec<u8>>>)>>>
+            ) -> BoxStream<'a, $crate::Result<($crate::CasFetchedStats, Vec<($crate::CasDigest, Result<Option<Vec<u8>>>)>)>>
             {
                 stream::iter(split_up_to_max_bytes(digests, self.fetch_limit.value()))
-                    .then(move |digests| async move {
+                    .map(move |digests| async move {
                         $crate::tracing::debug!(target: "cas", concat!(stringify!($struct), " fetching {} {}(s)"), digests.len(), log_name);
 
                         let request = DownloadRequest {
@@ -67,10 +84,13 @@ macro_rules! re_client {
                             ..Default::default()
                         };
 
-                        self.client()?
+                        let response = self.client()?
                             .download(self.metadata.clone(), request)
-                            .await?
-                            .inlined_blobs
+                            .await?;
+
+                        let stats = parse_stats(response.storage_stats.per_backend_stats.into_iter());
+
+                        let data = response.inlined_blobs
                             .unwrap_or_default()
                             .into_iter()
                             .map(|blob| {
@@ -89,8 +109,11 @@ macro_rules! re_client {
                                     )),
                                 }
                             })
-                            .collect::<$crate::Result<Vec<_>>>()
+                            .collect::<$crate::Result<Vec<_>>>()?;
+
+                        Ok((stats, data))
                     })
+                    .buffer_unordered(self.fetch_concurrency)
                     .boxed()
             }
         }

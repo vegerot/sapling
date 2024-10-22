@@ -3,6 +3,7 @@
 #require no-eden
 
 #inprocess-hg-incompatible
+
   $ setconfig devel.segmented-changelog-rev-compat=true
   $ configure mutation dummyssh
 
@@ -12,7 +13,6 @@ Set up server repository
   $ cat >> .hg/hgrc << EOF
   > [extensions]
   > pushrebase=
-  > remotenames = !
   > EOF
   $ echo foo > a
   $ echo foo > b
@@ -24,14 +24,14 @@ Set up server repository
 
 Set up client repository
 
-  $ hg clone --config 'extensions.remotenames=' ssh://user@dummy/server client -q
+  $ hg clone ssh://user@dummy/server client -q
   $ cp -R server server1
-  $ hg clone --config 'extensions.remotenames=' ssh://user@dummy/server1 client1 -q
+  $ hg clone ssh://user@dummy/server1 client1 -q
 
 Test that pushing to a remotename preserves commit hash if no rebase happens
 
   $ cd client1
-  $ setconfig extensions.remotenames= extensions.pushrebase=
+  $ setconfig extensions.pushrebase=
   $ hg up -q master
   $ echo x >> a && hg commit -qm 'add a'
   $ hg commit --amend -qm 'changed message'
@@ -51,7 +51,7 @@ Test that pushing to a remotename preserves commit hash if no rebase happens
   $ hg log -r . -T '{node}\n'
   a59527fd0ae5acd6fe09597193f5eb3e01113f22
   $ hg log -G -r 'all()' -T '{desc} {remotebookmarks} {bookmarks}'
-  @  changed message default/master
+  @  changed message remote/master
   │
   o  initial
   
@@ -65,16 +65,16 @@ Test that pushing to a remotename gets rebased
   $ cd ../client
   $ cat >> .hg/hgrc << EOF
   > [extensions]
-  > remotenames =
   > pushrebase=
   > [remotenames]
   > allownonfastforward=True
+  > selectivepulldefault=master,newbook,bm
   > EOF
   $ echo x >> b && hg commit -m "client's commit"
   $ hg log -G -T '"{desc}" {remotebookmarks}'
   @  "client's commit"
   │
-  o  "initial" default/master
+  o  "initial" remote/master
   
 
  (disable remotenames.racy-pull-on-push so we can check pushrebase's fallback behavior on updating remotenames)
@@ -88,11 +88,11 @@ Test that pushing to a remotename gets rebased
   remote: pushing 1 changeset:
   remote:     5c3cfb78df2f  client's commit
   remote: 2 new changesets from the server will be downloaded
-  moving remote bookmark 'default/master' to 98d6f1036c3b
+  moving remote bookmark 'remote/master' to 98d6f1036c3b
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
   $ hg log -G -T '"{desc}" {remotebookmarks}'
-  @  "client's commit" default/master
+  @  "client's commit" remote/master
   │
   o  "master's commit"
   │
@@ -132,7 +132,7 @@ Test pushing a new bookmark
   o  "initial"
   
   $ hg log -R client -G -r 'all()' -T '{desc} {remotebookmarks}'
-  @  client's commit default/master default/newbook
+  @  client's commit remote/master remote/newbook
   │
   o  master's commit
   │
@@ -153,7 +153,7 @@ Test doing a non-fastforward bookmark move
   o  "initial"
   
   $ hg log -R client -G -r 'all()' -T '{desc} {remotebookmarks} {bookmarks}'
-  @  client's commit default/master default/newbook
+  @  client's commit remote/master remote/newbook
   │
   o  master's commit
   │
@@ -226,7 +226,7 @@ Test a push that comes with out-of-date bookmark discovery
   o  "aa"
   
   $ hg -R client log -G -T '"{desc}" {bookmarks} {remotenames}'
-  @  "cc"  default/bm
+  @  "cc"  remote/bm
   │
   o  "bb"
   │
@@ -264,13 +264,12 @@ Test force pushes
   $ cat >> .hg/hgrc <<EOF
   > [extensions]
   > pushrebase=
-  > remotenames = !
   > EOF
   $ echo a > a && hg commit -Aqm a
   $ hg book master
   $ cd ..
 
-  $ hg clone -q --config 'extensions.remotenames=' ssh://user@dummy/forcepushserver forcepushclient
+  $ hg clone -q ssh://user@dummy/forcepushserver forcepushclient
   $ cd forcepushserver
   $ echo a >> a && hg commit -Aqm aa
 
@@ -278,7 +277,6 @@ Test force pushes
   $ cat >> .hg/hgrc <<EOF
   > [extensions]
   > pushrebase=
-  > remotenames =
   > [remotenames]
   > allownonfastforward=True
   > EOF
@@ -297,21 +295,14 @@ Test force pushes
   remote: 1 new changeset from the server will be downloaded
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ hg log -G -r 'all()' -T '{desc} {remotebookmarks} {bookmarks}'
-  @  b default/master
+  @  b remote/master
   │
   o  a
   
-  $ hg pull
-  pulling from * (glob)
-  searching for changes
-  adding changesets
-  adding manifests
-  adding file changes
+  $ hg pull -q
   $ hg log -G -T '{desc} {remotebookmarks}'
-  o  aa
+  @  b remote/master
   │
-  │ @  b default/master
-  ├─╯
   o  a
   
   $ cd ..
@@ -321,17 +312,15 @@ Test 'hg push' with a tracking bookmark
   $ cat >> .hg/hgrc <<EOF
   > [extensions]
   > pushrebase=
-  > remotenames = !
   > EOF
   $ echo a > a && hg commit -Aqm a
   $ hg book master
   $ cd ..
-  $ hg clone --config 'extensions.remotenames=' -q ssh://user@dummy/trackingserver trackingclient
+  $ hg clone -q ssh://user@dummy/trackingserver trackingclient
   $ cd trackingclient
   $ cat >> .hg/hgrc <<EOF
   > [extensions]
   > pushrebase=
-  > remotenames =
   > [remotenames]
   > allownonfastforward=True
   > EOF
@@ -362,19 +351,14 @@ Test 'hg push' with a tracking bookmark
 
 Test push --to to a repo without pushrebase on (i.e. the default remotenames behavior)
   $ newserver oldserver
-  $ cat >> .hg/hgrc <<EOF
-  > [extensions]
-  > remotenames =
-  > EOF
   $ echo a > a && hg commit -Aqm a
   $ hg book serverfeature
   $ cd ..
-  $ hg clone --config 'extensions.remotenames=' -q ssh://user@dummy/oldserver newclient
+  $ hg clone -q ssh://user@dummy/oldserver newclient
   $ cd newclient
   $ cat >> .hg/hgrc <<EOF
   > [extensions]
   > pushrebase=
-  > remotenames =
   > EOF
   $ hg book clientfeature -t default/serverfeature
   $ echo b > b && hg commit -Aqm b
@@ -403,7 +387,6 @@ that requires pushrebase.
   $ newserver pushrebaseserver
   $ cat >> .hg/hgrc <<EOF
   > [extensions]
-  > remotenames =
   > pushrebase=
   > [pushrebase]
   > blocknonpushrebase = True
@@ -411,12 +394,11 @@ that requires pushrebase.
   $ echo a > a && hg commit -Aqm a
   $ hg book serverfeature
   $ cd ..
-  $ hg clone --config 'extensions.remotenames=' -q ssh://user@dummy/pushrebaseserver remotenamesonlyclient
+  $ hg clone -q ssh://user@dummy/pushrebaseserver remotenamesonlyclient
   $ cd remotenamesonlyclient
   $ cat >> .hg/hgrc <<EOF
   > [extensions]
   > pushrebase=!
-  > remotenames =
   > EOF
   $ hg book clientfeature -t default/serverfeature
   $ echo b > b && hg commit -Aqm b

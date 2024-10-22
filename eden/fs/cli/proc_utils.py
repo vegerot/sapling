@@ -259,7 +259,7 @@ class UnixProcUtils(ProcUtils):
 
         # Note that the command may be just "edenfs" rather than a path, but it
         # works out fine either way.
-        return os.path.basename(comm) in ("edenfs", "fake_edenfs")
+        return "eden" in os.path.basename(comm)
 
     def _get_process_command(self, pid: int) -> Optional[str]:
         try:
@@ -344,7 +344,6 @@ class MacProcUtils(UnixProcUtils):
         pid_to_eden_dir = self.get_eden_dir_mapping(pids)
 
         for uid, pid, cmdline in zip(uids, pids, cmds):
-
             if pid in pid_to_eden_dir:
                 eden_dir = pid_to_eden_dir[pid]
                 holding_lock = True

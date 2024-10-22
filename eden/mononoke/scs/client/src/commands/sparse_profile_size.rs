@@ -10,6 +10,7 @@ use std::io::Write;
 use anyhow::Result;
 use scs_client_raw::thrift;
 use serde::Serialize;
+use source_control_clients::errors::CommitSparseProfileSizePollError;
 
 use crate::args::commit_id::resolve_commit_id;
 use crate::args::commit_id::CommitIdArgs;
@@ -29,6 +30,9 @@ pub(super) struct CommandArgs {
 
     #[clap(flatten)]
     sparse_profiles_args: SparseProfilesArgs,
+
+    #[clap(long = "async")]
+    asynchronous: bool,
 }
 
 #[derive(Serialize)]
@@ -72,12 +76,46 @@ pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
         ..Default::default()
     };
 
-    let params = thrift::CommitSparseProfileSizeParams {
-        profiles,
-        ..Default::default()
-    };
+    let response = if args.asynchronous {
+        let params = thrift::CommitSparseProfileSizeParamsV2 {
+            commit: commit.clone(),
+            profiles,
+            ..Default::default()
+        };
+        let token = conn.commit_sparse_profile_size_async(&params).await?;
 
-    let response = conn.commit_sparse_profile_size(&commit, &params).await?;
+        loop {
+            let res = conn.commit_sparse_profile_size_poll(&token).await;
+            match res {
+                Ok(res) => match res {
+                    source_control::CommitSparseProfileSizePollResponse::response(success) => {
+                        break success;
+                    }
+                    source_control::CommitSparseProfileSizePollResponse::poll_pending(_) => {
+                        println!("sparse profile size is not ready yet, waiting some more...");
+                    }
+                    source_control::CommitSparseProfileSizePollResponse::UnknownField(t) => {
+                        return Err(anyhow::anyhow!(
+                            "request failed with unknown result: {:?}",
+                            t
+                        ));
+                    }
+                },
+                Err(e) => match e {
+                    CommitSparseProfileSizePollError::poll_error(_) => {
+                        // retry
+                    }
+                    _ => return Err(anyhow::anyhow!("request failed with error: {:?}", e)),
+                },
+            }
+        }
+    } else {
+        let params = thrift::CommitSparseProfileSizeParams {
+            profiles,
+            ..Default::default()
+        };
+        conn.commit_sparse_profile_size(&commit, &params).await?
+    };
 
     let output = SparseProfileSizeOutput {
         profiles_size: response.profiles_size,

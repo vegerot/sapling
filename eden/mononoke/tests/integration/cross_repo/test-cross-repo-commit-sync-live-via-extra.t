@@ -4,6 +4,8 @@
 # GNU General Public License found in the LICENSE file in the root
 # directory of this source tree.
 
+FIXME! - sorry, this test is broken due to migration D63999703
+
 This is a fork of test-cross-repo-commit-sync-live.t that brings the via-extra mode
 to be fully able to deal with mapping changes regardless of sync direction. I will
 replace that file once fully fixed.
@@ -42,7 +44,7 @@ Before the change
   $ hg ci -Aqm "before config change"
   $ hg push -r . --to master_bookmark -q
   $ log
-  @  before config change [public;rev=2;bc6a206054d0] default/master_bookmark
+  @  before config change [public;rev=2;bc6a206054d0] remote/master_bookmark
   │
   o  first post-move commit [public;rev=1;11f848659bfc]
   │
@@ -58,7 +60,7 @@ Before the change
   $ hg pull -q
   $ hg up -q master_bookmark
   $ log -r master_bookmark
-  @  before config change [public;rev=3;c76f6510b5c1] default/master_bookmark
+  @  before config change [public;rev=3;c76f6510b5c1] remote/master_bookmark
   │
   ~
   $ hg log -r master_bookmark -T "{files % '{file}\n'}"
@@ -72,13 +74,12 @@ Before the change
 Make a config change
   $ update_commit_sync_map_first_option
   $ MONONOKE_ADMIN_ALWAYS_ALLOW_MAPPING_CHANGE_VIA_EXTRA=1 \
-  > quiet mononoke_admin_source_target $REPOIDLARGE $REPOIDSMALL crossrepo pushredirection change-mapping-version \
+  > quiet mononoke_newadmin cross-repo --source-repo-id $REPOIDLARGE --target-repo-id $REPOIDSMALL pushredirection change-mapping-version \
   > --author author \
   > --large-repo-bookmark master_bookmark \
   > --via-extra \
   > --date 2002-10-02T21:38:00-05:00 \
   > --version-name new_version
-  $ flush_mononoke_bookmarks
 Find the hash of mapping change commit in the large repo
   $ cd "$TESTTMP/large-hg-client"
   $ hg pull -q
@@ -87,22 +88,15 @@ Find the hash of mapping change commit in the large repo
 After the change
 -- an empty, mapping changing commit from large repo shouldn't be backsynced when forward sync is on
   $ X=$(x_repo_lookup large-mon small-mon "$(hg whereami)")
-  $ with_stripped_logs mononoke_admin_source_target 0 1 crossrepo map $(hg whereami)
-  using repo "large-mon" repoid RepositoryId(0)
-  using repo "small-mon" repoid RepositoryId(1)
-  changeset resolved as: ChangesetId(Blake2(a45c6ed3a8522811955be9b4eb0b80f29d2229eeeb43f7f017b2411c0feab955))
+  $ with_stripped_logs mononoke_newadmin cross-repo --source-repo-id 0 --target-repo-id 1 map -i $(hg whereami)
   EquivalentWorkingCopyAncestor(ChangesetId(Blake2(cdd50b2d186ce87fe6d2428b01caf9994a98ac51e65f7d6bb43c6a0f6e8d7a56)), CommitSyncConfigVersion("new_version"))
 
   $ cd "$TESTTMP/small-hg-client"
   $ hg pull -r $X
   pulling from mono:small-mon
-  no changes found
-  adding changesets
-  adding manifests
-  adding file changes
   $ hg up -q $X
   $ log -r .^::.
-  @  before config change [public;rev=2;bc6a206054d0] default/master_bookmark
+  @  before config change [public;rev=2;bc6a206054d0] remote/master_bookmark
   │
   o  first post-move commit [public;rev=1;11f848659bfc]
   │
@@ -117,11 +111,14 @@ After the change
   $ hg ci -Aqm "after config change from small"
   $ hg push -r . --to master_bookmark -q
   $ log -r master_bookmark^::master_bookmark
-  @  after config change from small [public;rev=3;6bfa38885cea] default/master_bookmark
+  @  after config change from small [public;rev=3;6bfa38885cea] remote/master_bookmark
   │
   o  before config change [public;rev=2;bc6a206054d0] (glob)
   │
   ~
+
+-- trigger xrepo sync and show that can sync commit over the config change
+  $ with_stripped_logs wait_for_xrepo_sync 3
 
 -- push to a large repo
   $ cd "$TESTTMP/large-hg-client"
@@ -131,16 +128,10 @@ After the change
   $ hg ci -Aqm "after config change from large"
   $ hg push -r . --to master_bookmark -q
 
--- trigger xrepo sync and show that can sync commit over the config change
-  $ with_stripped_logs wait_for_xrepo_sync 3
 Rest of this test won't pass as we failed the previous command so is commented out.
-  $ flush_mononoke_bookmarks
 -- check the same commit in the large repo
-  $ cd "$TESTTMP/large-hg-client"
-  $ hg pull -q
-  $ hg up -q master_bookmark
   $ log -r "master_bookmark^::master_bookmark"
-  @  after config change from large [public;rev=?;ad029e9c7735] default/master_bookmark (glob)
+  @  after config change from large [public;rev=?;ad029e9c7735] remote/master_bookmark (glob)
   │
   o  after config change from small [public;rev=?;9a1a082f2f8e] (glob)
   │
@@ -164,8 +155,5 @@ Rest of this test won't pass as we failed the previous command so is commented o
   smallrepofolder_after/foo
 
 -- Show the actual mapping version used for rewriting of small repo change
-  $ with_stripped_logs mononoke_admin_source_target 0 1 crossrepo map $(hg log -T "{node}" -r .^)
-  using repo "large-mon" repoid RepositoryId(0)
-  using repo "small-mon" repoid RepositoryId(1)
-  changeset resolved as: ChangesetId(Blake2(*)) (glob)
+  $ with_stripped_logs mononoke_newadmin cross-repo --source-repo-id 0 --target-repo-id 1 map -i $(hg log -T "{node}" -r .^)
   RewrittenAs([(ChangesetId(Blake2(e7a0827177ac9caf3578f2c5e4307f3d11a8954ccaa576c3813f166d174f4e64)), CommitSyncConfigVersion("new_version"))])

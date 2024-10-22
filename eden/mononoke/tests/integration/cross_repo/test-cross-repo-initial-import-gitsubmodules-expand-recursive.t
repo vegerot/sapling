@@ -21,6 +21,7 @@
   $ export LARGE_REPO_ID=10
   $ export SUBMODULE_REPO_NAME="small_repo"
   $ export SUBMODULE_REPO_ID=11
+  $ export ENABLE_BOOKMARK_CACHE=1
 
   $ . "${TEST_FIXTURES}/library.sh"
   $ . "${TEST_FIXTURES}/library-push-redirector.sh"
@@ -40,6 +41,9 @@ Run the x-repo with submodules setup
   $ set_git_submodules_action_in_config_version "$LATEST_CONFIG_VERSION_NAME" "$SUBMODULE_REPO_ID" 3 # 3=expand
   $ set_git_submodule_dependencies_in_config_version "$LATEST_CONFIG_VERSION_NAME" \
   > "$SUBMODULE_REPO_ID" "{\"git-repo-b\": $REPO_B_ID, \"git-repo-b/git-repo-c\": $REPO_C_ID, \"repo_c\": $REPO_C_ID}"
+  $ killandwait $MONONOKE_PID
+  $ start_and_wait_for_mononoke_server
+
 
 -- Setup git repos A, B and C
   $ setup_git_repos_a_b_c
@@ -116,7 +120,7 @@ Run the x-repo with submodules setup
   NOTE: Importing repo A commits into large repo
   IMPORT_CONFIG_VERSION_NAME: INITIAL_IMPORT_SYNC_CONFIG
   FINAL_CONFIG_VERSION_NAME: INITIAL_IMPORT_SYNC_CONFIG
-  Large repo MASTER_BOOKMARK_NAME: master
+  Large repo MASTER_BOOKMARK_NAME: master_bookmark
   SMALL_REPO_FOLDER: smallrepofolder1
   
   GIT_REPO_A_HEAD: eef414bd5fc8f7dcc129318276af6945117fe32bb5cfda6b0e6d43036107f61c
@@ -137,7 +141,7 @@ Run the x-repo with submodules setup
   
   
   NOTE: Large repo bookmarks
-  54a6db91baf1c10921369339b50e5a174a7ca82e master
+  54a6db91baf1c10921369339b50e5a174a7ca82e master_bookmark
   
   IMPORTED_HEAD: 6e3217760eada6926186d7cb48f4f24bd8a734ad615aec528065a0912dec6cba
   
@@ -273,7 +277,7 @@ Run the x-repo with submodules setup
       ),
   }
   UNSAFE: changing mapping version during pushrebase to INITIAL_IMPORT_SYNC_CONFIG
-  syncing eef414bd5fc8f7dcc129318276af6945117fe32bb5cfda6b0e6d43036107f61c via pushrebase for master
+  syncing eef414bd5fc8f7dcc129318276af6945117fe32bb5cfda6b0e6d43036107f61c via pushrebase for master_bookmark
   changeset eef414bd5fc8f7dcc129318276af6945117fe32bb5cfda6b0e6d43036107f61c synced as 04190d634e49d29bf87edffb012f42f9f5e49b5b66e99714f17fcd4ef3f3e294 in * (glob)
   successful sync
   X Repo Sync execution finished from small repo small_repo to large repo large_repo
@@ -385,7 +389,7 @@ Run the x-repo with submodules setup
   
   
   
-  Running mononoke_admin to verify mapping
+  Running mononoke_newadmin to verify mapping
   
   RewrittenAs([(ChangesetId(Blake2(eef414bd5fc8f7dcc129318276af6945117fe32bb5cfda6b0e6d43036107f61c)), CommitSyncConfigVersion("INITIAL_IMPORT_SYNC_CONFIG"))])
   
@@ -443,7 +447,7 @@ Run the x-repo with submodules setup
   
   NOTE: Update those changes in repo B
   From $TESTTMP/git-repo-c
-     114b61c..810d4f5  master     -> origin/master
+     114b61c..810d4f5  master_bookmark -> origin/master_bookmark
   Submodule path 'git-repo-c': checked out '810d4f53650b0fd891ad367ccfd8fa6067d93937'
   0597690 Delete files in repo B
   c9e2185 Update submodule C in repo B
@@ -457,10 +461,10 @@ Run the x-repo with submodules setup
   
   NOTE: Update submodule b in A
   From $TESTTMP/git-repo-b
-     776166f..0597690  master     -> origin/master
+     776166f..0597690  master_bookmark -> origin/master_bookmark
   Submodule path 'git-repo-b': checked out '0597690a839ce11a250139dae33ee85d9772a47a'
   From $TESTTMP/git-repo-c
-     114b61c..810d4f5  master     -> origin/master
+     114b61c..810d4f5  master_bookmark -> origin/master_bookmark
   Submodule path 'repo_c': checked out '810d4f53650b0fd891ad367ccfd8fa6067d93937'
   
   
@@ -477,7 +481,7 @@ Run the x-repo with submodules setup
   8c33a27 Add root_file
 
   $ mononoke_newadmin bookmarks -R "$SUBMODULE_REPO_NAME" list -S hg
-  heads/master
+  heads/master_bookmark
 
 -- Import the changes from the git repos B and C into their Mononoke repos
   $ REPOID="$REPO_C_ID" QUIET_LOGGING_LOG_FILE="$TESTTMP/gitimport_repo_c.out"  \
@@ -489,7 +493,7 @@ Run the x-repo with submodules setup
   > --bypass-readonly --generate-bookmarks missing-for-commit "$GIT_REPO_B_HEAD"
 
 Set up live forward syncer, which should sync all commits in small repo's (repo A)
-heads/master bookmark to large repo's master bookmark via pushrebase
+heads/master_bookmark bookmark to large repo's master_bookmark bookmark via pushrebase
   $ touch $TESTTMP/xreposync.out
   $ with_stripped_logs mononoke_x_repo_sync_forever "$SUBMODULE_REPO_ID" "$LARGE_REPO_ID" 
 
@@ -501,8 +505,9 @@ heads/master bookmark to large repo's master bookmark via pushrebase
   $ QUIET_LOGGING_LOG_FILE="$TESTTMP/xrepo_sync_last_logs.out" with_stripped_logs wait_for_xrepo_sync 2
 
   $ cd "$TESTTMP/$LARGE_REPO_NAME"
+  $ wait_for_bookmark_move_away_edenapi large_repo master_bookmark $(hg whereami)
   $ hg pull -q 
-  $ hg co -q master
+  $ hg co -q master_bookmark
 
   $ hg log --graph -T '{node} {desc}\n' -r "all()"
   @  d246b01a5a5baff205958295aa764916ae288291 Remove repo C submodule from repo A
@@ -623,14 +628,14 @@ TODO(T174902563): Fix deletion of submodules in EXPAND submodule action.
   0597690a839ce11a250139dae33ee85d9772a47a (no-eol)
 
 -- Also check that our two binaries that can verify working copy are able to deal with expansions
-  $ REPOIDLARGE=$LARGE_REPO_ID REPOIDSMALL=$SUBMODULE_REPO_ID verify_wc $(hg log -r master -T '{node}') |& strip_glog
+  $ REPOIDLARGE=$LARGE_REPO_ID REPOIDSMALL=$SUBMODULE_REPO_ID verify_wc $(hg log -r master_bookmark -T '{node}') |& strip_glog
 
 -- The check-push-redirection-prereqs should behave the same both ways but let's verify it (we had bugs where it didn't)
 -- (those outputs are still not correct but that's expected)
-  $ quiet_grep "all is well" -- with_stripped_logs megarepo_tool_multirepo --source-repo-id $SUBMODULE_REPO_ID --target-repo-id $LARGE_REPO_ID check-push-redirection-prereqs "heads/master" "master" "$LATEST_CONFIG_VERSION_NAME" | strip_glog | tee $TESTTMP/push_redir_prereqs_small_large
+  $ quiet_grep "all is well" -- with_stripped_logs megarepo_tool_multirepo --source-repo-id $SUBMODULE_REPO_ID --target-repo-id $LARGE_REPO_ID check-push-redirection-prereqs "heads/master_bookmark" "master_bookmark" "$LATEST_CONFIG_VERSION_NAME" | strip_glog | tee $TESTTMP/push_redir_prereqs_small_large
   all is well!
 
-  $ quiet_grep "all is well" -- with_stripped_logs megarepo_tool_multirepo --source-repo-id $LARGE_REPO_ID --target-repo-id $SUBMODULE_REPO_ID check-push-redirection-prereqs "master" "heads/master" "$LATEST_CONFIG_VERSION_NAME" | strip_glog | tee $TESTTMP/push_redir_prereqs_large_small
+  $ quiet_grep "all is well" -- with_stripped_logs megarepo_tool_multirepo --source-repo-id $LARGE_REPO_ID --target-repo-id $SUBMODULE_REPO_ID check-push-redirection-prereqs "master_bookmark" "heads/master_bookmark" "$LATEST_CONFIG_VERSION_NAME" | strip_glog | tee $TESTTMP/push_redir_prereqs_large_small
   all is well!
   $ diff -wbBdu $TESTTMP/push_redir_prereqs_small_large $TESTTMP/push_redir_prereqs_large_small
 
@@ -639,11 +644,11 @@ TODO(T174902563): Fix deletion of submodules in EXPAND submodule action.
   $ echo corrupt > smallrepofolder1/git-repo-b/git-repo-c/choo3 
   $ echo corrupt > smallrepofolder1/.x-repo-submodule-git-repo-b
   $ hg commit -m "submodule corruption"
-  $ hg push -q --to master
-  $ quiet_grep "mismatch" -- megarepo_tool_multirepo --source-repo-id $SUBMODULE_REPO_ID --target-repo-id $LARGE_REPO_ID check-push-redirection-prereqs "heads/master" "master" "$LATEST_CONFIG_VERSION_NAME" | strip_glog | tee $TESTTMP/push_redir_prereqs_small_large
+  $ hg push -q --to master_bookmark
+  $ quiet_grep "mismatch" -- megarepo_tool_multirepo --source-repo-id $SUBMODULE_REPO_ID --target-repo-id $LARGE_REPO_ID check-push-redirection-prereqs "heads/master_bookmark" "master_bookmark" "$LATEST_CONFIG_VERSION_NAME" | strip_glog | tee $TESTTMP/push_redir_prereqs_small_large
   submodule expansion mismatch: Failed to fetch content from content id 06a434694d9172d617062abd92f015f73978fb17dd6bcc54e708cd2c6f247970 file containing the submodule's git commit hash
 
-  $ quiet_grep "mismatch" -- megarepo_tool_multirepo --source-repo-id $LARGE_REPO_ID --target-repo-id $SUBMODULE_REPO_ID check-push-redirection-prereqs "master" "heads/master" "$LATEST_CONFIG_VERSION_NAME" | sort | tee $TESTTMP/push_redir_prereqs_large_small
+  $ quiet_grep "mismatch" -- megarepo_tool_multirepo --source-repo-id $LARGE_REPO_ID --target-repo-id $SUBMODULE_REPO_ID check-push-redirection-prereqs "master_bookmark" "heads/master_bookmark" "$LATEST_CONFIG_VERSION_NAME" | sort | tee $TESTTMP/push_redir_prereqs_large_small
   submodule expansion mismatch: Failed to fetch content from content id 06a434694d9172d617062abd92f015f73978fb17dd6bcc54e708cd2c6f247970 file containing the submodule's git commit hash
 
   $ diff -wbBdu $TESTTMP/push_redir_prereqs_small_large $TESTTMP/push_redir_prereqs_large_small
@@ -657,8 +662,8 @@ TODO(T174902563): Fix deletion of submodules in EXPAND submodule action.
   >   local hg_hash=$1; shift;
   >   
   >   printf "Check mapping in database with Mononoke admin\n"
-  >   with_stripped_logs mononoke_admin_source_target $LARGE_REPO_ID $SUBMODULE_REPO_ID \
-  >     crossrepo map $hg_hash | rg -v "using repo"
+  >   with_stripped_logs mononoke_newadmin \
+  >     cross-repo --source-repo-id $LARGE_REPO_ID --target-repo-id $SUBMODULE_REPO_ID map -i $hg_hash | rg -v "using repo"
   >   
   >   printf "\n\nCall hg committranslateids\n" 
   >   
@@ -674,7 +679,6 @@ TODO(T174902563): Fix deletion of submodules in EXPAND submodule action.
 -- Commit: Change directly in A
   $ check_mapping_and_run_xrepo_lookup_large_to_small ada44b220ff885a5757bf80bee03e64f0b0e063d
   Check mapping in database with Mononoke admin
-  changeset resolved as: ChangesetId(Blake2(b382cdfd9ad4ee0cc977e2263ff392900cd41b1141ddf046cf93d5ef1136f0e7))
   RewrittenAs([(ChangesetId(Blake2(4aee0499ea629ebcd9d0e4be89267d7a4eab5e72f988c20a392d59081db0c32a)), CommitSyncConfigVersion("INITIAL_IMPORT_SYNC_CONFIG"))])
   
   
@@ -685,7 +689,6 @@ TODO(T174902563): Fix deletion of submodules in EXPAND submodule action.
 -- Commit: Update submodule B in repo A
   $ check_mapping_and_run_xrepo_lookup_large_to_small d3dae76d4349c88c24d60fe533bd9fbd02ddd5ae
   Check mapping in database with Mononoke admin
-  changeset resolved as: ChangesetId(Blake2(0617acae68a70aff4e62d0afc707785bd7b0318f912d9a83c35f99d6e0c79158))
   RewrittenAs([(ChangesetId(Blake2(b86f7426fc1fe95e22b6bef591e7ba9c8385b86f7b85abd3a377f941d39522af)), CommitSyncConfigVersion("INITIAL_IMPORT_SYNC_CONFIG"))])
   
   
@@ -697,7 +700,6 @@ TODO(T174902563): Fix deletion of submodules in EXPAND submodule action.
 -- Commit: Add regular_dir/aardvar
   $ check_mapping_and_run_xrepo_lookup_large_to_small e2c69ce8cc11691984e50e6023f4bbf4271aa4c3
   Check mapping in database with Mononoke admin
-  changeset resolved as: ChangesetId(Blake2(b43576e9e9685513cf91adbe5fb817cbe2837ba9a4dca12a4c64a6aebfe09780))
   RewrittenAs([(ChangesetId(Blake2(856b09638e2550d912282c5a9e8bd47fdf1a899545f9f4a05430a8dc7be1f768)), CommitSyncConfigVersion("INITIAL_IMPORT_SYNC_CONFIG"))])
   
   
@@ -710,7 +712,7 @@ TODO(T174902563): Fix deletion of submodules in EXPAND submodule action.
 -- Test backsyncing (i.e. large to small)
 
   $ cd "$TESTTMP/$LARGE_REPO_NAME" || exit
-  $ hg pull -q && hg co -q master  
+  $ hg pull -q && hg co -q master_bookmark  
   $ hg status
   $ hg co -q .^ # go before the commit that corrupts submodules
   $ hg status
@@ -821,7 +823,7 @@ TODO(T174902563): Fix deletion of submodules in EXPAND submodule action.
 -- EXPECT: commit isn't synced and returns working copy equivalent instead
   $ echo "changing large repo file" > file_in_large_repo.txt
   $ hg commit -A -m "Changing large repo file" 
-  $ hg push -q -r . --to master --non-forward-move --pushvar NON_FAST_FORWARD=true
+  $ hg push -q -r . --to master_bookmark --non-forward-move --pushvar NON_FAST_FORWARD=true
   $ backsync_get_info_and_derive_data
   Processing commit: Changing large repo file
   Commit hash: 48021e7aeafd324f9976f551aea60aa88dd9f61a
@@ -845,7 +847,7 @@ TODO(T174902563): Fix deletion of submodules in EXPAND submodule action.
 -- EXPECT: commit is backsynced normally because it doesn't touch submodule expansions
   $ echo "changing small repo file" > smallrepofolder1/regular_dir/aardvar
   $ hg commit -A -m "Changing small repo in large repo (not submodule)" 
-  $ hg push -q -r . --to master --non-forward-move --pushvar NON_FAST_FORWARD=true
+  $ hg push -q -r . --to master_bookmark --non-forward-move --pushvar NON_FAST_FORWARD=true
   $ backsync_get_info_and_derive_data
   Processing commit: Changing small repo in large repo (not submodule)
   Commit hash: 35e70dc7f37c3f51876a0f017a733a13809bef32
@@ -903,7 +905,7 @@ TODO(T174902563): Fix deletion of submodules in EXPAND submodule action.
   
   NOTE: Update repo_c submodule in git repo_b
   From $TESTTMP/git-repo-c
-     810d4f5..5b44771  master     -> origin/master
+     810d4f5..5b44771  master_bookmark -> origin/master_bookmark
   Submodule path 'git-repo-c': checked out '5b447718cdc49d6289690f68b11f6b8a3002a396'
   GIT_REPO_B_HEAD: 065ee332e835cab7f781b87decb8c07bd5bb7fe129fc3aed47f4fa07697b65de
   REPO_B_GIT_COMMIT_HASH: 538924163436e89a3aa25a686075afb7182ec9c1

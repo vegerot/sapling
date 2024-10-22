@@ -12,11 +12,19 @@ use std::sync::Arc;
 use anyhow::format_err;
 use anyhow::Result;
 use edenapi_types::FileAuxData;
-use hgstore::strip_hg_file_metadata;
+use format_util::git_sha1_digest;
+use format_util::hg_sha1_digest;
+use format_util::strip_file_metadata;
 use minibytes::Bytes;
 use storemodel::BoxIterator;
+use storemodel::InsertOpts;
+use storemodel::KeyStore;
+use storemodel::Kind;
+use storemodel::SerializationFormat;
 use types::fetch_mode::FetchMode;
+use types::hgid::NULL_ID;
 use types::HgId;
+use types::Id20;
 use types::Key;
 use types::RepoPath;
 
@@ -42,6 +50,7 @@ where
         _fetch_mode: FetchMode,
     ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, Bytes)>>> {
         let store = Arc::clone(&self.0);
+        let format = self.format();
         for chunk in keys.chunks(PREFETCH_CHUNK_SIZE) {
             let store_keys = chunk
                 .iter()
@@ -54,12 +63,16 @@ where
             match store_result {
                 Err(err) => Err(err),
                 Ok(StoreResult::Found(data)) => {
-                    strip_hg_file_metadata(&data.into()).map(|(d, _)| (key, d))
+                    strip_file_metadata(&data.into(), format).map(|(d, _)| (key, d))
                 }
                 Ok(StoreResult::NotFound(k)) => Err(format_err!("{:?} not found in store", k)),
             }
         });
         Ok(Box::new(iter))
+    }
+
+    fn clone_key_store(&self) -> Box<dyn KeyStore> {
+        Box::new(Self(self.0.clone()))
     }
 }
 
@@ -72,6 +85,7 @@ where
         keys: Vec<Key>,
     ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, Key)>>> {
         let store = Arc::clone(&self.0);
+        let format = self.format();
         for chunk in keys.chunks(PREFETCH_CHUNK_SIZE) {
             let store_keys = chunk
                 .iter()
@@ -84,7 +98,7 @@ where
                 let store_result = store.get(StoreKey::HgId(key.clone()))?;
                 match store_result {
                     StoreResult::Found(data) => {
-                        let (_data, maybe_copy_from) = strip_hg_file_metadata(&data.into())?;
+                        let (_data, maybe_copy_from) = strip_file_metadata(&data.into(), format)?;
                         Ok(maybe_copy_from.map(|copy_from| (key, copy_from)))
                     }
                     StoreResult::NotFound(k) => Err(format_err!("{:?} not found in store", k)),
@@ -93,6 +107,10 @@ where
             .transpose()
         });
         Ok(Box::new(iter))
+    }
+
+    fn clone_file_store(&self) -> Box<dyn storemodel::FileStore> {
+        Box::new(Self(self.0.clone()))
     }
 }
 
@@ -131,6 +149,24 @@ impl storemodel::KeyStore for ArcFileStore {
 
     fn statistics(&self) -> Vec<(String, usize)> {
         FileStore::metrics(&self.0)
+    }
+
+    /// Decides whether the store uses git or hg format.
+    fn format(&self) -> SerializationFormat {
+        self.0.format
+    }
+
+    fn insert_data(&self, opts: InsertOpts, path: &RepoPath, data: &[u8]) -> anyhow::Result<HgId> {
+        let id = sha1_digest(&opts, data, self.format());
+        let key = Key::new(path.to_owned(), id);
+        // PERF: Ideally, there is no need to copy `data`.
+        let data = Bytes::copy_from_slice(data);
+        self.0.write_nonlfs(key, data, Default::default())?;
+        Ok(id)
+    }
+
+    fn clone_key_store(&self) -> Box<dyn KeyStore> {
+        Box::new(self.clone())
     }
 }
 
@@ -185,6 +221,27 @@ impl storemodel::FileStore for ArcFileStore {
             });
         Ok(Box::new(iter))
     }
+
+    fn clone_file_store(&self) -> Box<dyn storemodel::FileStore> {
+        Box::new(self.clone())
+    }
 }
 
 const PREFETCH_CHUNK_SIZE: usize = 1000;
+
+pub(crate) fn sha1_digest(opts: &InsertOpts, data: &[u8], format: SerializationFormat) -> Id20 {
+    match format {
+        SerializationFormat::Hg => {
+            let p1 = opts.parents.first().copied().unwrap_or(NULL_ID);
+            let p2 = opts.parents.get(1).copied().unwrap_or(NULL_ID);
+            hg_sha1_digest(data, &p1, &p2)
+        }
+        SerializationFormat::Git => {
+            let kind = match opts.kind {
+                Kind::File => "blob",
+                Kind::Tree => "tree",
+            };
+            git_sha1_digest(data, kind)
+        }
+    }
+}

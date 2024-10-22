@@ -9,12 +9,12 @@ import type {Platform} from '../platform';
 import type {ThemeColor} from '../theme';
 import type {OneIndexedLineNumber, RepoRelativePath} from '../types';
 
-import {browserPlatformImpl} from './browerPlatformImpl';
+import {makeBrowserLikePlatformImpl} from './browerPlatformImpl';
 
 declare global {
   interface Window {
     __IdeBridge: {
-      openFileInAndroidStudio: (path: string) => void;
+      openFileInAndroidStudio: (path: string, line?: number, col?: number) => void;
       clipboardCopy?: (data: string) => void;
       getIDETheme(): ThemeColor;
     };
@@ -25,7 +25,7 @@ declare global {
 // since it will end up getting duplicated when bundling.
 
 const androidStudioPlatform: Platform = {
-  platformName: 'androidStudio',
+  ...makeBrowserLikePlatformImpl('androidStudio'),
 
   confirm: (message: string, details?: string) => {
     // TODO: Android Studio-style confirm modal
@@ -33,14 +33,12 @@ const androidStudioPlatform: Platform = {
     return Promise.resolve(ok);
   },
 
-  openFile: (_path: RepoRelativePath, _options: {line?: OneIndexedLineNumber}) => {
-    // TODO: support line numbers
-    window.__IdeBridge.openFileInAndroidStudio(_path);
+  openFile: (_path: RepoRelativePath, _options?: {line?: OneIndexedLineNumber}) => {
+    window.__IdeBridge.openFileInAndroidStudio(_path, _options?.line);
   },
-  openFiles: (paths: Array<RepoRelativePath>, _options: {line?: OneIndexedLineNumber}) => {
+  openFiles: (paths: Array<RepoRelativePath>, _options?: {line?: OneIndexedLineNumber}) => {
     for (const path of paths) {
-      // TODO: support line numbers
-      window.__IdeBridge.openFileInAndroidStudio(path);
+      window.__IdeBridge.openFileInAndroidStudio(path, _options?.line);
     }
   },
   canCustomizeFileOpener: false,
@@ -53,11 +51,6 @@ const androidStudioPlatform: Platform = {
   clipboardCopy(text: string, _html?: string) {
     window.__IdeBridge.clipboardCopy?.(text);
   },
-
-  getPersistedState: browserPlatformImpl.getPersistedState,
-  setPersistedState: browserPlatformImpl.setPersistedState,
-  clearPersistedState: browserPlatformImpl.clearPersistedState,
-  getAllPersistedState: browserPlatformImpl.getAllPersistedState,
 
   theme: {
     getTheme(): ThemeColor {

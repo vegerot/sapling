@@ -31,7 +31,7 @@ describe('Dag', () => {
     bookmarks: [],
     remoteBookmarks: [],
     totalFileCount: 0,
-    filesSample: [],
+    filePathsSample: [],
     maxCommonPathPrefix: '',
   };
 

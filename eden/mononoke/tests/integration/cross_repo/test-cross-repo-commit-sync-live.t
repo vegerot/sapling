@@ -31,7 +31,7 @@ Before the change
   $ hg ci -Aqm "before config change"
   $ hg push -r . --to master_bookmark -q
   $ log
-  @  before config change [public;rev=2;bc6a206054d0] default/master_bookmark
+  @  before config change [public;rev=2;bc6a206054d0] remote/master_bookmark
   │
   o  first post-move commit [public;rev=1;11f848659bfc]
   │
@@ -47,7 +47,7 @@ Before the change
   $ hg pull -q
   $ hg up -q master_bookmark
   $ log -r master_bookmark
-  @  before config change [public;rev=3;c76f6510b5c1] default/master_bookmark
+  @  before config change [public;rev=3;c76f6510b5c1] remote/master_bookmark
   │
   ~
   $ hg log -r master_bookmark -T "{files % '{file}\n'}"
@@ -61,14 +61,14 @@ Before the change
 Make a config change
   $ update_commit_sync_map_first_option
 -- try to create mapping commit with incorrect file - this should fail
-  $ mononoke_admin_source_target $REPOIDLARGE $REPOIDSMALL crossrepo pushredirection change-mapping-version \
+  $ mononoke_newadmin cross-repo --source-repo-id $REPOIDLARGE --target-repo-id $REPOIDSMALL pushredirection change-mapping-version \
   > --author author \
   > --large-repo-bookmark master_bookmark \
   > --version-name new_version \
   > --dump-mapping-large-repo-path mapping.json 2>&1 | grep 'cannot dump'
   * cannot dump mapping to a file because path doesn't rewrite to a small repo (glob)
 -- now fix the filename - it should succeed
-  $ mononoke_admin_source_target $REPOIDLARGE $REPOIDSMALL crossrepo pushredirection change-mapping-version \
+  $ mononoke_newadmin cross-repo --source-repo-id $REPOIDLARGE --target-repo-id $REPOIDSMALL pushredirection change-mapping-version \
   > --author author \
   > --large-repo-bookmark master_bookmark \
   > --version-name new_version \
@@ -93,7 +93,7 @@ After the change
     }
   } (no-eol)
   $ log -r master_bookmark^::master_bookmark
-  @  after config change [public;rev=4;*] default/master_bookmark (glob)
+  @  after config change [public;rev=4;*] remote/master_bookmark (glob)
   │
   o  Changing synced mapping version to new_version for large-mon->small-mon sync [public;rev=3;*] (glob)
   │
@@ -108,7 +108,7 @@ After the change
   $ hg pull -q
   $ hg up -q master_bookmark
   $ log -r "master_bookmark^::master_bookmark"
-  @  after config change [public;rev=6;*] default/master_bookmark (glob)
+  @  after config change [public;rev=6;*] remote/master_bookmark (glob)
   │
   o  Changing synced mapping version to new_version for large-mon->small-mon sync [public;rev=5;*] (glob)
   │
@@ -142,8 +142,5 @@ After the change
   smallrepofolder_after/mapping.json
 
 -- Show the actual mapping version used for the operation
-  $ with_stripped_logs mononoke_admin_source_target 0 1 crossrepo map $(hg whereami)
-  using repo "large-mon" repoid RepositoryId(0)
-  using repo "small-mon" repoid RepositoryId(1)
-  changeset resolved as: ChangesetId(Blake2(*)) (glob)
+  $ with_stripped_logs mononoke_newadmin cross-repo --source-repo-id 0 --target-repo-id 1 map -i $(hg whereami)
   RewrittenAs([(ChangesetId(Blake2(*)), CommitSyncConfigVersion("new_version"))]) (glob)

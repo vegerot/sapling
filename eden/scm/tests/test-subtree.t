@@ -1,4 +1,5 @@
   $ setconfig diff.git=True
+  $ setconfig subtree.copy-reuse-tree=False
 
 setup backing repo
 
@@ -31,15 +32,15 @@ test subtree copy paths validation
 
 test subtree copy
   $ hg subtree cp -r $A --from-path foo --to-path bar -m "subtree copy foo -> bar"
-  1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  copying foo to bar
   $ hg log -G -T '{node|short} {desc|firstline}\n'
-  @  ecc461c7d308 subtree copy foo -> bar
+  @  a6c15b42e6a2 subtree copy foo -> bar
   │
   o  b9450a0e6ae4 B
   │
   o  d908813f0f7c A
   $ hg show --git
-  commit:      ecc461c7d308
+  commit:      a6c15b42e6a2
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000
   files:       bar/x
@@ -57,7 +58,26 @@ test subtree copy
   @@ -0,0 +1,1 @@
   +aaa
   $ hg dbsh -c 'print(repo["."].extra())'
-  {'branch': 'default', 'test_subtree_copy': '{"v":1,"branches":[{"from_path":"foo","to_path":"bar","from_commit":"d908813f0f7c9078810e26aad1e37bdb32013d4b"}]}'}
+  {'branch': 'default', 'test_subtree_copy': '{"branches":[{"from_commit":"d908813f0f7c9078810e26aad1e37bdb32013d4b","from_path":"foo","to_path":"bar"}],"v":1}'}
+
+
+abort when subtree copy too many files
+
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > B   # B/foo/x = bbb\n
+  > |
+  > A   # A/foo/x = aaa\n
+  >     # A/foo/y = yyy\n
+  >     # drawdag.defaultfiles=false
+  > EOS  
+  $ hg subtree cp -r $A --from-path foo --to-path bar --config subtree.copy-max-file-count=1
+  abort: subtree copy includes too many files
+  [255]
+  $ hg subtree cp -r $A --from-path foo --to-path bar --config subtree.copy-max-file-count=1 --config ui.supportcontact="Sapling Team"
+  abort: subtree copy includes too many files
+  (contact Sapling Team for help)
+  [255]
 
 
 abort when the working copy is dirty
@@ -77,6 +97,42 @@ abort when the working copy is dirty
   abort: uncommitted changes
   [255]
 
+test subtree copy with symlinks
+  $ newclientrepo
+  $ mkdir foo
+  $ echo "aaa" > foo/a
+  $ ln -s a foo/b
+  $ hg ci -Aqm 'first'
+  $ echo "bbb" > foo/a
+  $ hg ci -m 'second'
+  $ hg subtree cp -r "desc(first)" --from-path foo --to-path foo2
+  copying foo to foo2
+  $ readlink foo2/b
+  a
+  $ cat foo2/b
+  aaa
+
+test subtree copy to tracked directory
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > C   # B/bar/x = ccc\n
+  > |
+  > B   # B/foo/x = bbb\n
+  > |
+  > A   # A/foo/x = aaa\n
+  >     # drawdag.defaultfiles=false
+  > EOS  
+  $ hg go $C -q
+  $ hg subtree cp -r $A --from-path foo --to-path bar
+  abort: cannot copy to an existing path: bar
+  (use --force to overwrite (recursively remove bar))
+  [255]
+  $ hg subtree cp -r $A --from-path foo --to-path bar --force
+  removing bar/x
+  copying foo to bar
+  $ cat bar/x
+  aaa
+
 test subtree graft
   $ newclientrepo
   $ drawdag <<'EOS'
@@ -89,7 +145,7 @@ test subtree graft
   > EOS
   $ hg go $C -q
   $ hg subtree copy -r $B --from-path foo --to-path bar -m 'subtree copy foo -> bar'
-  1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  copying foo to bar
 
   $ hg subtree graft -r $C
   abort: must provide --from-path and --to-path
@@ -103,10 +159,11 @@ test subtree graft
 
   $ hg subtree graft -r $C --from-path foo --to-path bar
   grafting 78072751cf70 "C"
+  merging bar/x and foo/x to bar/x
   $ hg log -G -T '{node|short} {desc|firstline}\n'
-  @  8b7f0cb610d9 Graft "C"
+  @  94b9958c85ae Graft "C"
   │
-  o  c8ddf4d613b1 subtree copy foo -> bar
+  o  d52331776b7e subtree copy foo -> bar
   │
   o  78072751cf70 C
   │
@@ -114,7 +171,7 @@ test subtree graft
   │
   o  2f10237b4399 A
   $ hg show
-  commit:      8b7f0cb610d9
+  commit:      94b9958c85ae
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000
   files:       bar/x
@@ -146,12 +203,13 @@ test 'subtree graft -m'
   > EOS
   $ hg go $C -q
   $ hg subtree copy -r $B --from-path foo --to-path bar -m 'subtree copy foo -> bar'
-  1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  copying foo to bar
 
   $ hg subtree graft -r $C --from-path foo --to-path bar -m "new C"
   grafting 78072751cf70 "C"
+  merging bar/x and foo/x to bar/x
   $ hg show
-  commit:      faa9028b5ad6
+  commit:      785d864769d0
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000
   files:       bar/x
@@ -185,9 +243,11 @@ test subtree merge
   > EOS
   $ hg go $D -q
   $ hg subtree copy -r $B --from-path foo --to-path bar -m 'subtree copy foo -> bar'
-  1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  copying foo to bar
   $ hg subtree merge -r $D --from-path foo --to-path bar
-  1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  merge base: 55ff286fb56f
+  merging bar/x and foo/x to bar/x
+  0 files updated, 1 files merged, 0 files removed, 0 files unresolved
   (subtree merge, don't forget to commit)
   $ hg st
   M bar/x
@@ -203,9 +263,9 @@ test subtree merge
   +4
   $ hg ci -m 'subtree merge foo to bar'
   $ hg dbsh -c 'print(repo["."].extra())'
-  {'branch': 'default', 'test_subtree_merge': '{"v":1,"merges":[{"from_commit":"907442010f516d83aea80b4382964be22a34214f","from_path":"foo","to_path":"bar"}]}'}
+  {'branch': 'default', 'test_subtree_merge': '{"merges":[{"from_commit":"907442010f516d83aea80b4382964be22a34214f","from_path":"foo","to_path":"bar"}],"v":1}'}
   $ hg show
-  commit:      d4af047a2267
+  commit:      944563f24b78
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000
   files:       bar/x
@@ -227,13 +287,17 @@ test subtree merge
   +4
 should have one parent
   $ hg log -r . -T '{parents}'
-  573882c72521  (no-eol)
-tofix: show logs of 'bar' directory
+  4658f38ab377  (no-eol)
   $ hg log bar
-  commit:      d4af047a2267
+  commit:      944563f24b78
   user:        test
   date:        Thu Jan 01 00:00:00 1970 +0000
   summary:     subtree merge foo to bar
+  
+  commit:      4658f38ab377
+  user:        test
+  date:        Thu Jan 01 00:00:00 1970 +0000
+  summary:     subtree copy foo -> bar
 
 test subtree merge with normal copy
   $ newclientrepo
@@ -247,6 +311,7 @@ test subtree merge with normal copy
   > EOS
   $ hg go $C -q
   $ hg subtree merge -r $C --from-path foo --to-path bar
+  merge base: 2f10237b4399
   merging bar/x and foo/x to bar/x
   0 files updated, 1 files merged, 0 files removed, 0 files unresolved
   (subtree merge, don't forget to commit)
@@ -279,6 +344,7 @@ test subtree merge with no copy
   > EOS
   $ hg go $C -q
   $ hg subtree merge -r $C --from-path foo --to-path bar
+  merge base: 2f10237b4399
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
   (subtree merge, don't forget to commit)
   $ hg st
@@ -312,7 +378,8 @@ test subtree merge with no common base
   │ @  19915b669dd5 D
   │
   o  2f10237b4399 A
-  $ zzl=1 hg subtree merge -r $C --from-path foo --to-path bar
+  $ hg subtree merge -r $C --from-path foo --to-path bar
+  merge base: 000000000000
   merging bar/x and foo/x to bar/x
   warning: 1 conflicts while merging bar/x! (edit, then use 'hg resolve --mark')
   0 files updated, 0 files merged, 0 files removed, 1 files unresolved

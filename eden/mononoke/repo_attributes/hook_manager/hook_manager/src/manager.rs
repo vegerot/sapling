@@ -13,14 +13,16 @@ use anyhow::Error;
 use anyhow::Result;
 use bookmarks_types::BookmarkKey;
 use bytes::Bytes;
+use cloned::cloned;
 use context::CoreContext;
 use fbinit::FacebookInit;
+use futures::future::BoxFuture;
 use futures::stream::futures_unordered::FuturesUnordered;
+use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures::try_join;
 use futures::Future;
-use futures::TryFutureExt;
-use futures_stats::TimedFutureExt;
+use futures::FutureExt;
 use metaconfig_types::BookmarkOrRegex;
 use metaconfig_types::HookBypass;
 use metaconfig_types::HookConfig;
@@ -41,13 +43,9 @@ use slog::debug;
 use crate::errors::HookManagerError;
 use crate::provider::HookStateProvider;
 use crate::BookmarkHook;
-use crate::BookmarkHookExecutionId;
 use crate::ChangesetHook;
-use crate::ChangesetHookExecutionId;
 use crate::CrossRepoPushSource;
 use crate::FileHook;
-use crate::FileHookExecutionId;
-use crate::HookExecution;
 use crate::HookOutcome;
 use crate::PushAuthoredBy;
 
@@ -274,11 +272,9 @@ impl HookManager {
             scuba.add("hook", hook_name.to_string());
             scuba.add("to", to.get_changeset_id().to_string());
 
-            if let Some(bypass_reason) = get_bypass_reason(
-                hook.get_config().bypass.as_ref(),
-                to.message(),
-                maybe_pushvars,
-            ) {
+            if let Some(bypass_reason) =
+                get_bypassed_by_pushvar_reason(hook.get_config().bypass.as_ref(), maybe_pushvars)
+            {
                 scuba.add("bypass_reason", bypass_reason);
                 scuba.log();
                 continue;
@@ -304,7 +300,7 @@ impl HookManager {
     pub async fn run_changesets_hooks_for_bookmark(
         &self,
         ctx: &CoreContext,
-        changesets: impl Clone + itertools::Itertools<Item = &BonsaiChangeset>,
+        changesets: &[BonsaiChangeset],
         bookmark: &BookmarkKey,
         maybe_pushvars: Option<&HashMap<String, Bytes>>,
         cross_repo_push_source: CrossRepoPushSource,
@@ -314,8 +310,6 @@ impl HookManager {
 
         let hooks = self.hooks_for_bookmark(bookmark);
 
-        let futs = FuturesUnordered::new();
-
         let mut scuba = self.scuba.clone();
         let username = ctx.metadata().unix_name();
         let user_option = ctx.metadata().client_hostname().or(username);
@@ -324,57 +318,134 @@ impl HookManager {
             scuba.add("user", user);
         }
 
-        for (cs, hook_name) in changesets.cartesian_product(hooks) {
-            let hook = self
-                .hooks
-                .get(hook_name)
-                .ok_or_else(|| HookManagerError::NoSuchHook(hook_name.to_string()))?;
+        let (batched, individual) = hooks
+            .map(|hook_name| {
+                let hook = self
+                    .hooks
+                    .get(hook_name)
+                    .ok_or_else(|| HookManagerError::NoSuchHook(hook_name.to_string()))?;
+                scuba.add("hook", hook_name.to_string());
+                Ok((hook_name, hook))
+            })
+            // Collapse out if an error happened
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            // Skip any hook that's entirely bypassed due to a pushvar
+            .filter(|(hook_name, hook)| {
+                cloned!(mut scuba);
+                log_if_bypassed_by_pushvar(&mut scuba, hook_name, hook, changesets, maybe_pushvars)
+            })
+            .map(|(hook_name, hook)| {
+                // Skip any changeset that explicitly bypasses this hook in its commit message
+                let changesets = changesets
+                    .iter()
+                    .filter(|cs| {
+                        cloned!(mut scuba);
+                        log_if_bypassed_by_commit_msg(&mut scuba, hook_name, hook, cs)
+                    })
+                    .collect::<Vec<_>>();
+                hook.get_futures_for_changeset_or_file_hooks(
+                    ctx,
+                    bookmark,
+                    &*self.content_provider,
+                    hook_name,
+                    changesets,
+                    scuba.clone(),
+                    cross_repo_push_source,
+                    push_authored_by,
+                    hook.get_config().log_only,
+                )
+            })
+            .partition::<Vec<_>, _>(HooksOutcome::is_batched);
 
-            let mut scuba = scuba.clone();
-            scuba.add("hook", hook_name.to_string());
-            scuba.add("hash", cs.get_changeset_id().to_string());
+        let individual_concurrency = justknobs::get_as::<usize>(
+            "scm/mononoke:bookmark_movement_changeset_hooks_individual_concurency",
+            Some(&self.repo_name),
+        )
+        .unwrap_or(100);
+        let batched_concurrency = justknobs::get_as::<usize>(
+            "scm/mononoke:bookmark_movement_changeset_hooks_batched_concurency",
+            Some(&self.repo_name),
+        )
+        .unwrap_or(10);
 
-            if let Some(bypass_reason) = get_bypass_reason(
-                hook.get_config().bypass.as_ref(),
-                cs.message(),
-                maybe_pushvars,
-            ) {
-                scuba.add("bypass_reason", bypass_reason);
-                scuba.log();
-                continue;
-            }
+        // Avoid mixing fast and slow futures by joining two streams:
+        // * One that runs fast futures that operate on a single changeset or file.
+        //   Such futures should be lightweight enough that we can run 100 of them concurrently
+        // * One that runs slow futures that process multiple changesets at once.
+        //   Such futures may take longer waiting for IO, so we only run 10 of them concurrently
+        let individual_fut =
+            futures::stream::iter(individual.into_iter().flat_map(HooksOutcome::into_inner))
+                .boxed()
+                .buffer_unordered(individual_concurrency)
+                .try_collect::<Vec<_>>();
+        let batched_fut =
+            futures::stream::iter(batched.into_iter().flat_map(HooksOutcome::into_inner))
+                .boxed()
+                .buffer_unordered(batched_concurrency)
+                .try_collect::<Vec<_>>();
 
-            for future in hook.get_futures_for_changeset_or_file_hooks(
-                ctx,
-                bookmark,
-                &*self.content_provider,
-                hook_name,
-                cs,
-                scuba,
-                cross_repo_push_source,
-                push_authored_by,
-                hook.get_config().log_only,
-            ) {
-                futs.push(future);
-            }
-        }
-        futs.try_collect().await
+        let (individual_res, batched_res) = futures::try_join!(individual_fut, batched_fut)?;
+        Ok(individual_res
+            .into_iter()
+            .chain(batched_res.into_iter())
+            .collect())
     }
 }
 
-fn get_bypass_reason(
+fn log_if_bypassed_by_commit_msg(
+    scuba: &mut MononokeScubaSampleBuilder,
+    hook_name: &str,
+    hook: &Hook,
+    cs: &BonsaiChangeset,
+) -> bool {
+    if let Some(bypass_reason) =
+        get_bypassed_by_commit_msg_reason(hook.get_config().bypass.as_ref(), cs.message())
+    {
+        log_bypassed_changeset(scuba, hook_name, cs, &bypass_reason);
+        false
+    } else {
+        true
+    }
+}
+
+fn log_if_bypassed_by_pushvar(
+    scuba: &mut MononokeScubaSampleBuilder,
+    hook_name: &str,
+    hook: &Hook,
+    changesets: &[BonsaiChangeset],
+    maybe_pushvars: Option<&HashMap<String, Bytes>>,
+) -> bool {
+    if let Some(bypass_reason) =
+        get_bypassed_by_pushvar_reason(hook.get_config().bypass.as_ref(), maybe_pushvars)
+    {
+        // Log all bypassed hooks. No need to be async
+        for cs in changesets {
+            log_bypassed_changeset(scuba, hook_name, cs, &bypass_reason);
+        }
+        false
+    } else {
+        true
+    }
+}
+
+fn log_bypassed_changeset(
+    scuba: &mut MononokeScubaSampleBuilder,
+    hook_name: &str,
+    cs: &BonsaiChangeset,
+    bypass_reason: &str,
+) {
+    scuba.add("hook", hook_name.to_string());
+    scuba.add("hash", cs.get_changeset_id().to_string());
+    scuba.add("bypass_reason", bypass_reason.to_string());
+    scuba.log();
+}
+
+fn get_bypassed_by_pushvar_reason(
     bypass: Option<&HookBypass>,
-    cs_msg: &str,
     maybe_pushvars: Option<&HashMap<String, Bytes>>,
 ) -> Option<String> {
     let bypass = bypass?;
-
-    if let Some(bypass_string) = bypass.commit_message_bypass() {
-        if cs_msg.contains(bypass_string) {
-            return Some(format!("bypass string: {}", bypass_string));
-        }
-    }
-
     if let Some((name, value)) = bypass.pushvar_bypass() {
         if let Some(pushvars) = maybe_pushvars {
             let pushvar_val = pushvars
@@ -392,13 +463,45 @@ fn get_bypass_reason(
     None
 }
 
+fn get_bypassed_by_commit_msg_reason(bypass: Option<&HookBypass>, cs_msg: &str) -> Option<String> {
+    let bypass = bypass?;
+
+    if let Some(bypass_string) = bypass.commit_message_bypass() {
+        if cs_msg.contains(bypass_string) {
+            return Some(format!("bypass string: {}", bypass_string));
+        }
+    }
+
+    None
+}
+
+pub enum HooksOutcome<'a> {
+    Individual(Vec<BoxFuture<'a, Result<HookOutcome, Error>>>),
+    Batched(Vec<BoxFuture<'a, Result<HookOutcome, Error>>>),
+}
+
+impl<'a> HooksOutcome<'a> {
+    fn is_batched(&self) -> bool {
+        match self {
+            Self::Individual(_) => false,
+            Self::Batched(_) => true,
+        }
+    }
+    fn into_inner(self) -> Vec<BoxFuture<'a, Result<HookOutcome, Error>>> {
+        match self {
+            Self::Individual(x) => x,
+            Self::Batched(x) => x,
+        }
+    }
+}
+
 enum Hook {
     Bookmark(Box<dyn BookmarkHook>, HookConfig),
     Changeset(Box<dyn ChangesetHook>, HookConfig),
     File(Box<dyn FileHook>, HookConfig),
 }
 
-enum HookInstance<'a> {
+pub(crate) enum HookInstance<'a> {
     Bookmark(&'a dyn BookmarkHook),
     Changeset(&'a dyn ChangesetHook),
     File(
@@ -409,229 +512,89 @@ enum HookInstance<'a> {
 }
 
 impl<'a> HookInstance<'a> {
-    async fn run_on_bookmark(
+    fn run_changeset_hook_on_many_changesets(
         self,
-        ctx: &CoreContext,
-        bookmark: &BookmarkKey,
-        content_provider: &dyn HookStateProvider,
-        hook_name: &str,
-        mut scuba: MononokeScubaSampleBuilder,
-        to: &BonsaiChangeset,
+        ctx: &'a CoreContext,
+        bookmark: &'a BookmarkKey,
+        content_provider: &'a dyn HookStateProvider,
+        hook_name: &'a str,
+        scuba: MononokeScubaSampleBuilder,
+        changesets: Vec<&'a BonsaiChangeset>,
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
         log_only: bool,
-    ) -> Result<HookOutcome, Error> {
-        let cs_id = to.get_changeset_id();
-        let (stats, mut result) = match self {
-            Self::Bookmark(hook) => {
-                hook.run(
-                    ctx,
-                    bookmark,
-                    to,
-                    content_provider,
-                    cross_repo_push_source,
-                    push_authored_by,
-                )
-                .map_ok(|exec| {
-                    HookOutcome::BookmarkHook(
-                        BookmarkHookExecutionId {
-                            cs_id,
-                            bookmark_name: bookmark.to_string(),
-                            hook_name: hook_name.to_string(),
-                        },
-                        exec,
-                    )
-                })
-                .timed()
-                .await
+    ) -> HooksOutcome<'a> {
+        match self {
+            Self::Bookmark(..) | Self::File(..) => {
+                // For bookmarks, we don't need batching as we run one per hook per push
+                // For files, the instance is specific to a changeset, so batching on changesets
+                // doesn't make much sense
+                // This should never be called
+                HooksOutcome::Individual(Vec::new())
             }
-            Self::Changeset(..) => {
-                // Don't run changeset hook on bookmark. Just accept the change.
-                async { Ok(HookExecution::Accepted) }
-                    .map_ok(|exec| {
-                        HookOutcome::ChangesetHook(
-                            ChangesetHookExecutionId {
-                                cs_id,
-                                hook_name: hook_name.to_string(),
-                            },
-                            exec,
-                        )
-                    })
-                    .timed()
-                    .await
-            }
-            Self::File(_, path, _) => {
-                // Don't run file hook on bookmark. Just accept the change.
-                async { Ok(HookExecution::Accepted) }
-                    .map_ok(|exec| {
-                        HookOutcome::FileHook(
-                            FileHookExecutionId {
-                                cs_id,
-                                path: path.clone(),
-                                hook_name: hook_name.to_string(),
-                            },
-                            exec,
-                        )
-                    })
-                    .timed()
-                    .await
-            }
-        };
-
-        let mut errorcode = 0;
-        let mut failed_hooks = 0;
-        let mut stderr = None;
-
-        match result.as_mut() {
-            Ok(outcome) => match outcome.get_execution() {
-                HookExecution::Accepted => {
-                    // Nothing to do
-                }
-                HookExecution::Rejected(info) if log_only => {
-                    scuba.add("log_only_rejection", info.long_description.clone());
-                    // Convert to accepted as we are only logging.
-                    outcome.set_execution(HookExecution::Accepted);
-                }
-                HookExecution::Rejected(info) => {
-                    failed_hooks = 1;
-                    errorcode = 1;
-                    stderr = Some(info.long_description.clone());
-                }
-            },
-            Err(e) => {
-                errorcode = 1;
-                stderr = Some(format!("{:?}", e));
-                scuba.add("internal_failure", true);
-            }
-        };
-
-        if let Some(stderr) = stderr {
-            scuba.add("stderr", stderr);
+            Self::Changeset(hook) => hook.run_hook_on_many_changesets(
+                ctx,
+                bookmark,
+                changesets,
+                content_provider,
+                cross_repo_push_source,
+                push_authored_by,
+                hook_name,
+                scuba,
+                log_only,
+            ),
         }
-
-        let elapsed = stats.completion_time.as_millis() as i64;
-        scuba
-            .add("elapsed", elapsed)
-            .add("total_time", elapsed)
-            .add("errorcode", errorcode)
-            .add("failed_hooks", failed_hooks)
-            .log();
-
-        result.map_err(|e| e.context(format!("while executing hook {}", hook_name)))
     }
-
-    async fn run_on_changeset(
+    pub(crate) async fn run_hook(
         self,
         ctx: &CoreContext,
         bookmark: &BookmarkKey,
         content_provider: &dyn HookStateProvider,
         hook_name: &str,
-        mut scuba: MononokeScubaSampleBuilder,
+        scuba: MononokeScubaSampleBuilder,
         cs: &BonsaiChangeset,
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
         log_only: bool,
     ) -> Result<HookOutcome, Error> {
         let cs_id = cs.get_changeset_id();
-        let (stats, mut result) = match self {
-            Self::Bookmark(..) => {
-                // Don't run bookmark hook on changeset. Just accept the change.
-                async { Ok(HookExecution::Accepted) }
-                    .map_ok(|exec| {
-                        HookOutcome::ChangesetHook(
-                            ChangesetHookExecutionId {
-                                cs_id,
-                                hook_name: hook_name.to_string(),
-                            },
-                            exec,
-                        )
-                    })
-                    .timed()
-                    .await
-            }
-            Self::Changeset(hook) => {
-                hook.run(
-                    ctx,
-                    bookmark,
-                    cs,
-                    content_provider,
-                    cross_repo_push_source,
-                    push_authored_by,
-                )
-                .map_ok(|exec| {
-                    HookOutcome::ChangesetHook(
-                        ChangesetHookExecutionId {
-                            cs_id,
-                            hook_name: hook_name.to_string(),
-                        },
-                        exec,
-                    )
-                })
-                .timed()
-                .await
-            }
-            Self::File(hook, path, change) => {
-                hook.run(
-                    ctx,
-                    content_provider,
-                    change,
-                    path,
-                    cross_repo_push_source,
-                    push_authored_by,
-                )
-                .map_ok(|exec| {
-                    HookOutcome::FileHook(
-                        FileHookExecutionId {
-                            cs_id,
-                            path: path.clone(),
-                            hook_name: hook_name.to_string(),
-                        },
-                        exec,
-                    )
-                })
-                .timed()
-                .await
-            }
-        };
-
-        let mut errorcode = 0;
-        let mut failed_hooks = 0;
-        let mut stderr = None;
-
-        match result.as_mut() {
-            Ok(outcome) => match outcome.get_execution() {
-                HookExecution::Accepted => {
-                    // Nothing to do
-                }
-                HookExecution::Rejected(info) if log_only => {
-                    scuba.add("log_only_rejection", info.long_description.clone());
-                    // Convert to accepted as we are only logging.
-                    outcome.set_execution(HookExecution::Accepted);
-                }
-                HookExecution::Rejected(info) => {
-                    failed_hooks = 1;
-                    stderr = Some(info.long_description.clone());
-                }
-            },
-            Err(e) => {
-                errorcode = 1;
-                stderr = Some(format!("{:?}", e));
-            }
-        };
-
-        if let Some(stderr) = stderr {
-            scuba.add("stderr", stderr);
+        match self {
+            Self::Bookmark(hook) => hook.run_hook(
+                ctx,
+                bookmark,
+                cs,
+                content_provider,
+                cross_repo_push_source,
+                push_authored_by,
+                hook_name,
+                scuba,
+                log_only,
+            ),
+            Self::Changeset(hook) => hook.run_hook(
+                ctx,
+                bookmark,
+                cs,
+                content_provider,
+                cross_repo_push_source,
+                push_authored_by,
+                hook_name,
+                scuba,
+                log_only,
+            ),
+            Self::File(hook, path, change) => hook.run_hook(
+                ctx,
+                content_provider,
+                change,
+                path,
+                cross_repo_push_source,
+                push_authored_by,
+                cs_id,
+                hook_name,
+                scuba,
+                log_only,
+            ),
         }
-
-        let elapsed = stats.completion_time.as_millis() as i64;
-        scuba
-            .add("elapsed", elapsed)
-            .add("total_time", elapsed)
-            .add("errorcode", errorcode)
-            .add("failed_hooks", failed_hooks)
-            .log();
-
-        result.map_err(|e| e.context(format!("while executing hook {}", hook_name)))
+        .await
     }
 }
 
@@ -667,28 +630,26 @@ impl Hook {
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
         log_only: bool,
-    ) -> impl Iterator<Item = impl Future<Output = Result<HookOutcome, Error>> + 'cs> + 'cs {
+    ) -> Vec<impl Future<Output = Result<HookOutcome, Error>> + 'cs> {
         let mut futures = Vec::new();
 
         match self {
-            Self::Bookmark(hook, _) => {
-                futures.push(HookInstance::Bookmark(&**hook).run_on_bookmark(
-                    ctx,
-                    bookmark,
-                    content_provider,
-                    hook_name,
-                    scuba,
-                    to,
-                    cross_repo_push_source,
-                    push_authored_by,
-                    log_only,
-                ))
-            }
+            Self::Bookmark(hook, _) => futures.push(HookInstance::Bookmark(&**hook).run_hook(
+                ctx,
+                bookmark,
+                content_provider,
+                hook_name,
+                scuba,
+                to,
+                cross_repo_push_source,
+                push_authored_by,
+                log_only,
+            )),
             Self::Changeset(..) | Self::File(..) =>
                 /* Not a bookmark hook */
                 {}
         };
-        futures.into_iter()
+        futures
     }
 
     pub fn get_futures_for_changeset_or_file_hooks<'a: 'cs, 'cs>(
@@ -697,48 +658,56 @@ impl Hook {
         bookmark: &'a BookmarkKey,
         content_provider: &'a dyn HookStateProvider,
         hook_name: &'cs str,
-        cs: &'cs BonsaiChangeset,
+        changesets: Vec<&'cs BonsaiChangeset>,
         scuba: MononokeScubaSampleBuilder,
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
         log_only: bool,
-    ) -> impl Iterator<Item = impl Future<Output = Result<HookOutcome, Error>> + 'cs> + 'cs {
-        let mut futures = Vec::new();
-
+    ) -> HooksOutcome<'cs> {
         match self {
-            Self::Changeset(hook, _) => {
-                futures.push(HookInstance::Changeset(&**hook).run_on_changeset(
+            Self::Changeset(hook, _) => HookInstance::Changeset(&**hook)
+                .run_changeset_hook_on_many_changesets(
                     ctx,
                     bookmark,
                     content_provider,
                     hook_name,
                     scuba,
-                    cs,
+                    changesets,
                     cross_repo_push_source,
                     push_authored_by,
                     log_only,
-                ))
-            }
-            Self::File(hook, _) => {
-                futures.extend(cs.simplified_file_changes().map(move |(path, change)| {
-                    HookInstance::File(&**hook, path, change).run_on_changeset(
-                        ctx,
-                        bookmark,
-                        content_provider,
-                        hook_name,
-                        scuba.clone(),
-                        cs,
-                        cross_repo_push_source,
-                        push_authored_by,
-                        log_only,
-                    )
-                }))
-            }
+                ),
+            Self::File(hook, _) => HooksOutcome::Individual(
+                changesets
+                    .iter()
+                    .flat_map(|cs| {
+                        cloned!(mut scuba);
+                        cs.simplified_file_changes()
+                            .map(move |(path, change)| {
+                                HookInstance::File(&**hook, path, change)
+                                    .run_hook(
+                                        ctx,
+                                        bookmark,
+                                        content_provider,
+                                        hook_name,
+                                        scuba.clone(),
+                                        cs,
+                                        cross_repo_push_source,
+                                        push_authored_by,
+                                        log_only,
+                                    )
+                                    .boxed()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect(),
+            ),
             Self::Bookmark(..) =>
-                /* Not a changeset or file hook */
-                {}
-        };
-        futures.into_iter()
+            /* Not a changeset or file hook */
+            {
+                HooksOutcome::Individual(Vec::new())
+            }
+        }
     }
 }
 
@@ -752,10 +721,10 @@ mod test {
     fn test_commit_message_bypass() {
         let bypass = HookBypass::new_with_commit_msg("@mybypass".into());
 
-        let r = get_bypass_reason(Some(&bypass), "@notbypass", None);
+        let r = get_bypassed_by_commit_msg_reason(Some(&bypass), "@notbypass");
         assert!(r.is_none());
 
-        let r = get_bypass_reason(Some(&bypass), "foo @mybypass bar", None);
+        let r = get_bypassed_by_commit_msg_reason(Some(&bypass), "foo @mybypass bar");
         assert!(r.is_some());
     }
 
@@ -764,23 +733,23 @@ mod test {
         let bypass = HookBypass::new_with_pushvar("myvar".into(), "myvalue".into());
 
         let mut m = HashMap::new();
-        let r = get_bypass_reason(Some(&bypass), "", Some(&m));
+        let r = get_bypassed_by_pushvar_reason(Some(&bypass), Some(&m));
         assert!(r.is_none()); // No var
 
         m.insert("somevar".into(), "somevalue".as_bytes().into());
-        let r = get_bypass_reason(Some(&bypass), "", Some(&m));
+        let r = get_bypassed_by_pushvar_reason(Some(&bypass), Some(&m));
         assert!(r.is_none()); // wrong var
 
         m.insert("myvar".into(), "somevalue".as_bytes().into());
-        let r = get_bypass_reason(Some(&bypass), "", Some(&m));
+        let r = get_bypassed_by_pushvar_reason(Some(&bypass), Some(&m));
         assert!(r.is_none()); // wrong value
 
         m.insert("myvar".into(), "myvalue foo".as_bytes().into());
-        let r = get_bypass_reason(Some(&bypass), "", Some(&m));
+        let r = get_bypassed_by_pushvar_reason(Some(&bypass), Some(&m));
         assert!(r.is_none()); // wrong value
 
         m.insert("myvar".into(), "myvalue".as_bytes().into());
-        let r = get_bypass_reason(Some(&bypass), "", Some(&m));
+        let r = get_bypassed_by_pushvar_reason(Some(&bypass), Some(&m));
         assert!(r.is_some());
     }
 }
