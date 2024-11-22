@@ -1,15 +1,17 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
+use std::io;
 use std::io::BufRead;
 use std::io::Result;
 use std::io::Write;
 
 use anyhow::anyhow;
+use anyhow::bail;
 use anyhow::Error;
 use base64::alphabet::STANDARD;
 use base64::engine::general_purpose::GeneralPurpose;
@@ -24,7 +26,7 @@ use crate::CasDigest;
 use crate::FileType;
 use crate::HgId;
 use crate::Id20;
-use crate::RepoPathBuf;
+use crate::PathComponentBuf;
 use crate::Sha1;
 
 // Bring back the pre 0.20 bevahiour and allow either padded or un-padded base64 strings at decode time.
@@ -65,7 +67,7 @@ pub struct AugmentedTree {
     pub computed_hg_node_id: Option<HgId>,
     pub p1: Option<HgId>,
     pub p2: Option<HgId>,
-    pub entries: Vec<(RepoPathBuf, AugmentedTreeEntry)>,
+    pub entries: Vec<(PathComponentBuf, AugmentedTreeEntry)>,
 }
 
 impl AugmentedTree {
@@ -96,6 +98,17 @@ impl AugmentedTree {
                 }
                 AugmentedTreeEntry::FileNode(file) => {
                     w.write_all(file.filenode.to_hex().as_bytes())?;
+                    match file.file_type {
+                        FileType::Regular => {}
+                        FileType::Executable => w.write_all(b"x")?,
+                        FileType::Symlink => w.write_all(b"l")?,
+                        FileType::GitSubmodule => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                anyhow!("submodules not supported in augmented manifests"),
+                            ));
+                        }
+                    }
                 }
             };
             w.write_all(b"\n")?;
@@ -189,7 +202,17 @@ impl AugmentedTree {
             match subentry {
                 AugmentedTreeEntry::FileNode(file) => {
                     w.write_all(file.filenode.to_hex().as_ref())?;
-                    w.write_all(b"r")?;
+                    w.write_all(match file.file_type {
+                        FileType::Regular => b"r",
+                        FileType::Executable => b"x",
+                        FileType::Symlink => b"l",
+                        FileType::GitSubmodule => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                anyhow!("submodules not supported in augmented manifests"),
+                            ));
+                        }
+                    })?;
                     w.write_all(b" ")?;
                     w.write_all(file.content_blake3.to_hex().as_ref())?;
                     w.write_all(b" ")?;
@@ -278,16 +301,17 @@ impl AugmentedTree {
                 .map(|line| {
                     let line = line?;
                     let line = line.trim();
-                    let mut parts = line.split(' ');
-                    let idpath = parts.next().ok_or(anyhow!(
-                        "augmented tree: missing path/id part in a child entry"
-                    ))?;
-                    let (path, id) = idpath
+
+                    let (path, rest) = line
                         .split_once('\0')
                         .ok_or(anyhow!("augmented tree: invalid format of a child entry"))?;
 
+                    let mut parts = rest.split(' ');
+                    let id = parts.next().ok_or(anyhow!(
+                        "augmented tree: missing id part in a child entry"
+                    ))?;
+
                     let mut id = id.to_string();
-                    let path = RepoPathBuf::from_utf8(path.into())?;
                     let flag = id.pop().ok_or(anyhow!(
                         "augmented tree: missing flag part in a child entry"
                     ))?;
@@ -306,7 +330,15 @@ impl AugmentedTree {
                     let size = size.parse::<u64>()?;
 
                     match flag {
-                        'r' => {
+                        't' => Ok((
+                            path.to_string().try_into()?,
+                            AugmentedTreeEntry::DirectoryNode(AugmentedDirectoryNode {
+                                treenode: hgid,
+                                augmented_manifest_id: blake3,
+                                augmented_manifest_size: size,
+                            }),
+                        )),
+                        _ => {
                             let sha1 = parts
                                 .next()
                                 .ok_or(anyhow!(
@@ -332,9 +364,14 @@ impl AugmentedTree {
                             };
 
                             Ok((
-                                path,
+                                path.to_string().try_into()?,
                                 AugmentedTreeEntry::FileNode(AugmentedFileNode {
-                                    file_type: FileType::Regular,
+                                    file_type: match flag {
+                                        'l' => FileType::Symlink,
+                                        'x' => FileType::Executable,
+                                        'r' => FileType::Regular,
+                                        _ => bail!("augmented tree: invalid flag '{flag}' in a child entry for tree {hg_node_id}")
+                                    },
                                     filenode: hgid,
                                     content_blake3: blake3,
                                     content_sha1: sha1,
@@ -343,18 +380,9 @@ impl AugmentedTree {
                                 }),
                             ))
                         }
-                        't' => Ok((
-                            path,
-                            AugmentedTreeEntry::DirectoryNode(AugmentedDirectoryNode {
-                                treenode: hgid,
-                                augmented_manifest_id: blake3,
-                                augmented_manifest_size: size,
-                            }),
-                        )),
-                        _ => Err(anyhow!("augmented tree: invalid flag in a child entry")),
                     }
                 })
-                .collect::<anyhow::Result<Vec<(RepoPathBuf, AugmentedTreeEntry)>, Error>>()?,
+                .collect::<anyhow::Result<Vec<(PathComponentBuf, AugmentedTreeEntry)>, Error>>()?,
         })
     }
 
@@ -529,7 +557,10 @@ mod tests {
         let first_child = augmented_tree_entry.entries.first().unwrap();
         assert_eq!(
             first_child.0,
-            RepoPathBuf::from_utf8(r"AssetWithZoneReclassifications.php".into()).unwrap()
+            "AssetWithZoneReclassifications.php"
+                .to_string()
+                .try_into()
+                .unwrap()
         );
         assert_matches!(first_child.1, AugmentedTreeEntry::FileNode(_));
         assert_matches!(
@@ -743,5 +774,102 @@ mod tests {
         let augmented_tree_with_digest2 =
             AugmentedTreeWithDigest::try_deserialize(reader1).expect("parsing failed");
         assert_eq!(augmented_tree_with_digest, augmented_tree_with_digest2);
+    }
+
+    #[test]
+    fn test_augmented_tree_file_types() {
+        let serialized_manifest = concat!(
+            "v1 1111111111111111111111111111111111111111 - 2222222222222222222222222222222222222222 3333333333333333333333333333333333333333\n",
+            "bin\x004444444444444444444444444444444444444444x 4444444444444444444444444444444444444444444444444444444444444444 10 4444444444444444444444444444444444444444 -\n",
+            "link\x002222222222222222222222222222222222222222l 2222222222222222222222222222222222222222222222222222222222222222 1000 2121212121212121212121212121212121212121 -\n",
+        );
+
+        // Parse initial augmented tree entry.
+        let augmented_tree =
+            AugmentedTree::try_deserialize(serialized_manifest.as_bytes()).expect("parsing failed");
+
+        assert_eq!(
+            augmented_tree.entries,
+            vec![
+                (
+                    "bin".to_string().try_into().unwrap(),
+                    AugmentedTreeEntry::FileNode(AugmentedFileNode {
+                        file_type: FileType::Executable,
+                        filenode: HgId::from_hex(b"4444444444444444444444444444444444444444")
+                            .expect("bad hgid"),
+                        content_blake3: Blake3::from_hex(
+                            b"4444444444444444444444444444444444444444444444444444444444444444"
+                        )
+                        .expect("bad blake3"),
+                        content_sha1: Sha1::from_hex(b"4444444444444444444444444444444444444444")
+                            .expect("bad id20"),
+                        total_size: 10,
+                        file_header_metadata: None,
+                    })
+                ),
+                (
+                    "link".to_string().try_into().unwrap(),
+                    AugmentedTreeEntry::FileNode(AugmentedFileNode {
+                        file_type: FileType::Symlink,
+                        filenode: HgId::from_hex(b"2222222222222222222222222222222222222222")
+                            .expect("bad hgid"),
+                        content_blake3: Blake3::from_hex(
+                            b"2222222222222222222222222222222222222222222222222222222222222222"
+                        )
+                        .expect("bad blake3"),
+                        content_sha1: Sha1::from_hex(b"2121212121212121212121212121212121212121")
+                            .expect("bad id20"),
+                        total_size: 1000,
+                        file_header_metadata: None,
+                    })
+                ),
+            ],
+        );
+
+        let mut buf: Vec<u8> = Vec::new();
+        augmented_tree
+            .try_serialize(&mut buf)
+            .expect("writing failed");
+
+        assert_eq!(&buf, serialized_manifest.as_bytes());
+    }
+
+    #[test]
+    fn test_filename_with_space() {
+        let serialized_manifest = concat!(
+            "v1 1111111111111111111111111111111111111111 - 2222222222222222222222222222222222222222 3333333333333333333333333333333333333333\n",
+            "hi there\x004444444444444444444444444444444444444444r 4444444444444444444444444444444444444444444444444444444444444444 10 4444444444444444444444444444444444444444 -\n",
+        );
+
+        // Parse initial augmented tree entry.
+        let augmented_tree =
+            AugmentedTree::try_deserialize(serialized_manifest.as_bytes()).expect("parsing failed");
+
+        assert_eq!(
+            augmented_tree.entries,
+            vec![(
+                "hi there".to_string().try_into().unwrap(),
+                AugmentedTreeEntry::FileNode(AugmentedFileNode {
+                    file_type: FileType::Regular,
+                    filenode: HgId::from_hex(b"4444444444444444444444444444444444444444")
+                        .expect("bad hgid"),
+                    content_blake3: Blake3::from_hex(
+                        b"4444444444444444444444444444444444444444444444444444444444444444"
+                    )
+                    .expect("bad blake3"),
+                    content_sha1: Sha1::from_hex(b"4444444444444444444444444444444444444444")
+                        .expect("bad id20"),
+                    total_size: 10,
+                    file_header_metadata: None,
+                })
+            ),],
+        );
+
+        let mut buf: Vec<u8> = Vec::new();
+        augmented_tree
+            .try_serialize(&mut buf)
+            .expect("writing failed");
+
+        assert_eq!(&buf, serialized_manifest.as_bytes());
     }
 }

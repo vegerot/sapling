@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.64
+
+### Nov 19 2024
+
+- Sapling commands now show progress bars (requires a recent Sapling version)
+
+## 0.1.63
+
+### Nov 11 2024
+
+- Improvements to warning diagnostics when submitting for review
+
+## 0.1.62
+
+### Nov 5 2024
+
+- Fixed ISL not respecting your VS Code theme
+
+## 0.1.61
+
+### Oct 31 2024
+
+- Made Changed Files more visually compact
+
 ## 0.1.60
 
 ### Oct 14 2024

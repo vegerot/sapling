@@ -5,11 +5,9 @@
 # directory of this source tree.
 
   $ . "${TEST_FIXTURES}/library.sh"
-  $ ENABLED_DERIVED_DATA='["git_trees", "filenodes", "hgchangesets"]' setup_common_config "blob_files"
   $ GIT_REPO="${TESTTMP}/repo-git"
   $ HG_REPO="${TESTTMP}/repo"
-  $ REPOTYPE="blob_files"
-  $ setup_common_config $REPOTYPE
+  $ setup_common_config blob_files
   $ setconfig remotenames.selectivepulldefault=master_bookmark,branch1,branch2
 
 # Setup git repsitory
@@ -72,7 +70,7 @@
   blob-repo0000.git_object.d53a2ef2bbadbe26f8c28598b408e03c0b01027c
 
 # Set master_bookmark (gitimport does not do this yet)
-  $ mononoke_newadmin bookmarks -R repo set master_bookmark cc6482da2d0514725c8e52d064f83963dfbc3b4f7d6bee8e90cc21e2dd555f7d
+  $ mononoke_admin bookmarks -R repo set master_bookmark cc6482da2d0514725c8e52d064f83963dfbc3b4f7d6bee8e90cc21e2dd555f7d
   Creating publishing bookmark master_bookmark at cc6482da2d0514725c8e52d064f83963dfbc3b4f7d6bee8e90cc21e2dd555f7d
 
 # Start Mononoke

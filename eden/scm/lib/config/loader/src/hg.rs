@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! Mercurial-specific config postprocessing
@@ -396,30 +396,41 @@ impl ConfigSetHgExt for ConfigSet {
         errors.append(&mut user.load_user(opts.clone(), &ident));
         layers.push(Arc::new(user));
 
-        if let Some(info) = info.as_disk() {
-            if let Some(dotgit_sl_path) = dotgit_sl_path {
-                let mut repo_git = ConfigSet::new().named("repo-git");
-                let path = translated_git_repo_config_path(dotgit_sl_path, ident);
-                errors.append(&mut repo_git.load_hgrc(path, "repo-git"));
-                layers.push(Arc::new(repo_git));
+        let repo_name: Option<String> = match info {
+            RepoInfo::Disk(info) => {
+                if let Some(dotgit_sl_path) = dotgit_sl_path {
+                    let mut repo_git = ConfigSet::new().named("repo-git");
+                    let path = translated_git_repo_config_path(dotgit_sl_path, ident);
+                    errors.append(&mut repo_git.load_hgrc(path, "repo-git"));
+                    layers.push(Arc::new(repo_git));
+                }
+                let mut local = ConfigSet::new().named("repo");
+                errors.append(&mut local.load_repo(info, opts.clone()));
+                layers.push(Arc::new(local));
+                Some(
+                    read_set_repo_name(&layers, self, &info.dot_hg_path)
+                        .map_err(|e| Errors(vec![e]))?,
+                )
             }
-            let mut local = ConfigSet::new().named("repo");
-            errors.append(&mut local.load_repo(info, opts.clone()));
-            layers.push(Arc::new(local));
-            if let Err(e) = read_set_repo_name(&layers, self, &info.dot_hg_path) {
-                errors.push(e);
-            }
-        }
+            RepoInfo::Ephemeral(name) => Some(name.to_string()),
+            RepoInfo::NoRepo => None,
+        };
+
+        #[cfg(not(feature = "fb"))]
+        let _ = repo_name;
 
         #[cfg(feature = "fb")]
         {
             let dynamic = load_dynamic(
+                repo_name,
                 info,
                 opts,
                 &ident,
                 layers
                     .get_opt("auth_proxy", "unix_socket_path")
                     .unwrap_or_default(),
+                self.get("experimental", "dynamic-config-domain-override")
+                    .or_else(|| layers.get("experimental", "dynamic-config-domain-override")),
                 &mut errors,
             )
             .map_err(|e| Errors(vec![Error::Other(e)]))?;
@@ -744,17 +755,21 @@ pub fn calculate_internalconfig(
     user_name: String,
     proxy_sock_path: Option<String>,
     allow_remote_snapshot: bool,
+    domain_override: Option<crate::fb::internalconfig::Domain>,
 ) -> Result<ConfigSet> {
     use crate::fb::internalconfig::Generator;
-    Generator::new(
+    let mut gen = Generator::new(
         mode,
         repo_name,
         config_dir,
         user_name,
         proxy_sock_path,
         allow_remote_snapshot,
-    )?
-    .execute(canary)
+    )?;
+    if let Some(domain) = domain_override {
+        gen.domain = domain;
+    }
+    gen.execute(canary)
 }
 
 #[cfg(feature = "fb")]
@@ -766,16 +781,19 @@ pub fn generate_internalconfig(
     user_name: String,
     proxy_sock_path: Option<String>,
     allow_remote_snapshot: bool,
+    domain_override: Option<crate::fb::internalconfig::Domain>,
 ) -> Result<()> {
     use std::io::Write;
 
+    use faccess::AccessMode;
+    use faccess::PathExt;
     use filetime::set_file_mtime;
     use filetime::FileTime;
-    use tempfile::tempfile_in;
 
     tracing::debug!(
         repo_path = ?info.map(|i| &i.path),
         canary = ?canary,
+        has_info = info.is_some(),
         "generate_internalconfig",
     );
 
@@ -784,12 +802,24 @@ pub fn generate_internalconfig(
 
     // Verify that the filesystem is writable, otherwise exit early since we won't be able to write
     // the config.
-    if tempfile_in(&config_dir).is_err() {
-        return Err(IOError::new(
-            ErrorKind::PermissionDenied,
-            format!("no write access to {:?}", config_dir),
-        )
-        .into());
+    for _attempt in 0..2 {
+        if let Err(e) = config_dir.access(AccessMode::WRITE) {
+            tracing::debug!("directory {} is not writable: {}", config_dir.display(), &e);
+            if e.kind() == io::ErrorKind::NotFound {
+                // Attempt to create the directory (ex. ".git/sl") and try again.
+                fs::create_dir_all(&config_dir)?;
+                continue;
+            } else {
+                return Err(IOError::new(
+                    ErrorKind::PermissionDenied,
+                    format!("no write access to {:?} ({:?})", config_dir, e),
+                )
+                .into());
+            }
+        } else {
+            tracing::debug!("directory {} is writable", config_dir.display());
+            break;
+        }
     }
 
     let version = ::version::VERSION;
@@ -799,12 +829,16 @@ pub fn generate_internalconfig(
             "# reponame={}\n",
             "# canary={:?}\n",
             "# username={}\n",
+            "{}",
             "# Generated by `hg debugrefreshconfig` - DO NOT MODIFY\n",
         ),
         version,
         repo_name.as_ref().map_or("no_repo", |r| r.as_ref()),
         canary.as_ref(),
         &user_name,
+        domain_override
+            .map(|d| format!("# domain-override={}\n", d.to_str()))
+            .unwrap_or_default(),
     );
 
     let hgrc_path = match (info, &repo_name) {
@@ -816,6 +850,7 @@ pub fn generate_internalconfig(
         )),
         _ => config_dir.join("hgrc.dynamic"),
     };
+    tracing::debug!("hgrc path is {}", hgrc_path.display());
 
     let global_config_dir = get_config_dir(None)?;
 
@@ -827,6 +862,7 @@ pub fn generate_internalconfig(
         user_name,
         proxy_sock_path,
         allow_remote_snapshot,
+        domain_override,
     )?;
     let config_str = format!("{}{}", header, config);
 
@@ -850,13 +886,16 @@ pub fn generate_internalconfig(
 /// Returns errors parsing, generating, or fetching the configs.
 #[cfg(feature = "fb")]
 fn load_dynamic(
+    repo_name: Option<String>,
     info: RepoInfo,
     opts: Options,
     identity: &Identity,
     proxy_sock_path: Option<String>,
+    domain_override: Option<Text>,
     errors: &mut Vec<Error>,
 ) -> Result<ConfigSet> {
     use crate::fb::internalconfig::vpnless_config_path;
+    use crate::fb::internalconfig::Domain;
 
     let mode = FbConfigMode::from_identity(identity);
     let mut this = ConfigSet::new().named("dynamic");
@@ -881,58 +920,57 @@ fn load_dynamic(
 
     // Check version
     let content = read_to_string(&dynamic_path).ok();
-    let version = content.as_ref().and_then(|c| {
-        let mut lines = c.split('\n');
-        match lines.next() {
-            Some(line) if line.starts_with("# version=") => Some(&line[10..]),
-            Some(_) | None => None,
+    let mut headers = HashMap::new();
+    for line in content.as_deref().unwrap_or_default().lines() {
+        if let Some(kv) = line.strip_prefix("# ") {
+            if let Some((k, v)) = kv.split_once('=') {
+                headers.insert(k, v);
+            }
+        } else {
+            break;
         }
-    });
+    }
+    let version = headers.get("version").copied();
+    let repo_name_in_file = headers.get("reponame").copied();
 
     let this_version = ::version::VERSION;
 
-    let vpnless_changed = match (dynamic_path.metadata(), vpnless_config_path().metadata()) {
+    let dynamic_metadata = dynamic_path.metadata();
+
+    let vpnless_changed = match (&dynamic_metadata, vpnless_config_path().metadata()) {
         (Ok(d), Ok(v)) => v.modified()? > d.modified()?,
         _ => false,
     };
 
+    let domain_override = domain_override.and_then(|d| Domain::from_str(d.as_ref()));
+
     let needs_sync_generation =
-            // No current dynamic config - need to generate.
-            version.is_none()
-            // VPNLess changed - need to regenerate.
-            || vpnless_changed
-            // Version mismatch between us and already generated - optionally generate.
-            || !opts.minimize_dynamic_gen && version != Some(this_version);
+        // No current dynamic config - need to generate.
+        version.is_none()
+        // VPNLess changed - need to regenerate.
+        || vpnless_changed
+        // Repo has entered or left AWS mode - need to regenerate.
+        || headers.get("domain-override").copied() != domain_override.as_ref().map(|d| d.to_str())
+        // In-hand repo name differs from repo name in file.
+        || repo_name.as_deref() != repo_name_in_file
+        // Version mismatch between us and already generated - optionally generate.
+        || !opts.minimize_dynamic_gen && version != Some(this_version);
 
     if needs_sync_generation {
-        tracing::info!(?dynamic_path, file_version=?version, my_version=%this_version, vpnless_changed, "regenerating dynamic config (version mismatch)");
-        let (repo_name, user_name) = {
+        tracing::info!(
+            ?dynamic_path,
+            ?headers,
+            version=%this_version,
+            ?domain_override,
+            vpnless_changed,
+            "regenerating (sync) dynamic config (version mismatch)",
+        );
+        let user_name = {
             let mut temp_config = ConfigSet::new().named("temp");
             if !temp_config.load_user(opts.clone(), identity).is_empty() {
                 bail!("unable to read user config to get user name");
             }
-
-            let repo_name = match info {
-                RepoInfo::Disk(info) => {
-                    let opts = opts.clone().source("temp").process_hgplain();
-                    // We need to know the repo name, but that's stored in the repository configs at
-                    // the moment. In the long term we need to move that, but for now let's load the
-                    // repo config ahead of time to read the name.
-                    let repo_hgrc_path = info.dot_hg_path.join("hgrc");
-                    if !temp_config.load_path(repo_hgrc_path, &opts).is_empty() {
-                        bail!("unable to read repo config to get repo name");
-                    }
-                    Some(read_set_repo_name(
-                        &temp_config,
-                        &mut ConfigSet::new(),
-                        &info.dot_hg_path,
-                    )?)
-                }
-                RepoInfo::Ephemeral(repo_name) => Some(repo_name.to_string()),
-                RepoInfo::NoRepo => None,
-            };
-
-            (repo_name, temp_config.get_or_default("ui", "username")?)
+            temp_config.get_or_default("ui", "username")?
         };
 
         // Regen inline
@@ -945,8 +983,10 @@ fn load_dynamic(
             proxy_sock_path,
             // Allow using baked in remote config snapshot in case remote fetch fails.
             true,
+            domain_override,
         );
         if let Err(e) = res {
+            tracing::warn!(error=?e, "failed to regenerate (sync)");
             let is_perm_error = e
                 .chain()
                 .any(|cause| match cause.downcast_ref::<IOError>() {

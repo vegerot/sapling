@@ -32,7 +32,7 @@ from . import (
     util as util_mod,
     version as version_mod,
 )
-from .config import EdenInstance
+from .config import CheckoutPathProblemType, detect_checkout_path_problem, EdenInstance
 
 try:
     from .facebook.rage import (
@@ -279,6 +279,10 @@ def print_diagnostic_info(
     }
 
     for checkout_path in mountpoint_paths:
+        try:
+            nested_checkout, __ = detect_checkout_path_problem(checkout_path, instance)
+        except Exception:
+            nested_checkout = None
         out.write(b"\nMount point info for path %s:\n" % checkout_path.encode())
         checkout_data = instance.get_checkout_info(checkout_path)
         mount_data = mounts_data.get(checkout_path, {})
@@ -286,6 +290,10 @@ def print_diagnostic_info(
         if "data_dir" in mount_data:
             mount_data.pop("data_dir")
 
+        if nested_checkout == CheckoutPathProblemType.NESTED_CHECKOUT:
+            mount_data["nested_checkout"] = True
+        else:
+            mount_data["nested_checkout"] = False
         checkout_data.update(mount_data)
         for k, v in checkout_data.items():
             out.write("{:>20} : {}\n".format(k, v).encode())
@@ -294,6 +302,8 @@ def print_diagnostic_info(
         with io.StringIO() as stats_stream:
             stats_mod.do_stats_general(
                 instance,
+                # pyre-fixme[6]: For 1st argument expected `TextIOWrapper[Any]` but
+                #  got `StringIO`.
                 stats_mod.StatsGeneralOptions(out=stats_stream),
             )
             out.write(stats_stream.getvalue().encode())
@@ -691,7 +701,7 @@ def print_eden_doctor(processor: str, out: IO[bytes], dry_run: bool) -> None:
     cmd = ["edenfsctl", "doctor"]
     try:
         paste_output(
-            lambda sink: run_cmd(cmd, sink, out, 20),
+            lambda sink: run_cmd(cmd, sink, out, 120),
             processor,
             out,
             dry_run,
@@ -767,6 +777,7 @@ def print_crashed_edenfs_logs(processor: str, out: IO[bytes], dry_run: bool) -> 
 
     section_title("EdenFS crashes and dumps:", out)
     num_uploads = 0
+    # pyre-fixme[10]: Name `crashes_paths` is used but not defined.
     for crashes_path in crashes_paths:
         try:
             if not crashes_path.exists():
@@ -811,6 +822,7 @@ def trace_running_edenfs(
 
     section_title("EdenFS process trace", out)
     try:
+        # pyre-fixme[10]: Name `trace_fn` is used but not defined.
         paste_output(lambda sink: trace_fn(pid, sink), processor, out, dry_run)
     except Exception as e:
         out.write(b"Error getting EdenFS trace: %s.\n" % str(e).encode())

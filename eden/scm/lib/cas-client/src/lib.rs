@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 use std::sync::Arc;
@@ -46,4 +46,12 @@ pub trait CasClient: Sync + Send {
             Vec<(CasDigest, anyhow::Result<Option<Vec<u8>>>)>,
         )>,
     >;
+
+    /// Prefetch blobs into the CAS cache
+    /// Returns a stream of (stats, digests_prefetched, digests_not_found) tuples.
+    async fn prefetch<'a>(
+        &'a self,
+        digests: &'a [CasDigest],
+        log_name: CasDigestType,
+    ) -> BoxStream<'a, anyhow::Result<(CasFetchedStats, Vec<CasDigest>, Vec<CasDigest>)>>;
 }

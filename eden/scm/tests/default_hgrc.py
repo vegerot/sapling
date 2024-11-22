@@ -3,6 +3,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 """
 Default config file for testing
 """
@@ -122,7 +124,6 @@ evolution=obsolete
 [extensions]
 amend=
 commitcloud=
-infinitepush=
 
 [mutation]
 enabled=true

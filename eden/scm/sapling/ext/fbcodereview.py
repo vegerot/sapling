@@ -99,6 +99,7 @@ DESCRIPTION_REGEX: Pattern[str] = re.compile(
     "(?P<id>[a-f0-9]+)"  # rev
 )
 
+# e.g.: Grafted from e8470334d2058106534ac7d72485e6bfaa76ca01
 GRAFT_INFO_REGEX: Pattern[str] = re.compile("(?m)^(Grafted from [a-f0-9]+)")
 
 DEFAULT_TIMEOUT = 60
@@ -171,15 +172,18 @@ def makebackoutmessage(orig, repo, message: str, node):
 
 
 def makegraftmessage(orig, repo, ctx, opts):
-    message = orig(repo, ctx, opts)
+    message, is_from_user = orig(repo, ctx, opts)
     if not opts.get("from_path"):
-        return message
+        return message, is_from_user
 
-    # Grafted from e8470334d2058106534ac7d72485e6bfaa76ca01
-    new_message = cmdutil.extract_summary(ctx.repo().ui, message)
+    if is_from_user:
+        new_message = message
+    else:
+        # only keep the summary section
+        new_message = cmdutil.extract_summary(ctx.repo().ui, message)
     if revision := diffprops.parserevfromcommitmsg(message):
         new_message = GRAFT_INFO_REGEX.sub(r"\1 (D%s)" % revision, new_message)
-    return new_message
+    return new_message, is_from_user
 
 
 def extsetup(ui) -> None:
@@ -623,7 +627,7 @@ def _process_landed(
     if publicnode is None or publicnode not in repo:
         return 0
     # skip it if the local repo does not think it's a public commit.
-    if repo[publicnode].phase() != phases.public:
+    if not repo[publicnode].ispublic():
         return 0
     # sanity check - the public commit should have a sane commit message.
     if diffprops.parserevfromcommitmsg(repo[publicnode].description()) != diffid:

@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ use crate::Metadata;
 
 /// A minimal tree enum that simply wraps the possible underlying tree types,
 /// with no processing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum LazyTree {
     /// An entry from a local IndexedLog. The contained Key's path might not match the requested Key's path.
     IndexedLog(Entry),
@@ -85,7 +85,6 @@ impl LazyTree {
     }
 
     pub fn manifest_tree_entry(&mut self) -> Result<ManifestTreeEntry> {
-        // TODO(meyer): Make manifest-tree crate use minibytes::Bytes
         // Currently revisionstore is only for hg format.
         let format = SerializationFormat::Hg;
         Ok(ManifestTreeEntry(self.hg_content()?, format))

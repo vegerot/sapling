@@ -28,6 +28,18 @@ python_unittest(
 )
 
 python_unittest(
+    name = "changes",
+    srcs = ["changes_test.py"],
+    env = artifacts["env"],
+    supports_static_listing = False,
+    runtime_deps = artifacts["deps"],
+    deps = [
+        "//eden/fs/service:thrift-py-deprecated",
+        "//eden/integration/lib:lib",
+    ],
+)
+
+python_unittest(
     name = "chown",
     srcs = ["chown_test.py"],
     env = artifacts["env"],
@@ -56,9 +68,9 @@ python_unittest(
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],
     deps = [
-        "//eden/fs/config:config_thrift-py",
+        "//eden/fs/config:config_thrift-py-deprecated",
         "//eden/fs/py/eden/thrift:legacy",
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
     ],
 )
@@ -70,7 +82,7 @@ python_unittest(
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],
     deps = [
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
     ],
 )
@@ -82,7 +94,7 @@ python_unittest(
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],
     deps = [
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
     ],
 )
@@ -106,7 +118,7 @@ python_unittest(
     runtime_deps = artifacts["deps"],
     deps = [
         "//eden/fs/py/eden/thrift:legacy",
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
     ],
 )
@@ -156,7 +168,7 @@ python_unittest(
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],
     deps = [
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
     ],
 )
@@ -207,8 +219,38 @@ python_unittest(
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],
     deps = [
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
+    ],
+)
+
+python_unittest(
+    name = "lock",
+    srcs = ["lock_test.py"],
+    compatible_with = [
+        "ovr_config//os:windows",
+    ],
+    env = artifacts["env"],
+    supports_static_listing = False,
+    runtime_deps = artifacts["deps"],
+    deps = [
+        "//eden/integration/lib:lib",
+        "//eden/integration/lib:ntapi",
+    ],
+)
+
+python_unittest(
+    name = "eden_lock",
+    srcs = ["eden_lock_test.py"],
+    compatible_with = [
+        "ovr_config//os:windows",
+    ],
+    env = artifacts["env"],
+    supports_static_listing = False,
+    runtime_deps = artifacts["deps"],
+    deps = [
+        "//eden/integration/lib:lib",
+        "//eden/integration/lib:ntapi",
     ],
 )
 
@@ -219,7 +261,7 @@ python_unittest(
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],
     deps = [
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
     ],
 )
@@ -231,7 +273,7 @@ python_unittest(
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],
     deps = [
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
     ],
 )
@@ -256,7 +298,7 @@ python_unittest(
     deps = [
         "//eden/fs/cli:lib",
         "//eden/fs/py/eden/thrift:legacy",
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
         "//fb303/thrift:fb303_core-py",
         "//thrift/lib/py:base",
@@ -314,7 +356,7 @@ python_unittest(
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],
     deps = [
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
     ],
 )
@@ -348,7 +390,7 @@ python_unittest(
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],
     deps = [
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
     ],
 )
@@ -489,7 +531,7 @@ python_unittest(
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],
     deps = [
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
     ],
 )
@@ -517,7 +559,7 @@ python_unittest(
         "fbsource//third-party/pypi/pexpect:pexpect",
         "//eden/fs/cli:lib",
         "//eden/fs/py/eden/thrift:legacy",
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
         "//fb303/thrift:fb303_core-py",
     ],
@@ -530,8 +572,8 @@ python_unittest(
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],
     deps = [
-        "//eden/fs/config:config_thrift-py",
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/config:config_thrift-py-deprecated",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
     ],
 )
@@ -591,7 +633,7 @@ python_unittest(
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],
     deps = [
-        "//eden/fs/service:thrift-py",
+        "//eden/fs/service:thrift-py-deprecated",
         "//eden/integration/lib:lib",
     ],
 )
@@ -599,6 +641,9 @@ python_unittest(
 python_unittest(
     name = "xattr",
     srcs = ["xattr_test.py"],
+    compatible_with = [
+        "ovr_config//os:linux",
+    ],
     env = artifacts["env"],
     supports_static_listing = False,
     runtime_deps = artifacts["deps"],

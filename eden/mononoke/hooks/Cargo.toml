@@ -17,7 +17,7 @@ async-trait = "0.1.71"
 bookmarks = { version = "0.1.0", path = "../bookmarks" }
 bytes = { version = "1.6.0", features = ["serde"] }
 context = { version = "0.1.0", path = "../server/context" }
-fancy-regex = "0.10.0"
+fancy-regex = "0.14.0"
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures = { version = "0.3.30", features = ["async-await", "compat"] }
 hook_manager = { version = "0.1.0", path = "../repo_attributes/hook_manager/hook_manager" }
@@ -37,14 +37,14 @@ regex = "1.9.2"
 scuba_ext = { version = "0.1.0", path = "../common/scuba_ext" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
 serde_derive = "1.0.185"
-serde_json = { version = "1.0.125", features = ["float_roundtrip", "unbounded_depth"] }
+serde_json = { version = "1.0.132", features = ["float_roundtrip", "unbounded_depth"] }
 serde_regex = "1"
 slog = { version = "2.7", features = ["max_level_trace", "nested-values"] }
 source_control = { version = "0.1.0", path = "../scs/if" }
 source_control_clients = { version = "0.1.0", path = "../scs/if/clients" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 thiserror = "1.0.64"
-tokio = { version = "1.37.0", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.41.0", features = ["full", "test-util", "tracing"] }
 
 [dev-dependencies]
 blobstore = { version = "0.1.0", path = "../blobstore" }

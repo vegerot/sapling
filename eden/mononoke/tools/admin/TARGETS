@@ -4,31 +4,20 @@ load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 oncall("scm_server_infra")
 
 rust_binary(
-    name = "newadmin",
+    name = "admin",
     srcs = glob([
         "src/**/*.rs",
     ]),
-    autocargo = {
-        "cargo_toml_config": {
-            "dependencies_override": {
-                "dependencies": {
-                    "dag-types": {"features": [
-                        "for-tests",
-                        "serialize-abomonation",
-                    ]},
-                },
-            },
-            "extra_buck_dependencies": {
-                # This rule already depends on dag-lite, but it doesn't have a
-                # generated Cargo.toml file. Instead depend on dag and enable
-                # only lite features on it.
-                "dependencies": [
-                    "//eden/scm/lib/dag:dag",
-                    "//eden/scm/lib/dag/dag-types:dag-types",
-                ],
-            },
-        },
-    },
+    autocargo = {"cargo_toml_config": {
+        "dependencies_override": {"dependencies": {"sapling-dag-types": {"features": [
+            "for-tests",
+            "serialize-abomonation",
+        ]}}},
+        "extra_buck_dependencies": {"dependencies": [
+            "//eden/scm/lib/dag:dag",
+            "//eden/scm/lib/dag/dag-types:dag-types",
+        ]},
+    }},
     test_deps = [
         "fbsource//third-party/rust:maplit",
         "//common/rust/shed/fbinit:fbinit-tokio",
@@ -98,6 +87,7 @@ rust_binary(
         "//eden/mononoke/derived_data:fsnodes",
         "//eden/mononoke/derived_data:skeleton_manifest",
         "//eden/mononoke/derived_data:unodes",
+        "//eden/mononoke/derived_data/content_manifest_derivation:content_manifest_derivation",
         "//eden/mononoke/derived_data/mercurial_derivation:mercurial_derivation",
         "//eden/mononoke/features/redaction:redaction",
         "//eden/mononoke/filenodes:filenodes",

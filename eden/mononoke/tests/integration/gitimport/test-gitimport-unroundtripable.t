@@ -5,10 +5,8 @@
 # directory of this source tree.
 
   $ . "${TEST_FIXTURES}/library.sh"
-  $ ENABLED_DERIVED_DATA='["unodes", "git_commits", "git_trees", "git_delta_manifests_v2"]' setup_common_config
   $ GIT_REPO="${TESTTMP}/repo-git"
-  $ REPOTYPE="blob_files"
-  $ ENABLED_DERIVED_DATA='["unodes", "git_commits", "git_trees", "git_delta_manifests_v2"]' setup_common_config $REPOTYPE
+  $ setup_common_config blob_files
 
 # Setup git repository
   $ mkdir -p "$GIT_REPO"
@@ -26,7 +24,7 @@
   GitRepo:$TESTTMP/repo-git commit 1 of 1 - Oid:a57065d8 => Bid:f1c2afeb
   Ref: "refs/heads/master_bookmark": Some(ChangesetId(Blake2(f1c2afeb1a400c6b7d45af203fd2de012f5c55a08616cdd2a8499278ab1ddf3d)))
 
-  $ mononoke_newadmin git-objects -R repo fetch --id a57065d80c86fdef0f01cc4c822278257107ccad
+  $ mononoke_admin git-objects -R repo fetch --id a57065d80c86fdef0f01cc4c822278257107ccad
   The object is a Git Commit
   
   Commit {

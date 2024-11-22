@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 #![allow(unexpected_cfgs)]
@@ -72,14 +72,14 @@ impl ClientInfo {
     }
 
     /// Creates a new ClientInfo object with given ClientRequestInfo
-    pub fn new_with_client_request_info(client_request_info: ClientRequestInfo) -> Result<Self> {
+    pub fn new_with_client_request_info(client_request_info: ClientRequestInfo) -> Self {
         let fb = get_fb_client_info();
         let hostname = get_hostname().ok();
-        Ok(ClientInfo {
+        ClientInfo {
             hostname,
             fb,
             request_info: Some(client_request_info),
-        })
+        }
     }
 
     /// Creates a new ClientInfo object with fresh generated ClientRequestInfo for the specified

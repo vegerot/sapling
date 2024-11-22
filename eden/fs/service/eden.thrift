@@ -8,6 +8,7 @@
 include "eden/fs/config/eden_config.thrift"
 include "fb303/thrift/fb303_core.thrift"
 include "thrift/annotation/thrift.thrift"
+include "thrift/annotation/cpp.thrift"
 
 namespace cpp2 facebook.eden
 namespace java com.facebook.eden.thrift
@@ -125,10 +126,11 @@ enum EdenErrorType {
 }
 
 exception EdenError {
+  @thrift.ExceptionMessage
   1: string message;
   2: optional i32 errorCode;
   3: EdenErrorType errorType;
-} (message = 'message')
+}
 
 exception NoValueForKeyError {
   1: string key;
@@ -175,6 +177,7 @@ struct PrivHelperInfo {
 /**
  * The current running state of an EdenMount.
  */
+@cpp.EnumType{type = cpp.EnumUnderlyingType.U32}
 enum MountState {
   /**
    * The EdenMount object has been constructed but has not started
@@ -232,7 +235,7 @@ enum MountState {
    * before we have attempted to start the user-space filesystem mount.
    */
   INIT_ERROR = 9,
-} (cpp2.enum_type = 'uint32_t')
+}
 
 struct MountInfo {
   1: PathString mountPoint;
@@ -361,7 +364,7 @@ enum FileAttributes {
    */
   DIGEST_HASH = 64,
 /* NEXT_ATTR = 2^x */
-} (cpp2.enum_type = 'uint64_t')
+}
 
 typedef unsigned64 RequestedAttributes
 
@@ -885,7 +888,7 @@ enum DataFetchOrigin {
   LOCAL_BACKING_STORE = 8,
   REMOTE_BACKING_STORE = 16,
 /* NEXT_WHERE = 2^x */
-} (cpp2.enum_type = 'uint64_t')
+}
 
 struct DebugGetScmBlobRequest {
   1: MountId mountId;
@@ -1749,6 +1752,189 @@ union CheckoutProgressInfoResponse {
   2: CheckoutNotInProgress noProgress;
 }
 
+/*
+ * Structs/Unions for changesSinceV2 API
+ */
+
+/*
+ * Small change notification returned when invoking changesSinceV2.
+ * Indicates that a new filesystem entry has been added to the
+ * given mount point since the provided journal position.
+ *
+ * fileType - Dtype of added filesystem entry.
+ * path - path (vector of bytes) of added filesystem entry.
+ */
+struct Added {
+  1: Dtype fileType;
+  3: PathString path;
+}
+
+/*
+ * Small change notification returned when invoking changesSinceV2.
+ * Indicates that an existing filesystem entry has been modified within
+ * the given mount point since the provided journal position.
+ *
+ * fileType - Dtype of modified filesystem entry.
+ * path - path (vector of bytes) of modified filesystem entry.
+ */
+struct Modified {
+  1: Dtype fileType;
+  3: PathString path;
+}
+
+/*
+ * Small change notification returned when invoking changesSinceV2.
+ * Indicates that an existing filesystem entry has been renamed within
+ * the given mount point since the provided journal position.
+ *
+ * fileType - Dtype of renamed filesystem entry.
+ * from - path (vector of bytes) the filesystem entry was previously located at.
+ * to - path (vector of bytes) the filesystem entry was relocated to.
+ */
+struct Renamed {
+  1: Dtype fileType;
+  2: PathString from;
+  3: PathString to;
+}
+
+/*
+ * Small change notification returned when invoking changesSinceV2.
+ * Indicates that an existing filesystem entry has been replaced within
+ * the given mount point since the provided journal position.
+ *
+ * fileType - Dtype of replaced filesystem entry.
+ * from - path (vector of bytes) the filesystem entry was previously located at.
+ * to - path (vector of bytes) the filesystem entry was relocated over.
+ */
+struct Replaced {
+  1: Dtype fileType;
+  2: PathString from;
+  3: PathString to;
+}
+
+/*
+ * Small change notification returned when invoking changesSinceV2.
+ * Indicates that an existing filesystem entry has been removed from
+ * the given mount point since the provided journal position.
+ *
+ * fileType - Dtype of removed filesystem entry.
+ * path - path (vector of bytes) of removed filesystem entry.
+ */
+struct Removed {
+  1: Dtype fileType;
+  3: PathString path;
+}
+
+/*
+ * Change notification returned when invoking changesSinceV2.
+ * Indicates that the given change is small in impact - affecting
+ * one or two filesystem entries at most.
+ */
+union SmallChangeNotification {
+  1: Added added;
+  2: Modified modified;
+  3: Renamed renamed;
+  4: Replaced replaced;
+  5: Removed removed;
+}
+
+/*
+ * Large change notification returned when invoking changesSinceV2.
+ * Indicates that an existing directory has been renamed within
+ * the given mount point since the provided journal position.
+ */
+struct DirectoryRenamed {
+  1: PathString from;
+  2: PathString to;
+}
+
+/*
+ * Large change notification returned when invoking changesSinceV2.
+ * Indicates that a commit transition has occurred within the
+ * given mount point since the provided journal position.
+ */
+struct CommitTransition {
+  1: ThriftRootId from;
+  2: ThriftRootId to;
+}
+
+/*
+ * Large change notification returned when invoking changesSinceV2.
+ * Indicates that EdenfS was unable to track changes within the given
+ * mount point since the provided journal poistion. Callers should
+ * treat all filesystem entries as changed.
+ */
+enum LostChangesReason {
+  // Unknown reason.
+  UNKNOWN = 0,
+  // The given mount point was remounted (or EdenFS was restarted).
+  EDENFS_REMOUNTED = 1,
+  // EdenFS' journal was truncated.
+  JOURNAL_TRUNCATED = 2,
+  // There were too many change notifications to report to the caller.
+  TOO_MANY_CHANGES = 3,
+}
+
+/*
+ * Large change notification returned when invoking changesSinceV2.
+ * Indicates that EdenFS was unable to provide the changes to the caller.
+ */
+struct LostChanges {
+  1: LostChangesReason reason;
+}
+
+/*
+ * Change notification returned when invoking changesSinceV2.
+ * Indicates that the given change is large in impact - affecting
+ * an unknown number of filesystem entries.
+ */
+union LargeChangeNotification {
+  1: DirectoryRenamed directoryRenamed;
+  2: CommitTransition commitTransition;
+  3: LostChanges lostChanges;
+}
+
+/*
+ * Changed returned when invoking changesSinceV2.
+ * Contains a change that occured within the given mount point
+ * since the provided journal position.
+ */
+union ChangeNotification {
+  1: SmallChangeNotification smallChange;
+  2: LargeChangeNotification largeChange;
+}
+
+/**
+ * Return value of the changesSinceV2 API
+ *
+ * toPosition - a new journal poistion that indicates the next change
+ * that will occur in the future. Should be used in the next call to
+ * changesSinceV2 go get the next list of changes.
+ *
+ * changes -  a list of all change notifications that have ocurred in
+ * within the given mount point since the provided journal position.
+ */
+struct ChangesSinceV2Result {
+  1: JournalPosition toPosition;
+  2: list<ChangeNotification> changes;
+}
+
+/**
+ * Argument to changesSinceV2 API
+ *
+ * mountPoint - the EdenFS checkout to request changes about.
+ *
+ * fromPosition - the journal position used as the starting point to
+ * request changes since. Typically, fromPosition is the set to the
+ * toPostiion value returned in ChangesSinceV2Result. However, for
+ * the initial invocation of changesSinceV2, the caller can obtain
+ * the current journal position by calling getCurrentJournalPosition.
+ */
+struct ChangesSinceV2Params {
+  1: PathString mountPoint;
+  2: JournalPosition fromPosition;
+}
+
 service EdenService extends fb303_core.BaseService {
   list<MountInfo> listMounts() throws (1: EdenError ex);
   void mount(1: MountArgument info) throws (1: EdenError ex);
@@ -2089,9 +2275,8 @@ service EdenService extends fb303_core.BaseService {
    * for optimization and the result not relied on for operations. This command does not
    * return the list of prefetched files.
    */
-  void prefetchFiles(1: PrefetchParams params) throws (1: EdenError ex) (
-    priority = 'BEST_EFFORT',
-  );
+  @thrift.Priority{level = thrift.RpcPriority.BEST_EFFORT}
+  void prefetchFiles(1: PrefetchParams params) throws (1: EdenError ex);
 
   /**
    * Has the same behavior as globFiles, but should be called in the case of a prefetch.
@@ -2189,7 +2374,8 @@ service EdenService extends fb303_core.BaseService {
    * Returns information about the running process, including pid and command
    * line.
    */
-  DaemonInfo getDaemonInfo() throws (1: EdenError ex) (priority = 'IMPORTANT');
+  @thrift.Priority{level = thrift.RpcPriority.IMPORTANT}
+  DaemonInfo getDaemonInfo() throws (1: EdenError ex);
 
   /**
   * Returns information about the privhelper process, including accesibility.
@@ -2583,6 +2769,17 @@ service EdenService extends fb303_core.BaseService {
    * consuming disk space. Also, materialized files slow down checkout and status operations.
    */
   void ensureMaterialized(1: EnsureMaterializedParams params) throws (
+    1: EdenError ex,
+  );
+
+  /**
+   * Returns a list of change notifications along with a new journal position for a given mount
+   * point since a provided journal position.
+   *
+   * This does not resolve expensive operations like moving a directory or changing
+   * commits. Callers must query Sapling to evaluate those potentially expensive operations.
+   */
+  ChangesSinceV2Result changesSinceV2(1: ChangesSinceV2Params params) throws (
     1: EdenError ex,
   );
 }

@@ -19,6 +19,7 @@ use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::Ordering::SeqCst;
+use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::thread;
@@ -314,6 +315,10 @@ fn dispatch_command(
         }
     }
 
+    if let Err(err) = io.disable_progress(true) {
+        tracing::warn!(?err, "error clearing progress at end of command");
+    }
+
     // Clean up progress models.
     Registry::main().remove_orphan_models();
 
@@ -496,11 +501,6 @@ fn spawn_progress_thread(
         disable_rendering = true;
     }
 
-    let assume_tty = config.get_or("progress", "assume-tty", || false)?;
-    if !assume_tty && !io.error().is_tty() {
-        disable_rendering = true;
-    }
-
     if global_opts.quiet || hgplain::is_plain(Some("progress")) {
         disable_rendering = true;
     }
@@ -510,8 +510,14 @@ fn spawn_progress_thread(
         disable_rendering = true;
     }
 
+    let assume_tty = config.get_or("progress", "assume-tty", || false)?;
+    if !assume_tty && !io.error().is_tty() && renderer_name != "nodeipc" {
+        disable_rendering = true;
+    }
+
     let render_function = match renderer_name.as_str() {
         "structured" => progress_render::structured::render,
+        "nodeipc" => progress_render::nodeipc::render,
         _ => progress_render::simple::render,
     };
 
@@ -1037,6 +1043,14 @@ fn setup_ctrlc() {
             // the terminal if a Python `input()` call (with readline) is interrupted by
             // ctrl-c.
             let _ = io.reset_term();
+
+            // Wait up to 5ms to clear out any progress output.
+            let (send, recv) = channel::<()>();
+            std::thread::spawn(move || {
+                let _ = io.disable_progress(true);
+                drop(send);
+            });
+            let _ = recv.recv_timeout(Duration::from_millis(5));
         }
 
         // Run atexit handlers.

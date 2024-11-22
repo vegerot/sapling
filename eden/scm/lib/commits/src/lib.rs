@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 #![allow(unexpected_cfgs)]
@@ -11,6 +11,7 @@
 //!
 //! Commits stored in HG format and backed by efficient `dag` structures.
 
+pub use commits_trait::trait_impls;
 pub use commits_trait::AppendCommits;
 pub use commits_trait::DagCommits;
 pub use commits_trait::DescribeBackend;
@@ -29,7 +30,6 @@ mod mem_commits;
 mod on_disk_commits;
 mod revlog;
 mod strip;
-pub mod trait_impls;
 mod utils;
 
 pub use anyhow::Result;

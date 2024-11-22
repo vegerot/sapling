@@ -7,7 +7,6 @@ edition = "2021"
 
 [dependencies]
 cpython = { version = "0.7.2", features = ["python3-sys"], default-features = false }
-cpython_ext = { version = "0.1.0", path = "../../lib/cpython-ext" }
 paste = "1.0.14"
 pyatexit = { version = "0.1.0", path = "modules/pyatexit" }
 pyauth = { version = "0.1.0", path = "modules/pyauth" }
@@ -33,6 +32,7 @@ pyedenapi = { version = "0.1.0", path = "modules/pyedenapi" }
 pyerror = { version = "0.1.0", path = "modules/pyerror" }
 pyexchange = { version = "0.1.0", path = "modules/pyexchange" }
 pyfail = { version = "0.1.0", path = "modules/pyfail" }
+pyformatutil = { version = "0.1.0", path = "modules/pyformatutil" }
 pyfs = { version = "0.1.0", path = "modules/pyfs" }
 pygitcompat = { version = "0.1.0", path = "modules/pygitcompat" }
 pygitstore = { version = "0.1.0", path = "modules/pygitstore" }
@@ -78,3 +78,4 @@ pyworkingcopyclient = { version = "0.1.0", path = "modules/pyworkingcopyclient" 
 pyxdiff = { version = "0.1.0", path = "modules/pyxdiff" }
 pyzstd = { version = "0.1.0", path = "modules/pyzstd" }
 pyzstore = { version = "0.1.0", path = "modules/pyzstore" }
+sapling-cpython-ext = { version = "0.1.0", path = "../../lib/cpython-ext" }

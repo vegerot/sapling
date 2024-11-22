@@ -62,6 +62,8 @@ class Journal {
   using SequenceNumber = JournalDelta::SequenceNumber;
   using SubscriberId = uint64_t;
   using SubscriberCallback = std::function<void()>;
+  using FileChangeCallback = std::function<void(const FileChangeJournalDelta&)>;
+  using HashUpdateCallback = std::function<void(const RootUpdateJournalDelta&)>;
 
   explicit Journal(EdenStatsPtr edenStats);
 
@@ -70,20 +72,26 @@ class Journal {
 
   // Functions to record writes:
 
-  void recordCreated(RelativePathPiece fileName);
-  void recordRemoved(RelativePathPiece fileName);
-  void recordChanged(RelativePathPiece fileName);
+  void recordCreated(RelativePathPiece fileName, dtype_t type);
+  void recordRemoved(RelativePathPiece fileName, dtype_t type);
+  void recordChanged(RelativePathPiece fileName, dtype_t type);
 
   /**
    * "Renamed" means that that newName was created as a result of the mv(1).
    */
-  void recordRenamed(RelativePathPiece oldName, RelativePathPiece newName);
+  void recordRenamed(
+      RelativePathPiece oldName,
+      RelativePathPiece newName,
+      dtype_t type);
 
   /**
    * "Replaced" means that that newName was overwritten by oldName as a result
    * of the mv(1).
    */
-  void recordReplaced(RelativePathPiece oldName, RelativePathPiece newName);
+  void recordReplaced(
+      RelativePathPiece oldName,
+      RelativePathPiece newName,
+      dtype_t type);
 
   /**
    * Creates a journal delta that updates the root to this new hash
@@ -123,6 +131,16 @@ class Journal {
    */
   std::unique_ptr<JournalDeltaRange> accumulateRange(
       SequenceNumber limitSequence = 1);
+
+  /**
+   * Enumerates over all deltas with sequence number >= limitSequence.
+   */
+  // return bool indicating whether the journal is truncated
+  bool forEachDelta(
+      JournalDelta::SequenceNumber from,
+      std::optional<size_t> lengthLimit,
+      FileChangeCallback&& fileChangeCallback,
+      HashUpdateCallback&& hashUpdateCallback);
 
   // Subscription functionality:
 
@@ -277,13 +295,12 @@ class Journal {
    * is not nullopt then checks at most 'lengthLimit' entries) and runs
    * deltaActor on each entry encountered.
    * */
-  template <class FileChangeFunc, class HashUpdateFunc>
   void forEachDelta(
       const DeltaState& deltaState,
       JournalDelta::SequenceNumber from,
       std::optional<size_t> lengthLimit,
-      FileChangeFunc&& fileChangeDeltaCallback,
-      HashUpdateFunc&& hashUpdateDeltaCallback) const;
+      FileChangeCallback&& fileChangeDeltaCallback,
+      HashUpdateCallback&& hashUpdateDeltaCallback) const;
 
   folly::Synchronized<SubscriberState> subscriberState_;
 

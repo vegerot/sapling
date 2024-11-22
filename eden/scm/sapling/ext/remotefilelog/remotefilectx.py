@@ -16,7 +16,6 @@ from sapling.node import bin, hex, nullid, nullrev
 from ..extlib.phabricator import graphql
 from . import shallowutil
 
-
 propertycache = util.propertycache
 conduit = None
 FASTLOG_TIMEOUT_IN_SECS = 0.5
@@ -54,6 +53,9 @@ class remotefilectx(context.filectx):
         # If we're comparing against a file context that isn't yet committed, a
         # full comparison is always necessary.
         if self._filenode is not None and fctx.filenode() is not None:
+            if self._filenode == fctx.filenode():
+                return False
+
             try:
                 selfmeta = fileslog.filestore.metadata(self._path, self._filenode)
                 othermeta = fileslog.filestore.metadata(fctx.path(), fctx.filenode())
@@ -575,7 +577,7 @@ class remotefilectx(context.filectx):
                     queue.append(parent)
 
         self._repo.ui.debug(
-            "remotefilelog: prefetching %d files " "for annotate\n" % len(fetch)
+            "remotefilelog: prefetching %d files for annotate\n" % len(fetch)
         )
         if fetch:
             self._repo.fileservice.prefetch(fetch)

@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! # storemodel
@@ -20,7 +20,9 @@
 //! Traits can be combined later. For example, reading file content, metadata,
 //! and history should probably be 3 different traits.
 
+use std::any::type_name;
 use std::any::Any;
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -45,6 +47,7 @@ use types::Key;
 use types::PathComponent;
 use types::PathComponentBuf;
 use types::RepoPath;
+pub use types::SerializationFormat;
 
 /// Boxed dynamic iterator. Similar to `BoxStream`.
 pub type BoxIterator<T> = Box<dyn Iterator<Item = T> + Send + 'static>;
@@ -145,13 +148,13 @@ pub trait KeyStore: Send + Sync {
         _path: &RepoPath,
         _data: &[u8],
     ) -> anyhow::Result<HgId> {
-        anyhow::bail!("store is read-only")
+        anyhow::bail!("store {} is read-only", self.type_name())
     }
 
     /// Write pending changes to disk.
     /// For some implementations, this also includes `refresh()`.
     fn flush(&self) -> anyhow::Result<()> {
-        anyhow::bail!("store is read-only")
+        anyhow::bail!("store {} is read-only", self.type_name())
     }
 
     /// Refresh the store so it might pick up new contents written by other processes.
@@ -175,6 +178,11 @@ pub trait KeyStore: Send + Sync {
     /// as `Some(self)` explicitly.
     fn maybe_as_any(&self) -> Option<&dyn Any> {
         None
+    }
+
+    /// Obtain the type name of the store.
+    fn type_name(&self) -> Cow<'static, str> {
+        type_name::<Self>().into()
     }
 
     /// Obtains a snapshot of the store state.
@@ -472,52 +480,6 @@ pub trait TreeStore: KeyStore {
     /// Usually it is just `Arc::clone` under the hood.
     /// Used to relax lifetime requirements for various `BoxIterator` outputs.
     fn clone_tree_store(&self) -> Box<dyn TreeStore>;
-}
-
-/// Decides the serialization format. This exists so different parts of the code
-/// base can agree on how to generate a SHA1, how to lookup in a tree, etc.
-/// Ideally this information is private and the differences are behind
-/// abstractions too.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Eq,
-    PartialEq,
-    Hash,
-    Ord,
-    PartialOrd,
-    Default,
-    Serialize,
-    Deserialize
-)]
-#[serde(rename_all = "snake_case")]
-pub enum SerializationFormat {
-    // Hg SHA1:
-    //   SORTED_PARENTS CONTENT
-    //
-    // Hg file:
-    //   FILELOG_METADATA CONTENT
-    //
-    // Hg tree:
-    //   NAME '\0' HEX_SHA1 MODE '\n'
-    //   MODE: 't' (tree), 'l' (symlink), 'x' (executable)
-    //   (sorted by name)
-    #[default]
-    Hg,
-
-    // Git SHA1:
-    //   TYPE LENGTH CONTENT
-    //
-    // Git file:
-    //   CONTENT
-    //
-    // Git tree:
-    //   MODE ' ' NAME '\0' BIN_SHA1
-    //   MODE: '40000' (tree), '100644' (regular), '100755' (executable),
-    //         '120000' (symlink), '160000' (gitlink)
-    //   (sorted by name, but directory names are treated as ending with '/')
-    Git,
 }
 
 /// Options used by `insert_data`

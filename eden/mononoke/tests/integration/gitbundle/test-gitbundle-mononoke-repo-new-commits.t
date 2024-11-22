@@ -14,13 +14,12 @@
   $ cat >> $HGRCPATH <<EOF
   > [extensions]
   > amend=
-  > infinitepush=
   > commitcloud=
   > EOF
 
-# Enable infinite push and commit cloud for the test
+# Enable commit cloud for the test
   $ cd $TESTTMP
-  $ enable amend infinitepush commitcloud
+  $ enable amend commitcloud
 
 # Setup git repository
   $ mkdir -p "$GIT_REPO_ORIGIN"
@@ -63,7 +62,7 @@
   Bookmark: "tags/first_tag": ChangesetId(Blake2(032cd4dce0406f1c1dd1362b6c3c9f9bdfa82f2fc5615e237a890be4fe08b044)) (created)
 
 # Regenerate the Git repo out of the Mononoke repo
-  $ mononoke_newadmin git-bundle create from-repo -R repo --output-location "$BUNDLE_PATH"
+  $ mononoke_admin git-bundle create from-repo -R repo --output-location "$BUNDLE_PATH"
 
 # Create a new empty folder for containing the repo
   $ mkdir $TESTTMP/git_client_repo  
@@ -81,7 +80,7 @@
   $ start_and_wait_for_mononoke_server
 # Clone the repository
   $ cd "$TESTTMP"
-  $ hg clone -q mono:repo "$HG_REPO"
+  $ hg clone -q mono:repo "$HG_REPO" --config remotenames.selectivepulldefault=heads/master_bookmark
   $ cd "$HG_REPO"
 
 # Add more commits to the HG repo
@@ -109,11 +108,11 @@
   edenapi: uploaded 3 changesets
 
 # Get the bonsai changeset ID for the latest commit in the stack
-  $ mononoke_newadmin convert -R repo -f hg -t bonsai $(hg whereami)
+  $ mononoke_admin convert -R repo -f hg -t bonsai $(hg whereami)
   19881757b04cb22f8c86ac8b30d0e7f8eb26348ee271ff6c1f0f9b4fabb266ac
 
 # Generate a git bundle for the changes made in the draft commit
-  $ mononoke_newadmin git-bundle create from-repo -R repo --output-location "$BUNDLE_PATH" --have-heads da93dc81badd8d407db0f3219ec0ec78f1ef750ebfa95735bb483310371af80c --included-refs-with-value heads/master_bookmark=19881757b04cb22f8c86ac8b30d0e7f8eb26348ee271ff6c1f0f9b4fabb266ac,heads/non_existent_ref=19881757b04cb22f8c86ac8b30d0e7f8eb26348ee271ff6c1f0f9b4fabb266ac
+  $ mononoke_admin git-bundle create from-repo -R repo --output-location "$BUNDLE_PATH" --have-heads da93dc81badd8d407db0f3219ec0ec78f1ef750ebfa95735bb483310371af80c --included-refs-with-value heads/master_bookmark=19881757b04cb22f8c86ac8b30d0e7f8eb26348ee271ff6c1f0f9b4fabb266ac,heads/non_existent_ref=19881757b04cb22f8c86ac8b30d0e7f8eb26348ee271ff6c1f0f9b4fabb266ac
 
 # Ensure that Git considers this a valid bundle
   $ cd $GIT_REPO

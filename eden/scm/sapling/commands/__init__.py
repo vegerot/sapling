@@ -798,7 +798,7 @@ def _dobackout(ui, repo, node=None, rev=None, **opts):
             hg.showstats(repo, stats)
             if stats[3]:
                 repo.ui.status(
-                    _("use '@prog@ resolve' to retry unresolved " "file merges\n")
+                    _("use '@prog@ resolve' to retry unresolved file merges\n")
                 )
                 return 1
         finally:
@@ -813,7 +813,7 @@ def _dobackout(ui, repo, node=None, rev=None, **opts):
         _replayrenames(repo, node)
 
     if opts.get("no_commit"):
-        msg = _("changeset %s backed out, " "don't forget to commit.\n")
+        msg = _("changeset %s backed out, don't forget to commit.\n")
         ui.status(msg % short(node))
         return 0
 
@@ -840,11 +840,8 @@ def _dobackout(ui, repo, node=None, rev=None, **opts):
     if opts.get("merge") and op1 != node:
         hg.clean(repo, op1, show_stats=False)
         ui.status(_("merging with changeset %s\n") % nice(repo.changelog.tip()))
-        try:
-            ui.setconfig("ui", "forcemerge", opts.get("tool", ""), "backout")
+        with ui.configoverride({("ui", "forcemerge"): opts.get("tool", "")}, "backout"):
             return hg.merge(repo, hex(repo.changelog.tip()))
-        finally:
-            ui.setconfig("ui", "forcemerge", "", "")
     return 0
 
 
@@ -1021,7 +1018,7 @@ def bisect(
         while size <= changesets:
             tests, size = tests + 1, size * 2
         ui.write(
-            _("Testing changeset %s " "(%d changesets remaining, ~%d tests)\n")
+            _("Testing changeset %s (%d changesets remaining, ~%d tests)\n")
             % (short(node), changesets, tests)
         )
 
@@ -1454,7 +1451,7 @@ def bundle(ui, repo, fname, dest=None, **opts):
     except error.UnsupportedBundleSpecification as e:
         raise error.Abort(
             str(e),
-            hint=_("see '@prog@ help bundlespec' for supported " "values for --type"),
+            hint=_("see '@prog@ help bundlespec' for supported values for --type"),
         )
 
     # Packed bundles are a pseudo bundle format for now.
@@ -1466,9 +1463,7 @@ def bundle(ui, repo, fname, dest=None, **opts):
 
     if opts.get("all"):
         if dest:
-            raise error.Abort(
-                _("--all is incompatible with specifying " "a destination")
-            )
+            raise error.Abort(_("--all is incompatible with specifying a destination"))
         if opts.get("base"):
             ui.warn(_("ignoring --base because --all was specified\n"))
         base = ["null"]
@@ -1481,9 +1476,7 @@ def bundle(ui, repo, fname, dest=None, **opts):
 
     if base:
         if dest:
-            raise error.Abort(
-                _("--base is incompatible with specifying " "a destination")
-            )
+            raise error.Abort(_("--base is incompatible with specifying a destination"))
         common = [repo.lookup(rev) for rev in base]
         heads = revs and list(map(repo.lookup, revs)) or None
         outgoing = discovery.outgoing(repo, common, heads)
@@ -1601,14 +1594,11 @@ def cat(ui, repo, file1, *pats, **opts):
             ),
         ),
         ("u", "updaterev", "", _("revision or branch to check out"), _("REV")),
-        ("r", "rev", [], _("include the specified changeset"), _("REV")),
-        ("", "pull", None, _("use pull protocol to copy metadata")),
-        ("", "stream", None, _("clone with minimal data processing")),
         (
             "",
             "shallow",
             True,
-            _("use remotefilelog (only turn it off in legacy tests) (ADVANCED)"),
+            _("use remotefilelog (has no effect) (DEPRECATED)"),
         ),
         ("", "git", None, _("use git protocol (EXPERIMENTAL)")),
     ],
@@ -1630,11 +1620,7 @@ def clone(ui, source, dest=None, **opts):
             opts,
             source,
             dest,
-            pull=opts.get("pull"),
-            stream=opts.get("stream"),
-            rev=opts.get("rev"),
             update=opts.get("updaterev") or not opts.get("noupdate"),
-            shallow=opts.get("shallow"),
         )
 
     return r
@@ -1755,7 +1741,7 @@ def _docommit(ui, repo, *pats, **opts):
         def commitfunc(ui, repo, message, match, opts):
             ms = mergemod.mergestate.read(repo)
             subtree_merges = ms.subtree_merges
-            extra.update(subtreeutil.gen_merge_info(subtree_merges))
+            extra.update(subtreeutil.gen_merge_info(repo, subtree_merges))
             summaryfooter = subtree.gen_merge_commit_msg(subtree_merges)
             if subtree_merges:
                 parents = repo[None].parents()
@@ -1781,7 +1767,7 @@ def _docommit(ui, repo, *pats, **opts):
             stat = cmdutil.postcommitstatus(repo, pats, opts)
             if stat[3]:
                 ui.status(
-                    _("nothing changed (%d missing files, see " "'@prog@ status')\n")
+                    _("nothing changed (%d missing files, see '@prog@ status')\n")
                     % len(stat[3])
                 )
             else:
@@ -2479,8 +2465,7 @@ def forget(ui, repo, *pats, **opts):
     ]
     + commitopts2
     + mergetoolopts
-    + dryrunopts
-    + diffgraftopts,
+    + dryrunopts,
     _("[OPTION]... REV..."),
     legacyaliases=["gra", "graf"],
 )
@@ -2632,8 +2617,8 @@ def _dograft(ui, repo, *revs, **opts):
         if not revs:
             return -1
 
-    from_paths = scmutil.rootrelpaths(repo["."], opts.get("from_path"))
-    to_paths = scmutil.rootrelpaths(repo["."], opts.get("to_path"))
+    from_paths = scmutil.rootrelpaths(repo["."], opts.get("from_path", []))
+    to_paths = scmutil.rootrelpaths(repo["."], opts.get("to_path", []))
 
     for pos, ctx in enumerate(repo.set("%ld", revs)):
         desc = '%s "%s"' % (ctx, ctx.description().split("\n", 1)[0])
@@ -2665,17 +2650,15 @@ def _dograft(ui, repo, *revs, **opts):
         # we don't merge the first commit when continuing
         if not cont:
             # perform the graft merge with p1(rev) as 'ancestor'
-            try:
-                # ui.forcemerge is an internal variable, do not document
-                repo.ui.setconfig("ui", "forcemerge", opts.get("tool", ""), "graft")
+            with repo.ui.configoverride(
+                {("ui", "forcemerge"): opts.get("tool", "")}, "graft"
+            ):
                 stats = mergemod.graft(
                     repo,
                     ctx,
                     ctx.p1(),
                     ["local", "graft"],
                 )
-            finally:
-                repo.ui.setconfig("ui", "forcemerge", "", "graft")
             # report any conflicts
             if stats and stats[3] > 0:
                 # write out state for --continue
@@ -2695,7 +2678,7 @@ def _dograft(ui, repo, *revs, **opts):
 
         # commit
         editor = cmdutil.getcommiteditor(editform="graft", **opts)
-        message = _makegraftmessage(repo, ctx, opts)
+        message, _is_from_user = _makegraftmessage(repo, ctx, opts)
         node = repo.commit(
             text=message, user=user, date=date, extra=extra, editor=editor
         )
@@ -2714,9 +2697,9 @@ def _dograft(ui, repo, *revs, **opts):
 
 def _makegraftmessage(repo, ctx, opts):
     if logmessage := cmdutil.logmessage(repo, opts):
-        description, is_from_ctx = logmessage, False
+        description, is_from_user = logmessage, True
     else:
-        description, is_from_ctx = ctx.description(), True
+        description, is_from_user = ctx.description(), False
 
     message = []
     if opts.get("from_path"):
@@ -2726,9 +2709,8 @@ def _makegraftmessage(repo, ctx, opts):
             for f, t in zip(opts.get("from_path"), opts.get("to_path")):
                 message.append("- Grafted path %s to %s" % (f, t))
 
-            # only update the title if it is from original change context,
-            # we don't update the user provided title
-            if is_from_ctx:
+            # don't update the user provided title
+            if not is_from_user:
                 try:
                     title, rest = description.split("\n", 1)
                     description = f'Graft "{title}"\n{rest}'
@@ -2738,7 +2720,7 @@ def _makegraftmessage(repo, ctx, opts):
         if opts.get("log"):
             message.append("(grafted from %s)" % ctx.hex())
     message = "\n".join(message)
-    return cmdutil.add_summary_footer(ctx.repo().ui, description, message)
+    return cmdutil.add_summary_footer(ctx.repo().ui, description, message), is_from_user
 
 
 @command(
@@ -3250,7 +3232,7 @@ def hint(ui, *names, **opts):
             "f",
             "follow",
             None,
-            _("follow changeset history," " or file history across copies and renames"),
+            _("follow changeset history, or file history across copies and renames"),
         ),
         ("i", "ignore-case", None, _("ignore case when matching")),
         (
@@ -3595,7 +3577,7 @@ def identify(
             _("identify is deprecated - use `@prog@ whereami` instead"),
         )
     if not repo and not source:
-        raise error.Abort(_("there is no @Product@ repository here " "(.hg not found)"))
+        raise error.Abort(_("there is no @Product@ repository here (.hg not found)"))
 
     if ui.debugflag:
         hexfunc = hex
@@ -3907,7 +3889,7 @@ def import_(ui, repo, patch1=None, *patches, **opts):
                 if rej:
                     ui.write_err(_("patch applied partially\n"))
                     ui.write_err(
-                        _("(fix the .rej files and run " "`@prog@ commit --amend`)\n")
+                        _("(fix the .rej files and run `@prog@ commit --amend`)\n")
                     )
                     ret = 1
                     break
@@ -4426,14 +4408,11 @@ def merge(ui, repo, node=None, **opts):
         displayer.close()
         return 0
 
-    try:
-        # ui.forcemerge is an internal variable, do not document
-        repo.ui.setconfig("ui", "forcemerge", opts.get("tool", ""), "merge")
+    # ui.forcemerge is an internal variable, do not document
+    with ui.configoverride({("ui", "forcemerge"): opts.get("tool", "")}, "merge"):
         force = opts.get("force")
         labels = ["working copy", "merge rev"]
         return hg.merge(repo, node, force=force, labels=labels)
-    finally:
-        ui.setconfig("ui", "forcemerge", "", "merge")
 
 
 @command(
@@ -4663,7 +4642,7 @@ def phase(ui, repo, *revs, **opts):
         rejected = [n for n in nodes if getphase(unfi, cl.rev(n)) < targetphase]
         if rejected:
             ui.warn(
-                _("cannot move %i changesets to a higher " "phase, use --force\n")
+                _("cannot move %i changesets to a higher phase, use --force\n")
                 % len(rejected)
             )
             ret = 1
@@ -4751,112 +4730,7 @@ def pull(ui, repo, source="default", **opts):
     source = hg.parseurl(ui.expandpath(source))
     ui.status_err(_("pulling from %s\n") % util.hidepassword(source))
 
-    hasselectivepull = ui.configbool("remotenames", "selectivepull")
-    if hasselectivepull and ui.configbool("commands", "new-pull"):
-        # Use the new repo.pull API.
-        # - Does not support non-selectivepull.
-        modheads, checkout = _newpull(ui, repo, source, **opts)
-    else:
-        if git.isgitpeer(repo):
-            raise error.Abort(_("pull: branch name in URL is not supported"))
-        # The legacy pull implementation. Problems:
-        # - Remotenames:
-        #   - Inefficiency: Call listkey proto twice.
-        #   - Race condition: Because listkey is called twice, remotenames can
-        #     fail to update properly (if it has moved server-side after
-        #     pulling the commits).
-        # - Features considered as tech-debt:
-        #   - Has named branch support (and overhead listing branchmap).
-        #   - Has "pull everything" (non-selectivepull) support.
-        # - Slow algorithms:
-        #   - visibility.add the entire changeroup can be inefficient.
-        with repo.connectionpool.get(
-            source, opts=opts
-        ) as conn, repo.wlock(), repo.lock(), repo.transaction("pull"):
-            other = conn.peer
-            revs = opts.get("rev") or None
-            checkout = None
-            if revs:
-                checkout = revs[0]
-                revs = autopull.rewritepullrevs(repo, revs)
-
-            implicitbookmarks = set()
-            # If any revision is given, ex. pull -r HASH, include selectivepull
-            # bookmarks automatically. This check exists so the no-argument
-            # pull is unaffected (pulls everything instead of just
-            # selectivepull bookmarks)
-            if revs:
-                remotename = bookmarks.remotenameforurl(
-                    ui, other.url()
-                )  # ex. 'default' or 'remote'
-                # Include selective pull bookmarks automatically.
-                implicitbookmarks.update(
-                    bookmarks.selectivepullbookmarknames(repo, remotename)
-                )
-
-            # If any revision is given, ex. pull -r HASH and the commit is known locally make it visible again.
-            if revs:
-                if visibility.enabled(repo):
-                    visibility.add(
-                        repo,
-                        [
-                            repo[r].node()
-                            for r in revs
-                            if r in repo and repo[r].mutable()
-                        ],
-                    )
-
-            pullopargs = {}
-            if opts.get("bookmark") or implicitbookmarks:
-                if not revs:
-                    revs = []
-                # The list of bookmark used here is not the one used to actually
-                # update the bookmark name. This can result in the revision pulled
-                # not ending up with the name of the bookmark because of a race
-                # condition on the server. (See issue 4689 for details)
-                # TODO: Consider migrate to repo.pull to avoid the race
-                # condition.
-                remotebookmarks = other.listkeys("bookmarks")
-                remotebookmarks = bookmarks.unhexlifybookmarks(remotebookmarks)
-                pullopargs["remotebookmarks"] = remotebookmarks
-                for b in opts["bookmark"]:
-                    b = repo._bookmarks.expandname(b)
-                    if b not in remotebookmarks:
-                        raise error.Abort(_("remote bookmark %s not found!") % b)
-                    revs.append(hex(remotebookmarks[b]))
-                    implicitbookmarks.discard(b)
-                for b in implicitbookmarks:
-                    if b in remotebookmarks:
-                        revs.append(hex(remotebookmarks[b]))
-
-            if revs:
-                try:
-                    # When 'rev' is a bookmark name, we cannot guarantee that it
-                    # will be updated with that name because of a race condition
-                    # server side. (See issue 4689 for details)
-                    oldrevs = revs
-                    revs = []  # actually, nodes
-                    for r in oldrevs:
-                        node = other.lookup(r)
-                        revs.append(node)
-                        if r == checkout:
-                            checkout = node
-                except error.CapabilityError:
-                    err = _(
-                        "other repository doesn't support revision lookup, "
-                        "so a rev cannot be specified."
-                    )
-                    raise error.Abort(err)
-
-            pullopargs.update(opts.get("opargs", {}))
-            modheads = exchange.pull(
-                repo,
-                other,
-                heads=revs,
-                force=opts.get("force"),
-                bookmarks=opts.get("bookmark", ()),
-                opargs=pullopargs,
-            ).cgresult
+    modheads, checkout = _newpull(ui, repo, source, **opts)
 
     # brev is a name, which might be a bookmark to be activated at
     # the end of the update. In other words, it is an explicit
@@ -4891,7 +4765,6 @@ def _newpull(ui, repo, source, **opts):
     Do not use named branches.
     Do not issue duplicated listkey commands.
     No remotenames race conditions.
-    Requires selectivepull.
     """
     revs = opts.get("rev") or []
     bmarks = opts.get("bookmark") or []
@@ -5056,7 +4929,7 @@ def push(ui, repo, dest=None, **opts):
         revs = [repo[rev].node() for rev in revs]
         if not revs:
             raise error.Abort(
-                _("default push revset for path evaluates to an " "empty set")
+                _("default push revset for path evaluates to an empty set")
             )
 
     if ui.configbool("push", "requirereason"):
@@ -5614,7 +5487,7 @@ def revert(ui, repo, *pats, **opts):
                 )
             else:
                 hint = (
-                    _("use --all to revert all files," " or '@prog@ goto %s' to update")
+                    _("use --all to revert all files, or '@prog@ goto %s' to update")
                     % ctx.rev()
                 )
         elif dirty:
@@ -5755,7 +5628,7 @@ def serve(ui, repo, **opts):
     if opts["stdio"]:
         if repo is None:
             raise error.RepoError(
-                _("there is no @Product@ repository here" " (.hg not found)")
+                _("there is no @Product@ repository here (.hg not found)")
             )
         s = sshserver.sshserver(ui, repo)
         s.serve_forever()
@@ -6278,7 +6151,7 @@ def unbundle(ui, repo, fname1, *fnames, **opts):
 
                 if isinstance(gen, streamclone.streamcloneapplier):
                     raise error.Abort(
-                        _("packed bundles cannot be applied with " '"@prog@ unbundle"'),
+                        _('packed bundles cannot be applied with "@prog@ unbundle"'),
                         hint=_('use "@prog@ debugapplystreamclonebundle"'),
                     )
                 url = "bundle:" + fname
@@ -6422,7 +6295,7 @@ def update(
 
     if len([x for x in (clean, check, merge) if x]) > 1:
         raise error.Abort(
-            _("can only specify one of -C/--clean, -c/--check, " "or -m/--merge")
+            _("can only specify one of -C/--clean, -c/--check, or -m/--merge")
         )
 
     if node is None and rev is None and not date:

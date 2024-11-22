@@ -201,9 +201,6 @@ def extsetup(ui) -> None:
 
 
 def reposetup(ui, repo) -> None:
-    if not repo.local():
-        return
-
     # The sparse extension should never be enabled in Eden repositories;
     # Eden automatically only fetches the parts of the repository that are
     # actually required.
@@ -323,17 +320,17 @@ def _setupupdates(_ui) -> None:
             files.add(file)
             if sparsematch(file):
                 prunedactions[file] = action
-            elif type == "m":
+            elif type == mergemod.ACTION_MERGE:
                 temporaryfiles.append(file)
                 prunedactions[file] = action
             elif branchmerge:
-                if type != "k":
+                if type != mergemod.ACTION_KEEP:
                     temporaryfiles.append(file)
                     prunedactions[file] = action
-            elif type == "f":
+            elif type == mergemod.ACTION_FORGET:
                 prunedactions[file] = action
             elif file in wctx:
-                prunedactions[file] = ("r", args, msg)
+                prunedactions[file] = (mergemod.ACTION_REMOVE, args, msg)
 
         if len(temporaryfiles) > 0:
             ui.status(
@@ -355,7 +352,7 @@ def _setupupdates(_ui) -> None:
                     actions.append((file, (file, fctx.flags(), False), message))
 
             typeactions = collections.defaultdict(list)
-            typeactions["g"] = actions
+            typeactions[mergemod.ACTION_GET] = actions
             mergemod.applyupdates(repo, typeactions, repo[None], repo["."], False)
 
             dirstate = repo.dirstate
@@ -403,9 +400,13 @@ def _setupupdates(_ui) -> None:
                             new = sparsematch(file)
                             if not old and new:
                                 flags = mf.flags(file)
-                                prunedactions[file] = ("g", (file, flags, False), "")
+                                prunedactions[file] = (
+                                    mergemod.ACTION_GET,
+                                    (file, flags, False),
+                                    "",
+                                )
                             elif old and not new:
-                                prunedactions[file] = ("r", [], "")
+                                prunedactions[file] = (mergemod.ACTION_REMOVE, [], "")
 
         return prunedactions
 
@@ -1082,7 +1083,7 @@ class SparseMixin:
                     dropped.append(file)
 
             typeactions = collections.defaultdict(list)
-            typeactions["r"] = actions
+            typeactions[mergemod.ACTION_REMOVE] = actions
             mergemod.applyupdates(self, typeactions, self[None], self["."], False)
 
             # Fix dirstate
@@ -1226,17 +1227,17 @@ def _wraprepo(ui, repo) -> None:
                     if (new and not old) or (old and new and not file in dirstate):
                         fl = mf.flags(file)
                         if self.wvfs.exists(file):
-                            actions[file] = ("e", (fl,), "")
+                            actions[file] = (mergemod.ACTION_EXEC, (fl,), "")
                             lookup.append(file)
                         else:
-                            actions[file] = ("g", (file, fl, False), "")
+                            actions[file] = (mergemod.ACTION_GET, (file, fl, False), "")
                             added.append(file)
                     # Drop files that are newly excluded, or that still exist in
                     # the dirstate.
                     elif (old and not new) or (not (old or new) and file in dirstate):
                         dropped.append(file)
                         if file not in pending:
-                            actions[file] = ("r", [], "")
+                            actions[file] = (mergemod.ACTION_REMOVE, [], "")
 
             # Verify there are no pending changes in newly included files
             if len(lookup) > 0:
@@ -1265,9 +1266,26 @@ def _wraprepo(ui, repo) -> None:
             # Apply changes to disk
             if len(actions) > 0:
                 ui.note(_("applying changes to disk (%d actions)\n") % len(actions))
-            typeactions = dict(
-                (m, []) for m in "a f g am cd dc r rg dm dg m e k p pr".split()
-            )
+            typeactions = {
+                m: []
+                for m in (
+                    mergemod.ACTION_ADD,
+                    mergemod.ACTION_FORGET,
+                    mergemod.ACTION_GET,
+                    mergemod.ACTION_ADD_MODIFIED,
+                    mergemod.ACTION_CHANGED_DELETED,
+                    mergemod.ACTION_DELETED_CHANGED,
+                    mergemod.ACTION_REMOVE,
+                    mergemod.ACTION_REMOVE_GET,
+                    mergemod.ACTION_DIR_RENAME_MOVE_LOCAL,
+                    mergemod.ACTION_LOCAL_DIR_RENAME_GET,
+                    mergemod.ACTION_MERGE,
+                    mergemod.ACTION_EXEC,
+                    mergemod.ACTION_KEEP,
+                    mergemod.ACTION_PATH_CONFLICT,
+                    mergemod.ACTION_PATH_CONFLICT_RESOLVE,
+                )
+            }
 
             with progress.bar(ui, _("applying"), total=len(actions)) as prog:
                 for f, (m, args, msg) in actions.items():
@@ -1557,7 +1575,7 @@ def readsparseprofile(
     try:
         raw = getrawprofile(repo, name, ctx.hex())
     except error.ManifestLookupError:
-        msg = "warning: sparse profile '%s' not found " "in rev %s - ignoring it\n" % (
+        msg = "warning: sparse profile '%s' not found in rev %s - ignoring it\n" % (
             name,
             ctx,
         )
@@ -1703,7 +1721,7 @@ def _discover(ui, repo, rev: Optional[str] = None):
     if profile_directory is not None:
         if os.path.isabs(profile_directory) or profile_directory.startswith("../"):
             raise error.Abort(
-                _("sparse.profile_directory must be relative to the " "repository root")
+                _("sparse.profile_directory must be relative to the repository root")
             )
         if not profile_directory.endswith("/"):
             profile_directory += "/"
@@ -1859,7 +1877,7 @@ def hintlistverbose(profiles, filters, load_matcher) -> Optional[str]:
     hidden_count = sum(1 for p in filter(pred, profiles))
     if hidden_count:
         return (
-            _("%d hidden profiles not shown; " "add '--verbose' to include these")
+            _("%d hidden profiles not shown; add '--verbose' to include these")
             % hidden_count
         )
 
@@ -1876,52 +1894,52 @@ _deprecate = lambda o, l=_("(DEPRECATED)"): (
             "f",
             "force",
             False,
-            _("allow changing rules even with pending changes" "(DEPRECATED)"),
+            _("allow changing rules even with pending changes(DEPRECATED)"),
         ),
         (
             "I",
             "include",
             False,
-            _("include files in the sparse checkout " "(DEPRECATED)"),
+            _("include files in the sparse checkout (DEPRECATED)"),
         ),
         (
             "X",
             "exclude",
             False,
-            _("exclude files in the sparse checkout " "(DEPRECATED)"),
+            _("exclude files in the sparse checkout (DEPRECATED)"),
         ),
-        ("d", "delete", False, _("delete an include/exclude rule " "(DEPRECATED)")),
+        ("d", "delete", False, _("delete an include/exclude rule (DEPRECATED)")),
         (
             "",
             "enable-profile",
             False,
-            _("enables the specified profile " "(DEPRECATED)"),
+            _("enables the specified profile (DEPRECATED)"),
         ),
         (
             "",
             "disable-profile",
             False,
-            _("disables the specified profile " "(DEPRECATED)"),
+            _("disables the specified profile (DEPRECATED)"),
         ),
         ("", "import-rules", False, _("imports rules from a file (DEPRECATED)")),
         (
             "",
             "clear-rules",
             False,
-            _("clears local include/exclude rules " "(DEPRECATED)"),
+            _("clears local include/exclude rules (DEPRECATED)"),
         ),
         (
             "",
             "refresh",
             False,
-            _("updates the working after sparseness changes " "(DEPRECATED)"),
+            _("updates the working after sparseness changes (DEPRECATED)"),
         ),
         ("", "reset", False, _("makes the repo full again (DEPRECATED)")),
         (
             "",
             "cwd-list",
             False,
-            _("list the full contents of the current " "directory (DEPRECATED)"),
+            _("list the full contents of the current directory (DEPRECATED)"),
         ),
     ]
     + [_deprecate(o) for o in commands.templateopts],
@@ -3111,7 +3129,7 @@ def _cwdlist(repo) -> None:
     cwd = "" if cwd == os.curdir else cwd + pycompat.ossep
     if cwd.startswith(os.pardir + pycompat.ossep):
         raise error.Abort(
-            _("the current working directory should begin " "with the root %s") % root
+            _("the current working directory should begin with the root %s") % root
         )
 
     matcher = matchmod.match(repo.root, repo.getcwd(), patterns=["path:" + cwd])

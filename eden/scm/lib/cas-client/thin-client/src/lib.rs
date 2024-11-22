@@ -1,11 +1,12 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use cas_client::CasClient;
@@ -29,7 +30,10 @@ pub struct ThinCasClient {
     log_dir: Option<String>,
     fetch_limit: ByteCount,
     fetch_concurrency: usize,
+    use_streaming_dowloads: bool,
 }
+
+const DEFAULT_SCM_CAS_LOGS_DIR: &str = "scm_cas";
 
 pub fn init() {
     fn construct(config: &dyn Config) -> Result<Option<Arc<dyn CasClient>>> {
@@ -40,19 +44,26 @@ pub fn init() {
         }
 
         tracing::debug!(target: "cas", "creating thin client");
-        ThinCasClient::from_config(config).map(|c| Some(Arc::new(c) as Arc<dyn CasClient>))
+        ThinCasClient::from_config(config).map(|c| c.map(|c| Arc::new(c) as Arc<dyn CasClient>))
     }
     factory::register_constructor("thin-client", construct);
 }
 
 impl ThinCasClient {
-    pub fn from_config(config: &dyn Config) -> Result<Self> {
+    pub fn from_config(config: &dyn Config) -> Result<Option<Self>> {
         let use_case: String = match config.get("cas", "use-case") {
             Some(use_case) => use_case.to_string(),
-            None => format!(
-                "source-control-{}",
-                config.must_get::<String>("remotefilelog", "reponame")?
-            ),
+            None => {
+                let repo_name =
+                    match config.get_nonempty_opt::<String>("remotefilelog", "reponame")? {
+                        Some(repo_name) => repo_name,
+                        None => {
+                            tracing::info!(target: "cas", "no use case or repo name configured");
+                            return Ok(None);
+                        }
+                    };
+                format!("source-control-{repo_name}")
+            }
         };
 
         let verbose: bool = config.get_or_default("cas", "verbose")?;
@@ -63,18 +74,26 @@ impl ThinCasClient {
             if let Some(ref log_dir_path) = log_dir {
                 if !std::path::Path::new(log_dir_path).exists() {
                     if let Err(err) = std::fs::create_dir(log_dir_path) {
-                        tracing::warn!(target: "cas", "failed to create log dir: {}", err);
-                        log_dir = Some(std::env::temp_dir().to_string_lossy().to_string());
+                        tracing::warn!(target: "cas", "failed to create log dir with path {}: {}", log_dir_path, err);
+                        log_dir = None;
                     }
                 }
             } else {
-                log_dir = Some(std::env::temp_dir().to_string_lossy().to_string());
+                let temp_dir = std::env::temp_dir();
+                let log_dir_path = temp_dir.join(DEFAULT_SCM_CAS_LOGS_DIR);
+                log_dir = Some(log_dir_path.to_string_lossy().to_string());
+                if !std::path::Path::new(&log_dir_path).exists() {
+                    if let Err(err) = std::fs::create_dir(&log_dir_path) {
+                        tracing::warn!(target: "cas", "failed to create log dir with path {:?}: {}", log_dir_path, err);
+                        log_dir = None;
+                    }
+                }
             }
         }
 
         let default_fetch_limit = ByteCount::try_from_str("200MB")?;
 
-        Ok(Self {
+        Ok(Some(Self {
             client: Default::default(),
             connection_count: config.get_or("cas", "connection-count", || 1)?,
             port: config.get_opt::<i32>("cas", "port")?,
@@ -88,10 +107,12 @@ impl ThinCasClient {
             fetch_limit: config
                 .get_or::<ByteCount>("cas", "max-batch-bytes", || default_fetch_limit)?,
             fetch_concurrency: config.get_or("cas", "fetch-concurrency", || 4)?,
-        })
+            use_streaming_dowloads: config.get_or("cas", "use-streaming-downloads", || true)?,
+        }))
     }
 
     fn build(&self) -> Result<REClient> {
+        let start = Instant::now();
         let mut re_config = create_default_config();
 
         re_config.client_name = Some("sapling".to_string());
@@ -116,7 +137,10 @@ impl ThinCasClient {
             builder = builder.with_wdb_cas_daemon(self.connection_count);
         }
 
-        builder.build()
+        let client = builder.build();
+        let elapsed = start.elapsed();
+        tracing::debug!(target: "cas", "creating RE CAS client took {} ms", elapsed.as_millis());
+        client
     }
 }
 

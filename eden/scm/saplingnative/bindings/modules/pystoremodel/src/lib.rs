@@ -23,10 +23,13 @@ use storemodel::TreeItemFlag;
 use storemodel::TreeStore as NativeTreeStore;
 use types::fetch_mode::FetchMode;
 use types::Id20;
-use types::Key;
 use types::PathComponent;
 use types::PathComponentBuf;
 use types::RepoPath;
+mod key;
+use key::CompactKey;
+use key::IntoCompactKey as _;
+use key::IntoKeys as _;
 
 pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
     let name = [package, "storemodel"].join(".");
@@ -50,9 +53,10 @@ py_class!(pub class KeyStore |py| {
     data inner: Arc<dyn NativeKeyStore>;
 
     /// get_content_iter(keys, fetch_mode = (AllowRemote)) -> Iterator[Tuple[Key, bytes]]
-    def get_content_iter(&self, keys: Serde<Vec<Key>>, fetch_mode: Serde<FetchMode> = Serde(FetchMode::AllowRemote)) -> PyResult<PyIter> {
+    def get_content_iter(&self, keys: Serde<Vec<CompactKey>>, fetch_mode: Serde<FetchMode> = Serde(FetchMode::AllowRemote)) -> PyResult<PyIter> {
         let inner = self.inner(py);
-        let iter = inner.get_content_iter(keys.0, fetch_mode.0).map_pyerr(py)?;
+        let iter = inner.get_content_iter(keys.0.into_keys(), fetch_mode.0).map_pyerr(py)?;
+        let iter = iter.into_compact_key();
         let iter = PyIter::new(py, iter)?;
         Ok(iter)
     }
@@ -74,9 +78,9 @@ py_class!(pub class KeyStore |py| {
     }
 
     /// prefetch(keys)
-    def prefetch(&self, keys: Serde<Vec<Key>>) -> PyResult<PyNone> {
+    def prefetch(&self, keys: Serde<Vec<CompactKey>>) -> PyResult<PyNone> {
         let inner = self.inner(py);
-        py.allow_threads(|| inner.prefetch(keys.0)).map_pyerr(py)?;
+        py.allow_threads(|| inner.prefetch(keys.0.into_keys())).map_pyerr(py)?;
         Ok(PyNone)
     }
 
@@ -102,6 +106,11 @@ py_class!(pub class KeyStore |py| {
         Ok(inner.statistics())
     }
 
+    def type_name(&self) -> PyResult<String> {
+        let inner = self.inner(py);
+        Ok(inner.type_name().into_owned())
+    }
+
     @staticmethod
     def from_store(store: ImplInto<Arc<dyn NativeKeyStore>>) -> PyResult<Self> {
         let inner = store.into();
@@ -113,9 +122,10 @@ py_class!(pub class FileStore |py| {
     data inner: Arc<dyn NativeFileStore>;
 
     /// get_rename_iter(keys) -> Iteratable[Tuple[Key, Key]]
-    def get_rename_iter(&self, keys: Serde<Vec<Key>>) -> PyResult<PyIter> {
+    def get_rename_iter(&self, keys: Serde<Vec<CompactKey>>) -> PyResult<PyIter> {
         let inner = self.inner(py);
-        let iter = inner.get_rename_iter(keys.0).map_pyerr(py)?;
+        let iter = inner.get_rename_iter(keys.0.into_keys()).map_pyerr(py)?;
+        let iter = iter.map(|v| v.map(|(k1, k2)| (CompactKey::from_key(k1), CompactKey::from_key(k2))));
         let iter = PyIter::new(py, iter)?;
         Ok(iter)
     }
@@ -149,9 +159,9 @@ py_class!(pub class FileStore |py| {
 
     /// Upload LFS files specified by the keys.
     /// This is called before push.
-    def upload_lfs(&self, keys: Serde<Vec<Key>>) -> PyResult<PyNone> {
+    def upload_lfs(&self, keys: Serde<Vec<CompactKey>>) -> PyResult<PyNone> {
         let inner = self.inner(py);
-        py.allow_threads(|| inner.upload_lfs(keys.0)).map_pyerr(py)?;
+        py.allow_threads(|| inner.upload_lfs(keys.0.into_keys())).map_pyerr(py)?;
         Ok(PyNone)
     }
 
@@ -177,6 +187,11 @@ py_class!(pub class FileStore |py| {
         let inner = self.inner(py);
         let store = inner.clone_key_store();
         KeyStore::create_instance(py, store.into())
+    }
+
+    def type_name(&self) -> PyResult<String> {
+        let inner = self.inner(py);
+        Ok(inner.type_name().into_owned())
     }
 
     @staticmethod
@@ -219,20 +234,20 @@ py_class!(pub class TreeStore |py| {
     }
 
     /// get_remote_tree_iter(keys) -> Iterator[Tuple[Key, TreeEntry]]
-    def get_remote_tree_iter(&self, keys: Serde<Vec<Key>>) -> PyResult<PyIter> {
+    def get_remote_tree_iter(&self, keys: Serde<Vec<CompactKey>>) -> PyResult<PyIter> {
         let inner = self.inner(py);
-        let iter = inner.get_remote_tree_iter(keys.0).map_pyerr(py)?;
+        let iter = inner.get_remote_tree_iter(keys.0.into_keys()).map_pyerr(py)?;
         PyIter::new_custom(py, iter, |py, (key, entry)| {
-            Ok((Serde(key), TreeEntry::create_instance(py, entry)?).to_py_object(py).into_object())
+            Ok((Serde(key.into_compact_key()), TreeEntry::create_instance(py, entry)?).to_py_object(py).into_object())
         })
     }
 
     /// get_tree_iter(keys, fetch_mode) -> Iterator[Tuple[Key, TreeEntry]]
-    def get_tree_iter(&self, keys: Serde<Vec<Key>>, fetch_mode: Serde<FetchMode> = Serde(FetchMode::AllowRemote)) -> PyResult<PyIter> {
+    def get_tree_iter(&self, keys: Serde<Vec<CompactKey>>, fetch_mode: Serde<FetchMode> = Serde(FetchMode::AllowRemote)) -> PyResult<PyIter> {
         let inner = self.inner(py);
-        let iter = inner.get_tree_iter(keys.0, fetch_mode.0).map_pyerr(py)?;
+        let iter = inner.get_tree_iter(keys.0.into_keys(), fetch_mode.0).map_pyerr(py)?;
         PyIter::new_custom(py, iter, |py, (key, entry)| {
-            Ok((Serde(key), TreeEntry::create_instance(py, entry)?).to_py_object(py).into_object())
+            Ok((Serde(key.into_compact_key()), TreeEntry::create_instance(py, entry)?).to_py_object(py).into_object())
         })
     }
 
@@ -280,6 +295,11 @@ py_class!(pub class TreeStore |py| {
         let inner = self.inner(py);
         let store = inner.clone_key_store();
         KeyStore::create_instance(py, store.into())
+    }
+
+    def type_name(&self) -> PyResult<String> {
+        let inner = self.inner(py);
+        Ok(inner.type_name().into_owned())
     }
 
     @staticmethod

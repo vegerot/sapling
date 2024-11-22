@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 use std::collections::HashSet;
@@ -95,7 +95,7 @@ pub fn generate_repo_paths(count: usize, qc_gen: &mut Gen) -> Vec<RepoPathBuf> {
                 if component_hash.contains(&component) {
                     continue;
                 }
-                self.current_path.push(component.as_ref());
+                self.current_path.push(component.as_path_component());
                 component_hash.insert(component);
                 self.current_component_length += 1;
 

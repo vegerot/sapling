@@ -261,6 +261,9 @@ impl HookManager {
         if let Some(user) = user_option {
             scuba.add("user", user);
         }
+        if let Some(cri) = ctx.metadata().client_request_info() {
+            scuba.add_client_request_info(cri);
+        }
 
         for hook_name in hooks {
             let hook = self
@@ -317,6 +320,13 @@ impl HookManager {
         if let Some(user) = user_option {
             scuba.add("user", user);
         }
+        if let Some(cri) = ctx.metadata().client_request_info() {
+            scuba.add_client_request_info(cri);
+        }
+
+        if let Some(user) = user_option {
+            scuba.add("user", user);
+        }
 
         let (batched, individual) = hooks
             .map(|hook_name| {
@@ -331,26 +341,23 @@ impl HookManager {
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             // Skip any hook that's entirely bypassed due to a pushvar
-            .filter(|(hook_name, hook)| {
-                cloned!(mut scuba);
-                log_if_bypassed_by_pushvar(&mut scuba, hook_name, hook, changesets, maybe_pushvars)
+            .filter(|(_hook_name, hook)| {
+                log_if_bypassed_by_pushvar(&scuba, hook, changesets, maybe_pushvars)
             })
             .map(|(hook_name, hook)| {
                 // Skip any changeset that explicitly bypasses this hook in its commit message
                 let changesets = changesets
                     .iter()
-                    .filter(|cs| {
-                        cloned!(mut scuba);
-                        log_if_bypassed_by_commit_msg(&mut scuba, hook_name, hook, cs)
-                    })
+                    .filter(|cs| log_if_bypassed_by_commit_msg(&scuba, hook, cs))
                     .collect::<Vec<_>>();
+                cloned!(mut scuba);
                 hook.get_futures_for_changeset_or_file_hooks(
                     ctx,
                     bookmark,
                     &*self.content_provider,
                     hook_name,
                     changesets,
-                    scuba.clone(),
+                    scuba,
                     cross_repo_push_source,
                     push_authored_by,
                     hook.get_config().log_only,
@@ -394,15 +401,14 @@ impl HookManager {
 }
 
 fn log_if_bypassed_by_commit_msg(
-    scuba: &mut MononokeScubaSampleBuilder,
-    hook_name: &str,
+    scuba: &MononokeScubaSampleBuilder,
     hook: &Hook,
     cs: &BonsaiChangeset,
 ) -> bool {
     if let Some(bypass_reason) =
         get_bypassed_by_commit_msg_reason(hook.get_config().bypass.as_ref(), cs.message())
     {
-        log_bypassed_changeset(scuba, hook_name, cs, &bypass_reason);
+        log_bypassed_changeset(scuba, cs, &bypass_reason);
         false
     } else {
         true
@@ -410,8 +416,7 @@ fn log_if_bypassed_by_commit_msg(
 }
 
 fn log_if_bypassed_by_pushvar(
-    scuba: &mut MononokeScubaSampleBuilder,
-    hook_name: &str,
+    scuba: &MononokeScubaSampleBuilder,
     hook: &Hook,
     changesets: &[BonsaiChangeset],
     maybe_pushvars: Option<&HashMap<String, Bytes>>,
@@ -421,7 +426,7 @@ fn log_if_bypassed_by_pushvar(
     {
         // Log all bypassed hooks. No need to be async
         for cs in changesets {
-            log_bypassed_changeset(scuba, hook_name, cs, &bypass_reason);
+            log_bypassed_changeset(scuba, cs, &bypass_reason);
         }
         false
     } else {
@@ -430,12 +435,11 @@ fn log_if_bypassed_by_pushvar(
 }
 
 fn log_bypassed_changeset(
-    scuba: &mut MononokeScubaSampleBuilder,
-    hook_name: &str,
+    scuba: &MononokeScubaSampleBuilder,
     cs: &BonsaiChangeset,
     bypass_reason: &str,
 ) {
-    scuba.add("hook", hook_name.to_string());
+    cloned!(mut scuba);
     scuba.add("hash", cs.get_changeset_id().to_string());
     scuba.add("bypass_reason", bypass_reason.to_string());
     scuba.log();

@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 use std::io;
@@ -22,10 +22,9 @@ use dag::Group;
 use dag::Set;
 use dag::Vertex;
 use dag::VertexListWithOptions;
-use format_util::git_sha1_deserialize;
 use format_util::git_sha1_serialize;
-use format_util::hg_sha1_deserialize;
 use format_util::hg_sha1_serialize;
+use format_util::strip_sha1_header;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
 use minibytes::Bytes;
@@ -58,6 +57,7 @@ pub struct OnDiskCommits {
 
 impl OnDiskCommits {
     pub fn new(dag_path: &Path, commits_path: &Path, format: SerializationFormat) -> Result<Self> {
+        tracing::trace!(target: "commits::format", ?format);
         let result = Self {
             dag: Dag::open(dag_path)?,
             dag_path: dag_path.to_path_buf(),
@@ -173,6 +173,10 @@ impl ReadCommitText for OnDiskCommits {
     fn to_dyn_read_commit_text(&self) -> Arc<dyn ReadCommitText + Send + Sync> {
         ArcRwLockZstore(self.commits.clone(), self.format()).to_dyn_read_commit_text()
     }
+
+    fn format(&self) -> SerializationFormat {
+        self.format
+    }
 }
 
 #[derive(Clone)]
@@ -188,6 +192,10 @@ impl ReadCommitText for ArcRwLockZstore {
     fn to_dyn_read_commit_text(&self) -> Arc<dyn ReadCommitText + Send + Sync> {
         Arc::new(self.clone())
     }
+
+    fn format(&self) -> SerializationFormat {
+        self.1
+    }
 }
 
 fn get_commit_raw_text(
@@ -198,11 +206,8 @@ fn get_commit_raw_text(
     let id = Id20::from_slice(vertex.as_ref())?;
     match store.get(id)? {
         Some(bytes) => {
-            let raw_text = match format {
-                SerializationFormat::Hg => hg_sha1_deserialize(bytes.as_ref())?.0,
-                SerializationFormat::Git => git_sha1_deserialize(bytes.as_ref())?.0,
-            };
-            Ok(Some(bytes.slice_to_bytes(raw_text)))
+            let raw_text = strip_sha1_header(&bytes, format)?;
+            Ok(Some(raw_text))
         }
         None => Ok(crate::revlog::get_hard_coded_commit_text(vertex)),
     }
@@ -214,6 +219,7 @@ impl StreamCommitText for OnDiskCommits {
         stream: BoxStream<'static, anyhow::Result<Vertex>>,
     ) -> Result<BoxStream<'static, anyhow::Result<ParentlessHgCommit>>> {
         let zstore = Zstore::open(&self.commits_path)?;
+        let format = self.format;
         let stream = stream.map(move |item| {
             let vertex = item?;
             let id = Id20::from_slice(vertex.as_ref())?;
@@ -222,7 +228,7 @@ impl StreamCommitText for OnDiskCommits {
                 Default::default()
             } else {
                 match zstore.get(id)? {
-                    Some(raw_data) => raw_data.slice(Id20::len() * 2..),
+                    Some(raw_data) => strip_sha1_header(&raw_data, format)?,
                     None => return vertex.not_found().map_err(Into::into),
                 }
             };

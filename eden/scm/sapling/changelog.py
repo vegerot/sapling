@@ -14,9 +14,11 @@ from __future__ import absolute_import
 
 import subprocess
 import textwrap
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional
 
-from . import encoding, error, gituser, revlog, util
+import bindings
+
+from . import encoding, error, revlog, util
 from .i18n import _
 from .node import bbin, hex, nullid
 from .pycompat import decodeutf8, encodeutf8, iteritems
@@ -201,7 +203,60 @@ class changelogrevision:
         return encoding.tolocalstr(self._text[self._offsets[3] + 2 :])
 
 
-def hgcommittext(manifest, files, desc, user, date, extra):
+class changelogrevision2:
+    """Commit fields parser backed by Rust. Supports Git and Hg formats."""
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, text, format):
+        if not text:
+            text = ""
+        elif isinstance(text, bytes):
+            text = text.decode(errors="ignore")
+        self._inner = bindings.formatutil.CommitFields.from_text(text, format)
+
+    @property
+    def manifest(self):
+        return self._inner.root_tree()
+
+    @property
+    def user(self):
+        return self._inner.author_name()
+
+    @property
+    def date(self):
+        timestamp, tz = self._inner.author_date()
+        # for compatibility, use 'float' for timestamp
+        return float(timestamp), tz
+
+    @property
+    def extra(self):
+        extra = self._inner.extras()
+        if "branch" not in extra:
+            # Is this needed?
+            extra = {"branch": "default", **extra}
+        # For compatibility, also provide committer in one field
+        if "committer" not in extra:
+            committer_name = self._inner.committer_name()
+            committer_date = self._inner.committer_date()
+            if committer_name and committer_date:
+                extra["committer"] = committer_name
+                extra["committer_date"] = "%d %d" % committer_date
+        return extra
+
+    @property
+    def files(self):
+        files = self._inner.files()
+        if files is None:
+            return None
+        return tuple(files)
+
+    @property
+    def description(self):
+        return self._inner.description()
+
+
+def hgcommittext(manifest, files, desc, user, date, extra, use_rust=True):
     """Generate the 'text' of a commit"""
     # Convert to UTF-8 encoded bytestrings as the very first
     # thing: calling any method on a localstr object will turn it
@@ -220,43 +275,36 @@ def hgcommittext(manifest, files, desc, user, date, extra):
     desc = stripdesc(desc)
 
     if date:
-        parseddate = "%d %d" % util.parsedate(date)
+        timestamp, tz = util.parsedate(date)
     else:
-        parseddate = "%d %d" % util.makedate()
+        timestamp, tz = util.makedate()
+
     if extra:
         branch = extra.get("branch")
         if branch in ("default", ""):
             del extra["branch"]
         elif branch in (".", "null", "tip"):
             raise error.RevlogError(_("the name '%s' is reserved") % branch)
-    if extra:
-        extra = encodeextra(extra)
-        parseddate = "%s %s" % (parseddate, extra)
-    l = [hex(manifest), user, parseddate] + sorted(files) + ["", desc]
-    text = encodeutf8("\n".join(l), errors="surrogateescape")
-    return text
 
-
-def gitdatestr(dateobj: Union[str, Tuple[int, int]]) -> str:
-    """convert dateobj to git date str used in commits
-
-    >>> util.parsedate('2000-01-01T00:00:00 +0700')
-    (946659600, -25200)
-    >>> gitdatestr('2000-01-01T00:00:00 +0700')
-    '946659600 +0700'
-    >>> gitdatestr('2000-01-01T00:00:00 +0000')
-    '946684800 +0000'
-    """
-    utc, offset = util.parsedate(dateobj)
-    if offset > 0:
-        offsetsign = "-"
+    if use_rust:
+        # see Rust format-util HgCommitFields for available fields
+        fields = {
+            "tree": manifest,
+            "author": user,
+            "date": (int(timestamp), tz),
+            "extras": extra,
+            "files": sorted(files),
+            "message": desc,
+        }
+        text = bindings.formatutil.hg_commit_fields_to_text(fields).encode()
     else:
-        offsetsign = "+"
-        offset = -offset
-    offset = offset // 60
-    offsethour = offset // 60
-    offsetminute = offset % 60
-    return "%d %s%02d%02d" % (utc, offsetsign, offsethour, offsetminute)
+        parseddate = "%d %d" % (timestamp, tz)
+        if extra:
+            extra = encodeextra(extra)
+            parseddate = "%s %s" % (parseddate, extra)
+        l = [hex(manifest), user, parseddate] + sorted(files) + ["", desc]
+        text = encodeutf8("\n".join(l), errors="surrogateescape")
+    return text
 
 
 def gitcommittext(
@@ -277,52 +325,48 @@ def gitcommittext(
     Note that while Git supports multiple signature formats (openpgp, x509, ssh),
     Sapling only supports openpgp today.
 
-    >>> import binascii
-    >>> tree = binascii.unhexlify('deadbeef')
+    >>> tree = b'0' * 20
     >>> desc = " HI! \n   another line with leading spaces\n\nsecond line\n\n\n"
     >>> user = "Alyssa P. Hacker <alyssa@example.com>"
     >>> date = "2000-01-01T00:00:00 +0700"
-    >>> no_parents = gitcommittext(tree, [], desc, user, date, None)
-    >>> no_parents == (
-    ...     b'tree deadbeef\n' +
-    ...     b'author Alyssa P. Hacker <alyssa@example.com> 946659600 +0700\n' +
-    ...     b'committer Alyssa P. Hacker <alyssa@example.com> 946659600 +0700\n' +
-    ...     b'\n' +
-    ...     b' HI!\n' +
-    ...     b'   another line with leading spaces\n' +
-    ...     b'\n' +
-    ...     b'second line\n'
-    ... )
-    True
-    >>> p1 = binascii.unhexlify('deadc0de')
-    >>> one_parent = gitcommittext(tree, [p1], desc, user, date, None)
-    >>> one_parent == (
-    ...     b'tree deadbeef\n' +
-    ...     b'parent deadc0de\n' +
-    ...     b'author Alyssa P. Hacker <alyssa@example.com> 946659600 +0700\n' +
-    ...     b'committer Alyssa P. Hacker <alyssa@example.com> 946659600 +0700\n' +
-    ...     b'\n' +
-    ...     b' HI!\n' +
-    ...     b'   another line with leading spaces\n' +
-    ...     b'\n' +
-    ...     b'second line\n'
-    ... )
-    True
-    >>> p2 = binascii.unhexlify('baadf00d')
-    >>> two_parents = gitcommittext(tree, [p1, p2], desc, user, date, None)
-    >>> two_parents == (
-    ...     b'tree deadbeef\n' +
-    ...     b'parent deadc0de\n' +
-    ...     b'parent baadf00d\n' +
-    ...     b'author Alyssa P. Hacker <alyssa@example.com> 946659600 +0700\n' +
-    ...     b'committer Alyssa P. Hacker <alyssa@example.com> 946659600 +0700\n' +
-    ...     b'\n' +
-    ...     b' HI!\n' +
-    ...     b'   another line with leading spaces\n' +
-    ...     b'\n' +
-    ...     b'second line\n'
-    ... )
-    True
+    >>> print(gitcommittext(tree, [], desc, user, date, None).decode())
+    tree 3030303030303030303030303030303030303030
+    author Alyssa P. Hacker <alyssa@example.com> 946659600 +0700
+    committer Alyssa P. Hacker <alyssa@example.com> 946659600 +0700
+    <BLANKLINE>
+     HI!
+       another line with leading spaces
+    <BLANKLINE>
+    second line
+    <BLANKLINE>
+
+    >>> p1 = b'2' * 20
+    >>> print(gitcommittext(tree, [p1], desc, user, date, None).decode())
+    tree 3030303030303030303030303030303030303030
+    parent 3232323232323232323232323232323232323232
+    author Alyssa P. Hacker <alyssa@example.com> 946659600 +0700
+    committer Alyssa P. Hacker <alyssa@example.com> 946659600 +0700
+    <BLANKLINE>
+     HI!
+       another line with leading spaces
+    <BLANKLINE>
+    second line
+    <BLANKLINE>
+
+    >>> p2 = b'1' * 20
+    >>> print(gitcommittext(tree, [p1, p2], desc, user, date, None).decode())
+    tree 3030303030303030303030303030303030303030
+    parent 3232323232323232323232323232323232323232
+    parent 3131313131313131313131313131313131313131
+    author Alyssa P. Hacker <alyssa@example.com> 946659600 +0700
+    committer Alyssa P. Hacker <alyssa@example.com> 946659600 +0700
+    <BLANKLINE>
+     HI!
+       another line with leading spaces
+    <BLANKLINE>
+    second line
+    <BLANKLINE>
+
     """
     # Example:
     # tree 97e8739f1945a4ba78c9bc1c670718c5dc5c08eb
@@ -332,13 +376,6 @@ def gitcommittext(
     #
     # Updating submodules
     committer = (extra.get("committer") if extra else None) or user
-
-    # Bail out early with concise error if usernames are not valid.
-    try:
-        gituser.parse_username(committer)
-        gituser.parse_username(user)
-    except ValueError as ex:
-        raise error.Abort(ex)
 
     get_date = lambda name: util.parsedate((extra.get(name) if extra else None) or date)
 
@@ -353,15 +390,20 @@ def gitcommittext(
     if date != authordate and date != committerdate:
         authordate = date
 
-    parent_entries = "".join(f"parent {hex(p)}\n" for p in parents)
-    pre_sig_text = f"""\
-tree {hex(tree)}
-{parent_entries}author {gituser.normalize(user)} {gitdatestr(authordate)}
-committer {gituser.normalize(committer)} {gitdatestr(committerdate)}"""
+    # see Rust format-util GitCommitFields for available fields
+    fields = {
+        "tree": tree,
+        "parents": parents,
+        "author": user,
+        "date": util.parsedate(authordate),
+        "committer": committer,
+        "committer_date": util.parsedate(committerdate),
+        "message": desc,
+        "extras": extra or {},
+    }
+    to_text = bindings.formatutil.git_commit_fields_to_text
+    text = to_text(fields).encode()
 
-    normalized_desc = stripdesc(desc)
-    text = pre_sig_text + f"\n\n{normalized_desc}\n"
-    text = encodeutf8(text, errors="surrogateescape")
     if not gpgkeyid:
         return text
 
@@ -392,83 +434,7 @@ committer {gituser.normalize(committer)} {gitdatestr(committerdate)}"""
             % (gpgkeyid, indented_stderr)
         )
 
-    return _signedgitcommittext(sig_bytes, pre_sig_text, normalized_desc, gpgkeyid)
-
-
-def _signedgitcommittext(
-    sig_bytes: bytes, pre_sig_text: str, normalized_desc: str, gpgkeyid: str
-) -> bytes:
-    r"""produces a signed commit from the intermediate values produced by gitcommittext()
-
-    >>> sig_bytes = (
-    ...     b"-----BEGIN PGP SIGNATURE-----\r\n" +
-    ...     b"\r\n" +
-    ...     b"iQEzBAABCAAdFiEEurYkrcQEDEhXMjb8tXeqdrrlBbEFAmOPpRIACgkQtXeqdrrl\r\n" +
-    ...     b"BbE8hAf/eybgd1jrovZhs8X/SU2UO4rQnekz5D1BpAVjKUIDTfvuVg7sczTyuXvE\r\n" +
-    ...     b"pkuhkeZd2Is0HvSzWa9dD88VECrwQfHjOFe2Ffb7QdVN4811pZ4+lcGcWKKVG9Oq\r\n" +
-    ...     b"uAtXJgXpBf58Vp9x7wgnbqPFlSUTk5vlbZ2TQNyJbT3/YNLiqTECD0MYeLmAlbiI\r\n" +
-    ...     b"tU4hdb6T57ztxy6DL5nk/mfrcO+k4Up+flpGVjm9juWY3jGgszClCLJW0vUH4ToI\r\n" +
-    ...     b"1Cb8ew5c7b0f4oYl9AQgySTN1slO64beedMpakS79Mcv5WFwen0vPBQilX7hEYVC\r\n" +
-    ...     b"DQnndXm8zU6/MhpVjfoLHd9Tzr0YYQ==\r\n" +
-    ...     b"=Equk\r\n" +
-    ...     b"-----END PGP SIGNATURE-----\r\n"
-    ... )
-    >>> pre_sig_text = (
-    ...     'tree deadbeef\n' +
-    ...     'parent deadc0de\n' +
-    ...     'parent baadf00d\n' +
-    ...     'author Alyssa P. Hacker <alyssa@example.com> 946659600 +0700\n' +
-    ...     'committer Alyssa P. Hacker <alyssa@example.com> 946659600 +0700'
-    ... )
-    >>> desc = " HI! \n   another line with leading spaces\n\nsecond line\n\n\n"
-    >>> normalized_desc = stripdesc(desc)
-    >>> gpgkeyid = "B577AA76BAE505B1"
-    >>> signedcommit = _signedgitcommittext(sig_bytes, pre_sig_text, normalized_desc, gpgkeyid)
-    >>> signedcommit == (
-    ...     b'tree deadbeef\n' +
-    ...     b'parent deadc0de\n' +
-    ...     b'parent baadf00d\n' +
-    ...     b'author Alyssa P. Hacker <alyssa@example.com> 946659600 +0700\n' +
-    ...     b'committer Alyssa P. Hacker <alyssa@example.com> 946659600 +0700\n' +
-    ...     b'gpgsig -----BEGIN PGP SIGNATURE-----\n' +
-    ...     b' \n' +
-    ...     b' iQEzBAABCAAdFiEEurYkrcQEDEhXMjb8tXeqdrrlBbEFAmOPpRIACgkQtXeqdrrl\n' +
-    ...     b' BbE8hAf/eybgd1jrovZhs8X/SU2UO4rQnekz5D1BpAVjKUIDTfvuVg7sczTyuXvE\n' +
-    ...     b' pkuhkeZd2Is0HvSzWa9dD88VECrwQfHjOFe2Ffb7QdVN4811pZ4+lcGcWKKVG9Oq\n' +
-    ...     b' uAtXJgXpBf58Vp9x7wgnbqPFlSUTk5vlbZ2TQNyJbT3/YNLiqTECD0MYeLmAlbiI\n' +
-    ...     b' tU4hdb6T57ztxy6DL5nk/mfrcO+k4Up+flpGVjm9juWY3jGgszClCLJW0vUH4ToI\n' +
-    ...     b' 1Cb8ew5c7b0f4oYl9AQgySTN1slO64beedMpakS79Mcv5WFwen0vPBQilX7hEYVC\n' +
-    ...     b' DQnndXm8zU6/MhpVjfoLHd9Tzr0YYQ==\n' +
-    ...     b' =Equk\n' +
-    ...     b' -----END PGP SIGNATURE-----\n'
-    ...     b'\n' +
-    ...     b' HI!\n' +
-    ...     b'   another line with leading spaces\n' +
-    ...     b'\n' +
-    ...     b'second line\n'
-    ... )
-    True
-    """
-    sig = sig_bytes.decode("ascii")
-    if not sig.endswith("\n"):
-        raise error.Abort(
-            _("expected signature to end with a newline but was %s") % sig_bytes
-        )
-
-    # Remove any carriage returns in case `gpg` was used on Windows:
-    # https://github.com/git/git/blob/2e71cbbddd64695d43383c25c7a054ac4ff86882/gpg-interface.c#L985
-    sig = sig.replace("\r\n", "\n")
-
-    # The signature returned by `gpg` contains '\n\n' after '-----BEGIN PGP SIGNATURE-----',
-    # which is a problem because '\n\n' is used to delimit the start of the commit message
-    # in a Git commit object. As a workaround, Git inserts a space after every '\n'
-    # (except the last one) as shown here:
-    # https://github.com/git/git/blob/2e71cbbddd64695d43383c25c7a054ac4ff86882/commit.c#L1059-L1072
-    sig = sig[:-1].replace("\n", "\n ") + "\n"
-
-    signed_text = f"""\
-{pre_sig_text}
-gpgsig {sig}
-{normalized_desc}
-"""
-    return encodeutf8(signed_text, errors="surrogateescape")
+    gpgsig = sig_bytes.replace(b"\r", b"").decode()
+    fields["extras"]["gpgsig"] = gpgsig
+    text = to_text(fields).encode()
+    return text

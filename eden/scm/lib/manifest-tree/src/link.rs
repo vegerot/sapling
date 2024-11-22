@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 use std::cmp::Ordering;
@@ -214,8 +214,12 @@ impl DurableEntry {
             for element_result in entry.elements() {
                 let element = element_result.with_context(|| {
                     format!(
-                        "failed to deserialize manifest entry {:?} for ({}, {})",
-                        entry, path, self.hgid
+                        "failed to deserialize manifest entry {:?} for ({}, {}) (store: {:?}, format: {:?})",
+                        entry,
+                        path,
+                        self.hgid,
+                        store.type_name(),
+                        store.format(),
                     )
                 })?;
                 let link = match element.flag {
@@ -302,7 +306,7 @@ impl DirLink {
 
         for (name, link) in self.links(store)? {
             let mut path = self.path.clone();
-            path.push(name.as_ref());
+            path.push(name.as_path_component());
             match link.as_ref() {
                 Leaf(_) => files.push(link.to_file(path).expect("leaf node must be a valid file")),
                 Ephemeral(_) | Durable(_) => dirs.push(

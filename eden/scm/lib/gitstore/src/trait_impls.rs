@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! Implement traits from other crates.
@@ -90,6 +90,11 @@ impl KeyStore for GitStore {
 
     fn refresh(&self) -> anyhow::Result<()> {
         // We don't hold state in memory, so no need to refresh.
+        Ok(())
+    }
+
+    fn flush(&self) -> anyhow::Result<()> {
+        // We don't hold pending state in memory, so no need to flush.
         Ok(())
     }
 

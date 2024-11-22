@@ -11,20 +11,21 @@ use std::time::Duration;
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Error;
+use permission_checker::MononokeIdentity;
+use permission_checker::MononokeIdentitySet;
 use serde::de::Deserializer;
 use serde::de::Error as _;
 use serde::Deserialize;
 
-#[cfg(fbcode_build)]
-pub use crate::facebook::get_region_capacity;
-#[cfg(not(fbcode_build))]
-pub use crate::oss::get_region_capacity;
+use crate::FciMetric;
 use crate::LoadShedLimit;
 use crate::Metric;
 use crate::MononokeRateLimitConfig;
 use crate::RateLimit;
 use crate::RateLimitBody;
+use crate::Scope;
 use crate::StaticSlice;
+use crate::StaticSliceTarget;
 use crate::Target;
 
 impl TryFrom<rate_limiting_config::Target> for Target {
@@ -32,31 +33,42 @@ impl TryFrom<rate_limiting_config::Target> for Target {
 
     fn try_from(value: rate_limiting_config::Target) -> Result<Self, Self::Error> {
         match value {
-            rate_limiting_config::Target::not_target(t) => {
-                Ok(Target::NotTarget(Box::new((*t).try_into()?)))
-            }
-            rate_limiting_config::Target::and_target(t) => Ok(Target::AndTarget(
-                t.into_iter()
-                    .map(|t| t.try_into())
-                    .collect::<Result<Vec<_>, _>>()?,
-            )),
-            rate_limiting_config::Target::or_target(t) => Ok(Target::OrTarget(
-                t.into_iter()
-                    .map(|t| t.try_into())
-                    .collect::<Result<Vec<_>, _>>()?,
-            )),
-            rate_limiting_config::Target::identity(i) => {
-                Ok(Target::Identity(FromStr::from_str(&i)?))
-            }
             rate_limiting_config::Target::static_slice(s) => {
                 let slice_pct = s.slice_pct.try_into()?;
                 Ok(Target::StaticSlice(StaticSlice {
                     slice_pct,
                     nonce: s.nonce,
+                    target: s.target.try_into()?,
                 }))
             }
-            rate_limiting_config::Target::client_main_id(i) => {
+            rate_limiting_config::Target::main_client_id(i) => {
                 Ok(Target::MainClientId(FromStr::from_str(&i)?))
+            }
+            rate_limiting_config::Target::identities(i) => Ok(Target::Identities(
+                i.into_iter()
+                    .map(|s| MononokeIdentity::from_str(&s))
+                    .collect::<Result<MononokeIdentitySet, _>>()?,
+            )),
+            _ => Err(anyhow!(
+                "Invalid target. Are you using deprecated `and`, `or` or `not` targets?"
+            )),
+        }
+    }
+}
+
+impl TryFrom<rate_limiting_config::StaticSliceTarget> for StaticSliceTarget {
+    type Error = Error;
+    fn try_from(value: rate_limiting_config::StaticSliceTarget) -> Result<Self, Self::Error> {
+        match value {
+            rate_limiting_config::StaticSliceTarget::main_client_id(i) => {
+                Ok(StaticSliceTarget::MainClientId(FromStr::from_str(&i)?))
+            }
+            rate_limiting_config::StaticSliceTarget::identities(i) => {
+                Ok(StaticSliceTarget::Identities(
+                    i.into_iter()
+                        .map(|s| MononokeIdentity::from_str(&s))
+                        .collect::<Result<MononokeIdentitySet, _>>()?,
+                ))
             }
             _ => Err(anyhow!("Invalid target")),
         }
@@ -76,17 +88,46 @@ impl TryFrom<rate_limiting_config::RateLimitBody> for RateLimitBody {
     }
 }
 
-impl TryFrom<rate_limiting_config::RegionalMetric> for Metric {
+impl TryFrom<rate_limiting_config::FciMetricKey> for Metric {
     type Error = Error;
 
-    fn try_from(value: rate_limiting_config::RegionalMetric) -> Result<Self, Self::Error> {
+    fn try_from(value: rate_limiting_config::FciMetricKey) -> Result<Self, Self::Error> {
         match value {
-            rate_limiting_config::RegionalMetric::EgressBytes => Ok(Metric::EgressBytes),
-            rate_limiting_config::RegionalMetric::TotalManifests => Ok(Metric::TotalManifests),
-            rate_limiting_config::RegionalMetric::GetpackFiles => Ok(Metric::GetpackFiles),
-            rate_limiting_config::RegionalMetric::Commits => Ok(Metric::Commits),
-            _ => Err(anyhow!("Invalid RegionalMetric")),
+            rate_limiting_config::FciMetricKey::EgressBytes => Ok(Metric::EgressBytes),
+            rate_limiting_config::FciMetricKey::TotalManifests => Ok(Metric::TotalManifests),
+            rate_limiting_config::FciMetricKey::GetpackFiles => Ok(Metric::GetpackFiles),
+            rate_limiting_config::FciMetricKey::Commits => Ok(Metric::Commits),
+            rate_limiting_config::FciMetricKey::CommitsPerAuthor => Ok(Metric::CommitsPerAuthor),
+            _ => Err(anyhow!("Invalid FciMetricKey")),
         }
+    }
+}
+
+impl TryFrom<rate_limiting_config::FciMetricScope> for Scope {
+    type Error = Error;
+
+    fn try_from(value: rate_limiting_config::FciMetricScope) -> Result<Self, Self::Error> {
+        match value {
+            rate_limiting_config::FciMetricScope::Global => Ok(Scope::Global),
+            rate_limiting_config::FciMetricScope::Regional => Ok(Scope::Regional),
+            _ => Err(anyhow!("Invalid Scope")),
+        }
+    }
+}
+
+impl TryFrom<rate_limiting_config::FciMetric> for FciMetric {
+    type Error = Error;
+
+    fn try_from(value: rate_limiting_config::FciMetric) -> Result<Self, Self::Error> {
+        let metric: Metric = value.metric.try_into().context("Invalid metric")?;
+        let window: u64 = value.window.try_into().context("Invalid window")?;
+        let scope: Scope = value.scope.try_into().context("Invalid scope")?;
+
+        Ok(Self {
+            metric,
+            window: Duration::from_secs(window),
+            scope,
+        })
     }
 }
 
@@ -107,12 +148,16 @@ impl TryFrom<rate_limiting_config::RateLimit> for RateLimit {
             .transpose()
             .context("Invalid target")?;
 
-        let metric = value.metric.clone().try_into().context("Invalid metric")?;
+        let fci_metric = value
+            .fci_metric
+            .clone()
+            .try_into()
+            .context("Invalid fci metric")?;
 
         Ok(Self {
             body,
-            metric,
             target,
+            fci_metric,
         })
     }
 }
@@ -156,17 +201,6 @@ impl<'de> Deserialize<'de> for MononokeRateLimitConfig {
     {
         let raw_config = rate_limiting_config::MononokeRateLimits::deserialize(deserializer)?;
 
-        let dc_prefix_capacity = &raw_config.datacenter_prefix_capacity;
-
-        // We scale the limits used for RegionalMetrics according to the amount of capacity in a
-        // region. Calculate the fraction of tasks that this region accounts for.
-        let region_weight = match get_region_capacity(dc_prefix_capacity) {
-            Some(capacity) => {
-                capacity as f64 / dc_prefix_capacity.values().map(|c| *c as f64).sum::<f64>()
-            }
-            None => 1.0,
-        };
-
         let rate_limits = raw_config
             .rate_limits
             .clone()
@@ -183,12 +217,6 @@ impl<'de> Deserialize<'de> for MononokeRateLimitConfig {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| D::Error::custom(format!("{:?}", e)))?;
 
-        let commits_per_author = raw_config
-            .commits_per_author
-            .clone()
-            .try_into()
-            .map_err(|e| D::Error::custom(format!("{:?}", e)))?;
-
         let total_file_changes = raw_config
             .total_file_changes
             .clone()
@@ -197,10 +225,8 @@ impl<'de> Deserialize<'de> for MononokeRateLimitConfig {
             .map_err(|e| D::Error::custom(format!("{:?}", e)))?;
 
         Ok(Self {
-            region_weight,
             rate_limits,
             load_shed_limits,
-            commits_per_author,
             total_file_changes,
         })
     }

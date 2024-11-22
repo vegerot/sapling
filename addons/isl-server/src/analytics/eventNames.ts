@@ -154,7 +154,9 @@ export type TrackEventName =
   | 'SplitSuggestionError'
   | 'SplitOpenFromSplitSuggestion'
   | 'PendingSlocCommand'
-  | 'SplitSuggestionsDismissedForSevenDays';
+  | 'SplitSuggestionsDismissedForSevenDays'
+  | 'WarnAboutRebaseOffWarm'
+  | 'SaplingISLUriHandlerHandle';
 
 export type TrackErrorName =
   | 'BlameError'

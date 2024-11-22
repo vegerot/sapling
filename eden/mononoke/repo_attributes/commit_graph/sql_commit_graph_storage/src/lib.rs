@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -40,11 +41,14 @@ use rendezvous::ConfigurableRendezVousController;
 use rendezvous::RendezVous;
 use rendezvous::RendezVousOptions;
 use rendezvous::RendezVousStats;
+use retry::retry;
+use retry::RetryLogic;
 use sql::Connection;
 use sql::SqlConnections;
 use sql_construct::SqlConstruct;
 use sql_construct::SqlConstructFromMetadataDatabaseConfig;
 use sql_ext::mononoke_queries;
+use sql_ext::should_retry_query;
 use vec1::vec1;
 use vec1::Vec1;
 
@@ -931,6 +935,10 @@ mononoke_queries! {
             LIMIT {limit}"
         )
     }
+
+    read GetCommitCount(id: RepositoryId) -> (u64) {
+        "SELECT COUNT(*) FROM commit_graph_edges WHERE repo_id={id}"
+    }
 }
 
 type FetchedEdgesRow = (
@@ -1368,18 +1376,23 @@ impl SqlCommitGraphStorage {
         )
         .await
     }
-}
 
-#[async_trait]
-impl CommitGraphStorage for SqlCommitGraphStorage {
-    fn repo_id(&self) -> RepositoryId {
-        self.repo_id
+    // Returns the amount of commits in a repo.  Only to be used for ad-hoc internal operations
+    pub async fn fetch_commit_count(&self, ctx: &CoreContext, id: RepositoryId) -> Result<u64> {
+        let conn = self.read_conn(true);
+        let result =
+            GetCommitCount::maybe_traced_query(conn, ctx.client_request_info(), &id).await?;
+        Ok(result.first().map_or(0, |(count,)| *count))
     }
 
-    async fn add_many(&self, ctx: &CoreContext, many_edges: Vec1<ChangesetEdges>) -> Result<usize> {
+    async fn _add_many(
+        &self,
+        ctx: &CoreContext,
+        many_edges: &Vec1<ChangesetEdges>,
+    ) -> Result<usize> {
         // If we're inserting a single changeset, use the faster single insertion method.
         if many_edges.len() == 1 {
-            return Ok(self.add(ctx, many_edges.split_off_first().0).await? as usize);
+            return Ok(self.add(ctx, many_edges.first().clone()).await? as usize);
         }
 
         // We need to be careful because there might be dependencies among the edges
@@ -1420,7 +1433,7 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
         // Part 2 - Collect all changesets we need the ids from, and query them
         // using the same transaction
         let mut need_ids = HashSet::new();
-        for edges in &many_edges {
+        for edges in many_edges {
             need_ids.insert(edges.node.cs_id);
             edges.merge_ancestor.map(|u| need_ids.insert(u.cs_id));
             edges.skip_tree_parent.map(|u| need_ids.insert(u.cs_id));
@@ -1524,6 +1537,30 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
             .increment_counter(PerfCounterType::SqlWrites);
 
         Ok(modified.try_into()?)
+    }
+}
+
+#[async_trait]
+impl CommitGraphStorage for SqlCommitGraphStorage {
+    fn repo_id(&self) -> RepositoryId {
+        self.repo_id
+    }
+
+    async fn add_many(&self, ctx: &CoreContext, many_edges: Vec1<ChangesetEdges>) -> Result<usize> {
+        Ok(retry(
+            None,
+            |_| self._add_many(ctx, &many_edges),
+            should_retry_query,
+            RetryLogic::ExponentialWithJitter {
+                base: Duration::from_secs(1),
+                factor: 1.2,
+                jitter: Duration::from_secs(2),
+            },
+            justknobs::get_as::<usize>("scm/mononoke:commit_graph_storage_sql_retries_num", None)
+                .unwrap_or(1),
+        )
+        .await?
+        .0)
     }
 
     async fn add(&self, ctx: &CoreContext, edges: ChangesetEdges) -> Result<bool> {

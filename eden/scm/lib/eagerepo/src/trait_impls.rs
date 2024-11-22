@@ -1,14 +1,15 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! Implement traits from other crates.
 
 use cas_client::CasClient;
 use cas_client::CasFetchedStats;
+use format_util::commit_text_to_root_tree_id;
 use format_util::git_sha1_serialize;
 use format_util::hg_sha1_serialize;
 use format_util::split_hg_file_metadata;
@@ -169,10 +170,11 @@ impl TreeStore for EagerRepoStore {
 impl ReadRootTreeIds for EagerRepoStore {
     async fn read_root_tree_ids(&self, commits: Vec<HgId>) -> anyhow::Result<Vec<(HgId, HgId)>> {
         let mut res = Vec::new();
+        let format = self.format();
         for commit in &commits {
             let content = self.get_content(*commit)?;
             if let Some(data) = content {
-                let tree_id = HgId::from_hex(&data[0..HgId::hex_len()])?;
+                let tree_id = commit_text_to_root_tree_id(&data, format)?;
                 res.push((commit.clone(), tree_id));
             }
         }
@@ -207,6 +209,19 @@ impl CasClient for EagerRepoStore {
                     )
                 })
                 .collect()))
+        }).boxed()
+    }
+
+    /// Prefetch blobs into the CAS cache
+    /// Returns a stream of (stats, digests_prefetched, digests_not_found) tuples
+    async fn prefetch<'a>(
+        &'a self,
+        digests: &'a [CasDigest],
+        log_name: CasDigestType,
+    ) -> BoxStream<'a, anyhow::Result<(CasFetchedStats, Vec<CasDigest>, Vec<CasDigest>)>> {
+        stream::once(async move {
+            tracing::debug!(target: "cas", "EagerRepoStore prefetching {} {}(s)", digests.len(), log_name);
+            Ok((CasFetchedStats::default(), digests.to_owned(), vec![]))
         }).boxed()
     }
 }

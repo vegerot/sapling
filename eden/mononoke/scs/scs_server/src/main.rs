@@ -12,6 +12,7 @@ use std::io::Write;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Error;
@@ -105,6 +106,9 @@ struct ScsServerArgs {
     /// Thrift queue size
     #[clap(long, default_value = "0")]
     thrift_queue_size: usize,
+    /// Thrift queue timeout in milliseconds
+    #[clap(long, default_value = "500")]
+    thrift_queue_timeout: u64,
     /// Number of Thrift workers
     #[clap(long, default_value = "1000")]
     thrift_workers_num: usize,
@@ -117,6 +121,12 @@ struct ScsServerArgs {
     /// Some long-running requests are processed asynchronously by default. This flag disables that behavior; requests will fail.
     #[clap(long, default_value = "false")]
     disable_async_requests: bool,
+    /// Enable the futures watchdog; this will log stack traces for futures that take longer than 0.5 seconds to complete.
+    #[clap(long, default_value = "false")]
+    enable_futures_watchdog: bool,
+    /// Sets the threshold for watchdog logging of top-level SCS methods. As a rule of thumb this should the same or lower than thrift_queue_timeout.
+    #[clap(long, default_value = "500")]
+    watchdog_method_max_poll: u64,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,6 +304,8 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
             &app.repo_configs().common,
             maybe_factory_group,
             async_requests_queue_client,
+            args.enable_futures_watchdog,
+            args.watchdog_method_max_poll,
         ))?
     };
 
@@ -315,6 +327,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
             let (factory, _processing_handle) = runtime.block_on(async move {
                 ThriftFactoryBuilder::new(fb, "main-thrift-incoming", args.thrift_workers_num)
                     .with_queueing_limit(args.thrift_queue_size)
+                    .with_queueing_timeout(Some(Duration::from_millis(args.thrift_queue_timeout)))
                     .build()
                     .await
                     .expect("Failed to build thrift factory")
@@ -386,6 +399,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
             .await;
         },
         args.shutdown_timeout_args.shutdown_timeout,
+        None,
     )?;
 
     info!(logger, "Exiting...");

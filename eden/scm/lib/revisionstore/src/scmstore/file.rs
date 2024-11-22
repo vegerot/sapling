@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 mod fetch;
@@ -110,6 +110,9 @@ pub struct FileStore {
 
     // The serialization format that the store should use
     pub format: SerializationFormat,
+
+    // The threshold for using CAS cache
+    pub(crate) cas_cache_threshold_bytes: Option<u64>,
 }
 
 impl Drop for FileStore {
@@ -146,6 +149,11 @@ impl FileStore {
         attrs: FileAttributes,
         fetch_mode: FetchMode,
     ) -> FetchResults<StoreFile> {
+        let mut keys = keys.into_iter().peekable();
+        if keys.peek().is_none() {
+            return FetchResults::new(Box::new(std::iter::empty()));
+        }
+
         let (found_tx, found_rx) = unbounded();
         let mut state = FetchState::new(
             keys,
@@ -154,7 +162,25 @@ impl FileStore {
             found_tx,
             self.lfs_threshold_bytes.is_some(),
             fetch_mode,
+            self.cas_cache_threshold_bytes,
         );
+
+        if tracing::enabled!(target: "file_fetches", tracing::Level::TRACE) {
+            let attrs = [
+                attrs.pure_content.then_some("content"),
+                attrs.content_header.then_some("header"),
+                attrs.aux_data.then_some("aux"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+            let mut keys = state.all_keys();
+            keys.sort();
+            let keys: Vec<_> = keys.into_iter().map(|key| key.path.into_string()).collect();
+
+            tracing::trace!(target: "file_fetches", ?attrs, ?keys);
+        }
 
         debug!(
             ?attrs,
@@ -197,7 +223,9 @@ impl FileStore {
             );
             let _enter = span.enter();
 
-            if fetch_local || (fetch_remote && cas_client.is_some()) {
+            let fetch_from_cas = fetch_remote && cas_client.is_some();
+
+            if fetch_local || fetch_from_cas {
                 if let Some(ref aux_cache) = aux_cache {
                     state.fetch_aux_indexedlog(
                         aux_cache,
@@ -207,7 +235,38 @@ impl FileStore {
                 }
             }
 
-            if fetch_local {
+            if fetch_from_cas {
+                // When fetching from CAS, first fetch from local repo to avoid network
+                // request for data that is only available locally (e.g. localy
+                // committed).
+                if fetch_local {
+                    if let Some(ref indexedlog_local) = indexedlog_local {
+                        state.fetch_indexedlog(indexedlog_local, StoreLocation::Local);
+                    }
+
+                    if let Some(ref lfs_local) = lfs_local {
+                        state.fetch_lfs(lfs_local, StoreLocation::Local);
+                    }
+                }
+
+                // Then fetch from CAS since we essentially always expect a hit.
+                if let (Some(cas_client), true) = (&cas_client, fetch_remote) {
+                    state.fetch_cas(cas_client);
+                }
+
+                // Finally fetch from local cache (shouldn't normally get here).
+                if fetch_local {
+                    if let Some(ref indexedlog_cache) = indexedlog_cache {
+                        state.fetch_indexedlog(indexedlog_cache, StoreLocation::Cache);
+                    }
+
+                    if let Some(ref lfs_cache) = lfs_cache {
+                        state.fetch_lfs(lfs_cache, StoreLocation::Cache);
+                    }
+                }
+            } else if fetch_local {
+                // If not using CAS, fetch from cache first then local (hit rate in cache
+                // is typically much higher).
                 if let Some(ref indexedlog_cache) = indexedlog_cache {
                     state.fetch_indexedlog(indexedlog_cache, StoreLocation::Cache);
                 }
@@ -234,10 +293,6 @@ impl FileStore {
             }
 
             if fetch_remote {
-                if let Some(cas_client) = &cas_client {
-                    state.fetch_cas(cas_client);
-                }
-
                 if let Some(ref edenapi) = edenapi {
                     state.fetch_edenapi(
                         edenapi,
@@ -452,6 +507,8 @@ impl FileStore {
             lfs_progress: AggregatingProgressBar::new("fetching", "LFS"),
             flush_on_drop: true,
             format: SerializationFormat::Hg,
+
+            cas_cache_threshold_bytes: None,
         }
     }
 
@@ -501,6 +558,8 @@ impl FileStore {
             // Conservatively flushing on drop here, didn't see perf problems and might be needed by Python
             flush_on_drop: true,
             format: self.format(),
+
+            cas_cache_threshold_bytes: self.cas_cache_threshold_bytes.clone(),
         }
     }
 
@@ -520,7 +579,6 @@ impl FileStore {
 }
 
 impl HgIdDataStore for FileStore {
-    // Fetch the raw content of a single TreeManifest blob
     fn get(&self, key: StoreKey) -> Result<StoreResult<Vec<u8>>> {
         self.metrics.write().api.hg_get.call(0);
         Ok(
@@ -532,7 +590,7 @@ impl HgIdDataStore for FileStore {
                 )
                 .single()?
             {
-                Some(entry) => StoreResult::Found(entry.content.unwrap().hg_content()?.into_vec()),
+                Some(entry) => StoreResult::Found(entry.hg_content()?.into_vec()),
                 None => StoreResult::NotFound(key),
             },
         )
@@ -630,8 +688,6 @@ impl HgIdMutableDeltaStore for FileStore {
     }
 }
 
-// TODO(meyer): Content addressing not supported at all for trees. I could look for HgIds present here and fetch with
-// that if available, but I feel like there's probably something wrong if this is called for trees.
 impl ContentDataStore for FileStore {
     fn blob(&self, key: StoreKey) -> Result<StoreResult<Bytes>> {
         self.metrics.write().api.contentdatastore_blob.call(0);
@@ -644,7 +700,7 @@ impl ContentDataStore for FileStore {
                 )
                 .single()?
             {
-                Some(entry) => StoreResult::Found(entry.content.unwrap().file_content()?),
+                Some(entry) => StoreResult::Found(entry.content.unwrap().file_content()?.0),
                 None => StoreResult::NotFound(key),
             },
         )
@@ -652,22 +708,21 @@ impl ContentDataStore for FileStore {
 
     fn metadata(&self, key: StoreKey) -> Result<StoreResult<ContentMetadata>> {
         self.metrics.write().api.contentdatastore_metadata.call(0);
-        Ok(
-            match self
-                .fetch(
-                    std::iter::once(key.clone()).filter_map(|sk| sk.maybe_into_key()),
-                    FileAttributes::CONTENT,
-                    FetchMode::LocalOnly,
-                )
-                .single()?
-            {
-                Some(StoreFile {
-                    content: Some(LazyFile::Lfs(_blob, pointer)),
-                    ..
-                }) => StoreResult::Found(pointer.into()),
-                Some(_) => StoreResult::NotFound(key),
-                None => StoreResult::NotFound(key),
-            },
-        )
+
+        if let Some(cache) = &self.lfs_cache {
+            let result = cache.metadata(key.clone())?;
+            if matches!(result, StoreResult::Found(_)) {
+                return Ok(result);
+            }
+        }
+
+        if let Some(local) = &self.lfs_local {
+            let result = local.metadata(key.clone())?;
+            if matches!(result, StoreResult::Found(_)) {
+                return Ok(result);
+            }
+        }
+
+        Ok(StoreResult::NotFound(key))
     }
 }

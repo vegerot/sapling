@@ -132,7 +132,7 @@ Verification function
   $ function verify_wc() {
   >   local large_repo_commit
   >   large_repo_commit="$1"
-  >   "$MONONOKE_NEWADMIN" "${CACHE_ARGS[@]}" "${COMMON_ARGS[@]}" --log-level ERROR --mononoke-config-path "$TESTTMP"/mononoke-config cross-repo --source-repo-id="$REPOIDLARGE" --target-repo-id="$REPOIDSMALL1" verify-working-copy $large_repo_commit
+  >   "$MONONOKE_ADMIN" "${CACHE_ARGS[@]}" "${COMMON_ARGS[@]}" --log-level ERROR --mononoke-config-path "$TESTTMP"/mononoke-config cross-repo --source-repo-id="$REPOIDLARGE" --target-repo-id="$REPOIDSMALL1" verify-working-copy $large_repo_commit
   > }
 
 setup hg server repos
@@ -198,9 +198,9 @@ setup hg client repos
   $ init_client large large-hg-client
 
 Setup helpers
-  $ LARGE_MASTER_BONSAI=$(mononoke_newadmin bookmarks --repo-id $REPOIDLARGE get master_bookmark)
-  $ SMALL1_MASTER_BONSAI=$(mononoke_newadmin bookmarks --repo-id $REPOIDSMALL1 get master_bookmark)
-  $ SMALL2_MASTER_BONSAI=$(mononoke_newadmin bookmarks --repo-id $REPOIDSMALL2 get master_bookmark)
+  $ LARGE_MASTER_BONSAI=$(mononoke_admin bookmarks --repo-id $REPOIDLARGE get master_bookmark)
+  $ SMALL1_MASTER_BONSAI=$(mononoke_admin bookmarks --repo-id $REPOIDSMALL1 get master_bookmark)
+  $ SMALL2_MASTER_BONSAI=$(mononoke_admin bookmarks --repo-id $REPOIDSMALL2 get master_bookmark)
 
 start mononoke server
   $ start_and_wait_for_mononoke_server
@@ -242,7 +242,7 @@ At the same time, the tailed repo gets new commits
   $ hg ci -qm "Post-merge commit 1"
   $ hg push --to master_bookmark -q
 -- tailer puts this commit into a large repo
-  $ mononoke_x_repo_sync $REPOIDSMALL2 $REPOIDLARGE once --target-bookmark master_bookmark --commit master_bookmark 2>&1 | grep "synced as"
+  $ mononoke_x_repo_sync $REPOIDSMALL2 $REPOIDLARGE once --target-bookmark master_bookmark -B master_bookmark 2>&1 | grep "synced as"
   * changeset 46d7f49c05a72a305692183a11274a0fbbdc4f8a4b53ca759fb3d257ba54184e synced as 3a9ffb4771519f86b79729a543da084c6a70ff385933aed540e2112a049a0697 * (glob)
 
 Force pushrebase should fail, because it pushes to a shared bookmark

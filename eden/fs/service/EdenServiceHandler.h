@@ -254,6 +254,10 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
   apache::thrift::ResponseAndServerStream<ChangesSinceResult, ChangedFileResult>
   streamChangesSince(std::unique_ptr<StreamChangesSinceParams> params) override;
 
+  void sync_changesSinceV2(
+      ChangesSinceV2Result& result,
+      std::unique_ptr<ChangesSinceV2Params> params) override;
+
   apache::thrift::ResponseAndServerStream<ChangesSinceResult, ChangedFileResult>
   streamSelectedChangesSince(
       std::unique_ptr<StreamSelectedChangesSinceParams> params) override;
@@ -472,15 +476,13 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
       EntryAttributeFlags reqBitmask,
       AttributesRequestScope reqScope,
       SyncBehavior sync,
-      const ObjectFetchContextPtr& fetchContext,
-      bool getEntryAttributesForPath);
+      const ObjectFetchContextPtr& fetchContext);
   ImmediateFuture<EntryAttributes> getEntryAttributesForPath(
       const EdenMount& edenMount,
       EntryAttributeFlags reqBitmask,
       AttributesRequestScope reqScope,
       std::string_view path,
-      const ObjectFetchContextPtr& fetchContext,
-      bool getEntryAttributesForPath);
+      const ObjectFetchContextPtr& fetchContext);
 
   folly::Synchronized<std::unordered_map<uint64_t, ThriftRequestTraceEvent>>
       outstandingThriftRequests_;

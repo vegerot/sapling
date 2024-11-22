@@ -121,53 +121,67 @@ const SM_CLEANUP_TIMEOUT_SECS: u64 = 60;
 
 /// Sync and all of its unsynced ancestors **if the given commit has at least
 /// one synced ancestor**.
-async fn run_in_single_commit_mode(
+async fn run_in_single_sync_mode(
     ctx: &CoreContext,
-    bcs: ChangesetId,
+    bcs_ids: Vec<ChangesetId>,
     commit_syncer: CommitSyncer<Arc<Repo>>,
     scuba_sample: MononokeScubaSampleBuilder,
-    maybe_bookmark: Option<BookmarkKey>,
+    mb_target_bookmark: Option<BookmarkKey>,
     common_bookmarks: HashSet<BookmarkKey>,
     pushrebase_rewrite_dates: PushrebaseRewriteDates,
     new_version: Option<CommitSyncConfigVersion>,
     unsafe_force_rewrite_parent_to_target_bookmark: bool,
 ) -> Result<(), Error> {
+    let mb_target_bookmark = mb_target_bookmark.map(Target);
+
     log_info(
         ctx,
         format!(
-            "Checking if {} is already synced {}->{}",
-            bcs,
-            commit_syncer.repos.get_source_repo().repo_identity().id(),
-            commit_syncer.repos.get_target_repo().repo_identity().id(),
+            "Syncing {} commits and all of their unsynced ancestors",
+            bcs_ids.len()
         ),
     );
-    if commit_syncer
-        .commit_sync_outcome_exists(ctx, Source(bcs))
-        .await?
-    {
-        log_info(ctx, format!("{} is already synced", bcs));
-        return Ok(());
+
+    for bcs_id in bcs_ids {
+        log_info(
+            ctx,
+            format!(
+                "Checking if {} is already synced {}->{}",
+                bcs_id,
+                commit_syncer.repos.get_source_repo().repo_identity().id(),
+                commit_syncer.repos.get_target_repo().repo_identity().id(),
+            ),
+        );
+        if commit_syncer
+            .commit_sync_outcome_exists(ctx, Source(bcs_id))
+            .await?
+        {
+            log_info(ctx, format!("{} is already synced", bcs_id));
+            continue;
+        }
+
+        let res = sync_commit_and_ancestors(
+            ctx,
+            &commit_syncer,
+            None, // from_cs_id,
+            bcs_id,
+            &mb_target_bookmark,
+            &common_bookmarks,
+            scuba_sample.clone(),
+            pushrebase_rewrite_dates,
+            None,
+            &new_version,
+            unsafe_force_rewrite_parent_to_target_bookmark,
+        )
+        .await;
+
+        if res.is_ok() {
+            log_info(ctx, "successful sync");
+        }
+        res.map(|_| ())?
     }
 
-    let res = sync_commit_and_ancestors(
-        ctx,
-        &commit_syncer,
-        None, // from_cs_id,
-        bcs,
-        &maybe_bookmark.map(Target),
-        &common_bookmarks,
-        scuba_sample,
-        pushrebase_rewrite_dates,
-        None,
-        &new_version,
-        unsafe_force_rewrite_parent_to_target_bookmark,
-    )
-    .await;
-
-    if res.is_ok() {
-        log_info(ctx, "successful sync");
-    }
-    res.map(|_| ())
+    Ok(())
 }
 
 async fn run_in_initial_import_mode_for_single_head(
@@ -389,78 +403,75 @@ async fn tail(
 
     if log_entries.is_empty() {
         log_noop_iteration(scuba_sample.clone());
-        Ok(false)
-    } else {
-        scuba_sample.add("queue_size", remaining_entries);
-        log_info(ctx, format!("queue size is {}", remaining_entries));
+        return Ok(false);
+    };
 
-        for entry in log_entries {
-            let entry_id = entry.id;
-            scuba_sample.add("entry_id", u64::from(entry.id));
+    scuba_sample.add("queue_size", remaining_entries);
+    log_info(ctx, format!("queue size is {}", remaining_entries));
 
-            let mut skip = false;
-            if let Some(regex) = maybe_bookmark_regex {
-                if !regex.is_match(entry.bookmark_name.as_str()) {
-                    skip = true;
-                }
-            }
+    for entry in log_entries {
+        let entry_id = entry.id;
+        scuba_sample.add("entry_id", u64::from(entry.id));
 
-            if !skip {
-                let (stats, res) = sync_single_bookmark_update_log(
-                    ctx,
-                    commit_syncer,
-                    entry,
-                    common_pushrebase_bookmarks,
-                    scuba_sample.clone(),
-                    pushrebase_rewrite_dates,
-                )
-                .timed()
-                .await;
+        let skip = maybe_bookmark_regex
+            .as_ref()
+            .map_or(false, |regex| !regex.is_match(entry.bookmark_name.as_str()));
 
-                log_bookmark_update_result(ctx, entry_id, scuba_sample.clone(), &res, stats);
-                let maybe_synced_css = res?;
+        if !skip {
+            let (stats, res) = sync_single_bookmark_update_log(
+                ctx,
+                commit_syncer,
+                entry,
+                common_pushrebase_bookmarks,
+                scuba_sample.clone(),
+                pushrebase_rewrite_dates,
+            )
+            .timed()
+            .await;
 
-                if let SyncResult::Synced(synced_css) = maybe_synced_css {
-                    commit_syncer
-                        .get_target_repo()
-                        .repo_derived_data()
-                        .manager()
-                        .derive_bulk(ctx, &synced_css, None, derived_data_types, None)
-                        .await?;
+            log_bookmark_update_result(ctx, entry_id, scuba_sample.clone(), &res, stats);
+            let maybe_synced_css = res?;
 
-                    maybe_apply_backpressure(
-                        ctx,
-                        backpressure_params,
-                        commit_syncer.get_target_repo(),
-                        scuba_sample.clone(),
-                        sleep_duration,
-                    )
-                    .boxed()
+            if let SyncResult::Synced(synced_css) = maybe_synced_css {
+                commit_syncer
+                    .get_target_repo()
+                    .repo_derived_data()
+                    .manager()
+                    .derive_bulk(ctx, &synced_css, None, derived_data_types, None)
                     .await?;
-                }
-            } else {
-                log_info(
-                    ctx,
-                    format!(
-                        "skipping log entry #{} for {}",
-                        entry.id, entry.bookmark_name,
-                    ),
-                );
-                let mut scuba_sample = scuba_sample.clone();
-                scuba_sample.add("source_bookmark_name", format!("{}", entry.bookmark_name));
-                scuba_sample.add("skipped", true);
-                scuba_sample.log();
-            }
 
-            // Note that updating the counter might fail after successful sync of the commits.
-            // This is expected - next run will try to update the counter again without
-            // re-syncing the commits.
-            target_mutable_counters
-                .set_counter(ctx, &counter, entry_id.try_into()?, None)
+                maybe_apply_backpressure(
+                    ctx,
+                    backpressure_params,
+                    commit_syncer.get_target_repo(),
+                    scuba_sample.clone(),
+                    sleep_duration,
+                )
+                .boxed()
                 .await?;
+            }
+        } else {
+            log_info(
+                ctx,
+                format!(
+                    "skipping log entry #{} for {}",
+                    entry.id, entry.bookmark_name,
+                ),
+            );
+            let mut scuba_sample = scuba_sample.clone();
+            scuba_sample.add("source_bookmark_name", format!("{}", entry.bookmark_name));
+            scuba_sample.add("skipped", true);
+            scuba_sample.log();
         }
-        Ok(true)
+
+        // Note that updating the counter might fail after successful sync of the commits.
+        // This is expected - next run will try to update the counter again without
+        // re-syncing the commits.
+        target_mutable_counters
+            .set_counter(ctx, &counter, entry_id.try_into()?, None)
+            .await?;
     }
+    Ok(true)
 }
 
 async fn maybe_apply_backpressure(

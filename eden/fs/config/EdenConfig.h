@@ -223,6 +223,14 @@ class EdenConfig : private ConfigSettingManager {
       true,
       this};
 
+  /**
+   * How many threads to use for the misc EdenCPUThreadPool.
+   */
+  ConfigSetting<uint8_t> edenCpuPoolNumThreads{
+      "core:eden-cpu-pool-num-threads",
+      12,
+      this};
+
   // [config]
 
   /**
@@ -317,11 +325,6 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> thriftUseSerialExecution{
       "thrift:use-serial-execution",
-      false,
-      this};
-
-  ConfigSetting<bool> shouldFetchTreeMetadata{
-      "thrift:request-tree-metadata",
       false,
       this};
 
@@ -647,6 +650,22 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> allowAppleDouble{"nfs:allow-apple-double", true, this};
 
+  /**
+   * When set to true, NFS mounts are mounted with the "soft" mount option. This
+   * setting applies to all NFS mounts. Behavior when set to false differs
+   * between platforms:
+   *
+   * - macOS: Hard mount with INTR mount option is used.
+   * - Linux: Hard mount is used (no INTR). Intr is unsupported after Linux
+   *          kernel version 2.6.25.
+   *
+   * Note: setting to "true" does not turn off the "INTR" option on macOS.
+   */
+  ConfigSetting<bool> useSoftMounts{
+      "nfs:use-soft-mounts",
+      folly::kIsLinux ? true : false,
+      this};
+
   // [prjfs]
 
   /**
@@ -848,14 +867,6 @@ class EdenConfig : private ConfigSettingManager {
       1024,
       this};
 
-  /**
-   * Whether fetching objects should fall back to hg importer process.
-   */
-  ConfigSetting<bool> hgImporterFetchFallback{
-      "hg:importer-fetch-fallback",
-      true,
-      this};
-
   ConfigSetting<uint32_t> hgActivityBufferSize{
       "hg:activity-buffer-size",
       100,
@@ -910,6 +921,18 @@ class EdenConfig : private ConfigSettingManager {
       "hg:scm-status-cache-max-entires-per-item",
       10000,
       this};
+
+  /**
+   * The number of threads to use for retrying failed Sapling import requests
+   * (per repo).
+   *
+   * Why 8? 1 is materially slower but 24 is no better than 4 in a simple
+   * microbenchmark that touches all files.  8 is better than 4 in the case
+   * that we need to fetch a bunch from the network.
+   * See benchmarks in the doc linked from D5067763.
+   * Note: this number would benefit from occasional revisiting.
+   */
+  ConfigSetting<uint8_t> hgNumRetryThreads{"hg:num-retry-threads", 8, this};
 
   // [backingstore]
 
@@ -1004,6 +1027,18 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<std::chrono::nanoseconds> updateNFSStatsInterval{
       "telemetry:update-nfs-stats-interval",
       std::chrono::seconds{0},
+      this};
+
+  /**
+   * OBC API is used for a few counters on EdenFS to make them enable on
+   * sandcastle. For now, OBC API is only works on prod/Linux. Then this config
+   * should only be set to true on prod/Linux.
+   * TODO: change this config when EngEnv team enable OBC API on macOS and
+   * Windows.
+   */
+  ConfigSetting<bool> enableOBCOnEden{
+      "telemetry:enable-obc-on-eden",
+      false,
       this};
 
   /**
@@ -1500,6 +1535,14 @@ class EdenConfig : private ConfigSettingManager {
       false,
       this};
 
+  /**
+   * Allowed suffix queries for offloading to EdenAPI
+   */
+  ConfigSetting<std::unordered_set<std::string>> allowedSuffixQueries{
+      "glob:allowed-suffix-queries",
+      {},
+      this};
+
   // [doctor]
 
   /**
@@ -1581,16 +1624,6 @@ class EdenConfig : private ConfigSettingManager {
       {},
       this};
 
-  /**
-   * How often to automatically run the eden doctor.
-   * Defaults to 0 for now, so that we can run config based rollouts.
-   * 0 = eden doctor would not run at all.
-   */
-  ConfigSetting<std::chrono::nanoseconds> edenDoctorInterval{
-      "core:eden-doctor-interval",
-      std::chrono::hours(0),
-      this};
-
   // [rage]
   /**
    * The tool that will be used to upload eden rages. Only currently used in the
@@ -1612,6 +1645,15 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<std::optional<std::string>> blake3Key{
       "hash:blake3-key",
       std::nullopt,
+      this};
+
+  // [notify]
+  /**
+   * This is the maximum number of changes that changesSinceV2 will return.
+   */
+  ConfigSetting<uint64_t> notifyMaxNumberOfChanges{
+      "notify:max-num-changes",
+      10000,
       this};
 
 // [facebook]

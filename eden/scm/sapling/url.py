@@ -30,7 +30,6 @@ from . import (
 )
 from .i18n import _
 
-
 # pyre-fixme[11]: Annotation `client` is not defined as a type.
 httplib = util.httplib
 stringio = util.stringio
@@ -110,7 +109,11 @@ class passwordmgr:
 # pyre-fixme[11]: Annotation `proxyhandler` is not defined as a type.
 class proxyhandler(urlreq.proxyhandler):
     def __init__(self, ui):
-        proxyurl = ui.config("http_proxy", "host") or encoding.environ.get("http_proxy")
+        proxyurl = (
+            ui.config("http_proxy", "host")
+            or encoding.environ.get("http_proxy")
+            or encoding.environ.get("https_proxy")
+        )
         # XXX proxyauthinfo = None
 
         if proxyurl:
@@ -121,6 +124,9 @@ class proxyhandler(urlreq.proxyhandler):
             if not proxy.user:
                 proxy.user = ui.config("http_proxy", "user")
                 proxy.passwd = ui.config("http_proxy", "passwd")
+
+            if port := ui.config("http_proxy", "port"):
+                proxy.port = port
 
             # see if we should use a proxy for this url
             no_list = ["localhost", "127.0.0.1"]
@@ -138,25 +144,41 @@ class proxyhandler(urlreq.proxyhandler):
             else:
                 self.no_list = no_list
 
+            self._proxyurl = proxy
+
             proxyurl = str(proxy)
             proxies = {"http": proxyurl, "https": proxyurl}
             ui.debug("proxying through http://%s:%s\n" % (proxy.host, proxy.port))
         else:
             proxies = {}
+            self._proxyurl = None
 
         urlreq.proxyhandler.__init__(self, proxies)
         self.ui = ui
 
-    def proxy_open(self, req, proxy, type_):
-        host = urllibcompat.gethost(req).split(":")[0]
+    def proxy_url(self, host):
+        """Return util.url that should be used as proxy for host, if any.
+        Respects Sapling configuration and proxy related env vars."""
+        if not self._proxyurl:
+            return None
+
+        # "*.foo.com", ".foo.com", and "foo.com" are all equivalent.
         for e in self.no_list:
-            if host == e:
-                return None
-            if e.startswith("*.") and host.endswith(e[2:]):
-                return None
-            if e.startswith(".") and host.endswith(e[1:]):
+            # Normalize e to not start with ".*" or ".".
+            if e.startswith("*."):
+                e = e[2:]
+            elif e.startswith("."):
+                e = e[1:]
+
+            if host == e or host.endswith("." + e):
                 return None
 
+        return self._proxyurl
+
+    def proxy_open(self, req, proxy, type_):
+        host = urllibcompat.gethost(req).split(":")[0]
+        if self.proxy_url(host) is None:
+            return None
         return urlreq.proxyhandler.proxy_open(self, req, proxy, type_)
 
 
@@ -484,7 +506,7 @@ class cookiehandler(urlreq.basehandler):
             self.cookiejar = cookiejar
         except util.cookielib.LoadError as e:
             ui.warn(
-                _("(error loading cookie file %s: %s; continuing without " "cookies)\n")
+                _("(error loading cookie file %s: %s; continuing without cookies)\n")
                 % (cookiefile, str(e))
             )
 

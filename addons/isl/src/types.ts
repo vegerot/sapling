@@ -85,13 +85,49 @@ export type DiffCommentReaction = {
     | 'THUMBS_UP';
 };
 
-export enum SuggestedChangeStatus {
+export type InternalCommitMessageFields = InternalTypes['InternalCommitMessageFields'];
+
+export enum CodePatchSuggestionStatus {
   Accepted = 'ACCEPTED',
-  Active = 'ACTIVE',
-  ClosedDeprecated = 'CLOSED_DEPRECATED',
-  Draft = 'DRAFT',
-  Rejected = 'REJECTED',
+  Declined = 'DECLINED',
+  Unset = 'UNSET',
 }
+
+export enum SuggestedChangeType {
+  HUMAN_SUGGESTION = 'HUMAN_SUGGESTION',
+  METAMATE_SUGGESTION = 'METAMATE_SUGGESTION',
+  CI_SIGNAL = 'CI_SIGNAL',
+}
+
+export enum ArchivedStateType {
+  ARCHIVED = 'ARCHIVED',
+  NOT_ARCHIVED = 'NOT_ARCHIVED',
+}
+
+export enum ArchivedReasonType {
+  APPLIED_IN_EDITOR = 'APPLIED_IN_EDITOR',
+  APPLIED_MERGED = 'APPLIED_MERGED',
+  APPLIED_STACKED_DIFF = 'APPLIED_STACKED_DIFF',
+  AUTHOR_DISCARDED = 'AUTHOR_DISCARDED',
+  STALE_DIFF_CLOSED = 'STALE_DIFF_CLOSED',
+  STALE_FILE_CHANGED = 'STALE_FILE_CHANGED',
+}
+
+export type SuggestedChange = {
+  id?: string;
+  type?: SuggestedChangeType;
+  codePatchSuggestionID?: string;
+  status?: CodePatchSuggestionStatus;
+  archivedState?: ArchivedStateType;
+  archivedReason?: ArchivedReasonType;
+  commitHashBefore?: string;
+  patch?: ParsedDiff;
+  oldPath?: string;
+  currentPath?: string;
+  oldContent?: string;
+  newContent?: string;
+  oldLineNumber?: number;
+};
 
 export type DiffComment = {
   id?: string;
@@ -107,12 +143,9 @@ export type DiffComment = {
   line?: number;
   reactions: Array<DiffCommentReaction>;
   /** Suggestion for how to change the code, as a patch */
-  suggestedChange?: {
-    id?: string;
-    status?: SuggestedChangeStatus;
-    patch?: ParsedDiff;
-  };
-  codePatchSuggestedChange?: ParsedDiff;
+  suggestedChange?: SuggestedChange;
+  // codePatchSuggestedChange?: SuggestedChange;
+  // signalSuggestedChange?: SuggestedChange;
   replies: Array<DiffComment>;
   /** If this comment has been resolved. true => "resolved", false => "unresolved", null => the comment is not resolvable, don't show any UI for it */
   isResolved?: boolean;
@@ -586,6 +619,11 @@ export type Diagnostic = {
   code?: string;
 };
 
+export type DiagnosticAllowlistValue =
+  | {block: Set<string>; allow?: undefined}
+  | {allow: Set<string>; block?: undefined};
+export type DiagnosticAllowlist = Map<'warning' | 'error', Map<string, DiagnosticAllowlistValue>>;
+
 /* protocol */
 
 /**
@@ -679,6 +717,7 @@ export const allConfigNames = [
   'isl.download-commit-rebase-type',
   'isl.experimental-features',
   'isl.hold-off-refresh-ms',
+  'isl.sl-progress-enabled',
   'isl.use-sl-graphql',
   'github.preferred_submit_command',
   'isl.open-file-cmd',
@@ -740,6 +779,7 @@ export type LocalStorageName =
   | 'isl.auto-resolve-before-continue'
   | 'isl.warn-about-diagnostics'
   | 'isl.hide-non-blocking-diagnostics'
+  | 'isl.rebase-off-warm-warning-enabled'
   // These keys are prefixes, with further dynamic keys appended afterwards
   | 'isl.edited-commit-messages:';
 
@@ -799,6 +839,7 @@ export type ClientToServerMessage =
   | {type: 'unsubscribe'; kind: SubscriptionKind; subscriptionID: string}
   | {type: 'exportStack'; revs: string; assumeTracked?: Array<string>}
   | {type: 'importStack'; stack: ImportStack}
+  | {type: 'fetchQeFlag'; name: string}
   | {type: 'fetchFeatureFlag'; name: string}
   | {type: 'fetchInternalUserInfo'}
   | {
@@ -806,7 +847,8 @@ export type ClientToServerMessage =
       id: string;
       comparison: Comparison;
       fieldName: string;
-      title: string;
+      latestFields: InternalCommitMessageFields;
+      suggestionId: string;
     }
   | {type: 'gotUiState'; state: string}
   | CodeReviewProviderSpecificClientToServerMessages
@@ -892,6 +934,7 @@ export type ServerToClientMessage =
       error: string | undefined;
     }
   | {type: 'importedStack'; imported: ImportedStack; error: string | undefined}
+  | {type: 'fetchedQeFlag'; name: string; passes: boolean}
   | {type: 'fetchedFeatureFlag'; name: string; passes: boolean}
   | {type: 'fetchedInternalUserInfo'; info: Serializable}
   | {

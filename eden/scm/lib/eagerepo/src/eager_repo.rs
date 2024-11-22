@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 use std::collections::BTreeMap;
@@ -34,6 +34,7 @@ use futures::lock::Mutex;
 use futures::lock::MutexGuard;
 use manifest_tree::FileType;
 use manifest_tree::Flag;
+use manifest_tree::PathComponentBuf;
 use manifest_tree::TreeEntry;
 use manifest_tree::TreeManifest;
 use metalog::CommitOptions;
@@ -55,7 +56,6 @@ use storemodel::types::AugmentedTreeWithDigest;
 use storemodel::types::CasDigest;
 use storemodel::types::HgId;
 use storemodel::types::Parents;
-use storemodel::types::RepoPathBuf;
 use storemodel::FileAuxData;
 use storemodel::ReadRootTreeIds;
 use storemodel::SerializationFormat;
@@ -192,6 +192,10 @@ impl EagerRepoStore {
     /// Read CAS data for digest.
     #[tracing::instrument(skip(self), level = "trace")]
     pub fn get_cas_blob(&self, digest: CasDigest) -> Result<Option<Bytes>> {
+        ::fail::fail_point!("eagerepo::cas", |_| {
+            Err(anyhow!("stub eagerepo CAS error").into())
+        });
+
         let Some(pointer_data) = self.get_sha1_blob(digest_id(digest))? else {
             tracing::trace!("no CAS pointer data");
             return Ok(None);
@@ -504,7 +508,7 @@ impl EagerRepo {
                 let sapling_manifest = sapling_manifest.unwrap();
                 let (parents, data) = Self::extract_parents_from_tree_data_hg(sapling_manifest)?;
                 let tree_entry = manifest_tree::TreeEntry(data, SerializationFormat::Hg);
-                let mut entries: Vec<(RepoPathBuf, AugmentedTreeEntry)> = Vec::new();
+                let mut entries: Vec<(PathComponentBuf, AugmentedTreeEntry)> = Vec::new();
                 for child in tree_entry.elements() {
                     let child = child?;
                     let hgid = child.hgid;
@@ -555,9 +559,7 @@ impl EagerRepo {
                             })
                         }
                     };
-                    let path = RepoPathBuf::from_string(child.component.to_string())
-                        .map_err(anyhow::Error::from)?;
-                    entries.push((path, entry));
+                    entries.push((child.component, entry));
                 }
 
                 let aug_tree = AugmentedTree {

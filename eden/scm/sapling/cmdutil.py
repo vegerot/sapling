@@ -30,6 +30,7 @@ from sapling import tracing
 from . import (
     bookmarks,
     changelog,
+    context,
     copies,
     crecord as crecordmod,
     dagop,
@@ -45,6 +46,7 @@ from . import (
     json,
     match as matchmod,
     mdiff,
+    merge as mergemod,
     mergeutil,
     mutation,
     patch,
@@ -346,8 +348,6 @@ def recordfilter(ui, originalhunks, operation=None):
 
 
 def dorecord(ui, repo, commitfunc, cmdsuggest, backupall, filterfn, *pats, **opts):
-    from . import merge as mergemod
-
     if not ui.interactive():
         if cmdsuggest:
             msg = _("running non-interactively, use %s instead") % cmdsuggest
@@ -379,7 +379,7 @@ def dorecord(ui, repo, commitfunc, cmdsuggest, backupall, filterfn, *pats, **opt
         merge = len(wctx.parents()) > 1
         if merge:
             raise error.Abort(
-                _("cannot partially commit a merge " '(use "@prog@ commit" instead)')
+                _('cannot partially commit a merge (use "@prog@ commit" instead)')
             )
 
         def fail(f, msg):
@@ -706,9 +706,6 @@ def _commentlines(raw):
 
 
 def _conflictsmsg(repo):
-    # avoid merge cycle
-    from . import merge as mergemod
-
     mergestate = mergemod.mergestate.read(repo)
     if not mergestate.active():
         return
@@ -986,9 +983,7 @@ def logmessage(repo, opts):
     logfile = opts.get("logfile")
 
     if message and logfile:
-        raise error.Abort(
-            _("options --message and --logfile are mutually " "exclusive")
-        )
+        raise error.Abort(_("options --message and --logfile are mutually exclusive"))
     if not message and logfile:
         try:
             if isstdiofilename(logfile):
@@ -1212,7 +1207,7 @@ def openrevlog(repo, cmd, file_, opts):
         elif dir:
             if "treemanifest" not in repo.requirements:
                 raise error.Abort(
-                    _("--dir can only be used on repos with " "treemanifest enabled")
+                    _("--dir can only be used on repos with treemanifest enabled")
                 )
             dirlog = repo.manifestlog._revlog.dirlog(dir)
             if len(dirlog):
@@ -1275,8 +1270,7 @@ def copy(ui, repo, pats, opts, rename=False):
                     ui.warn(_("%s: not copying - file is not managed\n") % rel)
                 if exact and state == "r":
                     ui.warn(
-                        _("%s: not copying - file has been marked for" " remove\n")
-                        % rel
+                        _("%s: not copying - file has been marked for remove\n") % rel
                     )
                 continue
             # abs: hgsep
@@ -1503,7 +1497,7 @@ def copy(ui, repo, pats, opts, rename=False):
     if not destdirexists:
         if len(pats) > 1 or matchmod.patkind(pats[0]):
             raise error.Abort(
-                _("with multiple sources, destination must be an " "existing directory")
+                _("with multiple sources, destination must be an existing directory")
             )
         if util.endswithsep(dest):
             raise error.Abort(_("destination %s is not a directory") % dest)
@@ -1588,9 +1582,6 @@ def amend_copy(repo, to_amend, rename, force):
                         hint=_("use --force to skip similarity check"),
                     )
 
-        # Actual amend
-        from . import context
-
         mctx = context.memctx.mirrorformutation(ctx, "amend")
         for src_path, dst_path in to_amend:
             mctx[dst_path] = context.overlayfilectx(
@@ -1656,8 +1647,6 @@ def tryimportone(ui, repo, hunk, parents, opts, msgs, updatefunc):
     :updatefunc: a function that update a repo to a given node
                  updatefunc(<repo>, <node>)
     """
-    # avoid cycle context -> cmdutil
-    from . import context
 
     extractdata = patch.extract(ui, hunk)
     tmpname = extractdata.get("filename")
@@ -2592,8 +2581,7 @@ def walkfilerevs(repo, match, follow, revs, fncache):
             if follow:
                 if filename not in pctx:
                     raise error.Abort(
-                        _("cannot follow file not in parent " 'revision: "%s"')
-                        % filename
+                        _('cannot follow file not in parent revision: "%s"') % filename
                     )
                 yield filename, pctx[filename].filenode()
             else:
@@ -2743,7 +2731,7 @@ def walkchangerevs(repo, match, opts, prepare):
 
         if follow:
             raise error.Abort(
-                _("can only follow copies/renames for explicit " "filenames")
+                _("can only follow copies/renames for explicit filenames")
             )
 
         # The slow path checks files modified in every changeset.
@@ -3058,7 +3046,7 @@ def _makelogrevset(repo, pats, opts, revs):
                                 """did you mean "@prog@ log -r '%s'", or "@prog@ log -r '%s' -f" to follow history?"""
                             ) % (pats[0], pats[0])
                         raise error.Abort(
-                            _("cannot follow file not in parent " 'revision: "%s"') % f,
+                            _('cannot follow file not in parent revision: "%s"') % f,
                             hint=hint,
                         )
 
@@ -3296,7 +3284,7 @@ def getloglinerangerevs(repo, userrevs, opts):
     for fname, (fromline, toline) in _parselinerangelogopt(repo, opts):
         if fname not in wctx:
             raise error.Abort(
-                _("cannot follow file not in parent " 'revision: "%s"') % fname
+                _('cannot follow file not in parent revision: "%s"') % fname
             )
         fctx = wctx.filectx(fname)
         for fctx, linerange in dagop.blockancestors(fctx, fromline, toline):
@@ -3625,7 +3613,7 @@ def forget(ui, repo, match, prefix, explicitonly):
                         if repo.dirstate.normalize(f) in repo.dirstate:
                             continue
                         ui.warn(
-                            _("not removing %s: " "file is already untracked\n")
+                            _("not removing %s: file is already untracked\n")
                             % match.rel(f)
                         )
                     bad.append(f)
@@ -3838,22 +3826,6 @@ def commit(ui, repo, commitfunc, pats, opts):
         return commitfunc(ui, repo, message, matcher, opts)
 
 
-def samefile(f, ctx1, ctx2, m1=None, m2=None):
-    if m1 is None:
-        m1 = ctx1.manifest()
-    if m2 is None:
-        m2 = ctx2.manifest()
-    if f in m1:
-        a = ctx1.filectx(f)
-        if f in m2:
-            b = ctx2.filectx(f)
-            return not a.cmp(b) and a.flags() == b.flags()
-        else:
-            return False
-    else:
-        return f not in m2
-
-
 def amend(ui, repo, old, extra, pats, opts):
     wctx = repo[None]
     matcher = scmutil.match(wctx, pats, opts)
@@ -3868,9 +3840,6 @@ def amend(ui, repo, old, extra, pats, opts):
 
 
 def _amend(ui, repo, wctx, old, extra, opts, matcher):
-    # avoid cycle context -> subrepo -> cmdutil
-    from . import context
-
     ui.note(_("amending changeset %s\n") % old)
     base = old.p1()
 
@@ -3899,12 +3868,8 @@ def _amend(ui, repo, wctx, old, extra, opts, matcher):
         # Parse the date to allow comparison between date and old.date()
         date = util.parsedate(date)
 
-        if len(old.parents()) > 1:
-            # ctx.files() isn't reliable for merges, so fall back to the
-            # slower repo.status() method
-            files = set([fn for st in repo.status(base, old)[:3] for fn in st])
-        else:
-            files = set(old.files())
+        ms = mergemod.mergestate.read(repo)
+        mergeutil.checkunresolved(ms)
 
         # add/remove the files to the working copy if the "addremove" option
         # was specified.
@@ -3913,11 +3878,10 @@ def _amend(ui, repo, wctx, old, extra, opts, matcher):
                 _("failed to mark all new/missing files as added/removed")
             )
 
-        # avoid cycle (TODO: should be removed in default branch)
-        from . import merge as mergemod
-
-        ms = mergemod.mergestate.read(repo)
-        mergeutil.checkunresolved(ms)
+        # Compute status from base through wctx. This will naturally prune files in `old`
+        # which were undone in wctx (e.g. `old` added file "foo" and wctx removes/renames
+        # it, or `old` modified file "foo" and wctx reverts it).
+        files = [fn for st in base.status(wctx, wcmatch=matcher)[:4] for fn in st]
 
         status = repo.status(match=matcher)
         filestoamend = set(status.modified + status.added + status.removed)
@@ -3928,24 +3892,6 @@ def _amend(ui, repo, wctx, old, extra, opts, matcher):
             copied = copies.pathcopies(base, wctx, matcher)
             if old.p2:
                 copied.update(copies.pathcopies(old.p2(), wctx, matcher))
-
-            # Prune files which were reverted by the updates: if old
-            # introduced file X and the file was renamed in the working
-            # copy, then those two files are the same and
-            # we can discard X from our list of files. Likewise if X
-            # was removed, it's no longer relevant. If X is missing (aka
-            # deleted), old X must be preserved.
-            with perftrace.trace("Prune files reverted by amend"):
-                statusmanifest = wctx.buildstatusmanifest(status)
-                for f in filestoamend:
-                    if (
-                        not samefile(f, wctx, base, m1=statusmanifest)
-                        or f in status.deleted
-                    ):
-                        files.add(f)
-                    else:
-                        files.discard(f)
-                files = list(files)
 
             def filectxfn(repo, ctx_, path):
                 try:
@@ -4130,7 +4076,22 @@ def add_summary_footer(
     i am a summary footer
     <BLANKLINE>
     Test Plan: I am a test plan
+
+    >>> print(add_summary_footer(
+    ...   ui,
+    ...   "this is a title\\n\\nTest Plan: I am a test plan",
+    ...   "i am a summary footer"
+    ... ))
+    this is a title
+    <BLANKLINE>
+    i am a summary footer
+    <BLANKLINE>
+    Test Plan: I am a test plan
     """
+
+    def get_lines(field_content_list):
+        return [line for (_field, content) in field_content_list for line in content]
+
     if not summary_footer:
         return commit_msg
 
@@ -4147,6 +4108,12 @@ def add_summary_footer(
         if field == summary_field:
             summary_index, summary_content = i, content
             break
+        elif field is not None:
+            summary_index = i - 1
+            if summary_index >= 0:
+                summary_content = field_content_list[summary_index][1]
+            else:
+                summary_content = [""]
 
     if summary_content[-1]:
         summary_content.append("")
@@ -4154,9 +4121,12 @@ def add_summary_footer(
     if summary_index < len(field_content_list) - 1:
         summary_content.append("")
 
-    return "\n".join(
-        line for (_field, content) in field_content_list for line in content
+    new_lines = (
+        get_lines(field_content_list[:summary_index])
+        + summary_content
+        + get_lines(field_content_list[summary_index + 1 :])
     )
+    return "\n".join(new_lines)
 
 
 def extract_summary(ui, message: str) -> str:
@@ -4192,6 +4162,12 @@ def extract_summary(ui, message: str) -> str:
     this is a title
     <BLANKLINE>
     Summary: I am a summary
+
+    >>> print(extract_summary(
+    ...   ui,
+    ...   "this is a title\\n\\nTest Plan: I am a test plan",
+    ... ))
+    this is a title
     """
     commit_fields = set(ui.configlist("committemplate", "commit-message-fields"))
     summary_field = ui.config("committemplate", "summary-field")
@@ -4200,8 +4176,11 @@ def extract_summary(ui, message: str) -> str:
 
     new_lines = []
     for field, content in field_content_list:
-        new_lines.extend(content)
-        if field == summary_field:
+        if field is None:
+            new_lines.extend(content)
+        else:
+            if field == summary_field:
+                new_lines.extend(content)
             break
     while new_lines and not new_lines[-1]:
         new_lines.pop()

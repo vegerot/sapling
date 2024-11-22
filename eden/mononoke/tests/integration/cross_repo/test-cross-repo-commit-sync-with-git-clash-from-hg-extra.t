@@ -93,7 +93,7 @@ Create small repo commits
   
   
   
-  Running mononoke_newadmin to verify mapping
+  Running mononoke_admin to verify mapping
   
   RewrittenAs([(ChangesetId(Blake2(738630e43445144e9f5ddbe1869730cfbaf8ff6bf95b25b8410cb35ca92f25c7)), CommitSyncConfigVersion("INITIAL_IMPORT_SYNC_CONFIG"))])
   
@@ -133,13 +133,13 @@ Create small repo commits
   │   smallrepofolder1/new_file.txt |  1 +
   │   1 files changed, 1 insertions(+), 0 deletions(-)
   │
-  o  5d44cb1dbffb change large repo file AGAIN
-  │   large_repo_file.txt |  2 +-
-  │   1 files changed, 1 insertions(+), 1 deletions(-)
-  │
   │ o  7faf677d5367 change small repo from large repo
-  ├─╯   smallrepofolder1/new_file.txt |  1 +
-  │     1 files changed, 1 insertions(+), 0 deletions(-)
+  │ │   smallrepofolder1/new_file.txt |  1 +
+  │ │   1 files changed, 1 insertions(+), 0 deletions(-)
+  │ │
+  o │  5d44cb1dbffb change large repo file AGAIN
+  ├─╯   large_repo_file.txt |  2 +-
+  │     1 files changed, 1 insertions(+), 1 deletions(-)
   │
   o  72e1f4df4120 change large repo file
   │   large_repo_file.txt |  1 +
@@ -174,19 +174,19 @@ Create small repo commits
 -- Backup all commits to commit cloud
   $ hg cloud backup -q
 
-  $ ORIG_BONSAI_HASH=$(mononoke_newadmin convert -R $LARGE_REPO_NAME -f hg -t bonsai $ORIGINAL_HG_COMMIT)
+  $ ORIG_BONSAI_HASH=$(mononoke_admin convert -R $LARGE_REPO_NAME -f hg -t bonsai $ORIGINAL_HG_COMMIT)
   $ echo "ORIG_BONSAI_HASH: $ORIG_BONSAI_HASH"
   ORIG_BONSAI_HASH: 45b0a006e9f7012884ec6d8799e45eeaac7583f4b4a0cd06eec06e839b7748a7
 
-  $ REBASED_BONSAI_HASH=$(mononoke_newadmin convert -R $LARGE_REPO_NAME -f hg -t bonsai $REBASED_HG_COMMIT)
+  $ REBASED_BONSAI_HASH=$(mononoke_admin convert -R $LARGE_REPO_NAME -f hg -t bonsai $REBASED_HG_COMMIT)
   $ echo "REBASED_BONSAI_HASH: $REBASED_BONSAI_HASH"
   REBASED_BONSAI_HASH: 3bac370e50ea100cc1eb8b0559209335d7069c7c57235bc9dad51fdf453d76a1
 
 
-  $ mononoke_newadmin blobstore -R $LARGE_REPO_NAME fetch \
+  $ mononoke_admin blobstore -R $LARGE_REPO_NAME fetch \
   >   "changeset.blake2.$ORIG_BONSAI_HASH" > $TESTTMP/large_repo_original_bonsai
 
-  $ mononoke_newadmin blobstore -R $LARGE_REPO_NAME fetch \
+  $ mononoke_admin blobstore -R $LARGE_REPO_NAME fetch \
   >   "changeset.blake2.$REBASED_BONSAI_HASH" > $TESTTMP/large_repo_rebased_bonsai
 
 
@@ -197,32 +197,56 @@ Create small repo commits
   >   rg '.+"translated": \{"Bonsai": bin\("(\w+)"\)\}\}\]' -or '$1')
 
   $ echo "SMALL_REPO_COMMIT_A: $SMALL_REPO_COMMIT_A"
-  SMALL_REPO_COMMIT_A: 86097c1de278a997c434c78f0227e0be9f307ac3c66d39a7a167435d1a4e292c
+  SMALL_REPO_COMMIT_A: 6405c11e11523c644532ffce53c95793f2051de3ecd52115e6a74a81e4cd4d7e
 
   $ SMALL_REPO_COMMIT_B=$(hg debugapi --sort -e committranslateids \
   >   -i "[{'Hg': '$REBASED_HG_COMMIT'}]" -i "'Bonsai'" -i None -i "'$SUBMODULE_REPO_NAME'" | \
   >   rg '.+"translated": \{"Bonsai": bin\("(\w+)"\)\}\}\]' -or '$1')
 
   $ echo "SMALL_REPO_COMMIT_B: $SMALL_REPO_COMMIT_B"
-  SMALL_REPO_COMMIT_B: 86097c1de278a997c434c78f0227e0be9f307ac3c66d39a7a167435d1a4e292c
+  SMALL_REPO_COMMIT_B: 6405c11e11523c644532ffce53c95793f2051de3ecd52115e6a74a81e4cd4d7e
 
 
 -- Now fetch both changeset blobs
 
-  $ mononoke_newadmin blobstore -R $SUBMODULE_REPO_NAME fetch \
+  $ mononoke_admin blobstore -R $SUBMODULE_REPO_NAME fetch \
   >   "changeset.blake2.$SMALL_REPO_COMMIT_A" > $TESTTMP/commit_a_bonsai
 
-  $ mononoke_newadmin blobstore -R $SUBMODULE_REPO_NAME fetch \
+  $ mononoke_admin blobstore -R $SUBMODULE_REPO_NAME fetch \
   >   "changeset.blake2.$SMALL_REPO_COMMIT_B" > $TESTTMP/commit_b_bonsai
 
 -- To debug the raw bonsais, uncomment the line below
 # $ diff -y -t -T $TESTTMP/commit_a_bonsai $TESTTMP/commit_b_bonsai
 
 
+# Examine committer and committer date, which are not set in the large repo, but
+# should be set on the small git repo.
+  $ mononoke_admin fetch -R $LARGE_REPO_NAME -i $REBASED_HG_COMMIT \
+  > --json > $TESTTMP/commit_b_info_large_repo.json
+  $ jq '{author: .author, author_date: .author_date, committer: .committer, committer_date: .committer_date}' \
+  > $TESTTMP/commit_b_info_large_repo.json
+  {
+    "author": "test",
+    "author_date": "1970-01-01T00:00:00-00:00",
+    "committer": null,
+    "committer_date": null
+  }
+
+  $ mononoke_admin fetch -R $SUBMODULE_REPO_NAME -i $SMALL_REPO_COMMIT_B \
+  > --json > $TESTTMP/commit_b_info_small_repo.json
+  $ jq '{author: .author, author_date: .author_date, committer: .committer, committer_date: .committer_date}' \
+  > $TESTTMP/commit_b_info_small_repo.json
+  {
+    "author": "test",
+    "author_date": "1970-01-01T00:00:00-00:00",
+    "committer": "test",
+    "committer_date": "1970-01-01T00:00:00-00:00"
+  }
+
 -- Derive git commit for commit A
-  $ mononoke_newadmin derived-data -R $SUBMODULE_REPO_NAME \
+  $ mononoke_admin derived-data -R $SUBMODULE_REPO_NAME \
   >   derive -T git_commits -i "$SMALL_REPO_COMMIT_A"
 
 -- Derivation of commit B will succeed because hg extra is stripped
-  $ mononoke_newadmin derived-data -R $SUBMODULE_REPO_NAME \
+  $ mononoke_admin derived-data -R $SUBMODULE_REPO_NAME \
   >   derive -T git_commits -i "$SMALL_REPO_COMMIT_B"

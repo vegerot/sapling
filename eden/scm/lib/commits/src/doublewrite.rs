@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 use std::io;
@@ -34,6 +34,7 @@ use crate::StripCommits;
 pub struct DoubleWriteCommits {
     revlog: RevlogCommits,
     commits: OnDiskCommits,
+    format: SerializationFormat,
 }
 
 impl DoubleWriteCommits {
@@ -45,7 +46,11 @@ impl DoubleWriteCommits {
     ) -> Result<Self> {
         let commits = OnDiskCommits::new(dag_path, commits_path, format)?;
         let revlog = RevlogCommits::new(revlog_dir, format)?;
-        Ok(Self { revlog, commits })
+        Ok(Self {
+            revlog,
+            commits,
+            format,
+        })
     }
 }
 
@@ -85,6 +90,10 @@ impl ReadCommitText for DoubleWriteCommits {
 
     fn to_dyn_read_commit_text(&self) -> Arc<dyn ReadCommitText + Send + Sync> {
         self.revlog.to_dyn_read_commit_text()
+    }
+
+    fn format(&self) -> SerializationFormat {
+        self.format
     }
 }
 

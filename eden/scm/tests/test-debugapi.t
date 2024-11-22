@@ -85,31 +85,6 @@ Test APIs:
    {"hgid": bin("112478962961147124edd43549aedd1a335e44bf"),
     "known": {"Ok": True}}]
 
-  $ hg debugapi -e clonedata
-  {"idmap": {1: bin("112478962961147124edd43549aedd1a335e44bf")},
-   "flat_segments": {"segments": [{"low": 0,
-                                   "high": 1,
-                                   "parents": []}]}}
-
-  $ hg debugapi -e pullfastforwardmaster -i "b'$A'" -i "b'$B'"
-  {"idmap": {0: bin("426bada5c67598ca65036d57d9e4b64b0c1ce7a0"),
-             1: bin("112478962961147124edd43549aedd1a335e44bf")},
-   "flat_segments": {"segments": [{"low": 1,
-                                   "high": 1,
-                                   "parents": [0]}]}}
-
-  $ hg debugapi -e pulllazy -i "[b'$A']" -i "[b'$B']"
-  {"idmap": {0: bin("426bada5c67598ca65036d57d9e4b64b0c1ce7a0"),
-             1: bin("112478962961147124edd43549aedd1a335e44bf")},
-   "flat_segments": {"segments": [{"low": 1,
-                                   "high": 1,
-                                   "parents": [0]}]}}
-  $ hg debugapi -e pulllazy -i "[]" -i "[b'$A']"
-  {"idmap": {0: bin("426bada5c67598ca65036d57d9e4b64b0c1ce7a0")},
-   "flat_segments": {"segments": [{"low": 0,
-                                   "high": 0,
-                                   "parents": []}]}}
-
   $ hg debugapi -e trees  -i '[("", "41b34f08c1356f6ad068e9ab9b43d984245111aa")]' -i '{"manifest_blob": True, "parents": True, "child_metadata": True, "augmented_trees":True }'
   [{"key": {"node": bin("41b34f08c1356f6ad068e9ab9b43d984245111aa"),
             "path": ""},
@@ -138,7 +113,7 @@ Test APIs:
                                                     "content_sha1": bin("6dcd4ce23d88e2ee9568ba546c007c63d9131c1b"),
                                                     "content_blake3": bin("5ad3ba58a716e5fc04296ac9af7a1420f726b401fdf16d270beb5b6b30bc0cda"),
                                                     "content_sha256": bin("0000000000000000000000000000000000000000000000000000000000000000"),
-                                                    "file_header_metadata": None}}}}],
+                                                    "file_header_metadata": b""}}}}],
     "tree_aux_data": None}]
 
 Works outside repo

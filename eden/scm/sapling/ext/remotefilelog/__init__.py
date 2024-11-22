@@ -305,10 +305,12 @@ def onetimeclientsetup(ui):
     def applyupdates(
         orig, repo, actions, wctx, mctx, overwrite, labels=None, ancestors=None
     ):
-        if shallowrepo.requirement in repo.requirements:
+        # Don't prefetch GETs for in-memory merge. We likely don't need the file content
+        # at all.
+        if shallowrepo.requirement in repo.requirements and not wctx.isinmemory():
             manifest = mctx.manifest()
             files = []
-            for _f, args, msg in actions["g"]:
+            for _f, args, msg in actions[merge.ACTION_GET]:
                 f2 = args[0]
                 files.append((f2, manifest[f2]))
             # batch fetch the needed files from the server
@@ -321,18 +323,23 @@ def onetimeclientsetup(ui):
 
     # Prefetch merge checkunknownfiles
     def checkunknownfiles(orig, repo, wctx, mctx, force, actions, *args, **kwargs):
-        if shallowrepo.requirement in repo.requirements:
+        # Don't prefetch file content for in-memory merge. We likely don't need the file
+        # content at all.
+        if shallowrepo.requirement in repo.requirements and not wctx.isinmemory():
             files = []
             sparsematch = repo.maybesparsematch(mctx.rev())
             for f, (m, actionargs, msg) in actions.items():
                 if sparsematch and not sparsematch(f):
                     continue
-                if m == "c":
+                if m == merge.ACTION_CREATED:
                     files.append((f, mctx.filenode(f)))
-                elif m == "dc":
+                elif m == merge.ACTION_DELETED_CHANGED:
                     f2 = actionargs[1]
                     files.append((f, mctx.filenode(f2)))
-                elif m in ("dg", "cm"):
+                elif m in (
+                    merge.ACTION_LOCAL_DIR_RENAME_GET,
+                    merge.ACTION_CREATED_MERGE,
+                ):
                     f2 = actionargs[0]
                     files.append((f2, mctx.filenode(f2)))
             # We need history for the files so we can compute the sha(p1, p2,
@@ -583,7 +590,7 @@ def walkfilerevs(orig, repo, match, follow, revs, fncache):
     for filename in match.files():
         if filename not in pctx:
             raise error.Abort(
-                _("cannot follow file not in parent " 'revision: "%s"') % filename
+                _('cannot follow file not in parent revision: "%s"') % filename
             )
         fctx = pctx[filename]
 

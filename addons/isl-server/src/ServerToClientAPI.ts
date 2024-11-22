@@ -11,7 +11,6 @@ import type {ServerSideTracker} from './analytics/serverSideTracker';
 import type {Logger} from './logger';
 import type {ServerPlatform} from './serverPlatform';
 import type {RepositoryContext} from './serverTypes';
-import type {ExecaError} from 'execa';
 import type {TypeaheadResult} from 'isl-components/Types';
 import type {Serializable} from 'isl/src/serialize';
 import type {
@@ -29,6 +28,7 @@ import type {
   CodeReviewProviderSpecificClientToServerMessages,
   StableLocationData,
 } from 'isl/src/types';
+import type {EjecaError} from 'shared/ejeca';
 import type {ExportStack, ImportedStack} from 'shared/types/stack';
 
 import {generatedFilesDetector} from './GeneratedFiles';
@@ -847,6 +847,13 @@ export default class ServerToClientAPI {
         parseExecJson(exec, reply);
         break;
       }
+      case 'fetchQeFlag': {
+        Internal.fetchQeFlag?.(repo.initialConnectionContext, data.name).then((passes: boolean) => {
+          this.logger.info(`qe flag ${data.name} ${passes ? 'PASSES' : 'FAILS'}`);
+          this.postMessage({type: 'fetchedQeFlag', name: data.name, passes});
+        });
+        break;
+      }
       case 'fetchFeatureFlag': {
         Internal.fetchFeatureFlag?.(repo.initialConnectionContext, data.name).then(
           (passes: boolean) => {
@@ -897,9 +904,10 @@ export default class ServerToClientAPI {
         }
         repo.runDiff(ctx, data.comparison, /* context lines */ 4).then(diff => {
           Internal.generateSuggestionWithAI?.(repo.initialConnectionContext, {
-            title: data.title,
             context: diff,
             fieldName: data.fieldName,
+            latestFields: data.latestFields,
+            suggestionId: data.suggestionId,
           })
             .catch((error: Error) => ({error}))
             .then((result: Result<string>) => {
@@ -955,7 +963,7 @@ export default class ServerToClientAPI {
               url: {value: result.stdout},
             });
           })
-          .catch((err: ExecaError) => {
+          .catch((err: EjecaError) => {
             this.logger.error('Failed to get repo url at hash:', err);
             this.postMessage({
               type: 'gotRepoUrlAtHash',

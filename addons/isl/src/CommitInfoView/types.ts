@@ -5,7 +5,19 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-/** Values for each field key,  */
+/**
+ * Either a commit hash, or 'commit/foo' when making a new commit on top of commit hash 'foo'.
+ */
+export type HashKey = `commit/${string}` | string;
+
+/**
+ * Field name and hash key that are separated by +, used for indexing the cached suggestions and map of funnel trackers.
+ */
+export type FieldNameAndHashKey = `${string}+${HashKey}`;
+
+/**
+ * Values for each field key in a commit message.
+ */
 export type CommitMessageFields = Record<string, string | Array<string>>;
 
 export type TypeaheadKind =

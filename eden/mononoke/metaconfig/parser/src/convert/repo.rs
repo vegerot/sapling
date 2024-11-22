@@ -38,11 +38,13 @@ use metaconfig_types::InfinitepushParams;
 use metaconfig_types::LfsParams;
 use metaconfig_types::LoggingDestination;
 use metaconfig_types::MetadataLoggerConfig;
+use metaconfig_types::ModernSyncConfig;
 use metaconfig_types::MononokeCasSyncConfig;
 use metaconfig_types::PushParams;
 use metaconfig_types::PushrebaseFlags;
 use metaconfig_types::PushrebaseParams;
 use metaconfig_types::PushrebaseRemoteMode;
+use metaconfig_types::RemoteDerivationConfig;
 use metaconfig_types::RepoClientKnobs;
 use metaconfig_types::ServiceWriteRestrictions;
 use metaconfig_types::ShardedService;
@@ -84,10 +86,12 @@ use repos::RawLfsParams;
 use repos::RawLoggingDestination;
 use repos::RawLoggingDestinationScribe;
 use repos::RawMetadataLoggerConfig;
+use repos::RawModernSyncConfig;
 use repos::RawPushParams;
 use repos::RawPushrebaseParams;
 use repos::RawPushrebaseRemoteMode;
 use repos::RawPushrebaseRemoteModeRemote;
+use repos::RawRemoteDerivationConfig;
 use repos::RawRepoClientKnobs;
 use repos::RawServiceWriteRestrictions;
 use repos::RawShardedService;
@@ -557,7 +561,32 @@ impl Convert for RawDerivedDataConfig {
                 .map(|(s, raw_config)| Ok((s, raw_config.convert()?)))
                 .collect::<Result<_, anyhow::Error>>()?,
             derivation_queue_scuba_table: self.derivation_queue_scuba_table,
+            remote_derivation_config: self
+                .remote_derivation_config
+                .map(|raw| raw.convert())
+                .transpose()?,
         })
+    }
+}
+
+impl Convert for RawRemoteDerivationConfig {
+    type Output = RemoteDerivationConfig;
+
+    fn convert(self) -> Result<Self::Output> {
+        match self {
+            RawRemoteDerivationConfig::shard_manager_tier(shard_manager_tier) => {
+                Ok(RemoteDerivationConfig::ShardManagerTier(shard_manager_tier))
+            }
+            RawRemoteDerivationConfig::smc_tier(smc_tier) => {
+                Ok(RemoteDerivationConfig::SmcTier(smc_tier))
+            }
+            RawRemoteDerivationConfig::host_port(host_port) => {
+                Ok(RemoteDerivationConfig::HostPort(host_port))
+            }
+            RawRemoteDerivationConfig::UnknownField(e) => {
+                anyhow::bail!("Unknown variant of RawRemoteDerivationConfig: {}", e)
+            }
+        }
     }
 }
 
@@ -681,6 +710,14 @@ impl Convert for RawCasSyncConfig {
     }
 }
 
+impl Convert for RawModernSyncConfig {
+    type Output = ModernSyncConfig;
+
+    fn convert(self) -> Result<Self::Output> {
+        Ok(ModernSyncConfig { url: self.url })
+    }
+}
+
 impl Convert for RawLoggingDestination {
     type Output = LoggingDestination;
 
@@ -772,6 +809,7 @@ impl Convert for RawShardedService {
             RawShardedService::DRAFT_COMMIT_DELETION => ShardedService::DraftCommitDeletion,
             RawShardedService::MONONOKE_GIT_SERVER => ShardedService::MononokeGitServer,
             RawShardedService::REPO_METADATA_LOGGER => ShardedService::RepoMetadataLogger,
+            RawShardedService::BOOKMARK_SERVICE => ShardedService::BookmarkService,
             v => return Err(anyhow!("Invalid value {} for enum ShardedService", v)),
         };
         Ok(service)

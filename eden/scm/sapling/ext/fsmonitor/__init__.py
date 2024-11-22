@@ -270,7 +270,7 @@ def wrappurge(orig, dirstate, match, findfiles, finddirs, includeignored):
                 )
             )
         except Exception:
-            ui.debug("fsmonitor: fallback to core purge, " "query dirs failed")
+            ui.debug("fsmonitor: fallback to core purge, query dirs failed")
             dirs = None
 
     if findfiles or dirs is None:
@@ -341,10 +341,6 @@ def reposetup(ui, repo):
                 % ext
             )
             return
-
-    # We only work with local repositories
-    if not repo.local():
-        return
 
     # For Eden-backed repositories the eden extension already handles optimizing
     # dirstate operations.  Let the eden extension manage the dirstate in this case.

@@ -9,6 +9,8 @@
 //! [`EdenFsClient`]).
 
 use std::collections::BTreeMap;
+#[cfg(windows)]
+use std::fs::remove_file;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -16,10 +18,12 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use anyhow::Context;
+use atomicfile::atomic_write;
 use edenfs_config::EdenFsConfig;
 use edenfs_error::EdenFsError;
 use edenfs_error::Result;
 use edenfs_error::ResultExt;
+use edenfs_utils::bytes_from_path;
 use edenfs_utils::get_executable;
 #[cfg(windows)]
 use edenfs_utils::strip_unc_prefix;
@@ -30,6 +34,8 @@ use fbthrift_socket::SocketTransport;
 use thrift_streaming_clients::errors::StreamStartStatusError;
 #[cfg(fbcode_build)]
 use thrift_streaming_thriftclients::build_StreamingEdenService_client;
+#[cfg(fbcode_build)]
+use thrift_types::edenfs::ChangesSinceV2Params;
 use thrift_types::edenfs::DaemonInfo;
 use thrift_types::edenfs_clients::EdenService;
 use thrift_types::fb303_core::fb303_status;
@@ -42,7 +48,9 @@ use thriftclient::TransportType;
 use tokio_uds_compat::UnixStream;
 use tracing::event;
 use tracing::Level;
+use util::lock::PathLock;
 
+use crate::utils::get_mount_point;
 use crate::EdenFsClient;
 #[cfg(fbcode_build)]
 use crate::StartStatusStream;
@@ -57,6 +65,8 @@ static INSTANCE: OnceLock<EdenFsInstance> = OnceLock::new();
 /// These paths are relative to the user's client directory.
 const CLIENTS_DIR: &str = "clients";
 const CONFIG_JSON: &str = "config.json";
+const CONFIG_JSON_LOCK: &str = "config.json.lock";
+const CONFIG_JSON_MODE: u32 = 0o664;
 
 #[derive(Debug)]
 pub struct EdenFsInstance {
@@ -112,15 +122,13 @@ impl EdenFsInstance {
         let socket_path = self.config_dir.join("socket");
 
         let connect = self._connect(&socket_path);
-        let res = if let Some(timeout) = timeout {
+        if let Some(timeout) = timeout {
             tokio::time::timeout(timeout, connect)
                 .await
                 .map_err(|_| EdenFsError::ThriftConnectionTimeout(socket_path))?
         } else {
             connect.await
-        };
-
-        res
+        }
     }
 
     #[cfg(fbcode_build)]
@@ -238,6 +246,48 @@ impl EdenFsInstance {
         }
     }
 
+    #[cfg(fbcode_build)]
+    pub async fn get_journal_position(
+        &self,
+        mount_point: &Option<PathBuf>,
+        timeout: Option<Duration>,
+    ) -> Result<crate::types::JournalPosition> {
+        let client = self
+            .connect(timeout)
+            .await
+            .context("Unable to connect to EdenFS daemon")?;
+        let mount_point_path = get_mount_point(mount_point)?;
+        let mount_point = bytes_from_path(mount_point_path)?;
+        client
+            .getCurrentJournalPosition(&mount_point)
+            .await
+            .map(|p| p.into())
+            .from_err()
+    }
+
+    #[cfg(fbcode_build)]
+    pub async fn get_changes_since(
+        &self,
+        mount_point: &Option<PathBuf>,
+        from_position: &crate::types::JournalPosition,
+        timeout: Option<Duration>,
+    ) -> Result<crate::types::ChangesSinceV2Result> {
+        let client = self
+            .connect(timeout)
+            .await
+            .context("Unable to connect to EdenFS daemon")?;
+        let params = ChangesSinceV2Params {
+            mountPoint: bytes_from_path(get_mount_point(mount_point)?)?,
+            fromPosition: from_position.clone().into(),
+            ..Default::default()
+        };
+        client
+            .changesSinceV2(&params)
+            .await
+            .map(|r| r.into())
+            .from_err()
+    }
+
     /// Returns a map of mount paths to mount names
     /// as defined in EdenFS's config.json.
     pub fn get_configured_mounts_map(&self) -> Result<BTreeMap<PathBuf, String>, anyhow::Error> {
@@ -293,6 +343,59 @@ impl EdenFsInstance {
 
     pub fn config_directory(&self, client_name: &str) -> PathBuf {
         self.clients_dir().join(client_name)
+    }
+
+    pub fn client_dir_for_mount_point(&self, path: &Path) -> Result<PathBuf> {
+        Ok(self.clients_dir().join(self.client_name(path)?))
+    }
+
+    pub fn remove_path_from_directory_map(&self, path: &Path) -> Result<()> {
+        let lock_file_path = self.config_dir.join(CONFIG_JSON_LOCK);
+        let config_file_path = self.config_dir.join(CONFIG_JSON);
+
+        // For Linux and MacOS we have a lock file "config.json.lock" under the config directory
+        // which works as a file lock to prevent the file "config.json" being accessed by
+        // multiple processes at the same time.
+        //
+        // In Python CLI code, FileLock lib is used to create config.json.lock.
+        // In Rust, we use PathLock from "scm/lib/util"
+        let _lock = PathLock::exclusive(&lock_file_path).with_context(|| {
+            format!("Failed to open the lock file {}", lock_file_path.display())
+        })?;
+
+        // Lock acquired, now we can read and write to the "config.json" file
+
+        // On Windows the "Path" crate will append the prefix "\\?\" to the original path when
+        // "canonicalize()" is called to indicate the path is in unicode.
+        // We need to strip the prefix before checking the key in "config.json" file
+        // For non-windows platforms, this is no-op.
+        let entry_key = dunce::simplified(path);
+        let mut all_checkout_map = self.get_configured_mounts_map()?;
+        let original_num_of_entries = all_checkout_map.len();
+
+        all_checkout_map.retain(|path, _| dunce::simplified(path) != entry_key);
+
+        if all_checkout_map.len() < original_num_of_entries {
+            atomic_write(&config_file_path, CONFIG_JSON_MODE, true, |f| {
+                serde_json::to_writer_pretty(f, &all_checkout_map)?;
+                Ok(())
+            })
+            .with_context(|| {
+                format!(
+                    "Failed to write updated config JSON back to {}",
+                    config_file_path.display()
+                )
+            })?;
+        } else {
+            event!(
+                Level::WARN,
+                "There is not entry for {} in config.json",
+                path.display()
+            );
+        }
+
+        // Lock will be released when _lock is dropped
+        Ok(())
     }
 }
 

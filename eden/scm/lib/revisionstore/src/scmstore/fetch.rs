@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 use std::collections::HashMap;
@@ -31,7 +31,7 @@ pub(crate) struct CommonFetchState<T: StoreValue> {
     pub mode: FetchMode,
 }
 
-impl<T: StoreValue> CommonFetchState<T> {
+impl<T: StoreValue + std::fmt::Debug> CommonFetchState<T> {
     pub(crate) fn new(
         keys: impl IntoIterator<Item = Key>,
         attrs: T::Attrs,
@@ -44,6 +44,10 @@ impl<T: StoreValue> CommonFetchState<T> {
             found_tx,
             mode,
         }
+    }
+
+    pub(crate) fn all_keys(&self) -> Vec<Key> {
+        self.pending.keys().cloned().collect()
     }
 
     pub(crate) fn pending_len(&self) -> usize {
@@ -132,10 +136,13 @@ impl<T: StoreValue> CommonFetchState<T> {
     }
 
     pub(crate) fn results(self, errors: FetchErrors) {
-        // Combine and collect errors
+        // Only emit keyed errors for items that are stuck in pending.
+        // We may have, for example, gotten an error fetching a key from CAS, but then succeeded in
+        // fetching it from SLAPI. In that case, `fetch_errors` contains the CAS error, but the
+        // requested item won't be in `pending` since it was satisfied via SLAPI.
         let mut incomplete = errors.fetch_errors;
         for (key, _value) in self.pending.into_iter() {
-            incomplete.entry(key).or_insert_with(|| {
+            let err = incomplete.remove(&key).unwrap_or_else(|| {
                 let msg = if self.mode.is_local() {
                     "not found locally and not contacting server"
                 } else if self.mode.is_remote() {
@@ -147,12 +154,9 @@ impl<T: StoreValue> CommonFetchState<T> {
                 };
                 anyhow!("{}", msg)
             });
-        }
-
-        for (key, error) in incomplete {
             let _ = self
                 .found_tx
-                .send(Err(KeyFetchError::KeyedError(KeyedError(key, error))));
+                .send(Err(KeyFetchError::KeyedError(KeyedError(key, err))));
         }
 
         for err in errors.other_errors {

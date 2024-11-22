@@ -592,7 +592,7 @@ def _premerge(repo, fcd, fco, fca, toolconf, files, labels):
         if premerge not in validkeep:
             _valid = ", ".join(["'" + v + "'" for v in validkeep])
             raise error.ConfigError(
-                _("%s.premerge not valid " "('%s' is neither boolean nor %s)")
+                _("%s.premerge not valid ('%s' is neither boolean nor %s)")
                 % (tool, premerge, _valid)
             )
 
@@ -611,7 +611,7 @@ def _premerge(repo, fcd, fco, fca, toolconf, files, labels):
         if not r:
             ui.debug(" premerge successful\n")
             return 0
-        if premerge not in validkeep:
+        if back is not None and premerge not in validkeep:
             # restore from backup and try again
             _restorebackup(fcd, back)
     return 1  # continue merging
@@ -622,7 +622,7 @@ def _ismergeable(repo, mynode, orig, fcd, fco, fca, toolconf, warn=True):
     if symlink:
         if warn:
             repo.ui.warn(
-                _("warning: internal %s cannot merge symlinks " "for %s\n")
+                _("warning: internal %s cannot merge symlinks for %s\n")
                 % (tool, fcd.path())
             )
         return False
@@ -736,7 +736,7 @@ def _merge(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels, mode):
     return True, r, False
 
 
-@internaltool("union", fullmerge, _describefailure, precheck=_ismergeable)
+@internaltool("union", mergeonly, _describefailure, precheck=_ismergeable)
 def _iunion(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):
     """
     Uses the internal non-interactive simple merge algorithm for merging
@@ -745,7 +745,7 @@ def _iunion(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):
     return _merge(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels, "union")
 
 
-@internaltool("merge", fullmerge, _describefailure, precheck=_ismergeable)
+@internaltool("merge", mergeonly, _describefailure, precheck=_ismergeable)
 def _imerge(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):
     """
     Uses the internal non-interactive simple merge algorithm for merging
@@ -755,7 +755,7 @@ def _imerge(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):
     return _merge(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels, "merge")
 
 
-@internaltool("merge3", fullmerge, _describefailure, precheck=_ismergeable)
+@internaltool("merge3", mergeonly, _describefailure, precheck=_ismergeable)
 def _imerge3(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):
     """
     Uses the internal non-interactive simple merge algorithm for merging
@@ -771,7 +771,7 @@ def _imerge3(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):
 
 @internaltool(
     "mergediff",
-    fullmerge,
+    mergeonly,
     _(
         "warning: conflicts while merging %s! "
         "(edit, then use '@prog@ resolve --mark')\n"
@@ -796,7 +796,7 @@ def _imergediff(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None)
 
 @internaltool(
     "mergediffs",
-    fullmerge,
+    mergeonly,
     _(
         "warning: conflicts while merging %s! "
         "(edit, then use '@prog@ resolve --mark')\n"
@@ -900,7 +900,7 @@ def _xmerge(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):
     tool, toolpath, binary, symlink = toolconf
     if fcd.isabsent() or fco.isabsent():
         repo.ui.warn(
-            _("warning: %s cannot merge change/delete conflict " "for %s\n")
+            _("warning: %s cannot merge change/delete conflict for %s\n")
             % (tool, fcd.path())
         )
         return False, 1, None
@@ -1027,36 +1027,23 @@ def _makebackup(repo, ui, wctx, fcd, premerge):
     """
     if fcd.isabsent():
         return None
+
+    if wctx.isinmemory():
+        # Don't bother saving backup for in-memory merge. This assumes that in-memory
+        # merge never needs a premerge (which is currently the case).
+        return None
+
     # TODO: Break this import cycle somehow. (filectx -> ctx -> fileset ->
     # merge -> filemerge). (I suspect the fileset import is the weakest link)
     from . import context
 
     a = _workingpath(repo, fcd)
     back = scmutil.origpath(ui, repo, a)
-    inworkingdir = back.startswith(repo.wvfs.base) and not back.startswith(
-        repo.localvfs.base
-    )
-    if isinstance(fcd, context.overlayworkingfilectx) and inworkingdir:
-        # If the backup file is to be in the working directory, and we're
-        # merging in-memory, we must redirect the backup to the memory context
-        # so we don't disturb the working directory.
-        relpath = back[len(repo.wvfs.base) + 1 :]
-        if premerge:
-            wctx[relpath].write(fcd.data(), fcd.flags())
-        return wctx[relpath]
-    else:
-        if premerge:
-            # Otherwise, write to wherever path the user specified the backups
-            # should go. We still need to switch based on whether the source is
-            # in-memory so we can use the fast path of ``util.copy`` if both are
-            # on disk.
-            if isinstance(fcd, context.overlayworkingfilectx):
-                util.writefile(back, fcd.data())
-            else:
-                util.copyfile(a, back)
-        # A arbitraryfilectx is returned, so we can run the same functions on
-        # the backup context regardless of where it lives.
-        return context.arbitraryfilectx(back, repo=repo)
+    if premerge:
+        util.copyfile(a, back)
+    # A arbitraryfilectx is returned, so we can run the same functions on
+    # the backup context regardless of where it lives.
+    return context.arbitraryfilectx(back, repo=repo)
 
 
 def _maketempfiles(repo, fco, fca):
@@ -1163,7 +1150,7 @@ def _filemerge(premerge, repo, wctx, mynode, orig, fcd, fco, fca, labels=None):
         markerstyle = ui.config("ui", "mergemarkers")
         if not labels:
             labels = _defaultconflictlabels
-        if markerstyle != "basic":
+        if markerstyle != "basic" and not wctx.isinmemory():
             labels = _formatlabels(repo, fcd, fco, fca, labels)
 
         if premerge and mergetype == fullmerge:
@@ -1232,7 +1219,7 @@ def _check(repo, r, ui, tool, fcd, files):
     if "prompt" in _toollist(ui, tool, "check"):
         checked = True
         if ui.promptchoice(
-            _("was merge of '%s' successful (yn)?" "$$ &Yes $$ &No") % fd, 1
+            _("was merge of '%s' successful (yn)?$$ &Yes $$ &No") % fd, 1
         ):
             r = 1
 

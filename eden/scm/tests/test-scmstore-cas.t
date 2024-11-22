@@ -26,7 +26,7 @@ Can also fetch tree data.
       p2: None,
       entries: [
           (
-              RepoPathBuf(
+              PathComponentBuf(
                   "A",
               ),
               FileNode(
@@ -41,7 +41,7 @@ Can also fetch tree data.
               ),
           ),
           (
-              RepoPathBuf(
+              PathComponentBuf(
                   "dir",
               ),
               DirectoryNode(
@@ -112,7 +112,7 @@ Then fetch "dir" from CAS:
                           p2: None,
                           entries: [
                               (
-                                  RepoPathBuf(
+                                  PathComponentBuf(
                                       "file",
                                   ),
                                   FileNode(
@@ -145,15 +145,31 @@ Make sure prefetch uses CAS:
   DEBUG cas: created client
   DEBUG cas: EagerRepoStore fetching 1 tree(s)
   DEBUG cas: EagerRepoStore fetching 1 tree(s)
-  DEBUG cas: EagerRepoStore fetching 2 file(s)
+  DEBUG cas: EagerRepoStore prefetching 2 file(s)
 
 Don't rewrite aux data to cache:
   $ LOG=revisionstore=trace hg prefetch -r $A . 2>&1 | grep "writing to"
   [1]
 
 
-FIXME - we try fetching from local cache unnecessarily
+Make sure we don't fetch from local cache unnecessarily.
   $ hg debugscmstore -r $A --mode tree "dir" --config devel.print-metrics=scmstore.tree.fetch.indexedlog.cache.keys >/dev/null
-  scmstore.tree.fetch.indexedlog.cache.keys: 1
   $ hg debugscmstore -r $A --mode file "dir/file" --config devel.print-metrics=scmstore.file.fetch.indexedlog.cache.keys >/dev/null
+
+And sanity check the counter we are looking for exists:
+  $ hg debugscmstore -r $A --mode tree "dir" --config devel.print-metrics=scmstore.tree.fetch.indexedlog.cache.keys --config scmstore.fetch-from-cas=false >/dev/null
+  scmstore.tree.fetch.indexedlog.cache.keys: 1
+  $ hg debugscmstore -r $A --mode file "dir/file" --config devel.print-metrics=scmstore.file.fetch.indexedlog.cache.keys --config scmstore.fetch-from-cas=false >/dev/null
   scmstore.file.fetch.indexedlog.cache.keys: 1
+
+Count duplicate key fetches properly:
+  $ hg dbsh -c "n = repo['$A']['dir/file'].filenode(); repo.fileslog.filestore.prefetch([('foo', n), ('bar', n)])" --config devel.print-metrics=scmstore.file.fetch.cas >/dev/null
+  scmstore.file.fetch.cas.hits: 2
+  scmstore.file.fetch.cas.keys: 2
+  scmstore.file.fetch.cas.requests: 1
+  scmstore.file.fetch.cas.time: * (glob)
+
+
+Make sure fall back to non-CAS fetching works:
+  $ FAILPOINTS=eagerepo::cas=return hg cat -r $A dir/file
+  contents (no-eol)

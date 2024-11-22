@@ -19,13 +19,13 @@ import os
 import re
 import stat
 import sys
+from functools import partial
 from typing import Callable, List, Optional, Tuple, Union
 
 import bindings
 
 from . import (
     annotate,
-    encoding,
     error,
     fileset,
     git,
@@ -54,16 +54,32 @@ from .node import (
     wdirrev,
 )
 from .pycompat import encodeutf8, isint, range
-from .utils.subtreeutil import SUBTREE_BRANCH_KEY
+from .utils import subtreeutil
 
-filectx_or_bytes = Union["basefilectx", bytes]
+bytes_or_lazy_bytes = Union[bytes, Callable[[], bytes]]
+
+filectx_or_bytes = Union["basefilectx", bytes_or_lazy_bytes]
 
 
+# Evaluate maybe-lazy data, returning bytes.
 def filedata(data: filectx_or_bytes) -> bytes:
     if isinstance(data, bytes):
         return data
+    elif callable(data):
+        return data()
     else:
         return data.data()
+
+
+# Get a "detach" friendly bytes, prefering to keep lazy. If `data` is
+# a filectx, we "detach" the data from the context so the data will
+# not be affected if the associated path in the parent changectx is
+# later mutated.
+def detacheddata(data: filectx_or_bytes) -> bytes_or_lazy_bytes:
+    if isinstance(data, bytes) or callable(data):
+        return data
+    else:
+        return data.detacheddata()
 
 
 propertycache = util.propertycache
@@ -150,7 +166,9 @@ class basectx:
         """
         return match
 
-    def _buildstatus(self, other, s, match, listignored, listclean, listunknown):
+    def _buildstatus(
+        self, other, s, match, wcmatch, listignored, listclean, listunknown
+    ):
         """build a status with respect to another context"""
         # Load earliest manifest first for caching reasons. More specifically,
         # if you have revisions 1000 and 1001, 1001 is probably stored as a
@@ -177,6 +195,20 @@ class basectx:
         if mf1.hasgrafts():
             dmf1, dmf2 = bindings.manifest.treemanifest.applydiffgrafts(mf1, mf2)
         d = dmf1.diff(dmf2, matcher=match)
+
+        prefetch = []
+        for fn, (left, right) in d.items():
+            if left and right and left[0] and right[0] and left[1] == right[1]:
+                for side in (left, right):
+                    if side[0] != modifiednodeid:
+                        prefetch.append((fn, side[0]))
+
+        # Prefetch file contents and file parents to avoid serial fetches in below
+        # `fctx.cmp(fctx)` call.
+        if len(prefetch) > 1 and "remotefilelog" in self._repo.requirements:
+            self._repo.fileslog.filestore.prefetch(prefetch)
+            self._repo.fileslog.metadatastore.prefetch(prefetch, length=1)
+
         for fn, value in d.items():
             if listclean:
                 cleanset.discard(fn)
@@ -249,6 +281,9 @@ class basectx:
 
     def phase(self) -> int:
         raise NotImplementedError()
+
+    def ispublic(self) -> bool:
+        return self.phase() == phases.public
 
     def mutable(self) -> bool:
         return self.phase() > phases.public
@@ -357,6 +392,8 @@ class basectx:
         listignored=False,
         listclean=False,
         listunknown=False,
+        # matcher that only applies to dirstate status
+        wcmatch=None,
     ):
         """return status of files between two nodes or node and working
         directory.
@@ -388,8 +425,13 @@ class basectx:
 
         match = match or matchmod.always(self._repo.root, self._repo.getcwd())
         match = ctx2._matchstatus(ctx1, match)
+        if wcmatch is None:
+            wcmatch = match
+
         r = scmutil.status([], [], [], [], [], [], [])
-        r = ctx2._buildstatus(ctx1, r, match, listignored, listclean, listunknown)
+        r = ctx2._buildstatus(
+            ctx1, r, match, wcmatch, listignored, listclean, listunknown
+        )
 
         if reversed:
             # Reverse added and removed. Clear deleted, unknown and ignored as
@@ -570,8 +612,7 @@ class changectx(basectx):
         return [changectx(repo, p) for p in pnodes]
 
     def changeset(self):
-        c = self._changeset
-        return (c.manifest, c.user, c.date, c.files, c.description, c.extra)
+        return self._changeset
 
     def manifestnode(self):
         return self._changeset.manifest
@@ -588,10 +629,9 @@ class changectx(basectx):
             # The following cases does not provide "files" in commit message,
             # run diff to get it:
             # - git repo
-            # - O(1) subtree copy
-            if (
-                git.isgitformat(self._repo)
-                or SUBTREE_BRANCH_KEY in self._changeset.extra
+            # - subtree shallow copy
+            if git.isgitformat(self._repo) or subtreeutil.contains_shallow_copy(
+                self._repo, self.node()
             ):
                 files = sorted(self.manifest().diff(self.p1().manifest()).keys())
         return files
@@ -832,6 +872,13 @@ class basefilectx:
 
     def data(self) -> bytes:
         raise NotImplementedError()
+
+    # Get a maybe-lazy handle to the data bytes. The returned bytes
+    # should be change if the parent change context mutates its entry
+    # for our path.
+    def detacheddata(self) -> bytes_or_lazy_bytes:
+        # Default impl is not lazy, since that is safest.
+        return self.data()
 
     def flags(self):
         return self._flags
@@ -1657,7 +1704,16 @@ class committablectx(basectx):
                     fctx = self[f]
                     if fctx.filenode() is not None:
                         keys.append((fctx.path(), fctx.filenode()))
-                repo.fileslog.metadatastore.prefetch(keys)
+                if p2.node() == nullid:
+                    # Not merging - only fetch direct file history so we avoid per-file
+                    # fetches for `flog.parents(node)` in _filecommit.
+                    length = 1
+                else:
+                    # If we are merging, _filecommit has some logic with flog history, so
+                    # let's fetch the files' full history to avoid serial history
+                    # fetching.
+                    length = None
+                repo.fileslog.metadatastore.prefetch(keys, length=length)
         for f in progress.each(ui, added, _("committing"), _("files")):
             ui.note(f + "\n")
             try:
@@ -1967,7 +2023,7 @@ class workingctx(committablectx):
             return
         if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
             self._repo.ui.warn(
-                _("copy failed: %s is not a file or a " "symbolic link\n")
+                _("copy failed: %s is not a file or a symbolic link\n")
                 % self._repo.dirstate.pathto(dest)
             )
         else:
@@ -2028,7 +2084,7 @@ class workingctx(committablectx):
                 d = self[f].data()
                 if d == b"" or len(d) >= 1024 or b"\n" in d or util.binary(d):
                     self._repo.ui.debug(
-                        "ignoring suspect symlink placeholder" ' "%s"\n' % f
+                        'ignoring suspect symlink placeholder "%s"\n' % f
                     )
                     continue
             sane.append(f)
@@ -2091,7 +2147,13 @@ class workingctx(committablectx):
 
         man = parents[0].manifest().copy()
 
-        ff = self._flagfunc
+        # Bulk fetch all the paths to avoid serial fetching bellow.
+        man.walkfiles(
+            matchmod.exact(
+                "", "", status.deleted + status.removed + status.added + status.modified
+            )
+        )
+
         for f in status.deleted + status.removed:
             if f in man:
                 del man[f]
@@ -2100,6 +2162,8 @@ class workingctx(committablectx):
             submodulestatus = git.submodulestatus(self)
         else:
             submodulestatus = {}
+
+        ff = self._flagfunc
         for i, l in ((addednodeid, status.added), (modifiednodeid, status.modified)):
             for f in l:
                 submodulenodes = submodulestatus.get(f)
@@ -2116,7 +2180,9 @@ class workingctx(committablectx):
 
         return man
 
-    def _buildstatus(self, other, s, match, listignored, listclean, listunknown):
+    def _buildstatus(
+        self, other, s, match, wcmatch, listignored, listclean, listunknown
+    ):
         """build a status with respect to another context
 
         This includes logic for maintaining the fast path of status when
@@ -2132,14 +2198,14 @@ class workingctx(committablectx):
         # consistent before and after.
         pctx = self._repo["."]
 
-        s = self._dirstatestatus(match, listignored, listclean, listunknown)
+        s = self._dirstatestatus(wcmatch, listignored, listclean, listunknown)
         # Filter out symlinks that, in the case of FAT32 and NTFS filesystems,
         # might have accidentally ended up with the entire contents of the file
         # they are supposed to be linking to.
         s.modified[:] = self._filtersuspectsymlink(s.modified)
         if other != pctx:
             s = super(workingctx, self)._buildstatus(
-                other, s, match, listignored, listclean, listunknown
+                other, s, match, wcmatch, listignored, listclean, listunknown
             )
         return s
 
@@ -2390,6 +2456,19 @@ class overlayworkingctx(committablectx):
         else:
             return self._wrappedctx[path].data()
 
+    # Similar to data(), but try to keep data lazy.
+    def detacheddata(self, path) -> bytes_or_lazy_bytes:
+        if self.isdirty(path):
+            if self._cache[path]["exists"]:
+                if (data := self._cache[path]["data"]) is not None:
+                    return detacheddata(data)
+                else:
+                    # No data - fall through to _wrappedctx
+                    pass
+            else:
+                raise error.ProgrammingError("No such file or directory: %s" % path)
+        return self._wrappedctx[path].detacheddata()
+
     @propertycache
     def _manifest(self):
         parents = self.parents()
@@ -2527,7 +2606,11 @@ class overlayworkingctx(committablectx):
     def size(self, path):
         if self.isdirty(path):
             if self._cache[path]["exists"]:
-                return len(filedata(self._cache[path]["data"]))
+                if (data := self._cache[path]["data"]) is not None:
+                    return len(filedata(data))
+                else:
+                    # No data - fall through to _wrappedctx
+                    pass
             else:
                 raise error.ProgrammingError("No such file or directory: %s" % path)
         return self._wrappedctx[path].size()
@@ -2569,7 +2652,7 @@ class overlayworkingctx(committablectx):
                     repo,
                     memctx,
                     path,
-                    self.data(path),
+                    partial(self.data, path),
                     copied=self._cache[path]["copied"],
                     flags=self.flags(path),
                     filenode=self._cache[path]["filenode"],
@@ -2615,13 +2698,20 @@ class overlayworkingctx(committablectx):
         keys = []
         for path in self._cache.keys():
             cache = self._cache[path]
+            if cache["data"] is None:
+                continue
+
             try:
                 underlying = self._wrappedctx[path]
-                if (
-                    cache["data"] is not None
-                    and underlying.data() == filedata(cache["data"])
-                    and underlying.flags() == cache["flags"]
-                ):
+                fnode, cachenode = underlying.filenode(), cache["filenode"]
+
+                # Do content check using filenodes, if available.
+                if fnode is not None and cachenode is not None:
+                    contents_match = fnode == cachenode
+                else:
+                    contents_match = underlying.data() == filedata(cache["data"])
+
+                if contents_match and underlying.flags() == cache["flags"]:
                     keys.append(path)
             except error.ManifestLookupError:
                 # Path not in the underlying manifest (created).
@@ -2716,6 +2806,9 @@ class overlayworkingfilectx(committablefilectx):
 
     def clearunknown(self):
         pass
+
+    def detacheddata(self) -> bytes_or_lazy_bytes:
+        return self._parent.detacheddata(self._path)
 
 
 class workingcommitctx(workingctx):
@@ -3147,11 +3240,17 @@ class memfilectx(committablefilectx):
             # HACK: Reconstruct filenode from "data()" for submodules.
             # Ideally the callsite provides filenode, but that's not a
             # trivial change.
-            self._filenode = bin(data.rstrip()[-len(nullhex) :])
+            self._filenode = bin(self.data().rstrip()[-len(nullhex) :])
         if copied:
             self._copied = (copied, nullid)
 
     def data(self):
+        if callable(self._data):
+            self._data = self._data()
+        return self._data
+
+    # Similar to data(), but try to keep data lazy.
+    def detacheddata(self, path) -> bytes_or_lazy_bytes:
         return self._data
 
     def remove(self, ignoremissing=False):
@@ -3161,7 +3260,7 @@ class memfilectx(committablefilectx):
 
     def write(self, data: filectx_or_bytes, flags):
         """wraps repo.wwrite"""
-        self._data = filedata(data)
+        self._data = partial(filedata, data)
 
     def filenode(self):
         return self._filenode

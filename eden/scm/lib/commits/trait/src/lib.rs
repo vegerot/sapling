@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! # commits-trait
@@ -38,6 +38,7 @@ use minibytes::Bytes;
 use serde::Deserialize;
 use serde::Serialize;
 use storemodel::ReadRootTreeIds;
+use storemodel::SerializationFormat;
 
 #[async_trait::async_trait]
 pub trait ReadCommitText: Sync {
@@ -68,6 +69,8 @@ pub trait ReadCommitText: Sync {
         let reader = trait_impls::ArcReadCommitText(reader);
         Arc::new(reader)
     }
+
+    fn format(&self) -> SerializationFormat;
 }
 
 pub trait StreamCommitText {
@@ -216,6 +219,6 @@ pub struct ParentlessHgCommit {
     pub raw_text: Bytes,
 }
 
-mod trait_impls;
+pub mod trait_impls;
 
 pub use anyhow::Result;

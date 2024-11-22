@@ -20,7 +20,6 @@ Set up local hgrc and Mononoke config, with commit cloud, http pull and upload.
   > [extensions]
   > amend =
   > commitcloud =
-  > infinitepush =
   > rebase =
   > share =
   > [commitcloud]
@@ -55,8 +54,8 @@ Initialize test repo.
 
 Import and start mononoke
   $ cd $TESTTMP
-  $ hg clone -q mono:repo client1 --noupdate --config clone.prefer-edenapi-clonedata=false
-  $ hg clone -q mono:repo client2 --noupdate --config clone.prefer-edenapi-clonedata=false
+  $ hg clone -q mono:repo client1 --noupdate
+  $ hg clone -q mono:repo client2 --noupdate
   $ blobimport repo/.hg repo
   $ start_and_wait_for_mononoke_server
 Test mutations on client 1

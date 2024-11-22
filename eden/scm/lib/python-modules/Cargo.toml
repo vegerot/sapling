@@ -3,12 +3,16 @@
 [package]
 name = "python-modules"
 version = "0.1.0"
+authors = ["Meta Source Control Team <sourcecontrol-dev@meta.com>"]
 edition = "2021"
+homepage = "https://sapling-scm.com/"
+repository = "https://github.com/facebook/sapling"
+license = "GPL-2.0-only"
 
 [dependencies]
 once_cell = "1.12"
 phf = { version = "0.11", features = ["macros"] }
-zstdelta = { version = "0.1.0", path = "../zstdelta" }
+sapling-zstdelta = { version = "0.1.0", path = "../zstdelta" }
 
 [build-dependencies]
 codegen = { version = "0.1.0", path = "codegen" }

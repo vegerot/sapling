@@ -23,14 +23,28 @@ import subprocess
 import sys
 import traceback
 import typing
+from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Type
 
 import thrift.transport
+from eden.fs.cli.version import VersionInfo
 
-from cli.py import par_telemetry
+try:
+    from cli.py import par_telemetry
+except ImportError:
+    # in OSS define a stub
+    class ParTelemetryStub:
+        def set_sample_rate(self, automation: int) -> None:
+            pass
+
+    # pyre-fixme[31]: Expression `eden.fs.cli.main.ParTelemetryStub()` is not a
+    #  valid type.
+    par_telemetry = ParTelemetryStub()
+
 from eden.fs.cli.buck import get_buck_command, run_buck_command
 from eden.fs.cli.config import HG_REPO_TYPES
+from eden.fs.cli.doctor.facebook import check_x509
 from eden.fs.cli.telemetry import TelemetrySample
 from eden.fs.cli.util import (
     check_health_using_lockfile,
@@ -44,7 +58,6 @@ from facebook.eden.ttypes import ChangeOwnershipRequest, MountState
 from fb303_core.ttypes import fb303_status
 
 from . import (
-    buck,
     config as config_mod,
     daemon,
     daemon_util,
@@ -1181,6 +1194,92 @@ class DoctorCmd(Subcmd):
         return doctor.cure_what_ails_you()
 
 
+@subcmd("health-report", "Notify critical eden issues")
+class HealthReportCmd(Subcmd):
+    class ErrorCode(Enum):
+        EDEN_NOT_RUNNING = 1
+        STALE_EDEN_VERSION = 2
+        INVALID_CERTS = 3
+
+        def description(self) -> str:
+            descriptions = {
+                self.EDEN_NOT_RUNNING: "The EdenFS daemon is not running",
+                self.STALE_EDEN_VERSION: "The running EdenFS daemon is over 30 days out-of-date",
+                self.INVALID_CERTS: "The EdenFS cannot find a valid user certificate",
+            }
+            return descriptions[self]
+
+    running_version: str = ""
+    version_info: VersionInfo = VersionInfo()
+    error_codes: Set[ErrorCode] = set()
+
+    def is_eden_running(self, instance: EdenInstance) -> bool:
+        health_info = instance.check_health()
+        if not health_info.is_healthy():
+            self.error_codes.add(HealthReportCmd.ErrorCode.EDEN_NOT_RUNNING)
+            return False
+
+        try:
+            self.running_version = instance.get_running_version()
+        except EdenNotRunningError:
+            self.error_codes.add(HealthReportCmd.ErrorCode.EDEN_NOT_RUNNING)
+            return False
+
+        self.version_info = version_mod.get_version_info(self.running_version)
+        if not self.version_info.is_eden_running:
+            self.error_codes.add(HealthReportCmd.ErrorCode.EDEN_NOT_RUNNING)
+            return False
+        return True
+
+    def is_eden_up_to_date(self) -> bool:
+        if (
+            self.version_info.ages_deltas is not None
+            and self.version_info.ages_deltas >= 30
+        ):
+            self.error_codes.add(HealthReportCmd.ErrorCode.STALE_EDEN_VERSION)
+            return False
+        return True
+
+    def are_certs_valid(self) -> bool:
+        if (cert := check_x509.find_x509_path()) and check_x509.validate_x509(cert):
+            return True
+        # cert error!
+        self.error_codes.add(HealthReportCmd.ErrorCode.INVALID_CERTS)
+        return False
+
+    @staticmethod
+    def print_error_codes_json(out: ui.Output) -> None:
+        """
+        Serialize and print error codes in JSON format.
+        Args:
+            out (ui.Output): Output stream to write the JSON data to.
+        Notes:
+            This method takes the set of error codes stored in `self.error_codes` and
+            converts them into a JSON string. The resulting JSON object has error code
+            names as keys and their corresponding descriptions as values.
+        """
+        data = [
+            {"error": error_code.name, "description": error_code.description()}
+            for error_code in HealthReportCmd.error_codes
+        ]
+        json_str = json.dumps(data, indent=2)
+        out.writeln(json_str)
+
+    def run(self, args: argparse.Namespace) -> int:
+        instance = get_eden_instance(args)
+        out = ui.get_output()
+        exit_code = 0
+
+        if not self.is_eden_running(instance) or not all(
+            f() for f in [self.is_eden_up_to_date, self.are_certs_valid]
+        ):
+            exit_code = 1
+
+        self.print_error_codes_json(out)
+
+        return exit_code
+
+
 @subcmd("strace", "Monitor FUSE requests.")
 class StraceCmd(Subcmd):
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
@@ -1236,7 +1335,14 @@ class MinitopCmd(Subcmd):
         print_stderr(
             "This is not implemented for python edenfsctl. Use `top` subcommand instead."
         )
-        return 1
+        return EX_USAGE
+
+
+@subcmd("notify", "Provides a list of filesystem changes since the specified position")
+class NotifyCmd(Subcmd):
+    def run(self, args: argparse.Namespace) -> int:
+        print_stderr("This is not implemented for python edenfsctl.")
+        return EX_USAGE
 
 
 @subcmd(
@@ -1823,8 +1929,15 @@ class UnmountCmd(Subcmd):
                 'prefer using "eden rm" instead'
             )
 
-        instance = get_eden_instance(args)
         for path in args.paths:
+            # Removing redirection targets from checkout config to allow deletion of redirected paths
+            instance, checkout, _rel_path = require_checkout(args, path)
+            config = checkout.get_config()
+            config._replace(
+                redirection_targets={},
+            )
+            checkout.save_config(config)
+
             path = normalize_path_arg(path)
             try:
                 instance.unmount(path)

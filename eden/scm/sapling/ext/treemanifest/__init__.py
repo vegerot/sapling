@@ -401,20 +401,22 @@ def wraprepo(repo):
 
 def setuptreestores(repo, mfl):
     if git.isgitstore(repo):
-        mfl._iseager = False
+        mfl._use_abstraction = True
         mfl.datastore = git.openstore(repo)
     elif eagerepo.iseagerepo(repo) or repo.storage_format() == "revlog":
-        mfl._iseager = True
+        mfl._use_abstraction = True
         store = repo.fileslog.filestore
+        mfl._raw_store = store
         mfl.datastore = EagerDataStore(store)
         mfl.historystore = mfl.datastore.historystore
-        mfl._raw_store = store
         if not isinstance(store, bindings.eagerepo.EagerRepoStore):
             raise error.ProgrammingError(
                 "incompatible eagerrepo store: %r (expect EagerRepoStore)" % store
             )
     else:
-        mfl._iseager = False
+        # "historystore" related logic does not yet have confident
+        # abstraction-friendly alternative yet.
+        mfl._use_abstraction = False
         mfl.makeruststore()
 
 
@@ -425,6 +427,8 @@ class basetreemanifestlog:
         self._treemanifestcache = util.lrucachedict(cachesize)
         # store object used to construct storemodel.TreeStore
         self._raw_store = None
+        # whether to use the "storemodel" abstraction for write paths
+        self._use_abstraction = False
 
     def abstract_store(self):
         """returns storemodel.TreeStore backed by Rust trait object"""
@@ -494,14 +498,12 @@ class basetreemanifestlog:
     ):
         newtreeiter = _finalize(self, newtree, p1node, p2node)
 
-        if self._iseager:
-            # eagerepo does not have history pack but requires p1node and
-            # p2node to be part of the sha1 blob.
-            store = self.datastore
+        if self._use_abstraction:
+            store = self.abstract_store()
             rootnode = None
             for nname, nnode, ntext, _np1text, np1, np2 in newtreeiter:
-                rawtext = revlog.textwithheader(ntext, np1, np2)
-                node = store.add_sha1_blob(rawtext)
+                # ntext is the raw text of either git or hg format
+                node = store.insert_data({"parents": (np1, np2)}, nname, ntext)
                 assert node == nnode, f"{node} == {nnode}"
                 if rootnode is None and nname == "":
                     rootnode = node
@@ -521,10 +523,8 @@ class basetreemanifestlog:
 
     def commitsharedpacks(self):
         """Persist the dirty trees written to the shared packs."""
-        if self._isgit:
-            return
-        if self._iseager:
-            self.datastore.flush()
+        if self._use_abstraction:
+            self.abstract_store().flush()
             return
 
         self.datastore.markforrefresh()
@@ -555,7 +555,7 @@ class basetreemanifestlog:
         # git store does not have the Python `.get(path, node)` method.
         # it can only be accessed via the Rust treemanifest.
         # eager store does not require remote lookup.
-        if node == nullid or self._isgit or self._iseager:
+        if node == nullid or self._use_abstraction:
             return treemanifestctx(self, dir, node)
         if node in self._treemanifestcache:
             m = self._treemanifestcache[node]
@@ -595,7 +595,7 @@ class basetreemanifestlog:
         return None
 
     def makeruststore(self):
-        assert not self._iseager
+        assert not self._use_abstraction
         mask = os.umask(0o002)
         try:
             self.treescmstore = self._repo._rsrepo.treescmstore()
@@ -629,7 +629,14 @@ class treeonlymanifestlog(basetreemanifestlog):
 def _buildtree(manifestlog, node=None):
     # this code seems to belong in manifestlog but I have no idea how
     # manifestlog objects work
+    # XXX: This breaks abstraction. But we want the "native" store, instead of a
+    # Python object (EagerDataStore) so store APIs like "format()" etc work
+    # well. Alternatively, we need to define "def format()" to pass the
+    # "format()" as-is across languages. Once we kill historystore then we might
+    # remove the EagerDataStore Python wrapper.
     store = manifestlog.datastore
+    if isinstance(store, EagerDataStore):
+        store = store._store
     initfn = rustmanifest.treemanifest
     if node is not None and node != nullid:
         return initfn(store, node)
@@ -676,7 +683,7 @@ class treemanifestctx:
     def new(self, dir=""):
         if dir != "":
             raise RuntimeError(
-                "native tree manifestlog doesn't support " "subdir creation: '%s'" % dir
+                "native tree manifestlog doesn't support subdir creation: '%s'" % dir
             )
         return _buildtree(self._manifestlog)
 
@@ -712,7 +719,7 @@ class treemanifestctx:
             # This appears to only be used for changegroup creation in
             # upstream changegroup.py. Since we use pack files for all native
             # tree exchanges, we shouldn't need to implement this.
-            raise NotImplemented("native trees don't support shallow " "readdelta yet")
+            raise NotImplemented("native trees don't support shallow readdelta yet")
         else:
             md = _buildtree(self._manifestlog)
             for f, ((n1, fl1), (n2, fl2)) in parentmf.diff(mf).items():
@@ -844,28 +851,6 @@ def getbundlemanifestlog(orig, self):
 def debuggetroottree(ui, repo, rootnode):
     with ui.configoverride({("treemanifest", "fetchdepth"): "1"}, "forcesinglefetch"):
         repo.prefetchtrees([bin(rootnode)])
-
-
-def _difftoaddremove(diff):
-    added = []
-    removed = []
-    for filename, (old, new) in diff.items():
-        if new is not None and new[0] is not None:
-            added.append((filename, new[0], new[1]))
-        else:
-            removed.append(filename)
-    return added, removed
-
-
-def _getnewtree(parenttree, added, removed):
-    newtree = parenttree.copy()
-    for fname in removed:
-        del newtree[fname]
-
-    for fname, fnode, fflags in added:
-        newtree.set(fname, fnode, fflags)
-
-    return newtree
 
 
 def _unpackmanifestscg3(orig, self, repo, *args, **kwargs):
@@ -1052,7 +1037,7 @@ def createtreepackpart(repo, outgoing, partname, sendtrees=shallowbundle.AllTree
     linknodemap = {}
     for node in outgoing.missing:
         ctx = repo[node]
-        if sendtrees == shallowbundle.AllTrees or ctx.phase() != phases.public:
+        if sendtrees == shallowbundle.AllTrees or not ctx.ispublic():
             mfnode = ctx.manifestnode()
             if mfnode != nullid:
                 mfnodes.append(mfnode)
@@ -1137,55 +1122,6 @@ def _postpullprefetch(ui, repo):
         basemfnodes.difference_update(n for k, n in missingbases)
 
         repo.prefetchtrees(mfnodes, basemfnodes=basemfnodes)
-
-
-@util.timefunction("findrecenttrees")
-def _findrecenttree(repo, startnode, targetmfnodes):
-    cl = repo.changelog
-    mfstore = repo.manifestlog.datastore
-    targetmfnodes = set(targetmfnodes)
-
-    with progress.spinner(repo.ui, _("finding nearest trees")):
-        # Look up and down from the given rev
-        ancestors = iter(
-            repo.revs(
-                "limit(reverse(ancestors(%n)), %z) & public()",
-                startnode,
-                BASENODESEARCHMAX,
-            )
-        )
-
-        descendantquery = "limit(descendants(%n), %z) & public()"
-        if extensions.enabled().get("remotenames", False):
-            descendantquery += " & ::remotenames()"
-        descendants = iter(repo.revs(descendantquery, startnode, BASENODESEARCHMAX))
-
-        revs = []
-
-        # Zip's the iterators together, using the fillvalue when the shorter
-        # iterator runs out of values.
-        candidates = zip_longest(ancestors, descendants, fillvalue=None)
-        for revs in candidates:
-            for rev in revs:
-                if rev is None:
-                    continue
-
-                mfnode = cl.changelogrevision(rev).manifest
-
-                # In theory none of the target mfnodes should be in the store at
-                # all, since that's why we're trying to prefetch them now, but
-                # we've seen cases where getmissing claims they are in the
-                # store, and therefore we return the target mfnode as the recent
-                # tree, which is an invalid request to the server. Let's prevent
-                # this while we track down the root cause.
-                if mfnode in targetmfnodes:
-                    continue
-
-                missing = mfstore.getmissing([("", mfnode)])
-                if not missing:
-                    return [mfnode]
-
-    return []
 
 
 def clientgettreepack(remote, rootdir, mfnodes, basemfnodes, directories, depth):
@@ -1384,6 +1320,11 @@ class EagerDataStore:
         self._store = store
         # need the historystore to provide p1, p2 information
         self.historystore = EagerHistoryStore(store)
+
+    def format(self):
+        format = bindings.storemodel.TreeStore.from_store(self._store).format()
+        self.format = lambda: format
+        return format
 
     def get(self, dir, node):
         rawtext = self._store.get_content(node)

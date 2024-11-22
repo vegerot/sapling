@@ -16,6 +16,10 @@
 
 namespace facebook::eden {
 std::tuple<RootId, std::string> parseFilterIdFromRootId(const RootId& rootId) {
+  if (rootId == RootId{}) {
+    // Null root id. Just render the empty string(no filter)
+    return {RootId{}, std::string()};
+  }
   auto rootRange = folly::range(rootId.value());
   auto expectedLength = folly::tryDecodeVarint(rootRange);
   if (UNLIKELY(!expectedLength)) {
@@ -30,8 +34,8 @@ std::tuple<RootId, std::string> parseFilterIdFromRootId(const RootId& rootId) {
       DBG7,
       "Decoded Original RootId Length: {}, Original RootId: {}, FilterID: {}",
       expectedLength.value(),
-      filterId,
-      root.value());
+      root.value(),
+      filterId);
   return {std::move(root), std::move(filterId)};
 }
 } // namespace facebook::eden

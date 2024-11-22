@@ -2198,6 +2198,7 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
         if (shouldBeOrIsNfsChannel()) {
           auto iosize = edenConfig->nfsIoSize.getValue();
           auto useReaddirplus = edenConfig->useReaddirplus.getValue();
+          auto useSoftMount = edenConfig->useSoftMounts.getValue();
 
           // Make sure that we are running on the EventBase while registering
           // the mount point.
@@ -2207,6 +2208,7 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
                readOnly,
                iosize,
                useReaddirplus,
+               useSoftMount,
                mountPromise = std::move(mountPromise),
                mountPath = std::move(mountPath)](
                   NfsServer::NfsMountInfo mountInfo) mutable {
@@ -2229,7 +2231,8 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
                         addr,
                         readOnly,
                         iosize,
-                        useReaddirplus)
+                        useReaddirplus,
+                        useSoftMount)
                     .thenTry([this,
                               mountPromise = std::move(mountPromise),
                               channel_2 = std::move(channel)](
@@ -2247,6 +2250,7 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
                 (void)readOnly;
                 (void)iosize;
                 (void)useReaddirplus;
+                (void)useSoftMount;
                 mountPromise->setValue();
                 channel_ = std::move(channel);
                 return folly::makeFutureWith([]() { NOT_IMPLEMENTED(); });
@@ -2294,10 +2298,7 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
             "failMountInitialization", mountPath.view());
         return serverState_->getPrivHelper()
             ->fuseMount(
-                mountPath.view(),
-                readOnly,
-                std::make_optional<folly::StringPiece>(
-                    edenConfig->fuseVfsType.getValue()))
+                mountPath.view(), readOnly, edenConfig->fuseVfsType.getValue())
             .thenTry(
                 [mountPath, mountPromise, this](Try<folly::File>&& fuseDevice)
                     -> folly::Future<folly::Unit> {

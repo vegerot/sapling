@@ -37,6 +37,7 @@ use futures::pin_mut;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use futures::Stream;
+use futures_stats::TimedFutureExt;
 use hostname::get_hostname;
 use megarepo_api::MegarepoApi;
 use mononoke_api::Mononoke;
@@ -105,7 +106,7 @@ impl AsyncMethodRequestWorker {
                     format!("{}/{}/{}", tw_job_cluster, tw_job_name, tw_task_id)
                 }
                 _ => format!(
-                    "megarepo_async_requests_worker/{}",
+                    "async_requests_worker/{}",
                     get_hostname().unwrap_or_else(|_| "unknown_hostname".to_string())
                 ),
             }
@@ -298,7 +299,8 @@ impl AsyncMethodRequestWorker {
 
         // Do the actual work.
         STATS::requested.add_value(1);
-        let work_fut = megarepo_async_request_compute(&ctx, self.mononoke, &self.megarepo, params);
+        let work_fut =
+            megarepo_async_request_compute(&ctx, self.mononoke, &self.megarepo, params).timed();
 
         // Start the loop that would keep saying that request is still being
         // processed
@@ -312,16 +314,16 @@ impl AsyncMethodRequestWorker {
         pin_mut!(work_fut);
         pin_mut!(keep_alive);
         match select(work_fut, keep_alive).await {
-            Either::Left((result, _)) => {
+            Either::Left(((stats, result), _)) => {
                 // We completed the request - let's mark it as complete
                 keep_alive_abort_handle.abort();
                 info!(
                     ctx.logger(),
                     "[{}] request complete, saving result", &req_id.0
                 );
-                ctx.scuba()
-                    .clone()
-                    .log_with_msg("Request complete, saving result", None);
+                let mut scuba = ctx.scuba().clone();
+                scuba.add_future_stats(&stats);
+                scuba.log_with_msg("Request complete, saving result", None);
 
                 // Save the result.
                 match result {
@@ -381,6 +383,7 @@ impl AsyncMethodRequestWorker {
     fn prepare_ctx(&self, ctx: &CoreContext, req_id: &RequestId, target: &str) -> CoreContext {
         let ctx = ctx.with_mutated_scuba(|mut scuba| {
             scuba.add("request_id", req_id.0.0);
+            scuba.add("request_type", req_id.1.0.clone());
             scuba
         });
 
@@ -468,6 +471,7 @@ mod test {
 
     use anyhow::Error;
     use fbinit::FacebookInit;
+    use mononoke_api::RepositoryId;
     use mononoke_macros::mononoke;
     use requests_table::RequestType;
     use source_control as thrift;
@@ -476,21 +480,22 @@ mod test {
 
     #[mononoke::fbinit_test]
     async fn test_request_stream_simple(fb: FacebookInit) -> Result<(), Error> {
-        let q = Arc::new(AsyncMethodRequestQueue::new_test_in_memory().unwrap());
+        let repo_id = RepositoryId::new(0);
+        let q = Arc::new(AsyncMethodRequestQueue::new_test_in_memory(Some(vec![repo_id])).unwrap());
         let ctx = CoreContext::test_mock(fb);
 
         let params = thrift::MegarepoSyncChangesetParams {
             cs_id: vec![],
             source_name: "name".to_string(),
             target: thrift::MegarepoTarget {
-                repo_id: Some(0),
+                repo_id: Some(repo_id.id() as i64),
                 bookmark: "book".to_string(),
                 ..Default::default()
             },
             target_location: vec![],
             ..Default::default()
         };
-        q.enqueue(&ctx, None, params).await?;
+        q.enqueue(&ctx, Some(&repo_id), params).await?;
 
         let will_exit = Arc::new(AtomicBool::new(false));
         let s = AsyncMethodRequestWorker::request_stream_inner(
@@ -516,21 +521,22 @@ mod test {
 
     #[mononoke::fbinit_test]
     async fn test_request_stream_clear_abandoned(fb: FacebookInit) -> Result<(), Error> {
-        let q = Arc::new(AsyncMethodRequestQueue::new_test_in_memory().unwrap());
+        let repo_id = RepositoryId::new(0);
+        let q = Arc::new(AsyncMethodRequestQueue::new_test_in_memory(Some(vec![repo_id])).unwrap());
         let ctx = CoreContext::test_mock(fb);
 
         let params = thrift::MegarepoSyncChangesetParams {
             cs_id: vec![],
             source_name: "name".to_string(),
             target: thrift::MegarepoTarget {
-                repo_id: Some(0),
+                repo_id: Some(repo_id.id() as i64),
                 bookmark: "book".to_string(),
                 ..Default::default()
             },
             target_location: vec![],
             ..Default::default()
         };
-        q.enqueue(&ctx, None, params).await?;
+        q.enqueue(&ctx, Some(&repo_id), params).await?;
 
         // Grab it from the queue...
         let dequed = q.dequeue(&ctx, &ClaimedBy("name".to_string())).await?;

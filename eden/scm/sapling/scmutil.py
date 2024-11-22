@@ -292,6 +292,7 @@ def callcatch(ui, req, func):
         error.PathMatcherError,
         error.RepoInitError,
         error.WorkingCopyError,
+        error.UncategorizedNativeError,
     ) as inst:
         ui.warn(_("%s\n") % inst, error=_("abort"))
     except ImportError as inst:
@@ -1453,7 +1454,7 @@ def contextnodesupportingwdir(ctx):
     # Neither `None` nor `wdirid` feels right here:
     if isinstance(ctx, context.overlayworkingctx):
         raise error.ProgrammingError(
-            "contextnodesupportingwdir doesn't support " "overlayworkingctx"
+            "contextnodesupportingwdir doesn't support overlayworkingctx"
         )
 
     return ctx.node()

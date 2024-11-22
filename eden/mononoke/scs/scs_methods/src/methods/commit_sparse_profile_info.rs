@@ -6,6 +6,7 @@
  */
 
 use anyhow::Result;
+use async_requests::types::CommitSparseProfileDeltaToken;
 use async_requests::types::CommitSparseProfileSizeToken;
 use context::CoreContext;
 use mononoke_api::sparse_profile::get_profile_delta_size;
@@ -41,35 +42,7 @@ impl SourceControlServiceImpl {
         let (repo, changeset, other) = self
             .repo_changeset_pair(ctx.clone(), &commit, &params.other_id)
             .await?;
-        let profiles = convert_profiles_params(params.profiles).await?;
-        let monitor = SparseProfileMonitoring::new(
-            repo.name(),
-            repo.sparse_profiles(),
-            repo.config().sparse_profiles_config.clone(),
-            profiles,
-        )?;
-        let profiles = monitor.get_monitoring_profiles(&changeset).await?;
-        let sizes_hashmap =
-            get_profile_delta_size(&ctx, &monitor, &changeset, &other, profiles).await;
-        let sizes = sizes_hashmap?
-            .into_iter()
-            .map(|(source, change)| {
-                (
-                    source,
-                    thrift::SparseProfileChange {
-                        change: convert(change),
-                        ..Default::default()
-                    },
-                )
-            })
-            .collect();
-        Ok(thrift::CommitSparseProfileDeltaResponse {
-            changed_sparse_profiles: Some(thrift::SparseProfileDeltaSizes {
-                size_changes: sizes,
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
+        commit_sparse_profile_delta_impl(&ctx, repo, changeset, other, params.profiles).await
     }
 
     pub(crate) async fn commit_sparse_profile_size_async(
@@ -94,6 +67,30 @@ impl SourceControlServiceImpl {
     ) -> Result<thrift::CommitSparseProfileSizePollResponse, scs_errors::ServiceError> {
         let token = CommitSparseProfileSizeToken(token);
         poll::<CommitSparseProfileSizeToken>(&ctx, &self.async_requests_queue, token).await
+    }
+
+    pub(crate) async fn commit_sparse_profile_delta_async(
+        &self,
+        ctx: CoreContext,
+        params: thrift::CommitSparseProfileDeltaParamsV2,
+    ) -> Result<thrift::CommitSparseProfileDeltaToken, scs_errors::ServiceError> {
+        let (repo, _changeset) = self.repo_changeset(ctx.clone(), &params.commit).await?;
+        enqueue::<thrift::CommitSparseProfileDeltaParamsV2>(
+            &ctx,
+            &self.async_requests_queue,
+            Some(&repo.repoid()),
+            params,
+        )
+        .await
+    }
+
+    pub(crate) async fn commit_sparse_profile_delta_poll(
+        &self,
+        ctx: CoreContext,
+        token: thrift::CommitSparseProfileDeltaToken,
+    ) -> Result<thrift::CommitSparseProfileDeltaPollResponse, scs_errors::ServiceError> {
+        let token = CommitSparseProfileDeltaToken(token);
+        poll::<CommitSparseProfileDeltaToken>(&ctx, &self.async_requests_queue, token).await
     }
 }
 
@@ -129,6 +126,43 @@ pub async fn commit_sparse_profile_size_impl(
             sizes,
             ..Default::default()
         },
+        ..Default::default()
+    })
+}
+
+pub async fn commit_sparse_profile_delta_impl(
+    ctx: &CoreContext,
+    repo: RepoContext<Repo>,
+    changeset: ChangesetContext<Repo>,
+    other: ChangesetContext<Repo>,
+    profiles: thrift::SparseProfiles,
+) -> Result<thrift::CommitSparseProfileDeltaResponse, scs_errors::ServiceError> {
+    let profiles = convert_profiles_params(profiles).await?;
+    let monitor = SparseProfileMonitoring::new(
+        repo.name(),
+        repo.sparse_profiles(),
+        repo.config().sparse_profiles_config.clone(),
+        profiles,
+    )?;
+    let profiles = monitor.get_monitoring_profiles(&changeset).await?;
+    let sizes_hashmap = get_profile_delta_size(ctx, &monitor, &changeset, &other, profiles).await;
+    let sizes = sizes_hashmap?
+        .into_iter()
+        .map(|(source, change)| {
+            (
+                source,
+                thrift::SparseProfileChange {
+                    change: convert(change),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    Ok(thrift::CommitSparseProfileDeltaResponse {
+        changed_sparse_profiles: Some(thrift::SparseProfileDeltaSizes {
+            size_changes: sizes,
+            ..Default::default()
+        }),
         ..Default::default()
     })
 }

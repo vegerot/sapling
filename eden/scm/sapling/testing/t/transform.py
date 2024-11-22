@@ -43,7 +43,9 @@ from __future__ import annotations
 
 import textwrap
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+
+from itertools import product
+from typing import Callable, List, Optional, Tuple, Union
 
 
 def transform(
@@ -296,7 +298,7 @@ def rewriteblocks(
         ... end''', registertestcase=lambda _case: None))
         #if case1
         <BLANKLINE>
-        if testcase == 'case1':
+        if all([t.hasfeature(f) for f in 'case1'.split()]):
         <BLANKLINE>
             checkoutput(sheval('echo case1\n'), '', src='$ echo case1\n', srcloc=2, outloc=3, endloc=3, indent=2, filename='')
         <BLANKLINE>
@@ -308,7 +310,7 @@ def rewriteblocks(
         #endif
         #if case2
         <BLANKLINE>
-        if testcase == 'case2':
+        if all([t.hasfeature(f) for f in 'case2'.split()]):
         <BLANKLINE>
             checkoutput(sheval('echo case2\n'), '', src='$ echo case2\n', srcloc=7, outloc=8, endloc=8, indent=2, filename='')
         <BLANKLINE>
@@ -362,6 +364,11 @@ def rewriteblocks(
     ifstack = []
 
     testcases = []
+    testcase_feature_names = set()
+
+    def is_rawfeatures_for_testcases(rawfeatures):
+        features = set(rawfeatures.replace("no-", "").split())
+        return features.issubset(testcase_feature_names)
 
     while i < n:
         info = lineinfos[i]
@@ -408,10 +415,14 @@ def rewriteblocks(
             if missing:
                 msg = f"missing feature: {' '.join(missing)}"
                 appendline(f'raise __import__("unittest").SkipTest({repr(msg)})\n')
-        elif info.line.startswith("#testcases "):
+        elif info.line.startswith("#testcases"):
             assert registertestcase is not None
-            newcases = info.line.split()[1:]
+            newcases = parse_testcases(info.line)
             for testcase in newcases:
+                if isinstance(testcase, str):
+                    testcase_feature_names.update([testcase])
+                else:
+                    testcase_feature_names.update(testcase)
                 registertestcase(testcase)
             testcases.extend(newcases)
         elif info.line.startswith("#if "):
@@ -421,9 +432,11 @@ def rewriteblocks(
             appendline(info.line)
             ifstack.append(rawfeatures)
 
-            if rawfeatures in testcases:
+            if is_rawfeatures_for_testcases(rawfeatures):
                 maybeseparate("python")
-                appendline(f"if testcase == '{rawfeatures}':\n")
+                appendline(
+                    f"if all([t.hasfeature(f) for f in '{rawfeatures}'.split()]):\n"
+                )
                 extraindent += 1
                 condition = True
             elif hasfeature and all(hasfeature(f) for f in features):
@@ -433,7 +446,7 @@ def rewriteblocks(
             conditionstack.append((condition, condition and conditionstacktopeval()))
         elif info.line == "#else\n":
             maybeseparate("if")
-            if ifstack[-1] in testcases:
+            if is_rawfeatures_for_testcases(ifstack[-1]):
                 maybeseparate("python")
                 extraindent -= 1
                 appendline(info.line)
@@ -453,7 +466,7 @@ def rewriteblocks(
             except IndexError as e:
                 raise e
 
-            if ifstack.pop() in testcases:
+            if is_rawfeatures_for_testcases(ifstack.pop()):
                 extraindent -= 1
 
             appendline(info.line)
@@ -470,3 +483,37 @@ def rewriteblocks(
         i = nexti
 
     return "".join(newlines)
+
+
+def parse_testcases(testcases: str) -> List[Union[str, Tuple[str]]]:
+    r"""Helper function to parse "#testcases " directive.
+
+    Support of the previous syntax where a list of simple test cases are provided:
+
+        >>> parse_testcases("#testcases CASE1 CASE2")
+        ['CASE1', 'CASE2']
+
+    Support of parsing the string as Python code when seeing "(":
+
+        >>> parse_testcases("#testcases('FEATURE_1', 'FEATURE_2')")
+        ['FEATURE_1', 'FEATURE_2']
+
+    With Python code, we can combine different cases to get a mixed testcase consisting of
+    independent features:
+
+        >>> parse_testcases("#testcases(*product(['FEATURE_1', None], ['FEATURE_2', None]))")
+        [('FEATURE_1', 'FEATURE_2'), ('FEATURE_1', None), (None, 'FEATURE_2'), (None, None)]
+
+    """
+    prefix = "#testcases "
+
+    if testcases.startswith(prefix):
+        return testcases[len(prefix) :].split()
+
+    # treat it as a python expression to evaluate
+    # ignore the leading "#"
+    python_str = testcases[1:]
+
+    res = eval(python_str, {"product": product, "testcases": lambda *args: args})
+
+    return list(res)

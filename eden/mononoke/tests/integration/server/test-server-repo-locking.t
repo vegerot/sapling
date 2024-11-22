@@ -17,21 +17,21 @@
 
   $ start_and_wait_for_mononoke_server
 
-  $ mononoke_newadmin locking status
+  $ mononoke_admin locking status
   repo                 Unlocked
 
 Lock the repo
-  $ mononoke_newadmin locking lock -R repo --reason "integration test"
+  $ mononoke_admin locking lock -R repo --reason "integration test"
   repo locked
 
 Show it is locked
-  $ mononoke_newadmin locking status
+  $ mononoke_admin locking status
   repo                 Locked("integration test")
 
 Can still clone the repo
   $ hg clone -q mono:repo repo
   $ cd repo
-  $ enable infinitepush commitcloud pushrebase
+  $ enable commitcloud pushrebase
   $ hg checkout -q '.^' 
   $ echo D > D
   $ hg commit -Aqm D
@@ -65,7 +65,7 @@ Cannot push to the server
   [255]
 
 Unlock the repo
-  $ mononoke_newadmin locking unlock -R repo
+  $ mononoke_admin locking unlock -R repo
   repo unlocked
 
 Now we can push
@@ -79,11 +79,11 @@ Now we can push
 
   $ hg pull -q
   $ tglogp
-  o  1e21255e651f public 'D'
+  @  9c00c53d25b3 draft 'D'
   │
-  │ @  9c00c53d25b3 draft 'D'
+  │ o  1e21255e651f public 'D'
   │ │
-  o │  d3b399ca8757 public 'C'
+  │ o  d3b399ca8757 public 'C'
   ├─╯
   o  80521a640a0c public 'B'
   │

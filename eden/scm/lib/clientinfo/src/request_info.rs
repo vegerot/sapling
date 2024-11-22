@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 use std::cell::RefCell;
@@ -147,6 +147,8 @@ pub enum ClientEntryPoint {
     BookmarkService,
     BookmarkServiceClientCli,
     MononokeGitServer,
+    Git,
+    ModernSync,
 }
 
 impl ClientRequestInfo {
@@ -227,6 +229,7 @@ impl Display for ClientEntryPoint {
             ClientEntryPoint::SaplingRemoteApiReplay => "eden_api_replay",
             ClientEntryPoint::MononokeHgSync => "hg_sync",
             ClientEntryPoint::MononokeCasSync => "mononoke_re_cas_sync",
+            ClientEntryPoint::ModernSync => "modern_sync",
             ClientEntryPoint::CurlTest => "curl_test",
             ClientEntryPoint::MirrorHgCommits => "mirror_hg_commits",
             ClientEntryPoint::StreamingClone => "streaming_clone",
@@ -234,6 +237,7 @@ impl Display for ClientEntryPoint {
             ClientEntryPoint::BookmarkService => "bookmark_service",
             ClientEntryPoint::BookmarkServiceClientCli => "bookmark_service_client_cli",
             ClientEntryPoint::MononokeGitServer => "mononoke_git_server",
+            ClientEntryPoint::Git => "git",
         };
         write!(f, "{}", out)
     }
@@ -268,6 +272,7 @@ impl TryFrom<&str> for ClientEntryPoint {
             "eden_api_replay" => Ok(ClientEntryPoint::SaplingRemoteApiReplay),
             "hg_sync" => Ok(ClientEntryPoint::MononokeHgSync),
             "mononoke_re_cas_sync" => Ok(ClientEntryPoint::MononokeCasSync),
+            "modern_sync" => Ok(ClientEntryPoint::ModernSync),
             "curl_test" => Ok(ClientEntryPoint::CurlTest),
             "mirror_hg_commits" => Ok(ClientEntryPoint::MirrorHgCommits),
             "streaming_clone" => Ok(ClientEntryPoint::StreamingClone),
@@ -275,6 +280,7 @@ impl TryFrom<&str> for ClientEntryPoint {
             "bookmark_service" => Ok(ClientEntryPoint::BookmarkService),
             "bookmark_service_client_clie" => Ok(ClientEntryPoint::BookmarkServiceClientCli),
             "mononoke_git_server" => Ok(ClientEntryPoint::MononokeGitServer),
+            "git" => Ok(ClientEntryPoint::Git),
             _ => Err(anyhow!("Invalid client entry point")),
         }
     }
@@ -457,6 +463,11 @@ mod tests {
             Some(ClientEntryPoint::MononokeGitServer),
             ClientEntryPoint::try_from(ClientEntryPoint::MononokeGitServer.to_string().as_ref())
                 .ok()
+        );
+
+        assert_eq!(
+            Some(ClientEntryPoint::Git),
+            ClientEntryPoint::try_from(ClientEntryPoint::Git.to_string().as_ref()).ok()
         );
     }
 }

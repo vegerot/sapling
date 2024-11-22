@@ -15,7 +15,6 @@ use anyhow::Error;
 use async_trait::async_trait;
 use cached_config::ConfigHandle;
 use fbinit::FacebookInit;
-use permission_checker::MononokeIdentity;
 use permission_checker::MononokeIdentitySet;
 use permission_checker::MononokeIdentitySetExt;
 use scuba_ext::MononokeScubaSampleBuilder;
@@ -29,12 +28,8 @@ mod oss;
 
 #[cfg(fbcode_build)]
 pub use facebook::create_rate_limiter;
-#[cfg(fbcode_build)]
-pub use facebook::get_region_capacity;
 #[cfg(not(fbcode_build))]
 pub use oss::create_rate_limiter;
-#[cfg(not(fbcode_build))]
-pub use oss::get_region_capacity;
 pub use rate_limiting_config::RateLimitStatus;
 
 pub mod config;
@@ -64,11 +59,11 @@ pub trait RateLimiter {
         scuba: &mut MononokeScubaSampleBuilder,
     ) -> LoadShedResult;
 
-    fn bump_load(&self, metric: Metric, load: LoadCost);
+    fn bump_load(&self, metric: Metric, scope: Scope, load: LoadCost);
 
     fn category(&self) -> &str;
 
-    fn commits_per_author_limit(&self) -> Option<RateLimitBody>;
+    fn commits_per_author_limit(&self) -> Option<RateLimit>;
 
     fn total_file_changes_limit(&self) -> Option<RateLimitBody>;
 }
@@ -112,11 +107,8 @@ pub struct RateLimitBody {
 
 #[derive(Debug, Clone)]
 pub struct MononokeRateLimitConfig {
-    pub region_weight: f64,
     pub rate_limits: Vec<RateLimit>,
     pub load_shed_limits: Vec<LoadShedLimit>,
-    #[allow(dead_code)]
-    commits_per_author: RateLimitBody,
     #[allow(dead_code)]
     total_file_changes: Option<RateLimitBody>,
 }
@@ -127,7 +119,7 @@ pub struct RateLimit {
     #[allow(dead_code)]
     target: Option<Target>,
     #[allow(dead_code)]
-    metric: Metric,
+    fci_metric: FciMetric,
 }
 
 #[cfg(fbcode_build)]
@@ -217,6 +209,20 @@ pub enum Metric {
     TotalManifests,
     GetpackFiles,
     Commits,
+    CommitsPerAuthor,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum Scope {
+    Global,
+    Regional,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct FciMetric {
+    metric: Metric,
+    window: Duration,
+    scope: Scope,
 }
 
 #[must_use]
@@ -230,12 +236,9 @@ pub enum RateLimitReason {
 
 #[derive(Debug, Clone)]
 pub enum Target {
-    NotTarget(Box<Target>),
-    AndTarget(Vec<Target>),
-    OrTarget(Vec<Target>),
-    Identity(MononokeIdentity),
     StaticSlice(StaticSlice),
     MainClientId(String),
+    Identities(MononokeIdentitySet),
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -259,6 +262,13 @@ pub struct StaticSlice {
     // This is hashed with a client's hostname to allow us to change
     // which percentage of hosts are in a static slice.
     nonce: String,
+    target: StaticSliceTarget,
+}
+
+#[derive(Debug, Clone)]
+pub enum StaticSliceTarget {
+    Identities(MononokeIdentitySet),
+    MainClientId(String),
 }
 
 impl Target {
@@ -268,19 +278,49 @@ impl Target {
         main_client_id: Option<&str>,
     ) -> bool {
         match self {
-            Self::NotTarget(t) => !t.matches_client(identities, None),
-            Self::AndTarget(ts) => ts.iter().all(|t| t.matches_client(identities, None)),
-            Self::OrTarget(ts) => ts.iter().any(|t| t.matches_client(identities, None)),
-            Self::Identity(i) => match identities {
-                Some(client_idents) => client_idents.contains(i),
-                None => false,
-            },
+            Self::Identities(target_identities) => {
+                match identities {
+                    Some(identities) => {
+                        // Check that identities is a subset of client_idents
+                        target_identities.is_subset(identities)
+                    }
+                    None => false,
+                }
+            }
             Self::MainClientId(id) => match main_client_id {
                 Some(client_id) => client_id == id,
                 None => false,
             },
-            Self::StaticSlice(s) => in_throttled_slice(identities, s.slice_pct, &s.nonce),
+            Self::StaticSlice(s) => {
+                // Check that identities is a subset of client_idents
+                match matches_static_slice_target(&s.target, identities, main_client_id) {
+                    true => in_throttled_slice(identities, s.slice_pct, &s.nonce),
+                    false => false,
+                }
+            }
         }
+    }
+}
+
+fn matches_static_slice_target(
+    target: &StaticSliceTarget,
+    identities: Option<&MononokeIdentitySet>,
+    main_client_id: Option<&str>,
+) -> bool {
+    match target {
+        StaticSliceTarget::Identities(target_identities) => {
+            match identities {
+                Some(identities) => {
+                    // Check that identities is a subset of client_idents
+                    target_identities.is_subset(identities)
+                }
+                None => false,
+            }
+        }
+        StaticSliceTarget::MainClientId(id) => match main_client_id {
+            Some(client_id) => client_id == id,
+            None => false,
+        },
     }
 }
 
@@ -305,40 +345,31 @@ fn in_throttled_slice(
 #[cfg(test)]
 mod test {
     use mononoke_macros::mononoke;
+    use permission_checker::MononokeIdentity;
 
     use super::*;
 
     #[mononoke::test]
     fn test_target_matches() {
         let test_ident = MononokeIdentity::new("USER", "foo");
-        let test2_ident = MononokeIdentity::new("USER", "bar");
-        let test3_ident = MononokeIdentity::new("USER", "baz");
+        let test2_ident = MononokeIdentity::new("USER", "baz");
         let test_client_id = String::from("test_client_id");
-
-        let ident_target = Target::Identity(test_ident.clone());
-        let ident2_target = Target::Identity(test2_ident);
-        let ident3_target = Target::Identity(test3_ident.clone());
         let empty_idents = Some(MononokeIdentitySet::new());
+
+        let ident_target = Target::Identities([test_ident.clone()].into());
 
         assert!(!ident_target.matches_client(empty_idents.as_ref(), None));
 
         let mut idents = MononokeIdentitySet::new();
-        idents.insert(test_ident);
-        idents.insert(test3_ident);
+        idents.insert(test_ident.clone());
+        idents.insert(test2_ident.clone());
         let idents = Some(idents);
 
         assert!(ident_target.matches_client(idents.as_ref(), None));
 
-        let and_target = Target::AndTarget(vec![ident_target.clone(), ident3_target]);
+        let two_idents = Target::Identities([test_ident, test2_ident].into());
 
-        assert!(and_target.matches_client(idents.as_ref(), None));
-
-        let or_target = Target::OrTarget(vec![ident_target, ident2_target.clone()]);
-
-        assert!(or_target.matches_client(idents.as_ref(), None));
-
-        let not_target = Target::NotTarget(Box::new(ident2_target));
-        assert!(not_target.matches_client(idents.as_ref(), None));
+        assert!(two_idents.matches_client(idents.as_ref(), None));
 
         let client_id_target = Target::MainClientId(test_client_id.clone());
         assert!(client_id_target.matches_client(None, Some(&test_client_id)))
@@ -385,14 +416,16 @@ mod test {
         let test3_ident = MononokeIdentity::new("MACHINE", "abc125.abc.facebook.com");
         let test4_ident = MononokeIdentity::new("MACHINE", "abc124.abc.facebook.com");
 
-        let ident_target = Target::Identity(test2_ident.clone());
-        let twenty_pct_target = Target::StaticSlice(StaticSlice {
+        let ident_target = Target::Identities([test2_ident.clone()].into());
+        let twenty_pct_service_identity = Target::StaticSlice(StaticSlice {
             slice_pct: 20.try_into().unwrap(),
             nonce: "nonce".into(),
+            target: StaticSliceTarget::Identities([test2_ident.clone()].into()),
         });
-        let hundred_pct_target = Target::StaticSlice(StaticSlice {
+        let hundred_pct_service_identity = Target::StaticSlice(StaticSlice {
             slice_pct: 100.try_into().unwrap(),
             nonce: "nonce".into(),
+            target: StaticSliceTarget::Identities([test2_ident.clone()].into()),
         });
 
         let mut idents = MononokeIdentitySet::new();
@@ -411,23 +444,15 @@ mod test {
         assert!(ident_target.matches_client(idents1.as_ref(), None));
 
         // 20% of SERVICE_IDENTITY: bar. ratelimited host
-        let twenty_pct_service_identity =
-            Target::AndTarget(vec![ident_target.clone(), twenty_pct_target.clone()]);
         assert!(twenty_pct_service_identity.matches_client(idents1.as_ref(), None));
 
         // 20% of SERVICE_IDENTITY: bar. not ratelimited host
-        let twenty_pct_service_identity =
-            Target::AndTarget(vec![ident_target.clone(), twenty_pct_target]);
         assert!(!twenty_pct_service_identity.matches_client(idents2.as_ref(), None));
 
         // 100% of SERVICE_IDENTITY: bar
-        let hundred_pct_service_identity =
-            Target::AndTarget(vec![ident_target.clone(), hundred_pct_target.clone()]);
         assert!(hundred_pct_service_identity.matches_client(idents1.as_ref(), None));
 
         // 100% of SERVICE_IDENTITY: bar
-        let hundred_pct_service_identity =
-            Target::AndTarget(vec![ident_target.clone(), hundred_pct_target]);
         assert!(hundred_pct_service_identity.matches_client(idents2.as_ref(), None));
     }
 }

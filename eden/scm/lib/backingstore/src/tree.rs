@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 //! Representation of tree in EdenFS.
@@ -65,7 +65,7 @@ impl TreeEntry {
 
         let entry = TreeEntry {
             hash: hash.into_byte_array(),
-            name: path.as_ref().as_byte_slice().to_vec(),
+            name: path.as_byte_slice().to_vec(),
             ttype,
             has_size: size.is_some(),
             size: size.map_or(0, |size| size),

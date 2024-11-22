@@ -1,20 +1,23 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 pub use anyhow::anyhow;
 pub use anyhow::Result;
 pub use async_trait::async_trait;
 pub use cas_client::CasClient;
+pub use itertools::Either;
+pub use itertools::Itertools;
 pub use once_cell::sync::OnceCell;
 pub use tracing;
 pub use types::Blake3;
 pub use types::CasDigest;
 pub use types::CasDigestType;
 pub use types::CasFetchedStats;
+pub use types::CasPrefetchOutcome;
 
 #[macro_export]
 macro_rules! re_client {
@@ -22,13 +25,19 @@ macro_rules! re_client {
         use futures::stream;
         use futures::stream::BoxStream;
         use futures::StreamExt;
+        use futures::TryStreamExt;
         use re_cas_common::split_up_to_max_bytes;
+        use re_cas_common::Itertools;
         use re_client_lib::DownloadRequest;
+        use re_client_lib::DownloadDigestsIntoCacheRequest;
+        use re_client_lib::DownloadStreamRequest;
+        use re_client_lib::REClientError;
         use re_client_lib::TCode;
         use re_client_lib::TDigest;
         use re_client_lib::THashAlgo;
         use re_client_lib::TStorageBackendType;
         use re_client_lib::TStorageBackendStats;
+        use re_client_lib::TLocalCacheStats;
 
         impl $struct {
             fn client(&self) -> Result<&REClient> {
@@ -52,7 +61,7 @@ macro_rules! re_client {
             })
         }
 
-        fn parse_stats(stats_entries: impl Iterator<Item=(TStorageBackendType, TStorageBackendStats)>) -> $crate::CasFetchedStats {
+        fn parse_stats(stats_entries: impl Iterator<Item=(TStorageBackendType, TStorageBackendStats)>, local_cache_stats: TLocalCacheStats) -> $crate::CasFetchedStats {
             let mut stats = $crate::CasFetchedStats::default();
             for (backend, dstats) in stats_entries {
                 match backend {
@@ -63,6 +72,10 @@ macro_rules! re_client {
                         _ => {}
                 }
             }
+            stats.hits_files_local_cache = local_cache_stats.hits_files as u64;
+            stats.hits_bytes_local_cache = local_cache_stats.hits_bytes as u64;
+            stats.misses_files_local_cache = local_cache_stats.misses_files as u64;
+            stats.misses_bytes_local_cache = local_cache_stats.misses_bytes as u64;
             stats
         }
 
@@ -76,6 +89,42 @@ macro_rules! re_client {
             {
                 stream::iter(split_up_to_max_bytes(digests, self.fetch_limit.value()))
                     .map(move |digests| async move {
+
+                        if self.use_streaming_dowloads && digests.len() == 1 && digests.first().unwrap().size >= self.fetch_limit.value() {
+                            // Single large file, fetch it via the streaming API to avoid memory issues on CAS side.
+                            let digest = digests.first().unwrap();
+                            $crate::tracing::debug!(target: "cas", concat!(stringify!($struct), " streaming {} {}(s)"), digests.len(), log_name);
+                            let request =  DownloadStreamRequest {
+                                digest: to_re_digest(digest),
+                                ..Default::default()
+                            };
+
+                            // Unfortunately, the streaming API does not return the storage stats, so it won't be added to the stats.
+                            let stats = $crate::CasFetchedStats::default();
+
+                            let response = self.client()?
+                                .download_stream(self.metadata.clone(), request)
+                                .await;
+
+                            if let Err(ref err) = response {
+                                if let Some(inner) = err.downcast_ref::<REClientError>() {
+                                    if inner.code == TCode::NOT_FOUND {
+                                        return Ok((stats, vec![(digest.to_owned(), Ok(None))]));
+                                    }
+                                }
+                            }
+
+                            let mut bytes: Vec<u8> = Vec::with_capacity(digest.size as usize);
+                            let mut response_stream = response?;
+                            while let Some(chunk) = response_stream.next().await {
+                                bytes.extend(chunk?.data);
+                            }
+
+                            return Ok((stats, vec![(digest.to_owned(), Ok(Some(bytes)))]));
+                        }
+
+                        // Fetch digests via the regular API (download inlined digests).
+
                         $crate::tracing::debug!(target: "cas", concat!(stringify!($struct), " fetching {} {}(s)"), digests.len(), log_name);
 
                         let request = DownloadRequest {
@@ -88,7 +137,9 @@ macro_rules! re_client {
                             .download(self.metadata.clone(), request)
                             .await?;
 
-                        let stats = parse_stats(response.storage_stats.per_backend_stats.into_iter());
+                        let local_cache_stats = response.local_cache_stats;
+
+                        let stats = parse_stats(response.storage_stats.per_backend_stats.into_iter(), local_cache_stats);
 
                         let data = response.inlined_blobs
                             .unwrap_or_default()
@@ -116,7 +167,76 @@ macro_rules! re_client {
                     .buffer_unordered(self.fetch_concurrency)
                     .boxed()
             }
+
+        /// Prefetch digests into the cache.
+        /// Returns a stream of (stats, digests_prefetched, digests_not_found) tuples.
+        async fn prefetch<'a>(
+            &'a self,
+            digests: &'a [$crate::CasDigest],
+            log_name: $crate::CasDigestType,
+        ) -> BoxStream<'a, $crate::Result<($crate::CasFetchedStats, Vec<$crate::CasDigest>, Vec<$crate::CasDigest>)>>
+        {
+            stream::iter(split_up_to_max_bytes(digests, self.fetch_limit.value()))
+                .map(move |digests| async move {
+                    $crate::tracing::debug!(target: "cas", concat!(stringify!($struct), " prefetching {} {}(s)"), digests.len(), log_name);
+
+                    let request = DownloadDigestsIntoCacheRequest {
+                        digests: digests.iter().map(to_re_digest).collect(),
+                        throw_on_error: false,
+                        ..Default::default()
+                    };
+
+                    let response = self.client()?
+                        .download_digests_into_cache(self.metadata.clone(), request)
+                        .await;
+
+                    // Unfortunately, the download_digests_into_cache fails entirely with NOT_FOUND if a digest is not found.
+                    // For now, let's report that everything is missing instead of failing the entire prefetch.
+                    // The issue should be fixed on RE side, so that they can provide correct per digest statuses.
+                    if let Err(ref err) = response {
+                        if let Some(inner) = err.downcast_ref::<REClientError>() {
+                            if inner.code == TCode::NOT_FOUND {
+                                return Ok(($crate::CasFetchedStats::default(), Vec::new(), digests.to_vec()));
+                            }
+                        }
+                    }
+
+                    let response = response?;
+                    let local_cache_stats = response.local_cache_stats;
+
+                    let stats = parse_stats(response.storage_stats.per_backend_stats.into_iter(), local_cache_stats);
+
+                    let (digests_prefetched, digests_not_found) = response.digests_with_status
+                        .into_iter()
+                        .map(|blob| {
+                            let digest = from_re_digest(&blob.digest)?;
+                            match blob.status.code {
+                                TCode::OK => Ok($crate::CasPrefetchOutcome::Prefetched(digest)),
+                                TCode::NOT_FOUND => {
+                                    $crate::tracing::warn!(target: "cas", "digest not found and can not be prefetched: {:?}", digest);
+                                    Ok($crate::CasPrefetchOutcome::Missing(digest))
+                                },
+                                _ => Err($crate::anyhow!(
+                                        "bad status (code={}, message={}, group={})",
+                                        blob.status.code,
+                                        blob.status.message,
+                                        blob.status.group
+                                    )),
+                            }
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                        .into_iter()
+                        .partition_map(|outcome| match outcome {
+                            $crate::CasPrefetchOutcome::Prefetched(digest) => $crate::Either::Left(digest),
+                            $crate::CasPrefetchOutcome::Missing(digest) => $crate::Either::Right(digest),
+                        });
+
+                    Ok((stats, digests_prefetched, digests_not_found))
+                })
+                .buffer_unordered(self.fetch_concurrency)
+                .boxed()
         }
+    }
     };
 }
 

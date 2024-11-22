@@ -658,17 +658,16 @@ impl_async_svc_method_types_legacy! {
 
 // Params and result types for async_ping
 
-impl_async_svc_method_types_legacy! {
+impl_async_svc_method_types! {
     method_name => "async_ping",
     request_struct => AsyncPing,
 
     params_value_thrift_type => AsyncPingParams,
     params_union_variant => async_ping_params,
 
-    result_value_thrift_type => AsyncPingResult,
+    response_type => AsyncPingResponse,
     result_union_variant => async_ping_result,
 
-    response_type => AsyncPingResponse,
     poll_response_type => AsyncPingPollResponse,
     token_type => AsyncPingToken,
     token_thrift_type => AsyncPingToken,
@@ -699,6 +698,32 @@ impl_async_svc_method_types! {
             "repo: {}, id: {}",
             self.commit.repo,
             self.commit.id
+        )
+    }
+}
+
+// Params and result types for commit_sparse_profile_delta_async
+
+impl_async_svc_method_types! {
+    method_name => "commit_sparse_profile_delta_async",
+    request_struct => CommitSparseProfileDelta,
+
+    params_value_thrift_type => CommitSparseProfileDeltaParamsV2,
+    params_union_variant => commit_sparse_profile_delta_params,
+
+    response_type => CommitSparseProfileDeltaResponse,
+    result_union_variant => commit_sparse_profile_delta_result,
+
+    poll_response_type => CommitSparseProfileDeltaPollResponse,
+    token_type => CommitSparseProfileDeltaToken,
+    token_thrift_type => CommitSparseProfileDeltaToken,
+
+    fn target(&self: ThriftParams) -> String {
+        format!(
+            "repo: {}, commit: {}, other: {}",
+            self.commit.repo,
+            self.commit.id,
+            self.other_id,
         )
     }
 }
@@ -754,6 +779,9 @@ impl AsynchronousRequestParams {
             }
             ThriftAsynchronousRequestParams::async_ping_params(params) => Ok(params.target()),
             ThriftAsynchronousRequestParams::commit_sparse_profile_size_params(params) => {
+                Ok(params.target())
+            }
+            ThriftAsynchronousRequestParams::commit_sparse_profile_delta_params(params) => {
                 Ok(params.target())
             }
             ThriftAsynchronousRequestParams::UnknownField(union_tag) => {

@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 use std::collections::BTreeMap;
@@ -33,8 +33,7 @@ use crate::BareGit;
 ///
 /// `dot_dir` is expected to be something like `<prefix>/.git/sl`.
 pub fn maybe_init_inside_dotgit(root_path: &Path, ident: Identity) -> Result<()> {
-    let dot_dir = ident.dot_dir();
-    if dot_dir != ".git/sl" {
+    if !ident.is_dot_git() {
         return Ok(());
     }
 

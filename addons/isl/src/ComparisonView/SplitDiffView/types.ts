@@ -11,6 +11,8 @@ import type {Comparison} from 'shared/Comparison';
 
 type ContextId = {path: string; comparison: Comparison};
 
+export type DiffViewMode = 'split' | 'unified';
+
 /**
  * Context used to render SplitDiffView
  */
@@ -26,6 +28,7 @@ export type Context = {
     start: OneIndexedLineNumber,
     numLines: number,
   ): Promise<Result<Array<string>>>;
+  displayLineNumbers?: boolean;
   /** A React hook that gives a string value used as an effect dependency. If this value changes, the comparison will be considered invalidated and must be refreshed.
    * This is a hook so it can trigger rerenders. */
   useComparisonInvalidationKeyHook?: () => string;
@@ -37,7 +40,7 @@ export type Context = {
    * Whether to render as a side-by-side diff view, or a unified view where deleted and added lines are interleaved.
    * TODO: make this controllable / configurable / responsive based on screen width
    */
-  display: 'split' | 'unified';
+  display: DiffViewMode;
 };
 
 export type OneIndexedLineNumber = Exclude<number, 0>;

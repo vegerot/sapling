@@ -273,6 +273,8 @@ pub struct RepoConfig {
     pub mononoke_cas_sync_config: Option<MononokeCasSyncConfig>,
     /// All Git related configs (e.g. Git Server and Git-only repos)
     pub git_configs: GitConfigs,
+    /// Configuration for the modern sync job
+    pub modern_sync_config: Option<ModernSyncConfig>,
 }
 
 /// Config determining if the repo is deep sharded in the context of a service.
@@ -317,6 +319,10 @@ pub enum ShardedService {
     MononokeGitServer,
     /// Repo Metadata Logger,
     RepoMetadataLogger,
+    /// Modern Sync Job
+    ModernSync,
+    /// Bookmark Service
+    BookmarkService,
 }
 
 /// Indicates types of commit hashes used in a repo context.
@@ -362,6 +368,9 @@ pub struct DerivedDataConfig {
 
     /// Name of scuba table to log all derivation queue operations
     pub derivation_queue_scuba_table: Option<String>,
+
+    /// Config to use for remote derivation
+    pub remote_derivation_config: Option<RemoteDerivationConfig>,
 }
 
 impl DerivedDataConfig {
@@ -479,6 +488,17 @@ pub struct GitDeltaManifestV2Config {
     pub max_inlined_delta_size: u64,
     /// Chunk size for delta instructions.
     pub delta_chunk_size: u64,
+}
+
+/// Config for remote derivation
+#[derive(Eq, Clone, Debug, PartialEq)]
+pub enum RemoteDerivationConfig {
+    /// Shardmanager tier for remote derivation
+    ShardManagerTier(String),
+    /// SMC tier for remote derivation
+    SmcTier(String),
+    /// host:port string for remote derivation
+    HostPort(String),
 }
 
 impl RepoConfig {
@@ -1826,6 +1846,13 @@ pub struct MononokeCasSyncConfig {
     pub main_bookmark_to_sync: String,
     /// Enabling it would expand the sync to all the bookmarks
     pub sync_all_bookmarks: bool,
+}
+
+/// Repo-specific configuration parameters for modern sync job for a specific job variant
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct ModernSyncConfig {
+    /// Edenapi url to use for modern sync
+    pub url: String,
 }
 
 /// Destination for telemetry logging.

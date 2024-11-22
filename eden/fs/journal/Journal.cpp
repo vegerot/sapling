@@ -101,30 +101,35 @@ Journal::Journal(EdenStatsPtr edenStats) : edenStats_{std::move(edenStats)} {
   edenStats_->increment(&JournalStats::truncatedReads, 0);
 }
 
-void Journal::recordCreated(RelativePathPiece fileName) {
-  addDelta(FileChangeJournalDelta(fileName, FileChangeJournalDelta::CREATED));
+void Journal::recordCreated(RelativePathPiece fileName, dtype_t type) {
+  addDelta(
+      FileChangeJournalDelta(fileName, type, FileChangeJournalDelta::CREATED));
 }
 
-void Journal::recordRemoved(RelativePathPiece fileName) {
-  addDelta(FileChangeJournalDelta(fileName, FileChangeJournalDelta::REMOVED));
+void Journal::recordRemoved(RelativePathPiece fileName, dtype_t type) {
+  addDelta(
+      FileChangeJournalDelta(fileName, type, FileChangeJournalDelta::REMOVED));
 }
 
-void Journal::recordChanged(RelativePathPiece fileName) {
-  addDelta(FileChangeJournalDelta(fileName, FileChangeJournalDelta::CHANGED));
+void Journal::recordChanged(RelativePathPiece fileName, dtype_t type) {
+  addDelta(
+      FileChangeJournalDelta(fileName, type, FileChangeJournalDelta::CHANGED));
 }
 
 void Journal::recordRenamed(
     RelativePathPiece oldName,
-    RelativePathPiece newName) {
+    RelativePathPiece newName,
+    dtype_t type) {
   addDelta(FileChangeJournalDelta(
-      oldName, newName, FileChangeJournalDelta::RENAMED));
+      oldName, newName, type, FileChangeJournalDelta::RENAMED));
 }
 
 void Journal::recordReplaced(
     RelativePathPiece oldName,
-    RelativePathPiece newName) {
+    RelativePathPiece newName,
+    dtype_t type) {
   addDelta(FileChangeJournalDelta(
-      oldName, newName, FileChangeJournalDelta::REPLACED));
+      oldName, newName, type, FileChangeJournalDelta::REPLACED));
 }
 
 void Journal::recordHashUpdate(RootId toHash) {
@@ -485,6 +490,28 @@ std::unique_ptr<JournalDeltaRange> Journal::accumulateRange(
   return result;
 }
 
+bool Journal::forEachDelta(
+    SequenceNumber from,
+    std::optional<size_t> lengthLimit,
+    FileChangeCallback&& fileChangeCallback,
+    HashUpdateCallback&& hashUpdateCallback) {
+  XDCHECK(from > 0);
+  auto deltaState = deltaState_.lock();
+  // If this is going to be truncated, handle it before iterating.
+  if (!deltaState->empty() && deltaState->getFrontSequenceID() > from) {
+    return true;
+  } else {
+    forEachDelta(
+        *deltaState,
+        from,
+        lengthLimit,
+        std::forward<FileChangeCallback>(fileChangeCallback),
+        std::forward<HashUpdateCallback>(hashUpdateCallback));
+  }
+  deltaState->lastModificationHasBeenObserved = true;
+  return false;
+}
+
 std::vector<DebugJournalDelta> Journal::getDebugRawJournalInfo(
     SequenceNumber from,
     std::optional<size_t> limit,
@@ -548,17 +575,12 @@ std::vector<DebugJournalDelta> Journal::getDebugRawJournalInfo(
   return result;
 }
 
-/**
- * FileChangeFunc: void(const FileChangeJournalDelta&)
- * HashUpdateFunc: void(const RootUpdateJournalDelta&)
- */
-template <class FileChangeFunc, class HashUpdateFunc>
 void Journal::forEachDelta(
     const DeltaState& deltaState,
     JournalDelta::SequenceNumber from,
     std::optional<size_t> lengthLimit,
-    FileChangeFunc&& fileChangeDeltaCallback,
-    HashUpdateFunc&& hashUpdateDeltaCallback) const {
+    FileChangeCallback&& fileChangeDeltaCallback,
+    HashUpdateCallback&& hashUpdateDeltaCallback) const {
   size_t iters = 0;
   auto fileChangeIt = deltaState.fileChangeDeltas.rbegin();
   auto hashUpdateIt = deltaState.hashUpdateDeltas.rbegin();

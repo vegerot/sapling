@@ -3,7 +3,7 @@
   $ setconfig devel.collapse-traceback=true
 
   $ configure dummyssh mutation-norecord
-  $ enable amend directaccess commitcloud infinitepush rebase share smartlog
+  $ enable amend directaccess commitcloud rebase share smartlog
 
   $ setconfig infinitepush.branchpattern="re:scratch/.*"
   $ setconfig commitcloud.hostname=testhost
@@ -792,7 +792,7 @@ Run cloud status after failing to synchronize
   Raw Workspace Name: user/test/default
   Automatic Sync (on local changes): OFF
   Automatic Sync via 'Scm Daemon' (on remote changes): OFF
-  Last Sync Version: 17
+  Last Sync Version: * (glob)
   Last Sync Heads: 1 (0 omitted)
   Last Sync Bookmarks: 1 (0 omitted)
   Last Sync Remote Bookmarks: 1

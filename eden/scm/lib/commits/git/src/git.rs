@@ -1,17 +1,18 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
+use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 
 use anyhow::bail;
@@ -40,6 +41,7 @@ use dag::VertexOptions;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
 use gitcompat::BareGit;
+use gitcompat::GitCmd as _;
 use gitcompat::ReferenceValue;
 use gitdag::git2;
 use gitdag::GitDag;
@@ -47,7 +49,9 @@ use metalog::MetaLog;
 use minibytes::Bytes;
 use parking_lot::Mutex;
 use paste::paste;
+use spawn_ext::CommandError;
 use storemodel::ReadRootTreeIds;
+use storemodel::SerializationFormat;
 use types::HgId;
 
 use crate::ref_filter::GitRefFilter;
@@ -435,7 +439,7 @@ impl GitSegmentedCommits {
             metalog.root_id().to_hex()
         );
         let repo = self.git_repo.lock();
-        let mut ref_to_change = HashMap::<String, Option<git2::Oid>>::new();
+        let mut ref_to_change = HashMap::<String, Option<HgId>>::new();
 
         let new_bookmarks = metalog.get_bookmarks()?;
         let new_git_refs = metalog.get_git_refs()?;
@@ -454,7 +458,7 @@ impl GitSegmentedCommits {
             let mut git_visibleheads = HashSet::with_capacity(visibleheads.len());
             // Delete non-existed visibleheads.
             for reference in repo.references()? {
-                let mut reference = reference?;
+                let reference = reference?;
                 let ref_name = match reference.name() {
                     Some(n) => n,
                     None => continue,
@@ -468,20 +472,19 @@ impl GitSegmentedCommits {
                         _ => true,
                     };
                     if should_delete {
-                        tracing::debug!(ref_name = &ref_name, "deleting visiblehead ref");
-                        reference.delete()?;
+                        tracing::trace!(ref_name, "removing visiblehead");
+                        ref_to_change.insert(ref_name.to_string(), None);
                     }
                 }
             }
             // Insert new visibleheads.
             for id in visibleheads.difference(&git_visibleheads) {
                 if new_visible_oids.contains(id) {
-                    tracing::debug!(?id, "skipping visiblehead - matches another ref");
+                    tracing::trace!(?id, "skipping visiblehead - matches another ref");
                 } else {
                     let ref_name = format!("refs/visibleheads/{}", id.to_hex());
-                    let oid = hgid_to_git_oid(*id);
-                    tracing::debug!(ref_name = &ref_name, "adding visiblehead ref");
-                    repo.reference(&ref_name, oid, true, &reflog_message)?;
+                    tracing::trace!(ref_name, ?id, "setting visiblehead");
+                    ref_to_change.insert(ref_name, Some(*id));
                 }
             }
         }
@@ -490,7 +493,9 @@ impl GitSegmentedCommits {
         'update_changes: {
             let parent = match metalog.parent()? {
                 None => {
-                    tracing::debug!("metalog parent is missing - skip updating changes");
+                    tracing::debug!(
+                        "metalog parent is missing - skip updating non-visiblehead refs"
+                    );
                     break 'update_changes; // skip - no parent
                 }
                 Some(v) => v,
@@ -506,39 +511,59 @@ impl GitSegmentedCommits {
                     }
                     _ => format!("refs/remotes/{}", name),
                 };
-                tracing::debug!(ref_name=&ref_name, id=?optional_id, "updating remotename ref");
-                ref_to_change.insert(ref_name, optional_id.map(hgid_to_git_oid));
+                tracing::trace!(ref_name=&ref_name, id=?optional_id, "updating remotename ref");
+                ref_to_change.insert(ref_name, optional_id);
             }
             for (name, optional_id) in find_changes(&old_bookmarks, &new_bookmarks) {
                 let ref_name = format!("refs/heads/{}", name);
-                tracing::debug!(ref_name=&ref_name, id=?optional_id, "updating bookmark ref");
-                ref_to_change.insert(ref_name, optional_id.map(hgid_to_git_oid));
+                tracing::trace!(ref_name=&ref_name, id=?optional_id, "updating bookmark ref");
+                ref_to_change.insert(ref_name, optional_id);
             }
             for (ref_name, optional_id) in find_changes(&old_git_refs, &new_git_refs) {
-                tracing::debug!(ref_name=&ref_name, id=?optional_id, "updating git ref");
-                ref_to_change.insert(ref_name.clone(), optional_id.map(hgid_to_git_oid));
+                tracing::trace!(ref_name=&ref_name, id=?optional_id, "updating git ref");
+                ref_to_change.insert(ref_name.clone(), optional_id);
             }
+        }
 
-            if !ref_to_change.is_empty() {
-                for reference in repo.references()? {
-                    let mut reference = reference?;
-                    let ref_name = match reference.name() {
-                        Some(n) => n,
-                        None => continue,
-                    };
-                    match ref_to_change.remove(ref_name) {
-                        None => continue,
-                        Some(None) => reference.delete()?,
-                        Some(Some(oid)) => {
-                            repo.reference(ref_name, oid, true, &reflog_message)?;
-                        }
+        // Run `git update-ref` to apply updates.
+        if !ref_to_change.is_empty() {
+            tracing::debug!(?ref_to_change, "updating git ref");
+
+            let mut update_ref_stdin = String::new();
+            for (name, value) in ref_to_change {
+                match value {
+                    Some(oid) => {
+                        update_ref_stdin.push_str(&format!(
+                            "update {}\0{}\0\0",
+                            name,
+                            oid.to_hex()
+                        ));
+                    }
+                    None => {
+                        update_ref_stdin.push_str(&format!("delete {}\0\0", name));
                     }
                 }
-                for (ref_name, optional_oid) in ref_to_change {
-                    if let Some(oid) = optional_oid {
-                        repo.reference(&ref_name, oid, true, &reflog_message)?;
-                    }
-                }
+            }
+            let mut cmd = self.git.git_cmd(
+                "update-ref",
+                &[
+                    "-m",
+                    reflog_message.as_str(),
+                    "--no-deref",
+                    "--create-reflog",
+                    "--stdin",
+                    "-z",
+                ],
+            );
+            let mut child = cmd.stdin(Stdio::piped()).spawn()?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(update_ref_stdin.as_bytes())?;
+                drop(stdin);
+            }
+            let status = child.wait()?;
+            if !status.success() {
+                let err = CommandError::new(&cmd, None).with_status(&status);
+                return Err(err.into());
             }
         }
 
@@ -632,6 +657,10 @@ impl ReadCommitText for GitSegmentedCommits {
         // the hg text. Bypass that overhead.
         Arc::new(Wrapper(self.git_repo.clone()))
     }
+
+    fn format(&self) -> SerializationFormat {
+        SerializationFormat::Git
+    }
 }
 
 #[derive(Clone)]
@@ -647,6 +676,10 @@ impl ReadCommitText for ArcMutexGitRepo {
     fn to_dyn_read_commit_text(&self) -> Arc<dyn ReadCommitText + Send + Sync> {
         Arc::new(self.clone())
     }
+
+    fn format(&self) -> SerializationFormat {
+        SerializationFormat::Git
+    }
 }
 
 fn get_commit_raw_text(repo: &git2::Repository, vertex: &Vertex) -> Result<Option<Bytes>> {
@@ -654,15 +687,11 @@ fn get_commit_raw_text(repo: &git2::Repository, vertex: &Vertex) -> Result<Optio
         Ok(oid) => oid,
         Err(_) => return Ok(None),
     };
-    let commit = match repo.find_commit(oid) {
-        Ok(commit) => commit,
-        Err(e) if e.code() == git2::ErrorCode::NotFound => {
-            return Ok(get_hard_coded_commit_text(vertex));
-        }
-        Err(e) => return Err(e.into()),
-    };
-    let text = to_hg_text(&commit);
-    Ok(Some(text))
+    match repo.odb()?.read(oid) {
+        Ok(obj) => Ok(Some(Bytes::copy_from_slice(obj.data()))),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(get_hard_coded_commit_text(vertex)),
+        Err(e) => Err(e.into()),
+    }
 }
 
 // Workaround orphan rule
@@ -697,12 +726,10 @@ impl StreamCommitText for GitSegmentedCommits {
         let git_repo = git2::Repository::open(self.git.git_dir())?;
         let stream = stream.map(move |item| {
             let vertex = item?;
-            let oid = match git2::Oid::from_bytes(vertex.as_ref()) {
-                Ok(oid) => oid,
-                Err(_) => return vertex.not_found().map_err(Into::into),
+            let raw_text = match get_commit_raw_text(&git_repo, &vertex)? {
+                Some(v) => v,
+                None => return vertex.not_found().map_err(Into::into),
             };
-            let commit = git_repo.find_commit(oid)?;
-            let raw_text = to_hg_text(&commit);
             Ok(ParentlessHgCommit { vertex, raw_text })
         });
         Ok(Box::pin(stream))
@@ -745,88 +772,6 @@ Feature Providers:
     fn explain_internals(&self, w: &mut dyn io::Write) -> io::Result<()> {
         write!(w, "{:?}", &*self.dag)
     }
-}
-
-fn to_hex(oid: git2::Oid) -> String {
-    const HEX_CHARS: &[u8] = b"0123456789abcdef";
-    let bytes = oid.as_bytes();
-    let mut v = Vec::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        v.push(HEX_CHARS[(byte >> 4) as usize]);
-        v.push(HEX_CHARS[(byte & 0xf) as usize]);
-    }
-    unsafe { String::from_utf8_unchecked(v) }
-}
-
-// For "Wed, 23 Nov 2022 17:47:30 -0800",
-//
-// git commit message: "1669254450 -0800"
-// hg commit message:  "1669254450 28800"
-// libgit2 Time::offset_minutes: -480
-
-fn to_hg_date_text(time: &git2::Time) -> String {
-    // See above. Convert -480 to 28800.
-    let hg_date_offset_seconds = -time.offset_minutes() * 60;
-    format!("{} {}", time.seconds(), hg_date_offset_seconds)
-}
-
-/// Convert a git commit to hg commit text.
-fn to_hg_text(commit: &git2::Commit) -> Bytes {
-    // 222 is calculated from debugshell in linux.git:
-    // max(len(cl.revision(n))-len(repo[n].description().encode('utf8')) for n in cl.dag.all().take(50000))
-    let len = commit.message_bytes().len() + 222;
-    let mut result = Vec::with_capacity(len);
-    let mut write = |s: &[u8]| result.extend_from_slice(s);
-
-    fn utf8<'a>(s: &'a [u8]) -> Cow<'a, str> {
-        String::from_utf8_lossy(s)
-    }
-
-    // Construct the commit using (faked) hg format:
-    // manifest hex + "\n" + user + "\n" + date + (extra) + "\n" + (files) + "\n" + desc
-
-    // manifest hex
-    write(to_hex(commit.tree_id()).as_bytes());
-    write(b"\n");
-
-    let author = commit.author();
-    let committer = commit.committer();
-
-    // author
-    write(utf8(author.name_bytes()).as_bytes());
-    write(b" <");
-    write(utf8(author.email_bytes()).as_bytes());
-    write(b">\n");
-
-    // date
-    // We want the "modified" date to match user expectation. For hg we bump dates on commit
-    // rewrites (rebase, metaedit, amend, ...). So the hg "date" is the "modified" date.
-    // Usually, the committer date is the "modified" date. For tests, to preserve "stable"
-    // hashes the "date.now" is patched to return UNIX epoch. So we pick the maximum date
-    // from author and committer dates for test compatibility.
-    let max_date = committer.when().max(author.when());
-    write(to_hg_date_text(&max_date).as_bytes());
-
-    // extras
-    // The extras format is: "\0".join(f"{key}:{value}"). See "encodeextra" in changelog.py.
-    write(b" author_date:");
-    write(to_hg_date_text(&author.when()).as_bytes());
-    write(b"\0committer:");
-    write(utf8(committer.name_bytes()).as_bytes());
-    write(b" <");
-    write(utf8(committer.email_bytes()).as_bytes());
-    write(b">\0committer_date:");
-    write(to_hg_date_text(&committer.when()).as_bytes());
-    write(b"\n");
-
-    // files
-    // NOTE: currently ignored.
-    write(b"\n");
-
-    // message
-    write(utf8(commit.message_bytes()).as_bytes());
-
-    result.into()
 }
 
 /// Find "deleted" and "changed" references.

@@ -468,6 +468,34 @@ impl AddScubaParams for thrift::CommitSparseProfileDeltaParams {
     }
 }
 
+impl AddScubaParams for thrift::CommitSparseProfileDeltaParamsV2 {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("repo", self.commit.repo.to_string());
+        scuba.add("commit", self.commit.id.to_string());
+        scuba.add("other_commit", self.other_id.to_string());
+        scuba.add(
+            "param_paths",
+            match &self.profiles {
+                thrift::SparseProfiles::all_profiles(_) => {
+                    ScubaValue::from("all sparse profiles".to_string())
+                }
+                thrift::SparseProfiles::profiles(profiles) => {
+                    profiles.iter().collect::<ScubaValue>()
+                }
+                thrift::SparseProfiles::UnknownField(t) => {
+                    ScubaValue::from(format!("unknown SparseProfiles type {}", t))
+                }
+            },
+        );
+    }
+}
+
+impl AddScubaParams for thrift::CommitSparseProfileDeltaToken {
+    fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
+        scuba.add("token", self.id.to_string());
+    }
+}
+
 impl AddScubaParams for thrift::CommitSparseProfileSizeParams {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
         scuba.add(
@@ -510,7 +538,7 @@ impl AddScubaParams for thrift::CommitSparseProfileSizeParamsV2 {
 
 impl AddScubaParams for thrift::CommitSparseProfileSizeToken {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
-        scuba.add("param_token", self.id);
+        scuba.add("token", self.id.to_string());
     }
 }
 
@@ -716,7 +744,7 @@ impl AddScubaParams for thrift::AsyncPingParams {
 
 impl AddScubaParams for thrift::AsyncPingToken {
     fn add_scuba_params(&self, scuba: &mut MononokeScubaSampleBuilder) {
-        scuba.add("param_token", self.id);
+        scuba.add("token", self.id.to_string());
     }
 }
 

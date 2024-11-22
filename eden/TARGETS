@@ -29,6 +29,12 @@ fbpkg.builder(
         "x86_64",
         "aarch64",
     ],
+    buck_opts = fbpkg.buck_opts(
+        config = {
+            "fbcode.dwp": "false",
+        },
+        mode = "opt",
+    ),
 
     # this is doing (almost) the same as eden/fs/facebook/packaging/packman.yml
     # for the config we cannot do with fbpkg.builder (e.g. set mode for a binary) we
@@ -65,10 +71,13 @@ fbpkg.builder(
         "libexec/eden/edenfs": fbpkg.copy("//eden/fs/service:edenfs"),
         "libexec/eden/edenfs_config_manager": fbpkg.copy("//eden/fs/config/facebook:edenfs_config_manager"),
         "libexec/eden/edenfs_monitor": fbpkg.copy("//eden/fs/monitor:edenfs_monitor"),
-        "libexec/eden/edenfs_privhelper": fbpkg.copy("//eden/fs/service:edenfs_privhelper"),
+        "libexec/eden/edenfs_privhelper": fbpkg.copy("//eden/fs/service:edenfs_privhelper_with_setuid_root"),
         "libexec/eden/edenfs_restarter": fbpkg.copy("//eden/fs/facebook:edenfs_restarter"),
 
         # static file for eden-locale
         "locale/en/LC_MESSAGES/libc.mo": "locale/glibc_en.mo",
+
+        # static file for Sandcastle live-installation
+        "sandcastle_install.sh": "facebook/sandcastle_install.sh",
     },
 )

@@ -572,7 +572,8 @@ void PrivHelperServer::nfsMount(
     folly::SocketAddress nfsdAddr,
     bool readOnly,
     uint32_t iosize,
-    bool useReaddirplus) {
+    bool useReaddirplus,
+    [[maybe_unused]] bool useSoftMount) {
 #ifdef __APPLE__
   if (shouldLoadNfsKext()) {
     XLOG(DBG3, "Apple nfs.kext is not loaded. Attempting to load");
@@ -594,6 +595,13 @@ void PrivHelperServer::nfsMount(
     readdirplus_flag = NFS_MFLAG_RDIRPLUS;
   }
 
+  // Check if we should use a soft or hard mount. If soft is desired, set the
+  // flag value to NFS_MFLAG_SOFT so it's used in the bitwise OR operation.
+  uint32_t soft_flag = 0;
+  if (useSoftMount) {
+    soft_flag = NFS_MFLAG_SOFT;
+  }
+
   // Make the client use any source port, enable/disable rdirplus, and set the
   // mount type to hard (but make it interruptible). While in theory we would
   // want the mount to be soft, macOS force a maximum timeout of 60s, which in
@@ -605,7 +613,7 @@ void PrivHelperServer::nfsMount(
       NFS_MATTR_BITMAP_LEN,
       NFS_MFLAG_RESVPORT | NFS_MFLAG_RDIRPLUS | NFS_MFLAG_SOFT | NFS_MFLAG_INTR,
       NFS_MATTR_BITMAP_LEN,
-      NFS_MFLAG_INTR | readdirplus_flag};
+      NFS_MFLAG_INTR | readdirplus_flag | soft_flag};
   XdrTrait<nfs_mattr_flags>::serialize(attrSer, flags);
 
   mattrFlags |= NFS_MATTR_NFS_VERSION;
@@ -757,13 +765,21 @@ void PrivHelperServer::nfsMount(
   if (useReaddirplus) {
     noReaddirplusStr = ",";
   }
+
+  // Check if we should use a soft or hard mount.
+  // https://linux.die.net/man/5/nfs
+  folly::StringPiece softOptionStr = "hard";
+  if (useSoftMount) {
+    softOptionStr = "soft";
+  }
   auto mountOpts = fmt::format(
       "addr={},vers=3,proto=tcp,port={},mountvers=3,mountproto=tcp,mountport={},"
-      "noresvport,nolock{}soft,retrans=0,rsize={},wsize={}",
+      "noresvport,nolock{}{},retrans=0,rsize={},wsize={}",
       nfsdAddr.getAddressStr(),
       nfsdAddr.getPort(),
       mountdAddr.getPort(),
       noReaddirplusStr,
+      softOptionStr,
       iosize,
       iosize);
 
@@ -878,7 +894,7 @@ UnixSocket::Message PrivHelperServer::processMountMsg(Cursor& cursor) {
 UnixSocket::Message PrivHelperServer::processMountNfsMsg(Cursor& cursor) {
   string mountPath;
   folly::SocketAddress mountdAddr, nfsdAddr;
-  bool readOnly, useReaddirplus;
+  bool readOnly, useReaddirplus, useSoftMount;
   uint32_t iosize;
   PrivHelperConn::parseMountNfsRequest(
       cursor,
@@ -887,12 +903,20 @@ UnixSocket::Message PrivHelperServer::processMountNfsMsg(Cursor& cursor) {
       nfsdAddr,
       readOnly,
       iosize,
-      useReaddirplus);
+      useReaddirplus,
+      useSoftMount);
   XLOGF(DBG3, "mount.nfs \"{}\"", mountPath);
 
   sanityCheckMountPoint(mountPath, true /* isNfs */);
 
-  nfsMount(mountPath, mountdAddr, nfsdAddr, readOnly, iosize, useReaddirplus);
+  nfsMount(
+      mountPath,
+      mountdAddr,
+      nfsdAddr,
+      readOnly,
+      iosize,
+      useReaddirplus,
+      useSoftMount);
   mountPoints_.insert(mountPath);
 
   return makeResponse();

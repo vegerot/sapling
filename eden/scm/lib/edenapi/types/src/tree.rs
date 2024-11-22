@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 use minibytes::Bytes;
@@ -22,6 +22,7 @@ use types::AugmentedTree;
 use types::AugmentedTreeEntry;
 use types::AugmentedTreeWithDigest;
 
+use crate::hash::check_hash;
 use crate::Blake3;
 use crate::DirectoryMetadata;
 use crate::FileAuxData;
@@ -128,22 +129,13 @@ impl TreeEntry {
     pub fn data_checked(&self) -> Result<Bytes, TreeError> {
         if let Some(data) = self.data.as_ref() {
             if let Some(parents) = self.parents {
-                let computed = HgId::from_content(data, parents);
-                if computed != self.key.hgid {
-                    let err = InvalidHgId {
-                        expected: self.key.hgid,
-                        computed,
-                        data: data.clone(),
-                        parents,
-                    };
-
-                    return Err(if self.key.path.is_empty() {
+                check_hash(data, parents, "tree", self.key.hgid).map_err(|err| {
+                    if self.key.path.is_empty() {
                         TreeError::MaybeHybridManifest(err)
                     } else {
                         TreeError::Corrupt(err)
-                    });
-                }
-
+                    }
+                })?;
                 Ok(data.clone())
             } else {
                 Err(TreeError::MissingField("parents"))
@@ -173,6 +165,10 @@ pub enum TreeChildEntry {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
 pub struct TreeChildFileEntry {
+    // TODO: Child entries should almost certainly not use Keys, as the path field in a Key is
+    // supposed to represent a repo relative path. The path field in this case is being used to
+    // represent a PathComponent, so it's very misleading. The fix is risky due to changing EdenAPI
+    // serialization, so I'm punting on the fix for now.
     pub key: Key,
     pub file_metadata: Option<FileMetadata>,
 }
@@ -180,6 +176,7 @@ pub struct TreeChildFileEntry {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
 pub struct TreeChildDirectoryEntry {
+    // See above comment warning about using a RepoPathBuf to represent a PathComponent.
     pub key: Key,
     pub tree_aux_data: Option<TreeAuxData>,
 }
@@ -224,7 +221,7 @@ impl TryFrom<AugmentedTree> for TreeEntry {
                     AugmentedTreeEntry::FileNode(file) => Ok(TreeChildEntry::new_file_entry(
                         Key {
                             hgid: file.filenode,
-                            path,
+                            path: path.into(),
                         },
                         FileAuxData {
                             blake3: Blake3::from_another(file.content_blake3),
@@ -241,7 +238,7 @@ impl TryFrom<AugmentedTree> for TreeEntry {
                         Ok(TreeChildEntry::new_directory_entry(
                             Key {
                                 hgid: tree.treenode,
-                                path,
+                                path: path.into(),
                             },
                             DirectoryMetadata {
                                 augmented_manifest_id: Blake3::from_another(

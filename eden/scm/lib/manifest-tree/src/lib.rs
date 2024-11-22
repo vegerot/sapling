@@ -1,8 +1,8 @@
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This software may be used and distributed according to the terms of the
- * GNU General Public License version 2.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 mod diff;
@@ -22,9 +22,10 @@ use std::sync::Arc;
 
 use anyhow::bail;
 use anyhow::Result;
+use format_util::git_sha1_digest;
+use format_util::hg_sha1_digest;
 use iter::bfs_iter;
 use manifest::DiffEntry;
-use manifest::DirDiffEntry;
 use manifest::Directory;
 use manifest::File;
 use manifest::FileMetadata;
@@ -33,20 +34,19 @@ use manifest::FsNodeMetadata;
 use manifest::List;
 pub use manifest::Manifest;
 use minibytes::Bytes;
+use once_cell::sync::Lazy;
 use once_cell::sync::OnceCell;
 use pathmatcher::Matcher;
-use sha1::Digest;
-use sha1::Sha1;
 pub use store::Flag;
 use storemodel::SerializationFormat;
 use thiserror::Error;
+use threadpool::ThreadPool;
 use types::HgId;
 pub use types::PathComponent;
 pub use types::PathComponentBuf;
 use types::RepoPath;
 use types::RepoPathBuf;
 
-pub use self::diff::Diff;
 pub(crate) use self::link::Link;
 pub use self::store::Element as TreeElement;
 pub use self::store::Entry as TreeEntry;
@@ -59,6 +59,9 @@ use crate::link::DurableEntry;
 use crate::link::Ephemeral;
 use crate::link::Leaf;
 use crate::store::InnerStore;
+
+// Shared thread pool for manifest-tree parallelized operations.
+static THREAD_POOL: Lazy<ThreadPool> = Lazy::new(|| ThreadPool::new(10));
 
 /// The Tree implementation of a Manifest dedicates an inner node for each directory in the
 /// repository and a leaf for each file.
@@ -267,12 +270,6 @@ impl Manifest for TreeManifest {
             cursor: &'c mut Link,
             format: SerializationFormat,
         ) -> Result<(HgId, store::Flag)> {
-            #[cfg(not(test))]
-            assert_eq!(
-                format,
-                SerializationFormat::Git,
-                "flush() cannot be used with hg store, use finalize() instead"
-            );
             loop {
                 let new_cursor = match cursor.as_mut_ref()? {
                     Leaf(file_metadata) => {
@@ -310,6 +307,13 @@ impl Manifest for TreeManifest {
         }
         let mut path = RepoPathBuf::new();
         let format = self.store.format();
+        #[cfg(not(test))]
+        assert_eq!(
+            format,
+            SerializationFormat::Git,
+            "flush() cannot be used with hg store, use finalize() instead (store: {})",
+            self.store.type_name(),
+        );
         let (hgid, _) = do_flush(&self.store, &mut path, &mut self.root, format)?;
         Ok(hgid)
     }
@@ -355,20 +359,12 @@ impl Manifest for TreeManifest {
         Box::new(dirs)
     }
 
-    fn diff<'a, M: Matcher>(
+    fn diff<'a, M: 'static + Matcher + Sync + Send>(
         &'a self,
         other: &'a Self,
-        matcher: &'a M,
+        matcher: M,
     ) -> Result<Box<dyn Iterator<Item = Result<DiffEntry>> + 'a>> {
-        Ok(Box::new(Diff::new(self, other, matcher)?))
-    }
-
-    fn modified_dirs<'a, M: Matcher>(
-        &'a self,
-        other: &'a Self,
-        matcher: &'a M,
-    ) -> Result<Box<dyn Iterator<Item = Result<DirDiffEntry>> + 'a>> {
-        Ok(Box::new(Diff::new(self, other, matcher)?.modified_dirs()))
+        Ok(diff::diff(self, other, Arc::new(matcher)))
     }
 }
 
@@ -420,23 +416,20 @@ impl TreeManifest {
         &mut self,
         parent_trees: Vec<&TreeManifest>,
     ) -> Result<impl Iterator<Item = (RepoPathBuf, HgId, Bytes, HgId, HgId)>> {
-        fn compute_hgid<C: AsRef<[u8]>>(parent_tree_nodes: &[HgId], content: C) -> HgId {
-            let mut hasher = Sha1::new();
-            debug_assert!(parent_tree_nodes.len() <= 2);
-            let p1 = parent_tree_nodes.first().unwrap_or(HgId::null_id());
-            let p2 = parent_tree_nodes.get(1).unwrap_or(HgId::null_id());
-            // Even if parents are sorted two hashes go into hash computation but surprise
-            // the NULL_ID is not a special case in this case and gets sorted.
-            if p1 < p2 {
-                hasher.update(p1.as_ref());
-                hasher.update(p2.as_ref());
-            } else {
-                hasher.update(p2.as_ref());
-                hasher.update(p1.as_ref());
+        fn compute_hgid(
+            parent_tree_nodes: &[HgId],
+            content: &[u8],
+            format: SerializationFormat,
+        ) -> HgId {
+            match format {
+                SerializationFormat::Hg => {
+                    debug_assert!(parent_tree_nodes.len() <= 2);
+                    let p1 = parent_tree_nodes.first().unwrap_or(HgId::null_id());
+                    let p2 = parent_tree_nodes.get(1).unwrap_or(HgId::null_id());
+                    hg_sha1_digest(content, p1, p2)
+                }
+                SerializationFormat::Git => git_sha1_digest(content, "tree"),
             }
-            hasher.update(content.as_ref());
-            let buf: [u8; HgId::len()] = hasher.finalize().into();
-            (&buf).into()
         }
         struct Executor<'a> {
             store: &'a InnerStore,
@@ -537,19 +530,18 @@ impl TreeManifest {
                 // a list of entries to insert in the local store. For those cases we don't
                 // need to convert to Ephemeral instead only verify the hash.
                 let links = link.mut_ephemeral_links(self.store, &self.path)?;
-                // finalize() is only used for hg format.
-                let format = SerializationFormat::Hg;
-                let mut entry = store::EntryMut::new(format);
+                let format = self.store.format();
+                let mut elements = Vec::with_capacity(links.len());
                 for (component, link) in links.iter_mut() {
                     self.path.push(component.as_path_component());
                     let child_parents = self.parent_trees_for_subdirectory(&active_parents)?;
                     let (hgid, flag) = self.work(link, child_parents)?;
                     self.path.pop();
                     let element = store::Element::new(component.clone(), hgid, flag);
-                    entry.add_element_hg(element);
+                    elements.push(element);
                 }
-                let entry = entry.freeze();
-                let hgid = compute_hgid(&parent_tree_nodes, &entry);
+                let entry = store::Entry::from_elements(elements, format);
+                let hgid = compute_hgid(&parent_tree_nodes, entry.as_ref(), format);
 
                 let cell = OnceCell::new();
                 // TODO: remove clone
@@ -860,7 +852,7 @@ pub fn compat_subtree_diff(
                         continue;
                     }
                     others.dedup();
-                    self.path.push(element.component.as_ref());
+                    self.path.push(element.component.as_path_component());
                     self.depth_remaining -= 1;
                     self.work(element.hgid, others)?;
                     self.depth_remaining += 1;
@@ -1522,8 +1514,8 @@ mod tests {
             output,
             "Root (Ephemeral)\n\
              | a1 (Ephemeral)\n\
-             | | b1 (Durable, 4f75b40350c5a77ea27d3287b371016e2d940bab)\n\
-             | | | c1 (Durable, 4495bc0cc4093ed880fe1eb1489635f3cddcf04d)\n\
+             | | b1 (Durable, d6a71387fe6f91389e9f1b253b5d89d73e2c0741)\n\
+             | | | c1 (Durable, 73480e69d7ce9b9b3e8a3a02c4d0190f1f460306)\n\
              | | | | d1 (File, 0000000000000000000000000000000000000010, Regular)\n\
              | | b2 (File, 0000000000000000000000000000000000000020, Regular)\n\
              | a2 (Ephemeral)\n\
@@ -1821,7 +1813,7 @@ mod tests {
     fn grafted_diff(a: &TreeManifest, b: &TreeManifest) -> Vec<String> {
         let (a, b) = apply_diff_grafts(a, b).unwrap();
         let mut files = a
-            .diff(&b, &AlwaysMatcher::new())
+            .diff(&b, AlwaysMatcher::new())
             .unwrap()
             .map(|e| Ok(e?.path.into_string()))
             .collect::<Result<Vec<_>>>()

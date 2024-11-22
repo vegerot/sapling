@@ -911,7 +911,7 @@ class patchfile:
         if self.exists and self.create:
             if self.copysource:
                 self.ui.warn(
-                    _("cannot create %s: destination already " "exists\n") % self.fname
+                    _("cannot create %s: destination already exists\n") % self.fname
                 )
             else:
                 self.ui.warn(_("file %s already exists\n") % self.fname)
@@ -984,7 +984,7 @@ class patchfile:
                             self.printfile(True)
                             self.ui.warn(msg % (h.number, l + 1, fuzzlen, offset))
                         else:
-                            msg = _("Hunk #%d succeeded at %d " "(offset %d lines).\n")
+                            msg = _("Hunk #%d succeeded at %d (offset %d lines).\n")
                             self.ui.note(msg % (h.number, l + 1, offset))
                         return fuzzlen
         self.printfile(True)
@@ -2315,8 +2315,7 @@ def _applydiff(ui, fp, patcher, backend, store, strip=1, prefix="", eolmode="str
                 if data or mode:
                     if gp.op in ("ADD", "RENAME", "COPY") and backend.exists(gp.path):
                         raise PatchError(
-                            _("cannot create %s: destination " "already exists")
-                            % gp.path
+                            _("cannot create %s: destination already exists") % gp.path
                         )
                     backend.setfile(gp.path, data, mode, gp.oldpath)
             else:
@@ -2887,17 +2886,20 @@ def diffsinglehunkinline(hunklines):
         (b"-", "diff.deleted", atokens),
         (b"+", "diff.inserted", btokens),
     ]:
-        nextisnewline = True
-        for changed, token in tokens:
-            if nextisnewline:
+        isprevnewline = True
+        length = len(tokens)
+        for i, (changed, token) in enumerate(tokens):
+            if isprevnewline:
                 yield (prefix, label)
-                nextisnewline = False
+                isprevnewline = False
             # special handling line end
+            isnextnewline = i + 1 < length and tokens[i + 1][1] == b"\n"
             isendofline = token.endswith(b"\n")
-            if isendofline:
-                chomp = token[:-1]  # chomp
+            if isendofline or isnextnewline:
+                chomp = token[:-1] if isendofline else token  # chomp
                 token = chomp.rstrip()  # detect spaces at the end
                 endspaces = chomp[len(token) :]
+
             # scan tabs
             for maybetab in tabsplitter.findall(token):
                 if b"\t" == maybetab[0:1]:
@@ -2908,11 +2910,13 @@ def diffsinglehunkinline(hunklines):
                     else:
                         currentlabel = label + ".unchanged"
                 yield (maybetab, currentlabel)
-            if isendofline:
+
+            if isendofline or isnextnewline:
                 if endspaces:
                     yield (endspaces, "diff.trailingwhitespace")
-                yield (b"\n", "")
-                nextisnewline = True
+                if isendofline:
+                    yield (b"\n", "")
+                    isprevnewline = True
 
 
 def difflabel(func, *args, **kw):
@@ -3337,7 +3341,7 @@ def diffstat(lines, width=80, status=None):
 
     if stats:
         output.append(
-            _(" %d files changed, %d insertions(+), " "%d deletions(-)\n")
+            _(" %d files changed, %d insertions(+), %d deletions(-)\n")
             % (len(stats), totaladds, totalremoves)
         )
 
