@@ -138,8 +138,7 @@ async fn run_push(
 
     if bookmark_pushes.len() > 1 {
         return Err(anyhow!(
-            "only push to at most one bookmark is allowed, got {:?}",
-            bookmark_pushes
+            "only push to at most one bookmark is allowed, got {bookmark_pushes:?}"
         )
         .into());
     }
@@ -278,7 +277,7 @@ async fn run_pushrebase(
                 "scm/mononoke:wireproto_force_local_pushrebase",
                 None,
                 Some(repo.repo_identity().name()),
-            )?;
+            );
 
             let outcome = normal_pushrebase(
                 ctx,

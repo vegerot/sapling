@@ -62,7 +62,6 @@ const PACK_OK: &[u8] = b"unpack ok";
 const REF_OK: &str = "ok";
 const REF_ERR: &str = "ng";
 const REF_UPDATE_CONCURRENCY: usize = 20;
-const MAX_LFS_RETRIES: u32 = 2;
 const MAX_PACKETLINE_TEXT: usize = 65_000;
 
 pub async fn receive_pack(state: &mut State) -> Result<Response<Body>, HttpError> {
@@ -116,7 +115,7 @@ async fn push(
         let max_request_size = justknobs::get_as::<usize>(
             "scm/mononoke:git_server_max_packfile_size",
             Some(repo_name.as_str()),
-        )?;
+        );
 
         let packfile_size = pack_file.get_ref().len();
         if packfile_size > max_request_size {
@@ -137,9 +136,7 @@ async fn push(
             "scm/mononoke:git_server_enable_push_memory_tracking",
             None,
             Some(repo_name.as_str()),
-        )
-        .unwrap_or(false)
-        {
+        ) {
             let main_client_id = request_context
                 .ctx
                 .metadata()
@@ -210,8 +207,7 @@ async fn push(
                 )
             } else {
                 let max_lfs_tries =
-                    justknobs::get_as::<u32>("scm/mononoke:git_server_lfs_max_retries", None)
-                        .unwrap_or(MAX_LFS_RETRIES);
+                    justknobs::get_as::<u32>("scm/mononoke:git_server_lfs_max_retries", None);
                 let url_format = match git_ctx.upstream_lfs_url_format() {
                     crate::UpstreamLfsUrlFormat::Dewey => LfsServerUrlFormat::LegacyDewey,
                     crate::UpstreamLfsUrlFormat::MononokeGitLfs => {
@@ -242,6 +238,7 @@ async fn push(
             &ref_updates,
             lfs,
             concurrency,
+            git_ctx.persist_partial_mappings(),
         )
         .try_timed()
         .await;
@@ -252,12 +249,12 @@ async fn push(
                 "Push".to_string(),
             ),
             Err(e) => {
-                let err_msg = format!("{:?}", e);
+                let err_msg = format!("{e:?}");
                 if err_msg.contains("find_file_changes") && err_msg.contains("status: 404") {
                     return reject_push_with_message(
                         state,
                         &ref_updates,
-                        format!("LFS files missing in Git LFS server. Please upload before pushing. Error:\n {}", err_msg),
+                        format!("LFS files missing in Git LFS server. Please upload before pushing. Error:\n {err_msg}"),
                         true /* with_unpack_error */
                     )
                     .await;
@@ -549,7 +546,7 @@ async fn reject_push_with_message(
     let mut output = vec![];
     let error_message = packetline_truncated_string(error_message);
     if with_unpack_error {
-        let unpack_error = format!("unpack {}", error_message);
+        let unpack_error = format!("unpack {error_message}");
         write_text_packetline(unpack_error.as_bytes(), &mut output).await?;
     } else {
         write_text_packetline(PACK_OK, &mut output).await?;

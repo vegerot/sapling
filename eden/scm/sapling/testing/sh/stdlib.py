@@ -22,7 +22,15 @@ from pathlib import PurePosixPath
 from typing import BinaryIO, Callable, Dict, Iterator, List, Optional, Tuple
 
 from .bufio import BufIO
-from .types import Env, InterpResult, Scope, ShellExit, ShellFS, ShellReturn
+from .types import (
+    _commandnotfound,
+    Env,
+    InterpResult,
+    Scope,
+    ShellExit,
+    ShellFS,
+    ShellReturn,
+)
 
 cmdtable = {}
 SKIP_PYTHON_LOOKUP = True
@@ -165,7 +173,12 @@ def base64(
 
 @command
 def dirname(args: List[str]) -> str:
-    return "".join(arg.rsplit("/", 1)[0] + "\n" for arg in args)
+    def dirnameone(arg: str) -> str:
+        if "/" not in arg:
+            return "."
+        return arg.rsplit("/", 1)[0] or "/"
+
+    return "".join(dirnameone(arg) + "\n" for arg in args)
 
 
 @command
@@ -439,6 +452,35 @@ def seq(args: List[str]) -> str:
 
 
 @command
+def expr(args: List[str], stderr: BinaryIO):
+    if len(args) == 1:
+        return f"{args[0]}\n"
+    if len(args) != 3:
+        raise NotImplementedError(f"expr {args=}")
+
+    try:
+        lhs = int(args[0])
+        rhs = int(args[2])
+    except ValueError:
+        stderr.write(b"expr: non-integer argument\n")
+        return 2
+    op = args[1]
+    if op == "+":
+        result = lhs + rhs
+    elif op == "-":
+        result = lhs - rhs
+    elif op == "*":
+        result = lhs * rhs
+    elif op == "/":
+        result = lhs // rhs
+    elif op == "%":
+        result = lhs % rhs
+    else:
+        raise NotImplementedError(f"expr operator {op}")
+    return f"{result}\n"
+
+
+@command
 def sed(args: List[str], stdin: BinaryIO, stdout: BinaryIO, fs: ShellFS) -> str:
     scripts = []
     paths = []
@@ -466,27 +508,85 @@ def sed(args: List[str], stdin: BinaryIO, stdout: BinaryIO, fs: ShellFS) -> str:
         out = fs.open(paths[0], "wb")
 
     for script in scripts:
-        # line range selection
-        if script[0] == "$":
-            # last line
-            linerange = slice(len(lines) - 1, len(lines))
-            script = script[1:]
-        elif script[0].isdigit():
-            # single line
-            linenostr = "".join(ch.isdigit() and ch or " " for ch in script).split(
-                " ", 1
-            )[0]
-            lineno = int(linenostr)
-            script = script[len(linenostr) :]
-            linerange = slice(lineno - 1, lineno)
-        else:
-            # everything
-            linerange = slice(0, len(lines))
-        # apply the script
-        lines[linerange] = _sedscript(script, lines[linerange])
+        for command in _sedcommands(script):
+            lines = _runsedcommand(command, lines)
 
     # pyre-fixme[7]: Expected `str` but got implicit return value of `None`.
     out.write("".join(lines).encode())
+
+
+def _sedcommands(script: str) -> List[str]:
+    """split a sed script into commands
+
+    This intentionally implements only enough parsing to avoid splitting
+    semicolons inside a substitute expression.
+    """
+    commands = []
+    command_start = 0
+    substitute_delimiter: Optional[str] = None
+    substitute_delimiter_count = 0
+    escaped = False
+    for i, ch in enumerate(script):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if substitute_delimiter is not None:
+            if ch == substitute_delimiter:
+                substitute_delimiter_count += 1
+                if substitute_delimiter_count == 3:
+                    substitute_delimiter = None
+            continue
+        if ch == "s" and i == command_start and i + 1 < len(script):
+            substitute_delimiter = script[i + 1]
+            substitute_delimiter_count = 0
+            continue
+        if ch == ";":
+            command = script[command_start:i]
+            if command:
+                commands.append(command)
+            command_start = i + 1
+    command = script[command_start:]
+    if command:
+        commands.append(command)
+    return commands
+
+
+def _runsedcommand(script: str, lines: List[str]) -> List[str]:
+    """run a single sed command on lines"""
+    # line range selection
+    if script[0] == "$":
+        # last line
+        start = len(lines) - 1
+        end = len(lines)
+        script = script[1:]
+    elif script[0].isdigit():
+        # single line
+        linenostr = "".join(ch.isdigit() and ch or " " for ch in script).split(" ", 1)[
+            0
+        ]
+        lineno = int(linenostr)
+        start = lineno - 1
+        end = lineno
+        script = script[len(linenostr) :]
+    elif script.startswith("/"):
+        range_match = re.match(r"/((?:\\.|[^/])*)/,\$([^;]*)\Z", script)
+        if range_match is not None:
+            pat, command = range_match.groups()
+            patre = re.compile(pat)
+            for start, line in enumerate(lines):
+                if patre.search(line):
+                    return lines[:start] + _sedscript(command, lines[start:])
+            return lines
+        start = 0
+        end = len(lines)
+    else:
+        start = 0
+        end = len(lines)
+
+    return lines[:start] + _sedscript(script, lines[start:end]) + lines[end:]
 
 
 def _sedscript(script: str, lines: List[str]) -> List[str]:
@@ -578,6 +678,18 @@ def read(args: List[str], stdin: BinaryIO, env: Env) -> int:
 
 
 @command
+def umask(args: List[str]) -> int:
+    import os
+
+    if not args:
+        oldmask = os.umask(0)
+        os.umask(oldmask)
+        return 0
+    os.umask(int(args[0], 8))
+    return 0
+
+
+@command
 def source(args: List[str], env: Env):
     # pyre-fixme[9]: env has type `Env`; used as `Optional[Env]`.
     env = env.parent
@@ -638,6 +750,20 @@ def exit(args: List[str], arg0: str):
         raise ShellReturn(code)
     else:
         raise ShellExit(code)
+
+
+def _exec(env: Env) -> InterpResult:
+    args = env.args[1:]
+    if not args:
+        return InterpResult()
+    env.args = args
+    command = env.cmdtable.get(args[0])
+    if command is None:
+        return _commandnotfound(env)
+    return command(env)
+
+
+cmdtable["exec"] = _exec
 
 
 @command
@@ -800,6 +926,7 @@ def ls(args: List[str], stdout: BinaryIO, stderr: BinaryIO, fs: ShellFS):
 
     listall = False
     listlong = False
+    recursive = False
     entries = []
     paths_given = False
     for arg in args:
@@ -807,6 +934,8 @@ def ls(args: List[str], stdout: BinaryIO, stderr: BinaryIO, fs: ShellFS):
             listall = True
         elif arg == "-l":
             listlong = True
+        elif arg == "-R":
+            recursive = True
         elif arg.startswith("-"):
             raise NotImplementedError(f"ls with flag {arg}")
         else:
@@ -825,8 +954,6 @@ def ls(args: List[str], stdout: BinaryIO, stderr: BinaryIO, fs: ShellFS):
     if not paths_given:
         entries = [("", listdir("", listall=listall))]
 
-    entries = sorted(entries)
-
     def format_entry(dir: str, entry: str) -> str:
         if listlong:
             full_path = PurePosixPath(dir, entry)
@@ -837,6 +964,38 @@ def ls(args: List[str], stdout: BinaryIO, stderr: BinaryIO, fs: ShellFS):
             return ls_mode + "\n"
         else:
             return f"{entry}\n"
+
+    if recursive:
+
+        def format_child_display(parent_display: str, entry: str) -> str:
+            if parent_display == ".":
+                return f"./{entry}"
+            return str(PurePosixPath(parent_display, entry))
+
+        def collect_recursive(path: str, display: str) -> List[str]:
+            direntries = sorted(listdir(path, listall=listall))
+            lines = [f"{display}:\n"]
+            for entry in direntries:
+                lines.append(format_entry(path, entry))
+            for entry in direntries:
+                childpath = str(PurePosixPath(path, entry))
+                if fs.isdir(childpath):
+                    lines.append("\n")
+                    lines.extend(
+                        collect_recursive(
+                            childpath, format_child_display(display, entry)
+                        )
+                    )
+            return lines
+
+        lines = []
+        for dir, direntries in sorted(entries):
+            display = dir or "."
+            lines.extend(collect_recursive(dir, display))
+        stdout.write("".join(lines).encode())
+        return 0
+
+    entries = sorted(entries)
 
     lines = [
         format_entry(dir, entry)
@@ -934,6 +1093,22 @@ def pwd(fs: ShellFS):
 
 
 @command
+def which(args: List[str], env: Env, fs: ShellFS, stdout: BinaryIO) -> int:
+    path = env.getenv("PATH")
+    paths = path.split(":") if path else []
+    exitcode = 0
+    for arg in args:
+        for path in paths:
+            candidate = str(PurePosixPath(path, arg))
+            if fs.isfile(candidate):
+                stdout.write(f"{candidate}\n".encode())
+                break
+        else:
+            exitcode = 1
+    return exitcode
+
+
+@command
 def grep(args: List[str], arg0: str, stdin: BinaryIO, fs: ShellFS, stdout: BinaryIO):
     def expect_arg(typ, args, flag):
         try:
@@ -950,6 +1125,7 @@ def grep(args: List[str], arg0: str, stdin: BinaryIO, fs: ShellFS, stdout: Binar
 
     inverse = False
     only = False
+    quiet = False
     extended = arg0 == "egrep"
     before = 0
     after = 0
@@ -961,8 +1137,13 @@ def grep(args: List[str], arg0: str, stdin: BinaryIO, fs: ShellFS, stdout: Binar
         elif flag == "-e":
             extended = True
             arg0 = "egrep"
+        elif flag == "-E" or flag == "--extended-regexp":
+            extended = True
+            arg0 = "egrep"
         elif flag == "-o":
             only = True
+        elif flag == "-q" or flag == "--quiet" or flag == "--silent":
+            quiet = True
         elif flag == "-A" or flag == "--after-context":
             after = expect_arg(int, args, flag)
         elif flag == "-B" or flag == "--before-context":
@@ -985,25 +1166,122 @@ def grep(args: List[str], arg0: str, stdin: BinaryIO, fs: ShellFS, stdout: Binar
 
     pat = re.compile(patstr)
     paths = args[1:]
-    lines = [l.decode() for l in _lines(fs, paths, stdin)]
-    line_matches = [(l, pat.search(l)) for l in lines]
+    path_lines = []
+    if paths:
+        for path in paths:
+            path_lines.extend((path, l.decode()) for l in _lines(fs, [path], stdin))
+    else:
+        path_lines = [("", l.decode()) for l in _lines(fs, paths, stdin)]
+    line_matches = [(path, l, pat.search(l)) for path, l in path_lines]
     if only:
+        show_path = len(paths) > 1
         out = "".join(
-            f"{m.group()}\n" for l, m in line_matches if m and bool(m) != inverse
+            f"{path}:{m.group()}\n" if show_path else f"{m.group()}\n"
+            for path, _line, m in line_matches
+            if m and bool(m) != inverse
         )
     else:
         out_lines = set()
-        for i, (l, m) in enumerate(line_matches):
+        for i, (_path, _line, m) in enumerate(line_matches):
             if bool(m) != inverse:
                 for j in range(max(0, i - before), i):
                     out_lines.add(j)
                 out_lines.add(i)
-                for j in range(i + 1, min(i + 1 + after, len(lines))):
+                for j in range(i + 1, min(i + 1 + after, len(line_matches))):
                     out_lines.add(j)
-        out = "".join(lines[i] for i in sorted(out_lines))
-    stdout.write(out.encode())
+        show_path = len(paths) > 1
+        output = []
+        for i in sorted(out_lines):
+            path, line, _match = line_matches[i]
+            if show_path:
+                output.append(f"{path}:{line}")
+            else:
+                output.append(line)
+        out = "".join(output)
+    if not quiet:
+        stdout.write(out.encode())
     if not out:
         return 1
+
+
+@command
+def dd(args: List[str], fs: ShellFS) -> int:
+    settings = {}
+    for arg in args:
+        if "=" not in arg:
+            raise NotImplementedError(f"dd {arg}")
+        key, value = arg.split("=", 1)
+        settings[key] = value
+    if settings.get("if") != "/dev/zero":
+        raise NotImplementedError(f"dd if={settings.get('if')}")
+    outpath = settings["of"]
+    size = int(settings.get("bs", "512")) * int(settings.get("count", "1"))
+    with fs.open(outpath, "wb") as f:
+        f.write(b"\0" * size)
+    return 0
+
+
+@command
+def diff(args: List[str], stdout: BinaryIO, fs: ShellFS) -> int:
+    import difflib
+
+    unified = False
+    if args and args[0] == "-u":
+        unified = True
+        args = args[1:]
+    if len(args) != 2:
+        raise NotImplementedError(f"diff {args}")
+    leftpath, rightpath = args
+    with fs.open(leftpath, "rb") as f:
+        left = f.read().decode(errors="replace").splitlines(keepends=True)
+    with fs.open(rightpath, "rb") as f:
+        right = f.read().decode(errors="replace").splitlines(keepends=True)
+    if left == right:
+        return 0
+    if unified:
+        stdout.write(
+            "".join(
+                difflib.unified_diff(left, right, fromfile=leftpath, tofile=rightpath)
+            ).encode()
+        )
+    return 1
+
+
+@command
+def kill(args: List[str]) -> int:
+    if args and args[0] == "-TERM":
+        return 0
+    raise NotImplementedError(f"kill {args}")
+
+
+@command
+def curl(args: List[str], stdout: BinaryIO) -> int:
+    import urllib.request
+
+    method = "GET"
+    url = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "-s":
+            pass
+        elif arg == "-X":
+            i += 1
+            if i == len(args):
+                raise RuntimeError("curl -X requires an argument")
+            method = args[i]
+        elif arg.startswith("http://") or arg.startswith("https://"):
+            url = arg
+        else:
+            raise NotImplementedError(f"curl {arg}")
+        i += 1
+    if url is None:
+        raise RuntimeError("curl requires a URL")
+    request = urllib.request.Request(url, method=method)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request) as response:
+        stdout.write(response.read())
+    return 0
 
 
 @command
@@ -1059,6 +1337,13 @@ def find(args: List[str], fs: ShellFS):
                 appendfilter(lambda p: (fs.stat(p).st_mode & mode) == mode)
             else:
                 raise NotImplementedError(f"find -perm {modestr}")
+        elif arg == "-name":
+            patstr = args[i]
+            i += 1
+
+            from fnmatch import fnmatch
+
+            appendfilter(lambda p, pat=patstr: fnmatch(PurePosixPath(p).name, pat))
         elif arg == "-not":
             negate = True
         elif arg == "-wholename":
@@ -1071,16 +1356,16 @@ def find(args: List[str], fs: ShellFS):
         elif arg.startswith("-"):
             raise NotImplementedError(f"find {arg}")
         elif arg == ".":
-            findpaths.append("")
+            findpaths.append(".")
         else:
             findpaths.append(arg)
 
     outpaths = []
     for findpath in findpaths:
         fs.chdir(origcwd)
-        if findpath:
+        if findpath and findpath != ".":
             fs.chdir(findpath)
-        prefix = findpath and f"{findpath}/" or ""
+        prefix = "./" if findpath == "." else findpath and f"{findpath}/" or ""
         paths = [f"{prefix}{p}" for p in fs.glob("**/*")]
         fs.chdir(origcwd)
         paths = [p for p in paths if all(f(p) for f in filters)]

@@ -282,16 +282,14 @@ async fn validate_repo_acl(
             })
     }) {
         return Err(scs_errors::invalid_request(format!(
-            "Hipster group: {} is not a maintainer for acl: {}",
-            hipster_group, acl_name
+            "Hipster group: {hipster_group} is not a maintainer for acl: {acl_name}"
         ))
         .into());
     }
     // Ensure this oncall is point of contact for this ACL
     if acl.point_of_contact.id_data != oncall_name {
         return Err(scs_errors::invalid_request(format!(
-            "Oncall: {} is not a point of contact for acl: {}",
-            oncall_name, acl_name
+            "Oncall: {oncall_name} is not a point of contact for acl: {acl_name}"
         ))
         .into());
     }
@@ -324,7 +322,7 @@ async fn try_fetching_repo_acl(
 }
 
 fn make_full_acl_name_from_repo_name(repo_name: &str) -> String {
-    format!("repos/git/{}", repo_name)
+    format!("repos/git/{repo_name}")
 }
 
 fn make_top_level_acl_name_from_repo_name(repo_name: &str) -> String {
@@ -335,7 +333,7 @@ fn make_top_level_acl_name_from_repo_name(repo_name: &str) -> String {
     // NOTE for future implementer: any logging added inside add_repo() must use debug! not info!
     // — info! in add_repo() breaks .t integration tests (project memory).
     let (top_level, _rest) = repo_name.split_once('/').unwrap_or((repo_name, ""));
-    format!("repos/git/{}", top_level)
+    format!("repos/git/{top_level}")
 }
 
 #[cfg(fbcode_build)]
@@ -688,8 +686,7 @@ async fn prepare_repo_configs_mutation_nowait(
     );
     let mut txn = configo_client.managed_transaction();
 
-    let use_repo_spec = justknobs::eval("scm/mononoke:create_repos_use_repo_spec", None, None)
-        .map_err(scs_errors::internal_error)?;
+    let use_repo_spec = justknobs::eval("scm/mononoke:create_repos_use_repo_spec", None, None);
 
     // Load default repo config template once before the loop
     let default_repo_config = if use_repo_spec {
@@ -924,8 +921,7 @@ async fn create_repos_in_mononoke(
             .await?;
 
             let spawn_task =
-                justknobs::eval("scm/mononoke:spawn_mutation_polling_task", None, None)
-                    .map_err(scs_errors::internal_error)?;
+                justknobs::eval("scm/mononoke:spawn_mutation_polling_task", None, None);
             if spawn_task {
                 // Clone necessary data for the spawned task
                 let poll_ctx = ctx.clone();
@@ -1061,8 +1057,7 @@ impl SourceControlServiceImpl {
                     | MutationState::VALIDATING => thrift::CreateReposStatus::IN_PROGRESS,
                     _ => {
                         return Err(scs_errors::internal_error(format!(
-                            "Unexpected Configo mutation state: {}",
-                            state
+                            "Unexpected Configo mutation state: {state}"
                         ))
                         .into());
                     }
@@ -1071,7 +1066,7 @@ impl SourceControlServiceImpl {
             Err(err) => return Err(err),
         };
 
-        let message = Some(format!("Mutation state: {}", mutation_state));
+        let message = Some(format!("Mutation state: {mutation_state}"));
         Ok(thrift::CreateReposPollResponse {
             result: Some(thrift::CreateReposResponse {
                 status,
@@ -1133,8 +1128,7 @@ async fn handle_prepared_state(
         if let Err(e) = initiate_land_for_mutation(ctx, configo_client, mutation_id).await {
             if retry_count == 0 {
                 return Err(scs_errors::poll_error(format!(
-                    "Configo mutation error: {}",
-                    error_message
+                    "Configo mutation error: {error_message}"
                 ))
                 .into());
             } else {

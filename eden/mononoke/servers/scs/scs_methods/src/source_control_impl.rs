@@ -103,6 +103,7 @@ const FORWARDED_CLIENT_IP_HEADER: &str = "scm_forwarded_client_ip";
 const FORWARDED_CLIENT_PORT_HEADER: &str = "scm_forwarded_client_port";
 const FORWARDED_CLIENT_DEBUG_HEADER: &str = "scm_forwarded_client_debug";
 const FORWARDED_OTHER_CATS_HEADER: &str = "scm_forwarded_other_cats";
+const ALWAYS_LOG_HEADER: &str = "always_log";
 const PER_REQUEST_READ_QPS: usize = 4000;
 const PER_REQUEST_WRITE_QPS: usize = 4000;
 
@@ -217,7 +218,18 @@ impl SourceControlServiceImpl {
         let session_uuid = session.metadata().session_id().to_string();
         scuba.add("session_uuid", session_uuid.clone());
 
+        let always_log = req_ctxt
+            .header(ALWAYS_LOG_HEADER)
+            .map_err(scs_errors::internal_error)?
+            .is_some();
+        if always_log {
+            scuba.unsampled();
+        }
+
         let ctx = session.new_context_with_scribe(scuba, self.scribe.clone());
+        if always_log {
+            ctx.set_override_sampling();
+        }
 
         let repo_name = if let Some(specifier) = specifier {
             specifier.scuba_reponame()
@@ -256,10 +268,10 @@ impl SourceControlServiceImpl {
             scuba.add("config_store_last_updated_at", config_info.last_updated_at);
         }
 
-        let sampling_rate = NonZeroU64::new(
-            justknobs::get_as::<u64>("scm/mononoke:scs_method_sampling_rate", Some(name))
-                .map_err(scs_errors::internal_error)?,
-        );
+        let sampling_rate = NonZeroU64::new(justknobs::get_as::<u64>(
+            "scm/mononoke:scs_method_sampling_rate",
+            Some(name),
+        ));
         if let Some(sampling_rate) = sampling_rate {
             scuba.sampled(sampling_rate);
         } else {
@@ -627,8 +639,7 @@ impl SourceControlServiceImpl {
             }
             thrift::TreeSpecifier::UnknownField(id) => {
                 return Err(scs_errors::invalid_request(format!(
-                    "tree specifier type not supported: {}",
-                    id
+                    "tree specifier type not supported: {id}"
                 ))
                 .into());
             }
@@ -680,8 +691,7 @@ impl SourceControlServiceImpl {
             }
             thrift::FileSpecifier::UnknownField(id) => {
                 return Err(scs_errors::invalid_request(format!(
-                    "file specifier type not supported: {}",
-                    id
+                    "file specifier type not supported: {id}"
                 ))
                 .into());
             }
@@ -731,9 +741,7 @@ fn maybe_set_nocache_thriftcache(
         "scm/mononoke:scs_thriftcache_nocache_for_non_kcb_identities",
         None,
         None,
-    )
-    .map_err(scs_errors::internal_error)?
-    {
+    ) {
         return Ok(());
     }
 
@@ -821,7 +829,7 @@ fn log_result<T: AddScubaResponse>(
         }
     };
 
-    if let Ok(true) = justknobs::eval("scm/mononoke:scs_alert_on_methods", None, Some(method)) {
+    if justknobs::eval("scm/mononoke:scs_alert_on_methods", None, Some(method)) {
         STATS::total_method_requests.add_value(1, (method.to_string(),));
         if status == "INTERNAL_ERROR" {
             STATS::total_method_internal_failure.add_value(1, (method.to_string(),));
@@ -930,14 +938,10 @@ fn log_stream_chunk<T: AddScubaResponse>(
     if let Some(error) = error {
         scuba.add("error", error.as_str());
     }
-    let sampling_rate = NonZeroU64::new(
-        justknobs::get_as::<u64>(
-            "scm/mononoke:scs_stream_chunk_scuba_sampling_rate",
-            Some(method),
-        )
-        .ok()
-        .unwrap_or(1000),
-    ); // 1:1000 by default to avoid spamming scuba
+    let sampling_rate = NonZeroU64::new(justknobs::get_as::<u64>(
+        "scm/mononoke:scs_stream_chunk_scuba_sampling_rate",
+        Some(method),
+    ));
     if let Some(sampling_rate) = sampling_rate {
         scuba.sampled(sampling_rate);
     }
@@ -995,7 +999,7 @@ fn log_stream_complete(
             None => ("SUCCESS", Outcome::Success, None, 0, 0, 0),
         };
 
-    if let Ok(true) = justknobs::eval("scm/mononoke:scs_alert_on_methods", None, Some(method)) {
+    if justknobs::eval("scm/mononoke:scs_alert_on_methods", None, Some(method)) {
         STATS::total_method_requests.add_value(1, (method.to_string(),));
         if status == "INTERNAL_ERROR" {
             STATS::total_method_internal_failure.add_value(1, (method.to_string(),));
@@ -1121,11 +1125,9 @@ fn check_memory_usage(
         },
     };
     let rss_min_free_bytes =
-        justknobs::get_as::<usize>("scm/mononoke:scs_rss_min_free_bytes", Some(method))
-            .map_err(scs_errors::internal_error)?;
+        justknobs::get_as::<usize>("scm/mononoke:scs_rss_min_free_bytes", Some(method));
     let rss_min_free_pct =
-        justknobs::get_as::<i32>("scm/mononoke:scs_rss_min_free_pct", Some(method))
-            .map_err(scs_errors::internal_error)?;
+        justknobs::get_as::<i32>("scm/mononoke:scs_rss_min_free_pct", Some(method));
 
     if rss_min_free_bytes > 0 || rss_min_free_pct > 0 {
         debug!(
@@ -1779,8 +1781,7 @@ mod tests {
         for id_type in client_identifier_structs::consts::REQUEST_PRIMARY_IDENTITY_TYPES.iter() {
             assert!(
                 is_kcb_covered(id_type),
-                "Expected '{}' to be covered by KCB",
-                id_type
+                "Expected '{id_type}' to be covered by KCB"
             );
         }
     }
@@ -1874,8 +1875,7 @@ mod tests {
                     "scm/mononoke:scs_thriftcache_nocache_for_non_kcb_identities",
                     None,
                     None,
-                )
-                .unwrap_or(false);
+                );
                 assert!(!jk_enabled);
                 // Since JK is disabled, nocache should not be set.
                 assert!(!ctx.nocache_thriftcache());
@@ -1898,8 +1898,7 @@ mod tests {
                     "scm/mononoke:scs_thriftcache_nocache_for_non_kcb_identities",
                     None,
                     None,
-                )
-                .unwrap_or(false);
+                );
                 assert!(jk_enabled);
 
                 // With non-KCB type, should_set_nocache returns true.

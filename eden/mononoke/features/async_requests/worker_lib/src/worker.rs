@@ -59,6 +59,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::methods::megarepo_async_request_compute;
+use crate::scuba::log_repo_load_failure;
 use crate::scuba::log_result;
 use crate::scuba::log_retriable_error;
 use crate::scuba::log_start;
@@ -138,11 +139,12 @@ impl AsyncMethodRequestWorker {
     ) -> Result<Self, Error> {
         let name = {
             let tw_job_cluster = std::env::var("TW_JOB_CLUSTER");
+            let tw_job_user = std::env::var("TW_JOB_USER");
             let tw_job_name = std::env::var("TW_JOB_NAME");
             let tw_task_id = std::env::var("TW_TASK_ID");
-            match (tw_job_cluster, tw_job_name, tw_task_id) {
-                (Ok(tw_job_cluster), Ok(tw_job_name), Ok(tw_task_id)) => {
-                    format!("{}/{}/{}", tw_job_cluster, tw_job_name, tw_task_id)
+            match (tw_job_cluster, tw_job_user, tw_job_name, tw_task_id) {
+                (Ok(tw_job_cluster), Ok(tw_job_user), Ok(tw_job_name), Ok(tw_task_id)) => {
+                    format!("{tw_job_cluster}/{tw_job_user}/{tw_job_name}/{tw_task_id}")
                 }
                 _ => format!(
                     "async_requests_worker/{}",
@@ -347,9 +349,7 @@ impl AsyncMethodRequestWorker {
             let configs = self.repos_mgr.configs();
             let (repo_name, _) = configs
                 .get_or_load_repo_config_by_id(repo_id.id())
-                .map_err(|e| {
-                    Error::msg(format!("No config found for repo_id {}: {}", repo_id, e))
-                })?;
+                .map_err(|e| Error::msg(format!("No config found for repo_id {repo_id}: {e}")))?;
             refs.insert(repo_id, (repo_name, 1));
         }
 
@@ -393,26 +393,13 @@ impl AsyncMethodRequestWorker {
         root_request_id: Option<RowId>,
         created_by: Option<String>,
     ) {
-        // Load the repo on-demand if needed
-        let is_ondemand = match self.ensure_repo_loaded(repo_id).await {
-            Ok(v) => v,
-            Err(err) => {
-                STATS::process_failed.add_value(1);
-                error!("[{}] Failed to load repo for request: {:?}", &req_id.0, err);
-                if let Err(e) = self.queue.requeue(&ctx, req_id).await {
-                    error!("Failed to requeue after repo load failure: {:?}", e);
-                }
-                return;
-            }
-        };
-        let cleanup_repo_id = if is_ondemand { repo_id } else { None };
-
+        // Prepare the request context before doing any work, so that all
+        // logging carries the request fields.
         let target = match params.target() {
             Ok(target) => target,
             Err(err) => {
                 STATS::process_failed.add_value(1);
                 error!("Error getting target: {:?}", err);
-                self.release_ondemand_repo(cleanup_repo_id);
                 return;
             }
         };
@@ -423,6 +410,21 @@ impl AsyncMethodRequestWorker {
             root_request_id,
             created_by.as_deref(),
         );
+
+        // Load the repo on-demand if needed
+        let is_ondemand = match self.ensure_repo_loaded(repo_id).await {
+            Ok(v) => v,
+            Err(err) => {
+                STATS::process_failed.add_value(1);
+                error!("[{}] Failed to load repo for request: {:?}", &req_id.0, err);
+                log_repo_load_failure(&ctx, repo_id, &err);
+                if let Err(e) = self.queue.requeue(&ctx, req_id).await {
+                    error!("Failed to requeue after repo load failure: {:?}", e);
+                }
+                return;
+            }
+        };
+        let cleanup_repo_id = if is_ondemand { repo_id } else { None };
 
         // Check concurrency limit for this request type. If exceeded,
         // hold the claim briefly before requeueing so the same hot request
@@ -586,7 +588,7 @@ impl AsyncMethodRequestWorker {
                     );
                     scuba.log_with_msg(
                         "Failed to update inprogress timestamp",
-                        Some(format!("{:?}", err)),
+                        Some(format!("{err:?}")),
                     );
                 }
             }

@@ -11,7 +11,13 @@ pub use crate::suffix_query::WireSuffixQueryResponse;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::tests::auto_wire_tests;
+    use crate::wire::tests::wire_json_hashes;
 
-    auto_wire_tests!(WireSuffixQueryRequest, WireSuffixQueryResponse);
+    #[test]
+    fn test_wire_json() {
+        assert_eq!(
+            wire_json_hashes![WireSuffixQueryRequest, WireSuffixQueryResponse,],
+            [10314064990398522914, 7714689301404996401]
+        );
+    }
 }

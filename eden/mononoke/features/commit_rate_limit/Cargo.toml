@@ -15,13 +15,13 @@ doctest = false
 anyhow = "1.0.102"
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 bookmarks = { version = "0.1.0", path = "../../repo_attributes/bookmarks" }
-chrono = { version = "0.4.44", features = ["clock", "serde", "std"], default-features = false }
+chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 commit_graph = { version = "0.1.0", path = "../../repo_attributes/commit_graph/commit_graph" }
 commit_rate_limit_config = { version = "0.1.0", path = "../../repo_attributes/commit_rate_limit" }
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 history_traversal = { version = "0.1.0", path = "../history_traversal" }
-justknobs = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
+justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
 repo_blobstore = { version = "0.1.0", path = "../../repo_attributes/repo_blobstore" }
 repo_derived_data = { version = "0.1.0", path = "../../repo_attributes/repo_derived_data" }

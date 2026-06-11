@@ -96,6 +96,9 @@ struct MononokeServerArgs {
     /// Path to a file with land service client private key
     #[clap(long, requires = "land_service_client_cert")]
     land_service_client_private_key: Option<String>,
+    /// Configerator path to the MononokeRateLimits config to load
+    #[clap(long, default_value = "scm/mononoke/ratelimiting/ratelimits")]
+    rate_limit_config_path: Option<String>,
     /// Mark this instance as a shadow tier. Shadow tiers never forward
     /// shadow traffic, preventing forwarding loops.
     #[clap(long, default_value_t = false)]
@@ -145,7 +148,7 @@ impl MononokeServerProcess {
                 CacheWarmupKind::MononokeServer,
             )
             .await
-            .with_context(|| format!("Error while warming up cache for repo {}", repo_name))?;
+            .with_context(|| format!("Error while warming up cache for repo {repo_name}"))?;
             info!("Completed repo {} setup in Mononoke service", repo_name);
         } else {
             info!("Repo {} is already setup in Mononoke service", repo_name);
@@ -162,10 +165,7 @@ impl RepoShardedProcess for MononokeServerProcess {
         self.add_repo(&repo_name, &self.scuba.clone())
             .await
             .with_context(|| {
-                format!(
-                    "Failure in setting up repo {} in Mononoke service",
-                    repo_name
-                )
+                format!("Failure in setting up repo {repo_name} in Mononoke service")
             })?;
 
         Ok(Arc::new(MononokeServerProcessExecutor {
@@ -185,10 +185,7 @@ pub struct MononokeServerProcessExecutor {
 impl MononokeServerProcessExecutor {
     fn remove_repo(&self, repo_name: &str) -> Result<()> {
         let config = self.repos_mgr.repo_config(repo_name).with_context(|| {
-            format!(
-                "Failure in remove repo {}. The config for repo doesn't exist",
-                repo_name
-            )
+            format!("Failure in remove repo {repo_name}. The config for repo doesn't exist")
         })?;
         self.repos_mgr.remove_stats_handle_for_repo(repo_name);
         // Check if the current repo is a deep-sharded or shallow-sharded repo. If the
@@ -251,6 +248,7 @@ fn main(fb: FacebookInit) -> Result<()> {
     let runtime = app.runtime().clone();
 
     let cslb_config = args.cslb_config.clone();
+    let rate_limit_config_path = args.rate_limit_config_path.clone();
     info!("Starting up");
 
     #[cfg(fbcode_build)]
@@ -339,7 +337,7 @@ fn main(fb: FacebookInit) -> Result<()> {
                         .instrument(tracing::info_span!("cache warmup", repo = %repo_name))
                         .await
                         .with_context(|| {
-                            format!("Error while warming up cache for repo {}", repo_name)
+                            format!("Error while warming up cache for repo {repo_name}")
                         })
                     }
                 })
@@ -387,6 +385,7 @@ fn main(fb: FacebookInit) -> Result<()> {
                 args.tls_args.disable_mtls,
                 args.shadow_tier,
                 Some(Path::new(&args.tls_args.tls_ca)),
+                rate_limit_config_path,
             )
             .await
         }

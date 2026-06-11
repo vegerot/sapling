@@ -25,6 +25,8 @@ use tokio::time::Duration;
 use tokio::time::interval;
 
 use crate::CounterManager;
+use crate::DesiredCountersProvider;
+use crate::OdsCounterKey;
 
 const ODS_STALENESS_THRESHOLD: TimeDelta = TimeDelta::seconds(60);
 const ODS_QUERY_INTERVAL: Duration = Duration::from_mins(5);
@@ -32,8 +34,7 @@ const ODS_QUERY_INTERVAL: Duration = Duration::from_mins(5);
 #[derive(Clone)]
 pub struct OdsCounterManager {
     fb: FacebookInit,
-    pub counters:
-        HashMap<(String, String, Option<String>, Option<String>), (DateTime<Utc>, Option<f64>)>,
+    pub counters: HashMap<OdsCounterKey, (DateTime<Utc>, Option<f64>)>,
 }
 
 impl OdsCounterManager {
@@ -53,25 +54,21 @@ impl OdsCounterManager {
         value: Option<f64>,
     ) {
         let counters = &mut self.counters;
+        let counter_key = OdsCounterKey {
+            entity: entity.to_string(),
+            key: key.to_string(),
+            reduce: reduce.map(|s| s.to_string()),
+            transform: transform.map(|s| s.to_string()),
+        };
 
         match value {
             Some(value) => {
-                if let Some(counter) = counters.get_mut(&(
-                    entity.to_string(),
-                    key.to_string(),
-                    reduce.map(|s| s.to_string()),
-                    transform.map(|s| s.to_string()),
-                )) {
+                if let Some(counter) = counters.get_mut(&counter_key) {
                     *counter = (Utc::now(), Some(value));
                 }
             }
             None => {
-                if let Some(counter) = counters.get_mut(&(
-                    entity.to_string(),
-                    key.to_string(),
-                    reduce.map(|s| s.to_string()),
-                    transform.map(|s| s.to_string()),
-                )) {
+                if let Some(counter) = counters.get_mut(&counter_key) {
                     let (last_fetched, value) = *counter;
                     if Utc::now().signed_duration_since(last_fetched) > ODS_STALENESS_THRESHOLD {
                         *counter = (Utc::now(), None);
@@ -94,12 +91,12 @@ impl CounterManager for OdsCounterManager {
         transform: Option<String>,
     ) {
         self.counters.insert(
-            (
-                entity.clone(),
-                key.clone(),
-                reduce.clone(),
-                transform.clone(),
-            ),
+            OdsCounterKey {
+                entity,
+                key,
+                reduce,
+                transform,
+            },
             (Utc::now(), None),
         );
     }
@@ -112,12 +109,12 @@ impl CounterManager for OdsCounterManager {
         transform: Option<&str>,
     ) -> Option<f64> {
         self.counters
-            .get(&(
-                entity.to_string(),
-                key.to_string(),
-                reduce.map(|s| s.to_string()),
-                transform.map(|s| s.to_string()),
-            ))
+            .get(&OdsCounterKey {
+                entity: entity.to_string(),
+                key: key.to_string(),
+                reduce: reduce.map(|s| s.to_string()),
+                transform: transform.map(|s| s.to_string()),
+            })
             .and_then(|(_, value)| *value)
     }
 }
@@ -139,14 +136,30 @@ async fn fetch_counter(
         .ok()
 }
 
+fn reconcile_counters(
+    manager: &Arc<RwLock<OdsCounterManager>>,
+    desired_counters: &DesiredCountersProvider,
+) {
+    let desired = desired_counters();
+
+    let mut manager = manager.write().expect("Poisoned lock");
+    manager.counters.retain(|key, _| desired.contains(key));
+    for key in desired {
+        manager.counters.entry(key).or_insert((Utc::now(), None));
+    }
+}
+
 pub async fn periodic_fetch_counter(
     manager: Arc<RwLock<OdsCounterManager>>,
+    desired_counters: DesiredCountersProvider,
     interval_duration: Duration,
 ) {
     let mut interval = interval(interval_duration);
 
     loop {
         interval.tick().await;
+
+        reconcile_counters(&manager, &desired_counters);
 
         // Acquire the read guard once to get the keys
         let (fb, keys) = {
@@ -161,13 +174,20 @@ pub async fn periodic_fetch_counter(
         let mut fetched_values = Vec::new();
 
         // Fetch the counter values asynchronously
-        for (entity, key, reduce, transform) in &keys {
-            let value = fetch_counter(fb, entity, key, reduce.clone(), transform.clone()).await;
+        for counter_key in &keys {
+            let value = fetch_counter(
+                fb,
+                &counter_key.entity,
+                &counter_key.key,
+                counter_key.reduce.clone(),
+                counter_key.transform.clone(),
+            )
+            .await;
             fetched_values.push((
-                entity.clone(),
-                key.clone(),
-                reduce.clone(),
-                transform.clone(),
+                counter_key.entity.clone(),
+                counter_key.key.clone(),
+                counter_key.reduce.clone(),
+                counter_key.transform.clone(),
                 value,
             ));
         }
@@ -305,6 +325,7 @@ impl OdsQuery {
 #[cfg(test)]
 mod test {
 
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     use configerator_structs_rapido_if_clients::Rapido;
@@ -409,7 +430,12 @@ mod test {
         // Give it a value
         {
             manager.write().unwrap().counters.insert(
-                ("entity".to_string(), "key".to_string(), None, None),
+                OdsCounterKey {
+                    entity: "entity".to_string(),
+                    key: "key".to_string(),
+                    reduce: None,
+                    transform: None,
+                },
                 (Utc::now(), Some(5.0)),
             );
         }
@@ -419,7 +445,12 @@ mod test {
             let manager_lock = manager.read().unwrap();
             let values = manager_lock
                 .counters
-                .get(&("entity".to_string(), "key".to_string(), None, None))
+                .get(&OdsCounterKey {
+                    entity: "entity".to_string(),
+                    key: "key".to_string(),
+                    reduce: None,
+                    transform: None,
+                })
                 .clone();
             let (timestamp, value) = values.unwrap();
             assert!(timestamp.timestamp() > 0);
@@ -429,7 +460,19 @@ mod test {
 
         let clone = manager.clone();
 
-        mononoke::spawn_task(periodic_fetch_counter(clone, Duration::from_secs(1)));
+        let provider: DesiredCountersProvider = Box::new(|| {
+            HashSet::from([OdsCounterKey {
+                entity: "entity".to_string(),
+                key: "key".to_string(),
+                reduce: None,
+                transform: None,
+            }])
+        });
+        mononoke::spawn_task(periodic_fetch_counter(
+            clone,
+            provider,
+            Duration::from_secs(1),
+        ));
 
         // Wait for the counter to be fetched
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -439,12 +482,108 @@ mod test {
             let manager_lock = manager.read().unwrap();
             let values = manager_lock
                 .counters
-                .get(&("entity".to_string(), "key".to_string(), None, None))
+                .get(&OdsCounterKey {
+                    entity: "entity".to_string(),
+                    key: "key".to_string(),
+                    reduce: None,
+                    transform: None,
+                })
                 .clone();
 
             let (second_timestamp, value) = values.unwrap();
             assert_eq!(second_timestamp.timestamp(), timestamp.timestamp());
             assert_eq!(*value, Some(5.0));
+        }
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_reconcile_counters_dynamic(fb: FacebookInit) {
+        let manager = Arc::new(RwLock::new(OdsCounterManager {
+            fb,
+            counters: HashMap::new(),
+        }));
+
+        let key_a = OdsCounterKey {
+            entity: "entity_a".to_string(),
+            key: "key_a".to_string(),
+            reduce: None,
+            transform: None,
+        };
+        let key_b = OdsCounterKey {
+            entity: "entity_b".to_string(),
+            key: "key_b".to_string(),
+            reduce: None,
+            transform: None,
+        };
+
+        // Start with a single counter A.
+        let provider_a: DesiredCountersProvider = Box::new({
+            let key_a = key_a.clone();
+            move || HashSet::from([key_a.clone()])
+        });
+        reconcile_counters(&manager, &provider_a);
+
+        {
+            let manager = manager.read().unwrap();
+            assert_eq!(
+                manager.counters.len(),
+                1,
+                "Only counter A should be present"
+            );
+            assert!(manager.counters.contains_key(&key_a));
+        }
+
+        // Give A a cached value to prove it survives the next reconcile.
+        {
+            manager
+                .write()
+                .unwrap()
+                .counters
+                .insert(key_a.clone(), (Utc::now(), Some(42.0)));
+        }
+
+        // Reconcile against a new set: A stays, B is added.
+        let provider_ab: DesiredCountersProvider = Box::new({
+            let key_a = key_a.clone();
+            let key_b = key_b.clone();
+            move || HashSet::from([key_a.clone(), key_b.clone()])
+        });
+        reconcile_counters(&manager, &provider_ab);
+
+        {
+            let manager = manager.read().unwrap();
+            assert_eq!(
+                manager.counters.len(),
+                2,
+                "Counters A and B should be present"
+            );
+            assert_eq!(
+                manager.counters.get(&key_a).unwrap().1,
+                Some(42.0),
+                "Existing counter A's cached value must be preserved across reconcile"
+            );
+            assert_eq!(
+                manager.counters.get(&key_b).unwrap().1,
+                None,
+                "Newly added counter B starts with no value"
+            );
+        }
+
+        // Reconcile against a set that drops A and keeps B.
+        let provider_b: DesiredCountersProvider = Box::new({
+            let key_b = key_b.clone();
+            move || HashSet::from([key_b.clone()])
+        });
+        reconcile_counters(&manager, &provider_b);
+
+        {
+            let manager = manager.read().unwrap();
+            assert_eq!(manager.counters.len(), 1, "Only counter B should remain");
+            assert!(
+                !manager.counters.contains_key(&key_a),
+                "Removed counter A should be dropped"
+            );
+            assert!(manager.counters.contains_key(&key_b));
         }
     }
 }

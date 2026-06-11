@@ -19,20 +19,20 @@ blobstore = { version = "0.1.0", path = "../blobstore" }
 borrowed = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 bounded_traversal = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 bytes = { version = "1.11.1", features = ["serde"] }
-chrono = { version = "0.4.44", features = ["clock", "serde", "std"], default-features = false }
+chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 chrono-english = "0.1.8"
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 context = { version = "0.1.0", path = "../servers/slapi/slapi_server/context" }
 derivative = "2.2"
 derived_data_type_if = { version = "0.1.0", path = "../derived_data/if" }
-either = "1.5"
+either = "1.16.0"
 faster-hex = "0.6.1"
 fbthrift = { version = "0.0.1+unstable", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
 fn-error-context = "0.2"
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 futures_watchdog = { version = "0.1.0", path = "../common/futures_watchdog" }
-gix-date = "0.15.3"
-gix-hash = { version = "0.25.0", features = ["sha1"] }
+gix-date = "0.15.4"
+gix-hash = { version = "0.25.1", features = ["sha1"] }
 gix-object = "0.60.0"
 itertools = "0.14.0"
 lazy_static = "1.5"
@@ -40,7 +40,7 @@ lfs_protocol = { version = "0.1.0", path = "../common/lfs_protocol" }
 maplit = "1.0"
 mononoke_types_serialization = { version = "0.1.0", path = "serialization" }
 nonzero_ext = "0.2"
-quickcheck = "1.0"
+quickcheck = "1.1"
 quickcheck_arbitrary_derive = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 regex = "1.12.3"
 sapling-edenapi_types = { version = "0.1.0", path = "../../scm/lib/edenapi/types" }
@@ -51,7 +51,7 @@ sha1 = "0.10.5"
 smallvec = { version = "1.15", features = ["impl_bincode", "serde", "specialization", "union", "write"] }
 sorted_vector_map = { version = "0.2.1", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-strum = { version = "0.27.1", features = ["derive"] }
+strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.18"
 thrift_convert = { version = "0.1.0", path = "../common/thrift_convert" }
 tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }

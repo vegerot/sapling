@@ -242,6 +242,25 @@ struct GitimportArgs {
     /// hours). Required when `--github-lfs-url` is set.
     #[clap(long, requires = "github_lfs_url")]
     github_lfs_token_file: Option<PathBuf>,
+    /// HTTP forward proxy URL used to tunnel GitHub LFS Batch API requests
+    /// through via HTTP CONNECT. Defaults to Meta's prod forward proxy
+    /// (`http://fwdproxy:8080`), which is required to reach github.com from
+    /// any Meta host (Sandcastle workers, devservers, OD sandboxes). Pair
+    /// with `--github-lfs-no-https-proxy` to disable proxying entirely
+    /// (e.g. when running outside Meta in OSS environments where github.com
+    /// is reachable directly). Only applies to the `--github-lfs-url` code
+    /// path; the other LFS modes ignore it.
+    #[clap(
+        long,
+        requires = "github_lfs_url",
+        default_value = "http://fwdproxy:8080"
+    )]
+    github_lfs_https_proxy: String,
+    /// Disable HTTPS proxying for GitHub LFS Batch requests, overriding the
+    /// default `--github-lfs-https-proxy`. Use when running outside Meta
+    /// (OSS) where github.com is reachable directly without a forward proxy.
+    #[clap(long, requires = "github_lfs_url")]
+    github_lfs_no_https_proxy: bool,
     /// TLS parameters for this service used for outbound LFS connections
     #[clap(flatten)]
     tls_args: Option<TLSArgs>,
@@ -259,6 +278,12 @@ struct GitimportArgs {
     /// imports.
     #[clap(long)]
     cleanup_mononoke_bookmarks: bool,
+    /// On failure, persist `bonsai_git_mapping` rows for commits already
+    /// fully processed so retries can resume incrementally. Also surfaces
+    /// the real underlying error to Scuba instead of the SendError
+    /// cascade. See `GitimportPreferences::persist_partial_mappings`.
+    #[clap(long)]
+    persist_partial_mappings: bool,
 }
 
 #[derive(Subcommand)]
@@ -407,9 +432,15 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                         "--github-lfs-token-file is required when --github-lfs-url is set",
                     )
                 })?;
+                let https_proxy = if args.github_lfs_no_https_proxy {
+                    None
+                } else {
+                    Some(args.github_lfs_https_proxy)
+                };
                 GitImportLfs::new_github(
                     github_lfs_url,
                     token_file,
+                    https_proxy,
                     args.allow_dangling_lfs_pointers,
                     args.lfs_import_max_attempts,
                     Some(LFS_SIMULTANEOUS_CONNECTION_LIMIT),
@@ -431,6 +462,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
         allow_content_refs: args.allow_content_refs,
         backfill_derivation,
         lfs,
+        persist_partial_mappings: args.persist_partial_mappings,
         ..Default::default()
     };
 
@@ -474,12 +506,12 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                     cloned!(ctx, uploader, reader);
                     async move {
                         let tag_sha1 = ObjectId::from_str(&tag_sha1).with_context(|| {
-                            format!("Invalid SHA1 hash provided for Git Tag {}", tag_sha1)
+                            format!("Invalid SHA1 hash provided for Git Tag {tag_sha1}")
                         })?;
                         upload_git_tag(&ctx, uploader.clone(), reader.clone(), &tag_sha1)
                             .await
                             .with_context(|| {
-                                format!("Error in uploading tag with ID {}", tag_sha1)
+                                format!("Error in uploading tag with ID {tag_sha1}")
                             })?;
                         info!("Uploaded tag with ID {}", tag_sha1);
                         anyhow::Ok(())

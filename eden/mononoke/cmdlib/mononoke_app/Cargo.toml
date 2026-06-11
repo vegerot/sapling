@@ -36,7 +36,7 @@ futures = { version = "0.3.31", features = ["async-await", "compat"] }
 futures-util = { version = "0.3.30", features = ["compat"] }
 futures_retry = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 itertools = "0.14.0"
-justknobs = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
+justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
 megarepo_config = { version = "0.1.0", path = "../../megarepo_api/megarepo_config" }
 memcache = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 metaconfig_parser = { version = "0.1.0", path = "../../metaconfig/parser" }
@@ -60,7 +60,7 @@ services = { version = "0.1.0", git = "https://github.com/facebookexperimental/r
 shutdown_timeout = { version = "0.1.0", path = "shutdown_timeout" }
 sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-strum = { version = "0.27.1", features = ["derive"] }
+strum = { version = "0.28.0", features = ["derive"] }
 tls = { version = "0.1.0", path = "tls" }
 tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }

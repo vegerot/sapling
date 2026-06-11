@@ -32,9 +32,9 @@ Don't attempt to fetch 19d1f9c4 - it is restricted
   [1]
 
   $ find .
-  A
-  regular
-  regular/file.txt
+  ./A
+  ./regular
+  ./regular/file.txt
 
 Give a specific message when referencing a restricted file:
   $ sl cat restricted/secret.txt
@@ -79,3 +79,22 @@ Rust commands also warn about restricted paths:
   warning: results may be incomplete due to path ACLs
     'restricted' is restricted by ACL 'some-acl'
   [1]
+
+Matcher-scoped BFS should not check ACLs under directories it will not visit:
+
+  $ newserver server2
+  $ drawdag << 'EOS'
+  > A  # A/some_dir/public.txt = public content
+  >    # A/some_dir/secret/.slacl = acl config
+  >    # A/some_dir/secret/private.txt = private content
+  > EOS
+
+  $ cd
+  $ newclientrepo client2 server2
+  $ setconfig scmstore.fetch-tree-aux-data=true
+  $ setconfig scmstore.tree-metadata-mode=always
+  $ setconfig experimental.restricted-tree-mode=enforced
+  $ setconfig slacl.server-acl-enforcement=true
+
+No permission check is needed for `some_dir/secret` when only listing `some_dir/public.txt`.
+  $ SL_LOG=eagerepo::api=debug sl files -r $A some_dir/public.txt 2>&1 | grep check_manifest_permission || true

@@ -34,6 +34,7 @@ use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::FileType;
 use mononoke_types::FsnodeId;
+use mononoke_types::MPath;
 use mononoke_types::NonRootMPath;
 use mononoke_types::fsnode::FsnodeFile;
 
@@ -77,7 +78,7 @@ impl From<RootFsnodeId> for BlobstoreBytes {
 pub fn format_key(derivation_ctx: &DerivationContext, changeset_id: ChangesetId) -> String {
     let root_prefix = "derived_root_fsnode.";
     let key_prefix = derivation_ctx.mapping_key_prefix::<RootFsnodeId>();
-    format!("{}{}{}", root_prefix, key_prefix, changeset_id)
+    format!("{root_prefix}{key_prefix}{changeset_id}")
 }
 
 #[async_trait]
@@ -202,44 +203,27 @@ pub async fn get_fsnode_subtree_changes(
                 {
                     Some(root_fsnode) => root_fsnode.into_fsnode_id(),
                     None => {
-                        // Fallback for pipeline-derived commits: fetch from terminal stage output.
-                        let pipeline_config = derivation_ctx
-                            .pipeline_config()
-                            .filter(|cfg| cfg.types.contains(&DerivableType::Fsnodes))
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "No RootFsnodeId mapping and no pipeline config for {}",
-                                    from_cs_id
-                                )
-                            })?;
-                        let (terminal_stage_id, _) = pipeline_config
-                            .stages
-                            .iter()
-                            .find(|(_, cfg)| cfg.terminal)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("No terminal stage in pipeline config")
-                            })?;
+                        // Fallback for pipeline-derived commits: fetch from
+                        // the terminal stage's output. The validator
+                        // guarantees the terminal stage is at `MPath::ROOT`,
+                        // so we don't need to consult any config to find it.
                         let stage_outputs = RootFsnodeId::fetch_stage_outputs(
                             &ctx,
                             derivation_ctx,
-                            terminal_stage_id,
+                            &MPath::ROOT,
                             vec![from_cs_id],
                         )
                         .await?;
                         let entry = stage_outputs.get(&from_cs_id).ok_or_else(|| {
                             anyhow::anyhow!(
-                                "No stage output for {} in terminal stage {}",
-                                from_cs_id,
-                                terminal_stage_id,
+                                "No RootFsnodeId mapping and no terminal-stage output for {from_cs_id}",
                             )
                         })?;
                         match entry {
                             Some(Entry::Tree(fsnode_id)) => *fsnode_id,
                             other => {
                                 return Err(anyhow::anyhow!(
-                                    "Expected tree entry for terminal stage output of {}, got {:?}",
-                                    from_cs_id,
-                                    other,
+                                    "Expected tree entry for terminal stage output of {from_cs_id}, got {other:?}",
                                 ));
                             }
                         }
@@ -250,9 +234,7 @@ pub async fn get_fsnode_subtree_changes(
                     .await?
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "Subtree copy source {} does not exist in {}",
-                            from_path,
-                            from_cs_id
+                            "Subtree copy source {from_path} does not exist in {from_cs_id}"
                         )
                     })?;
                 Ok(ManifestParentReplacement {

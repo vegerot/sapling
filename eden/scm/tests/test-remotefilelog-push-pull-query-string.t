@@ -1,6 +1,3 @@
-#chg-compatible
-#debugruntest-incompatible
-
   $ . "$TESTDIR/library.sh"
 
   $ sl init repo

@@ -56,11 +56,14 @@
     "normal": {
       "client_atlas": null,
       "client_atlas_env_id": null,
+      "client_atlas_rl": null,
       "client_correlator": *, (glob)
       "client_entry_point": "curl_test",
       "client_hostname": "localhost.*", (re)
       "client_ip": "$LOCALIP",
       "client_main_id": *, (glob)
+      "client_tw_job": null,
+      "client_tw_task": null,
       "fetch_cause": null,
       "fetch_from_cas_attempted": "false",
       "http_host": *, (glob)
@@ -71,7 +74,8 @@
       "request_id": "*", (glob)
       "sandcastle_alias": null,
       "sandcastle_nonce": null,
-      "sandcastle_vcs": null
+      "sandcastle_vcs": null,
+      "session_uuid": "*" (glob)
     },
     "normvector": {
       "client_identities": [],

@@ -25,7 +25,6 @@ use path_hash::PathHashBytes;
 use smallvec::SmallVec;
 use sql::mysql_async::FromValueError;
 use sql::mysql_async::Value;
-use sql::mysql_async::prelude::ConvIr;
 use sql::mysql_async::prelude::FromValue;
 use sql::sql_common::mysql::OptionalTryFromRowField;
 use sql::sql_common::mysql::RowField;
@@ -332,8 +331,9 @@ const HG_AUGMENTED: &[u8] = b"HgAugmented";
 const FSNODE: &[u8] = b"Fsnode";
 const CONTENT_MANIFEST: &[u8] = b"ContentManifest";
 
-impl ConvIr<ManifestType> for ManifestType {
-    fn new(v: Value) -> FromValueResult<Self> {
+impl TryFrom<Value> for ManifestType {
+    type Error = FromValueError;
+    fn try_from(v: Value) -> FromValueResult<Self> {
         match v {
             Value::Bytes(ref b) if b == HG => Ok(ManifestType::Hg),
             Value::Bytes(ref b) if b == HG_AUGMENTED => Ok(ManifestType::HgAugmented),
@@ -341,14 +341,6 @@ impl ConvIr<ManifestType> for ManifestType {
             Value::Bytes(ref b) if b == CONTENT_MANIFEST => Ok(ManifestType::ContentManifest),
             v => Err(FromValueError(v)),
         }
-    }
-
-    fn commit(self) -> Self {
-        self
-    }
-
-    fn rollback(self) -> Value {
-        self.into()
     }
 }
 
@@ -385,7 +377,7 @@ impl Display for ManifestId {
 
 impl fmt::Debug for ManifestId {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "ManifestId({})", self)
+        write!(fmt, "ManifestId({self})")
     }
 }
 
@@ -440,8 +432,9 @@ impl From<ManifestId> for Value {
     }
 }
 
-impl ConvIr<ManifestId> for ManifestId {
-    fn new(v: Value) -> FromValueResult<Self> {
+impl TryFrom<Value> for ManifestId {
+    type Error = FromValueError;
+    fn try_from(v: Value) -> FromValueResult<Self> {
         match v {
             Value::Bytes(bytes) => {
                 // Fallback: treat as raw bytes
@@ -451,14 +444,6 @@ impl ConvIr<ManifestId> for ManifestId {
             }
             v => Err(FromValueError(v)),
         }
-    }
-
-    fn commit(self) -> Self {
-        self
-    }
-
-    fn rollback(self) -> Value {
-        self.into()
     }
 }
 
@@ -474,7 +459,7 @@ impl OptionalTryFromRowField for ManifestId {
 
 fn fmt_path_bytes(path: &PathBytes, f: &mut fmt::Formatter) -> fmt::Result {
     match std::str::from_utf8(&path.0) {
-        Ok(path_str) => write!(f, "\"{}\"", path_str),
+        Ok(path_str) => write!(f, "\"{path_str}\""),
         Err(_) => write!(f, "PathBytes({:?})", path.0),
     }
 }

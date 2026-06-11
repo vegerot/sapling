@@ -121,7 +121,7 @@ impl FileHook for DenyFiles {
         push_authored_by: PushAuthoredBy,
     ) -> Result<HookExecution> {
         if push_authored_by.service() {
-            return Ok(HookExecution::Accepted);
+            return Ok(HookExecution::accepted());
         }
 
         deny_unacceptable_patterns(
@@ -136,11 +136,10 @@ impl FileHook for DenyFiles {
 }
 
 fn rejection<'a, 'b>(path: &'a String, pattern: &'b LuaPattern) -> HookExecution {
-    HookExecution::Rejected(HookRejectionInfo::new_long(
+    HookExecution::rejected(HookRejectionInfo::new_long(
         "Denied filename matched name pattern",
         format!(
-            "Denied filename '{}' matched name pattern '{}'. Rename or remove this file and try again.",
-            path, pattern
+            "Denied filename '{path}' matched name pattern '{pattern}'. Rename or remove this file and try again."
         ),
     ))
 }
@@ -164,7 +163,7 @@ fn deny_unacceptable_patterns<'a, 'b, 'c>(
     }
     if change.is_none() && !block_deletions {
         // Deletions are accepted by default; opt in via `block_deletions`.
-        return Ok(HookExecution::Accepted);
+        return Ok(HookExecution::accepted());
     }
 
     for pattern in all_patterns {
@@ -173,7 +172,7 @@ fn deny_unacceptable_patterns<'a, 'b, 'c>(
         }
     }
 
-    Ok(HookExecution::Accepted)
+    Ok(HookExecution::accepted())
 }
 
 #[cfg(test)]
@@ -212,7 +211,7 @@ mod test {
             Some(&basic_change()),
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Rejected(_)));
+        assert!(r.is_rejected());
 
         let r = deny_unacceptable_patterns(
             &all,
@@ -223,7 +222,7 @@ mod test {
             Some(&basic_change()),
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Rejected(_)));
+        assert!(r.is_rejected());
     }
 
     #[mononoke::test]
@@ -239,7 +238,7 @@ mod test {
             Some(&basic_change()),
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Rejected(_)));
+        assert!(r.is_rejected());
 
         let r = deny_unacceptable_patterns(
             &all,
@@ -250,7 +249,7 @@ mod test {
             Some(&basic_change()),
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Accepted));
+        assert!(r.is_accepted());
     }
 
     #[mononoke::test]
@@ -266,7 +265,7 @@ mod test {
             None,
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Rejected(_)));
+        assert!(r.is_rejected());
 
         let r = deny_unacceptable_patterns(
             &all,
@@ -277,7 +276,7 @@ mod test {
             Some(&basic_change()),
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Accepted));
+        assert!(r.is_accepted());
     }
 
     #[mononoke::test]
@@ -293,7 +292,7 @@ mod test {
             Some(&basic_change()),
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Accepted));
+        assert!(r.is_accepted());
 
         let r = deny_unacceptable_patterns(
             &all,
@@ -304,7 +303,7 @@ mod test {
             Some(&basic_change()),
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Accepted));
+        assert!(r.is_accepted());
     }
 
     #[mononoke::test]
@@ -320,7 +319,7 @@ mod test {
             None,
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Accepted));
+        assert!(r.is_accepted());
     }
 
     #[mononoke::test]
@@ -337,7 +336,7 @@ mod test {
             None,
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Rejected(_)));
+        assert!(r.is_rejected());
 
         // Push-redirected: also rejected — this is the new behavior.
         let r = deny_unacceptable_patterns(
@@ -349,7 +348,7 @@ mod test {
             None,
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Rejected(_)));
+        assert!(r.is_rejected());
     }
 
     #[mononoke::test]
@@ -365,6 +364,6 @@ mod test {
             None,
         )
         .unwrap();
-        assert!(matches!(r, HookExecution::Accepted));
+        assert!(r.is_accepted());
     }
 }

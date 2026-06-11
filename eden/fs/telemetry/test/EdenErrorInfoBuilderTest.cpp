@@ -13,6 +13,9 @@
 
 #include <folly/CPortability.h>
 
+#include "eden/common/telemetry/DynamicEvent.h"
+#include "eden/fs/telemetry/DaemonError.h"
+
 #include "eden/fs/telemetry/ErrorArg.h"
 #include "eden/fs/telemetry/ThrowTraceCapture.h"
 
@@ -96,6 +99,59 @@ TEST(EdenErrorInfoTest, InitializeThriftEdenErrorInfoWithSystemError) {
   EXPECT_TRUE(info.errorCode.has_value());
   EXPECT_TRUE(info.errorName.has_value());
   EXPECT_NE(info.exceptionType.value().find("system_error"), std::string::npos);
+}
+
+TEST(EdenErrorInfoTest, SparseFieldsSerializedIntoExtrasJsonColumn) {
+  std::runtime_error ex("test error");
+
+  // Verify backingStore fields are populated in EdenErrorInfo
+  auto info = EdenErrorInfo::backingStore(ex)
+                  .withRepoName("fbsource")
+                  .withFetchType(FetchType::Blob)
+                  .withIsDogfoodingHost(true)
+                  .create();
+  EXPECT_EQ(info.repoName.value(), "fbsource");
+  EXPECT_EQ(info.fetchType.value(), "blob");
+  EXPECT_TRUE(info.isDogfoodingHost.value());
+
+  // The FetchType enum and std::string overloads of withFetchType are
+  // equivalent: both populate the same fetchType field.
+  EXPECT_EQ(fetchTypeToString(FetchType::TreeAux), "tree_aux");
+  auto stringOverload = EdenErrorInfo::backingStore(ex)
+                            .withFetchType(std::string{"tree"})
+                            .create();
+  EXPECT_EQ(stringOverload.fetchType.value(), "tree");
+
+  // Verify all sparse fields are serialized into extras JSON column
+  auto event = EdenErrorInfo::backingStore(ex)
+                   .withRepoName("fbsource")
+                   .withFetchType(FetchType::Blob)
+                   .withIsDogfoodingHost(true)
+                   .createEvent();
+  DynamicEvent de;
+  event.populate(de);
+  const auto& strings = de.getStringMap();
+  auto it = strings.find("extras");
+  ASSERT_NE(it, strings.end()) << "Should have extras column";
+  EXPECT_NE(it->second.find("repo_name"), std::string::npos)
+      << "Extras should contain repo_name, got: " << it->second;
+  EXPECT_NE(it->second.find("fbsource"), std::string::npos)
+      << "Extras should contain fbsource, got: " << it->second;
+  EXPECT_NE(it->second.find("fetch_type"), std::string::npos)
+      << "Extras should contain fetch_type, got: " << it->second;
+  EXPECT_NE(it->second.find("blob"), std::string::npos)
+      << "Extras should contain blob, got: " << it->second;
+  EXPECT_NE(it->second.find("is_dogfooding_host"), std::string::npos)
+      << "Extras should contain is_dogfooding_host, got: " << it->second;
+
+  // Verify clientCommandName is serialized into extras JSON column
+  auto thriftEvent = EdenErrorInfo::thrift(ex, "mount").createEvent();
+  DynamicEvent thriftDe;
+  thriftEvent.populate(thriftDe);
+  auto thriftIt = thriftDe.getStringMap().find("extras");
+  ASSERT_NE(thriftIt, thriftDe.getStringMap().end());
+  EXPECT_NE(thriftIt->second.find("client_command_name"), std::string::npos);
+  EXPECT_NE(thriftIt->second.find("mount"), std::string::npos);
 }
 
 TEST(EdenErrorInfoTest, SymbolizationIsDeferredUntilCreate) {

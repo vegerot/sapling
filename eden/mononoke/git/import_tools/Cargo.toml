@@ -30,12 +30,13 @@ futures_retry = { version = "0.1.0", git = "https://github.com/facebookexperimen
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 git_symbolic_refs = { version = "0.1.0", path = "../../repo_attributes/git_symbolic_refs" }
 git_types = { version = "0.1.0", path = "../git_types" }
-gix-actor = "0.41.0"
-gix-hash = { version = "0.25.0", features = ["sha1"] }
+gix-actor = "0.41.1"
+gix-hash = { version = "0.25.1", features = ["sha1"] }
 gix-object = "0.60.0"
-http = "1.4.0"
+http = "=1.4.0"
 http-body-util = "0.1.0"
 hyper-openssl = { version = "0.10", features = ["client-legacy", "tokio"] }
+hyper-proxy2 = { version = "0.1", features = ["rustls"], default-features = false }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
 lfs_protocol = { version = "0.1.0", path = "../../common/lfs_protocol" }
 linked-hash-map = { version = "0.5", features = ["serde_impl"] }
@@ -43,7 +44,7 @@ manifest = { version = "0.1.0", path = "../../manifest" }
 mononoke_api = { version = "0.1.0", path = "../../mononoke_api" }
 mononoke_macros = { version = "0.1.0", path = "../../common/mononoke_macros" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
-openssl = "0.10.72"
+openssl = "0.10.80"
 rand = "0.10.1"
 repo_blobstore = { version = "0.1.0", path = "../../repo_attributes/repo_blobstore" }
 repo_derived_data = { version = "0.1.0", path = "../../repo_attributes/repo_derived_data" }

@@ -25,20 +25,20 @@ content_manifest_derivation = { version = "0.1.0", path = "../../derived_data/co
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
 derivation_queue_thrift = { version = "0.1.0", path = "../../repo_attributes/repo_derivation_queues/if" }
 derived_data_manager = { version = "0.1.0", path = "../../derived_data/manager" }
-either = "1.5"
+either = "1.16.0"
 fancy-regex = "0.16.2"
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fsnodes = { version = "0.1.0", path = "../../derived_data/fsnodes" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 gix-config = { version = "0.56.0", features = ["sha1"] }
 hook_manager = { version = "0.1.0", path = "../../repo_attributes/hook_manager/hook_manager" }
-http = "1.4.0"
+http = "=1.4.0"
 http-body-util = "0.1.0"
 hyper-tls = "0.6"
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"] }
 ipnetwork = "0.20.0"
 itertools = "0.14.0"
-justknobs = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
+justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
 lazy_static = "1.5"
 manifest = { version = "0.1.0", path = "../../manifest" }
 maplit = "1.0"
@@ -58,7 +58,7 @@ scuba_ext = { version = "0.1.0", path = "../../common/scuba_ext" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_derive = "1.0.185"
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
-serde_regex = "1"
+serde_regex = "1.2.0"
 skeleton_manifest = { version = "0.1.0", path = "../../derived_data/skeleton_manifest" }
 source_control = { version = "0.1.0", path = "../../scs/if" }
 source_control_clients = { version = "0.1.0", path = "../../scs/if/clients" }

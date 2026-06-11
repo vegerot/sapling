@@ -81,7 +81,7 @@ fn parse_range(header: &str) -> Result<Range, Error> {
 
     let caps = RE
         .captures(header)
-        .with_context(|| format!("Unsupported range: {}", header))?;
+        .with_context(|| format!("Unsupported range: {header}"))?;
 
     let range = Range::range_inclusive(
         caps[1]
@@ -146,7 +146,7 @@ where
     let want_sniff = sniff_enabled_cli
         && !range_present
         && matches!(desired, ContentEncoding::Compressed(_))
-        && justknobs::eval(SNIFF_JK, None, Some(repo_name)).unwrap_or(false);
+        && justknobs::eval(SNIFF_JK, None, Some(repo_name));
 
     if !want_sniff {
         return (desired, stream.boxed());

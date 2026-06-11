@@ -50,7 +50,7 @@ pub async fn summary(
     let derivation_queue = repo
         .repo_derivation_queues()
         .queue(config_name)
-        .ok_or_else(|| anyhow!("Missing derivation queue for config {}", config_name))?;
+        .ok_or_else(|| anyhow!("Missing derivation queue for config {config_name}"))?;
 
     let summary = derivation_queue.summary(ctx).await?;
 
@@ -132,6 +132,10 @@ async fn print_table(
                 Some(ts) => format!("{}s{}ms", ts.since_seconds(), ts.since_millis() % 1000),
                 None => "-".to_string(),
             };
+            let type_cell = match item.stage_payload() {
+                Some(payload) => format!("{} (stage: {})", dd_type, payload.path()),
+                None => format!("{dd_type}"),
+            };
             let mut row = row![
                 format!(
                     "{}s{}ms",
@@ -141,10 +145,7 @@ async fn print_table(
                 time_ready_str,
                 time_deriving_str,
                 item.retry_count(),
-                match item.stage_id() {
-                    Some(stage_id) => format!("{} (stage: {})", dd_type, stage_id),
-                    None => format!("{}", dd_type),
-                },
+                type_cell,
                 priority_str,
                 format!("{:?}", item.bubble_id()),
                 item.head_cs_id(),

@@ -25,7 +25,10 @@ use super::types::BackfillChildDisplayData;
 use super::types::BackfillChildParams;
 use super::types::BackfillChildResult;
 use super::types::BackfillDisplayData;
+use super::types::BackfillSettings;
 use super::types::BoundaryDerivationStatus;
+use super::types::ChildRequestRow;
+use super::types::RepoDetailRow;
 use super::types::RepoDisplayData;
 use super::types::RepoStatus;
 
@@ -58,7 +61,7 @@ fn format_repo(repo_id: i64, repo_names: &HashMap<RepositoryId, String>) -> Stri
         .ok()
         .and_then(|id| repo_names.get(&RepositoryId::new(id)));
     match name {
-        Some(name) => format!("{} ({})", name, repo_id),
+        Some(name) => format!("{name} ({repo_id})"),
         None => repo_id.to_string(),
     }
 }
@@ -101,11 +104,11 @@ pub(super) fn format_duration(duration: &Duration) -> String {
     let seconds = total_secs % 60;
 
     if hours > 0 {
-        format!("{}h {}m", hours, minutes)
+        format!("{hours}h {minutes}m")
     } else if minutes > 0 {
-        format!("{}m {}s", minutes, seconds)
+        format!("{minutes}m {seconds}s")
     } else {
-        format!("{}s", seconds)
+        format!("{seconds}s")
     }
 }
 
@@ -196,6 +199,10 @@ pub(super) fn display_multi_repo_summary(
     );
     println!();
 
+    if let Some(settings) = &data.settings {
+        print_settings_section(settings);
+    }
+
     println!("Overall Progress:");
     println!("  Total Repos:         {}", format_number(total_repos));
     println!(
@@ -246,7 +253,7 @@ pub(super) fn display_multi_repo_summary(
         }
         println!();
         println!(
-            "Use --request-id {} --repo-id <ID> to drill down into a specific repo.",
+            "Use -R <REPO> --request-id {} to drill down into a specific repo.",
             data.request_id.0
         );
     }
@@ -266,7 +273,7 @@ pub(super) fn display_repo_detail(data: &RepoDisplayData) {
     println!();
 
     println!("Repo Details:");
-    println!("  Repo:              {}", repo_label);
+    println!("  Repo:              {repo_label}");
     println!("  Overall Status:    {}", data.overall_status);
     println!(
         "  Derived Data Type: {}",
@@ -369,13 +376,13 @@ pub(super) fn display_child_request_detail(
         } => {
             println!("Derive Boundaries Params:");
             println!("  Repo:              {}", format_repo(*repo_id, repo_names));
-            println!("  Derived Data Type: {}", derived_data_type);
+            println!("  Derived Data Type: {derived_data_type}");
             println!(
                 "  Config Name:       {}",
                 format_optional_str(config_name.as_deref())
             );
-            println!("  Concurrency:       {}", concurrency);
-            println!("  Use Predecessor:   {}", use_predecessor_derivation);
+            println!("  Concurrency:       {concurrency}");
+            println!("  Use Predecessor:   {use_predecessor_derivation}");
             println!(
                 "  Boundary Count:    {}",
                 format_number(boundary_cs_ids.len())
@@ -400,13 +407,13 @@ pub(super) fn display_child_request_detail(
                         );
                     }
                     BoundaryDerivationStatus::NotChecked { reason } => {
-                        println!("  Derived Check:     not checked ({})", reason);
+                        println!("  Derived Check:     not checked ({reason})");
                     }
                 }
             }
             println!("  Boundary Changesets:");
             for cs_id in boundary_cs_ids {
-                println!("    {}", cs_id);
+                println!("    {cs_id}");
             }
         }
         BackfillChildParams::DeriveSlice {
@@ -417,7 +424,7 @@ pub(super) fn display_child_request_detail(
         } => {
             println!("Derive Slice Params:");
             println!("  Repo:              {}", format_repo(*repo_id, repo_names));
-            println!("  Derived Data Type: {}", derived_data_type);
+            println!("  Derived Data Type: {derived_data_type}");
             println!(
                 "  Config Name:       {}",
                 format_optional_str(config_name.as_deref())
@@ -443,14 +450,14 @@ pub(super) fn display_child_request_detail(
                 derived_count,
                 error_message,
             } => {
-                println!("  Derived Count:     {}", derived_count);
+                println!("  Derived Count:     {derived_count}");
                 println!(
                     "  Error Message:     {}",
                     format_optional_str(error_message.as_deref())
                 );
             }
             BackfillChildResult::Error { message } => {
-                println!("  Error Message:     {}", message);
+                println!("  Error Message:     {message}");
             }
         }
     }
@@ -472,6 +479,29 @@ fn print_progress_section(total_requests: usize, status_counts: &[(RequestStatus
     println!();
 }
 
+fn print_settings_section(settings: &BackfillSettings) {
+    println!("Settings:");
+    println!(
+        "  Slice Size:           {}",
+        format_number(settings.slice_size.max(0) as usize)
+    );
+    println!(
+        "  Boundaries Concurrency: {}",
+        settings.boundaries_concurrency
+    );
+    println!(
+        "  Num Boundary Requests:  {}",
+        settings.num_boundary_requests
+    );
+    println!("  Rederive:             {}", settings.rederive);
+    println!("  Reslice:              {}", settings.reslice);
+    println!(
+        "  Config Name:          {}",
+        format_optional_str(settings.config_name.as_deref())
+    );
+    println!();
+}
+
 fn print_timing_section(
     elapsed_time: &Duration,
     avg_duration: Option<&Duration>,
@@ -487,10 +517,7 @@ fn print_timing_section(
         );
     }
     if requests_per_hour > 0.0 {
-        println!(
-            "  Completion Rate:     {:.0} requests/hour",
-            requests_per_hour
-        );
+        println!("  Completion Rate:     {requests_per_hour:.0} requests/hour");
     }
     if let Some(est) = estimated_remaining {
         println!("  Est. Remaining:      ~{}", format_duration(est));
@@ -538,6 +565,116 @@ fn print_type_breakdown_table(
     println!("{}", "━".repeat(80));
 }
 
+/// Display a per-repo table showing progress for each repository in a multi-repo backfill.
+pub(super) fn display_repo_detail_table(rows: &mut [RepoDetailRow]) {
+    fn status_sort_key(status: &RepoStatus) -> u8 {
+        match status {
+            RepoStatus::Failed => 0,
+            RepoStatus::InProgress => 1,
+            RepoStatus::NotStarted => 2,
+            RepoStatus::Completed => 3,
+        }
+    }
+
+    rows.sort_by(|a, b| {
+        status_sort_key(&a.status)
+            .cmp(&status_sort_key(&b.status))
+            .then_with(|| {
+                let a_name = a.repo_name.as_deref().unwrap_or("");
+                let b_name = b.repo_name.as_deref().unwrap_or("");
+                a_name.cmp(b_name)
+            })
+            .then_with(|| a.repo_id.cmp(&b.repo_id))
+    });
+
+    println!();
+    println!("Per-Repository Details:");
+    println!("{}", "━".repeat(80));
+
+    let mut table = Table::new();
+    table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
+
+    table.set_titles(Row::new(vec![
+        Cell::new("Repository"),
+        Cell::new("Status"),
+        Cell::new("Derived"),
+        Cell::new("Total"),
+    ]));
+
+    for row in rows.iter() {
+        let repo_label = match &row.repo_name {
+            Some(name) => format!("{} ({})", name, row.repo_id),
+            None => row.repo_id.to_string(),
+        };
+        table.add_row(Row::new(vec![
+            Cell::new(&repo_label),
+            Cell::new(&row.status.to_string()),
+            Cell::new(&format_number(row.derived)),
+            Cell::new(&format_number(row.total)),
+        ]));
+    }
+
+    table.printstd();
+    println!("{}", "━".repeat(80));
+}
+
+/// Display a per-child-request table for a single (large) repo backfill.
+///
+/// Large repo backfills fan out into thousands of `derive_slice` /
+/// `derive_boundaries` child requests. Most of them sit in the `new` state
+/// waiting to be claimed, so we elide those and just report their count,
+/// showing a row per request that has actually been picked up by a worker
+/// (along with which worker claimed it, from the `claimed_by` column).
+pub(super) fn display_child_request_table(rows: &mut [ChildRequestRow], new_count: usize) {
+    fn status_sort_key(status: RequestStatus) -> u8 {
+        match status {
+            RequestStatus::Failed => 0,
+            RequestStatus::InProgress => 1,
+            RequestStatus::New => 2,
+            RequestStatus::Ready | RequestStatus::Polled => 3,
+        }
+    }
+
+    rows.sort_by(|a, b| {
+        status_sort_key(a.status)
+            .cmp(&status_sort_key(b.status))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    println!();
+    println!("Child Requests:");
+    println!("{}", "━".repeat(80));
+
+    let mut table = Table::new();
+    table.set_format(*format::consts::FORMAT_NO_LINESEP_WITH_TITLE);
+
+    table.set_titles(Row::new(vec![
+        Cell::new("Request ID"),
+        Cell::new("Type"),
+        Cell::new("Status"),
+        Cell::new("Claimed By"),
+    ]));
+
+    for row in rows.iter() {
+        table.add_row(Row::new(vec![
+            Cell::new(&row.id.to_string()),
+            Cell::new(&row.request_type),
+            Cell::new(status_label(row.status)),
+            Cell::new(row.claimed_by.as_deref().unwrap_or("-")),
+        ]));
+    }
+
+    table.printstd();
+    println!("{}", "━".repeat(80));
+    if new_count > 0 {
+        println!(
+            "... and {} not-yet-started (new) request{} not shown",
+            format_number(new_count),
+            if new_count == 1 { "" } else { "s" }
+        );
+    }
+}
+
 /// Display detailed progress for a single-repo backfill
 pub(super) fn display_single_repo_detail(
     data: &BackfillDisplayData,
@@ -568,6 +705,10 @@ pub(super) fn display_single_repo_detail(
         data.derived_data_type.as_deref().unwrap_or("-")
     );
     println!();
+
+    if let Some(settings) = &data.settings {
+        print_settings_section(settings);
+    }
 
     print_progress_section(data.total_requests, &data.status_counts);
     print_timing_section(

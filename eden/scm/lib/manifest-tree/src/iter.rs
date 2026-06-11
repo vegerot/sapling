@@ -90,10 +90,20 @@ fn run_worker(work_recv: Receiver<IterWork>, work_send: WeakSender<IterWork>) ->
         // Batch-prefetch uninitialized durable entries.
         if let Err(e) = bfs::prefetch_trees(
             &ctx.store,
-            work.iter().filter_map(|(_, link, _)| match link.as_ref() {
-                Durable(entry) if !entry.is_permission_denied() => Some(entry),
-                _ => None,
-            }),
+            work.iter()
+                .filter_map(
+                    |(path, link, subtree_matches_everything)| match link.as_ref() {
+                        Durable(entry) if !entry.is_permission_denied() => {
+                            Some(bfs::PrefetchTree {
+                                path: path.as_repo_path(),
+                                entry,
+                                subtree_matches_everything: *subtree_matches_everything,
+                            })
+                        }
+                        _ => None,
+                    },
+                ),
+            ctx.matcher.as_ref(),
         ) {
             if ctx
                 .result_send
@@ -152,7 +162,7 @@ fn run_worker(work_recv: Receiver<IterWork>, work_send: WeakSender<IterWork>) ->
                             true
                         } else {
                             ctx.matcher.matches_file(&child_path).with_context(|| {
-                                format!("matches_file in bfs_iter for {}", child_path)
+                                format!("matches_file in bfs_iter for {child_path}")
                             })?
                         };
                         if is_match {
@@ -166,7 +176,7 @@ fn run_worker(work_recv: Receiver<IterWork>, work_send: WeakSender<IterWork>) ->
                             match directory_match {
                                 Some(directory_match) => directory_match,
                                 None => ctx.matcher.matches_directory(&child_path).with_context(
-                                    || format!("matches_directory in bfs_iter for {}", child_path),
+                                    || format!("matches_directory in bfs_iter for {child_path}"),
                                 )?,
                             };
                         match directory_match {
@@ -609,9 +619,7 @@ mod tests {
             expected_sorted.sort();
             assert!(
                 fetches.contains(&expected_sorted),
-                "expected batch {:?} not found in fetches {:?}",
-                expected_sorted,
-                fetches
+                "expected batch {expected_sorted:?} not found in fetches {fetches:?}"
             );
         };
 

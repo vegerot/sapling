@@ -84,10 +84,9 @@ pub trait RepoPermissionChecker: Send + Sync + 'static {
         ctx: &CoreContext,
         identities: &MononokeIdentitySet,
     ) -> bool {
-        let log = justknobs::eval("scm/mononoke:mononoke_log_draft_acl_failures", None, None)
-            .unwrap_or_default();
-        let enforce = justknobs::eval("scm/mononoke:mononoke_enforce_draft_acl", None, None)
-            .unwrap_or_default();
+        let log = justknobs::eval("scm/mononoke:mononoke_log_draft_acl_failures", None, None);
+        let enforce = justknobs::eval("scm/mononoke:mononoke_enforce_draft_acl", None, None);
+
         if log || enforce {
             let (draft_result, write_result) = join!(
                 self.check_if_draft_access_allowed(identities),
@@ -173,7 +172,7 @@ impl ProdRepoPermissionChecker {
         if let Some(acl_name) = repo_hipster_acl {
             repo_permchecker_builder = repo_permchecker_builder.allow(
                 acl_provider.repo_acl(acl_name).await.with_context(|| {
-                    format!("Failed to create repo PermissionChecker for {}", acl_name)
+                    format!("Failed to create repo PermissionChecker for {acl_name}")
                 })?,
             );
         }
@@ -193,7 +192,7 @@ impl ProdRepoPermissionChecker {
         let service_permchecker = if let Some(acl_name) = service_hipster_acl {
             PermissionCheckerBuilder::new()
                 .allow(acl_provider.tier_acl(acl_name).await.with_context(|| {
-                    format!("Failed to create PermissionChecker for {}", acl_name)
+                    format!("Failed to create PermissionChecker for {acl_name}")
                 })?)
                 .build()
         } else {
@@ -222,8 +221,7 @@ impl ProdRepoPermissionChecker {
                             .await
                             .with_context(|| {
                                 format!(
-                                    "Failed to create repo region PermissionChecker for {}",
-                                    acl_name
+                                    "Failed to create repo region PermissionChecker for {acl_name}"
                                 )
                             })?,
                     )
@@ -309,7 +307,6 @@ impl RepoPermissionChecker for ProdRepoPermissionChecker {
     ) -> bool {
         if identities.likely_an_agent()
             && justknobs::eval("scm/mononoke:block_agentic_service_writes", None, None)
-                .unwrap_or(true)
         {
             return false;
         }

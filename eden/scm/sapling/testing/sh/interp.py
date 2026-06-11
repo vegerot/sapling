@@ -8,6 +8,7 @@
 See module-level doc for examples.
 """
 
+import fnmatch
 import functools
 import re
 import shlex
@@ -95,6 +96,10 @@ def interpvec(trees, env: Env, onerror=OnError.RAISE) -> InterpResult:
                 else:
                     assert onerror == OnError.WARN_CONTINUE
         else:
+            if env.drainsideout:
+                sideout = env.popsideout()
+                if sideout:
+                    res = res.chain(InterpResult(out=sideout))
             res = res.chain(nextres)
     return res
 
@@ -180,31 +185,62 @@ def interpargs(trees, env: Env) -> List[str]:
                 res.out = home + res.out[1:]
                 # emulate $HOME expansion
                 res.quoted = res.quoted or "$"
-        # Expand globs.
-        if res.quoted in {"$", None} and "*" in res.out:
-            matched = env.fs.glob(res.out)
-            if matched:
-                args += matched
-                continue
-        # Expand space-separated words, or handle quotes.
-        # note about shlex.split:
-        # input       | shlex.split(posix=True) | shlex.split(posix=False)
-        # r'C:\Users' | ['C:Users']             | [r'C:\Users']
-        # '"a  b"'    | ['a  b']                | ['"a  b"']
-        if res.quoted in {'"', "'"}:
-            args.append(res.out)
-        elif res.quoted in {"`", "$"}:
-            args += shlex.split(res.out, posix=False)
-        else:
-            assert res.quoted is None, f"unsupported {res.quoted=}"
-            args += shlex.split(res.out)
+        words = [res.out]
+        if res.quoted is None:
+            words = _braceexpand(res.out)
+        for word in words:
+            args.extend(_splitargword(word, res.quoted, env))
     return args
 
 
+def _braceexpand(word: str) -> List[str]:
+    if "'" in word or '"' in word:
+        return [word]
+    match = re.search(r"\{([^{}]*,[^{}]*)\}", word)
+    if match is None:
+        return [word]
+    prefix = word[: match.start()]
+    suffix = word[match.end() :]
+    expanded = []
+    for part in match.group(1).split(","):
+        for rest in _braceexpand(suffix):
+            expanded.append(prefix + part + rest)
+    return expanded
+
+
+def _splitargword(word: str, quoted: Optional[str], env: Env) -> List[str]:
+    # Expand globs.
+    if quoted in {"$", None} and "*" in word:
+        matched = env.fs.glob(word)
+        if matched:
+            return matched
+    # Expand space-separated words, or handle quotes.
+    # note about shlex.split:
+    # input       | shlex.split(posix=True) | shlex.split(posix=False)
+    # r'C:\Users' | ['C:Users']             | [r'C:\Users']
+    # '"a  b"'    | ['a  b']                | ['"a  b"']
+    if quoted in {'"', "'"}:
+        return [word]
+    elif quoted in {"`", "$"}:
+        return shlex.split(word, posix=False)
+    else:
+        assert quoted is None, f"unsupported {quoted=}"
+        return shlex.split(word)
+
+
 def interpsubst(v, env: Env) -> InterpResult:
+    origenv = env
     env = env.nested(Scope.SHELL)
+    env.sideout = []
+    env.drainsideout = False
     env.stdout = BufIO()
+    stderr = None
+    if env.stderr is None:
+        stderr = env.stderr = BufIO()
     res = interp(v, env)
+    origenv.emitsideout(env.popsideout())
+    if stderr is not None:
+        origenv.emitsideout(stderr.getvalue().decode())
     # pyre-fixme[16]: `Optional` has no attribute `getvalue`.
     res.out += env.stdout.getvalue().decode()
     res.out = res.out.rstrip()
@@ -287,8 +323,7 @@ def interppipe(v, env: Env) -> InterpResult:
         if origenv.stderr is None:
             res.out = res.out + err.decode()
         else:
-            # pyre-fixme[61]: `out` is undefined, or not always defined.
-            origenv.stderr.write(out)
+            origenv.stderr.write(err)
     return res
 
 
@@ -353,8 +388,7 @@ def interpcompound(v, env: Env) -> InterpResult:
         for arm in arms:
             pats = arm["patterns"]
             for pat in pats:
-                # NOTE: not a real pattern match
-                if interp(pat, env).out.strip() == word:
+                if fnmatch.fnmatch(word, interp(pat, env).out.strip()):
                     body = arm["body"]
                     return interpvec(body, env)
         return InterpResult()
@@ -367,7 +401,12 @@ def interpredirect(v, env: Env, mode: str, defaultfd: int = 0) -> InterpResult:
     fd = v[0]
     if fd is None:
         fd = defaultfd
-    path = interp(v[1], env).out
+    res = interp(v[1], env)
+    path = res.out
+    if not res.quoted and (path == "~" or path.startswith("~/")):
+        home = env.getenv("HOME")
+        if home:
+            path = home + path[1:]
     f = env.fs.open(path, mode)
     if fd == 0:
         env.stdin = f
@@ -390,8 +429,12 @@ def interpdupwrite(v, env: Env) -> InterpResult:
         pass
     elif (fd, destfd) == (2, 1) and env.stdout:
         env.stderr = env.stdout
+    elif (fd, destfd) == (2, 1) and env.stdout is None:
+        pass
     elif (fd, destfd) == (1, 2) and env.stderr:
         env.stdout = env.stderr
+    elif (fd, destfd) == (1, 2) and env.stderr is None:
+        pass
     else:
         raise NotImplementedError(
             f"dup {fd} -> {destfd} while fd {destfd} is not already redirected"
@@ -537,7 +580,7 @@ INTERP_TYPE_TABLE = {
     "Param": interp,
     "Subst": interpsubst,
     "StarWord": partial(interpfixed, "*"),
-    "QuestionWord": None,
+    "QuestionWord": partial(interpfixed, "?"),
     "SquareOpen": partial(interpfixed, "["),
     "SquareClose": partial(interpfixed, "]"),
     "Tilde": partial(interpfixed, "~"),

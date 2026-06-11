@@ -126,7 +126,7 @@ where
                                     .with_parsed(|parsed| {
                                         parsed.as_blob().map(|blob_ref| blob_ref.into_owned())
                                     })
-                                    .ok_or_else(|| format_err!("{} is not a blob", oid))?;
+                                    .ok_or_else(|| format_err!("{oid} is not a blob"))?;
 
                                 let upload_packfile = uploader.upload_packfile_base_item(
                                     &ctx,
@@ -231,12 +231,12 @@ pub async fn create_changeset_for_annotated_tag<Uploader: GitUploader, Reader: G
     // Get the parsed Git Tag
     let tag_metadata = TagMetadata::new(ctx, *tag_id, maybe_tag_name, &reader)
         .await
-        .with_context(|| format_err!("Failed to create TagMetadata from git tag {}", tag_id))?;
+        .with_context(|| format_err!("Failed to create TagMetadata from git tag {tag_id}"))?;
     // Create the corresponding changeset for the Git Tag at Mononoke end
     let changeset_id = uploader
         .generate_changeset_for_annotated_tag(ctx, original_changeset_id, tag_metadata)
         .await
-        .with_context(|| format_err!("Failed to generate changeset for git tag {}", tag_id))?;
+        .with_context(|| format_err!("Failed to generate changeset for git tag {tag_id}"))?;
     Ok(changeset_id)
 }
 
@@ -253,10 +253,7 @@ async fn upload_git_object_by_content<Uploader: GitUploader>(
             .upload_packfile_base_item(ctx, *object_id, object_bytes)
             .await
             .with_context(|| {
-                format_err!(
-                    "Failed to upload packfile item for git object {}",
-                    object_id
-                )
+                format_err!("Failed to upload packfile item for git object {object_id}")
             })
     };
     // Upload Git object
@@ -264,7 +261,7 @@ async fn upload_git_object_by_content<Uploader: GitUploader>(
         uploader
             .upload_object(ctx, *object_id, raw_object_bytes)
             .await
-            .with_context(|| format_err!("Failed to upload raw git object {}", object_id))
+            .with_context(|| format_err!("Failed to upload raw git object {object_id}"))
     };
     try_join!(upload_packfile, upload_git_object)?;
     Ok(())
@@ -279,7 +276,7 @@ pub async fn upload_git_object<Uploader: GitUploader, Reader: GitReader>(
     let object_bytes = reader
         .read_raw_object(object_id)
         .await
-        .with_context(|| format_err!("Failed to fetch git object {}", object_id))?;
+        .with_context(|| format_err!("Failed to fetch git object {object_id}"))?;
     upload_git_object_by_content(ctx, uploader, object_id, object_bytes).await?;
     Ok(())
 }
@@ -321,7 +318,7 @@ pub fn upload_git_tag<'a, Uploader: GitUploader, Reader: GitReader>(
         if let Some((target_kind, target)) = reader
             .get_object(tag_id)
             .await
-            .with_context(|| format_err!("Invalid object {:?}", tag_id))?
+            .with_context(|| format_err!("Invalid object {tag_id:?}"))?
             .with_parsed_as_tag(|tag| (tag.target_kind, tag.target()))
         {
             upload_git_object(ctx, uploader.clone(), reader.clone(), tag_id).await?;
@@ -331,7 +328,7 @@ pub fn upload_git_tag<'a, Uploader: GitUploader, Reader: GitReader>(
                 upload_git_tag(ctx, uploader.clone(), reader.clone(), &target).await?;
             }
         } else {
-            bail!("Not a tag: {:?}", tag_id);
+            bail!("Not a tag: {tag_id:?}");
         }
         Ok(())
     }
@@ -577,7 +574,7 @@ pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
                     async move {
                         let extracted_commit = ExtractedCommit::new(&ctx, oid, &reader)
                             .await
-                            .with_context(|| format!("While extracting {}", oid))?;
+                            .with_context(|| format!("While extracting {oid}"))?;
 
                         let diff = extracted_commit.diff(&ctx, &reader, submodules);
                         let file_changes_uploader = uploader.clone();
@@ -651,7 +648,7 @@ pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
             }
         })
         .try_buffered(prefs.concurrency);
-    async {
+    let producer = async {
         while let Some((extracted_commit, file_changes)) = commits_with_file_changes
             .try_next()
             .try_timed()
@@ -668,38 +665,72 @@ pub async fn import_commit_contents<Uploader: GitUploader, Reader: GitReader>(
                 .context("Receiver dropped while sending Vec<(ExtractedCommit, FileChanges)>")?;
         }
         anyhow::Ok(())
+    };
+    if prefs.persist_partial_mappings {
+        // Await consumers so they flush their in-flight batch and persist
+        // mapping rows for commits that made it through before the
+        // failure. Also surfaces the consumer's real error instead of the
+        // producer's "Receiver dropped..." SendError cascade.
+        let producer_result = producer.try_timed().await;
+        drop(bonsai_sender);
+        let bonsai_join = bonsai_creator
+            .try_timed()
+            .await
+            .context("Error while running bonsai_creator for commits");
+        let finalize_join = batch_finalizer
+            .try_timed()
+            .await
+            .context("Error while running finalize_batch for commits");
+        bonsai_join?
+            .log_future_stats(
+                scuba.clone(),
+                "Completed Bonsai Changeset creation for all commits",
+                "Import".to_string(),
+            )
+            .context("Panic while running bonsai_creator for commits")?;
+        finalize_join?
+            .log_future_stats(
+                scuba.clone(),
+                "Completed Finalize Batch for all commits",
+                "Import".to_string(),
+            )
+            .context("Panic while running finalize_batch for commits")?;
+        producer_result?.log_future_stats(
+            scuba.clone(),
+            "Uploaded Content Blob, Git Blob, Commits and Trees for all commits",
+            "Import".to_string(),
+        );
+    } else {
+        producer.try_timed().await?.log_future_stats(
+            scuba.clone(),
+            "Uploaded Content Blob, Git Blob, Commits and Trees for all commits",
+            "Import".to_string(),
+        );
+        // Drop the sender since we finished sending all the commits to the bonsai creator
+        drop(bonsai_sender);
+        // Ensure that the bonsai creator has completed before we exit
+        bonsai_creator
+            .try_timed()
+            .await
+            .context("Error while running bonsai_creator for commits")?
+            .log_future_stats(
+                scuba.clone(),
+                "Completed Bonsai Changeset creation for all commits",
+                "Import".to_string(),
+            )
+            .context("Panic while running bonsai_creator for commits")?;
+        // Ensure that the batch finalization has completed before we exit
+        batch_finalizer
+            .try_timed()
+            .await
+            .context("Error while running finalize_batch for commits")?
+            .log_future_stats(
+                scuba.clone(),
+                "Completed Finalize Batch for all commits",
+                "Import".to_string(),
+            )
+            .context("Panic while running finalize_batch for commits")?;
     }
-    .try_timed()
-    .await?
-    .log_future_stats(
-        scuba.clone(),
-        "Uploaded Content Blob, Git Blob, Commits and Trees for all commits",
-        "Import".to_string(),
-    );
-    // Drop the sender since we finished sending all the commits to the bonsai creator
-    drop(bonsai_sender);
-    // Ensure that the bonsai creator has completed before we exit
-    bonsai_creator
-        .try_timed()
-        .await
-        .context("Error while running bonsai_creator for commits")?
-        .log_future_stats(
-            scuba.clone(),
-            "Completed Bonsai Changeset creation for all commits",
-            "Import".to_string(),
-        )
-        .context("Panic while running bonsai_creator for commits")?;
-    // Ensure that the batch finalization has completed before we exit
-    batch_finalizer
-        .try_timed()
-        .await
-        .context("Error while running finalize_batch for commits")?
-        .log_future_stats(
-            scuba.clone(),
-            "Completed Finalize Batch for all commits",
-            "Import".to_string(),
-        )
-        .context("Panic while running finalize_batch for commits")?;
 
     debug!("Completed git import for repo {}.", repo_name);
     let acc = Arc::try_unwrap(acc).map_err(|_| {
@@ -806,11 +837,7 @@ pub async fn read_symref(
                 tag_name.to_string(),
                 TAG_REF.to_string(),
             )?,
-            None => anyhow::bail!(
-                "Unexpected ref format {} for symref {}",
-                ref_mapping,
-                symref_name
-            ),
+            None => anyhow::bail!("Unexpected ref format {ref_mapping} for symref {symref_name}"),
         },
     };
     Ok(symref_entry)
@@ -938,7 +965,7 @@ pub async fn import_tree_as_single_bonsai_changeset<Uploader: GitUploader>(
 
     let mut extracted_commit = ExtractedCommit::new(ctx, git_cs_id, &reader)
         .await
-        .with_context(|| format!("While extracting {}", git_cs_id))?;
+        .with_context(|| format!("While extracting {git_cs_id}"))?;
     // Discard the parents: the commit we want to create has no parents
     extracted_commit.metadata.parents = Vec::new();
 
@@ -954,7 +981,7 @@ pub async fn import_tree_as_single_bonsai_changeset<Uploader: GitUploader>(
         extracted_commit.original_commit.clone(),
     )
     .await
-    .with_context(|| format_err!("Failed to upload raw git commit {}", git_cs_id))?;
+    .with_context(|| format_err!("Failed to upload raw git commit {git_cs_id}"))?;
 
     upload_git_tree_recursively(
         ctx,
@@ -964,10 +991,7 @@ pub async fn import_tree_as_single_bonsai_changeset<Uploader: GitUploader>(
     )
     .await
     .with_context(|| {
-        format_err!(
-            "Failed to upload git trees corresponding to commit {}",
-            git_cs_id
-        )
+        format_err!("Failed to upload git trees corresponding to commit {git_cs_id}")
     })?;
 
     uploader

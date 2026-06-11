@@ -123,13 +123,10 @@ struct SamplingRate(NonZeroU64);
 const UNSAMPLED: SamplingRate = SamplingRate(nonzero!(1u64));
 
 fn default_timeout() -> Duration {
-    const FALLBACK_TIMEOUT_SECS: u64 = 15 * 60;
-
     let timeout: u64 = justknobs::get_as::<u64>(
         "scm/mononoke_timeouts:repo_client_default_timeout_secs",
         None,
-    )
-    .unwrap_or(FALLBACK_TIMEOUT_SECS);
+    );
 
     Duration::from_secs(timeout)
 }
@@ -401,7 +398,7 @@ impl<R: Repo> RepoClient<R> {
                     let max_nodes = justknobs::get_as::<usize>(
                         "scm/mononoke:repo_client_max_nodes_in_known_method",
                         None,
-                    )?;
+                    );
 
                     if max_nodes > 0 {
                         if nodes_len > max_nodes {
@@ -614,7 +611,7 @@ impl<R: Repo> HgCommands for RepoClient<R> {
                                 async move {
                                     Ok(generate_lookup_resp_buf(
                                         false,
-                                        format!("ambiguous identifier '{}'", key).as_bytes(),
+                                        format!("ambiguous identifier '{key}'").as_bytes(),
                                     ))
                                 }
                                 .boxed(),
@@ -623,7 +620,7 @@ impl<R: Repo> HgCommands for RepoClient<R> {
                                 async move {
                                     Ok(generate_lookup_resp_buf(
                                         false,
-                                        format!("{} not found", key).as_bytes(),
+                                        format!("{key} not found").as_bytes(),
                                     ))
                                 }
                                 .boxed(),
@@ -745,8 +742,7 @@ impl<R: Repo> HgCommands for RepoClient<R> {
         if namespace != "bookmarks" {
             info!("unsupported listkeyspatterns namespace: {}", namespace,);
             return future::err(format_err!(
-                "unsupported listkeyspatterns namespace: {}",
-                namespace
+                "unsupported listkeyspatterns namespace: {namespace}"
             ))
             .boxed();
         }
@@ -773,8 +769,7 @@ impl<R: Repo> HgCommands for RepoClient<R> {
                             Ok(bookmarks)
                         } else {
                             Err(format_err!(
-                                    "Bookmark query was truncated after {} results, use a more specific prefix search.",
-                                    max,
+                                    "Bookmark query was truncated after {max} results, use a more specific prefix search.",
                             ))
                         }
                     } else {

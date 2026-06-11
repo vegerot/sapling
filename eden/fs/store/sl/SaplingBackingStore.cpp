@@ -112,12 +112,14 @@ HgImportTraceEvent::HgImportTraceEvent(
 SaplingBackingStore::SaplingBackingStore(
     AbsolutePathPiece repository,
     AbsolutePathPiece mount,
+    AbsolutePathPiece clientDirectory,
     CaseSensitivity caseSensitive,
     EdenStatsPtr stats,
     UnboundedQueueExecutor* serverThreadPool,
     std::shared_ptr<ReloadableConfig> config,
     std::unique_ptr<SaplingBackingStoreOptions> runtimeOptions,
     std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
+    ErrorLogger& errorLogger,
     std::unique_ptr<BackingStoreLogger> logger,
     FaultInjector* FOLLY_NONNULL faultInjector)
     : stats_(stats.copy()),
@@ -125,6 +127,7 @@ SaplingBackingStore::SaplingBackingStore(
       serverThreadPool_(serverThreadPool),
       queue_(std::move(config)),
       edenFsEventsLogger_{std::move(edenFsEventsLogger)},
+      errorLogger_(errorLogger),
       logger_(std::move(logger)),
       faultInjector_{*faultInjector},
       runtimeOptions_(computeRuntimeOptions(std::move(runtimeOptions))),
@@ -137,6 +140,9 @@ SaplingBackingStore::SaplingBackingStore(
           sapling::sapling_backingstore_new(
               rust::Str{repository.view().data(), repository.view().size()},
               rust::Str{mount.view().data(), mount.view().size()},
+              rust::Str{
+                  clientDirectory.view().data(),
+                  clientDirectory.view().size()},
               config_->getEdenConfig()->backingstoreWalkMode.getValue())
               .into_raw(),
           [](sapling::BackingStore* backingStore) {
@@ -181,12 +187,14 @@ SaplingBackingStore::SaplingBackingStore(
 SaplingBackingStore::SaplingBackingStore(
     AbsolutePathPiece repository,
     AbsolutePathPiece mount,
+    AbsolutePathPiece clientDirectory,
     CaseSensitivity caseSensitive,
     EdenStatsPtr stats,
     folly::Executor* executor,
     std::shared_ptr<ReloadableConfig> config,
     std::unique_ptr<SaplingBackingStoreOptions> runtimeOptions,
     std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
+    ErrorLogger& errorLogger,
     std::unique_ptr<BackingStoreLogger> logger,
     FaultInjector* FOLLY_NONNULL faultInjector)
     : stats_(std::move(stats)),
@@ -194,6 +202,7 @@ SaplingBackingStore::SaplingBackingStore(
       serverThreadPool_(executor),
       queue_(std::move(config)),
       edenFsEventsLogger_{std::move(edenFsEventsLogger)},
+      errorLogger_(errorLogger),
       logger_(std::move(logger)),
       faultInjector_{*faultInjector},
       runtimeOptions_(std::move(runtimeOptions)),
@@ -206,6 +215,9 @@ SaplingBackingStore::SaplingBackingStore(
           sapling::sapling_backingstore_new(
               rust::Str{repository.view().data(), repository.view().size()},
               rust::Str{mount.view().data(), mount.view().size()},
+              rust::Str{
+                  clientDirectory.view().data(),
+                  clientDirectory.view().size()},
               config_->getEdenConfig()->backingstoreWalkMode.getValue())
               .into_raw(),
           [](sapling::BackingStore* backingStore) {

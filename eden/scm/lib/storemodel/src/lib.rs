@@ -107,7 +107,7 @@ pub trait KeyStore: Send + Sync {
 
         let key = Key::new(path.to_owned(), hgid);
         match self.get_content_iter(fctx, vec![key])?.next() {
-            None => Err(anyhow::format_err!("{}@{}: not found remotely", path, hgid)),
+            None => Err(anyhow::format_err!("{path}@{hgid}: not found remotely")),
             Some(Err(e)) => Err(e),
             Some(Ok((_k, data))) => Ok(data),
         }
@@ -236,7 +236,7 @@ pub trait FileStore: KeyStore + 'static {
     ) -> anyhow::Result<FileAuxData> {
         let key = Key::new(path.to_owned(), id);
         match self.get_aux_iter(fctx, vec![key])?.next() {
-            None => Err(anyhow::format_err!("{}@{}: not found remotely", path, id)),
+            None => Err(anyhow::format_err!("{path}@{id}: not found remotely")),
             Some(Err(e)) => Err(e),
             Some(Ok((_k, aux))) => Ok(aux),
         }
@@ -342,6 +342,14 @@ pub trait TreeEntry: Send + Sync + 'static {
     fn permission_denied_children(
         &self,
     ) -> anyhow::Result<BoxIterator<anyhow::Result<(PathComponentBuf, HgId, String)>>> {
+        self.filter_permission_denied(self.children_with_acls()?)
+    }
+
+    /// Filter caller-selected `has_acl` directory children to those denied permission when fetched.
+    fn filter_permission_denied(
+        &self,
+        _children_with_acl: Vec<(PathComponentBuf, HgId)>,
+    ) -> anyhow::Result<BoxIterator<anyhow::Result<(PathComponentBuf, HgId, String)>>> {
         Ok(Box::new(std::iter::empty()))
     }
 
@@ -423,7 +431,7 @@ pub trait TreeStore: KeyStore {
         match self.get_tree_iter(fctx, vec![key])?.next() {
             Some(Ok((_, tree))) => Ok(tree),
             Some(Err(e)) => Err(e),
-            None => Err(anyhow::format_err!("{}@{}: tree not found", path, id)),
+            None => Err(anyhow::format_err!("{path}@{id}: tree not found")),
         }
     }
 
@@ -485,7 +493,7 @@ pub trait TreeStore: KeyStore {
     ) -> anyhow::Result<TreeAuxData> {
         let key = Key::new(path.to_owned(), id);
         match self.get_tree_aux_data_iter(fctx, vec![key.clone()])?.next() {
-            None => Err(anyhow::format_err!("{}@{}: not found remotely", path, id)),
+            None => Err(anyhow::format_err!("{path}@{id}: not found remotely")),
             Some(Err(e)) => Err(e),
             Some(Ok((_k, aux))) => Ok(aux),
         }

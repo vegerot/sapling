@@ -20,9 +20,18 @@ mod test_fixtures;
 #[cfg(test)]
 mod test_utils;
 
+/// `pipeline` module provides more flexible APIs.
+/// It's the main implementation.
+/// See module docstring for details.
+pub mod pipeline;
+
+// Original APIs for compatibility.
+// Delegate to pipeline APIs.
+// Might have users externally like jj-vcs.
 pub use self::ascii::AsciiRenderer;
 pub use self::ascii_large::AsciiLargeRenderer;
 pub use self::box_drawing::BoxDrawingRenderer;
+pub use self::output::OutputRendererOptions;
 pub use self::render::Ancestor;
 pub use self::render::GraphRow;
 pub use self::render::GraphRowRenderer;

@@ -10,19 +10,19 @@ use std::marker::PhantomData;
 use super::output::OutputRendererOptions;
 use super::render::Ancestor;
 use super::render::GraphRow;
-use super::render::LinkLine;
-use super::render::NodeLine;
-use super::render::PadLine;
 use super::render::Renderer;
-use crate::pad::pad_lines;
+use crate::pipeline::prefix_lines_to_text::PrefixLinesToText;
+use crate::pipeline::row_shape_to_prefix_lines::ascii::AsciiPrefixLineRenderer;
+use crate::pipeline::types::GraphRowShape;
+use crate::pipeline::types::PrefixLineRenderer;
 
 pub struct AsciiRenderer<N, R>
 where
     R: Renderer<N, Output = GraphRow<N>> + Sized,
 {
     inner: R,
-    options: OutputRendererOptions,
-    extra_pad_line: Option<String>,
+    prefix_lines: AsciiPrefixLineRenderer,
+    text: PrefixLinesToText,
     _phantom: PhantomData<N>,
 }
 
@@ -30,13 +30,17 @@ impl<N, R> AsciiRenderer<N, R>
 where
     R: Renderer<N, Output = GraphRow<N>> + Sized,
 {
-    pub(crate) fn new(inner: R, options: OutputRendererOptions) -> Self {
+    pub(crate) fn new(inner: R) -> Self {
         AsciiRenderer {
             inner,
-            options,
-            extra_pad_line: None,
+            prefix_lines: AsciiPrefixLineRenderer::new(),
+            text: PrefixLinesToText::new(),
             _phantom: PhantomData,
         }
+    }
+
+    fn options(&self) -> &OutputRendererOptions {
+        self.inner.output_options()
     }
 }
 
@@ -66,152 +70,34 @@ where
         message: String,
     ) -> String {
         let line = self.inner.next_row(node, parents, glyph, message);
-        let mut out = String::new();
-        let mut message_lines = pad_lines(line.message.lines(), self.options.min_row_height);
-        let mut need_extra_pad_line = false;
+        let glyph = line.glyph;
+        let message = line.message;
+        let separator_line = line.separator_line;
+        let row_shape = GraphRowShape {
+            node: line.node,
+            merge: line.merge,
+            separator_line,
+            node_line: line.node_line,
+            link_line: line.link_line,
+            term_line: line.term_line,
+            pad_lines: line.pad_lines,
+        };
+        let prefix_lines = self.prefix_lines.next_prefix_lines(&row_shape);
+        self.text.next_text(
+            prefix_lines,
+            separator_line,
+            &glyph,
+            &message,
+            self.options().min_row_height,
+        )
+    }
 
-        // Render the previous extra pad line
-        if let Some(extra_pad_line) = self.extra_pad_line.take() {
-            out.push_str(extra_pad_line.trim_end());
-            out.push('\n');
-        }
+    fn output_options_mut(&mut self) -> &mut OutputRendererOptions {
+        self.inner.output_options_mut()
+    }
 
-        // Render the nodeline
-        let mut node_line = String::new();
-        for entry in line.node_line.iter() {
-            match entry {
-                NodeLine::Node => {
-                    node_line.push_str(&line.glyph);
-                    node_line.push(' ');
-                }
-                NodeLine::Parent => node_line.push_str("| "),
-                NodeLine::Ancestor => node_line.push_str(". "),
-                NodeLine::Blank => node_line.push_str("  "),
-            }
-        }
-        if let Some(msg) = message_lines.next() {
-            node_line.push(' ');
-            node_line.push_str(msg);
-        }
-        out.push_str(node_line.trim_end());
-        out.push('\n');
-
-        // Render the link line
-        if let Some(link_row) = line.link_line {
-            let mut link_line = String::new();
-            let any_horizontal = link_row
-                .iter()
-                .any(|cur| cur.intersects(LinkLine::HORIZONTAL));
-            let mut iter = link_row
-                .iter()
-                .copied()
-                .chain(std::iter::once(LinkLine::empty()))
-                .peekable();
-            while let Some(cur) = iter.next() {
-                let next = match iter.peek() {
-                    Some(&v) => v,
-                    None => break,
-                };
-                // Draw the parent/ancestor line.
-                if cur.intersects(LinkLine::HORIZONTAL) {
-                    if cur.intersects(LinkLine::CHILD | LinkLine::ANY_FORK_OR_MERGE) {
-                        link_line.push('+');
-                    } else {
-                        link_line.push('-');
-                    }
-                } else if cur.intersects(LinkLine::VERTICAL) {
-                    if cur.intersects(LinkLine::ANY_FORK_OR_MERGE) && any_horizontal {
-                        link_line.push('+');
-                    } else if cur.intersects(LinkLine::VERT_PARENT) {
-                        link_line.push('|');
-                    } else {
-                        link_line.push('.');
-                    }
-                } else if cur.intersects(LinkLine::ANY_MERGE) && any_horizontal {
-                    link_line.push('\'');
-                } else if cur.intersects(LinkLine::ANY_FORK) && any_horizontal {
-                    link_line.push('.');
-                } else {
-                    link_line.push(' ');
-                }
-
-                // Draw the connecting line.
-                if cur.intersects(LinkLine::HORIZONTAL) {
-                    link_line.push('-');
-                } else if cur.intersects(LinkLine::RIGHT_MERGE) {
-                    if next.intersects(LinkLine::LEFT_FORK) && !any_horizontal {
-                        link_line.push('\\');
-                    } else {
-                        link_line.push('-');
-                    }
-                } else if cur.intersects(LinkLine::RIGHT_FORK) {
-                    if next.intersects(LinkLine::LEFT_MERGE) && !any_horizontal {
-                        link_line.push('/');
-                    } else {
-                        link_line.push('-');
-                    }
-                } else {
-                    link_line.push(' ');
-                }
-            }
-            if let Some(msg) = message_lines.next() {
-                link_line.push(' ');
-                link_line.push_str(msg);
-            }
-            out.push_str(link_line.trim_end());
-            out.push('\n');
-        }
-
-        // Render the term line
-        if let Some(term_row) = line.term_line {
-            let term_strs = ["| ", "~ "];
-            for term_str in term_strs.iter() {
-                let mut term_line = String::new();
-                for (i, term) in term_row.iter().enumerate() {
-                    if *term {
-                        term_line.push_str(term_str);
-                    } else {
-                        term_line.push_str(match line.pad_lines[i] {
-                            PadLine::Parent => "| ",
-                            PadLine::Ancestor => ". ",
-                            PadLine::Blank => "  ",
-                        });
-                    }
-                }
-                if let Some(msg) = message_lines.next() {
-                    term_line.push(' ');
-                    term_line.push_str(msg);
-                }
-                out.push_str(term_line.trim_end());
-                out.push('\n');
-            }
-            need_extra_pad_line = true;
-        }
-
-        let mut base_pad_line = String::new();
-        for entry in line.pad_lines.iter() {
-            base_pad_line.push_str(match entry {
-                PadLine::Parent => "| ",
-                PadLine::Ancestor => ". ",
-                PadLine::Blank => "  ",
-            });
-        }
-
-        // Render any pad lines
-        for msg in message_lines {
-            let mut pad_line = base_pad_line.clone();
-            pad_line.push(' ');
-            pad_line.push_str(msg);
-            out.push_str(pad_line.trim_end());
-            out.push('\n');
-            need_extra_pad_line = false;
-        }
-
-        if need_extra_pad_line {
-            self.extra_pad_line = Some(base_pad_line);
-        }
-
-        out
+    fn output_options(&self) -> &OutputRendererOptions {
+        self.inner.output_options()
     }
 }
 
@@ -236,6 +122,56 @@ mod tests {
             |
             o  B
             |
+            o  A"#
+        );
+    }
+
+    #[test]
+    fn basic_disconnected() {
+        assert_eq!(
+            render(&test_fixtures::BASIC_DISCONNECTED),
+            r#"
+            o  D
+            |
+            o  C
+            
+            o  B
+            
+            o  A"#
+        );
+    }
+
+    #[test]
+    fn basic_disconnected_min_row_height_1() {
+        let mut renderer = GraphRowRenderer::new()
+            .output()
+            .with_min_row_height(1)
+            .build_ascii();
+        assert_eq!(
+            render_string(&test_fixtures::BASIC_DISCONNECTED, &mut renderer),
+            r#"
+            o  D
+            o  C
+            
+            o  B
+            
+            o  A"#
+        );
+    }
+
+    #[test]
+    fn basic_disconnected_min_row_height_1_staggered() {
+        let mut renderer = GraphRowRenderer::new()
+            .output()
+            .with_min_row_height(1)
+            .with_stagger_consecutive_disconnected_nodes(true)
+            .build_ascii();
+        assert_eq!(
+            render_string(&test_fixtures::BASIC_DISCONNECTED, &mut renderer),
+            r#"
+            o  D
+            o  C
+              o  B
             o  A"#
         );
     }

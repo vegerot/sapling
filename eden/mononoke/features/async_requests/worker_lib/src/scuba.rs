@@ -13,6 +13,7 @@ use async_requests::types::RowId;
 use async_requests_types_thrift::AsynchronousRequestResult as ThriftAsynchronousRequestResult;
 use context::CoreContext;
 use futures_stats::FutureStats;
+use mononoke_types::RepositoryId;
 use source_control::AsyncRequestError;
 use stats::define_stats;
 use stats::prelude::*;
@@ -83,14 +84,14 @@ pub(crate) fn log_result(
     let (status, error, succeeded, complete_failed, method_error) = match result.thrift() {
         ThriftAsynchronousRequestResult::error(error) => match error {
             AsyncRequestError::request_error(error) => {
-                ("REQUEST_ERROR", Some(format!("{:?}", error)), 0, 0, 1)
+                ("REQUEST_ERROR", Some(format!("{error:?}")), 0, 0, 1)
             }
             AsyncRequestError::internal_error(error) => {
-                ("INTERNAL_ERROR", Some(format!("{:?}", error)), 0, 0, 1)
+                ("INTERNAL_ERROR", Some(format!("{error:?}")), 0, 0, 1)
             }
             AsyncRequestError::UnknownField(error) => (
                 "UNKNOWN_ERROR",
-                Some(format!("unknown error: {:?}", error)),
+                Some(format!("unknown error: {error:?}")),
                 0,
                 0,
                 1,
@@ -116,6 +117,23 @@ pub(crate) fn log_result(
     scuba.log_with_msg("Request complete", None);
 }
 
+pub(crate) fn log_repo_load_failure(
+    ctx: &CoreContext,
+    repo_id: Option<RepositoryId>,
+    error: &Error,
+) {
+    let mut scuba = ctx.scuba().clone();
+
+    scuba.unsampled();
+    scuba.add("status", "REPO_LOAD_ERROR");
+    scuba.add("error", format!("{error:?}"));
+
+    scuba.log_with_msg(
+        "Failed to load repo",
+        repo_id.map(|rid| format!("repo id: {}", rid.id())),
+    );
+}
+
 /// Log a retriable error, i.e. one that failed because of internal worker issues and will be retried.
 pub(crate) fn log_retriable_error(ctx: CoreContext, stats: &FutureStats, error: Error) {
     let mut scuba = ctx.scuba().clone();
@@ -125,7 +143,7 @@ pub(crate) fn log_retriable_error(ctx: CoreContext, stats: &FutureStats, error: 
     scuba.add_future_stats(stats);
     scuba.add("status", "RETRIABLE_ERROR");
     scuba.unsampled();
-    scuba.add("error", format!("{:?}", error));
+    scuba.add("error", format!("{error:?}"));
 
     scuba.log_with_msg("Request complete", None);
 }

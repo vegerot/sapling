@@ -17,7 +17,7 @@ abomonation = { git = "https://github.com/markbt/abomonation", rev = "0f43346d2a
 audio_streams = { git = "https://github.com/google/crosvm", rev = "299c1e7c3d5a1b98106212c20f58b9fdb7b1b1ea" }
 backtrace = { git = "https://github.com/rust-lang/backtrace-rs", rev = "df979dcf80027eb047d7bb9e0874710c15009f31" }
 base64urlsafedata = { git = "https://github.com/kanidm/webauthn-rs.git", rev = "d278c56adfa39a0723c79bdcd461644194bc5138" }
-bf-tree = { git = "https://github.com/ddrcoder/bf-tree.git", rev = "5b66d45329ba1c992c247983c0803baf38bbb55f" }
+bf-tree = { git = "https://github.com/fbsource/bf-tree", rev = "da3f2364e8f9fe002a85c19de8a879fc2c05f12c" }
 bindgen = { git = "https://github.com/jsgf/rust-bindgen", rev = "4d385d21c160e6ee1f443aeb7e00528a1dc7fd44" }
 bindgen-cli = { git = "https://github.com/jsgf/rust-bindgen", rev = "4d385d21c160e6ee1f443aeb7e00528a1dc7fd44" }
 c2pa = { git = "https://github.com/peekmoar/c2pa-rs", rev = "6bcd530a0b681d828e1b07430058c13427fe8bb1" }
@@ -48,13 +48,9 @@ postgres-protocol = { git = "https://github.com/neondatabase/rust-postgres.git",
 postgres-types = { git = "https://github.com/neondatabase/rust-postgres.git", rev = "f3cf448febde5fd298071d54d568a9c875a7a62b" }
 prettytable-rs = { git = "https://github.com/asm89/prettytable-rs", rev = "d5e2a480c02b0c4be8d61f4f3a9039c841376433" }
 protobuf-build = { git = "https://github.com/fbsource/protobuf-build", rev = "ee1de946ce2fd7d06a7a4fab7141e02c49f0981f" }
-quickcheck = { git = "https://github.com/jakoschiko/quickcheck", rev = "6ecdf5bb4b0132ce66670b4d46453aa022ea892c" }
 quickcheck_async = { git = "https://github.com/markbt/quickcheck_async", rev = "76b13525ca93e0725e757f841fc6ccab8bae1913" }
 ratatui = { git = "https://github.com/fbsource/ratatui", rev = "e49703b568262fceffcb8b95456a47926ebabf33" }
 rinja = { git = "https://github.com/fbsource/askama", rev = "2fc6173c98034c148f46330fc39a006cf0b09efe" }
-riscv = { git = "https://github.com/jsgf/riscv.git", rev = "90cfc5f2404e39e085e12845944d5bbbc869c290" }
-riscv-pac = { git = "https://github.com/jsgf/riscv.git", rev = "90cfc5f2404e39e085e12845944d5bbbc869c290" }
-riscv-rt = { git = "https://github.com/jsgf/riscv.git", rev = "90cfc5f2404e39e085e12845944d5bbbc869c290" }
 rootcause = { git = "https://github.com/rootcause-rs/rootcause.git", rev = "5010b020a57786de6f18bad027560d54b73875b0" }
 rootcause-backtrace = { git = "https://github.com/rootcause-rs/rootcause.git", rev = "5010b020a57786de6f18bad027560d54b73875b0" }
 rust-stemmers = { git = "https://github.com/fbsource/rust-stemmers", rev = "3b2545218f76e797baecbf91fa1cbd2c0db60726" }
@@ -71,10 +67,10 @@ warp = { git = "https://github.com/jdthomas/warp.git", rev = "c794232d182abaa3ad
 wezterm-color-types = { git = "https://github.com/wezterm/wezterm.git", rev = "05343b387085842b434d267f91b6b0ec157e4331" }
 wezterm-dynamic = { git = "https://github.com/wezterm/wezterm.git", rev = "05343b387085842b434d267f91b6b0ec157e4331" }
 wezterm-input-types = { git = "https://github.com/wezterm/wezterm.git", rev = "05343b387085842b434d267f91b6b0ec157e4331" }
-zbus = { git = "https://github.com/z-galaxy/zbus", rev = "db642298a0567a9c7f3afd735014ae7803fe8615" }
-zbus_macros = { git = "https://github.com/z-galaxy/zbus", rev = "db642298a0567a9c7f3afd735014ae7803fe8615" }
-zvariant = { git = "https://github.com/z-galaxy/zbus", rev = "db642298a0567a9c7f3afd735014ae7803fe8615" }
-zvariant_derive = { git = "https://github.com/z-galaxy/zbus", rev = "db642298a0567a9c7f3afd735014ae7803fe8615" }
+zbus = { git = "https://github.com/z-galaxy/zbus", rev = "40d8995fa012652c1b1e1e9bd96e54327024be09" }
+zbus_macros = { git = "https://github.com/z-galaxy/zbus", rev = "40d8995fa012652c1b1e1e9bd96e54327024be09" }
+zvariant = { git = "https://github.com/z-galaxy/zbus", rev = "40d8995fa012652c1b1e1e9bd96e54327024be09" }
+zvariant_derive = { git = "https://github.com/z-galaxy/zbus", rev = "40d8995fa012652c1b1e1e9bd96e54327024be09" }
 
 [patch."https://github.com/milvus-io/rust-stemmers.git"]
 rust-stemmers = { git = "https://github.com/fbsource/rust-stemmers", rev = "3b2545218f76e797baecbf91fa1cbd2c0db60726" }

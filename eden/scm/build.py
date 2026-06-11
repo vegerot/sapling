@@ -7,7 +7,8 @@
 """Script to build Sapling (sl) and ISL
 
 Currently support:
-- facebook/sapling (github) cargo build.
+- facebook/sapling (github) cargo build (without edenfs).
+- facebook/sapling (github) getdeps cargo build (with edenfs, requires fbthrift).
 - fbsource (monorepo) cargo build with fb-internal features.
 - fbsource (monorepo) cargo build without fb-internal features (--oss).
 
@@ -19,7 +20,6 @@ import datetime
 import glob
 import hashlib
 import os
-import platform
 import shutil
 import struct
 import subprocess
@@ -36,6 +36,9 @@ CARGO_TARGET = OUT / "cargo-target"
 CARGO_CONFIG_DIR = OUT / "cargo_config"
 HGMAIN_MANIFEST = ROOT / "exec" / "hgmain" / "Cargo.toml"
 _VCVARS_ENV = None
+BUILD_MODES = ("oss", "fbsource", "getdeps")
+RUST_BUILD_TOOLS = ("cargo", "buck")
+BUCK_SL_TARGET = "fbcode//eden/scm:hg"
 
 
 def status(args, message):
@@ -352,14 +355,21 @@ def link_config_file(cargo_dir, config_path):
         shutil.copy2(config_path, link_path)
 
 
-def cargo_features(oss):
+def cargo_features(mode):
+    # sl_oss: disable ".hg" support
+    # eden: edenfs related features, requires Thrift
+    # fb: (fbsource-only) fb-only features
     features = []
     if os.name != "nt":
         features.append("with_chg")
-    if oss:
+    if mode == "oss":
         features.append("sl_oss")
-    else:
+    elif mode == "fbsource":
         features.extend(["fb", "eden"])
+    elif mode == "getdeps":
+        features.extend(["eden", "sl_oss"])
+    else:
+        raise RuntimeError(f"unknown build mode: {mode}")
     return " ".join(features)
 
 
@@ -403,12 +413,17 @@ def copy_windows_openssl_dlls(args, dest):
 
 def cargo_env(args):
     env = scoped_env(args, msvc=(os.name == "nt"))
+    if args.mode == "getdeps":
+        env["GETDEPS_BUILD"] = "1"
+        getdeps_install = env.get("GETDEPS_INSTALL_DIR")
+        if getdeps_install and "THRIFT" not in env:
+            env["THRIFT"] = str(Path(getdeps_install) / "fbthrift/bin/thrift1")
     env["PYTHON_SYS_EXECUTABLE"] = args.python
     env["SAPLING_VERSION"] = args.version
     env["SAPLING_VERSION_HASH"] = version_hash(args.version)
     env["LIB_DIRS"] = str((OUT / "temp").resolve())
     env.pop("HOMEBREW_CCCFG", None)
-    if platform.system() == "Darwin" and "OPENSSL_DIR" not in env:
+    if sys.platform == "darwin" and "OPENSSL_DIR" not in env:
         openssl = Path("/opt/homebrew/opt/openssl")
         if openssl.is_dir():
             env["OPENSSL_DIR"] = str(openssl)
@@ -430,6 +445,22 @@ def cargo_output_path(args):
     return Path(*parts) / f"hgmain{exe}"
 
 
+def buck_build_mode():
+    if os.name == "nt":
+        return "@fbcode//mode/opt-win"
+    if sys.platform == "darwin":
+        return "@fbcode//mode/opt-mac"
+    return "@fbcode//mode/opt"
+
+
+def buck_output_path(output_text):
+    for line in output_text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == BUCK_SL_TARGET:
+            return (FBSOURCE / parts[1]).resolve()
+    raise RuntimeError(f"buck build did not print an output path for {BUCK_SL_TARGET}")
+
+
 def copy_artifact(src, dest):
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() or dest.is_symlink():
@@ -440,7 +471,7 @@ def copy_artifact(src, dest):
             return
         except OSError:
             pass
-    elif platform.system() == "Linux":
+    elif sys.platform.startswith("linux"):
         try:
             import fcntl
 
@@ -508,6 +539,13 @@ def eden_prefetch_fbsource(args, path, message):
 
 def build_sl(args):
     ensure_out_dir(args)
+    if args.rust_build_tool == "buck":
+        build_sl_with_buck(args)
+    else:
+        build_sl_with_cargo(args)
+
+
+def build_sl_with_cargo(args):
     paths = rust_paths(args)
     write_cargo_config(args, paths)
 
@@ -521,7 +559,7 @@ def build_sl(args):
         cmd.append(f"--target={args.rust_target}")
     if not args.debug:
         cmd.append("--release")
-    features = cargo_features(args.oss)
+    features = cargo_features(args.mode)
     if features:
         cmd.extend(["--features", features])
 
@@ -552,6 +590,33 @@ def build_sl(args):
         status(args, "Copying sl debug symbols")
         copy_artifact(pdb, OUT / "sl.pdb")
     copy_windows_openssl_dlls(args, OUT)
+
+
+def build_sl_with_buck(args):
+    cmd = [
+        "buck2",
+        "build",
+        buck_build_mode(),
+        BUCK_SL_TARGET,
+        "--show-output",
+    ]
+    status(args, "Building sl with buck")
+    if not args.quiet:
+        print("$", subprocess.list2cmdline(cmd), file=sys.stderr)
+    output_text = subprocess.check_output(
+        cmd,
+        cwd=FBSOURCE,
+        env=scoped_env(args),
+        encoding="utf-8",
+        errors="replace",
+    )
+    if not args.quiet:
+        print(output_text, end="", file=sys.stderr)
+
+    exe = ".exe" if os.name == "nt" else ""
+    dest = OUT / f"sl{exe}"
+    status(args, f"Copying sl to {dest}")
+    copy_artifact(buck_output_path(output_text), dest)
 
 
 def build_isl(args):
@@ -604,9 +669,42 @@ def add_common_options(parser):
         ),
     )
     parser.add_argument(
+        "--mode",
+        metavar="MODE",
+        help=(
+            "Build mode. Defaults to getdeps when GETDEPS_BUILD=1, "
+            "fbsource when fb/ exists, otherwise oss. Choices: oss, "
+            "fbsource, getdeps."
+        ),
+    )
+    parser.add_argument(
         "--oss",
         action="store_true",
-        help=("Build without fb-only features. By default, this is auto-detected."),
+        help="Shortcut for --mode oss.",
+    )
+    parser.add_argument(
+        "--getdeps",
+        action="store_true",
+        help="Shortcut for --mode getdeps.",
+    )
+    parser.add_argument(
+        "--rust-build-tool",
+        metavar="TOOL",
+        help=(
+            "Rust build tool. Defaults to buck in fbsource mode, otherwise "
+            "cargo. Choices: cargo, buck. buck is only valid with --mode "
+            "fbsource."
+        ),
+    )
+    parser.add_argument(
+        "--buck",
+        action="store_true",
+        help="Shortcut for --rust-build-tool buck.",
+    )
+    parser.add_argument(
+        "--cargo",
+        action="store_true",
+        help="Shortcut for --rust-build-tool cargo.",
     )
     parser.add_argument(
         "--debug",
@@ -640,8 +738,67 @@ def add_common_options(parser):
     )
 
 
-def normalize_args(args):
-    args.oss = args.oss or FBSOURCE is None
+def auto_mode():
+    if (
+        os.environ.get("GETDEPS_BUILD") == "1"
+        or os.environ.get("GETDEPS_BUILD_DIR")
+        or os.environ.get("GETDEPS_INSTALL_DIR")
+    ):
+        return "getdeps"
+    if FBSOURCE is not None:
+        return "fbsource"
+    return "oss"
+
+
+def normalize_mode(args, parser):
+    if args.mode and args.mode not in BUILD_MODES:
+        choices = ", ".join(repr(mode) for mode in BUILD_MODES)
+        parser.error(
+            f"argument --mode: invalid choice: {args.mode!r} (choose from {choices})"
+        )
+
+    modes = []
+    if args.mode:
+        modes.append(args.mode)
+    if args.oss:
+        modes.append("oss")
+    if args.getdeps:
+        modes.append("getdeps")
+    if len(set(modes)) > 1:
+        parser.error("--mode, --oss, and --getdeps specify conflicting modes")
+    args.mode = modes[0] if modes else auto_mode()
+
+
+def normalize_rust_build_tool(args, parser):
+    if args.rust_build_tool and args.rust_build_tool not in RUST_BUILD_TOOLS:
+        choices = ", ".join(repr(tool) for tool in RUST_BUILD_TOOLS)
+        parser.error(
+            "argument --rust-build-tool: invalid choice: "
+            f"{args.rust_build_tool!r} (choose from {choices})"
+        )
+
+    tools = []
+    if args.rust_build_tool:
+        tools.append(args.rust_build_tool)
+    if args.buck:
+        tools.append("buck")
+    if args.cargo:
+        tools.append("cargo")
+    if len(set(tools)) > 1:
+        parser.error("--rust-build-tool, --buck, and --cargo specify conflicting tools")
+    args.rust_build_tool = (
+        tools[0] if tools else ("buck" if args.mode == "fbsource" else "cargo")
+    )
+
+    if args.rust_build_tool == "buck" and args.mode != "fbsource":
+        parser.error("--rust-build-tool buck requires --mode fbsource")
+
+
+def normalize_args(args, parser):
+    normalize_mode(args, parser)
+    status(args, f"Using build mode (--mode): {args.mode}")
+    normalize_rust_build_tool(args, parser)
+    status(args, f"Using Rust build tool (--rust-build-tool): {args.rust_build_tool}")
     args.python = args.with_python or pick_python()
     status(args, f"Using Python: {args.python}")
     args.version = args.with_version or auto_version()
@@ -670,7 +827,7 @@ def main(argv):
             "argument TARGET: invalid choice: "
             f"{invalid_targets[0]!r} (choose from {choices})"
         )
-    normalize_args(args)
+    normalize_args(args, parser)
 
     for target in args.targets or build_targets:
         if target == "sl":

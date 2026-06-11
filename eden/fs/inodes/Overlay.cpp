@@ -13,6 +13,7 @@
 #include <folly/Exception.h>
 #include <folly/File.h>
 #include <folly/FileUtil.h>
+#include <folly/Random.h>
 #include <folly/Range.h>
 #include <folly/ScopeGuard.h>
 #include <folly/io/IOBuf.h>
@@ -35,8 +36,10 @@
 #include "eden/fs/inodes/sqlitecatalog/BufferedSqliteInodeCatalog.h"
 #include "eden/fs/inodes/sqlitecatalog/SqliteInodeCatalog.h"
 #include "eden/fs/sqlite/SqliteDatabase.h"
+#include "eden/fs/telemetry/EdenErrorInfoBuilder.h"
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
+#include "eden/fs/telemetry/ErrorLogger.h"
 #include "eden/fs/telemetry/LogEvent.h"
 
 #ifndef _WIN32
@@ -184,6 +187,7 @@ std::shared_ptr<Overlay> Overlay::create(
     InodeCatalogType inodeCatalogType,
     InodeCatalogOptions inodeCatalogOptions,
     std::shared_ptr<EdenFsEventsLogger> logger,
+    ErrorLogger& errorLogger,
     EdenStatsPtr stats,
     const EdenConfig& config) {
   // This allows us to access the private constructor.
@@ -194,6 +198,7 @@ std::shared_ptr<Overlay> Overlay::create(
         InodeCatalogType inodeCatalogType,
         InodeCatalogOptions inodeCatalogOptions,
         std::shared_ptr<EdenFsEventsLogger> logger,
+        ErrorLogger& errorLogger,
         EdenStatsPtr stats,
         const EdenConfig& config)
         : Overlay(
@@ -202,6 +207,7 @@ std::shared_ptr<Overlay> Overlay::create(
               inodeCatalogType,
               inodeCatalogOptions,
               logger,
+              errorLogger,
               std::move(stats),
               config) {}
   };
@@ -211,6 +217,7 @@ std::shared_ptr<Overlay> Overlay::create(
       inodeCatalogType,
       inodeCatalogOptions,
       logger,
+      errorLogger,
       std::move(stats),
       config);
 }
@@ -221,6 +228,7 @@ Overlay::Overlay(
     InodeCatalogType inodeCatalogType,
     InodeCatalogOptions inodeCatalogOptions,
     std::shared_ptr<EdenFsEventsLogger> logger,
+    ErrorLogger& errorLogger,
     EdenStatsPtr stats,
     const EdenConfig& config)
     : fileContentStore_{makeFileContentStore(
@@ -242,12 +250,14 @@ Overlay::Overlay(
       localDir_{localDir},
       caseSensitive_{caseSensitive},
       edenFsEventsLogger_{std::move(logger)},
+      errorLogger_(errorLogger),
       stats_{std::move(stats)},
       useDirectFileWrites_(config.overlayDirectFileWrites.getValue()),
       useWal_{config.overlayUseWal.getValue() && inodeCatalog_->supportsWal()},
       walCompactionMultiplier_{
           config.overlayWalCompactionMultiplier.getValue()},
-      walCompactionCap_{config.overlayWalCompactionCap.getValue()} {}
+      walCompactionByteCap_{config.overlayWalCompactionByteCap.getValue()},
+      walCompactionRng_{[] { return folly::Random::rand32(); }} {}
 
 Overlay::~Overlay() {
   close();
@@ -763,6 +773,7 @@ void Overlay::saveOverlayDir(
     stats_->increment(&OverlayStats::saveOverlayDirSuccessful);
   } catch (const std::exception& e) {
     XLOGF(ERR, "Failed to save overlay dir {} {}", inodeNumber, e.what());
+    errorLogger_.log(EdenErrorInfo::overlay(e, inodeNumber.get()));
     stats_->increment(&OverlayStats::saveOverlayDirFailure);
     throw;
   }
@@ -776,10 +787,6 @@ void Overlay::clearWalAfterFullWrite(InodeNumber parent) {
   if (!canHaveWalFiles()) {
     return;
   }
-  // Clear the in-memory counter first so a concurrent appender on the
-  // same parent does not observe count > 0 with no on-disk WAL between
-  // the unlinkat and the erase.
-  walEntryCountsShard(parent).wlock()->erase(parent);
   // Cleanup failure on a successful base rewrite is best-effort: the
   // base file is durable, so the new state is correct on disk; a stale
   // WAL will be re-merged (idempotently) on the next load. Swallow the
@@ -825,46 +832,39 @@ void Overlay::mergeWalIntoOverlayDir(
   }
 }
 
-void Overlay::maybeCompactWal(InodeNumber parent, const DirContents& content) {
+void Overlay::maybeCompactWal(
+    InodeNumber parent,
+    const DirContents& content,
+    uint64_t walFileSizeBytes) {
   if (!canHaveWalFiles()) {
     return;
   }
-  size_t count = 0;
-  {
-    auto counts = walEntryCountsShard(parent).wlock();
-    count = ++(*counts)[parent];
+  // Hard cap first: the on-disk WAL byte size is the source of truth.
+  bool atCap = walFileSizeBytes >= walCompactionByteCap_;
+  if (!atCap) {
+    // Below the cap: probabilistic roll. Expected appends between
+    // compactions = `threshold`, so amortized rewrite cost is O(1) per
+    // append.
+    size_t threshold = walCompactionMultiplier_ *
+        std::max(content.size(), static_cast<size_t>(10));
+    if (walCompactionRng_() % threshold != 0) {
+      return;
+    }
   }
-  // Use the directory size at last compaction (current size minus WAL
-  // entries) as the base for threshold calculation. This prevents the
-  // threshold from growing faster than the counter for directories that
-  // start small.
-  //
-  // The threshold is also capped at walCompactionCap_ so that a single
-  // compaction event cannot serialize an unboundedly large directory
-  // under the parent contents lock. Both the multiplier and the cap are
-  // snapshotted from EdenConfig at Overlay construction.
-  size_t baseSize = content.size() > count ? content.size() - count : 0;
-  size_t threshold = std::min(
-      walCompactionMultiplier_ * std::max(baseSize, static_cast<size_t>(10)),
-      walCompactionCap_);
-  if (count >= threshold) {
-    stats_->increment(&OverlayStats::walCompaction);
-    XLOGF(
-        DBG2,
-        "Compacting WAL for overlay dir {} after {} entries; content size {}, threshold {}",
-        parent,
-        count,
-        content.size(),
-        threshold);
-    // saveOverlayDir calls clearWalAfterFullWrite which removes the .wal
-    // file and erases the walEntryCounts_ entry. Pass isMaterialized=true
-    // explicitly: WAL-tracked directories are materialized by construction,
-    // and we need the crash-safe (atomic-rename) write path so a crash
-    // mid-rewrite cannot leave a truncated base file alongside a stale WAL.
-    DurationScope<EdenStats> compactScope{
-        stats_, &OverlayStats::walCompactionInline};
-    saveOverlayDir(parent, content, /*isMaterialized=*/true);
-  }
+  stats_->increment(&OverlayStats::walCompaction);
+  XLOGF(
+      DBG2,
+      "Compacting WAL for overlay dir {}; content size {}, wal bytes {} ({})",
+      parent,
+      content.size(),
+      walFileSizeBytes,
+      atCap ? "hard cap" : "probabilistic");
+  // Pass isMaterialized=true: WAL-tracked dirs are materialized, and we
+  // need the crash-safe rename path so a crash mid-rewrite cannot leave
+  // a truncated base file alongside a stale WAL.
+  DurationScope<EdenStats> compactScope{
+      stats_, &OverlayStats::walCompactionInline};
+  saveOverlayDir(parent, content, /*isMaterialized=*/true);
 }
 
 void Overlay::appendWalEntryAndCompact(
@@ -873,9 +873,10 @@ void Overlay::appendWalEntryAndCompact(
     PathComponentPiece childName,
     const overlay::OverlayEntry* entry,
     const DirContents& content) {
-  inodeCatalog_->appendWalEntry(parent, op, childName, entry);
+  uint64_t walFileSizeBytes =
+      inodeCatalog_->appendWalEntry(parent, op, childName, entry);
   stats_->increment(&OverlayStats::walAppend);
-  maybeCompactWal(parent, content);
+  maybeCompactWal(parent, content, walFileSizeBytes);
 }
 
 void Overlay::freeInodeFromMetadataTable(InodeNumber ino) {
@@ -1030,6 +1031,7 @@ OverlayFile Overlay::openFile(
     return file;
   } catch (const std::exception& e) {
     XLOGF(ERR, "Failed to open file {} {} {}", inodeNumber, headerId, e.what());
+    errorLogger_.log(EdenErrorInfo::overlay(e, inodeNumber.get()));
     stats_->increment(&OverlayStats::openOverlayFileFailure);
     throw;
   }
@@ -1046,6 +1048,7 @@ OverlayFile Overlay::openFileNoVerify(InodeNumber inodeNumber) {
     return file;
   } catch (const std::exception& e) {
     XLOGF(ERR, "Failed to open file {} {}", inodeNumber, e.what());
+    errorLogger_.log(EdenErrorInfo::overlay(e, inodeNumber.get()));
     stats_->increment(&OverlayStats::openOverlayFileFailure);
     throw;
   }
@@ -1068,6 +1071,7 @@ OverlayFile Overlay::createOverlayFile(
     return file;
   } catch (const std::exception& e) {
     XLOGF(ERR, "Failed to create file {} {}", inodeNumber, e.what());
+    errorLogger_.log(EdenErrorInfo::overlay(e, inodeNumber.get()));
     stats_->increment(&OverlayStats::createOverlayFileFailure);
     throw;
   }
@@ -1090,6 +1094,7 @@ OverlayFile Overlay::createOverlayFile(
     return file;
   } catch (const std::exception& e) {
     XLOGF(ERR, "Failed to create file {} {}", inodeNumber, e.what());
+    errorLogger_.log(EdenErrorInfo::overlay(e, inodeNumber.get()));
     stats_->increment(&OverlayStats::createOverlayFileFailure);
     throw;
   }

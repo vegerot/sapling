@@ -60,9 +60,11 @@ use mononoke_api_hg::HgRepoContext;
 use mononoke_api_hg::HgTreeContext;
 use mononoke_types::MPath;
 use mononoke_types::MPathElement;
+use permission_checker::MononokeIdentitySetExt;
 use rate_limiting::Metric;
 use rate_limiting::Scope;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_identity::RepoIdentityRef;
 use serde::Deserialize;
 use stats::define_stats;
 use stats::prelude::TimeseriesStatic;
@@ -492,7 +494,7 @@ impl SaplingRemoteApiHandler for CheckManifestPermissionHandler {
                 async move {
                     let hg_manifest_id = HgManifestId::new(
                         HgNodeHash::from_bytes(manifest_id.as_ref())
-                            .map_err(|e| anyhow::anyhow!("Invalid manifest id: {}", e))?,
+                            .map_err(|e| anyhow::anyhow!("Invalid manifest id: {e}"))?,
                     );
 
                     let restriction_ctx = HgAugmentedTreeRestrictionContext::new_check_exists(
@@ -516,6 +518,39 @@ impl SaplingRemoteApiHandler for CheckManifestPermissionHandler {
                                 .permission_request_group
                                 .to_string()
                         });
+
+                    for check in &restriction_checks {
+                        repo.ctx()
+                            .scuba()
+                            .clone()
+                            .add("repo", repo.repo().repo_identity().name())
+                            .add("edenapi_method", "check_manifest_permission")
+                            .add_opt(
+                                "edenapi_user",
+                                repo.ctx()
+                                    .metadata()
+                                    .identities()
+                                    .username()
+                                    .map(ToString::to_string),
+                            )
+                            .add(
+                                "unix_username",
+                                repo.ctx()
+                                    .metadata()
+                                    .identities()
+                                    .username()
+                                    .map(ToString::to_string),
+                            )
+                            .add(
+                                "restricted_path_acl",
+                                check.restriction_info().repo_region_acl.clone(),
+                            )
+                            .add("has_restricted_path_acl_access", check.has_acl_access())
+                            .add("is_allowlisted_tooling", check.is_allowlisted_tooling())
+                            .add("is_rollout_allowlisted", check.is_rollout_allowlisted())
+                            .add("has_restricted_path_access", check.has_authorization())
+                            .log_with_msg("Checked manifest permission", None);
+                    }
 
                     Ok(CheckManifestPermissionResponse {
                         manifest_id,
@@ -557,11 +592,11 @@ impl SaplingRemoteApiHandler for CheckPathPermissionHandler {
                 let cs = cs.clone();
                 async move {
                     let mpath = MPath::new(path.as_str().as_bytes())
-                        .with_context(|| format!("Invalid path: {}", path))?;
+                        .with_context(|| format!("Invalid path: {path}"))?;
                     let restriction_ctx = cs
                         .path_restriction(mpath)
                         .await
-                        .with_context(|| format!("Failed to check path restriction: {}", path))?;
+                        .with_context(|| format!("Failed to check path restriction: {path}"))?;
                     let restriction_infos = restriction_ctx.restriction_info(true).await?;
 
                     let has_access = restriction_infos

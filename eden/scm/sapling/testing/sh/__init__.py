@@ -30,6 +30,16 @@ Simple command:
     '(100) (no-eol)\n'
     >>> t('echo :')
     ':\n'
+    >>> t('echo ssh://host/repo?read_copy')
+    'ssh://host/repo?read_copy\n'
+    >>> t('echo file{0,1,2} dir{a,b}/x')
+    'file0 file1 file2 dira/x dirb/x\n'
+    >>> t('echo "{a,b}"')
+    '{a,b}\n'
+    >>> t("printf 'a\\nb\\n' | grep -E 'a|c'")
+    'a\n'
+    >>> t('dirname file dir/file /file')
+    '.\ndir\n/\n'
 
 Expanding envvar:
 
@@ -96,6 +106,8 @@ Math:
 
     >>> t('A=2; echo $((A+10))')
     '12\n'
+    >>> t('expr 2 + 3; expr 7 - 4; expr 3 \\* 4')
+    '5\n3\n12\n'
     >>> t('echo $((2*3)) $((2**3)) $((4|2)) $((3&6)) $((5/2)) $((3<<1)) $((7>>2))')
     '6 8 6 2 2 6 1\n'
     >>> t('echo $((3*3-2*2+5)) $((1<2)) $((2==2)) $((1>=2))')
@@ -132,17 +144,27 @@ Case:
 
     >>> t('case g in\n f)\n true\n;;\n g)\n false\n;;\n esac')
     '[1]\n'
+    >>> t('case Sapling-1 in\n Mercurial*)\n echo no\n;;\n Sapling*)\n echo yes\n;;\n esac')
+    'yes\n'
 
 Redirect:
 
     >>> t('echo 1 >/dev/null')
     ''
+    >>> t('HOME=.; echo 1 > ~/.arcrc; cat ./.arcrc')
+    '1\n'
+    >>> t('HOME=.; echo 1 > "~/literal"; cat "~/literal"')
+    '1\n'
     >>> t('echo 1 > a; echo 2 > a; echo 3 >> a; cat a; cat < a')
     '2\n3\n2\n3\n'
     >>> t('echo 1 > a; > a; cat a')
     ''
     >>> t('(echo 1 1>&2; ) 2>/dev/null')
     ''
+    >>> t('echo 1 2>&1')
+    '1\n'
+    >>> t('echo 1 > a 2>&1; cat a')
+    '1\n'
     >>> t('A=1; ( A=2; echo 1 && echo 2; ) > a; cat a; echo $A')
     '1\n2\n1\n'
     >>> t('A=1; { A=2; echo 1 && echo $A; } > a; cat a; echo $A')
@@ -181,6 +203,12 @@ Command substitution:
 
     >>> t('echo `echo foo` $(echo bar $(echo baz))')
     'foo bar baz\n'
+    >>> t('A=$(echo out; echo err >&2); echo "A=$A"')
+    'err\nA=out\n'
+    >>> t('A=$(echo out | (cat; echo err >&2)); echo "A=$A"')
+    'err\nA=out\n'
+    >>> t('A=$(echo $(echo err >&2)); echo "A=$A"')
+    'err\nA=\n'
     >>> t('''cat > a << EOF
     ... a
     ... $(echo b)
@@ -305,6 +333,11 @@ exit:
     >>> t('a() { echo 1; exit 2; echo 3; }; a; echo 4')
     '1\n[2]\n'
 
+exec:
+
+    >>> t('exec echo hi')
+    'hi\n'
+
 shift:
 
     >>> t('a() { echo $1 $#; shift; echo $1 $#; }; a 1 2 3')
@@ -332,6 +365,19 @@ grep:
     '1\n2\n3\n4\n9\n10\n11\n12\n13\n14\n17\n18\n19\n20\n'
     >>> t('seq 20 | grep -B 2 -C 3 2')
     '1\n2\n3\n4\n5\n10\n11\n12\n13\n14\n15\n18\n19\n20\n'
+    >>> t('seq 3 | grep -q 2; echo $?')
+    '0\n'
+    >>> t('seq 3 | grep -q 4; echo $?')
+    '1\n'
+    >>> t('echo abc > a; echo def > b; grep -o "[ad]" a b')
+    'a:a\nb:d\n'
+
+sed:
+
+    >>> t("printf 'a\\n#b\\n\\nc\\n' | sed '/^#/d;/^$/d;s:^:| :'")
+    '| a\n| c\n'
+    >>> t("printf 'keep\\ndrop\\ndrop\\n' | sed '/^drop/,$d'")
+    'keep\n'
 
 sort
 
@@ -369,7 +415,7 @@ basename and dirname
     >>> t('basename a b/c/d')
     'a\nd\n'
     >>> t('dirname a b/c/d')
-    'a\nb/c\n'
+    '.\nb/c\n'
 
 Commands on OS filesystem:
 
@@ -421,6 +467,23 @@ tee:
     >>> f('echo a b | tee d e; cat d e')
     'a b\na b\na b\n'
 
+ls -R:
+
+    >>> f('mkdir -p a/b; touch z a/y a/b/x; ls -R | grep -v ":"')
+    'a\nz\n\nb\ny\n\nx\n'
+
+diff:
+
+    >>> f('echo a > x; diff x x; echo $?')
+    '0\n'
+    >>> f('echo a > x; echo b > y; diff -u x y')
+    '--- x\n+++ y\n@@ -1 +1 @@\n-a\n+b\n[1]\n'
+
+dd:
+
+    >>> f('dd if=/dev/zero of=zeros bs=3 count=2; wc -c zeros')
+    '6\n'
+
 test:
 
     >>> f('''
@@ -442,19 +505,26 @@ find:
     ... find . -not -wholename '**/b/**' -type f
     ... ''').strip())
     find files:
-    a/b/d
-    d/e
+    ./a/b/d
+    ./d/e
     find ../d:
     ../d/b
     ../d/b/z
     ../d/e
     find with patterns:
-    d/e
+    ./d/e
 
 pwd == $PWD
 
     >>> f('[ "$(pwd)" = "$PWD" ] && echo pwd match')
     'pwd match\n'
+
+which:
+
+    >>> f('mkdir bin; touch bin/tool; PATH=bin which tool')
+    'bin/tool\n'
+    >>> f('which missing; echo $?')
+    '1\n'
 
 wc -l:
 

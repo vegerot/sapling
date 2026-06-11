@@ -113,35 +113,35 @@ impl BookmarkHook for BlockAccidentalNewBookmarkCreationHook {
     ) -> Result<HookExecution, Error> {
         let bookmark_state = hook_repo.get_bookmark_state(ctx, bookmark).await?;
         if !bookmark_state.is_new() {
-            return Ok(HookExecution::Accepted);
+            return Ok(HookExecution::accepted());
         }
 
         if bookmark.is_tag() {
-            return Ok(HookExecution::Accepted);
+            return Ok(HookExecution::accepted());
         }
 
         let bookmark_name = bookmark.as_str();
 
         if let Some(regex) = &self.bypass_for_bookmarks_matching_regex {
             if regex.is_match(bookmark_name) {
-                return Ok(HookExecution::Accepted);
+                return Ok(HookExecution::accepted());
             }
         }
 
         if let Some(options) = &self.creation_allowed_with_marker_options {
             if let Some(value_from_marker) = extract_value_from_marker(options, to) {
                 let value_to_compare = if let Some(comparison_prefix) = &options.comparison_prefix {
-                    &format!("{}{}", comparison_prefix, value_from_marker)
+                    &format!("{comparison_prefix}{value_from_marker}")
                 } else {
                     value_from_marker
                 };
 
                 if bookmark_name == value_to_compare {
-                    return Ok(HookExecution::Accepted);
+                    return Ok(HookExecution::accepted());
                 }
             }
 
-            Ok(HookExecution::Rejected(HookRejectionInfo::new_long(
+            Ok(HookExecution::rejected(HookRejectionInfo::new_long(
                 "Bookmark creation is restricted in this repository.",
                 format!(
                     "Add \"{}: {}\" to the commit message to be able to create this branch.",
@@ -157,7 +157,7 @@ impl BookmarkHook for BlockAccidentalNewBookmarkCreationHook {
                 ),
             )))
         } else {
-            Ok(HookExecution::Rejected(HookRejectionInfo::new_long(
+            Ok(HookExecution::rejected(HookRejectionInfo::new_long(
                 "Bookmark creation is restricted in this repository.",
                 "New bookmark creation is not possible in this repository.".to_string(),
             )))

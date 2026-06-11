@@ -5,51 +5,68 @@
  * GNU General Public License version 2.
  */
 
+//! `MononokeConfigs` — the per-service entry point for fetching repo configs
+//! and registering for config-update notifications.
+//!
+//! Internal organization:
+//! - [`ConfigUpdateReceiver`][receiver::ConfigUpdateReceiver] trait is in
+//!   [`receiver`]
+//! - The unified watcher task (single tokio task that owns the blob, manifest,
+//!   per-repo control channel, and per-repo wait fan-in) is in [`watcher`]
+//! - The deterministic content-hash + last-updated-at helper used to expose
+//!   stable config identity is in [`config_info`]
+//!
+//! `MononokeConfigs` itself owns the `ArcSwap` state and the task handles.
+
+mod config_info;
+mod receiver;
+mod watcher;
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::RwLock;
-use std::time::SystemTime;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use arc_swap::ArcSwap;
-use async_trait::async_trait;
 use cached_config::ConfigHandle;
 use cached_config::ConfigStore;
 use cached_config::ConfigUpdateWatcher;
 use cloned::cloned;
-use futures::future::join_all;
 use metaconfig_parser::RepoConfigs;
 use metaconfig_parser::StorageConfigs;
 use metaconfig_parser::config::configerator_config_handle;
-use metaconfig_parser::config::load_configs_from_raw;
 use metaconfig_parser::configerator_manifest_handle;
 use metaconfig_parser::configerator_repo_spec_handle;
 use metaconfig_parser::parse_repo_spec;
-use metaconfig_types::CommonConfig;
 use metaconfig_types::ConfigInfo;
 use metaconfig_types::RepoConfig;
 use repos::RawRepoConfigs;
 use repos::RepoSpec;
 use repos::TierManifest;
-use serde::Serialize;
-use sha2::Digest;
-use sha2::Sha256;
 use stats::prelude::*;
 use tokio::runtime::Handle;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
 
-const LIVENESS_INTERVAL: u64 = 300;
+use crate::config_info::build_config_info;
+pub use crate::receiver::ConfigUpdateReceiver;
+use crate::watcher::RepoHandleEvent;
+use crate::watcher::liveness_updater;
+use crate::watcher::unified_config_watcher;
+
 const CONFIGERATOR_TIER_PREFIX: &str = "configerator://scm/mononoke/repos/tiers/";
-type Swappable<T> = Arc<ArcSwap<T>>;
+
+/// Shorthand for a value swapped atomically via `arc_swap`. Used for the
+/// stateful slots inside `MononokeConfigs` that receivers read.
+pub(crate) type Swappable<T> = Arc<ArcSwap<T>>;
 
 define_stats! {
     prefix = "mononoke.config_refresh";
@@ -57,35 +74,15 @@ define_stats! {
     refresh_success_count: timeseries(Average, Sum, Count),
     liveness_count: timeseries(Average, Sum, Count),
     spurious_reload_suppressed: timeseries(Average, Sum, Count),
-}
-
-fn content_changed<T: PartialEq>(prev: &Option<Arc<T>>, current: &Option<Arc<T>>) -> bool {
-    match (prev, current) {
-        (Some(a), Some(b)) => **a != **b,
-        (None, None) => false,
-        _ => true,
-    }
-}
-
-async fn wait_for_handle<T: Send + Sync + 'static>(
-    watcher: &mut Option<ConfigUpdateWatcher<T>>,
-) -> Result<()> {
-    match watcher {
-        Some(w) => {
-            w.wait_for_next().await?;
-            Ok(())
-        }
-        None => std::future::pending().await,
-    }
+    merge_skipped_no_handle: timeseries(Average, Sum, Count),
+    per_repo_refresh_count: timeseries(Average, Sum, Count),
+    per_repo_refresh_failure_count: timeseries(Average, Sum, Count),
 }
 
 /// Configuration provider and update notifier for all of Mononoke services
 /// and jobs. The configurations provided by this struct are always up-to-date
 /// with its source.
 pub struct MononokeConfigs {
-    /// Serializes write operations (clone-insert-store) on repo_configs ArcSwap.
-    /// Must NOT be held across async operations.
-    config_update_lock: Arc<Mutex<()>>,
     repo_configs: Swappable<RepoConfigs>,
     storage_configs: Swappable<StorageConfigs>,
     update_receivers: Swappable<Vec<Arc<dyn ConfigUpdateReceiver>>>,
@@ -100,6 +97,12 @@ pub struct MononokeConfigs {
     /// Tier name derived from the configerator config path.
     /// Used for resolving tier_overrides in RepoSpec configs during split-loading.
     tier_name: Option<String>,
+    /// Sender side of the control channel that notifies `unified_config_watcher`
+    /// when a new per-repo `ConfigUpdateWatcher<RepoSpec>` has been created
+    /// (via sync_repo_handles or load_repo_config_handle) so it can be added
+    /// to the watcher's `FuturesUnordered` set. `None` when split-loading is
+    /// disabled.
+    repo_handle_event_tx: Option<mpsc::UnboundedSender<RepoHandleEvent>>,
 }
 
 impl MononokeConfigs {
@@ -132,7 +135,7 @@ impl MononokeConfigs {
             match build_config_info(config_handle.get()) {
                 Ok(new_config_info) => Some(new_config_info),
                 Err(e) => {
-                    warn!("Could not compute new config_info: {:?}", e);
+                    warn!("Could not compute new config_info: {e:?}");
                     None
                 }
             }
@@ -150,9 +153,8 @@ impl MononokeConfigs {
         if tier_name.is_some() {
             if let Some(manifest_path) = manifest_path {
                 debug!(
-                    "Split-loading enabled: config_path={}, manifest_path={}, tier_name={:?}",
+                    "Split-loading enabled: config_path={}, manifest_path={manifest_path}, tier_name={:?}",
                     config_path.as_ref().to_string_lossy(),
-                    manifest_path,
                     tier_name.as_deref().unwrap_or("<none>"),
                 );
             } else {
@@ -173,6 +175,21 @@ impl MononokeConfigs {
         }
 
         let repo_handles = Arc::new(RwLock::new(HashMap::new()));
+
+        // Control channel for the per-repo arm of unified_config_watcher.
+        // Only created when split-loading is active (manifest is set), since
+        // that's the only case where per-repo handles exist. Created BEFORE
+        // the pre-load so we can enqueue `Added` events for pre-loaded handles
+        // — the watcher will process those queued events on its first iteration
+        // via the control arm, which avoids running a separate seed loop that
+        // could race with a concurrent `load_repo_config_handle` call from
+        // ShardManager and double-register a handle.
+        let (repo_handle_event_tx, repo_handle_event_rx) = if maybe_manifest_handle.is_some() {
+            let (tx, rx) = mpsc::unbounded_channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
 
         // If manifest is available, pre-load handles for non-deep-sharded repos.
         // Collect all handles first, then insert in bulk under a single write lock.
@@ -195,9 +212,37 @@ impl MononokeConfigs {
                 manifest.repos.iter().filter(|e| e.is_deep_sharded).count(),
             );
 
+            // Derive watchers BEFORE handing handle ownership to the HashMap,
+            // then enqueue `Added` events for each so the watcher loop will
+            // register them on its first iteration. This is the sole path for
+            // watcher registration — see comment on `repo_handle_event_tx` above.
+            //
+            // A failure here means the repo silently loses hot-reload: the
+            // handle stays in `repo_handles` (so `load_repo_config_handle`
+            // skips it on the fast path) but no `Added` event ever fires.
+            // Logged so this is observable in production.
+            if let Some(tx) = repo_handle_event_tx.as_ref() {
+                for (name, handle) in &handles_to_add {
+                    match handle.watcher() {
+                        Ok(w) => {
+                            // Channel is unbounded and the watcher hasn't
+                            // started yet, so send cannot fail except via an
+                            // `rx` drop — which we control.
+                            let _ = tx.send(RepoHandleEvent::Added(name.clone(), w));
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Pre-load: failed to create watcher for {name}, \
+                                 per-repo hot-reload disabled for this repo until restart: {e:?}",
+                            );
+                        }
+                    }
+                }
+            }
+
             repo_handles
                 .write()
-                .map_err(|e| anyhow!("repo_handles lock poisoned: {}", e))?
+                .map_err(|e| anyhow!("repo_handles lock poisoned: {e}"))?
                 .extend(handles_to_add);
         }
 
@@ -229,13 +274,13 @@ impl MononokeConfigs {
                     storage_configs,
                     config_info,
                     update_receivers,
+                    repo_handle_event_rx,
                 )))
             } else {
                 None
             };
 
         Ok(Self {
-            config_update_lock: Arc::new(Mutex::new(())),
             repo_configs,
             storage_configs,
             update_receivers,
@@ -247,6 +292,7 @@ impl MononokeConfigs {
             repo_handles,
             config_store: Some(config_store.clone()),
             tier_name,
+            repo_handle_event_tx,
         })
     }
 
@@ -297,10 +343,31 @@ impl MononokeConfigs {
     /// the underlying configs which can then be used to perform further actions. Note that
     /// the operation performed by the ConfigUpdateReceiver should not be too long running.
     /// If that's the case, use config_watcher method instead.
+    ///
+    /// Thread-safe: uses `rcu` so concurrent registrations from multiple
+    /// services don't lose entries to a load-modify-store race.
     pub fn register_for_update(&self, update_receiver: Arc<dyn ConfigUpdateReceiver>) {
-        let mut update_receivers = Vec::from_iter(self.update_receivers.load().iter().cloned());
-        update_receivers.push(update_receiver);
-        self.update_receivers.store(Arc::new(update_receivers));
+        self.update_receivers.rcu(|current| {
+            let mut next: Vec<Arc<dyn ConfigUpdateReceiver>> = (**current).clone();
+            next.push(update_receiver.clone());
+            next
+        });
+    }
+
+    /// Drop the per-repo ConfigHandle (called by ShardManager on_drop_shard via
+    /// repos_manager::remove_repo). Symmetric counterpart to load_repo_config_handle.
+    /// No-op if no handle is held.
+    pub fn remove_repo_config_handle(&self, repo_name: &str) {
+        match self.repo_handles.write() {
+            Ok(mut handles) => {
+                if handles.remove(repo_name).is_some() {
+                    info!("Removed config handle for repo: {repo_name}");
+                }
+            }
+            Err(e) => {
+                error!("repo_handles lock poisoned while removing {repo_name}: {e}");
+            }
+        }
     }
 
     /// Create a per-repo ConfigHandle on-demand (called by ShardManager on_add_shard).
@@ -309,7 +376,7 @@ impl MononokeConfigs {
         if self
             .repo_handles
             .read()
-            .map_err(|e| anyhow!("repo_handles lock poisoned: {}", e))?
+            .map_err(|e| anyhow!("repo_handles lock poisoned: {e}"))?
             .contains_key(repo_name)
         {
             return Ok(());
@@ -325,7 +392,7 @@ impl MononokeConfigs {
             .repos
             .iter()
             .find(|e| e.repo_name == repo_name)
-            .ok_or_else(|| anyhow!("Repo {} not found in manifest", repo_name))?;
+            .ok_or_else(|| anyhow!("Repo {repo_name} not found in manifest"))?;
 
         let config_store = self
             .config_store
@@ -333,19 +400,53 @@ impl MononokeConfigs {
             .context("No config store available")?;
 
         let handle = configerator_repo_spec_handle(&entry.config_path, config_store)?;
+        // Derive the watcher BEFORE moving the handle into repo_handles —
+        // the watcher only requires &self on ConfigHandle, but we hand off
+        // ownership of the handle to the HashMap below.
+        //
+        // Subscription is live from `handle.watcher()` onwards: any
+        // configerator updates between here and when the unified_config_watcher
+        // loop processes the `Added` event get buffered in the
+        // `tokio::sync::watch::Receiver` (latest-value semantics) and are
+        // delivered on the first `wait_for_next` call. No update can be
+        // dropped.
+        let watcher = handle.watcher();
         self.repo_handles
             .write()
-            .map_err(|e| anyhow!("repo_handles lock poisoned: {}", e))?
+            .map_err(|e| anyhow!("repo_handles lock poisoned: {e}"))?
             .insert(repo_name.to_owned(), handle);
+        // Notify unified_config_watcher to start watching this repo for
+        // per-repo content updates. Send AFTER the handle is in the map so
+        // the `still_present` check in `handle_per_repo_fire` passes on
+        // dispatch.
+        match watcher {
+            Ok(w) => {
+                if let Some(tx) = self.repo_handle_event_tx.as_ref() {
+                    if let Err(e) = tx.send(RepoHandleEvent::Added(repo_name.to_owned(), w)) {
+                        warn!(
+                            "Failed to send Added event for repo {repo_name} \
+                             (watcher loop gone?): {e}",
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "load_repo_config_handle: failed to create watcher for {repo_name}, \
+                     per-repo hot-reload disabled for this repo until restart: {e:?}",
+                );
+            }
+        }
         Ok(())
     }
 
     /// Load a repo config on-demand. Checks the repo_configs cache first,
     /// falls back to loading from the TierManifest via ConfigHandle.
     ///
-    /// Thread-safe: uses config_update_lock for write serialization.
-    /// The lock only guards the synchronous clone-insert-store; expensive
-    /// work (ConfigHandle subscription, RepoSpec parsing) happens outside it.
+    /// Thread-safe: uses `ArcSwap::rcu` for write serialization. The closure
+    /// inside `rcu` runs at least once (possibly multiple times on CAS retry),
+    /// so the expensive work — ConfigHandle subscription, RepoSpec parsing —
+    /// happens once OUTSIDE the closure.
     pub fn get_or_load_repo_config(&self, repo_name: &str) -> Result<RepoConfig> {
         // Fast path: lock-free read from cache (covers both legacy blob
         // and previously loaded split-config repos)
@@ -358,24 +459,21 @@ impl MononokeConfigs {
         // we return the error — the fast path above already checked the legacy blob.
         let repo_config = self.load_and_parse_repo_config(repo_name)?;
 
-        // Insert into cache (INSIDE the lock, sync only)
-        {
-            let _guard = self
-                .config_update_lock
-                .lock()
-                .map_err(|e| anyhow!("config_update_lock poisoned: {}", e))?;
-
-            // Double-check: another thread may have loaded it while we were parsing
-            let current = self.repo_configs.load_full();
-            if let Some(config) = current.repos.get(repo_name) {
-                return Ok(config.clone());
+        // Insert into cache via rcu. The closure is idempotent: on CAS retry
+        // it re-runs against a fresher snapshot, and if a concurrent writer
+        // (per-repo refresh, another get_or_load) already inserted this repo,
+        // we keep their entry to avoid a redundant clone+store.
+        self.repo_configs.rcu(|current| {
+            let mut next = (**current).clone();
+            if !next.repos.contains_key(repo_name) {
+                next.insert_repo(repo_name.to_owned(), repo_config.clone());
             }
+            next
+        });
 
-            let mut new_configs = (*current).clone();
-            new_configs.insert_repo(repo_name.to_owned(), repo_config.clone());
-            self.repo_configs.store(Arc::new(new_configs));
-        }
-
+        // All paths leave the cache containing some entry for repo_name with
+        // the same value (configs for one repo at one snapshot are
+        // deterministic). Return what we parsed.
         Ok(repo_config)
     }
 
@@ -386,7 +484,7 @@ impl MononokeConfigs {
         let handle = self
             .repo_handles
             .read()
-            .map_err(|e| anyhow!("repo_handles lock poisoned: {}", e))?
+            .map_err(|e| anyhow!("repo_handles lock poisoned: {e}"))?
             .get(repo_name)
             .context("handle not found after load")?
             .clone();
@@ -403,14 +501,14 @@ impl MononokeConfigs {
         parse_repo_spec(Arc::unwrap_or_clone(repo_spec), tier, &manifest.storage)
     }
 
-    /// Batch-load repo configs. Single lock acquisition, single HashMap clone,
+    /// Batch-load repo configs. Single rcu acquisition, single HashMap clone,
     /// single ArcSwap store regardless of how many repos are loaded.
     /// This is the default path for startup (`open_managed_repos`).
     pub fn batch_load_repo_configs(
         &self,
         repo_names: &[String],
     ) -> Result<Vec<(String, RepoConfig)>> {
-        // Step 1: Separate cached from missing (no lock)
+        // Step 1: Separate cached from missing
         let current = self.repo_configs.load_full();
         let mut results: Vec<(String, RepoConfig)> = Vec::new();
         let mut missing: Vec<String> = Vec::new();
@@ -427,28 +525,32 @@ impl MononokeConfigs {
             return Ok(results);
         }
 
-        // Step 2: Subscribe to ConfigHandles + parse OUTSIDE the lock
+        // Step 2: Subscribe to ConfigHandles + parse OUTSIDE rcu
         let mut loaded: Vec<(String, RepoConfig)> = Vec::new();
         for name in &missing {
             match self.load_and_parse_repo_config(name) {
                 Ok(config) => loaded.push((name.clone(), config)),
                 Err(e) => {
-                    warn!("batch_load: failed to load config for {}: {:#}", name, e);
+                    warn!("batch_load: failed to load config for {name}: {e:#}");
                 }
             }
         }
 
-        // Step 3: Single lock, single clone, bulk insert, single store
+        // Step 3: rcu — bulk insert via a single closure that re-runs on CAS
+        // failure. Safe against concurrent per-repo refreshes and other
+        // get_or_load callers without needing a separate lock. Already-present
+        // entries (set by a concurrent writer between Step 1 and here) win
+        // — caller-side idempotency.
         if !loaded.is_empty() {
-            let _guard = self
-                .config_update_lock
-                .lock()
-                .map_err(|e| anyhow!("config_update_lock poisoned: {}", e))?;
-            let mut new = (*self.repo_configs.load_full()).clone();
-            for (name, config) in &loaded {
-                new.insert_repo(name.clone(), config.clone());
-            }
-            self.repo_configs.store(Arc::new(new));
+            self.repo_configs.rcu(|current| {
+                let mut next = (**current).clone();
+                for (name, config) in &loaded {
+                    if !next.repos.contains_key(name.as_str()) {
+                        next.insert_repo(name.clone(), config.clone());
+                    }
+                }
+                next
+            });
         }
 
         results.extend(loaded);
@@ -456,7 +558,7 @@ impl MononokeConfigs {
     }
 
     /// Load configs for all repos discovered from both the legacy blob and
-    /// the manifest. Uses batch loading (single lock, single clone).
+    /// the manifest. Uses batch loading (single rcu, single clone).
     pub fn load_all_repo_configs(&self) -> Result<Vec<(String, RepoConfig)>> {
         let mut all_names: HashSet<String> = self
             .repo_configs
@@ -488,13 +590,13 @@ impl MononokeConfigs {
         // fall back to the original "unknown repoid" error.
         let manifest = match self.maybe_manifest_handle.as_ref() {
             Some(handle) => handle.get(),
-            None => anyhow::bail!("unknown repoid: RepositoryId({})", repo_id),
+            None => anyhow::bail!("unknown repoid: RepositoryId({repo_id})"),
         };
         let entry = manifest
             .repos
             .iter()
             .find(|e| e.repo_id == repo_id)
-            .ok_or_else(|| anyhow!("unknown repoid: RepositoryId({})", repo_id))?;
+            .ok_or_else(|| anyhow!("unknown repoid: RepositoryId({repo_id})"))?;
         let config = self.get_or_load_repo_config(&entry.repo_name)?;
         Ok((entry.repo_name.clone(), config))
     }
@@ -512,453 +614,5 @@ impl Drop for MononokeConfigs {
         if let Some(liveness_updater) = self.maybe_liveness_updater.as_ref() {
             liveness_updater.abort();
         }
-    }
-}
-
-async fn liveness_updater() {
-    loop {
-        STATS::liveness_count.add_value(1);
-        tokio::time::sleep(tokio::time::Duration::from_secs(LIVENESS_INTERVAL)).await;
-    }
-}
-
-/// Unified config watcher: monitors both the legacy blob ConfigHandle and the
-/// TierManifest ConfigHandle via tokio::select!, applying changes exactly once.
-///
-/// Fixes two production bugs:
-/// 1. Spurious reloads: PartialEq on thrift structs skips no-op version bumps.
-/// 2. Double reloads: single apply_update call per real change (was two).
-async fn unified_config_watcher(
-    blob_handle: Option<ConfigHandle<RawRepoConfigs>>,
-    manifest_handle: Option<ConfigHandle<TierManifest>>,
-    repo_handles: Arc<RwLock<HashMap<String, ConfigHandle<RepoSpec>>>>,
-    config_store: ConfigStore,
-    tier_name: Option<String>,
-    repo_configs: Swappable<RepoConfigs>,
-    storage_configs: Swappable<StorageConfigs>,
-    config_info: Swappable<Option<ConfigInfo>>,
-    update_receivers: Swappable<Vec<Arc<dyn ConfigUpdateReceiver>>>,
-) {
-    let mut blob_watcher = blob_handle
-        .as_ref()
-        .map(|h| h.watcher())
-        .transpose()
-        .unwrap_or_else(|e| {
-            error!("Failed to create blob config watcher: {:?}", e);
-            None
-        });
-    let mut manifest_watcher = manifest_handle
-        .as_ref()
-        .map(|h| h.watcher())
-        .transpose()
-        .unwrap_or_else(|e| {
-            error!("Failed to create manifest watcher: {:?}", e);
-            None
-        });
-
-    if blob_watcher.is_none() && manifest_watcher.is_none() {
-        warn!("No config watchers available, unified_config_watcher exiting");
-        return;
-    }
-
-    let mut prev_blob: Option<Arc<RawRepoConfigs>> = None;
-    let mut prev_manifest: Option<Arc<TierManifest>> = None;
-    let mut cached_parsed: Option<RepoConfigs> = None;
-
-    loop {
-        tokio::select! {
-            result = wait_for_handle(&mut blob_watcher) => {
-                if let Err(e) = result {
-                    error!("Error waiting for blob config update: {:?}", e);
-                    continue;
-                }
-            }
-            result = wait_for_handle(&mut manifest_watcher) => {
-                if let Err(e) = result {
-                    error!("Error waiting for manifest config update: {:?}", e);
-                    continue;
-                }
-            }
-        }
-
-        let current_blob = blob_handle.as_ref().map(|h| h.get());
-        let current_manifest = manifest_handle.as_ref().map(|h| h.get());
-
-        let blob_changed = content_changed(&prev_blob, &current_blob);
-        let manifest_changed = content_changed(&prev_manifest, &current_manifest);
-
-        if !blob_changed && !manifest_changed {
-            STATS::spurious_reload_suppressed.add_value(1);
-            debug!("Config version bumped but content identical, skipping reload");
-            continue;
-        }
-
-        info!(
-            "Config content changed (blob={}, manifest={}), applying update",
-            blob_changed, manifest_changed,
-        );
-
-        if blob_changed {
-            if let Some(ref raw) = current_blob {
-                match load_configs_from_raw(Arc::unwrap_or_clone(raw.clone())) {
-                    Ok((configs, new_storage)) => {
-                        storage_configs.store(Arc::new(new_storage));
-                        match build_config_info(raw.clone()) {
-                            Ok(info) => config_info.store(Arc::new(Some(info))),
-                            Err(e) => warn!("Could not compute new config_info: {:?}", e),
-                        }
-                        cached_parsed = Some(configs);
-                    }
-                    Err(e) => {
-                        error!("Failed to parse blob config: {:?}", e);
-                        STATS::refresh_failure_count.add_value(1);
-                        continue;
-                    }
-                }
-            } else {
-                cached_parsed = None;
-            }
-            prev_blob = current_blob;
-        }
-
-        if manifest_changed {
-            if let Some(ref manifest) = current_manifest {
-                if let Err(e) = sync_repo_handles(manifest, &repo_handles, &config_store) {
-                    // Don't update prev_manifest so we retry on the next watcher cycle.
-                    // Transient failures (e.g., configerator timeout for a new repo handle)
-                    // will self-heal on the next notification.
-                    error!("Failed to sync repo handles: {:?}", e);
-                    STATS::refresh_failure_count.add_value(1);
-                    continue;
-                }
-            }
-            prev_manifest = current_manifest;
-        }
-
-        let base = cached_parsed
-            .clone()
-            .unwrap_or_else(|| RepoConfigs::new(HashMap::new(), CommonConfig::default()));
-
-        let merged = match (&prev_manifest, tier_name.as_deref()) {
-            (Some(manifest), Some(tier)) => {
-                let handles = match repo_handles.read() {
-                    Ok(h) => h,
-                    Err(e) => {
-                        error!("Failed to read repo handles lock: {:?}", e);
-                        STATS::refresh_failure_count.add_value(1);
-                        continue;
-                    }
-                };
-                let mut repos = base.repos.clone();
-                for entry in &manifest.repos {
-                    if let Some(handle) = handles.get(&entry.repo_name) {
-                        let spec = handle.get();
-                        match parse_repo_spec(Arc::unwrap_or_clone(spec), tier, &manifest.storage) {
-                            Ok(config) => {
-                                repos.insert(entry.repo_name.clone(), config);
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to parse RepoSpec for repo '{}', skipping: {:?}",
-                                    entry.repo_name, e,
-                                );
-                            }
-                        }
-                    }
-                }
-                RepoConfigs::new(repos, base.common.clone())
-            }
-            _ => base,
-        };
-
-        let new_configs = Arc::new(merged);
-        repo_configs.store(new_configs.clone());
-        let current_storage = storage_configs.load_full();
-        let receivers = update_receivers.load();
-        let results = join_all(
-            receivers
-                .iter()
-                .map(|r| r.apply_update(new_configs.clone(), current_storage.clone())),
-        )
-        .await;
-        let had_failure = results.iter().any(|r| r.is_err());
-        for (i, result) in results.iter().enumerate() {
-            if let Err(e) = result {
-                error!("Config update receiver {} failed: {:?}", i, e);
-            }
-        }
-        if had_failure {
-            STATS::refresh_failure_count.add_value(1);
-        } else {
-            info!("Successfully applied config update");
-            STATS::refresh_success_count.add_value(1);
-            // Keep the timeseries alive for OneDetection alerting
-            STATS::refresh_failure_count.add_value(0);
-        }
-    }
-}
-
-/// Syncs repo_handles with the manifest: adds handles for new repos, removes
-/// handles for repos no longer in the manifest.
-fn sync_repo_handles(
-    manifest: &TierManifest,
-    repo_handles: &RwLock<HashMap<String, ConfigHandle<RepoSpec>>>,
-    config_store: &ConfigStore,
-) -> Result<()> {
-    let current_repos: HashSet<String> = repo_handles
-        .read()
-        .map_err(|e| anyhow!("repo_handles lock poisoned: {}", e))?
-        .keys()
-        .cloned()
-        .collect();
-
-    let manifest_repos: HashSet<String> = manifest
-        .repos
-        .iter()
-        .filter(|e| !e.is_deep_sharded)
-        .map(|e| e.repo_name.clone())
-        .collect();
-
-    let new_handles: Vec<_> = manifest
-        .repos
-        .iter()
-        .filter(|entry| !entry.is_deep_sharded && !current_repos.contains(&entry.repo_name))
-        .filter_map(
-            |entry| match configerator_repo_spec_handle(&entry.config_path, config_store) {
-                Ok(handle) => {
-                    info!("Added config handle for new repo: {}", entry.repo_name);
-                    Some((entry.repo_name.clone(), handle))
-                }
-                Err(e) => {
-                    error!("Failed to load config for {}: {:?}", entry.repo_name, e);
-                    STATS::refresh_failure_count.add_value(1);
-                    None
-                }
-            },
-        )
-        .collect();
-
-    let to_remove: Vec<&String> = current_repos.difference(&manifest_repos).collect();
-
-    if !new_handles.is_empty() || !to_remove.is_empty() {
-        let mut handles = repo_handles
-            .write()
-            .map_err(|e| anyhow!("repo_handles lock poisoned: {}", e))?;
-        handles.extend(new_handles);
-        for repo_name in &to_remove {
-            handles.remove(*repo_name);
-            info!("Removed config handle for repo: {}", repo_name);
-        }
-    }
-
-    Ok(())
-}
-
-/// Trait defining methods related to config update notification. A struct implementing
-/// this trait can be configured to receive the most updated config value every time the
-/// underlying config changes.
-#[async_trait]
-pub trait ConfigUpdateReceiver: Send + Sync {
-    /// Method containing the logic to be executed when the configuration is updated. This
-    /// should not be too long running since the config updates will wait for all update
-    /// receivers before checking for the next config update.
-    async fn apply_update(
-        &self,
-        repo_configs: Arc<RepoConfigs>,
-        storage_configs: Arc<StorageConfigs>,
-    ) -> Result<()>;
-
-    /// Called when a single repo's config changes in the per-repo split-loading path.
-    /// Default implementation is a no-op — existing receivers that only handle bulk
-    /// updates don't need to implement this.
-    async fn apply_repo_update(&self, _repo_name: &str, _repo_config: &RepoConfig) -> Result<()> {
-        Ok(())
-    }
-}
-
-fn serialize_to_value<T: Serialize, S: serde::Serializer>(
-    value: &T,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    let value = serde_json::to_value(value).map_err(serde::ser::Error::custom)?;
-    value.serialize(serializer)
-}
-
-#[derive(Serialize)]
-struct SortKeys<T: Serialize>(#[serde(serialize_with = "serialize_to_value")] T);
-
-fn build_config_info(raw_repo_configs: Arc<RawRepoConfigs>) -> Result<ConfigInfo> {
-    let content_hash = {
-        let serialized = serde_json::to_string(&SortKeys(raw_repo_configs))
-            .expect("RawRepoConfigs serialization should never fail");
-        let mut hasher = Sha256::new();
-        hasher.update(serialized);
-        let hash = hasher.finalize();
-        hex::encode(hash)
-    };
-
-    let last_updated_at = {
-        let now = SystemTime::now();
-        now.duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_secs()
-    };
-
-    Ok(ConfigInfo {
-        content_hash,
-        last_updated_at,
-    })
-}
-
-#[cfg(test)]
-mod test {
-    use std::collections::HashSet;
-    use std::sync::Arc;
-
-    use mononoke_macros::mononoke;
-    use repos::RawRepoConfig;
-    use repos::RawRepoConfigs;
-
-    use super::*;
-
-    #[mononoke::test]
-    fn test_build_config_info_empty() {
-        let results = (1..10)
-            .map(|_i| {
-                let raw_repo_configs = RawRepoConfigs::default();
-                let res = build_config_info(Arc::new(raw_repo_configs));
-                assert!(res.is_ok());
-
-                let info = res.unwrap().to_owned();
-                assert!(info.last_updated_at > 0);
-
-                info.content_hash
-            })
-            .fold(HashSet::new(), |mut h, i| {
-                h.insert(i);
-                h
-            });
-        assert_eq!(results.len(), 1);
-    }
-
-    #[mononoke::test]
-    fn test_build_config_info_one_repo() {
-        let results = (1..10)
-            .map(|_| {
-                let mut raw_repo_configs = RawRepoConfigs::default();
-                raw_repo_configs
-                    .repos
-                    .insert("repo1".to_string(), RawRepoConfig::default());
-
-                let res = build_config_info(Arc::new(raw_repo_configs));
-                assert!(res.is_ok());
-
-                let info = res.unwrap().to_owned();
-                assert!(info.last_updated_at > 0);
-
-                info.content_hash
-            })
-            .fold(HashSet::new(), |mut h, i| {
-                h.insert(i);
-                h
-            });
-        assert_eq!(results.len(), 1);
-    }
-
-    #[mononoke::test]
-    fn test_build_config_info_two_repos() {
-        let results = (1..10)
-            .flat_map(|_| {
-                let mut ret = Vec::new();
-
-                let mut raw_repo_configs = RawRepoConfigs::default();
-                raw_repo_configs
-                    .repos
-                    .insert("repo1".to_string(), RawRepoConfig::default());
-                raw_repo_configs
-                    .repos
-                    .insert("repo2".to_string(), RawRepoConfig::default());
-
-                let res = build_config_info(Arc::new(raw_repo_configs));
-                assert!(res.is_ok());
-
-                let info = res.unwrap().to_owned();
-                assert!(info.last_updated_at > 0);
-                ret.push(info.content_hash);
-
-                // Test that the hash is different if the order of the repos is different
-                let mut raw_repo_configs = RawRepoConfigs::default();
-                raw_repo_configs
-                    .repos
-                    .insert("repo2".to_string(), RawRepoConfig::default());
-                raw_repo_configs
-                    .repos
-                    .insert("repo1".to_string(), RawRepoConfig::default());
-
-                let res = build_config_info(Arc::new(raw_repo_configs));
-                assert!(res.is_ok());
-
-                let info = res.unwrap().to_owned();
-                assert!(info.last_updated_at > 0);
-                ret.push(info.content_hash);
-
-                ret
-            })
-            .fold(HashSet::new(), |mut h, i| {
-                h.insert(i);
-                h
-            });
-        assert_eq!(results.len(), 1);
-    }
-
-    // The smallest fixture that did *not* demonstrate non-deterministic behavior
-    // with the old implementation.
-    #[mononoke::test]
-    fn test_build_config_info_minimal() {
-        let results = (1..10)
-            .map(|_| {
-                let json = fixtures::json_config_minimal();
-                let raw_repo_configs =
-                    serde_json::from_str::<RawRepoConfigs>(&json).expect("Unable to parse");
-
-                let res = build_config_info(Arc::new(raw_repo_configs));
-                assert!(res.is_ok());
-
-                let info = res.unwrap().to_owned();
-                assert!(info.last_updated_at > 0);
-
-                info.content_hash
-            })
-            .fold(HashSet::new(), |mut h, i| {
-                h.insert(i);
-                h
-            });
-
-        assert_eq!(results.len(), 1);
-    }
-
-    // The smallest fixture that *did* demonstrate non-deterministic behavior
-    // with the old implementation.
-    #[mononoke::test]
-    fn test_build_config_info_small() {
-        let results = (1..10)
-            .map(|_| {
-                let json = fixtures::json_config_small();
-                let raw_repo_configs =
-                    serde_json::from_str::<RawRepoConfigs>(&json).expect("Unable to parse");
-
-                let res = build_config_info(Arc::new(raw_repo_configs));
-                assert!(res.is_ok());
-
-                let info = res.unwrap().to_owned();
-                assert!(info.last_updated_at > 0);
-
-                info.content_hash
-            })
-            .fold(HashSet::new(), |mut h, i| {
-                h.insert(i);
-                h
-            });
-        assert_eq!(results.len(), 1);
     }
 }

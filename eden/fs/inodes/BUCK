@@ -166,6 +166,7 @@ cpp_library(
         "//eden/fs/service:thrift_util",
         "//eden/fs/sqlite:sqlite",
         "//eden/fs/store:backing_store_interface",
+        "//eden/fs/telemetry:error_info",
         "//eden/fs/telemetry:error_logger",
         "//eden/fs/telemetry:file_access_structured_logger",
         "//eden/fs/telemetry:fs_event_logger",
@@ -201,6 +202,7 @@ cpp_library(
             "//eden/fs/inodes/lmdbcatalog:buffered_lmdb_inode_catalog",
             "//eden/fs/inodes/lmdbcatalog:lmdb_file_content_store",
             "//eden/fs/inodes/lmdbcatalog:lmdb_inode_catalog",
+            "//eden/fs/utils:mount_info_table",
         ],
         "ovr_config//os:macos": [
             "//eden/fs/inodes/fscatalog:fsinodecatalog",
@@ -250,6 +252,7 @@ cpp_library(
         "//eden/fs/utils:mini_tracer",
         "//eden/fs/utils:static_assert",
         "//folly:cancellation_token",
+        "//folly:cpp_attributes",
         "//folly:exception_wrapper",
         "//folly:expected",
         "//folly:fbvector",

@@ -83,15 +83,20 @@ pub(crate) fn track_mmap_buffer(bytes: &Bytes) {
 /// Does not block. Returns `None` when unable to take the lock.
 #[cfg(unix)]
 pub(crate) fn find_region(addr: usize) -> Option<(usize, usize, bool)> {
-    let locked = BUFFERS.try_lock().ok()?;
-    if let Some((start, end)) = locked.find_region(addr) {
-        return Some((start, end, false));
+    if let Ok(locked) = BUFFERS.try_lock() {
+        if let Some((start, end)) = locked.find_region(addr) {
+            return Some((start, end, false));
+        }
     }
+
     // Also check the change_detect mmap buffers.
-    let locked = crate::change_detect::BUFFERS.try_lock().ok()?;
-    locked
-        .find_region(addr)
-        .map(|(start, end)| (start, end, true))
+    if let Ok(locked) = crate::change_detect::BUFFERS.try_lock() {
+        if let Some((start, end)) = locked.find_region(addr) {
+            return Some((start, end, true));
+        }
+    }
+
+    None
 }
 
 impl<W: WeakSlice> WeakBuffers<W> {
@@ -173,5 +178,36 @@ impl<W: WeakSlice> WeakBuffers<W> {
             let ret = EmptyWorkingSet(handle);
             tracing::debug!("EmptyWorkingSet returned {}", ret);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn find_region_checks_change_detector_when_log_buffer_lock_is_busy() {
+        use crate::change_detect::SharedChangeDetector;
+        use crate::lock::DirLockOptions;
+        use crate::lock::ScopedDirLock;
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DirLockOptions {
+            exclusive: false,
+            non_blocking: false,
+            file_name: "rlock",
+        };
+        let lock = ScopedDirLock::new_with_options(dir.path(), &opts).unwrap();
+        let mmap = lock.shared_mmap_mut(std::mem::size_of::<u64>()).unwrap();
+        let addr = mmap.as_ptr() as usize;
+
+        let _detector = SharedChangeDetector::new(mmap);
+
+        let _log_buffers = super::BUFFERS.lock().unwrap();
+        // Holding BUFFERS must not prevent the SIGBUS handler from finding
+        // rlock mmaps tracked by change_detect::BUFFERS.
+        assert_eq!(
+            super::find_region(addr).map(|(_start, _end, writable)| writable),
+            Some(true)
+        );
     }
 }

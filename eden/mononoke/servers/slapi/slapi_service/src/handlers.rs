@@ -194,7 +194,7 @@ impl fmt::Display for SaplingRemoteApiMethod {
             Self::UploadIdenticalChangesets => "upload_identical_changesets",
             Self::UploadTrees => "upload_trees",
         };
-        write!(f, "{}", name)
+        write!(f, "{name}")
     }
 }
 
@@ -230,7 +230,7 @@ impl ErrorFormatter for JsonErrorFormatter {
     type Body = Vec<u8>;
 
     fn format(&self, error: &Error, state: &State) -> Result<(Self::Body, Mime), Error> {
-        let message = format!("{:#}", error);
+        let message = format!("{error:#}");
 
         // Package the error message into a JSON response.
         let res = JsonError {
@@ -310,8 +310,7 @@ fn proxygen_health_handler(state: State) -> (State, &'static str) {
     } else {
         if let Some(request_load) = RequestLoad::try_borrow_from(&state) {
             let threshold =
-                justknobs::get_as::<i64>("scm/mononoke:edenapi_high_load_threshold", None)
-                    .unwrap_or_default();
+                justknobs::get_as::<i64>("scm/mononoke:edenapi_high_load_threshold", None);
             if threshold > 0 && request_load.0 > threshold {
                 return (state, HIGH_LOAD_SIGNAL);
             }

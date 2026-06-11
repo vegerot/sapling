@@ -62,6 +62,7 @@ struct Inner {
     treestore: Arc<dyn TreeStore>,
     repo: Arc<Repo>,
     mount_path: PathBuf,
+    eden_client_dir: Option<PathBuf>,
 
     // We store these so we can maintain them when reloading ourself.
     extra_configs: Vec<PinnedConfig>,
@@ -86,6 +87,7 @@ struct Inner {
 
     prefetch_send: flume::Sender<()>,
     walk_mode: WalkMode,
+    restricted_tree_mode: RestrictedTreeMode,
     walk_detector: walkdetector::Detector,
 }
 
@@ -111,6 +113,26 @@ impl FromStr for WalkMode {
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum RestrictedTreeMode {
+    Disabled,
+    Logged,
+    Enforced,
+}
+
+impl RestrictedTreeMode {
+    fn from_config(config: &dyn Config) -> Self {
+        match config
+            .get("experimental", "restricted-tree-mode")
+            .as_deref()
+        {
+            Some("logged") => Self::Logged,
+            Some("enforced") => Self::Enforced,
+            _ => Self::Disabled,
+        }
+    }
+}
+
 impl BackingStore {
     /// Initialize `BackingStore`.
     pub fn new<P: AsRef<Path>>(root: P, mount: P) -> Result<Self> {
@@ -131,6 +153,29 @@ impl BackingStore {
         mount: impl AsRef<Path>,
         extra_configs: &[String],
     ) -> Result<Self> {
+        Self::new_with_config_inner(root.as_ref(), mount.as_ref(), None, extra_configs)
+    }
+
+    pub fn new_with_config_and_client_dir(
+        root: impl AsRef<Path>,
+        mount: impl AsRef<Path>,
+        eden_client_dir: impl AsRef<Path>,
+        extra_configs: &[String],
+    ) -> Result<Self> {
+        Self::new_with_config_inner(
+            root.as_ref(),
+            mount.as_ref(),
+            Some(eden_client_dir.as_ref()),
+            extra_configs,
+        )
+    }
+
+    fn new_with_config_inner(
+        root: &Path,
+        mount: &Path,
+        eden_client_dir: Option<&Path>,
+        extra_configs: &[String],
+    ) -> Result<Self> {
         let extra_configs = extra_configs
             .iter()
             .map(|c| PinnedConfig::Raw(c.to_string().into(), "backingstore".into()))
@@ -140,8 +185,9 @@ impl BackingStore {
 
         Ok(Self {
             inner: ArcSwap::new(Arc::new(Self::new_inner(
-                root.as_ref(),
-                mount.as_ref(),
+                root,
+                mount,
+                eden_client_dir,
                 &extra_configs,
                 touch_file_mtime(),
                 parent_hint.clone(),
@@ -154,6 +200,7 @@ impl BackingStore {
     fn new_inner(
         root: &Path,
         mount: &Path,
+        eden_client_dir: Option<&Path>,
         extra_configs: &[PinnedConfig],
         touch_file_mtime: Option<SystemTime>,
         parent_hint: Arc<RwLock<Option<String>>>,
@@ -216,6 +263,7 @@ impl BackingStore {
                 .unwrap_or_default()
                 .as_ref(),
         )?;
+        let restricted_tree_mode = RestrictedTreeMode::from_config(config.as_ref());
 
         let repo = Arc::new(repo);
 
@@ -248,6 +296,16 @@ impl BackingStore {
         }
 
         walk_detector.set_root(Some(mount.to_path_buf()));
+        if config.get_or("backingstore", "walk-metadata-persistence", || true)? {
+            if let Some(eden_client_dir) = eden_client_dir {
+                walk_detector.set_persistence_path(walk_metadata_persistence_path(eden_client_dir));
+                walk_detector.load_persisted_metadata();
+            } else {
+                walk_detector.clear_persistence_path();
+            }
+        } else {
+            walk_detector.clear_persistence_path();
+        }
 
         let prefetch_send = if walk_mode == WalkMode::Prefetch {
             let prefetch_config = prefetch::Config {
@@ -290,6 +348,7 @@ impl BackingStore {
             filestore,
             repo,
             mount_path: mount.to_path_buf(),
+            eden_client_dir: eden_client_dir.map(Path::to_path_buf),
             extra_configs: extra_configs.to_vec(),
             create_time: Instant::now(),
             touch_file_mtime,
@@ -303,6 +362,7 @@ impl BackingStore {
                 .unwrap_or(Duration::from_mins(5)),
             prefetch_send,
             walk_mode,
+            restricted_tree_mode,
             walk_detector,
         })
     }
@@ -438,12 +498,17 @@ impl BackingStore {
     pub fn check_permission(&self, manifest_id: &[u8]) -> Result<bool> {
         use edenapi::types::CheckManifestPermissionRequest;
 
+        let inner = self.maybe_reload();
+        if inner.restricted_tree_mode == RestrictedTreeMode::Disabled {
+            return Ok(true);
+        }
+
         let id = HgId::from_slice(manifest_id)?;
         let request = CheckManifestPermissionRequest {
             manifest_ids: vec![id],
         };
         let response = BlockingResponse::from_async(
-            self.maybe_reload()
+            inner
                 .repo
                 .eden_api()
                 .map_err(|err| err.tag_network())?
@@ -451,6 +516,16 @@ impl BackingStore {
         )?;
         for entry in response.entries {
             if entry.manifest_id == id {
+                if inner.restricted_tree_mode == RestrictedTreeMode::Logged {
+                    if !entry.has_access {
+                        tracing::info!(
+                            hgid = %id,
+                            acl = entry.request_acl.as_deref().unwrap_or("unknown-acl"),
+                            "restricted tree detected (logged mode, not enforcing)"
+                        );
+                    }
+                    return Ok(true);
+                }
                 return Ok(entry.has_access);
             }
         }
@@ -592,6 +667,7 @@ impl BackingStore {
             match Self::new_inner(
                 inner.repo.path(),
                 &inner.mount_path,
+                inner.eden_client_dir.as_deref(),
                 &inner.extra_configs,
                 new_mtime,
                 self.parent_hint.clone(),
@@ -662,6 +738,7 @@ impl Inner {
             treestore: self.treestore.clone(),
             repo: self.repo.clone(),
             mount_path: self.mount_path.clone(),
+            eden_client_dir: self.eden_client_dir.clone(),
             extra_configs: self.extra_configs.clone(),
 
             touch_file_mtime,
@@ -673,6 +750,7 @@ impl Inner {
 
             prefetch_send: self.prefetch_send.clone(),
             walk_mode: self.walk_mode,
+            restricted_tree_mode: self.restricted_tree_mode,
             walk_detector: self.walk_detector.clone(),
         }
     }
@@ -692,6 +770,10 @@ impl Inner {
 
         let _ = self.prefetch_send.try_send(());
     }
+}
+
+fn walk_metadata_persistence_path(eden_client_dir: &Path) -> PathBuf {
+    eden_client_dir.join("walk_detector_metadata.jsonl")
 }
 
 fn touch_file_mtime() -> Option<SystemTime> {
@@ -869,7 +951,7 @@ impl LocalRemoteImpl<Arc<dyn TreeEntry>> for Arc<dyn TreeStore> {
         {
             Some(Ok((_key, tree))) => Ok(tree),
             Some(Err(e)) => Err(e),
-            None => Err(anyhow::format_err!("{}@{}: not found remotely", path, id)),
+            None => Err(anyhow::format_err!("{path}@{id}: not found remotely")),
         }
     }
     fn get_batch_iter(
@@ -940,5 +1022,23 @@ impl Drop for BackingStore {
     fn drop(&mut self) {
         // Make sure that all the data that was fetched is written to the hgcache.
         self.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    #[test]
+    fn test_walk_metadata_persistence_path_uses_eden_client_dir() {
+        let mount = Path::new("/eden/mount/repo");
+        let eden_client_dir = Path::new("/home/user/.eden/clients/repo");
+
+        let path = walk_metadata_persistence_path(eden_client_dir);
+
+        assert_eq!(path, eden_client_dir.join("walk_detector_metadata.jsonl"));
+        assert!(!path.starts_with(mount));
     }
 }

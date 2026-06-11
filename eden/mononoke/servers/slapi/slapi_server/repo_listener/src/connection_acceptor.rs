@@ -145,10 +145,10 @@ pub async fn connection_acceptor(
     let security_checker = ConnectionSecurityChecker::new(acl_provider, &common_config).await?;
     let addr: SocketAddr = sockname
         .parse()
-        .with_context(|| format!("could not parse '{}'", sockname))?;
+        .with_context(|| format!("could not parse '{sockname}'"))?;
     let listener = TcpListener::bind(&addr)
         .await
-        .with_context(|| format!("could not bind mononoke on '{}'", sockname))?;
+        .with_context(|| format!("could not bind mononoke on '{sockname}'"))?;
 
     let mut terminate_process = terminate_process.fuse();
 
@@ -509,8 +509,7 @@ async fn wireproto_idle_watchdog(data: Arc<Mutex<WireprotoSinkData>>) {
 /// configured threshold). Sync; safe to call from the watchdog loop without
 /// holding any guard across an await.
 fn check_wireproto_idle(data: &Arc<Mutex<WireprotoSinkData>>) -> Result<bool> {
-    let threshold_secs =
-        justknobs::get_as::<i64>("scm/mononoke:wireproto_idle_kill_seconds", None)?;
+    let threshold_secs = justknobs::get_as::<i64>("scm/mononoke:wireproto_idle_kill_seconds", None);
     if threshold_secs <= 0 {
         // Off switch: not configured for this rollout, or explicitly disabled.
         return Ok(false);
@@ -651,7 +650,7 @@ impl ChannelConn {
                         scuba.add("stderr_bytes", data.stderr.bytes);
                         scuba.add("stderr_messages", data.stderr.messages);
                     }
-                    scuba.log_with_msg("Forwarding failed", format!("{:#}", e));
+                    scuba.log_with_msg("Forwarding failed", format!("{e:#}"));
                 }
 
                 wr.flush().await?;

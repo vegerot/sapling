@@ -653,27 +653,53 @@ impl Arbitrary for WireEphemeralExtendResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::tests::auto_wire_tests;
+    use crate::wire::tests::wire_json_hashes;
 
-    auto_wire_tests!(
-        WireCommitLocation,
-        WireCommitLocationToHashRequest,
-        WireCommitLocationToHashResponse,
-        WireCommitLocationToHashRequestBatch,
-        WireCommitHashToLocationRequestBatch,
-        WireCommitHashToLocationResponse,
-        WireCommitHashLookupRequest,
-        WireCommitHashLookupResponse,
-        WireEphemeralExtendRequest,
-        WireEphemeralExtendResponse,
-        WireEphemeralPrepareRequest,
-        WireEphemeralPrepareResponse,
-        WireCommitGraphRequest,
-        WireUploadHgChangeset,
-        WireUploadHgChangesetsRequest,
-        WireFetchSnapshotRequest,
-        WireFetchSnapshotResponse,
-        WireCommitMutationsRequest,
-        WireCommitMutationsResponse,
-    );
+    #[test]
+    fn test_wire_json() {
+        assert_eq!(
+            wire_json_hashes![
+                WireCommitLocation,
+                WireCommitLocationToHashRequest,
+                WireCommitLocationToHashResponse,
+                WireCommitLocationToHashRequestBatch,
+                WireCommitHashToLocationRequestBatch,
+                WireCommitHashToLocationResponse,
+                WireCommitHashLookupRequest,
+                WireCommitHashLookupResponse,
+                WireEphemeralExtendRequest,
+                WireEphemeralExtendResponse,
+                WireEphemeralPrepareRequest,
+                WireEphemeralPrepareResponse,
+                WireCommitGraphRequest,
+                WireUploadHgChangeset,
+                WireUploadHgChangesetsRequest,
+                WireFetchSnapshotRequest,
+                WireFetchSnapshotResponse,
+                WireCommitMutationsRequest,
+                WireCommitMutationsResponse,
+            ],
+            [
+                3473352940809767921,
+                9679827643800040037,
+                9679827643800040037,
+                17395359819752046006,
+                4681085610575693090,
+                1141721279096408187,
+                14010494320882792131,
+                9918051020421534234,
+                9408360552512158447,
+                1084558840362791376,
+                18239180058534398051,
+                9408360552512158447,
+                14334170479859179441,
+                9436247928029971788,
+                17767870499441679706,
+                13872628972001337347,
+                13532639155927051556,
+                3944835397023904073,
+                6607109132335058288
+            ]
+        );
+    }
 }

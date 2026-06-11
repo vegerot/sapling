@@ -6,9 +6,13 @@ oncall("scm_server_treehugger")
 rust_library(
     name = "slapi_service",
     srcs = glob(["src/**/*.rs"]),
-    named_deps = ({} if rust_oss.is_oss_build() else {
-        "MononokeSaplingApiRequest_ods3_types": "//eden/mononoke/facebook/ods3_schemas:MononokeSaplingApiRequest_ods3-rust",
-    }),
+    named_deps = (
+        {}
+        if rust_oss.is_oss_build()
+        else {
+            "MononokeSaplingApiRequest_ods3_types": "//eden/mononoke/facebook/ods3_schemas:MononokeSaplingApiRequest_ods3-rust",
+        }
+    ),
     test_deps = [
         "//common/rust/shed/fbinit:fbinit-tokio",
         "//configerator/structs/scm/mononoke/ratelimiting:rate_limiting_config-rust",
@@ -52,7 +56,6 @@ rust_library(
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/futures_ext:futures_ext",
         "//common/rust/shed/futures_stats:futures_stats",
-        "//common/rust/shed/justknobs_stub:justknobs",
         "//common/rust/shed/sorted_vector_map:sorted_vector_map",
         "//common/rust/shed/stats:stats",
         "//common/rust/shed/time_ext:time_ext",
@@ -63,6 +66,7 @@ rust_library(
         "//eden/mononoke/common/mononoke_macros:mononoke_macros",
         "//eden/mononoke/common/permission_checker:permission_checker",
         "//eden/mononoke/common/rate_limiting:rate_limiting",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/common/scuba_ext:scuba_ext",
         "//eden/mononoke/common/shadow_forwarder:shadow_forwarder",
         "//eden/mononoke/common/time_window_counter:time_window_counter",
@@ -90,7 +94,12 @@ rust_library(
         "//eden/scm/lib/edenapi/types:edenapi_types",
         "//eden/scm/lib/revisionstore:revisionstore_types",
         "//eden/scm/lib/types:types",
-    ] + ([] if rust_oss.is_oss_build() else [
-        "//eden/mononoke/facebook/ods3_schemas:MononokeSaplingApiRequest_ods3-rs_bindings",
-    ]),
+    ]
+    + (
+        []
+        if rust_oss.is_oss_build()
+        else [
+            "//eden/mononoke/facebook/ods3_schemas:MononokeSaplingApiRequest_ods3-rs_bindings",
+        ]
+    ),
 )

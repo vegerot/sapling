@@ -481,7 +481,7 @@ impl<'a> FieldVisitor<'a> {
 
 impl<'a> tracing::field::Visit for FieldVisitor<'a> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.record(field, format!("{:?}", value));
+        self.record(field, format!("{value:?}"));
     }
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
         // NOTE: Maybe consider doing '+' here?
@@ -578,7 +578,7 @@ fn record_tracing_metadata(
     if let Some(line) = tracing_metadata.line() {
         output_meta.insert(
             output_strings.id("line"),
-            output_strings.id(format!("{}", line)),
+            output_strings.id(format!("{line}")),
         );
     }
 }
@@ -737,7 +737,7 @@ impl TracingData {
         }
 
         // Sort by timestamp.
-        eventus.sort_by(|e1, e2| e1.timestamp.cmp(&e2.timestamp));
+        eventus.sort_by_key(|e1| e1.timestamp);
 
         TracingData {
             start,
@@ -964,12 +964,12 @@ impl<'a> DescribeTreeSpan<TreeSpanExtra> for TracingTreeDescriptor<'a> {
             if cat.is_empty() {
                 String::new()
             } else {
-                format!("({})", cat)
+                format!("({cat})")
             }
         } else if line.is_empty() {
             module_path.to_string()
         } else {
-            format!("{} line {}", module_path, line)
+            format!("{module_path} line {line}")
         }
     }
 
@@ -1018,12 +1018,12 @@ impl<'a> DescribeTreeSpan<TreeSpanExtra> for TracingTreeDescriptor<'a> {
             .map(|item| {
                 let k = strings.get(*item.0);
                 let v = strings.get(*item.1);
-                let v = if v.len() > 32 {
-                    format!("{}...", &v[..30])
+                let v = if v.len() > 256 {
+                    format!("{}...", &v[..253])
                 } else {
                     v.to_string()
                 };
-                format!("- {} = {}", k, v)
+                format!("- {k} = {v}")
             })
             .collect()
     }

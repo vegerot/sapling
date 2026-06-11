@@ -36,6 +36,9 @@ use http::Uri;
 use http_body_util::BodyExt as _;
 use http_body_util::Full;
 use hyper_openssl::client::legacy::HttpsConnector;
+use hyper_proxy2::Intercept;
+use hyper_proxy2::Proxy;
+use hyper_proxy2::ProxyConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -72,6 +75,13 @@ use tracing::warn;
 fn build_https_client(
     tls_args: Option<TLSArgs>,
 ) -> Result<Client<HttpsConnector<HttpConnector>, Full<Bytes>>, Error> {
+    let connector = build_https_connector(tls_args)?;
+    Ok(Client::builder(TokioExecutor::new()).build(connector))
+}
+
+fn build_https_connector(
+    tls_args: Option<TLSArgs>,
+) -> Result<HttpsConnector<HttpConnector>, Error> {
     let mut ssl_connector = SslConnector::builder(SslMethod::tls_client())?;
     if let Some(tls_args) = tls_args {
         ssl_connector.set_ca_file(tls_args.tls_ca)?;
@@ -80,10 +90,44 @@ fn build_https_client(
     };
     let mut http_connector = HttpConnector::new();
     http_connector.enforce_http(false);
-    let connector =
-        HttpsConnector::with_connector(http_connector, ssl_connector).map_err(Error::from)?;
-    Ok(Client::builder(TokioExecutor::new()).build(connector))
+    HttpsConnector::with_connector(http_connector, ssl_connector).map_err(Error::from)
 }
+
+/// Builds an HTTPS client for the GitHub LFS path that tunnels HTTPS to
+/// github.com through an `http://...` forward proxy via CONNECT — required
+/// from Sandcastle / prod workers where direct outbound to github.com is
+/// blocked. Target TLS is handled by hyper-proxy2's built-in rustls path
+/// (rustls-native-certs supplies the trust store).
+///
+/// **Do NOT switch to `ProxyConnector::from_proxy_unsecured`** — it returns
+/// a plaintext tunnel for HTTPS targets (no TLS handshake with the target),
+/// which github.com:443 closes immediately. Production hit this silently
+/// until 2026-06-01.
+fn build_github_https_client(
+    proxy_url: Option<String>,
+) -> Result<Client<ProxyConnector<HttpConnector>, Full<Bytes>>, Error> {
+    let mut http_connector = HttpConnector::new();
+    http_connector.enforce_http(false);
+    let (intercept, proxy_uri) = match proxy_url {
+        Some(url) => {
+            let uri = url
+                .parse::<Uri>()
+                .with_context(|| format!("parsing --https-proxy URL {url}"))?;
+            (Intercept::All, uri)
+        }
+        None => (Intercept::None, "http://unused.invalid".parse::<Uri>()?),
+    };
+    let mut proxy_connector = ProxyConnector::new(http_connector)?;
+    proxy_connector.add_proxy(Proxy::new(intercept, proxy_uri));
+    Ok(Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(Duration::from_secs(GITHUB_LFS_POOL_IDLE_TIMEOUT_SECS))
+        .build(proxy_connector))
+}
+
+/// Short enough to evict CONNECT tunnels before fwdproxy / github.com
+/// silently reap them — hyper's default 90s left stale connections in the
+/// pool that failed mid-POST during long jarvis-scale imports.
+const GITHUB_LFS_POOL_IDLE_TIMEOUT_SECS: u64 = 10;
 
 /// URL pattern used by the upstream LFS server to serve a single object keyed by SHA256.
 /// `LegacyDewey` matches Dewey's bare-suffix scheme; `MononokeGitLfs` matches the
@@ -186,9 +230,10 @@ pub struct GitHubLfs {
     /// Optional connection-concurrency limiter (per-host; helps stay under
     /// GitHub's per-installation rate limits when importing wide trees).
     conn_limit_sem: Option<Arc<Semaphore>>,
-    /// HTTPS client built with the system trust store (no Meta mTLS) so it
-    /// can talk to github.com.
-    client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    /// HTTPS client that CONNECT-tunnels to github.com through the forward
+    /// proxy; target TLS done via hyper-proxy2's rustls path. See
+    /// `build_github_https_client` for details.
+    client: Client<ProxyConnector<HttpConnector>, Full<Bytes>>,
 }
 
 impl fmt::Debug for GitHubLfs {
@@ -303,19 +348,22 @@ impl GitImportLfs {
     /// Build a `GitImportLfs` that fetches LFS objects from a GitHub LFS Batch
     /// API endpoint authenticated with a GitHub App installation token read
     /// from `token_file`. The HTTPS client is built with the system trust
-    /// store (not Meta mTLS) since it talks to github.com. The token is read
-    /// lazily on first use and re-read from disk after a 401/403, so an
-    /// out-of-process refresher can rotate the file while gitimport is
-    /// running (installation tokens expire after ~1h; large imports take
-    /// several hours).
+    /// store (not Meta mTLS) since it talks to github.com, optionally
+    /// tunneling through `https_proxy_url` via HTTP CONNECT (required from
+    /// Sandcastle / prod workers where direct outbound traffic to github.com
+    /// is blocked). The token is read lazily on first use and re-read from
+    /// disk after a 401/403, so an out-of-process refresher can rotate the
+    /// file while gitimport is running (installation tokens expire after
+    /// ~1h; large imports take several hours).
     pub fn new_github(
         batch_url: String,
         token_file: PathBuf,
+        https_proxy_url: Option<String>,
         allow_not_found: bool,
         max_attempts: u32,
         conn_limit: Option<usize>,
     ) -> Result<Self, Error> {
-        let client = build_https_client(None)?;
+        let client = build_github_https_client(https_proxy_url)?;
         let github = GitHubLfs {
             batch_url,
             token_file,
@@ -373,7 +421,7 @@ impl GitImportLfs {
             .client
             .request(req)
             .await
-            .with_context(|| format!("fetch_bytes_upstream {}", uri))?;
+            .with_context(|| format!("fetch_bytes_upstream {uri}"))?;
 
         if resp.status().is_success() {
             let bytes = resp.into_body().into_data_stream().map_err(Error::from);
@@ -387,7 +435,7 @@ impl GitImportLfs {
             );
             return not_found_pointer_fallback(metadata);
         }
-        Err(format_err!("{} response {:?}", uri, resp))
+        Err(format_err!("{uri} response {resp:?}"))
     }
 
     /// Stream LFS object bytes directly from the local Mononoke filestore.
@@ -487,7 +535,7 @@ impl GitImportLfs {
             .uri(batch_uri.clone())
             .header(http::header::ACCEPT, git_lfs_mime().to_string())
             .header(http::header::CONTENT_TYPE, git_lfs_mime().to_string())
-            .header(http::header::AUTHORIZATION, format!("Bearer {}", token))
+            .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Full::new(Bytes::from(batch_req_body)))
             .context("creating GitHub LFS batch request")?;
         batch_request.headers_mut().insert(
@@ -500,7 +548,7 @@ impl GitImportLfs {
             .client
             .request(batch_request)
             .await
-            .with_context(|| format!("POST GitHub LFS batch {}", batch_uri))?;
+            .with_context(|| format!("POST GitHub LFS batch {batch_uri}"))?;
         let batch_status = batch_resp.status();
         let batch_latency_ms = batch_started_at.elapsed().as_millis() as u64;
 
@@ -703,7 +751,7 @@ impl GitImportLfs {
                             let sleep_time_ms =
                                 rand::random_range(0..upstream.time_ms_between_attempts * 2);
                             error!(
-                                "{}. Attempt {} of {} - Retrying in {} ms",
+                                "{:#}. Attempt {} of {} - Retrying in {} ms",
                                 err, attempt, upstream.max_attempts, sleep_time_ms,
                             );
                             sleep(Duration::from_millis(sleep_time_ms.into())).await;
@@ -730,7 +778,7 @@ impl GitImportLfs {
                             let sleep_time_ms =
                                 rand::random_range(0..github.time_ms_between_attempts * 2);
                             error!(
-                                "{}. Attempt {} of {} - Retrying in {} ms",
+                                "{:#}. Attempt {} of {} - Retrying in {} ms",
                                 err, attempt, github.max_attempts, sleep_time_ms,
                             );
                             sleep(Duration::from_millis(sleep_time_ms.into())).await;

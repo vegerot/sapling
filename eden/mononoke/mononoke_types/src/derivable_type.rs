@@ -87,6 +87,11 @@ pub enum DerivableUntopologicallyVariant {
 pub enum PipelineDerivableVariant {
     Fsnodes,
     Unodes,
+    SkeletonManifests,
+    SkeletonManifestsV2,
+    BlameV2,
+    Fastlog,
+    AclManifests,
 }
 
 impl DerivableType {
@@ -118,7 +123,7 @@ impl DerivableType {
             "directory_branch_cluster_manifest" => DerivableType::DirectoryBranchClusterManifest,
             "acl_manifests" => DerivableType::AclManifests,
             "history_manifests" => DerivableType::HistoryManifests,
-            _ => bail!("invalid name for DerivedDataType: {}", s),
+            _ => bail!("invalid name for DerivedDataType: {s}"),
         })
     }
     pub const fn name(&self) -> &'static str {
@@ -179,7 +184,7 @@ impl DerivableType {
             }
             thrift::DerivedDataType::ACL_MANIFEST => Self::AclManifests,
             thrift::DerivedDataType::HISTORY_MANIFEST => Self::HistoryManifests,
-            _ => bail!("invalid thrift value for DerivedDataType: {:?}", other),
+            _ => bail!("invalid thrift value for DerivedDataType: {other:?}"),
         })
     }
     pub fn into_thrift(&self) -> thrift::DerivedDataType {
@@ -249,6 +254,11 @@ impl DerivableType {
         match self {
             DerivableType::Fsnodes => Ok(PipelineDerivableVariant::Fsnodes),
             DerivableType::Unodes => Ok(PipelineDerivableVariant::Unodes),
+            DerivableType::SkeletonManifests => Ok(PipelineDerivableVariant::SkeletonManifests),
+            DerivableType::SkeletonManifestsV2 => Ok(PipelineDerivableVariant::SkeletonManifestsV2),
+            DerivableType::BlameV2 => Ok(PipelineDerivableVariant::BlameV2),
+            DerivableType::Fastlog => Ok(PipelineDerivableVariant::Fastlog),
+            DerivableType::AclManifests => Ok(PipelineDerivableVariant::AclManifests),
             _ => bail!("{} does not support derivation pipeline", self.name()),
         }
     }
@@ -259,6 +269,11 @@ impl PipelineDerivableVariant {
         match self {
             PipelineDerivableVariant::Fsnodes => DerivableType::Fsnodes,
             PipelineDerivableVariant::Unodes => DerivableType::Unodes,
+            PipelineDerivableVariant::SkeletonManifests => DerivableType::SkeletonManifests,
+            PipelineDerivableVariant::SkeletonManifestsV2 => DerivableType::SkeletonManifestsV2,
+            PipelineDerivableVariant::BlameV2 => DerivableType::BlameV2,
+            PipelineDerivableVariant::Fastlog => DerivableType::Fastlog,
+            PipelineDerivableVariant::AclManifests => DerivableType::AclManifests,
         }
     }
 }

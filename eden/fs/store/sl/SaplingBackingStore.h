@@ -66,6 +66,7 @@ class BackingStoreLogger;
 class ReloadableConfig;
 class UnboundedQueueExecutor;
 class EdenStats;
+class ErrorLogger;
 class SaplingImportRequest;
 class EdenFsEventsLogger;
 class FaultInjector;
@@ -179,12 +180,14 @@ class SaplingBackingStore final
   SaplingBackingStore(
       AbsolutePathPiece repository,
       AbsolutePathPiece mount,
+      AbsolutePathPiece clientDirectory,
       CaseSensitivity caseSensitive,
       EdenStatsPtr stats,
       UnboundedQueueExecutor* serverThreadPool,
       std::shared_ptr<ReloadableConfig> config,
       std::unique_ptr<SaplingBackingStoreOptions> runtimeOptions,
       std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
+      ErrorLogger& errorLogger,
       std::unique_ptr<BackingStoreLogger> logger,
       FaultInjector* FOLLY_NONNULL faultInjector);
 
@@ -197,12 +200,14 @@ class SaplingBackingStore final
   SaplingBackingStore(
       AbsolutePathPiece repository,
       AbsolutePathPiece mount,
+      AbsolutePathPiece clientDirectory,
       CaseSensitivity caseSensitive,
       EdenStatsPtr stats,
       folly::Executor* executor,
       std::shared_ptr<ReloadableConfig> config,
       std::unique_ptr<SaplingBackingStoreOptions> runtimeOptions,
       std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger,
+      ErrorLogger& errorLogger,
       std::unique_ptr<BackingStoreLogger> logger,
       FaultInjector* FOLLY_NONNULL faultInjector);
 
@@ -775,6 +780,7 @@ class SaplingBackingStore final
   std::vector<std::thread> threads_;
 
   std::shared_ptr<EdenFsEventsLogger> edenFsEventsLogger_;
+  ErrorLogger& errorLogger_;
 
   /**
    * Logger for backing store imports

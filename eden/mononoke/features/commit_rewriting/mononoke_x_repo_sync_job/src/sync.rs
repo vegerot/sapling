@@ -53,8 +53,6 @@ use indicatif::ProgressStyle;
 use metaconfig_types::CommitSyncConfigVersion;
 use mononoke_types::ChangesetId;
 use mononoke_types::Timestamp;
-use repo_blobstore::RepoBlobstoreRef;
-use repo_identity::RepoIdentityRef;
 use scuba_ext::FutureStatsScubaExt;
 use scuba_ext::MononokeScubaSampleBuilder;
 use tracing::trace;
@@ -108,8 +106,8 @@ where
             .ok_or_else(|| format_err!("unexpected empty bookmark rename"))?,
     );
     scuba_sample
-        .add("source_bookmark_name", format!("{}", source_bookmark))
-        .add("target_bookmark_name", format!("{}", target_bookmark));
+        .add("source_bookmark_name", format!("{source_bookmark}"))
+        .add("target_bookmark_name", format!("{target_bookmark}"));
 
     let to_cs_id = match entry.to_changeset_id {
         Some(to_cs_id) => to_cs_id,
@@ -174,13 +172,10 @@ where
 {
     log_debug(
         ctx,
-        format!("Syncing commit {to_cs_id} from commit {0:#?}", from_cs_id),
+        format!("Syncing commit {to_cs_id} from commit {from_cs_id:#?}"),
     );
 
-    log_debug(
-        ctx,
-        format!("Targeting bookmark {0:#?}", mb_target_bookmark),
-    );
+    log_debug(ctx, format!("Targeting bookmark {mb_target_bookmark:#?}"));
 
     if let Some(new_version) = unsafe_change_mapping_version_during_pushrebase {
         log_warning(
@@ -221,17 +216,14 @@ where
     } else {
         let maybe_version = synced_ancestors_versions
             .get_only_version()
-            .with_context(|| format!("failed to sync cs id {}", to_cs_id))?;
+            .with_context(|| format!("failed to sync cs id {to_cs_id}"))?;
         maybe_version.ok_or_else(|| {
-            format_err!(
-                "failed to sync {} - all of the ancestors are NotSyncCandidate",
-                to_cs_id
-            )
+            format_err!("failed to sync {to_cs_id} - all of the ancestors are NotSyncCandidate")
         })?
     };
 
     let len = unsynced_ancestors.len();
-    log_info(ctx, format!("{} unsynced ancestors of {}", len, to_cs_id));
+    log_info(ctx, format!("{len} unsynced ancestors of {to_cs_id}"));
 
     if let Some(target_bookmark) = mb_target_bookmark {
         // This is forward sync. The direction is small to large, so the source bookmark is the small
@@ -317,7 +309,7 @@ where
     }
     let maybe_remapped_cs_id = find_remapped_cs_id(ctx, commit_sync_data, to_cs_id).await?;
     let remapped_cs_id =
-        maybe_remapped_cs_id.ok_or_else(|| format_err!("unknown sync outcome for {}", to_cs_id))?;
+        maybe_remapped_cs_id.ok_or_else(|| format_err!("unknown sync outcome for {to_cs_id}"))?;
     if let Some(target_bookmark) = mb_target_bookmark {
         move_or_create_bookmark(
             ctx,
@@ -466,7 +458,7 @@ pub async fn sync_commit_without_pushrebase<R>(
 where
     R: Repo,
 {
-    log_info(ctx, format!("syncing {}", cs_id));
+    log_info(ctx, format!("syncing {cs_id}"));
     let bcs = cs_id
         .load(ctx, commit_sync_data.get_source_repo().repo_blobstore())
         .await?;
@@ -640,7 +632,7 @@ where
 
     log_info(
         ctx,
-        format!("Found {0} unsynced ancestors", num_unsynced_ancestors),
+        format!("Found {num_unsynced_ancestors} unsynced ancestors"),
     );
 
     trace!("Unsynced ancestors: {0:#?}", &unsynced_ancestors);
@@ -682,7 +674,7 @@ where
         let mb_synced = mb_synced?;
         let synced = mb_synced
             .clone()
-            .ok_or(anyhow!("Failed to sync ancestor commit {}", ancestor_cs_id))?;
+            .ok_or(anyhow!("Failed to sync ancestor commit {ancestor_cs_id}"))?;
         res.push(synced);
         changesets_to_derive.push(synced);
 
@@ -807,11 +799,10 @@ where
 {
     if common_pushrebase_bookmarks.contains(source_bookmark) {
         Err(format_err!(
-            "unexpected deletion of a shared bookmark {}",
-            source_bookmark
+            "unexpected deletion of a shared bookmark {source_bookmark}"
         ))
     } else {
-        log_info(ctx, format!("deleting bookmark {}", target_bookmark));
+        log_info(ctx, format!("deleting bookmark {target_bookmark}"));
         let (stats, result) = delete_bookmark(
             ctx.clone(),
             commit_sync_data.get_target_repo(),
@@ -910,7 +901,7 @@ where
 /// This function returns new commits that were introduced by this merge
 async fn validate_if_new_repo_merge(
     ctx: &CoreContext,
-    repo: &(impl RepoBlobstoreRef + RepoIdentityRef + CommitGraphRef),
+    repo: &impl CommitGraphRef,
     p1: ChangesetId,
     p2: ChangesetId,
 ) -> Result<Vec<ChangesetId>, Error> {
@@ -940,26 +931,23 @@ async fn validate_if_new_repo_merge(
 /// i.e. (::branch_tips) is returned in mercurial's revset terms
 async fn check_if_independent_branch_and_return(
     ctx: &CoreContext,
-    repo: &(impl RepoBlobstoreRef + RepoIdentityRef + CommitGraphRef),
+    repo: &impl CommitGraphRef,
     branch_tips: Vec<ChangesetId>,
     other_branches: Vec<ChangesetId>,
 ) -> Result<Option<Vec<ChangesetId>>, Error> {
-    let blobstore = repo.repo_blobstore();
-    let bcss = repo
+    let cs_ids: Vec<ChangesetId> = repo
         .commit_graph()
         .ancestors_difference_stream(ctx, branch_tips.clone(), other_branches)
         .await?
-        .map_ok(move |cs| async move { Ok(cs.load(ctx, blobstore).await?) })
-        .try_buffered(100)
-        .try_collect::<Vec<_>>()
+        .try_collect()
         .await?;
 
-    let bcss: Vec<_> = bcss.into_iter().rev().collect();
-    let mut cs_to_parents: HashMap<_, Vec<_>> = HashMap::new();
-    for bcs in &bcss {
-        let cs_id = bcs.get_changeset_id();
-        cs_to_parents.insert(cs_id, bcs.parents().collect());
-    }
+    // Use commit_graph to fetch all parent IDs in one batch instead of loading
+    // full bonsai changesets (which include file changes and other expensive data).
+    let cs_to_parents = repo
+        .commit_graph()
+        .many_changeset_parents(ctx, &cs_ids)
+        .await?;
 
     // If any of branch_tips hasn't been returned, then it was an ancestor of some of the
     // other_branches.
@@ -977,7 +965,7 @@ async fn check_if_independent_branch_and_return(
         }
     }
 
-    Ok(Some(cs_to_parents.keys().cloned().collect()))
+    Ok(Some(cs_to_parents.into_keys().collect()))
 }
 
 async fn delete_bookmark(
@@ -1002,10 +990,7 @@ async fn delete_bookmark(
     } else {
         log_warning(
             &ctx,
-            format!(
-                "Not deleting '{}' bookmark because it does not exist",
-                bookmark
-            ),
+            format!("Not deleting '{bookmark}' bookmark because it does not exist"),
         );
         Ok(())
     }
@@ -1465,7 +1450,7 @@ mod test {
             .into_iter()
             .map(|diff| diff.target_bookmark().clone())
             .collect::<HashSet<_>>();
-        println!("actually missing bookmarks: {:?}", actually_missing);
+        println!("actually missing bookmarks: {actually_missing:?}");
         assert_eq!(&actually_missing, should_be_missing,);
 
         let heads: Vec<_> = smallrepo
@@ -1474,7 +1459,7 @@ mod test {
             .try_collect()
             .await?;
         for head in heads {
-            println!("verifying working copy for {}", head);
+            println!("verifying working copy for {head}");
             verify_working_copy(
                 ctx,
                 commit_sync_data,
@@ -1503,7 +1488,7 @@ mod test {
             .await?
             .unwrap_or(1);
 
-        println!("start from: {}", start_from);
+        println!("start from: {start_from}");
         let read_all = 65536;
         let log_entries: Vec<_> = smallrepo
             .bookmark_update_log()

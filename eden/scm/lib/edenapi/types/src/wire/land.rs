@@ -12,7 +12,17 @@ pub use crate::land::WirePushVar;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::tests::auto_wire_tests;
+    use crate::wire::tests::wire_json_hashes;
 
-    auto_wire_tests!(WirePushVar, WireLandStackRequest, WireLandStackResponse,);
+    #[test]
+    fn test_wire_json() {
+        assert_eq!(
+            wire_json_hashes![WirePushVar, WireLandStackRequest, WireLandStackResponse,],
+            [
+                554167251054503582,
+                11781303561977194028,
+                8680749065747339838
+            ]
+        );
+    }
 }

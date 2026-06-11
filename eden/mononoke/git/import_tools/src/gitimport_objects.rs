@@ -207,6 +207,12 @@ pub struct GitimportPreferences {
     pub lfs: GitImportLfs,
     pub git_command_path: PathBuf,
     pub backfill_derivation: BackfillDerivation,
+    /// On producer failure, await consumers so they flush partial work
+    /// (commits already fully processed get their `bonsai_git_mapping`
+    /// persisted). Lets retries resume from the failing commit instead of
+    /// re-importing the whole range. Also surfaces the consumer's real
+    /// error to Scuba instead of the producer's SendError cascade.
+    pub persist_partial_mappings: bool,
 }
 
 impl Default for GitimportPreferences {
@@ -220,6 +226,7 @@ impl Default for GitimportPreferences {
             backfill_derivation: BackfillDerivation::No,
             stream_for_changed_trees: true,
             allow_content_refs: false,
+            persist_partial_mappings: false,
         }
     }
 }
@@ -300,9 +307,9 @@ impl GitimportTarget {
     async fn write_filter_list(&self, rev_list: &mut Child) -> Result<(), Error> {
         if let Some(wanted) = self.wanted.as_ref() {
             let mut stdin = rev_list.stdin.take().context("stdin not set up properly")?;
-            stdin.write_all(format!("{}\n", wanted).as_bytes()).await?;
+            stdin.write_all(format!("{wanted}\n").as_bytes()).await?;
             for commit in self.known.keys() {
-                stdin.write_all(format!("^{}\n", commit).as_bytes()).await?;
+                stdin.write_all(format!("^{commit}\n").as_bytes()).await?;
             }
         }
 
@@ -673,7 +680,7 @@ mod tests {
     fn should_decode_into(message: &[u8], encoding: &Option<BString>, expected: &str) {
         let m = decode_message(message, encoding);
         if m.is_err() {
-            panic!("{:?}", m);
+            panic!("{m:?}");
         }
         assert_eq!(expected, &m.unwrap())
     }

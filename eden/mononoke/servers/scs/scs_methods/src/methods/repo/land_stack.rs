@@ -70,7 +70,7 @@ fn reason_rejections(rejections: &Vec<HookRejection>) -> String {
 }
 
 fn reason_conflicts(conflicts: &Vec<PushrebaseConflict>) -> String {
-    format!("Conflicts while pushrebasing: {:?}", conflicts)
+    format!("Conflicts while pushrebasing: {conflicts:?}")
 }
 
 fn convert_rejection(rejection: HookRejection) -> thrift::HookRejection {
@@ -166,7 +166,7 @@ impl SourceControlServiceImpl {
             "scm/mononoke:scs_force_local_pushrebase",
             None,
             Some(repo.repo().repo_identity().name()),
-        )?;
+        );
 
         let pushrebase_outcome = repo
             .land_stack(

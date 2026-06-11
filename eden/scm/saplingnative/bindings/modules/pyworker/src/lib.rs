@@ -224,7 +224,7 @@ py_class!(class writerworker |py| {
             "x" => UpdateFlag::Executable,
             "" => UpdateFlag::Regular,
             _ => {
-                return Err(format_err!("Unknown flags: {}", flags)).map_pyerr(py);
+                return Err(format_err!("Unknown flags: {flags}")).map_pyerr(py);
             }
         };
 
@@ -448,11 +448,7 @@ mod tests {
 
         let file_type = symlink_metadata(&file)?.file_type();
 
-        if cfg!(windows) {
-            assert!(file_type.is_file());
-        } else {
-            assert!(file_type.is_symlink());
-        }
+        assert!(file_type.is_symlink());
 
         Ok(())
     }
@@ -768,7 +764,7 @@ mod tests {
 
             let mut expected_size = 0;
             for key in keys.iter() {
-                let data = Bytes::from(format!("{}", key));
+                let data = Bytes::from(format!("{key}"));
                 expected_size += data.len();
                 let delta = Delta {
                     data,
@@ -792,8 +788,8 @@ mod tests {
                 fullpath.push(key.path.as_str());
 
                 let ondisk = read_to_string(&fullpath)?;
-                let expected = format!("{}", key);
-                ensure!(ondisk == expected, format!("Got: {}, expected: {}", ondisk, expected));
+                let expected = format!("{key}");
+                ensure!(ondisk == expected, format!("Got: {ondisk}, expected: {expected}"));
             }
 
             Ok(TestResult::from_bool(expected_size == written_size))
@@ -836,7 +832,7 @@ mod tests {
 
             for key in keys.iter() {
                 let delta = Delta {
-                    data: Bytes::from(format!("{}", key)),
+                    data: Bytes::from(format!("{key}")),
                     base: None,
                     key: key.clone(),
                 };

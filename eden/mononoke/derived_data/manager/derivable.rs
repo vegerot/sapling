@@ -20,11 +20,11 @@ use futures::future::try_join;
 use futures::stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
-use metaconfig_types::DerivationPipelineStageConfig;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::DerivableType;
 use mononoke_types::DerivableUntopologicallyVariant;
+use mononoke_types::MPath;
 use mononoke_types::PipelineDerivableVariant;
 
 use crate::DerivedDataManager;
@@ -255,34 +255,35 @@ pub trait PipelineDerivable: BonsaiDerivable {
     /// parents. The manager handles the transitionary case (where parents
     /// were derived without derivation pipeline) by extracting stage outputs
     /// from the full derived value before calling this method.
+    ///
+    /// `dependency_outputs` is keyed by the absolute path of each dependency
+    /// stage.
     async fn derive_stage_batch(
         ctx: &CoreContext,
         derivation: &DerivationContext,
         bonsais: Vec<BonsaiChangeset>,
-        stage: &DerivationPipelineStageConfig,
-        stage_id: &str,
+        payload: &crate::stage_payload::DerivationStagePayload,
         parents: HashMap<ChangesetId, Self::StageOutput>,
-        dependency_outputs: HashMap<ChangesetId, HashMap<String, Self::StageOutput>>,
+        dependency_outputs: HashMap<ChangesetId, HashMap<MPath, Self::StageOutput>>,
     ) -> Result<HashMap<ChangesetId, Self::StageOutput>>;
 
     /// Extract a stage output from a fully derived value.
     ///
     /// Used by the manager during the transitionary period when parents
     /// were derived without derivation pipeline. The manager derives the
-    /// parent fully, then calls this to extract the subtree corresponding
-    /// to the given stage.
+    /// parent fully, then calls this to extract the subtree at `stage_path`.
     async fn extract_stage_output_from_derived(
         ctx: &CoreContext,
         derivation: &DerivationContext,
         derived: &Self,
-        stage: &DerivationPipelineStageConfig,
+        stage_path: &MPath,
     ) -> Result<Self::StageOutput>;
 
     /// Store stage outputs. Key format and storage are owned by the implementer.
     async fn store_stage_outputs(
         ctx: &CoreContext,
         derivation: &DerivationContext,
-        stage_id: &str,
+        stage_path: &MPath,
         outputs: HashMap<ChangesetId, Self::StageOutput>,
     ) -> Result<()>;
 
@@ -290,9 +291,33 @@ pub trait PipelineDerivable: BonsaiDerivable {
     async fn fetch_stage_outputs(
         ctx: &CoreContext,
         derivation: &DerivationContext,
-        stage_id: &str,
+        stage_path: &MPath,
         cs_ids: Vec<ChangesetId>,
     ) -> Result<HashMap<ChangesetId, Self::StageOutput>>;
+
+    /// Verify that the stage output stored for `csid` at `stage_path` is
+    /// consistent with the canonical (non-pipeline) derived value.
+    ///
+    /// The default implementation compares the stored stage output against the
+    /// output extracted from the canonical derived value.
+    async fn verify_stage(
+        ctx: &CoreContext,
+        derivation: &DerivationContext,
+        csid: ChangesetId,
+        stage_path: &MPath,
+    ) -> Result<bool> {
+        let stage_outputs =
+            Self::fetch_stage_outputs(ctx, derivation, stage_path, vec![csid]).await?;
+        let actual_output = stage_outputs
+            .get(&csid)
+            .ok_or_else(|| anyhow::anyhow!("Stage output not found for changeset {csid}"))?;
+
+        let derived = derivation.fetch_dependency::<Self>(ctx, csid).await?;
+        let expected_output =
+            Self::extract_stage_output_from_derived(ctx, derivation, &derived, stage_path).await?;
+
+        Ok(*actual_output == expected_output)
+    }
 }
 
 #[async_trait]

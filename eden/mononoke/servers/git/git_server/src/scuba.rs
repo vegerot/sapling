@@ -44,6 +44,7 @@ pub enum MononokeGitScubaKey {
     ClientMainId,
     ClientIdentities,
     ClientIdentitiesTyped,
+    ProtocolVersion,
 }
 
 impl AsRef<str> for MononokeGitScubaKey {
@@ -69,6 +70,7 @@ impl AsRef<str> for MononokeGitScubaKey {
             Self::ClientMainId => "client_main_id",
             Self::ClientIdentities => "client_identities",
             Self::ClientIdentitiesTyped => "client_identities_typed",
+            Self::ProtocolVersion => "protocol_version",
         }
     }
 }
@@ -180,7 +182,7 @@ impl MononokeGitScubaHandler {
             scuba.add(MononokeGitScubaKey::PackfileSize, push_data.packfile_size);
         }
         if let Some(err) = info.first_error() {
-            scuba.add(MononokeGitScubaKey::Error, format!("{:?}", err));
+            scuba.add(MononokeGitScubaKey::Error, format!("{err:?}"));
         }
         scuba.add(MononokeGitScubaKey::ErrorCount, info.error_count());
 

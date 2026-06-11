@@ -93,9 +93,9 @@ impl std::fmt::Display for RestrictedPathAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Manifest(manifest_id) => {
-                write!(f, "ManifestId({})", manifest_id)
+                write!(f, "ManifestId({manifest_id})")
             }
-            Self::Path(path) => write!(f, "{}", path),
+            Self::Path(path) => write!(f, "{path}"),
         }
     }
 }
@@ -778,7 +778,7 @@ fn fetch_options_for_access(
     enforcement_enabled: bool,
 ) -> Result<SourceFetchOptions> {
     Ok(SourceFetchOptions {
-        logging_enabled: justknobs::eval(ACCESS_LOGGING_JK, None, Some(switch_value))?,
+        logging_enabled: justknobs::eval(ACCESS_LOGGING_JK, None, Some(switch_value)),
         enforcement_enabled,
     })
 }
@@ -825,10 +825,7 @@ fn missing_authoritative_source_error(
     needs_acl_manifest: bool,
 ) -> anyhow::Error {
     anyhow::anyhow!(
-        "authoritative {access_type} source for acl_manifest_mode={:?} unavailable (needs_config={}, needs_acl_manifest={})",
-        acl_manifest_mode,
-        needs_config,
-        needs_acl_manifest,
+        "authoritative {access_type} source for acl_manifest_mode={acl_manifest_mode:?} unavailable (needs_config={needs_config}, needs_acl_manifest={needs_acl_manifest})",
     )
 }
 

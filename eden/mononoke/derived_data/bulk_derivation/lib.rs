@@ -51,6 +51,7 @@ use mercurial_derivation::RootHgAugmentedManifestId;
 use mononoke_macros::mononoke;
 use mononoke_types::ChangesetId;
 use mononoke_types::DerivableUntopologicallyVariant;
+use mononoke_types::MPath;
 use mononoke_types::PipelineDerivableVariant;
 use skeleton_manifest::RootSkeletonManifestId;
 use skeleton_manifest_v2::RootSkeletonManifestV2Id;
@@ -132,17 +133,17 @@ pub trait BulkDerivation {
         ctx: &CoreContext,
         csid: ChangesetId,
         derived_data_type: DerivableType,
-        stage_id: &str,
+        stage_path: &MPath,
     ) -> Result<bool, DerivationError>;
 
-    /// Verify that a stage output matches the expected output extracted from
-    /// the normal derived value.
+    /// Verify that a stage output is consistent with the canonical derived
+    /// value.
     async fn verify_stage_output(
         &self,
         ctx: &CoreContext,
         csid: ChangesetId,
         derived_data_type: DerivableType,
-        stage_id: &str,
+        stage_path: &MPath,
     ) -> Result<bool, DerivationError>;
 
     /// Returns a `Vec` that contains all changeset ids that don't have the given
@@ -355,7 +356,7 @@ impl<T: BonsaiDerivable> SingleTypeDerivation for SingleTypeManager<T> {
             .await?;
         Ok(derived
             .into_iter()
-            .map(|(csid, derived)| (csid, format!("{:?}", derived)))
+            .map(|(csid, derived)| (csid, format!("{derived:?}")))
             .collect())
     }
 
@@ -517,16 +518,36 @@ pub async fn derive_stage_batch(
     ddm: &DerivedDataManager,
     ctx: &CoreContext,
     csids: Vec<ChangesetId>,
-    stage_id: &str,
+    payload: &derived_data_manager::DerivationStagePayload,
     variant: PipelineDerivableVariant,
 ) -> Result<Duration, DerivationError> {
     match variant {
         PipelineDerivableVariant::Fsnodes => {
-            ddm.derive_stage_batch::<RootFsnodeId>(ctx, csids, stage_id)
+            ddm.derive_stage_batch::<RootFsnodeId>(ctx, csids, payload)
                 .await
         }
         PipelineDerivableVariant::Unodes => {
-            ddm.derive_stage_batch::<RootUnodeManifestId>(ctx, csids, stage_id)
+            ddm.derive_stage_batch::<RootUnodeManifestId>(ctx, csids, payload)
+                .await
+        }
+        PipelineDerivableVariant::SkeletonManifestsV2 => {
+            ddm.derive_stage_batch::<RootSkeletonManifestV2Id>(ctx, csids, payload)
+                .await
+        }
+        PipelineDerivableVariant::SkeletonManifests => {
+            ddm.derive_stage_batch::<RootSkeletonManifestId>(ctx, csids, payload)
+                .await
+        }
+        PipelineDerivableVariant::BlameV2 => {
+            ddm.derive_stage_batch::<RootBlameV2>(ctx, csids, payload)
+                .await
+        }
+        PipelineDerivableVariant::Fastlog => {
+            ddm.derive_stage_batch::<RootFastlog>(ctx, csids, payload)
+                .await
+        }
+        PipelineDerivableVariant::AclManifests => {
+            ddm.derive_stage_batch::<RootAclManifestId>(ctx, csids, payload)
                 .await
         }
     }
@@ -536,16 +557,36 @@ pub async fn is_stage_derived(
     ddm: &DerivedDataManager,
     ctx: &CoreContext,
     csid: ChangesetId,
-    stage_id: &str,
+    stage_path: &MPath,
     variant: PipelineDerivableVariant,
 ) -> Result<bool, DerivationError> {
     match variant {
         PipelineDerivableVariant::Fsnodes => {
-            ddm.is_stage_derived::<RootFsnodeId>(ctx, csid, stage_id)
+            ddm.is_stage_derived::<RootFsnodeId>(ctx, csid, stage_path)
                 .await
         }
         PipelineDerivableVariant::Unodes => {
-            ddm.is_stage_derived::<RootUnodeManifestId>(ctx, csid, stage_id)
+            ddm.is_stage_derived::<RootUnodeManifestId>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::SkeletonManifestsV2 => {
+            ddm.is_stage_derived::<RootSkeletonManifestV2Id>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::SkeletonManifests => {
+            ddm.is_stage_derived::<RootSkeletonManifestId>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::BlameV2 => {
+            ddm.is_stage_derived::<RootBlameV2>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::Fastlog => {
+            ddm.is_stage_derived::<RootFastlog>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::AclManifests => {
+            ddm.is_stage_derived::<RootAclManifestId>(ctx, csid, stage_path)
                 .await
         }
     }
@@ -555,16 +596,36 @@ pub async fn verify_stage_output(
     ddm: &DerivedDataManager,
     ctx: &CoreContext,
     csid: ChangesetId,
-    stage_id: &str,
+    stage_path: &MPath,
     variant: PipelineDerivableVariant,
 ) -> Result<bool, DerivationError> {
     match variant {
         PipelineDerivableVariant::Fsnodes => {
-            ddm.verify_stage_output::<RootFsnodeId>(ctx, csid, stage_id)
+            ddm.verify_stage_output::<RootFsnodeId>(ctx, csid, stage_path)
                 .await
         }
         PipelineDerivableVariant::Unodes => {
-            ddm.verify_stage_output::<RootUnodeManifestId>(ctx, csid, stage_id)
+            ddm.verify_stage_output::<RootUnodeManifestId>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::SkeletonManifestsV2 => {
+            ddm.verify_stage_output::<RootSkeletonManifestV2Id>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::SkeletonManifests => {
+            ddm.verify_stage_output::<RootSkeletonManifestId>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::BlameV2 => {
+            ddm.verify_stage_output::<RootBlameV2>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::Fastlog => {
+            ddm.verify_stage_output::<RootFastlog>(ctx, csid, stage_path)
+                .await
+        }
+        PipelineDerivableVariant::AclManifests => {
+            ddm.verify_stage_output::<RootAclManifestId>(ctx, csid, stage_path)
                 .await
         }
     }
@@ -675,10 +736,10 @@ impl BulkDerivation for DerivedDataManager {
         ctx: &CoreContext,
         csid: ChangesetId,
         derived_data_type: DerivableType,
-        stage_id: &str,
+        stage_path: &MPath,
     ) -> Result<bool, DerivationError> {
         let variant = derived_data_type.into_pipeline_derivable_variant()?;
-        is_stage_derived(self, ctx, csid, stage_id, variant).await
+        is_stage_derived(self, ctx, csid, stage_path, variant).await
     }
 
     async fn verify_stage_output(
@@ -686,10 +747,10 @@ impl BulkDerivation for DerivedDataManager {
         ctx: &CoreContext,
         csid: ChangesetId,
         derived_data_type: DerivableType,
-        stage_id: &str,
+        stage_path: &MPath,
     ) -> Result<bool, DerivationError> {
         let variant = derived_data_type.into_pipeline_derivable_variant()?;
-        verify_stage_output(self, ctx, csid, stage_id, variant).await
+        verify_stage_output(self, ctx, csid, stage_path, variant).await
     }
 
     async fn pending(

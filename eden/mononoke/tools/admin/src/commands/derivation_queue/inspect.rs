@@ -11,6 +11,7 @@ use clap::Args;
 use context::CoreContext;
 use mononoke_app::args::ChangesetArgs;
 use mononoke_app::args::DerivedDataArgs;
+use mononoke_types::MPath;
 use repo_derivation_queues::DagItemId;
 use repo_derivation_queues::ReadyState;
 use repo_derivation_queues::RepoDerivationQueuesRef;
@@ -27,9 +28,10 @@ pub struct InspectArgs {
     #[clap(flatten)]
     derived_data_args: DerivedDataArgs,
 
-    /// Stage ID for staged derivation items
-    #[clap(long)]
-    stage_id: Option<String>,
+    /// Absolute path of the pipeline stage (e.g. `""` for root, `"fbcode"`).
+    /// Omit for non-pipeline items.
+    #[clap(long, value_parser = |s: &str| MPath::new(s.as_bytes()))]
+    stage_path: Option<MPath>,
 }
 
 pub async fn inspect(
@@ -41,10 +43,11 @@ pub async fn inspect(
     let derivation_queue = repo
         .repo_derivation_queues()
         .queue(config_name)
-        .ok_or_else(|| anyhow!("Missing derivation queue for config {}", config_name))?;
+        .ok_or_else(|| anyhow!("Missing derivation queue for config {config_name}"))?;
 
     let derived_data_type = args.derived_data_args.resolve_type()?;
     let cs_ids = args.changeset_args.resolve_changesets(ctx, repo).await?;
+    let stage_hash = args.stage_path.as_ref().map(|p| p.get_path_hash());
 
     for cs_id in cs_ids {
         let item_id = DagItemId::new(
@@ -52,45 +55,58 @@ pub async fn inspect(
             config_name.to_string(),
             derived_data_type,
             cs_id,
-            args.stage_id.clone(),
+            stage_hash,
         );
 
         println!(
             "Item: {:?}/{}/{}",
             derived_data_type,
-            args.stage_id.as_deref().unwrap_or("(no stage)"),
+            args.stage_path
+                .as_ref()
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "(no stage)".to_string()),
             cs_id
         );
 
         let result = derivation_queue.inspect(ctx, item_id).await?;
 
-        match &result.needed {
+        // needed / ready / deriving / info are printed as independent
+        // fields so inconsistent states (e.g. info present in ready but
+        // needed znode missing) are visible rather than hidden.
+        println!(
+            "  needed:   {}",
+            if result.needed_exists {
+                "EXISTS"
+            } else {
+                "MISSING"
+            }
+        );
+        let ready_str = match result.ready_state {
+            ReadyState::NotReady => "no",
+            ReadyState::ReadyHighPri => "YES (high priority)",
+            ReadyState::ReadyLowPri => "YES (low priority)",
+        };
+        println!("  ready:    {ready_str}");
+        println!(
+            "  deriving: {}",
+            if result.is_deriving { "YES" } else { "no" }
+        );
+        match &result.info {
             Some(info) => {
                 let ts = info
                     .enqueue_timestamp()
                     .map(|t| format!("{}s{}ms ago", t.since_seconds(), t.since_millis() % 1000))
                     .unwrap_or_else(|| "unknown".to_string());
                 println!(
-                    "  needed:   EXISTS (retry_count={}, priority={}, enqueued {})",
+                    "  info:     retry_count={}, priority={}, enqueued {}",
                     info.retry_count(),
                     derivation_priority_to_str(info.priority()),
                     ts
                 );
                 println!("  head:     {}", info.head_cs_id());
             }
-            None => println!("  needed:   MISSING"),
+            None => println!("  info:     (none)"),
         }
-
-        let ready_str = match result.ready_state {
-            ReadyState::NotReady => "no",
-            ReadyState::ReadyHighPri => "YES (high priority)",
-            ReadyState::ReadyLowPri => "YES (low priority)",
-        };
-        println!("  ready:    {}", ready_str);
-        println!(
-            "  deriving: {}",
-            if result.is_deriving { "YES" } else { "no" }
-        );
 
         if result.forward_deps.is_empty() {
             println!("  forward deps: (none)");

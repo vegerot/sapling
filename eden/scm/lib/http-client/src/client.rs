@@ -154,6 +154,7 @@ impl HttpClient {
     }
 
     pub fn from_config(config: Config) -> Self {
+        crate::init();
         let claimer = RequestClaimer::new(config.limit_requests, config.max_concurrent_requests);
         let dispatcher = if config.http_worker_threads == 0 {
             spawn_blocking_dispatcher()
@@ -197,6 +198,7 @@ impl HttpClient {
     where
         F: FnMut(Result<Response, HttpClientError>) -> Result<(), Abort>,
     {
+        crate::check_not_shutting_down()?;
         let mut multi = self.pool.multi();
         multi
             .get_mut()
@@ -265,6 +267,7 @@ impl HttpClient {
         &self,
         requests: I,
     ) -> Result<(Vec<ResponseFuture>, StatsFuture), HttpClientError> {
+        crate::check_not_shutting_down()?;
         let client = self.worker_client();
 
         let mut stream_requests = Vec::new();
@@ -393,6 +396,7 @@ impl WorkerClient {
     /// until all of the transfers are complete, and will return
     /// the total stats across all transfers when complete.
     pub(crate) fn stream(&self, requests: Vec<StreamRequest>) -> Result<Stats, HttpClientError> {
+        crate::check_not_shutting_down()?;
         // This is a "local" limit for how many concurrent requests we allow for a single
         // batch of requests. Requests are still subject to the global limit via self.claimer.
         let mut allowed_requests = self
@@ -566,7 +570,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test port");
         let addr = listener.local_addr().expect("get local test port");
         drop(listener);
-        format!("http://{}", addr)
+        format!("http://{addr}")
     }
 
     fn read_request(stream: &mut TcpStream) {

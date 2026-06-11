@@ -423,6 +423,13 @@ class ListCmd(Subcmd):
             default=False,
             help="Print the output in JSON format",
         )
+        parser.add_argument(
+            "--verbose",
+            "-v",
+            action="store_true",
+            default=False,
+            help="Show additional details such as filesystem channel and transport type",
+        )
 
     def run(self, args: argparse.Namespace) -> int:
         instance = get_eden_instance(args)
@@ -432,7 +439,7 @@ class ListCmd(Subcmd):
         if args.json:
             self.print_mounts_json(out, mounts)
         else:
-            self.print_mounts(out, mounts)
+            self.print_mounts(out, mounts, verbose=args.verbose)
         return 0
 
     @staticmethod
@@ -447,7 +454,11 @@ class ListCmd(Subcmd):
         out.writeln(json_str)
 
     @staticmethod
-    def print_mounts(out: ui.Output, mount_points: Dict[Path, ListMountInfo]) -> None:
+    def print_mounts(
+        out: ui.Output,
+        mount_points: Dict[Path, ListMountInfo],
+        verbose: bool = False,
+    ) -> None:
         for path, mount_info in sorted(mount_points.items()):
             if not mount_info.configured:
                 suffix = " (unconfigured)"
@@ -464,7 +475,16 @@ class ListCmd(Subcmd):
                 state_name = mount_info.state.name
                 state_str = f" ({state_name})"
 
-            out.writeln(f"{path.as_posix()}{state_str}{suffix}")
+            transport_str = ""
+            if verbose and mount_info.fs_channel_type is not None:
+                if mount_info.fuse_transport is not None:
+                    transport_str = (
+                        f" ({mount_info.fs_channel_type}, {mount_info.fuse_transport})"
+                    )
+                else:
+                    transport_str = f" ({mount_info.fs_channel_type})"
+
+            out.writeln(f"{path.as_posix()}{state_str}{transport_str}{suffix}")
 
 
 @subcmd("clone", "Create a clone of a specific repo and check it out")
@@ -2133,7 +2153,7 @@ Do you still want to delete {path}?"""
                 # Handle aux process error (log but continue)
                 if result.aux_process_error:
                     msg = f"error stopping auxiliary processes {mount}: {result.aux_process_error}"
-                    telemetry_sample.add_string("problem_fixable", msg)
+                    telemetry_sample.fail(msg)
                     print_stderr(msg)
                     exit_code = 1
                     # We intentionally fall through here - unmount may still work
@@ -2897,16 +2917,26 @@ class RestartCmd(Subcmd):
             normalized = normalized[len(home) + 1 :]
         return normalized, is_default_config_dir
 
+    @staticmethod
+    def _get_fuse_transport_mismatch_direction(
+        transport_mismatches: Sequence[config_mod.FuseTransportMismatch],
+    ) -> str:
+        def get_transport_name(transports: Set[str]) -> str:
+            if len(transports) == 1:
+                return next(iter(transports))
+            return "mixed"
+
+        active_transport = get_transport_name(
+            {mismatch.active_transport for mismatch in transport_mismatches}
+        )
+        desired_transport = get_transport_name(
+            {mismatch.desired_transport for mismatch in transport_mismatches}
+        )
+        return f"{active_transport}_to_{desired_transport}"
+
     # pyrefly: ignore [bad-return]
     def _graceful_restart(self, instance: EdenInstance) -> int:
         print("Performing a graceful restart...")
-
-        # Clean up legacyephemeral checkouts before the takeover attempt. With this decision, there
-        # is a tradeoff for the case of unsuccessful takeover and old daemon recovery: The old
-        # daemon will not be able to recover the legacy ephemeral checkouts. Due to the
-        # nature of these checkouts, the tradeoff is acceptable considering the complexity of
-        # getting the recovery logic right for this edge case.
-        remove_legacyephemeral_checkouts(instance, ui.get_output())
 
         with instance.get_telemetry_logger().new_sample(
             "graceful_restart"
@@ -2916,6 +2946,58 @@ class RestartCmd(Subcmd):
             )
             telemetry_sample.add_string("eden_dir", eden_dir_normalized)
             telemetry_sample.add_bool("is_default_config_dir", is_default_config_dir)
+            if config_mod.is_fuse_transport_mismatch_restart_enabled(instance):
+                transport_mismatches = config_mod.get_fuse_transport_mismatches(
+                    instance
+                )
+            else:
+                transport_mismatches = []
+
+            if transport_mismatches:
+                telemetry_sample.add_string("reason", "fuse_transport_mismatch")
+                telemetry_sample.add_string(
+                    "transport_name",
+                    self._get_fuse_transport_mismatch_direction(transport_mismatches),
+                )
+                print(
+                    "FUSE transport config changed; performing a full restart instead of graceful restart."
+                )
+                for mismatch in transport_mismatches:
+                    print(
+                        f"  {mismatch.mount}: running {mismatch.active_transport}, configured {mismatch.desired_transport}"
+                    )
+                health = instance.check_health()
+                edenfs_pid = health.pid
+                if edenfs_pid is None:
+                    telemetry_sample.fail(
+                        "FUSE transport mismatch required full restart, but EdenFS was not running"
+                    )
+                    return self._start(instance)
+
+                status = self._full_restart(
+                    instance,
+                    edenfs_pid,
+                    self.args.migrate_to,
+                    self.args.prompt,
+                    self.args.allow_root,
+                )
+                instance.log_sample(
+                    "full_restart",
+                    success=status == 0,
+                    triggered_by="fuse_transport_mismatch",
+                )
+                if status != 0:
+                    telemetry_sample.fail(
+                        "FUSE transport mismatch fallback full restart failed"
+                    )
+                return status
+
+            # Clean up legacyephemeral checkouts before the takeover attempt. With this decision, there
+            # is a tradeoff for the case of unsuccessful takeover and old daemon recovery: The old
+            # daemon will not be able to recover the legacy ephemeral checkouts. Due to the
+            # nature of these checkouts, the tradeoff is acceptable considering the complexity of
+            # getting the recovery logic right for this edge case.
+            remove_legacyephemeral_checkouts(instance, ui.get_output())
 
             # The status here is returned by the exit status of the startup
             # logger. If this is successful, we will ensure the new process

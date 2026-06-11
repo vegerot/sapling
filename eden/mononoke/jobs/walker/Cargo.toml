@@ -29,7 +29,7 @@ cmdlib_caching = { version = "0.1.0", path = "../../cmdlib/caching" }
 cmdlib_scrubbing = { version = "0.1.0", path = "../../cmdlib/scrubbing" }
 commit_graph = { version = "0.1.0", path = "../../repo_attributes/commit_graph/commit_graph" }
 context = { version = "0.1.0", path = "../../servers/slapi/slapi_server/context" }
-dashmap = { version = "6.1.0", features = ["rayon", "serde"] }
+dashmap = { version = "6.2.1", features = ["rayon", "serde"] }
 deleted_manifest = { version = "0.1.0", path = "../../derived_data/deleted_manifest" }
 derivation_queue_thrift = { version = "0.1.0", path = "../../repo_attributes/repo_derivation_queues/if" }
 derive_more = { version = "1.0.0", features = ["full"] }
@@ -41,7 +41,7 @@ fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rus
 filenodes = { version = "0.1.0", path = "../../repo_attributes/filenodes" }
 filenodes_derivation = { version = "0.1.0", path = "../../derived_data/filenodes_derivation" }
 filestore = { version = "0.1.0", path = "../../repo_attributes/filestore" }
-filetime = "0.2.27"
+filetime = "0.2.29"
 fsnodes = { version = "0.1.0", path = "../../derived_data/fsnodes" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 hash_memo = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -77,7 +77,7 @@ sql_commit_graph_storage = { version = "0.1.0", path = "../../repo_attributes/co
 sql_construct = { version = "0.1.0", path = "../../common/sql_construct" }
 sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-strum = { version = "0.27.1", features = ["derive"] }
+strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }

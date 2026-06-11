@@ -33,6 +33,7 @@
 #include "eden/fs/store/sl/SaplingBackingStoreOptions.h"
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
+#include "eden/fs/telemetry/ErrorLogger.h"
 #include "eden/fs/testharness/FakeFilter.h"
 #include "eden/fs/testharness/HgRepo.h"
 #include "eden/fs/testharness/TestUtil.h"
@@ -62,6 +63,7 @@ const char kTestFilter8[] = "V1:this/filter/is/very/nested";
 struct TestRepo {
   folly::test::TemporaryDirectory testDir{"eden_filtered_backing_store_test"};
   AbsolutePath testPath = canonicalPath(testDir.path().string());
+  AbsolutePath clientPath = testPath + "client"_pc;
   HgRepo repo{testPath + "repo"_pc};
   RootId commit1;
   Hash20 manifest1;
@@ -154,10 +156,13 @@ struct SaplingFilteredBackingStoreTest : FilteredBackingStoreTestBase {
 
   folly::InlineExecutor executor_ = folly::InlineExecutor::instance();
 
+  ErrorLogger noopErrorLogger{nullptr, {}, nullptr};
+
   std::shared_ptr<SaplingBackingStore> wrappedStore_{
       std::make_shared<SaplingBackingStore>(
           repo.path(),
           repo.path(),
+          clientPath,
           kPathMapDefaultCaseSensitive,
           stats.copy(),
           &executor_,
@@ -168,6 +173,7 @@ struct SaplingFilteredBackingStoreTest : FilteredBackingStoreTestBase {
               /*xplatLogger=*/nullptr,
               edenConfig,
               stats.copy()),
+          /*errorLogger=*/noopErrorLogger,
           std::make_unique<BackingStoreLogger>(),
           &faultInjector)};
 };

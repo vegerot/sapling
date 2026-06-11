@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -22,6 +23,8 @@ use client_memory::global_client_memory_registry;
 use fbinit::FacebookInit;
 use mononoke_macros::mononoke;
 use ods_counters::CounterManager;
+use ods_counters::DesiredCountersProvider;
+use ods_counters::OdsCounterKey;
 use ods_counters::OdsCounterManager;
 use ods_counters::periodic_fetch_counter;
 use permission_checker::MononokeIdentitySet;
@@ -104,22 +107,9 @@ impl RateLimitEnvironment {
         config: ConfigHandle<MononokeRateLimitConfig>,
         counter_manager: Arc<RwLock<OdsCounterManager>>,
     ) -> Self {
-        for limit in &config.get().load_shed_limits {
-            match &limit.raw_config.load_shedding_metric {
-                LoadSheddingMetric::external_ods_counter(counter) => {
-                    counter_manager.write().expect("Poisoned lock").add_counter(
-                        counter.entity.clone(),
-                        counter.key.clone(),
-                        counter.reduce.clone(),
-                        counter.transform.clone(),
-                    )
-                }
-                _ => {}
-            };
-        }
-
         mononoke::spawn_task(periodic_fetch_counter(
             counter_manager.clone(),
+            desired_ods_counters_provider(config.clone()),
             Duration::from_mins(1),
         ));
 
@@ -138,22 +128,9 @@ impl RateLimitEnvironment {
         counter_manager: Arc<RwLock<OdsCounterManager>>,
         runtime: tokio::runtime::Handle,
     ) -> Self {
-        for limit in &config.get().load_shed_limits {
-            match &limit.raw_config.load_shedding_metric {
-                LoadSheddingMetric::external_ods_counter(counter) => {
-                    counter_manager.write().expect("Poisoned lock").add_counter(
-                        counter.entity.clone(),
-                        counter.key.clone(),
-                        counter.reduce.clone(),
-                        counter.transform.clone(),
-                    )
-                }
-                _ => {}
-            };
-        }
-
         runtime.spawn(periodic_fetch_counter(
             counter_manager.clone(),
+            desired_ods_counters_provider(config.clone()),
             Duration::from_mins(1),
         ));
 
@@ -175,6 +152,27 @@ impl RateLimitEnvironment {
             self.counter_manager.clone(),
         )
     }
+}
+
+fn desired_ods_counters_provider(
+    config: ConfigHandle<MononokeRateLimitConfig>,
+) -> DesiredCountersProvider {
+    Box::new(move || {
+        config
+            .get()
+            .load_shed_limits
+            .iter()
+            .filter_map(|limit| match &limit.raw_config.load_shedding_metric {
+                LoadSheddingMetric::external_ods_counter(counter) => Some(OdsCounterKey {
+                    entity: counter.entity.clone(),
+                    key: counter.key.clone(),
+                    reduce: counter.reduce.clone(),
+                    transform: counter.transform.clone(),
+                }),
+                _ => None,
+            })
+            .collect::<HashSet<OdsCounterKey>>()
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -271,60 +269,62 @@ impl LoadShedLimit {
         }
 
         // Fetch the counter
-        let (metric_string, value, force_targeted) =
-            match self.raw_config.load_shedding_metric.clone() {
-                LoadSheddingMetric::local_fb303_counter(metric) => {
-                    let metric = metric.to_string();
-                    (
-                        metric.clone(),
-                        STATS::load_shed_counter.get_value(fb, (metric,)),
-                        false,
-                    )
-                }
-                LoadSheddingMetric::external_ods_counter(ExternalOdsCounter {
-                    entity,
-                    key,
-                    reduce,
-                    transform,
-                }) => {
-                    let value = ods_counters
-                        .read()
-                        .expect("Poisoned lock")
-                        .get_counter_value(&entity, &key, reduce.as_deref(), transform.as_deref())
-                        .map(|v| v as i64);
-                    (
-                        format!(
-                            "Ods key:{} entity:{} reduce:{:?} transform:{:?}",
-                            entity, key, reduce, transform
-                        ),
-                        value,
-                        false,
-                    )
-                }
-                LoadSheddingMetric::top_client(top_client) => {
-                    let client_bucket: ClientBucket = main_id.into();
-                    let registry = global_client_memory_registry();
-                    let is_top = matches!(
-                        registry.top_consumer(),
-                        Some((top_bucket, _)) if client_bucket == top_bucket
-                    );
-                    let value = if is_top {
-                        STATS::load_shed_counter.get_value(fb, (top_client.metric.clone(),))
-                    } else {
-                        None
-                    };
-                    (
-                        format!(
-                            "top_client (bucket: {}, metric: {})",
-                            client_bucket.name(),
-                            top_client.metric
-                        ),
-                        value,
-                        true,
-                    )
-                }
-                _ => ("".to_string(), None, false),
-            };
+        let (metric_string, value, force_targeted) = match self
+            .raw_config
+            .load_shedding_metric
+            .clone()
+        {
+            LoadSheddingMetric::local_fb303_counter(metric) => {
+                let metric = metric.to_string();
+                (
+                    metric.clone(),
+                    STATS::load_shed_counter.get_value(fb, (metric,)),
+                    false,
+                )
+            }
+            LoadSheddingMetric::external_ods_counter(ExternalOdsCounter {
+                entity,
+                key,
+                reduce,
+                transform,
+            }) => {
+                let value = ods_counters
+                    .read()
+                    .expect("Poisoned lock")
+                    .get_counter_value(&entity, &key, reduce.as_deref(), transform.as_deref())
+                    .map(|v| v as i64);
+                (
+                    format!(
+                        "Ods key:{key} entity:{entity} reduce:{reduce:?} transform:{transform:?}"
+                    ),
+                    value,
+                    false,
+                )
+            }
+            LoadSheddingMetric::top_client(top_client) => {
+                let client_bucket: ClientBucket = main_id.into();
+                let registry = global_client_memory_registry();
+                let is_top = matches!(
+                    registry.top_consumer(),
+                    Some((top_bucket, _)) if client_bucket == top_bucket
+                );
+                let value = if is_top {
+                    STATS::load_shed_counter.get_value(fb, (top_client.metric.clone(),))
+                } else {
+                    None
+                };
+                (
+                    format!(
+                        "top_client (bucket: {}, metric: {})",
+                        client_bucket.name(),
+                        top_client.metric
+                    ),
+                    value,
+                    true,
+                )
+            }
+            _ => ("".to_string(), None, false),
+        };
 
         match value {
             Some(value) if value > self.raw_config.limit => {

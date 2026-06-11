@@ -910,12 +910,105 @@ void EdenServiceHandler::listMounts(std::vector<MountInfo>& results) {
         edenMount->getCheckoutConfig()->getClientDirectory());
     info.state() = edenMount->getState();
     info.backingRepoPath() = edenMount->getCheckoutConfig()->getRepoSource();
+    if (auto* fsChannel = edenMount->getFsChannel()) {
+      info.fsChannelType() = fsChannel->getName();
+#ifdef __linux__
+      if (auto* fuseChannel = dynamic_cast<FuseChannel*>(fsChannel)) {
+        info.fuseTransport() = fuseChannel->getTransportName();
+      }
+#endif
+    }
     results.push_back(info);
   }
 }
 
 folly::SemiFuture<std::unique_ptr<std::vector<CheckoutConflict>>>
 EdenServiceHandler::semifuture_checkOutRevision(
+    std::unique_ptr<std::string> mountPoint,
+    std::unique_ptr<std::string> hash,
+    CheckoutMode checkoutMode,
+    std::unique_ptr<CheckOutRevisionParams> params) {
+  auto config = server_->getServerState()->getEdenConfig();
+  bool useCoroutines = config->enableCoroutines.getValue() &&
+      config->enableCoroutinesPhase7.getValue();
+  if (useCoroutines) {
+    auto requestContext = getRequestContext();
+    // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
+    return folly::coro::co_invoke(
+               [this](
+                   apache::thrift::Cpp2RequestContext* ctx,
+                   std::unique_ptr<std::string> mp,
+                   std::unique_ptr<std::string> h,
+                   CheckoutMode mode,
+                   std::unique_ptr<CheckOutRevisionParams> p)
+                   -> folly::coro::Task<
+                       std::unique_ptr<std::vector<CheckoutConflict>>> {
+                 co_return co_await co_checkOutRevisionImpl(
+                     ctx, std::move(mp), std::move(h), mode, std::move(p));
+               },
+               requestContext,
+               std::move(mountPoint),
+               std::move(hash),
+               checkoutMode,
+               std::move(params))
+        .semi();
+  }
+  return semifuture_checkOutRevisionImpl(
+      std::move(mountPoint), std::move(hash), checkoutMode, std::move(params));
+}
+
+folly::coro::now_task<std::unique_ptr<std::vector<CheckoutConflict>>>
+EdenServiceHandler::co_checkOutRevisionImpl(
+    apache::thrift::Cpp2RequestContext* requestContext,
+    std::unique_ptr<std::string> mountPoint,
+    std::unique_ptr<std::string> hash,
+    CheckoutMode checkoutMode,
+    std::unique_ptr<CheckOutRevisionParams> params) {
+  // Yield once at entry so we don't tie up the thrift worker thread for the
+  // synchronous prologue (lookupMount, parsing, helper construction).
+  co_await folly::coro::co_reschedule_on_current_executor;
+
+  auto rootIdOptions = params->rootIdOptions().ensure();
+  auto helper = INSTRUMENT_THRIFT_CALL_WITH_CANCELLATION(
+      DBG1,
+      true,
+      requestContext,
+      *mountPoint,
+      logHash(*hash),
+      apache::thrift::util::enumName(checkoutMode, "(unknown)"),
+      params->hgRootManifest().has_value() ? logHash(*params->hgRootManifest())
+                                           : "(unspecified hg root manifest)",
+      rootIdOptions.fid().has_value() ? folly::hexlify(*rootIdOptions.fid())
+                                      : "no fid provided");
+  auto cancellationToken = getCancellationToken(helper->getRequestId());
+  if (cancellationToken.has_value()) {
+    helper->getThriftFetchContext().setCancellationToken(*cancellationToken);
+  }
+  helper->getThriftFetchContext().fillClientRequestInfo(params->cri());
+  auto& fetchContext = helper->getFetchContext();
+
+  auto mountHandle = lookupMount(mountPoint);
+
+  // If we were passed a FilterID, create a RootID that contains the
+  // filter and a varint that indicates the length of the original id.
+  std::string parsedId =
+      resolveRootId(std::move(*hash), rootIdOptions, mountHandle);
+  hash.reset();
+
+  auto mountPath = absolutePathFromThrift(*mountPoint);
+  auto result = co_await server_->co_checkOutRevision(
+      mountPath,
+      parsedId,
+      params->hgRootManifest().to_optional(),
+      fetchContext,
+      helper->getFunctionName(),
+      checkoutMode);
+  co_return std::make_unique<std::vector<CheckoutConflict>>(
+      std::move(result.conflicts));
+}
+
+folly::SemiFuture<std::unique_ptr<std::vector<CheckoutConflict>>>
+EdenServiceHandler::semifuture_checkOutRevisionImpl(
     std::unique_ptr<std::string> mountPoint,
     std::unique_ptr<std::string> hash,
     CheckoutMode checkoutMode,

@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#[derive(Copy, Clone, Default)]
 pub(crate) struct TestFixture {
     pub(crate) dag: &'static str,
     pub(crate) messages: &'static [(&'static str, &'static str)],
@@ -18,6 +19,18 @@ pub(crate) const BASIC: TestFixture = TestFixture {
     dag: "A-B-C",
     messages: &[],
     heads: &["C"],
+    reserve: &[],
+    ancestors: &[],
+    missing: &[],
+};
+
+// C-D is a connected pair; A and B are isolated nodes that end up in the same
+// column after D's column is freed. Used to verify that the renderer visually
+// distinguishes connected from unconnected adjacent nodes.
+pub(crate) const BASIC_DISCONNECTED: TestFixture = TestFixture {
+    dag: "A B C-D",
+    messages: &[],
+    heads: &["A", "B", "D"],
     reserve: &[],
     ancestors: &[],
     missing: &[],

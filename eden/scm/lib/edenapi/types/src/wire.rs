@@ -304,7 +304,7 @@ macro_rules! transparent_wire {
             fn to_wire(self) -> Self::Wire {
                 self
             }
-        }
+    }
 
         impl ToApi for $name {
             type Api = $name;
@@ -313,7 +313,7 @@ macro_rules! transparent_wire {
             fn to_api(self) -> Result<Self::Api, Self::Error> {
                 Ok(self)
             }
-        }
+    }
      )*
     }
 }
@@ -627,15 +627,29 @@ impl Arbitrary for WireDagId {
 #[cfg(test)]
 pub mod local_tests {
     use super::*;
-    use crate::wire::tests::auto_wire_tests;
+    use crate::wire::tests::wire_json_hashes;
 
-    auto_wire_tests!(
-        WireHgId,
-        WireKey,
-        WireRepoPathBuf,
-        WireParents,
-        WireRevisionstoreMetadata,
-        WireSaplingRemoteApiServerError,
-        WireDagId,
-    );
+    #[test]
+    fn test_wire_json() {
+        assert_eq!(
+            wire_json_hashes![
+                WireHgId,
+                WireKey,
+                WireRepoPathBuf,
+                WireParents,
+                WireRevisionstoreMetadata,
+                WireSaplingRemoteApiServerError,
+                WireDagId,
+            ],
+            [
+                6316582354165972683,
+                3066223164220783360,
+                9456629424509987447,
+                4507767538966787345,
+                14380116313707050612,
+                15686871036843111287,
+                6480712246590099299
+            ]
+        );
+    }
 }

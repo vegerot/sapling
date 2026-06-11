@@ -10,8 +10,8 @@ license = "GPLv2+"
 [dependencies]
 anyhow = "1.0.102"
 async-trait = "0.1.86"
-aws-config = "1.8.16"
-aws-sdk-secretsmanager = "1.104.0"
+aws-config = "1.8.18"
+aws-sdk-secretsmanager = "1.107.0"
 base64 = { version = "0.22.1", features = ["alloc"] }
 bincode = { version = "2", features = ["serde"] }
 borrowed = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -24,11 +24,11 @@ futures = { version = "0.3.31", features = ["async-await", "compat"] }
 futures_retry = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 itertools = "0.14.0"
-justknobs = { version = "0.1.0", path = "../justknobs_ext" }
+justknobs_ext = { version = "0.1.0", path = "../justknobs_ext" }
 maplit = "1.0"
 memcache = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 mononoke_types = { version = "0.1.0", path = "../../../mononoke_types" }
-mysql_async = "0.31.2"
+mysql_async = "0.33.0"
 once_cell = "1.21.4"
 paste = "1.0.14"
 rusqlite = { version = "0.37.0", features = ["backup", "blob", "bundled", "column_decltype", "functions", "limits", "modern_sqlite", "serde_json"] }
@@ -43,7 +43,7 @@ sql_ext_proc_macros = { version = "0.1.0", path = "proc_macros" }
 sql_query_config = { version = "0.1.0", path = "../../../repo_attributes/sql_query_config" }
 sql_query_telemetry = { version = "0.1.0", path = "sql_query_telemetry" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-strum = { version = "0.27.1", features = ["derive"] }
+strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.18"
 time_measuring = { version = "0.1.0", path = "../../time_measuring" }
 tokio = { version = "1.52.3", features = ["full", "test-util", "tracing"] }

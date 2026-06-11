@@ -1,5 +1,4 @@
-#chg-compatible
-#debugruntest-incompatible
+#require no-eden
 
   $ . "$TESTDIR/library.sh"
 
@@ -58,4 +57,3 @@ push from non-generaldelta to generaldelta
   remote: adding changesets
   remote: adding manifests
   remote: adding file changes
-

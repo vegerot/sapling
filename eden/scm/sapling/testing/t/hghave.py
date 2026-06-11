@@ -78,7 +78,6 @@ checkexe("dd")
 checkexe("diff")
 checkexe("echo")
 checkexe("env")
-checkexe("gpg")
 checkexe("gunzip")
 checkexe("gzip")
 checkexe("mkfifo")
@@ -370,8 +369,8 @@ def has_rmcwd():
             pass
 
 
-@check("gpg2", "gpg client v2")
-def has_gpg2():
+@check("gpg", "gpg client v2", exe=True)
+def has_gpg():
     return matchoutput("gpg --version 2>&1", rb"GnuPG[^0-9]+2\.")
 
 
@@ -427,6 +426,15 @@ def has_outer_repo():
     return not matchoutput("hg root 2>&1", rb"abort: no repository found", True)
 
 
+@check("version-control", "version-controlled source tree")
+def has_version_control():
+    try:
+        with open(os.devnull, "wb") as devnull:
+            return subprocess.call(["hg", "root"], stdout=devnull, stderr=devnull) == 0
+    except OSError:
+        return False
+
+
 @check("windows", "Windows")
 def has_windows():
     return os.name == "nt"
@@ -440,17 +448,6 @@ def has_system_sh():
 @check("serve", "platform and python can manage 'hg serve -d'")
 def has_serve():
     return True
-
-
-@check("test-repo", "running tests from repository")
-def has_test_repo():
-    # test-check-*.t tests. They are confusing as the "hg"
-    # might have to be the system hg, not the one for testing.
-    # Drop support for them to avoid supporting running tests
-    # using system hg.
-    # Those tests might want to be written as separate linters
-    # instead.
-    return False
 
 
 @check("tic", "terminfo compiler and curses module")

@@ -44,6 +44,7 @@ use futures_stats::TimedTryFutureExt;
 use lock_ext::LockExt;
 use mononoke_types::ChangesetId;
 use mononoke_types::DerivableType;
+use mononoke_types::MPath;
 use scuba_ext::FutureStatsScubaExt;
 use tracing::Instrument;
 
@@ -565,8 +566,7 @@ impl DerivedDataManager {
                     derived_data_scuba.log_remote_derivation_end(
                         ctx,
                         Some(format!(
-                            "Remote derivation timed out after {:?}",
-                            overall_timeout
+                            "Remote derivation timed out after {overall_timeout:?}"
                         )),
                     );
                     break DerivationError::Timeout(Derivable::NAME, overall_timeout);
@@ -625,7 +625,7 @@ impl DerivedDataManager {
                     Err(e) => {
                         if attempt >= RETRY_ATTEMPTS_LIMIT {
                             derived_data_scuba
-                                .log_remote_derivation_end(ctx, Some(format!("{:#}", e)));
+                                .log_remote_derivation_end(ctx, Some(format!("{e:#}")));
                             break DerivationError::Failed(Derivable::NAME, attempt, e);
                         }
                         attempt += 1;
@@ -781,7 +781,7 @@ impl DerivedDataManager {
             for bonsai in bonsais.iter() {
                 let csid = bonsai.get_changeset_id();
                 if ancestors.contains_key(&csid) {
-                    return Err(anyhow!("batch not in topological order at {}", csid).into());
+                    return Err(anyhow!("batch not in topological order at {csid}").into());
                 }
                 for parent in bonsai.parents() {
                     if !seen.contains(&parent) {
@@ -964,46 +964,37 @@ impl DerivedDataManager {
     /// Parent stage outputs are fetched for parents outside the batch;
     /// the trait implementation handles ordering within the batch.
     ///
-    /// NOTE: This method does not currently support types that have derived
-    /// data dependencies (i.e., types whose `Derivable::Dependencies::iter()`
-    /// returns a non-empty iterator).
+    /// Types with cross-type derived-data dependencies are supported; the
+    /// dependency data must already be derived for the batch (the derivation
+    /// pipeline co-manages dependencies in the same pipeline so they are
+    /// derived in lockstep).
     pub async fn derive_stage_batch<Derivable>(
         &self,
         ctx: &CoreContext,
         csids: Vec<ChangesetId>,
-        stage_id: &str,
+        payload: &crate::stage_payload::DerivationStagePayload,
     ) -> Result<Duration, DerivationError>
     where
         Derivable: PipelineDerivable,
     {
+        let stage_path = payload.path().clone();
+        let stage_path_display = stage_path.to_string();
+        let crate::stage_payload::DerivationStagePayload::Manifest(manifest_payload) = payload;
+        let dep_paths: Vec<MPath> = manifest_payload
+            .deps
+            .iter()
+            .map(|element| stage_path.join(std::iter::once(element)))
+            .collect();
+
         async {
             self.check_enabled::<Derivable>()?;
 
-            if Derivable::Dependencies::iter().next().is_some() {
-                return Err(anyhow!(
-                    "derive_stage_batch does not support types with derived data dependencies, but {} has dependencies",
-                    Derivable::NAME,
-                ).into());
-            }
-
             let mut derivation_ctx = self.derivation_context(None);
             derivation_ctx.enable_write_batching();
-
-            let stage_config = derivation_ctx
-                .pipeline_config()
-                .filter(|cfg| cfg.types.contains(&Derivable::VARIANT))
-                .and_then(|cfg| cfg.stages.get(stage_id))
-                .ok_or_else(|| {
-                    DerivationError::from(anyhow!(
-                        "derivation pipeline config not found for type {} stage {}",
-                        Derivable::VARIANT,
-                        stage_id,
-                    ))
-                })?;
             let derivation_ctx_ref = &derivation_ctx;
 
             let mut derived_data_scuba = self.derived_data_scuba::<Derivable>(ctx);
-            derived_data_scuba.add_stage_id(stage_id);
+            derived_data_scuba.add_stage_id(&stage_path_display);
 
             let ctx = ctx.clone_and_reset();
             let ctx = self.set_derivation_session_class(ctx)?;
@@ -1040,19 +1031,19 @@ impl DerivedDataManager {
                 let parent_fetch = Derivable::fetch_stage_outputs(
                     ctx,
                     derivation_ctx_ref,
-                    stage_id,
+                    &stage_path,
                     external_parent_csids.clone(),
                 );
 
-                let dep_fetches = stage_config.dependencies.iter().map(async |dep_stage_id| {
+                let dep_fetches = dep_paths.iter().map(async |dep_path| {
                     let outputs = Derivable::fetch_stage_outputs(
                         ctx,
                         derivation_ctx_ref,
-                        dep_stage_id,
+                        dep_path,
                         csids.clone(),
                     )
                     .await?;
-                    Ok::<_, Error>((dep_stage_id.clone(), outputs))
+                    Ok::<_, Error>((dep_path.clone(), outputs))
                 });
 
                 let (fetched_parents, dep_results) =
@@ -1076,7 +1067,7 @@ impl DerivedDataManager {
                                     ctx,
                                     derivation_ctx_ref,
                                     &derived,
-                                    stage_config,
+                                    &stage_path,
                                 )
                                 .await?;
                                 Ok::<_, Error>((parent_csid, stage_output))
@@ -1091,23 +1082,21 @@ impl DerivedDataManager {
                 // Build dependency outputs map from the concurrent fetch results.
                 let mut dependency_outputs: HashMap<
                     ChangesetId,
-                    HashMap<String, Derivable::StageOutput>,
+                    HashMap<MPath, Derivable::StageOutput>,
                 > = Default::default();
-                for (dep_stage_id, dep_outputs) in dep_results {
+                for (dep_path, dep_outputs) in dep_results {
                     for &csid in &csids {
                         let output = dep_outputs
                             .get(&csid)
                             .ok_or_else(|| {
                                 DerivationError::from(anyhow!(
-                                    "missing dependency stage output for stage '{}', changeset {}",
-                                    dep_stage_id,
-                                    csid,
+                                    "missing dependency stage output for path {dep_path}, changeset {csid}",
                                 ))
                             })?;
                         dependency_outputs
                             .entry(csid)
                             .or_default()
-                            .insert(dep_stage_id.clone(), output.clone());
+                            .insert(dep_path.clone(), output.clone());
                     }
                 }
 
@@ -1122,8 +1111,7 @@ impl DerivedDataManager {
                         ctx,
                         derivation_ctx_ref,
                         bonsais,
-                        stage_config,
-                        stage_id,
+                        payload,
                         parents,
                         dependency_outputs,
                     )
@@ -1133,7 +1121,7 @@ impl DerivedDataManager {
                         format!(
                             "failed to derive {} stage '{}' batch",
                             Derivable::NAME,
-                            stage_id,
+                            stage_path_display,
                         )
                     })?;
                     (stats.completion_time, derived)
@@ -1146,13 +1134,13 @@ impl DerivedDataManager {
                 let mut store_ctx = self.derivation_context(None);
                 store_ctx.enable_write_batching();
 
-                Derivable::store_stage_outputs(ctx, &store_ctx, stage_id, derived.clone())
+                Derivable::store_stage_outputs(ctx, &store_ctx, &stage_path, derived.clone())
                     .await
                     .with_context(|| {
                         format!(
                             "failed to store {} stage '{}' outputs",
                             Derivable::NAME,
-                            stage_id,
+                            stage_path_display,
                         )
                     })?;
 
@@ -1171,7 +1159,7 @@ impl DerivedDataManager {
             "derive_stage",
             repo = %self.repo_name(),
             ddt = %Derivable::NAME,
-            stage = %stage_id,
+            stage = %stage_path_display,
         ))
         .await
     }
@@ -1181,67 +1169,30 @@ impl DerivedDataManager {
         &self,
         ctx: &CoreContext,
         csid: ChangesetId,
-        stage_id: &str,
+        stage_path: &MPath,
     ) -> Result<bool, DerivationError>
     where
         Derivable: PipelineDerivable,
     {
         let derivation_ctx = self.derivation_context(None);
         let outputs =
-            Derivable::fetch_stage_outputs(ctx, &derivation_ctx, stage_id, vec![csid]).await?;
+            Derivable::fetch_stage_outputs(ctx, &derivation_ctx, stage_path, vec![csid]).await?;
         Ok(outputs.contains_key(&csid))
     }
 
-    /// Verify that a stage output matches the expected output extracted from the
-    /// normal derived value.
+    /// Verify that a stage output is consistent with the canonical derived
+    /// value, delegating to the type's `verify_stage` implementation.
     pub async fn verify_stage_output<Derivable>(
         &self,
         ctx: &CoreContext,
         csid: ChangesetId,
-        stage_id: &str,
+        stage_path: &MPath,
     ) -> Result<bool, DerivationError>
     where
         Derivable: PipelineDerivable,
     {
         let derivation_ctx = self.derivation_context(None);
-
-        let stage_config = derivation_ctx
-            .pipeline_config()
-            .filter(|cfg| cfg.types.contains(&Derivable::VARIANT))
-            .and_then(|cfg| cfg.stages.get(stage_id))
-            .ok_or_else(|| {
-                DerivationError::from(anyhow!(
-                    "derivation pipeline config not found for type {} stage {}",
-                    Derivable::VARIANT,
-                    stage_id,
-                ))
-            })?
-            .clone();
-
-        // Fetch actual stage output
-        let stage_outputs =
-            Derivable::fetch_stage_outputs(ctx, &derivation_ctx, stage_id, vec![csid]).await?;
-
-        let actual_output = match stage_outputs.get(&csid) {
-            Some(output) => output,
-            None => return Err(anyhow!("Stage output not found for changeset {}", csid).into()),
-        };
-
-        // Fetch normal derived value
-        let derived = derivation_ctx
-            .fetch_dependency::<Derivable>(ctx, csid)
-            .await?;
-
-        // Extract expected stage output from derived value
-        let expected_output = Derivable::extract_stage_output_from_derived(
-            ctx,
-            &derivation_ctx,
-            &derived,
-            &stage_config,
-        )
-        .await?;
-
-        Ok(*actual_output == expected_output)
+        Ok(Derivable::verify_stage(ctx, &derivation_ctx, csid, stage_path).await?)
     }
 
     /// Fetch derived data for a changeset if it has previously been derived.

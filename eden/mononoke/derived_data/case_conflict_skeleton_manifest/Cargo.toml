@@ -20,7 +20,7 @@ derived_data_manager = { version = "0.1.0", path = "../manager" }
 derived_data_service_if = { version = "0.1.0", path = "../remote/if" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 itertools = "0.14.0"
-justknobs = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
+justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
 manifest = { version = "0.1.0", path = "../../manifest" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
 skeleton_manifest = { version = "0.1.0", path = "../skeleton_manifest" }
@@ -38,7 +38,7 @@ filestore = { version = "0.1.0", path = "../../repo_attributes/filestore" }
 fixtures = { version = "0.1.0", path = "../../tests/fixtures" }
 mononoke_macros = { version = "0.1.0", path = "../../common/mononoke_macros" }
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
-quickcheck = "1.0"
+quickcheck = "1.1"
 repo_blobstore = { version = "0.1.0", path = "../../repo_attributes/repo_blobstore" }
 repo_derived_data = { version = "0.1.0", path = "../../repo_attributes/repo_derived_data" }
 repo_identity = { version = "0.1.0", path = "../../repo_attributes/repo_identity" }

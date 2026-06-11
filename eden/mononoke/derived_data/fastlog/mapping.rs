@@ -12,8 +12,6 @@ use anyhow::Result;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use blobstore::BlobstoreBytes;
-use blobstore::KeyedBlobstore;
-use blobstore::Loadable;
 use cloned::cloned;
 use context::CoreContext;
 use derived_data_manager::BonsaiDerivable;
@@ -33,6 +31,7 @@ use thiserror::Error;
 use unodes::RootUnodeManifestId;
 
 use crate::fastlog_impl::create_new_batch;
+use crate::fastlog_impl::fetch_unode_parents;
 use crate::fastlog_impl::save_fastlog_batch_by_unode_id;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -72,7 +71,7 @@ impl From<ChangesetId> for RootFastlog {
 pub fn format_key(derivation_ctx: &DerivationContext, changeset_id: ChangesetId) -> String {
     let root_prefix = "derived_rootfastlog.";
     let key_prefix = derivation_ctx.mapping_key_prefix::<RootFastlog>();
-    format!("{}{}{}", root_prefix, key_prefix, changeset_id)
+    format!("{root_prefix}{key_prefix}{changeset_id}")
 }
 
 #[async_trait]
@@ -169,32 +168,6 @@ impl BonsaiDerivable for RootFastlog {
     }
 }
 
-async fn fetch_unode_parents<B: KeyedBlobstore>(
-    ctx: &CoreContext,
-    blobstore: &B,
-    unode_entry: Entry<ManifestUnodeId, FileUnodeId>,
-) -> Result<Vec<Entry<ManifestUnodeId, FileUnodeId>>, Error> {
-    let res = match unode_entry {
-        Entry::Tree(tree_id) => {
-            let tree = tree_id.load(ctx, blobstore).await?;
-            tree.parents()
-                .clone()
-                .into_iter()
-                .map(Entry::Tree)
-                .collect()
-        }
-        Entry::Leaf(leaf_id) => {
-            let leaf = leaf_id.load(ctx, blobstore).await?;
-            leaf.parents()
-                .clone()
-                .into_iter()
-                .map(Entry::Leaf)
-                .collect()
-        }
-    };
-    Ok(res)
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -203,6 +176,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
+    use blobstore::Loadable;
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::BookmarkKey;
     use bookmarks::Bookmarks;
@@ -353,7 +327,7 @@ mod tests {
         let mut parents = vec![];
         for i in 1..max_entries_in_fastlog_batch() {
             let filename = String::from("1");
-            let content = format!("{}", i);
+            let content = format!("{i}");
             let stored_files = store_files(
                 &ctx,
                 btreemap! { filename.as_str() => Some(content.as_str()) },
@@ -456,14 +430,14 @@ mod tests {
             let mut parents = vec![];
 
             for (i, p) in parent_files.into_iter().enumerate() {
-                println!("parent {}, {:?} ", i, p);
+                println!("parent {i}, {p:?} ");
                 let stored_files = store_files(&ctx, p, &repo).await;
                 let bcs = create_bonsai_changeset_with_files(vec![], stored_files);
                 parents.push(bcs.get_changeset_id());
                 bonsais.push(bcs);
             }
 
-            println!("merge {:?} ", merge_files);
+            println!("merge {merge_files:?} ");
             let merge_stored_files = store_files(&ctx, merge_files, &repo).await;
             let bcs = create_bonsai_changeset_with_files(parents.clone(), merge_stored_files);
             let merge_bcs_id = bcs.get_changeset_id();
@@ -709,7 +683,7 @@ mod tests {
             .unwrap();
 
         for (path, entry) in entries {
-            println!("verifying: path: {:?} unode: {:?}", path, entry);
+            println!("verifying: path: {path:?} unode: {entry:?}");
             verify_list(ctx, repo, entry).await;
         }
     }

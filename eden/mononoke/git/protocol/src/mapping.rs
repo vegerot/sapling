@@ -64,8 +64,7 @@ pub async fn ref_oid_mapping<T: Repo, U: IntoIterator<Item = String>>(
         .map(|(bookmark, cs_id)| {
             let oid = bonsai_git_mappings.get(&cs_id).with_context(|| {
                 format!(
-                    "Error while fetching git sha1 for bonsai commit {} in ref_oid_mapping",
-                    cs_id
+                    "Error while fetching git sha1 for bonsai commit {cs_id} in ref_oid_mapping"
                 )
             })?;
             let ref_name = format!("{}{}", REF_PREFIX, bookmark.name());
@@ -101,7 +100,7 @@ pub(crate) async fn git_shas_to_bonsais(
         .bonsai_git_mapping()
         .get(ctx, BonsaisOrGitShas::GitSha1(shas.clone()))
         .await
-        .with_context(|| format!("Failed to fetch bonsai_git_mapping for repo {}", repo_name))?;
+        .with_context(|| format!("Failed to fetch bonsai_git_mapping for repo {repo_name}"))?;
     // Filter out the git shas for which we don't have an entry in the bonsai_git_mapping table
     // These are likely annotated tags which need to be resolved separately
     let tag_shas = shas
@@ -173,12 +172,20 @@ pub async fn bonsai_git_mappings_by_bonsai(
     repo: &impl Repo,
     cs_ids: Vec<ChangesetId>,
 ) -> Result<FxHashMap<ChangesetId, ObjectId>> {
+    if cs_ids.is_empty() {
+        return Ok(FxHashMap::default());
+    }
     // Get the Git shas corresponding to the Bonsai commits
     let bonsai_git_mappings = git_to_bonsai(ctx, repo, cs_ids.clone()).await?;
     let unmapped_bonsais = cs_ids
         .into_iter()
         .filter(|cs_id| !bonsai_git_mappings.contains_key(cs_id))
         .collect::<Vec<_>>();
+    // In the common case (all commits already derived), skip the derive and
+    // second mapping lookup entirely.
+    if unmapped_bonsais.is_empty() {
+        return Ok(bonsai_git_mappings);
+    }
     repo.repo_derived_data()
         .manager()
         .derive_bulk_locally(
@@ -321,17 +328,17 @@ pub(crate) async fn refs_to_include(
                 match tag_inclusion {
                     TagInclusion::AsIs => {
                         if let Some(git_objectid) = bonsai_tag_map.get(&bookmark.to_string()) {
-                            let ref_name = format!("{}{}", REF_PREFIX, bookmark);
+                            let ref_name = format!("{REF_PREFIX}{bookmark}");
                             return Ok((ref_name, RefTarget::Plain(git_objectid.clone())));
                         }
                     }
                     TagInclusion::Peeled => {
-                        let ref_name = format!("{}{}", REF_PREFIX, bookmark);
+                        let ref_name = format!("{REF_PREFIX}{bookmark}");
                         return Ok((ref_name, RefTarget::Plain(git_objectid.clone())));
                     }
                     TagInclusion::WithTarget => {
                         if let Some(tag_objectid) = bonsai_tag_map.get(&bookmark.to_string()) {
-                            let ref_name = format!("{}{}", REF_PREFIX, bookmark);
+                            let ref_name = format!("{REF_PREFIX}{bookmark}");
                             let metadata = format!("peeled:{}", git_objectid.to_hex());
                             return Ok((
                                 ref_name,
@@ -343,7 +350,7 @@ pub(crate) async fn refs_to_include(
             };
             // If the bookmark is a branch or if its just a simple (non-annotated) tag, we generate the
             // ref to target mapping based on the changeset id
-            let ref_name = format!("{}{}", REF_PREFIX, bookmark);
+            let ref_name = format!("{REF_PREFIX}{bookmark}");
             Ok((ref_name, RefTarget::Plain(git_objectid.clone())))
         })
         .collect::<Result<FxHashMap<_, _>>>()

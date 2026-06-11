@@ -358,6 +358,16 @@ async fn is_restricted_manifest_from_config(
     manifest_id: &ManifestId,
     manifest_type: &ManifestType,
 ) -> Result<bool> {
+    // The config source can only restrict a manifest when there are configured
+    // `path_acls`. For repos with none, skip the manifest-id store entirely --
+    // otherwise every per-child augmented-tree lookup falls through to a
+    // `SelectPathsByManifestId` SQL query, which at fleet QPS caused a SQL storm
+    // (S672712 / T248658346). Mirrors the enforcement path's
+    // `config_manifest_may_restrict` guard in lib.rs.
+    if restricted_paths.config().is_empty() {
+        return Ok(false);
+    }
+
     Ok(!get_manifest_restricted_paths_from_config(
         restricted_paths,
         ctx,
@@ -581,8 +591,7 @@ fn union_manifest_restriction_info_with_config_precedence(
 
 fn unsupported_acl_manifest_type_error<T>(manifest_type: &ManifestType) -> Result<T> {
     anyhow::bail!(
-        "AclManifest manifest restriction lookup only supports HgAugmented manifests, got {}",
-        manifest_type
+        "AclManifest manifest restriction lookup only supports HgAugmented manifests, got {manifest_type}"
     )
 }
 
@@ -816,8 +825,7 @@ async fn load_acl_manifest_directory_id_from_manifest(
             .await
             .with_context(|| {
                 format!(
-                    "Failed to load HgAugmentedManifest envelope for manifest type {} id {}",
-                    manifest_type, manifest_id
+                    "Failed to load HgAugmentedManifest envelope for manifest type {manifest_type} id {manifest_id}"
                 )
             })?
     else {

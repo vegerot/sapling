@@ -9,18 +9,26 @@ rust_binary(
     srcs = glob([
         "src/**/*.rs",
     ]),
-    autocargo = {"cargo_toml_config": {
-        "dependencies_override": {"dependencies": {
-            "gix-hash": {"features": ["sha1"]},
-            "sapling-dag-types": {"features": [
-                "for-tests",
-            ]},
-        }},
-        "extra_buck_dependencies": {"dependencies": [
-            "//eden/scm/lib/dag:dag",
-            "//eden/scm/lib/dag/dag-types:dag-types",
-        ]},
-    }},
+    autocargo = {
+        "cargo_toml_config": {
+            "dependencies_override": {
+                "dependencies": {
+                    "gix-hash": {"features": ["sha1"]},
+                    "sapling-dag-types": {
+                        "features": [
+                            "for-tests",
+                        ]
+                    },
+                }
+            },
+            "extra_buck_dependencies": {
+                "dependencies": [
+                    "//eden/scm/lib/dag:dag",
+                    "//eden/scm/lib/dag/dag-types:dag-types",
+                ]
+            },
+        }
+    },
     labels = [
         ci.heavyweight(),
     ],
@@ -61,7 +69,6 @@ rust_binary(
         "//common/rust/shed/facet:facet",
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/futures_stats:futures_stats",
-        "//common/rust/shed/justknobs_stub:justknobs",
         "//common/rust/shed/sorted_vector_map:sorted_vector_map",
         "//eden/mononoke/blobrepo:blobrepo_hg",
         "//eden/mononoke/blobrepo_utils:blobrepo_utils",
@@ -79,6 +86,7 @@ rust_binary(
         "//eden/mononoke/common/metadata:metadata",
         "//eden/mononoke/common/mononoke_macros:mononoke_macros",
         "//eden/mononoke/common/permission_checker:permission_checker",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/common/rust/sql_ext:sql_ext",
         "//eden/mononoke/common/scuba_ext:scuba_ext",
         "//eden/mononoke/common/time_measuring:time_measuring",
@@ -163,12 +171,17 @@ rust_binary(
         "//eden/mononoke/servers/slapi/slapi_server/context:context",
         "//eden/scm/lib/renderdag:renderdag",
         "//thrift/lib/rust:fbthrift",
-    ] + ([] if rust_oss.is_oss_build() else [
-        "fbsource//third-party/rust:serde",
-        "//eden/mononoke/blobstore:blobstore_factory",
-        "//eden/mononoke/blobstore:fileblob",
-        "//eden/mononoke/blobstore:redactedblobstore",
-        "//eden/mononoke/repo_attributes/bonsai_blob_mapping:bonsai_blob_mapping",
-        "//eden/mononoke/repo_attributes/deletion_log:deletion_log",
-    ]),
+    ]
+    + (
+        []
+        if rust_oss.is_oss_build()
+        else [
+            "fbsource//third-party/rust:serde",
+            "//eden/mononoke/blobstore:blobstore_factory",
+            "//eden/mononoke/blobstore:fileblob",
+            "//eden/mononoke/blobstore:redactedblobstore",
+            "//eden/mononoke/repo_attributes/bonsai_blob_mapping:bonsai_blob_mapping",
+            "//eden/mononoke/repo_attributes/deletion_log:deletion_log",
+        ]
+    ),
 )

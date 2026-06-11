@@ -30,11 +30,16 @@ use context::CoreContext;
 use derived_data_manager::DerivedDataManager;
 use futures::stream;
 use futures::stream::StreamExt;
+use mononoke_app::MononokeApp;
+use mononoke_app::args::RepoArgs;
 use mononoke_types::ChangesetId;
 use mononoke_types::DerivableType;
 use mononoke_types::RepositoryId;
 use mononoke_types::Timestamp;
+use phases::Phases;
+use phases::PhasesRef;
 use repo_derived_data::RepoDerivedDataRef;
+use repo_identity::RepoIdentity;
 use repo_identity::RepoIdentityRef;
 use requests_table::BlobstoreKey;
 use requests_table::LongRunningRequestEntry;
@@ -43,23 +48,39 @@ use requests_table::RequestStatus;
 use requests_table::RowId;
 use requests_table::SqlLongRunningRequestsQueue;
 use strum::IntoEnumIterator;
+use tracing::warn;
 
 use self::display::BackfillListRow;
 use self::display::display_backfill_list;
 use self::display::display_child_request_detail;
+use self::display::display_child_request_table;
 use self::display::display_multi_repo_summary;
 use self::display::display_repo_detail;
+use self::display::display_repo_detail_table;
 use self::display::display_single_repo_detail;
 use self::types::BackfillChildDisplayData;
 use self::types::BackfillChildParams;
 use self::types::BackfillChildResult;
 use self::types::BackfillDisplayData;
+use self::types::BackfillSettings;
 use self::types::BoundaryDerivationStatus;
 use self::types::ChildCounts;
+use self::types::ChildRequestRow;
+use self::types::RepoDetailRow;
 use self::types::RepoDisplayData;
 use self::types::RepoStatus;
 use self::types::SliceSegmentDisplayData;
 use super::Repo;
+
+/// Lightweight repo container for querying phase counts without opening
+/// the full derived-data `Repo`.
+#[facet::container]
+struct PhaseCountRepo {
+    #[facet]
+    repo_identity: RepoIdentity,
+    #[facet]
+    phases: dyn Phases,
+}
 
 /// How many backfills to load params for in parallel for the list view.
 const PARAMS_LOAD_CONCURRENCY: usize = 16;
@@ -71,17 +92,20 @@ pub(super) struct BackfillStatusArgs {
     #[clap(long)]
     request_id: Option<u64>,
 
-    /// For a multi-repo backfill, drill down on a specific repo
-    #[clap(long)]
-    repo_id: Option<i64>,
-
     /// Lookback window in days for listing backfills
     #[clap(long, default_value = "7")]
     lookback: i64,
+
+    /// Show per-request progress details: a per-repository table for
+    /// multi-repo backfills, or a per-child-request table for single
+    /// (large) repo backfills.
+    #[clap(long)]
+    detailed: bool,
 }
 
 pub(super) async fn backfill_status(
     ctx: &CoreContext,
+    app: &MononokeApp,
     queue: SqlLongRunningRequestsQueue,
     blobstore: Arc<dyn Blobstore>,
     repo_names: HashMap<RepositoryId, String>,
@@ -97,26 +121,18 @@ pub(super) async fn backfill_status(
         Some(request_id) => {
             // Mode 2: Show detailed progress for a specific backfill
             let row_id = RowId(request_id);
-            match args.repo_id {
-                None => {
-                    // Show overall backfill progress
-                    show_backfill_detail(
-                        ctx,
-                        &queue,
-                        &blobstore,
-                        &repo_names,
-                        &row_id,
-                        repo,
-                        manager,
-                    )
-                    .await?;
-                }
-                Some(repo_id) => {
-                    // Drill down into a specific repo
-                    show_repo_detail(ctx, &queue, &blobstore, &repo_names, &row_id, repo_id)
-                        .await?;
-                }
-            }
+            show_backfill_detail(
+                ctx,
+                app,
+                &queue,
+                &blobstore,
+                &repo_names,
+                &row_id,
+                repo,
+                manager,
+                args.detailed,
+            )
+            .await?;
         }
     }
 
@@ -141,6 +157,35 @@ async fn load_derived_data_type(
     }
 }
 
+/// Load the root `DeriveBackfillParams` blob and extract both the derived data
+/// type and the settings the backfill was enqueued with. Returns `(None, None)`
+/// if the blob can't be loaded or the params are not a backfill.
+async fn load_backfill_params_info(
+    ctx: &CoreContext,
+    blobstore: &Arc<dyn Blobstore>,
+    args_blobstore_key: &BlobstoreKey,
+) -> (Option<String>, Option<BackfillSettings>) {
+    let Ok(params) =
+        AsynchronousRequestParams::load_from_key(ctx, blobstore, &args_blobstore_key.0).await
+    else {
+        return (None, None);
+    };
+    match params.thrift() {
+        ThriftAsynchronousRequestParams::derive_backfill_params(p) => (
+            Some(p.derived_data_type.clone()),
+            Some(BackfillSettings {
+                slice_size: p.slice_size,
+                boundaries_concurrency: p.boundaries_concurrency,
+                num_boundary_requests: p.num_boundary_requests,
+                rederive: p.rederive,
+                reslice: p.reslice,
+                config_name: p.config_name.clone(),
+            }),
+        ),
+        _ => (None, None),
+    }
+}
+
 async fn list_backfills(
     ctx: &CoreContext,
     queue: &impl LongRunningRequestsQueue,
@@ -157,7 +202,7 @@ async fn list_backfills(
         .context("fetching recent backfills")?;
 
     if backfills.is_empty() {
-        println!("No backfills found in the last {} days", lookback_days);
+        println!("No backfills found in the last {lookback_days} days");
         return Ok(());
     }
 
@@ -202,12 +247,14 @@ async fn list_backfills(
 
 async fn show_backfill_detail(
     ctx: &CoreContext,
+    app: &MononokeApp,
     queue: &impl LongRunningRequestsQueue,
     blobstore: &Arc<dyn Blobstore>,
     repo_names: &HashMap<RepositoryId, String>,
     row_id: &RowId,
     repo: Option<&Repo>,
     manager: Option<&DerivedDataManager>,
+    detailed: bool,
 ) -> Result<()> {
     // Step 1: Verify the backfill exists
     let root_entry = queue
@@ -227,7 +274,8 @@ async fn show_backfill_detail(
             }
         };
 
-    let derived_data_type = load_derived_data_type(ctx, blobstore, &args_blobstore_key).await;
+    let (derived_data_type, settings) =
+        load_backfill_params_info(ctx, blobstore, &args_blobstore_key).await;
 
     // Step 2: Get aggregated stats
     let stats_by_status = queue
@@ -309,6 +357,7 @@ async fn show_backfill_detail(
         aggregate_status,
         request_type: request_type.to_string(),
         derived_data_type,
+        settings,
         total_requests,
         status_counts,
         type_breakdown,
@@ -333,6 +382,14 @@ async fn show_backfill_detail(
     if is_single_repo {
         let repo_id = unique_repos.iter().next().map(|r| r.id() as i64);
         display_single_repo_detail(&data, repo_id, repo_names);
+
+        if detailed {
+            let (mut child_rows, new_count) = load_child_request_rows(ctx, queue, row_id).await?;
+            display_child_request_table(&mut child_rows, new_count);
+        }
+    } else if let Some(r) = repo {
+        let drilldown_repo_id = r.repo_identity().id().id() as i64;
+        show_repo_detail(ctx, queue, blobstore, repo_names, row_id, drilldown_repo_id).await?;
     } else {
         // Multi-repo backfill: show condensed view
         let total_repos = unique_repos.len();
@@ -413,15 +470,181 @@ async fn show_backfill_detail(
             &failed_repos,
             repo_names,
         );
+
+        if detailed {
+            let mut detail_rows = load_per_repo_commit_counts(
+                ctx,
+                app,
+                queue,
+                blobstore,
+                repo_names,
+                row_id,
+                &repo_status_map,
+            )
+            .await?;
+            display_repo_detail_table(&mut detail_rows);
+        }
     }
 
     Ok(())
 }
 
+/// Load per-repo commit counts: "derived" from completed child request
+/// results, "total" from the phases table (public commit count per repo).
+async fn load_per_repo_commit_counts(
+    ctx: &CoreContext,
+    app: &MononokeApp,
+    queue: &impl LongRunningRequestsQueue,
+    blobstore: &Arc<dyn Blobstore>,
+    repo_names: &HashMap<RepositoryId, String>,
+    row_id: &RowId,
+    repo_status_map: &HashMap<i64, HashMap<RequestStatus, usize>>,
+) -> Result<Vec<RepoDetailRow>> {
+    let entries = queue
+        .get_requests_by_root_id(ctx, row_id)
+        .await
+        .context("fetching child entries for detailed view")?;
+
+    // Load derived counts from completed derive_boundaries/derive_slice results
+    let derived_pairs: Vec<(i64, i64)> = stream::iter(entries.iter().filter(|e| {
+        (e.request_type.0 == DeriveBoundaries::NAME || e.request_type.0 == DeriveSlice::NAME)
+            && matches!(e.status, RequestStatus::Ready | RequestStatus::Polled)
+            && e.result_blobstore_key.is_some()
+    }))
+    .map(|entry| async {
+        let result = match load_child_result(ctx, blobstore, entry).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Failed to load result for request {}: {:#}", entry.id.0, e);
+                return None;
+            }
+        };
+        let repo_id = entry.repo_id.map(|r| r.id() as i64)?;
+        let derived_count = match result? {
+            BackfillChildResult::DeriveBoundaries { derived_count, .. }
+            | BackfillChildResult::DeriveSlice { derived_count, .. } => derived_count.max(0),
+            BackfillChildResult::Error { .. } => 0,
+        };
+        Some((repo_id, derived_count))
+    })
+    .buffer_unordered(PARAMS_LOAD_CONCURRENCY)
+    .filter_map(|x| async move { x })
+    .collect()
+    .await;
+
+    let mut repo_derived: HashMap<i64, i64> = HashMap::new();
+    for (repo_id, count) in derived_pairs {
+        *repo_derived.entry(repo_id).or_default() += count;
+    }
+
+    // Load total public commit counts and repo names from the phases table.
+    // We get repo names here (from RepoIdentity) rather than relying on the
+    // caller's repo_names map, which may not include all repos.
+    let repo_ids: Vec<i64> = repo_status_map.keys().copied().collect();
+    let repo_info: HashMap<i64, (String, u64)> = stream::iter(repo_ids.iter())
+        .map(|repo_id| async move {
+            let repo_id_i32 = match i32::try_from(*repo_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    warn!("Repo id {} out of range, skipping phase count", repo_id);
+                    return None;
+                }
+            };
+            let repo_args = RepoArgs::from_repo_id(repo_id_i32);
+            let phase_repo: PhaseCountRepo = match app.open_repo(&repo_args).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Failed to open repo {} for phase count: {:#}", repo_id, e);
+                    return None;
+                }
+            };
+            let name = phase_repo.repo_identity().name().to_string();
+            let count = match phase_repo
+                .phases()
+                .count_all_public(ctx, RepositoryId::new(repo_id_i32))
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        "Failed to count public commits for repo {}: {:#}",
+                        repo_id, e
+                    );
+                    return None;
+                }
+            };
+            Some((*repo_id, (name, count)))
+        })
+        .buffer_unordered(PARAMS_LOAD_CONCURRENCY)
+        .filter_map(|x| async move { x })
+        .collect()
+        .await;
+
+    Ok(repo_status_map
+        .iter()
+        .map(|(repo_id, statuses)| {
+            let status = RepoStatus::from_child_counts(ChildCounts::from_status_map(statuses));
+            let (repo_name, total) = match repo_info.get(repo_id) {
+                Some((name, count)) => (Some(name.clone()), *count as usize),
+                None => (
+                    i32::try_from(*repo_id)
+                        .ok()
+                        .and_then(|id| repo_names.get(&RepositoryId::new(id)))
+                        .cloned(),
+                    0,
+                ),
+            };
+            let derived = *repo_derived.get(repo_id).unwrap_or(&0) as usize;
+            RepoDetailRow {
+                repo_id: *repo_id,
+                repo_name,
+                status,
+                derived,
+                total,
+            }
+        })
+        .collect())
+}
+
+/// Load all child requests of a backfill for the single-repo detailed view.
+///
+/// Returns the rows to render (every request that has been claimed or has
+/// progressed past `new`) along with the count of `new` requests, which are
+/// elided from the table: a large repo backfill can have thousands of them
+/// sitting in the queue, so we just report the count rather than listing each.
+async fn load_child_request_rows(
+    ctx: &CoreContext,
+    queue: &impl LongRunningRequestsQueue,
+    row_id: &RowId,
+) -> Result<(Vec<ChildRequestRow>, usize)> {
+    let entries = queue
+        .get_requests_by_root_id(ctx, row_id)
+        .await
+        .context("fetching child entries for detailed view")?;
+
+    let new_count = entries
+        .iter()
+        .filter(|entry| entry.status == RequestStatus::New)
+        .count();
+
+    let rows = entries
+        .iter()
+        .filter(|entry| entry.status != RequestStatus::New)
+        .map(|entry| ChildRequestRow {
+            id: entry.id.0,
+            request_type: entry.request_type.0.clone(),
+            status: entry.status,
+            claimed_by: entry.claimed_by.as_ref().map(|c| c.0.clone()),
+        })
+        .collect();
+
+    Ok((rows, new_count))
+}
+
 fn format_changeset_id(bytes: &[u8]) -> String {
     ChangesetId::from_bytes(bytes)
         .map(|cs_id| cs_id.to_string())
-        .unwrap_or_else(|e| format!("<invalid changeset id: {}>", e))
+        .unwrap_or_else(|e| format!("<invalid changeset id: {e}>"))
 }
 
 fn parse_changeset_id(bytes: &[u8]) -> Result<ChangesetId> {
@@ -500,7 +723,7 @@ async fn load_child_result(
         }
         (_, ThriftAsynchronousRequestResult::error(error)) => {
             Ok(Some(BackfillChildResult::Error {
-                message: format!("{:?}", error),
+                message: format!("{error:?}"),
             }))
         }
         (request_type, result) => bail!(
@@ -543,7 +766,7 @@ async fn load_boundary_derivation_status(
         Ok(repo_id) => RepositoryId::new(repo_id),
         Err(_) => {
             return Ok(Some(BoundaryDerivationStatus::NotChecked {
-                reason: format!("request repo id {} is out of range", repo_id),
+                reason: format!("request repo id {repo_id} is out of range"),
             }));
         }
     };
@@ -563,7 +786,7 @@ async fn load_boundary_derivation_status(
             let manager = repo
                 .repo_derived_data()
                 .manager_for_config(config_name)
-                .with_context(|| format!("loading derived data config {}", config_name))?;
+                .with_context(|| format!("loading derived data config {config_name}"))?;
             manager_with_all_types(manager)
         }
         None => default_manager
@@ -571,7 +794,7 @@ async fn load_boundary_derivation_status(
             .context("derived data manager unavailable for boundary derived status")?,
     };
     let derived_data_type = DerivableType::from_name(derived_data_type)
-        .with_context(|| format!("resolving derived data type {}", derived_data_type))?;
+        .with_context(|| format!("resolving derived data type {derived_data_type}"))?;
     let not_derived =
         BulkDerivation::pending(&manager, ctx, boundary_cs_ids, None, derived_data_type)
             .await

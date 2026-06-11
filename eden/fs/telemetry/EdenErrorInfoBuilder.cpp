@@ -31,9 +31,25 @@ EdenErrorInfoBuilder& EdenErrorInfoBuilder::withFilePath(std::string filePath) {
   return *this;
 }
 
-EdenErrorInfoBuilder& EdenErrorInfoBuilder::withClientCommandName(
-    std::string name) {
-  clientCommandName_ = std::move(name);
+EdenErrorInfoBuilder& EdenErrorInfoBuilder::withRepoName(std::string repoName) {
+  repoName_ = std::move(repoName);
+  return *this;
+}
+
+EdenErrorInfoBuilder& EdenErrorInfoBuilder::withFetchType(FetchType fetchType) {
+  fetchType_ = std::string{fetchTypeToString(fetchType)};
+  return *this;
+}
+
+EdenErrorInfoBuilder& EdenErrorInfoBuilder::withFetchType(
+    std::string fetchType) {
+  fetchType_ = std::move(fetchType);
+  return *this;
+}
+
+EdenErrorInfoBuilder& EdenErrorInfoBuilder::withIsDogfoodingHost(
+    bool isDogfoodingHost) {
+  isDogfoodingHost_ = isDogfoodingHost;
   return *this;
 }
 
@@ -82,6 +98,9 @@ EdenErrorInfo EdenErrorInfoBuilder::create() {
         sourceInfo_.func);
   }
   info.clientCommandName = std::move(clientCommandName_);
+  info.repoName = std::move(repoName_);
+  info.fetchType = std::move(fetchType_);
+  info.isDogfoodingHost = isDogfoodingHost_;
   info.inode = inode_;
   info.filePath = std::move(filePath_);
   info.mountPoint = std::move(mountPoint_);

@@ -12,11 +12,21 @@ pub use crate::bookmark::WireSetBookmarkRequest;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::tests::auto_wire_tests;
+    use crate::wire::tests::wire_json_hashes;
 
-    auto_wire_tests!(
-        WireBookmarkRequest,
-        WireBookmarkEntry,
-        WireSetBookmarkRequest
-    );
+    #[test]
+    fn test_wire_json() {
+        assert_eq!(
+            wire_json_hashes![
+                WireBookmarkRequest,
+                WireBookmarkEntry,
+                WireSetBookmarkRequest,
+            ],
+            [
+                12022826378170449279,
+                6472333485341887083,
+                808122434718511742
+            ]
+        );
+    }
 }

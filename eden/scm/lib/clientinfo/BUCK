@@ -27,8 +27,12 @@ rust_library(
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:tracing",
         "//common/rust/shed/hostname:hostname",
-    ] + (
-        [] if rust_oss.is_oss_build() else [
+    ]
+    + (
+        []
+        if rust_oss.is_oss_build()
+        else [
+            "//atlas/lib/rust/whoami:atlas_whoami",
             "//devx_www/cross_env_session_id:cross_env_session_id",
         ]
     ),

@@ -67,12 +67,12 @@ async fn check_lfsconfig_for_dewey_url(
 
     let content_id = match content_map.get(&path) {
         Some(PathContent::File(id)) => *id,
-        _ => return Ok(HookExecution::Accepted),
+        _ => return Ok(HookExecution::accepted()),
     };
 
     let file_bytes = match hook_repo.get_file_text(ctx, content_id).await? {
         Some(bytes) => bytes,
-        None => return Ok(HookExecution::Accepted),
+        None => return Ok(HookExecution::accepted()),
     };
 
     let config = match gix_config::File::from_bytes_no_includes(
@@ -81,28 +81,27 @@ async fn check_lfsconfig_for_dewey_url(
         gix_config::file::init::Options::default(),
     ) {
         Ok(config) => config,
-        Err(_) => return Ok(HookExecution::Accepted),
+        Err(_) => return Ok(HookExecution::accepted()),
     };
 
     if let Ok(url) = config.raw_value("lfs.url") {
         let url_str = String::from_utf8_lossy(url.as_ref());
         let lower = url_str.to_ascii_lowercase();
         if lower.contains(BLOCKED_HOST) {
-            return Ok(HookExecution::Rejected(HookRejectionInfo::new_long(
+            return Ok(HookExecution::rejected(HookRejectionInfo::new_long(
                 "The .lfsconfig file must not set lfs.url to dewey-lfs.vip.facebook.com.",
                 format!(
-                    "The .lfsconfig file sets lfs.url to \"{}\". \
+                    "The .lfsconfig file sets lfs.url to \"{url_str}\". \
                      The hardcoded dewey-lfs.vip.facebook.com URL must be removed as part of \
                      the Dewey LFS to Mononoke LFS migration tracked in S629462. \
                      Hardcoding an lfs.url for the internal LFS server is no longer required at Meta. \
                      Please remove the lfs.url setting from .lfsconfig.",
-                    url_str,
                 ),
             )));
         }
     }
 
-    Ok(HookExecution::Accepted)
+    Ok(HookExecution::accepted())
 }
 
 #[async_trait]
@@ -121,7 +120,7 @@ impl ChangesetHook for BlockDeweyLfsUrlHook {
         let touches_lfsconfig = changeset.file_changes().any(|(p, _)| *p == path);
 
         if !touches_lfsconfig {
-            return Ok(HookExecution::Accepted);
+            return Ok(HookExecution::accepted());
         }
 
         check_lfsconfig_for_dewey_url(ctx, hook_repo, changeset.get_changeset_id()).await
@@ -141,7 +140,7 @@ impl BookmarkHook for BlockDeweyLfsUrlOnNewBookmarkHook {
     ) -> Result<HookExecution, Error> {
         let bookmark_state = hook_repo.get_bookmark_state(ctx, bookmark).await?;
         if !bookmark_state.is_new() {
-            return Ok(HookExecution::Accepted);
+            return Ok(HookExecution::accepted());
         }
 
         check_lfsconfig_for_dewey_url(ctx, hook_repo, to.get_changeset_id()).await
@@ -193,7 +192,7 @@ mod tests {
                 PushAuthoredBy::User,
             )
             .await?,
-            HookExecution::Accepted,
+            HookExecution::accepted(),
         );
         Ok(())
     }
@@ -230,7 +229,7 @@ mod tests {
                 PushAuthoredBy::User,
             )
             .await?,
-            HookExecution::Accepted,
+            HookExecution::accepted(),
         );
         Ok(())
     }
@@ -267,7 +266,7 @@ mod tests {
                 PushAuthoredBy::User,
             )
             .await?,
-            HookExecution::Accepted,
+            HookExecution::accepted(),
         );
         Ok(())
     }
@@ -306,7 +305,7 @@ mod tests {
             PushAuthoredBy::User,
         )
         .await?;
-        assert!(matches!(result, HookExecution::Rejected(_)));
+        assert!(result.is_rejected());
         Ok(())
     }
 
@@ -346,7 +345,7 @@ mod tests {
             PushAuthoredBy::User,
         )
         .await?;
-        assert!(matches!(result, HookExecution::Rejected(_)));
+        assert!(result.is_rejected());
         Ok(())
     }
 
@@ -384,7 +383,7 @@ mod tests {
             PushAuthoredBy::User,
         )
         .await?;
-        assert!(matches!(result, HookExecution::Rejected(_)));
+        assert!(result.is_rejected());
         Ok(())
     }
 
@@ -422,7 +421,7 @@ mod tests {
             PushAuthoredBy::User,
         )
         .await?;
-        assert!(matches!(result, HookExecution::Rejected(_)));
+        assert!(result.is_rejected());
         Ok(())
     }
 
@@ -460,7 +459,7 @@ mod tests {
             PushAuthoredBy::User,
         )
         .await?;
-        assert!(matches!(result, HookExecution::Rejected(_)));
+        assert!(result.is_rejected());
         Ok(())
     }
 
@@ -496,7 +495,7 @@ mod tests {
                 PushAuthoredBy::User,
             )
             .await?,
-            HookExecution::Accepted,
+            HookExecution::accepted(),
         );
         Ok(())
     }
@@ -535,7 +534,7 @@ mod tests {
             PushAuthoredBy::User,
         )
         .await?;
-        assert!(matches!(result, HookExecution::Rejected(_)));
+        assert!(result.is_rejected());
         Ok(())
     }
 
@@ -573,7 +572,7 @@ mod tests {
                 PushAuthoredBy::User,
             )
             .await?,
-            HookExecution::Accepted,
+            HookExecution::accepted(),
         );
         Ok(())
     }
@@ -615,7 +614,7 @@ mod tests {
                 PushAuthoredBy::User,
             )
             .await?,
-            HookExecution::Accepted,
+            HookExecution::accepted(),
         );
         Ok(())
     }
@@ -656,7 +655,7 @@ mod tests {
             PushAuthoredBy::User,
         )
         .await?;
-        assert!(matches!(result, HookExecution::Rejected(_)));
+        assert!(result.is_rejected());
         Ok(())
     }
 }

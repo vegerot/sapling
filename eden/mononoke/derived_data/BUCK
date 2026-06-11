@@ -89,6 +89,7 @@ rust_library(
         "fbsource//third-party/rust:async-recursion",
         "fbsource//third-party/rust:async-trait",
         "fbsource//third-party/rust:futures",
+        "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tracing",
@@ -166,7 +167,6 @@ rust_library(
         "//eden/mononoke/derived_data:derived_data_manager",
         "//eden/mononoke/derived_data/remote/if:derived_data_service_if-rust",
         "//eden/mononoke/manifest:manifest",
-        "//eden/mononoke/metaconfig:metaconfig_types",
         "//eden/mononoke/mononoke_types:mononoke_types",
         "//eden/mononoke/repo_attributes/restricted_paths_common:restricted_paths_common",
         "//eden/mononoke/servers/slapi/slapi_server/context:context",
@@ -210,12 +210,14 @@ rust_library(
         "//common/rust/shed/sorted_vector_map:sorted_vector_map",
         "//common/rust/shed/stats:stats",
         "//eden/mononoke/blobstore:blobstore",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/derived_data:derived_data",
         "//eden/mononoke/derived_data:derived_data_manager",
         "//eden/mononoke/derived_data/remote/if:derived_data_service_if-rust",
         "//eden/mononoke/manifest:manifest",
         "//eden/mononoke/mononoke_types:mononoke_types",
         "//eden/mononoke/servers/slapi/slapi_server/context:context",
+        "//thrift/lib/rust:fbthrift",
     ],
 )
 
@@ -311,6 +313,7 @@ rust_library(
         "//common/rust/shed/cloned:cloned",
         "//eden/mononoke/blobstore:blobstore",
         "//eden/mononoke/common/mononoke_macros:mononoke_macros",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/derived_data/remote/if:derived_data_service_if-rust",
         "//eden/mononoke/manifest:manifest",
         "//eden/mononoke/mononoke_types:mononoke_types",
@@ -320,7 +323,7 @@ rust_library(
 
 rust_library(
     name = "blame",
-    srcs = glob(["blame/*.rs"]),
+    srcs = glob(["blame/**/*.rs"]),
     autocargo = {"cargo_toml_dir": "blame"},
     named_deps = {"tracing": "fbsource//third-party/rust:tracing"},
     test_deps = [
@@ -329,9 +332,14 @@ rust_library(
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/fbinit:fbinit-tokio",
         "//eden/mononoke/common/mononoke_macros:mononoke_macros",
+        "//eden/mononoke/features/changesets_creation:changesets_creation",
         "//eden/mononoke/repo_attributes/bonsai_hg_mapping:bonsai_hg_mapping",
         "//eden/mononoke/repo_attributes/bookmarks:bookmarks",
         "//eden/mononoke/repo_attributes/commit_graph/commit_graph:commit_graph",
+        "//eden/mononoke/repo_attributes/filestore:filestore",
+        "//eden/mononoke/repo_attributes/repo_blobstore:repo_blobstore",
+        "//eden/mononoke/repo_attributes/repo_derivation_queues/if:derivation_queue_thrift-rust",
+        "//eden/mononoke/repo_attributes/repo_derived_data:repo_derived_data",
         "//eden/mononoke/repo_attributes/repo_identity:repo_identity",
         "//eden/mononoke/repo_factory:test_repo_factory",
         "//eden/mononoke/tests/utils:tests_utils",
@@ -350,6 +358,7 @@ rust_library(
         "//common/rust/shed/lock_ext:lock_ext",
         "//eden/mononoke/blobstore:blobstore",
         "//eden/mononoke/common/mononoke_macros:mononoke_macros",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/derived_data/history_manifest:history_manifest",
         "//eden/mononoke/derived_data/remote/if:derived_data_service_if-rust",
         "//eden/mononoke/manifest:manifest",
@@ -532,6 +541,7 @@ rust_library(
         "//eden/mononoke/manifest:manifest",
         "//eden/mononoke/mononoke_types:mononoke_types",
         "//eden/mononoke/servers/slapi/slapi_server/context:context",
+        "//thrift/lib/rust:fbthrift",
     ],
 )
 
@@ -779,6 +789,7 @@ rust_library(
         ":fsnodes",
         "//common/rust/shed/cloned:cloned",
         "//eden/mononoke/blobstore:blobstore",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/common/scuba_ext:scuba_ext",
         "//eden/mononoke/derived_data:derived_data_manager",
         "//eden/mononoke/derived_data/remote/if:derived_data_service_if-rust",
@@ -788,6 +799,7 @@ rust_library(
         "//eden/mononoke/repo_attributes/filestore:filestore",
         "//eden/mononoke/repo_attributes/restricted_paths_acl_file:restricted_paths_acl_file",
         "//eden/mononoke/servers/slapi/slapi_server/context:context",
+        "//thrift/lib/rust:fbthrift",
     ],
 )
 

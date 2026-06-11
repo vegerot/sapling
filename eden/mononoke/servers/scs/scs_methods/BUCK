@@ -6,14 +6,20 @@ oncall("scm_server_treehugger")
 rust_library(
     name = "scs_methods",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {"cargo_toml_config": {
-        "dependencies_override": {"dependencies": {"gix-hash": {"features": ["sha1"]}}},
-    }},
+    autocargo = {
+        "cargo_toml_config": {
+            "dependencies_override": {"dependencies": {"gix-hash": {"features": ["sha1"]}}},
+        }
+    },
     crate_root = "src/lib.rs",
-    named_deps = ({} if rust_oss.is_oss_build() else {
-        "MononokeScsRequest_ods3_types": "//eden/mononoke/facebook/ods3_schemas:MononokeScsRequest_ods3-rust",
-        "client_identifier_structs": "//core_infra_security/thrift_authentication_module:client_identifier_structs-rust",
-    }),
+    named_deps = (
+        {}
+        if rust_oss.is_oss_build()
+        else {
+            "MononokeScsRequest_ods3_types": "//eden/mononoke/facebook/ods3_schemas:MononokeScsRequest_ods3-rust",
+            "client_identifier_structs": "//core_infra_security/thrift_authentication_module:client_identifier_structs-rust",
+        }
+    ),
     test_deps = [
         "//common/rust/shed/fbinit:fbinit-tokio",
         "//eden/mononoke/common/sql_construct:sql_construct",
@@ -48,7 +54,6 @@ rust_library(
         "//common/rust/shed/futures_ext:futures_ext",
         "//common/rust/shed/futures_retry:futures_retry",
         "//common/rust/shed/futures_stats:futures_stats",
-        "//common/rust/shed/justknobs_stub:justknobs",
         "//common/rust/shed/sorted_vector_map:sorted_vector_map",
         "//common/rust/shed/stats:stats",
         "//common/rust/shed/time_ext:time_ext",
@@ -69,6 +74,7 @@ rust_library(
         "//eden/mononoke/common/mononoke_configs:mononoke_configs",
         "//eden/mononoke/common/mononoke_macros:mononoke_macros",
         "//eden/mononoke/common/permission_checker:permission_checker",
+        "//eden/mononoke/common/rust/justknobs_ext:justknobs",
         "//eden/mononoke/common/scribe_ext:scribe_ext",
         "//eden/mononoke/common/scuba_ext:scuba_ext",
         "//eden/mononoke/derived_data:derived_data_manager",
@@ -110,9 +116,14 @@ rust_library(
         "//infrasec/authorization/if:if-service-rust-srclients",
         "//infrasec/authorization/review:review-thrift-rust",
         "//login/if:login_objects_thrift-rust",
-    ] + ([] if rust_oss.is_oss_build() else [
-        "fbsource//third-party/rust:lazy_static",
-        "//eden/mononoke/facebook/ods3_schemas:MononokeScsRequest_ods3-rs_bindings",
-        "//common/rust/configo:configo",
-    ]),
+    ]
+    + (
+        []
+        if rust_oss.is_oss_build()
+        else [
+            "fbsource//third-party/rust:lazy_static",
+            "//eden/mononoke/facebook/ods3_schemas:MononokeScsRequest_ods3-rs_bindings",
+            "//common/rust/configo:configo",
+        ]
+    ),
 )

@@ -106,8 +106,6 @@ define_stats! {
 
 const SERVICE_NAME: &str = "mononoke_git_server";
 const SM_CLEANUP_TIMEOUT_SECS: u64 = 60;
-/// The sampling rate for perf logging, default to 1 for no sampling
-const PERF_LOG_SAMPLING: u64 = 1;
 /// Configerator path for rate limiting config
 const CONFIGERATOR_RATE_LIMITING_CONFIG: &str = "scm/mononoke/ratelimiting/git_ratelimits";
 /// JustKnob to enable vectored writes for HTTP/1.1 connections.
@@ -123,15 +121,14 @@ const SHUTDOWN_GRACE_PERIOD_OVERRIDE: &str = "scm/mononoke:git_server_shutdown_g
 // More info: https://fburl.com/wiki/i78i3uzk
 const CACHE_OBJECT_SIZE: usize = 256 * 1024;
 
-struct DynamicGracePeriod {
-    fallback: Duration,
-}
+struct DynamicGracePeriod;
 
 impl ShutdownGracePeriod for DynamicGracePeriod {
     fn resolve(&self) -> Duration {
-        justknobs::get_as::<u64>(SHUTDOWN_GRACE_PERIOD_OVERRIDE, None)
-            .map(Duration::from_secs)
-            .unwrap_or(self.fallback)
+        Duration::from_secs(justknobs::get_as::<u64>(
+            SHUTDOWN_GRACE_PERIOD_OVERRIDE,
+            None,
+        ))
     }
 }
 
@@ -211,6 +208,13 @@ struct GitServerArgs {
     /// shadow traffic, preventing forwarding loops.
     #[clap(long, default_value_t = false)]
     shadow_tier: bool,
+    /// On per-push gitimport failure, persist `bonsai_git_mapping` rows
+    /// for commits already fully processed so retries can resume
+    /// incrementally. Also surfaces the real underlying error to Scuba
+    /// instead of the SendError cascade. See
+    /// `GitimportPreferences::persist_partial_mappings`.
+    #[clap(long, default_value_t = false)]
+    persist_partial_mappings: bool,
 }
 
 #[derive(Clone)]
@@ -246,9 +250,7 @@ fn construct_memory_health_check(
             "scm/mononoke:git_server_enable_memory_health_check",
             None,
             None,
-        )
-        .expect("JustKnob scm/mononoke:git_server_enable_memory_health_check not found")
-        {
+        ) {
             return true;
         }
         let util_pct = match STATS::container_memory
@@ -305,7 +307,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     let listen_port = args.listen_port.clone();
     let bound_addr_path = args.bound_address_file.clone();
 
-    let addr = format!("{}:{}", listen_host, listen_port);
+    let addr = format!("{listen_host}:{listen_port}");
     let common_config = app.repo_configs().common.clone();
     let tls_acceptor = args
         .tls_params
@@ -405,6 +407,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                 tls_args,
                 acl_provider.clone(),
                 args.multi_repo_land_service_address,
+                args.persist_partial_mappings,
             );
 
             let router = build_router(git_server_context);
@@ -412,8 +415,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
             let capture_session_data = tls_session_data_log.is_some();
             let mut git_scuba = scuba.clone();
             let perf_sampling =
-                justknobs::get_as::<u64>("scm/mononoke:git_server_perf_log_sampling", None)
-                    .unwrap_or(PERF_LOG_SAMPLING);
+                justknobs::get_as::<u64>("scm/mononoke:git_server_perf_log_sampling", None);
             git_scuba.sampled(perf_sampling.try_into()?);
             let handler = MononokeHttpHandler::builder()
                 .add(TlsSessionDataMiddleware::new(tls_session_data_log)?)
@@ -493,8 +495,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
             let serve = async move {
                 let http1_vectored_writes =
-                    justknobs::eval(HTTP1_VECTORED_WRITES, None, Some(SERVICE_NAME))
-                        .unwrap_or(false);
+                    justknobs::eval(HTTP1_VECTORED_WRITES, None, Some(SERVICE_NAME));
 
                 if let Some(tls_acceptor) = tls_acceptor {
                     let connection_security_checker =
@@ -516,16 +517,14 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
             pin_mut!(serve);
             try_select(
                 serve,
-                shutdown_rx.map_err(|err| anyhow!("Cancelled channel: {}", err)),
+                shutdown_rx.map_err(|err| anyhow!("Cancelled channel: {err}")),
             )
             .await
             .map_err(|e| futures::future::Either::factor_first(e).0)?;
             Ok(())
         }
     };
-    let shutdown_grace_period = DynamicGracePeriod {
-        fallback: args.shutdown_timeout_args.shutdown_grace_period,
-    };
+    let shutdown_grace_period = DynamicGracePeriod;
     app.run_until_terminated(
         server,
         move || {

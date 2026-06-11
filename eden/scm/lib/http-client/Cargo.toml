@@ -20,14 +20,14 @@ curl = { version = "0.4.49", features = ["http2", "static-ssl"] }
 curl-sys = "0.4.87"
 flume = "0.11.1"
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
-http = "1.4.0"
+http = "=1.4.0"
 lru-cache = "0.1.2"
 maplit = "1.0"
 once_cell = "1.21.4"
-openssl = "0.10.72"
+openssl = "0.10.80"
 parking_lot = { version = "0.12.1", features = ["arc_lock", "send_guard"] }
 paste = "1.0.14"
-pin-project = "1.1.11"
+pin-project = "1.1.13"
 regex = "1.12.3"
 sapling-async-runtime = { version = "0.1.0", path = "../async-runtime" }
 sapling-clientinfo = { version = "0.1.0", path = "../clientinfo" }

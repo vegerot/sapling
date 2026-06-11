@@ -14,12 +14,11 @@ doc = false
 
 [dependencies]
 async_limiter = { version = "0.1.0", path = "../../../../common/async_limiter" }
-chrono = { version = "0.4.44", features = ["clock", "serde", "std"], default-features = false }
+chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 governor = "0.10.4"
 metadata = { version = "0.1.0", path = "../../../../common/metadata" }
 mononoke_macros = { version = "0.1.0", path = "../../../../common/mononoke_macros" }
-permission_checker = { version = "0.1.0", path = "../../../../common/permission_checker" }
 rate_limiting = { version = "0.1.0", path = "../../../../common/rate_limiting" }
 sapling-clientinfo = { version = "0.1.0", path = "../../../../../scm/lib/clientinfo" }
 scribe_ext = { version = "0.1.0", path = "../../../../common/scribe_ext" }

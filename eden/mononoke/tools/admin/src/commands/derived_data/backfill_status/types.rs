@@ -58,7 +58,7 @@ impl std::fmt::Display for RepoStatus {
             RepoStatus::Completed => "completed",
             RepoStatus::Failed => "failed",
         };
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -82,6 +82,18 @@ impl TimingStats {
     }
 }
 
+/// Settings the backfill was enqueued with, decoded from the root request's
+/// `DeriveBackfillParams` blob. These are the knobs passed to
+/// `backfill-enqueue` (slice size, concurrency, etc.).
+pub(super) struct BackfillSettings {
+    pub slice_size: i64,
+    pub boundaries_concurrency: i32,
+    pub num_boundary_requests: i32,
+    pub rederive: bool,
+    pub reslice: bool,
+    pub config_name: Option<String>,
+}
+
 /// Common display data for backfill status views
 pub(super) struct BackfillDisplayData {
     pub request_id: RowId,
@@ -90,6 +102,7 @@ pub(super) struct BackfillDisplayData {
     pub aggregate_status: RepoStatus,
     pub request_type: String,
     pub derived_data_type: Option<String>,
+    pub settings: Option<BackfillSettings>,
     pub total_requests: usize,
     pub status_counts: Vec<(RequestStatus, usize)>,
     pub type_breakdown: Vec<(String, Vec<(RequestStatus, usize)>)>,
@@ -165,6 +178,23 @@ pub(super) struct BackfillChildDisplayData {
     pub params: BackfillChildParams,
     pub result: Option<BackfillChildResult>,
     pub boundary_derivation_status: Option<BoundaryDerivationStatus>,
+}
+
+pub(super) struct RepoDetailRow {
+    pub repo_id: i64,
+    pub repo_name: Option<String>,
+    pub status: RepoStatus,
+    pub derived: usize,
+    pub total: usize,
+}
+
+/// A single child request (derive_boundaries / derive_slice) of a backfill,
+/// rendered as a row in the single-repo detailed view.
+pub(super) struct ChildRequestRow {
+    pub id: u64,
+    pub request_type: String,
+    pub status: RequestStatus,
+    pub claimed_by: Option<String>,
 }
 
 /// Counts of child requests grouped by their effective state. All four

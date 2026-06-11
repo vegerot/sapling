@@ -10,13 +10,11 @@ use std::fs::Metadata;
 use std::io;
 use std::io::ErrorKind;
 use std::io::Read;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use anyhow::Context;
@@ -34,6 +32,7 @@ use util::no_follow::LiteMetadata;
 use util::no_follow::NoFollowRoot;
 use util::no_follow::OpenFlags;
 use util::no_follow::normalize_not_directory;
+use util::path::symlink_file;
 
 use crate::pathauditor::PathAuditor;
 
@@ -78,27 +77,6 @@ impl std::fmt::Display for ClearConflictError {
 
 impl std::error::Error for ClearConflictError {}
 
-fn reset_open_file_permissions(file: &File, flags: OpenFlags, mode: u32) -> io::Result<()> {
-    if !flags.intersects(OpenFlags::TRUNCATE | OpenFlags::CREATE_NEW) {
-        return Ok(());
-    }
-
-    // Legacy vfs.py write paths unlink and recreate the destination before
-    // opening it, so writes reset the mode even when the file already exists.
-    // Apply umask here to preserve normal file creation permissions.
-    set_file_permissions(file, util::file::apply_umask(mode))
-}
-
-#[cfg(unix)]
-fn set_file_permissions(file: &File, mode: u32) -> io::Result<()> {
-    file.set_permissions(std::fs::Permissions::from_mode(mode))
-}
-
-#[cfg(windows)]
-fn set_file_permissions(_file: &File, _mode: u32) -> io::Result<()> {
-    Ok(())
-}
-
 fn normalize_not_directory_anyhow(err: anyhow::Error) -> anyhow::Error {
     match err.downcast::<io::Error>() {
         Ok(err) => normalize_not_directory(err).into(),
@@ -109,7 +87,7 @@ fn normalize_not_directory_anyhow(err: anyhow::Error) -> anyhow::Error {
 fn path_component_from_dir_entry(name: std::ffi::OsString) -> Result<PathComponentBuf> {
     let name = name
         .into_string()
-        .map_err(|name| anyhow::format_err!("directory entry is not UTF-8: {:?}", name))?;
+        .map_err(|name| anyhow::format_err!("directory entry is not UTF-8: {name:?}"))?;
     Ok(PathComponentBuf::from_string(name)?)
 }
 
@@ -124,7 +102,9 @@ struct Inner {
     // initialization.
     no_follow: OnceLock<NoFollowRoot>,
     auditor: PathAuditor,
-    supports_symlinks: AtomicBool,
+    // For unknown (or undecided, e.g. fuse) fstype, lazily initialized to delay
+    // or avoid real detection temp file side effect.
+    supports_symlinks: OnceLock<bool>,
     supports_executables: bool,
     case_sensitive: bool,
     /// Whether to automatically blow away conflicting paths/directories in order to successfully
@@ -175,9 +155,13 @@ impl VFS {
     fn new_inner(root: PathBuf, overwrite_path_conflicts: bool) -> Result<Self> {
         let fs_type = fstype(&root)
             .map_err(normalize_not_directory_anyhow)
-            .with_context(|| format!("can't construct a VFS for {:?}", root))?;
-        let supports_symlinks = AtomicBool::new(!cfg!(windows));
+            .with_context(|| format!("can't construct a VFS for {root:?}"))?;
         let supports_executables = supports_executables(&fs_type);
+        let known_symlink_support = if std::env::var_os("SL_DEBUG_DISABLE_SYMLINKS").is_some() {
+            Some(false)
+        } else {
+            known_symlink_support(&fs_type)
+        };
         let case_sensitive =
             case_sensitive(&root, &fs_type).map_err(normalize_not_directory_anyhow)?;
         let no_follow = OnceLock::new();
@@ -188,7 +172,9 @@ impl VFS {
                 root,
                 no_follow,
                 auditor,
-                supports_symlinks,
+                supports_symlinks: known_symlink_support
+                    .map(OnceLock::from)
+                    .unwrap_or_default(),
                 supports_executables,
                 case_sensitive,
                 overwrite_path_conflicts,
@@ -243,7 +229,13 @@ impl VFS {
                 root: root.clone(),
                 no_follow: OnceLock::from(no_follow),
                 auditor: PathAuditor::new(&root, self.inner.case_sensitive),
-                supports_symlinks: AtomicBool::new(self.supports_symlinks()),
+                supports_symlinks: self
+                    .inner
+                    .supports_symlinks
+                    .get()
+                    .copied()
+                    .map(OnceLock::from)
+                    .unwrap_or_default(),
                 supports_executables: self.inner.supports_executables,
                 case_sensitive: self.inner.case_sensitive,
                 overwrite_path_conflicts: self.inner.overwrite_path_conflicts,
@@ -312,21 +304,35 @@ impl VFS {
     }
 
     /// Open the regular file at `path` without following symlinks.
+    /// `mode` is only used for newly created files.
     pub fn open(&self, path: &RepoPath, flags: OpenFlags, mode: u32) -> Result<File> {
         self.inner.auditor.audit_components(path)?;
-        match self.no_follow()?.open_file(path, flags, mode) {
-            Ok(file) => {
-                reset_open_file_permissions(&file, flags, mode)?;
-                Ok(file)
+        let mode = util::file::apply_umask(mode);
+        let no_follow = self.no_follow()?;
+
+        if flags.contains(OpenFlags::CREATE | OpenFlags::TRUNCATE) {
+            if let Ok(metadata) = no_follow.symlink_metadata(Some(path)) {
+                let should_remove = (metadata.is_file()
+                    && (metadata.mode() & 0o777) != (mode & 0o777))
+                    || metadata.is_symlink();
+                if should_remove {
+                    match no_follow.remove_file(path) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) => return Err(err.into()),
+                    }
+                }
             }
+        }
+
+        match no_follow.open_file(path, flags, mode) {
+            Ok(file) => Ok(file),
             Err(err) if flags.creates_file() => {
                 let err = anyhow::Error::from(err);
                 self.clear_conflicts(path).with_context(|| {
-                    format!("can't clear conflicts after handling error \"{:#}\"", err)
+                    format!("can't clear conflicts after handling error \"{err:#}\"")
                 })?;
-                let file = self.no_follow()?.open_file(path, flags, mode)?;
-                reset_open_file_permissions(&file, flags, mode)?;
-                Ok(file)
+                Ok(no_follow.open_file(path, flags, mode)?)
             }
             Err(err) => Err(err.into()),
         }
@@ -400,7 +406,7 @@ impl VFS {
                     .into());
                 }
                 self.no_follow()?.remove_dir_all(&prefix).with_context(|| {
-                    format!("can't remove conflicting directory {:?}", conflict_path)
+                    format!("can't remove conflicting directory {conflict_path:?}")
                 })?;
                 break;
             }
@@ -468,7 +474,7 @@ impl VFS {
     /// is the symlink destination for these.
     fn plain_symlink_file(&self, link_name: &RepoPath, link_dest: &Path) -> Result<()> {
         let link_dest = match link_dest.to_str() {
-            None => bail!("not a valid UTF-8 path: {:?}", link_dest),
+            None => bail!("not a valid UTF-8 path: {link_dest:?}"),
             Some(s) => s,
         };
 
@@ -533,7 +539,7 @@ impl VFS {
                 // failures not due to a conflicting file would show up here again, so let's not worry
                 // about it.
                 self.clear_conflicts(path).with_context(|| {
-                    format!("can't clear conflicts after handling error \"{:#}\"", e)
+                    format!("can't clear conflicts after handling error \"{e:#}\"")
                 })?;
 
                 self.write_inner(path, data, flag)
@@ -699,11 +705,14 @@ impl VFS {
     }
 
     pub fn supports_symlinks(&self) -> bool {
-        self.inner.supports_symlinks.load(Ordering::Acquire)
+        *self
+            .inner
+            .supports_symlinks
+            .get_or_init(|| detect_symlink_support(self.root()))
     }
 
     pub fn set_supports_symlinks(&self, value: bool) {
-        self.inner.supports_symlinks.store(value, Ordering::Release)
+        let _ = self.inner.supports_symlinks.set(value);
     }
 
     pub fn supports_executables(&self) -> bool {
@@ -1159,6 +1168,45 @@ fn supports_executables(_fs_type: &FsType) -> bool {
     !cfg!(windows)
 }
 
+fn detect_symlink_support(root: &Path) -> bool {
+    static CHECKLINK_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    loop {
+        let link_path = root.join(format!(
+            "sl-checklink-{}-{}",
+            std::process::id(),
+            CHECKLINK_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        match symlink_file(Path::new("target"), &link_path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&link_path);
+                return true;
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(_) => return false,
+        }
+    }
+}
+
+fn known_symlink_support(fs_type: &FsType) -> Option<bool> {
+    // Keep this table in sync with sapling.fscap's symlink entries. Known
+    // filesystems avoid probe files, which matters for virtual filesystems like
+    // EdenFS where writes can invalidate status caches.
+    match *fs_type {
+        FsType::APFS
+        | FsType::BTRFS
+        | FsType::EDENFS
+        | FsType::EXT4
+        | FsType::HFS
+        | FsType::NTFS
+        | FsType::TMPFS
+        | FsType::UFS
+        | FsType::XFS
+        | FsType::ZFS => Some(true),
+        // Certain fs, like fuse, might or might not support symlink.
+        _ => None,
+    }
+}
+
 /// determines whether FS located at root is case sensitive
 pub fn case_sensitive(root: &Path, fs_type: &FsType) -> Result<bool> {
     // Logic in this function is consistent with util.fscasesensitive in Python
@@ -1305,6 +1353,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_open_truncate_resets_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
         let tmp = tempfile::tempdir().unwrap();
         let vfs = VFS::new_destructive(tmp.path().to_path_buf()).unwrap();
         let path = RepoPath::from_str("file").unwrap();
@@ -1326,6 +1376,38 @@ mod tests {
             fs::metadata(vfs.join(path)).unwrap().permissions().mode() & 0o777,
             util::file::apply_umask(0o644)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_truncate_preserves_existing_file_with_same_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vfs = VFS::new_destructive(tmp.path().to_path_buf()).unwrap();
+        let path = RepoPath::from_str("file").unwrap();
+        vfs.write(path, Blob::from_static(b"old"), UpdateFlag::Regular)
+            .unwrap();
+        fs::set_permissions(
+            vfs.join(path),
+            fs::Permissions::from_mode(util::file::apply_umask(0o644)),
+        )
+        .unwrap();
+        let mut old_file = fs::File::open(vfs.join(path)).unwrap();
+
+        let mut file = vfs
+            .open(
+                path,
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+                0o644,
+            )
+            .unwrap();
+        file.write_all(b"new").unwrap();
+        drop(file);
+
+        let mut content = Vec::new();
+        old_file.read_to_end(&mut content).unwrap();
+        assert_eq!(content, b"new");
     }
 
     #[cfg(unix)]

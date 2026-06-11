@@ -38,7 +38,7 @@ case_conflict_skeleton_manifest = { version = "0.1.0", path = "../../derived_dat
 changeset_info = { version = "0.1.0", path = "../../derived_data/changeset_info" }
 changesets_creation = { version = "0.1.0", path = "../../features/changesets_creation" }
 changesets_uploader = { version = "0.1.0", path = "../../common/cas_client/changesets_uploader" }
-chrono = { version = "0.4.44", features = ["clock", "serde", "std"], default-features = false }
+chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "4.6.0", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cmdlib_cross_repo = { version = "0.1.0", path = "../../cmdlib/cross_repo" }
@@ -57,7 +57,7 @@ deletion_log = { version = "0.1.0", path = "../../repo_attributes/deletion_log" 
 derivation_queue_thrift = { version = "0.1.0", path = "../../repo_attributes/repo_derivation_queues/if" }
 derived_data_manager = { version = "0.1.0", path = "../../derived_data/manager" }
 directory_branch_cluster_manifest = { version = "0.1.0", path = "../../derived_data/directory_branch_cluster_manifest" }
-either = "1.5"
+either = "1.16.0"
 ephemeral_blobstore = { version = "0.1.0", path = "../../blobstore/ephemeral_blobstore" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -73,11 +73,11 @@ git_ref_content_mapping = { version = "0.1.0", path = "../../repo_attributes/git
 git_source_of_truth = { version = "0.1.0", path = "../../repo_attributes/git_source_of_truth" }
 git_symbolic_refs = { version = "0.1.0", path = "../../repo_attributes/git_symbolic_refs" }
 git_types = { version = "0.1.0", path = "../../git/git_types" }
-gix-hash = { version = "0.25.0", features = ["sha1"] }
+gix-hash = { version = "0.25.1", features = ["sha1"] }
 gix-object = "0.60.0"
 history_manifest = { version = "0.1.0", path = "../../derived_data/history_manifest" }
 itertools = "0.14.0"
-justknobs = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+justknobs_ext = { version = "0.1.0", path = "../../common/rust/justknobs_ext" }
 live_commit_sync_config = { version = "0.1.0", path = "../../features/commit_rewriting/live_commit_sync_config" }
 manifest = { version = "0.1.0", path = "../../manifest" }
 maplit = "1.0"
@@ -134,7 +134,7 @@ source_control = { version = "0.1.0", path = "../../scs/if" }
 sql_commit_graph_storage = { version = "0.1.0", path = "../../repo_attributes/commit_graph/sql_commit_graph_storage" }
 sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
 sql_query_config = { version = "0.1.0", path = "../../repo_attributes/sql_query_config" }
-strum = { version = "0.27.1", features = ["derive"] }
+strum = { version = "0.28.0", features = ["derive"] }
 synced_commit_mapping = { version = "0.1.0", path = "../../features/commit_rewriting/synced_commit_mapping" }
 thiserror = "2.0.18"
 time_measuring = { version = "0.1.0", path = "../../common/time_measuring" }

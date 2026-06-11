@@ -21,21 +21,75 @@ from ..sh import Env, Scope
 from ..sh.bufio import BufIO
 from ..sh.interp import interpcode
 from ..t.runtime import TestTmp
-from ..t.shext import shellenv, wrapexe
+from ..t.shext import shellenv, wrap, wrapexe
 from .python import python
+
+
+class _UiOutput:
+    """Binary output wrapper for a ui object passed as rawsystem(out=...)."""
+
+    def __init__(self, ui):
+        self._ui = ui
+
+    @property
+    def closed(self) -> bool:
+        return False
+
+    def write(self, data) -> int:
+        if isinstance(data, str):
+            self._ui.write(data)
+            return len(data)
+        data = bytes(data)
+        self._ui.writebytes(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self._ui.flush()
+
+    def readable(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def isatty(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        pass
+
+
+def _wrap_system_output(out):
+    if (
+        out is not None
+        and out.__class__.__module__ == "sapling.ui"
+        and out.__class__.__name__ == "ui"
+    ):
+        # ui.system(..., subproc=True) passes the ui object itself as
+        # rawsystem(out=...) so subprocess output is captured by the active
+        # ui buffer. debugruntest's nested in-process commands need binary-ish
+        # IO instead, so write through ui.writebytes() to keep that capture.
+        return _UiOutput(out)
+    return out
 
 
 def testsetup(t: TestTmp):
     _checkenvironment()
 
     testdir = t.getenv("TESTDIR")
+    runtestdir = _get_runtestdir(t)
+    environ_before_test = os.environ.copy()
+    source_root = os.path.dirname(testdir)
 
     # consider run-tests.py --watchman
     use_watchman = os.getenv("HGFSMONITOR_TESTS") == "1"
 
-    # extra hgrc fixup via $TESTDIR/features.py
+    # extra hgrc fixup via $RUNTESTDIR/features.py
     testfile = t.getenv("TESTFILE")
-    featurespy = os.path.join(testdir, "features.py")
+    featurespy = os.path.join(runtestdir, "features.py")
 
     inprocesshg = True
     modernconfigs = True
@@ -47,7 +101,7 @@ def testsetup(t: TestTmp):
         if "#modern-config-incompatible" in content:
             modernconfigs = False
 
-    hgrc = _get_hgrc(testdir, use_watchman, str(t.path), modernconfigs)
+    hgrc = _get_hgrc(runtestdir, use_watchman, str(t.path), modernconfigs)
 
     hgrcpath = t.path / "config"
     hgrcpath.write_bytes(hgrc.encode())
@@ -61,8 +115,8 @@ def testsetup(t: TestTmp):
                 testname = os.path.basename(testfile)
                 setup(testname, str(hgrcpath))
 
-    # the 'f' utility in $TESTDIR/f
-    fpath = os.path.join(testdir, "f")
+    # the 'f' utility in $RUNTESTDIR/f
+    fpath = os.path.join(runtestdir, "f")
     if os.path.exists(fpath):
         fmain = None
 
@@ -109,6 +163,7 @@ def testsetup(t: TestTmp):
         "LC_ALL": "en_US.UTF-8",
         "LOCALIP": "127.0.0.1",
         "RUST_BACKTRACE": "0",
+        "RUNTESTDIR": runtestdir,
         "SL_CONFIG_PATH": str(hgrcpath),
         # Normalize TERM to avoid control sequence variations.
         # We use a non-existent terminal to avoid any terminfo dependency.
@@ -139,8 +194,7 @@ def testsetup(t: TestTmp):
     for k, v in environ.items():
         t.setenv(k, v)
 
-    # source tinit.sh
-    tinitpath = os.path.join(testdir, "tinit.sh")
+    tinitpath = os.path.join(runtestdir, "tinit.sh")
     if os.path.exists(tinitpath):
         with open(tinitpath, "rb") as f:
             t.sheval(f.read().decode())
@@ -171,6 +225,8 @@ def testsetup(t: TestTmp):
         hgpath = sys.executable
 
     if hgpath:
+        _register_source_files_command(t, source_root, environ_before_test, hgpath)
+
         # provide access to the real binary
         # set symlink=True, since going through cmd.exe to execute
         # `.bat` is incompatilbe with node IPC channel.
@@ -192,6 +248,43 @@ def testsetup(t: TestTmp):
     if run is not None and inprocesshg:
         t.command(sl)
         t.command(hg)
+
+
+def _register_source_files_command(
+    t: TestTmp,
+    source_root: str,
+    base_environ: dict[str, str],
+    hgpath: str,
+) -> None:
+    def sl_source_files(args, stdout, stderr) -> int:
+        if _invalid_source_files_arg(args):
+            stderr.write(
+                b"abort: sl-source-files expects one non-option glob pattern\n"
+            )
+            return 1
+
+        env = {
+            name: base_environ[name]
+            for name in ("HOME", "LANG", "LC_ALL", "PATH", "TMP", "TMPDIR", "USER")
+            if name in base_environ
+        }
+        proc = subprocess.run(
+            [hgpath, "files", f"glob:{args[0]}"],
+            cwd=source_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stdout.write(proc.stdout)
+        if proc.returncode:
+            stderr.write(proc.stderr)
+        return proc.returncode
+
+    t.shenv.cmdtable["sl-source-files"] = wrap(sl_source_files)
+
+
+def _invalid_source_files_arg(args: list[str]) -> bool:
+    return len(args) != 1 or args[0].startswith("-")
 
 
 _checkedenvironment = False
@@ -254,8 +347,11 @@ def _sl_impl(stdin: BinaryIO, stdout: BinaryIO, stderr: BinaryIO, env: Env) -> i
             return hg_external(stdin=stdin, stdout=stdout, stderr=stderr, env=env)
 
     # debugpython won't work - emulate Py_Main instead
-    if env.args[1:3] == ["debugpython", "--"]:
-        env.args = [env.args[0]] + env.args[3:]
+    if env.args[1:2] == ["debugpython"]:
+        if env.args[2:3] == ["--"]:
+            env.args = [env.args[0]] + env.args[3:]
+        else:
+            env.args = [env.args[0]] + env.args[2:]
         args = env.args[1:]
         return python(args, stdin, stdout, stderr, env)
 
@@ -266,7 +362,7 @@ def _sl_impl(stdin: BinaryIO, stdout: BinaryIO, stderr: BinaryIO, env: Env) -> i
     rawsystem = partial(_rawsystem, env, stdin, stdout, stderr)
     origstdio = (util.stdin, util.stdout, util.stderr)
 
-    # bindings.commands.run might keep the stdio strems to prevent
+    # bindings.commands.run might keep the stdio streams to prevent
     # file deletion (for example, if stdout redirects to a file).
     # Workaround that by using a temporary in-memory stream.
     if os.name == "nt":
@@ -336,11 +432,16 @@ def _setupmodernclient(t: TestTmp):
     t.setenv("COMMITCLOUD", 1)
 
 
+def _get_runtestdir(t: TestTmp) -> str:
+    return os.path.abspath(t.getenv("RUNTESTDIR") or t.getenv("TESTDIR"))
+
+
 def _rawsystem(
     shenv, stdin, stdout, stderr, orig, cmd: str, environ=None, cwd=None, out=None
 ):
     # use testing.sh.interpcode to run the command
     env = shenv.nested(Scope.SHELL)
+    out = _wrap_system_output(out)
     env.stdin = stdin
     env.stdout = out or stdout
     env.stderr = out or stderr

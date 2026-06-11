@@ -658,6 +658,7 @@ impl Request {
     /// concurrent requests or large requests that require
     /// progress reporting.
     pub fn send(self) -> Result<Response, HttpClientError> {
+        crate::check_not_shutting_down()?;
         let mut easy: Easy2H = self.try_into()?;
         let res = easy.perform();
         let ctx = easy.get_mut().request_context_mut();
@@ -742,6 +743,8 @@ impl Request {
 
         let handler = create_handler(self.ctx);
 
+        crate::check_not_shutting_down()?;
+        crate::init_openssl();
         let mut easy = Easy2H::new(handler);
 
         easy.url(url.as_str())?;
@@ -821,7 +824,7 @@ impl Request {
         // Add headers.
         let mut headers = List::new();
         for (name, value) in self.headers.iter() {
-            let header = format!("{}: {}", name, value);
+            let header = format!("{name}: {value}");
             headers.append(&header)?;
         }
         easy.http_headers(headers)?;
@@ -935,6 +938,7 @@ pub struct StreamRequest {
 
 impl StreamRequest {
     pub(crate) fn send(self) -> Result<(), HttpClientError> {
+        crate::check_not_shutting_down()?;
         let claim = self.request.claimer.claim_request();
         let mut easy: Easy2H = self.into_easy(claim)?;
         let res = easy

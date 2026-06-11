@@ -1512,6 +1512,7 @@ function gitimport() {
     --tls-private-key "$TEST_CERTDIR/client0.key" \
     --tls-certificate "$TEST_CERTDIR/client0.crt" \
     --tracing-test-format \
+    --persist-partial-mappings \
     "$@"
 }
 
@@ -1535,7 +1536,7 @@ function git() {
   GIT_AUTHOR_DATE="${GIT_AUTHOR_DATE:-$date}" \
   GIT_AUTHOR_NAME="$name" \
   GIT_AUTHOR_EMAIL="$email" \
-  command git -c transfer.bundleURI=false -c init.defaultBranch=master_bookmark -c protocol.file.allow=always "$@"
+  command git -c transfer.bundleURI=false -c init.defaultBranch=master_bookmark -c protocol.file.allow=always -c commit.recordPredecessor=false "$@"
 }
 
 function git_set_only_author() {
@@ -1546,7 +1547,7 @@ function git_set_only_author() {
   GIT_AUTHOR_DATE="$date" \
   GIT_AUTHOR_NAME="$name" \
   GIT_AUTHOR_EMAIL="$email" \
-  command git -c init.defaultBranch=master_bookmark -c protocol.file.allow=always "$@"
+  command git -c init.defaultBranch=master_bookmark -c protocol.file.allow=always -c commit.recordPredecessor=false "$@"
 }
 
 function summarize_scuba_json() {

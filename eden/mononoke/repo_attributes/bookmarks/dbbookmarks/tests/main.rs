@@ -46,7 +46,6 @@ use mononoke_types_mocks::repo::REPO_TWO;
 use mononoke_types_mocks::repo::REPO_ZERO;
 use quickcheck_arbitrary_derive::Arbitrary;
 use sql::mysql_async::Value;
-use sql::mysql_async::prelude::ConvIr;
 use sql_construct::SqlConstruct;
 
 fn create_bookmark_name(book: &str) -> BookmarkKey {
@@ -1065,7 +1064,7 @@ fn test_update_reason_conversion() -> Result<(), Error> {
 
     for reason in reasons {
         let value = Value::from(reason);
-        BookmarkUpdateReason::new(value)?;
+        BookmarkUpdateReason::try_from(value)?;
     }
 
     Ok(())
@@ -1839,8 +1838,8 @@ async fn test_per_bookmark_locking_log_ids_monotonic(fb: FacebookInit) {
             let id3 = txn.commit().await.unwrap().unwrap();
 
             // IDs should be strictly increasing
-            assert!(id2 > id1, "id2 ({}) should be > id1 ({})", id2, id1);
-            assert!(id3 > id2, "id3 ({}) should be > id2 ({})", id3, id2);
+            assert!(id2 > id1, "id2 ({id2}) should be > id1 ({id1})");
+            assert!(id3 > id2, "id3 ({id3}) should be > id2 ({id2})");
         }
         .boxed(),
     )
