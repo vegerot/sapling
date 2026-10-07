@@ -62,6 +62,7 @@ from . import (
     repository,
     revset,
     revsetlang,
+    rewriteutil,
     scmutil,
     signing,
     smallcommitmetadata,
@@ -73,7 +74,6 @@ from . import (
 )
 from .i18n import _, _n
 from .node import bin, hex, nullhex, nullid
-from .utils import subtreeutil
 
 release = lockmod.release
 urlerr = util.urlerr
@@ -1667,8 +1667,8 @@ class localrepository:
           RGenerator) so they won't be read again by the next iteration
           via `draft_titles`.
         """
-        limit = self.ui.configint("experimental", "draft-title-limit") or 1000
-        draftrevs = self.revs("limit(reverse(draft()),%z)", limit).prefetch("text")
+        # allow user override via revsetalias._interestingdraft config.
+        draftrevs = self.anyrevs(["_interestingdraft()"], user=True).prefetch("text")
 
         def gen():
             for c in draftrevs.iterctx():
@@ -1776,14 +1776,10 @@ class localrepository:
         if tr is not None:
             return tr.nest(desc)
 
-        if not lockfree:
-            try:
-                self.svfs.stat("journal")
-            except FileNotFoundError:
-                # No existing transaction - this is the normal case.
-                pass
-            else:
-                self.recover()
+        # An existing journal means a previous transaction was interrupted.
+        # Lock-free transactions do not own the journal file.
+        if not lockfree and self.svfs.exists("journal"):
+            self.recover()
 
         idbase = b"%.40f#%f" % (random.random(), time.time())
         ha = hex(hashlib.sha1(idbase).digest())
@@ -1914,12 +1910,15 @@ class localrepository:
                 # In __del__, the repo is no longer valid.
                 return
             if success:
-                # this should be explicitly invoked here, because
-                # in-memory changes aren't written out at closing
-                # transaction, if tr.addfilegenerator (via
-                # dirstate.write or so) isn't invoked while
-                # transaction running
-                repo.dirstate.write(None)
+                # Lock-free transactions do not modify dirstate and might not
+                # hold the working copy lock required to write it.
+                if not tr.lockfree:
+                    # this should be explicitly invoked here, because
+                    # in-memory changes aren't written out at closing
+                    # transaction, if tr.addfilegenerator (via
+                    # dirstate.write or so) isn't invoked while
+                    # transaction running
+                    repo.dirstate.write(None)
                 repo._txnreleased = True
             else:
                 # discard all changes (including ones already written
@@ -1928,6 +1927,7 @@ class localrepository:
                     repo.dirstate.restorebackup(None, "journal.dirstate")
 
                 repo.invalidate(clearfilecache=True)
+                repo.invalidatemetalog()
 
         tr = transaction.transaction(
             rp,
@@ -1943,6 +1943,8 @@ class localrepository:
             uiconfig=self.ui.uiconfig(),
             desc=desc,
             lockfree=lockfree,
+            pendingroot=self.root,
+            sharedpendingroot=self.sharedroot,
         )
         tr.changes["nodes"] = []
         tr.changes["obsmarkers"] = set()
@@ -2007,7 +2009,12 @@ class localrepository:
 
                 repo.hook("txnclose", throw=False, txnname=desc, **hookargs)
 
-            reporef()._afterlock(hookfunc)
+            if tr2.lockfree:
+                # There is no lock to defer the hook through. Run it after the
+                # transaction has committed its final metalog root instead.
+                tr2.addpostclose("txnclose-hook", lambda _tr: hookfunc())
+            else:
+                reporef()._afterlock(hookfunc)
 
         tr.addfinalize("txnclose-hook", txnclosehook)
         tr.addpostclose("warms-cache", self._buildcacheupdater(tr))
@@ -2297,6 +2304,10 @@ class localrepository:
     def invalidatemetalog(self):
         """Invalidates the metalog. Discard pending changes."""
         self.svfs.invalidatemetalog()
+        # The bookmark store is changed in place while a transaction runs and
+        # only written to the metalog when it closes, so after a rollback its
+        # metalog cache key still matches and it has to be dropped explicitly.
+        self.__dict__.pop("_bookmarks", None)
 
     def invalidateall(self):
         """Fully invalidates both store and non-store parts, causing the
@@ -2822,6 +2833,7 @@ class localrepository:
         user = ctx.user()
 
         isgit = git.isgitformat(self)
+        rewriteutil.commitcheck(self, ctx)
         lock = self.lock()
         try:
             tr = self.transaction("commit")
@@ -2835,11 +2847,6 @@ class localrepository:
             extra = ctx.extra().copy()
             if isgit:
                 git.update_extra_with_git_committer(self.ui, ctx, extra)
-
-            if subtreeutil.extra_contains_shallow_copy(extra):
-                # the file list can be large for a shallow copy, so don't
-                # put it in the files of commit text
-                files = []
 
             n = self.changelog.add(
                 mn,

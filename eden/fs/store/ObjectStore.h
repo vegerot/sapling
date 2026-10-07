@@ -20,6 +20,7 @@
 #include "eden/common/utils/CaseSensitivity.h"
 #include "eden/common/utils/RefPtr.h"
 #include "eden/fs/config/ReloadableConfig.h"
+#include "eden/fs/config/RestrictedContentMode.h"
 #include "eden/fs/model/BlobAuxData.h"
 #include "eden/fs/model/Hash.h"
 #include "eden/fs/model/RootId.h"
@@ -252,15 +253,6 @@ class ObjectStore : public IObjectStore,
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
-  /**
-   * Returns the DigestHash hash of the contents of the tree with the given ID.
-   *
-   * DEPRECATED: Use co_getTreeDigestHash instead.
-   */
-  ImmediateFuture<std::optional<Hash32>> getTreeDigestHash(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) const;
-
   folly::coro::now_task<std::optional<Hash32>> co_getTreeDigestHash(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
@@ -276,16 +268,9 @@ class ObjectStore : public IObjectStore,
    * Prefetch all the blobs represented by the HashRange.
    *
    * The caller is responsible for making sure that the HashRange stays valid
-   * for as long as the returned ImmediateFuture.
-   *
-   * DEPRECATED: use co_prefetchBlobs directly. Futures wrapper kept for
-   * non-coroutine callers; remove once all callers have migrated.
+   * for as long as the returned coroutine.
    */
-  ImmediateFuture<folly::Unit> prefetchBlobs(
-      ObjectIdRange ids,
-      const ObjectFetchContextPtr& context) const override;
-
-  folly::coro::now_task<folly::Unit> co_prefetchBlobs(
+  folly::coro::now_task<folly::Unit> prefetchBlobs(
       ObjectIdRange ids,
       const ObjectFetchContextPtr& context) const;
 
@@ -365,17 +350,11 @@ class ObjectStore : public IObjectStore,
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
-  /**
-   * Returns the Blake3 hash of the contents of the blob with the given ID.
-   */
-  ImmediateFuture<Hash32> getBlobBlake3(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) const;
-
   folly::coro::now_task<Hash20> co_getBlobSha1(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
+  /** Returns the Blake3 hash of the contents of the blob. */
   folly::coro::now_task<Hash32> co_getBlobBlake3(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
@@ -394,21 +373,6 @@ class ObjectStore : public IObjectStore,
   folly::coro::now_task<bool> co_areBlobsEqual(
       const ObjectId& one,
       const ObjectId& two,
-      const ObjectFetchContextPtr& context) const;
-
-  /**
-   * Get file paths matching the given globs
-   */
-  ImmediateFuture<BackingStore::GetGlobFilesResult> getGlobFiles(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes,
-      const ObjectFetchContextPtr& context) const;
-
-  folly::coro::now_task<BackingStore::GetGlobFilesResult> co_getGlobFiles(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes,
       const ObjectFetchContextPtr& context) const;
 
   /**
@@ -439,6 +403,10 @@ class ObjectStore : public IObjectStore,
    */
   folly::ReadMostlySharedPtr<const EdenConfig> getEdenConfig() const {
     return edenConfig_->getEdenConfig();
+  }
+
+  RestrictedContentMode getRestrictedContentMode() const {
+    return restrictedContentMode_;
   }
 
   /**
@@ -515,11 +483,7 @@ class ObjectStore : public IObjectStore,
   void maybeCacheTreeAuxInMemCache(
       const ObjectId& id,
       const BackingStore::GetTreeResult& treeResult) const;
-
-  folly::SemiFuture<BackingStore::GetTreeAuxResult> getTreeAuxDataImpl(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context,
-      folly::stop_watch<std::chrono::milliseconds> watch) const;
+  bool bypassInMemoryTreeCaches(const ObjectFetchContext& context) const;
 
   folly::coro::now_task<BackingStore::GetTreeAuxResult> co_getTreeAuxDataImpl(
       const ObjectId& id,
@@ -534,27 +498,10 @@ class ObjectStore : public IObjectStore,
       const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
-  folly::SemiFuture<BackingStore::GetBlobAuxResult> getBlobAuxDataImpl(
+  folly::coro::now_task<BackingStore::GetBlobAuxResult> getBlobAuxDataImpl(
       const ObjectId& id,
       const ObjectFetchContextPtr& context,
       folly::stop_watch<std::chrono::milliseconds> watch) const;
-
-  folly::coro::now_task<BackingStore::GetBlobAuxResult> co_getBlobAuxDataImpl(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context,
-      folly::stop_watch<std::chrono::milliseconds> watch) const;
-
-  ImmediateFuture<BackingStore::GetGlobFilesResult> getGlobFilesImpl(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes,
-      const ObjectFetchContextPtr& context) const;
-
-  folly::coro::now_task<BackingStore::GetGlobFilesResult> co_getGlobFilesImpl(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes,
-      const ObjectFetchContextPtr& context) const;
 
   /**
    * During status and checkout, it's common to look up the SHA-1 for a given
@@ -612,6 +559,10 @@ class ObjectStore : public IObjectStore,
   // Is this ObjectStore case sensitive? This only matters for methods returning
   // Tree.
   CaseSensitivity caseSensitive_;
+
+  // Read once at construction: a live mount's listing policy must not flip
+  // under the kernel's caches.
+  const RestrictedContentMode restrictedContentMode_;
 };
 
 } // namespace facebook::eden

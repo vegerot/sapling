@@ -52,6 +52,12 @@ class FakePrivHelper final : public PrivHelper {
       AbsolutePathPiece mountPath,
       std::shared_ptr<MountDelegate>);
 
+  /**
+   * Forget a previously registered mount so the same path can be registered
+   * again, for tests that tear down and recreate an EdenMount.
+   */
+  void unregisterMount(AbsolutePathPiece mountPath);
+
   // PrivHelper functions
   void attachEventBase(folly::EventBase* eventBase) override;
   void detachEventBase() override;
@@ -76,16 +82,14 @@ class FakePrivHelper final : public PrivHelper {
       folly::StringPiece mountPath,
       const std::vector<std::string>& bindMounts) override;
   folly::Future<folly::Unit> setLogFile(folly::File logFile) override;
-  folly::Future<folly::Unit> setDaemonTimeout(
-      std::chrono::nanoseconds duration) override;
-  folly::Future<folly::Unit> setUseEdenFs(bool useEdenFs) override;
   folly::Future<pid_t> getServerPid() override;
   folly::Future<NamespaceInfo> getNamespaceInfo(pid_t daemonPid) override;
   folly::Future<pid_t> startFam(
       const std::vector<std::string>& paths,
       const std::string& tmpOutputPath,
       const std::string& specifiedOutputPath,
-      const bool shouldUpload) override;
+      const bool shouldUpload,
+      folly::File outputFile) override;
   folly::Future<StopFileAccessMonitorResponse> stopFam() override;
   folly::Future<folly::Unit> setMemoryPriorityForProcess(
       pid_t pid,

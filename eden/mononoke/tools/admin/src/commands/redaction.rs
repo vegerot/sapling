@@ -7,6 +7,7 @@
 
 mod aws_sync;
 mod create_key_list;
+mod delete_from_cas;
 mod list;
 
 use anyhow::Result;
@@ -18,8 +19,10 @@ use bookmarks::Bookmarks;
 use clap::Parser;
 use clap::Subcommand;
 use create_key_list::RedactionCreateKeyListArgs;
-use create_key_list::RedactionCreateKeyListFromIdsArgs;
 use create_key_list::RedactionFetchKeyListArgs;
+use create_key_list::RedactionSyncKeyListsFromJsonArgs;
+use create_key_list::RedactionSyncToAwsArgs;
+use delete_from_cas::RedactionDeleteFromCasArgs;
 use list::RedactionListArgs;
 use metaconfig_types::RepoConfig;
 use mononoke_app::MononokeApp;
@@ -68,12 +71,17 @@ pub struct Repo {
 pub enum RedactionSubcommand {
     /// Create a key list using files in a changeset.
     CreateKeyList(RedactionCreateKeyListArgs),
-    /// Create a key list using content ids.
-    CreateKeyListFromIds(RedactionCreateKeyListFromIdsArgs),
     /// List the redacted files in a commit.
     List(RedactionListArgs),
     /// Fetch a key list from its key list id.
     FetchKeyList(RedactionFetchKeyListArgs),
+    /// Sync all active prod key lists to the AWS shadow blobstore.
+    SyncToAws(RedactionSyncToAwsArgs),
+    /// Delete the content of enforced key lists from CAS.
+    DeleteFromCas(RedactionDeleteFromCasArgs),
+    /// Internal batch operation used by the AWS sync orchestrator.
+    #[clap(hide = true)]
+    SyncKeyListsFromJson(RedactionSyncKeyListsFromJsonArgs),
 }
 
 pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
@@ -83,12 +91,18 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
         RedactionSubcommand::CreateKeyList(create_args) => {
             create_key_list::create_key_list_from_commit_files(&ctx, &app, create_args).await?
         }
-        RedactionSubcommand::CreateKeyListFromIds(create_args) => {
-            create_key_list::create_key_list_from_blobstore_keys(&ctx, &app, create_args).await?
-        }
         RedactionSubcommand::List(list_args) => list::list(&ctx, &app, list_args).await?,
         RedactionSubcommand::FetchKeyList(fetch_args) => {
             create_key_list::fetch_key_list(&ctx, &app, fetch_args).await?
+        }
+        RedactionSubcommand::SyncToAws(sync_args) => {
+            create_key_list::sync_all_key_lists_to_aws(&ctx, &app, sync_args).await?
+        }
+        RedactionSubcommand::DeleteFromCas(delete_args) => {
+            delete_from_cas::delete_from_cas(&ctx, &app, delete_args).await?
+        }
+        RedactionSubcommand::SyncKeyListsFromJson(sync_args) => {
+            create_key_list::sync_key_lists_from_json(&ctx, &app, sync_args).await?
         }
     }
 

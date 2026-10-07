@@ -43,12 +43,11 @@ use mercurial_types::RepoPath;
 use mononoke_types::ChangesetId;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_identity::RepoIdentityRef;
-use stats::prelude::*;
 use thiserror::Error;
 use tracing::debug;
 
 #[derive(Debug, Error)]
-pub enum ErrorKind {
+pub enum FileHistoryError {
     #[error("internal error: file {0} copied from directory {1}")]
     InconsistentCopyInfo(RepoPath, RepoPath),
     #[error("Filenode is missing: {0} {1}")]
@@ -63,11 +62,6 @@ pub enum FilenodesRelatedResult {
     Unrelated,
     FirstAncestorOfSecond,
     SecondAncestorOfFirst,
-}
-
-define_stats! {
-    prefix = "mononoke.file_history";
-    too_big: dynamic_timeseries("{}.too_big", (repo: String); Rate, Sum),
 }
 
 pub trait Repo = RepoIdentityRef
@@ -260,7 +254,6 @@ pub async fn get_file_history(
         FilenodeResult::Present(FilenodeRange::TooBig) => {
             ctx.perf_counters()
                 .increment_counter(PerfCounterType::FilenodesTooBigHistory);
-            STATS::too_big.add_value(1, (repo.repo_identity().name().to_string(),));
             let history = get_file_history_using_prefetched(
                 ctx,
                 repo,
@@ -375,7 +368,7 @@ pub fn filenode_to_history_entry(
     let copyfrom = match filenode.copyfrom {
         Some((RepoPath::FilePath(frompath), node)) => Some((frompath, node)),
         Some((frompath, _)) => {
-            return Err(ErrorKind::InconsistentCopyInfo(path.clone(), frompath).into());
+            return Err(FileHistoryError::InconsistentCopyInfo(path.clone(), frompath).into());
         }
         None => None,
     };

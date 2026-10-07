@@ -153,6 +153,12 @@ pub fn run_command(args: Vec<String>, io: &IO) -> i32 {
                 let _guard = span.enter();
 
                 sampling::init(dispatcher.config());
+                let _trace = distributed_tracing::scope(
+                    dispatcher
+                        .config()
+                        .get_or_default("experimental", "enable-distributed-tracing")
+                        .unwrap_or_default(),
+                );
 
                 dispatch_command(
                     io,
@@ -356,6 +362,7 @@ fn dispatch_command(
     }
 
     drop(scoped_profiler);
+    log_logged_configs(config);
     if let Err(err) = log_perftrace(io, config, start_time) {
         tracing::error!(?err, "error logging perftrace");
     }
@@ -608,10 +615,8 @@ fn maybe_write_trace(
         // A hardcoded minimal duration (in microseconds).
         let data = tracing_data.lock();
         match write_trace(io, &path, &data) {
-            Ok(_) => io.write_err(format!("(Trace was written to {})\n", &path))?,
-            Err(err) => {
-                io.write_err(format!("(Failed to write Trace to {}: {})\n", &path, &err))?
-            }
+            Ok(_) => io.write_err(format!("(Trace was written to {path})\n"))?,
+            Err(err) => io.write_err(format!("(Failed to write Trace to {path}: {err})\n"))?,
         }
     }
     Ok(())
@@ -835,8 +840,42 @@ fn is_inside_test() -> bool {
     std::env::var_os("TESTTMP").is_some()
 }
 
+/// Log the configs listed under `[loggedconfigs]` (`name = section.key`)
+/// to the "logginghelper" sampling key. Entries whose value is not exactly
+/// `section.key` are skipped.
+fn log_logged_configs(config: &dyn Config) {
+    let logged: HashMap<String, String> = config
+        .keys("loggedconfigs")
+        .into_iter()
+        .filter_map(|name| {
+            let target = config.get("loggedconfigs", &name)?;
+            let (section, key) = target.split_once('.')?;
+            if key.contains('.') {
+                return None;
+            }
+            let value = config.get(section, key)?;
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect();
+    sampling::append_sample_map("logginghelper", &logged);
+}
+
 fn log_repo_path_and_exe_version(repo: Option<&Repo>) {
     // The "version" and "repo" fields are consumed by telemetry.
+    let worktree_info = repo.and_then(|repo| {
+        worktree::worktree_info(repo.store_path(), repo.path()).unwrap_or_else(|err| {
+            tracing::debug!(target: "worktree", error = %err, "failed to read worktree telemetry");
+            None
+        })
+    });
+    let is_linked_worktree = worktree_info.as_ref().is_some_and(|info| info.is_linked);
+    if let Some(info) = worktree_info {
+        tracing::info!(
+            target: "command_info",
+            worktree_count_group = info.worktree_count_group,
+            worktree_count = info.worktree_count,
+        );
+    }
     if let Some(repo) = repo {
         let config = repo.config();
         let opt_path_default: std::result::Result<Option<String>, _> =
@@ -847,12 +886,13 @@ fn log_repo_path_and_exe_version(repo: Option<&Repo>) {
                     target: "command_info",
                     version = version::VERSION,
                     repo = repo_name.as_str(),
+                    is_linked_worktree,
                 );
                 return;
             }
         }
     }
-    tracing::info!(target: "command_info", version = version::VERSION);
+    tracing::info!(target: "command_info", version = version::VERSION, is_linked_worktree);
 }
 
 fn log_perftrace(io: &IO, config: &dyn Config, start_time: StartTime) -> Result<()> {
@@ -869,7 +909,7 @@ fn log_perftrace(io: &IO, config: &dyn Config, start_time: StartTime) -> Result<
 
             let tracing_summary = pytracing::DATA.lock().ascii(&ascii_opts);
             if config.get_or_default("tracing", "stderr")? {
-                let _ = write!(io.error(), "{}\n", &tracing_summary);
+                let _ = write!(io.error(), "{tracing_summary}\n");
             }
             outputs.push(tracing_summary);
         }

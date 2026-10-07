@@ -15,6 +15,8 @@
 #include "eden/common/os/ProcessId.h"
 #include "eden/common/telemetry/DynamicEvent.h"
 #include "eden/common/telemetry/LogEvent.h"
+#include "eden/common/utils/ProcessInfo.h"
+#include "eden/fs/telemetry/XplatKeys.h"
 
 namespace facebook::eden {
 
@@ -23,11 +25,6 @@ struct EdenFSEvent : public TypedEvent {
   // to implement them
   virtual void populate(DynamicEvent&) const override = 0;
   virtual const char* getType() const override = 0;
-};
-
-struct EdenFSFileAccessEvent : public TypelessEvent {
-  // Keep populate() pure virtual to force subclasses to implement it
-  virtual void populate(DynamicEvent&) const override = 0;
 };
 
 struct Fsck : public EdenFSEvent {
@@ -66,34 +63,6 @@ struct StarGlob : public EdenFSEvent {
 
   const char* getType() const override {
     return "star_glob";
-  }
-};
-
-struct SuffixGlob : public EdenFSEvent {
-  double duration = 0.0;
-  std::string glob_request;
-  std::string client_cmdline;
-  bool is_local;
-
-  SuffixGlob(
-      double duration,
-      std::string glob_request,
-      std::string client_cmdline,
-      bool is_local)
-      : duration(duration),
-        glob_request(std::move(glob_request)),
-        client_cmdline(std::move(client_cmdline)),
-        is_local(is_local) {}
-
-  void populate(DynamicEvent& event) const override {
-    event.addDouble("duration", duration);
-    event.addString("glob_request", glob_request);
-    event.addString("client_cmdline", client_cmdline);
-    event.addBool("is_local", is_local);
-  }
-
-  const char* getType() const override {
-    return "suffix_glob";
   }
 };
 
@@ -138,16 +107,19 @@ struct FetchHeavy : public EdenFSEvent {
   ProcessId pid;
   uint64_t fetch_count;
   std::optional<uint64_t> loaded_inodes;
+  std::optional<ProcessAttribution> client_attribution;
 
   FetchHeavy(
       std::string client_cmdline,
       ProcessId pid,
       uint64_t fetch_count,
-      std::optional<uint64_t> loaded_inodes)
+      std::optional<uint64_t> loaded_inodes,
+      std::optional<ProcessAttribution> client_attribution = std::nullopt)
       : client_cmdline(std::move(client_cmdline)),
         pid(std::move(pid)),
         fetch_count(fetch_count),
-        loaded_inodes(loaded_inodes) {}
+        loaded_inodes(loaded_inodes),
+        client_attribution(std::move(client_attribution)) {}
 
   void populate(DynamicEvent& event) const override {
     event.addString("client_cmdline", client_cmdline);
@@ -155,6 +127,11 @@ struct FetchHeavy : public EdenFSEvent {
     event.addInt("fetch_count", fetch_count);
     if (loaded_inodes.has_value()) {
       event.addTruncatedInt("loaded_inodes", loaded_inodes.value(), 8U);
+    }
+    if (client_attribution.has_value()) {
+      for (const auto& [name, value] : *client_attribution) {
+        event.addString(name, value);
+      }
     }
   }
 
@@ -192,6 +169,10 @@ struct DaemonStart : public EdenFSEvent {
   std::optional<bool> is_daemon_in_root_mount_namespace;
   std::optional<bool> is_privhelper_in_root_mount_namespace;
   std::optional<std::string> cgroup;
+  // Restarts already spent in the current backoff window. Set only when this
+  // daemon was relaunched by the privhelper, so its presence is itself the
+  // "this was an auto-restart" signal.
+  std::optional<uint64_t> num_restarts;
 
   DaemonStart(
       double duration,
@@ -203,7 +184,8 @@ struct DaemonStart : public EdenFSEvent {
       std::optional<uint64_t> privhelper_pid_namespace = std::nullopt,
       std::optional<bool> is_daemon_in_root_mount_namespace = std::nullopt,
       std::optional<bool> is_privhelper_in_root_mount_namespace = std::nullopt,
-      std::optional<std::string> cgroup = std::nullopt)
+      std::optional<std::string> cgroup = std::nullopt,
+      std::optional<uint64_t> num_restarts = std::nullopt)
       : duration(duration),
         is_takeover(is_takeover),
         success(success),
@@ -214,7 +196,8 @@ struct DaemonStart : public EdenFSEvent {
         is_daemon_in_root_mount_namespace(is_daemon_in_root_mount_namespace),
         is_privhelper_in_root_mount_namespace(
             is_privhelper_in_root_mount_namespace),
-        cgroup(std::move(cgroup)) {}
+        cgroup(std::move(cgroup)),
+        num_restarts(num_restarts) {}
 
   void populate(DynamicEvent& event) const override {
     event.addDouble("duration", duration);
@@ -252,6 +235,9 @@ struct DaemonStart : public EdenFSEvent {
     if (cgroup.has_value()) {
       event.addString("cgroup", *cgroup);
     }
+    if (num_restarts.has_value()) {
+      event.addInt("num_restarts", static_cast<int64_t>(*num_restarts));
+    }
   }
 
   const char* getType() const override {
@@ -278,6 +264,40 @@ struct DaemonStop : public EdenFSEvent {
   }
 };
 
+struct PrivhelperShutdown : public EdenFSEvent {
+  int64_t exit_code = 0;
+  int64_t exit_signal = 0;
+
+  PrivhelperShutdown(int64_t exit_code, int64_t exit_signal)
+      : exit_code(exit_code), exit_signal(exit_signal) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addInt("exit_code", exit_code);
+    event.addInt("exit_signal", exit_signal);
+  }
+
+  const char* getType() const override {
+    return "privhelper_shutdown";
+  }
+};
+
+struct PrivhelperRequestStall : public EdenFSEvent {
+  std::string method;
+  double duration = 0.0; // seconds
+
+  PrivhelperRequestStall(std::string method, double duration)
+      : method(std::move(method)), duration(duration) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addString("method", method);
+    event.addDouble("duration", duration);
+  }
+
+  const char* getType() const override {
+    return "privhelper_request_stall";
+  }
+};
+
 struct FinishedCheckout : public EdenFSEvent {
   std::string mode;
   double duration = 0.0;
@@ -289,6 +309,8 @@ struct FinishedCheckout : public EdenFSEvent {
   uint64_t accessedBlobs = 0;
   uint64_t accessedBlobsAuxData = 0;
   uint64_t numConflicts = 0;
+  uint64_t numErrors = 0;
+  std::string error;
   uint64_t numLoadedInodes = 0;
   uint64_t numUnloadedInodes = 0;
   uint64_t numPeriodicLinkedUnloadedInodes = 0;
@@ -343,6 +365,11 @@ struct FinishedCheckout : public EdenFSEvent {
     durationFinish = durationFinish_;
   }
 
+  void populateError(uint64_t numErrors_, std::string error_) {
+    numErrors = numErrors_;
+    error = std::move(error_);
+  }
+
   void populate(DynamicEvent& event) const override {
     event.addString("mode", mode);
     event.addDouble("duration", duration);
@@ -354,6 +381,10 @@ struct FinishedCheckout : public EdenFSEvent {
     event.addInt("accessed_blobs", accessedBlobs);
     event.addInt("accessed_blobs_metadata", accessedBlobsAuxData);
     event.addInt("num_conflicts", numConflicts);
+    event.addInt("num_errors", numErrors);
+    if (!error.empty()) {
+      event.addString("error", error);
+    }
     event.addInt("loaded_inodes", numLoadedInodes);
     event.addInt("unloaded_inodes", numUnloadedInodes);
     event.addInt("linked_unloaded_inodes", numPeriodicLinkedUnloadedInodes);
@@ -401,13 +432,7 @@ struct ThriftCancellation : public EdenFSEvent {
 };
 
 struct NFSStaleError : public EdenFSEvent {
-  uint64_t ino;
-
-  explicit NFSStaleError(uint64_t ino) : ino(ino) {}
-
-  void populate(DynamicEvent& event) const override {
-    event.addInt("ino", ino);
-  }
+  void populate(DynamicEvent& /*event*/) const override {}
 
   const char* getType() const override {
     return "nfs_stale_error";
@@ -521,6 +546,53 @@ struct NfsParsingError : public EdenFSEvent {
   }
 };
 
+struct TccInvalidationDenied : public EdenFSEvent {
+  int err;
+  std::string path;
+
+  TccInvalidationDenied(int err, std::string path)
+      : err(err), path(std::move(path)) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addInt("errno", err);
+    event.addString("path", path);
+  }
+
+  const char* getType() const override {
+    return "tcc_invalidation_denied";
+  }
+};
+
+/**
+ * edenfs did not disclaim TCC responsibility for `process` ("daemon" or
+ * "privhelper") because its code signature carries a real team identifier
+ * that is not the expected one: a development certificate, or a rotated
+ * release team. Ad-hoc builds carry no team and are not reported.
+ */
+struct TccDisclaimSkipped : public EdenFSEvent {
+  std::string process;
+  std::string observed_team;
+  std::string expected_team;
+
+  TccDisclaimSkipped(
+      std::string process,
+      std::string observed_team,
+      std::string expected_team)
+      : process(std::move(process)),
+        observed_team(std::move(observed_team)),
+        expected_team(std::move(expected_team)) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addString(std::string{xplat_keys::kTccDisclaimProcess}, process);
+    event.addString(std::string{xplat_keys::kTccObservedTeam}, observed_team);
+    event.addString(std::string{xplat_keys::kTccExpectedTeam}, expected_team);
+  }
+
+  const char* getType() const override {
+    return "tcc_disclaim_skipped";
+  }
+};
+
 struct TooManyNfsClients : public EdenFSEvent {
   void populate(DynamicEvent& /*event*/) const override {}
 
@@ -548,7 +620,6 @@ struct MetadataSizeMismatch : public EdenFSEvent {
 
 struct InodeMetadataMismatch : public EdenFSEvent {
   uint64_t mode;
-  uint64_t ino;
   uint64_t gid;
   uint64_t uid;
   uint64_t atime;
@@ -557,14 +628,12 @@ struct InodeMetadataMismatch : public EdenFSEvent {
 
   InodeMetadataMismatch(
       uint64_t mode,
-      uint64_t ino,
       uint64_t gid,
       uint64_t uid,
       uint64_t atime,
       uint64_t ctime,
       uint64_t mtime)
       : mode(mode),
-        ino(ino),
         gid(gid),
         uid(uid),
         atime(atime),
@@ -573,7 +642,6 @@ struct InodeMetadataMismatch : public EdenFSEvent {
 
   void populate(DynamicEvent& event) const override {
     event.addInt("st_mode", mode);
-    event.addInt("ino", ino);
     event.addInt("gid", gid);
     event.addInt("uid", uid);
     event.addInt("atime", atime);
@@ -583,29 +651,6 @@ struct InodeMetadataMismatch : public EdenFSEvent {
 
   const char* getType() const override {
     return "inode_metadata_mismatch";
-  }
-};
-
-struct InodeLoadingFailed : public EdenFSEvent {
-  std::string error;
-  uint64_t ino;
-  bool causedByX2P = false;
-
-  explicit InodeLoadingFailed(std::string err, uint64_t ino)
-      : error(std::move(err)), ino(ino) {
-    if (error.find("x-x2pagentd-error")) {
-      causedByX2P = true;
-    }
-  }
-
-  void populate(DynamicEvent& event) const override {
-    event.addString("load_error", error);
-    event.addInt("ino", ino);
-    event.addBool("caused_by_x2p", causedByX2P);
-  }
-
-  const char* getType() const override {
-    return "inode_loading_failed";
   }
 };
 
@@ -684,6 +729,67 @@ struct WorkingCopyGc : public EdenFSEvent {
   }
 };
 
+/**
+ * A pin scan (`edenfs_privhelper --scan-pins`) that produced no usable
+ * report, so the GC run that asked for it treated pins as unknown. `reason`
+ * is one of spawn_error, poll_error, read_error, timeout, output_too_large,
+ * exit_status and malformed_output from running the helper, or
+ * mounts_unreadable and mount_not_covered from mapping its report to this
+ * daemon's mounts.
+ */
+struct PinScanFailure : public EdenFSEvent {
+  std::string reason;
+  // Errno text, exit status, or the mount the scan did not cover.
+  std::string detail;
+  // The start of the helper's report and the end of its progress trail.
+  std::string stdoutPrefix;
+  std::string stderrTail;
+  int64_t durationMs = 0;
+
+  PinScanFailure(std::string reason, std::string detail)
+      : reason(std::move(reason)), detail(std::move(detail)) {}
+
+  // Only columns the edenfs_events logger schema declares reach Scuba, so
+  // the fields ride in existing ones: `error` holds the detail, `causeDetail`
+  // the helper's stderr followed by its stdout when there is any, and
+  // `duration` is in seconds like the other GC events.
+  void populate(DynamicEvent& event) const override {
+    event.addString(std::string{xplat_keys::kReason}, reason);
+    event.addString(
+        std::string{xplat_keys::kError}, truncated(detail, kMaxDetail));
+    event.addString(std::string{xplat_keys::kCauseDetail}, helperOutput());
+    event.addDouble(std::string{xplat_keys::kDuration}, durationMs / 1000.0);
+  }
+
+  static constexpr size_t kMaxDetail = 256;
+  static constexpr size_t kMaxOutput = 1024;
+
+  static std::string truncated(const std::string& s, size_t max) {
+    return s.size() <= max ? s : s.substr(0, max);
+  }
+
+  // The end of stderr is the helper's last progress line, which is what a
+  // timed-out scan is judged by, so stderr keeps its tail and stdout, the
+  // report, its head.
+  std::string helperOutput() const {
+    std::string out = stderrTail.size() <= kMaxOutput
+        ? stderrTail
+        : stderrTail.substr(stderrTail.size() - kMaxOutput);
+    if (!stdoutPrefix.empty() && out.size() < kMaxOutput) {
+      if (!out.empty() && out.back() != '\n') {
+        out += '\n';
+      }
+      out += "[stdout] ";
+      out += stdoutPrefix;
+    }
+    return truncated(out, kMaxOutput);
+  }
+
+  const char* getType() const override {
+    return "pin_scan_failure";
+  }
+};
+
 struct SilentDaemonExit : public EdenFSEvent {
   uint64_t last_daemon_heartbeat = 0;
   uint8_t daemon_exit_signal = 0;
@@ -723,6 +829,20 @@ struct SilentDaemonExit : public EdenFSEvent {
 
   const char* getType() const override {
     return "silent_daemon_exit";
+  }
+};
+
+struct PrivHelperExit : public EdenFSEvent {
+  std::string reason;
+
+  explicit PrivHelperExit(std::string reason) : reason(std::move(reason)) {}
+
+  void populate(DynamicEvent& event) const override {
+    event.addString("reason", reason);
+  }
+
+  const char* getType() const override {
+    return "privhelper_exit";
   }
 };
 
@@ -1005,34 +1125,6 @@ struct LongRunningFSRequest : public EdenFSEvent {
 
   const char* getType() const override {
     return "long_running_fs_request";
-  }
-};
-
-struct FileAccessEvent : public EdenFSFileAccessEvent {
-  std::string repo;
-  std::string directory;
-  std::string filename;
-  std::string source;
-  std::string source_detail;
-
-  FileAccessEvent(
-      std::string repo,
-      std::string directory,
-      std::string filename,
-      std::string source,
-      std::string source_detail)
-      : repo(std::move(repo)),
-        directory(std::move(directory)),
-        filename(std::move(filename)),
-        source(std::move(source)),
-        source_detail(std::move(source_detail)) {}
-
-  void populate(DynamicEvent& event) const override {
-    event.addString("repo", repo);
-    event.addString("directory", directory);
-    event.addString("filename", filename);
-    event.addString("source", source);
-    event.addString("source_detail", source_detail);
   }
 };
 

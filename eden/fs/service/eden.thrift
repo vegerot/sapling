@@ -11,6 +11,8 @@ include "thrift/annotation/cpp.thrift"
 include "thrift/annotation/rust.thrift"
 include "thrift/annotation/thrift.thrift"
 
+cpp_include "eden/fs/utils/GlobPath.h"
+
 @thrift.AllowLegacyMissingUris
 package;
 
@@ -105,6 +107,9 @@ typedef binary BinaryHash
  */
 typedef binary PathString
 
+@cpp.Adapter{name = "::facebook::eden::GlobPathAdapter"}
+typedef PathString GlobPathValue
+
 /**
  * Bit set indicating where data should be fetched from in our debugging
  * commands.
@@ -160,6 +165,12 @@ enum EdenErrorType {
   * the higher bits of the error code can be utilized to disambiguate.
   */
   NETWORK_ERROR = 11,
+  /**
+   * The current EdenFS Thrift service is intentionally shutting down, so the
+   * request or stream cannot continue. Clients should reconnect to the
+   * recovered or replacement service. errorCode will not be set.
+   */
+  SHUTTING_DOWN = 12,
 }
 
 exception EdenError {
@@ -285,6 +296,8 @@ struct MountInfo {
   6: optional string fuseTransport;
   // Whether the mount point is visible in the daemon's current mount namespace.
   7: optional bool visibleInDaemonNamespace;
+  // The NFS transport: "tcp" or "unix". Only set for NFS mounts.
+  8: optional string nfsTransport;
 }
 
 struct MountArgument {
@@ -1595,8 +1608,12 @@ enum PreloadMethod {
   MMAP = 3,
 }
 
+/**
+ * DEPRECATED: predictive prefetching has been removed. This struct is kept
+ * only for wire compatibility and is ignored by the daemon.
+ */
 struct PredictiveFetch {
-  // Number of directories to glob. If not specified, a default value (predictivePrefetchProfileSize in EdenConfig.h) is used.
+  // Number of directories to glob.
   1: optional i32 numTopDirectories;
   // Fetch the most accessed directories by user specified. If not specified, user is derived from the server state.
   2: optional string user;
@@ -1625,8 +1642,7 @@ struct PrefetchParams {
   5: PathString searchRoot;
   // If set, will run the prefetch but will not wait for the result.
   6: bool background = false;
-  // When set, the globs list must be empty and the globbing pattern will be obtained
-  // from an online service.
+  // DEPRECATED: ignored.
   7: optional PredictiveFetch predictiveGlob;
   // When true, returns list of prefetched files.
   8: bool returnPrefetchedFiles = false;
@@ -1670,6 +1686,50 @@ struct PrefetchStats {
   17: i64 filesFailed;
 }
 
+/**
+ * Disk-usage state of one cache (blob/tree/lfs) within HgCacheStats.
+ */
+enum CacheUsageState {
+  // No cache is configured for this store (e.g. no remotefilelog.cachepath).
+  NOT_CONFIGURED = 0,
+  // This store implementation does not support usage reporting.
+  UNSUPPORTED = 1,
+  // A cache is configured; see the paired *BytesUsed/*BytesLimit fields.
+  AVAILABLE = 2,
+  // A cache is configured, but its usage could not be measured due to an
+  // error (e.g. corrupted on-disk data). The failure reason is logged
+  // server-side, not carried on this value.
+  UNAVAILABLE = 3,
+}
+
+/**
+ * Per-repo hgcache usage and limits (blob, tree, and LFS caches).
+ *
+ * Each of blob/tree/lfs independently reports NOT_CONFIGURED, UNSUPPORTED,
+ * AVAILABLE, or UNAVAILABLE via its *State field; the paired
+ * *BytesUsed/*BytesLimit fields are only meaningful when *State is
+ * AVAILABLE (0 otherwise). An AVAILABLE *BytesLimit of -1 means uncapped.
+ *
+ * lfsBytes* covers only the indexedlog-backed portion of the LFS cache
+ * (lfs/blobs, lfs/pointers); the loose-file lfs/objects directory is
+ * excluded, since sizing it needs a full directory walk.
+ */
+struct HgCacheStats {
+  1: PathString cachePath;
+  // Whether cachePath is meaningful; false when no cache is configured at
+  // all (cachePath is empty in that case, not merely unset).
+  2: bool cachePathConfigured;
+  3: CacheUsageState blobState;
+  4: i64 blobBytesUsed;
+  5: i64 blobBytesLimit;
+  6: CacheUsageState treeState;
+  7: i64 treeBytesUsed;
+  8: i64 treeBytesLimit;
+  9: CacheUsageState lfsState;
+  10: i64 lfsBytesUsed;
+  11: i64 lfsBytesLimit;
+}
+
 /** Result for prefetchFiles(). */
 struct PrefetchResult {
   1: optional Glob prefetchedFiles;
@@ -1677,6 +1737,9 @@ struct PrefetchResult {
   // ID for a long-running preload operation.
   // Only populated when preload=true and preloadProgress=true.
   3: optional string operationId;
+  // Set only when returnStats=true and the hgcache stats lookup succeeds;
+  // absent (not merely zeroed) when returnStats=false or the lookup fails.
+  4: optional HgCacheStats cacheStats;
 }
 
 /**
@@ -1746,8 +1809,7 @@ struct GlobParams {
   9: PathString searchRoot;
   // If set, will run the prefetch but will not wait for the result.
   10: bool background = false;
-  // When set, the globs list must be empty and the globbing pattern will be obtained
-  // from an online service.
+  // DEPRECATED: ignored.
   11: optional PredictiveFetch predictiveGlob;
   // Normally the returned file list will contain both files and directories.
   // Some clients would like to see only lists of files, this option tells us
@@ -1765,7 +1827,7 @@ struct Glob {
    * sorted. However, no duplicates may have the same originCommits (note this
    * is not true should the input GlobParams contain duplicate revisions) .
    */
-  1: list<PathString> matchingFiles;
+  1: list<GlobPathValue> matchingFiles;
   2: list<OsDtype> dtypes;
   /**
    * Currently these are the commit hash for the commit to which this file
@@ -2823,14 +2885,8 @@ service EdenService extends fb303_core.BaseService {
   ) throws (1: EdenError ex);
 
   /**
-   * Gets a list of a user's most accessed directories, performs
-   * prefetching as specified by PredictiveGlobParams, and returns
-   * a list of files matching the glob patterns.
-   * There are no duplicate values in the result.
-   *
-   * Note: may return stale data if synchronizeWorkingCopy isn't called, and if
-   * the SyncBehavior specify a 0 timeout. see the documentation for both of
-   * these for more details.
+   * DEPRECATED: predictive prefetching has been removed. This method is a
+   * no-op that always returns an empty Glob.
    */
   Glob predictiveGlobFiles(1: GlobParams params) throws (1: EdenError ex);
 
@@ -3353,8 +3409,8 @@ service EdenService extends fb303_core.BaseService {
   /**
    * Debug endpoint to test the structured error logging pipeline end-to-end.
    * Throws a test exception, catches it, and logs it via ErrorLogger to
-   * perfpipe_edenfs_errors. Returns true if the event was logged, false if
-   * error logging is not configured or disabled.
+   * edenfs_errors through XplatLogger. Returns true if the event was logged,
+   * false if error logging is not configured or disabled.
    * Use: eden debug thrift debugLogError
    */
   bool debugLogError() throws (1: EdenError ex);

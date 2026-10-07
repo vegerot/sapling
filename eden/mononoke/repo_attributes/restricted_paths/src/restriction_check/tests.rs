@@ -24,9 +24,12 @@ use permission_checker::InternalAclProvider;
 use permission_checker::MononokeIdentity;
 use permission_checker::MononokeIdentitySet;
 
+use super::AccessEnforcementOutcome;
 use super::AuthorizationCheckResult;
+use super::EnforcementDecision;
 use super::PathRestrictionCheckResult;
 use super::SharedFetchHandle;
+use super::SourceRestrictionSummary;
 use crate::restriction_info::PathRestrictionInfo;
 
 // What it tests: cloned source fetch handles share one spawned fetch result.
@@ -82,8 +85,54 @@ async fn test_source_enforcement_outcome_denial_permission_request_group_is_dete
         super::source_enforcement_outcome(&handle, &[], &super::PreFilterVariant::Definite).await?;
 
     assert_eq!(
-        outcome.denial_permission_request_group,
-        Some(MononokeIdentity::from_str("REPO_REGION:a_acl")?)
+        outcome.denial_permission_request_group(),
+        Some(&MononokeIdentity::from_str("REPO_REGION:a_acl")?)
+    );
+    Ok(())
+}
+
+// What it tests: a matching exemption only changes an enforced outcome.
+// Expected: enforced outcomes (denied or allowed) become `Exempted`, while
+// `NotEnforced` is unchanged and nothing changes when no exemption matched.
+#[mononoke::test]
+fn test_access_enforcement_outcome_exempt_if() -> Result<()> {
+    let denial_group = MononokeIdentity::from_str("REPO_REGION:deny_acl")?;
+    let denied = AccessEnforcementOutcome::Enforced {
+        denial_permission_request_group: Some(denial_group),
+    };
+    let allowed = AccessEnforcementOutcome::Enforced {
+        denial_permission_request_group: None,
+    };
+
+    assert_eq!(
+        denied.clone().exempt_if(true),
+        AccessEnforcementOutcome::Exempted,
+        "an exemption should exempt an enforced denial",
+    );
+    assert_eq!(
+        allowed.clone().exempt_if(true),
+        AccessEnforcementOutcome::Exempted,
+        "an exemption should exempt an enforced, authorized access",
+    );
+    assert_eq!(
+        AccessEnforcementOutcome::NotEnforced.exempt_if(true),
+        AccessEnforcementOutcome::NotEnforced,
+        "an exemption should not change an access no condition matched",
+    );
+    assert_eq!(
+        denied.clone().exempt_if(false),
+        denied,
+        "without an exemption an enforced denial should be unchanged",
+    );
+    assert_eq!(
+        allowed.clone().exempt_if(false),
+        allowed,
+        "without an exemption an enforced allow should be unchanged",
+    );
+    assert_eq!(
+        AccessEnforcementOutcome::Exempted.denial_permission_request_group(),
+        None,
+        "an exempted access should carry no denial",
     );
     Ok(())
 }
@@ -97,21 +146,17 @@ async fn test_authoritative_source_enforcement_outcome_preserves_error_semantics
     let permission_request_group = MononokeIdentity::from_str("REPO_REGION:deny_acl")?;
     let denied = super::authoritative_sources_enforcement_outcome(vec![
         Err(anyhow::anyhow!("source failed")),
-        Ok(super::AccessEnforcementOutcome {
-            access_enforcement_enabled: true,
+        Ok(AccessEnforcementOutcome::Enforced {
             denial_permission_request_group: Some(permission_request_group.clone()),
         }),
     ])?;
     assert_eq!(
-        denied.denial_permission_request_group,
-        Some(permission_request_group)
+        denied.denial_permission_request_group(),
+        Some(&permission_request_group)
     );
 
     let no_denial = super::authoritative_sources_enforcement_outcome(vec![
-        Ok(super::AccessEnforcementOutcome {
-            access_enforcement_enabled: false,
-            denial_permission_request_group: None,
-        }),
+        Ok(AccessEnforcementOutcome::NotEnforced),
         Err(anyhow::anyhow!("source failed")),
     ]);
     assert!(no_denial.is_err());
@@ -134,8 +179,7 @@ async fn test_admin_bypass_group_member_is_authorized_and_flagged(fb: FacebookIn
     let authorization = super::check_authorization(
         &ctx,
         &acl_provider,
-        &[&acl],
-        None,
+        &[(&acl, None)],
         None,
         Some(&bypass_group),
     )
@@ -170,8 +214,7 @@ async fn test_non_member_without_acl_is_denied(fb: FacebookInit) -> Result<()> {
     let authorization = super::check_authorization(
         &ctx,
         &acl_provider,
-        &[&acl],
-        None,
+        &[(&acl, None)],
         None,
         Some(&bypass_group),
     )
@@ -206,8 +249,7 @@ async fn test_direct_acl_read_is_not_flagged_as_bypass(fb: FacebookInit) -> Resu
     let authorization = super::check_authorization(
         &ctx,
         &acl_provider,
-        &[&acl],
-        None,
+        &[(&acl, None)],
         None,
         Some(&bypass_group),
     )
@@ -224,8 +266,324 @@ async fn test_direct_acl_read_is_not_flagged_as_bypass(fb: FacebookInit) -> Resu
     Ok(())
 }
 
+/// What it tests: rollout allowlisting is aggregated with `all`, not `any`.
+/// Expected: the caller counts as rollout-allowlisted only when every
+/// restriction in the batch allowlists them. Being allowlisted for one tent must
+/// not authorize a different tent caught by the same request.
+#[mononoke::test]
+fn test_summary_rollout_allowlist_requires_every_check() -> Result<()> {
+    let allowlisted = AuthorizationCheckResult::new(false, false, true, false);
+    let not_allowlisted = AuthorizationCheckResult::new(false, false, false, false);
+
+    let all_allowlisted = [
+        check_with_authorization("tent_a", allowlisted)?,
+        check_with_authorization("tent_b", allowlisted)?,
+    ];
+    assert!(
+        SourceRestrictionSummary::from_checks(&all_allowlisted).is_rollout_allowlisted(),
+        "every restriction in the batch allowlists the caller",
+    );
+
+    let mixed = [
+        check_with_authorization("tent_a", allowlisted)?,
+        check_with_authorization("tent_b", not_allowlisted)?,
+    ];
+    let summary = SourceRestrictionSummary::from_checks(&mixed);
+    assert!(
+        !summary.is_rollout_allowlisted(),
+        "allowlisted on tent_a but not tent_b must not count as rollout-allowlisted",
+    );
+    assert!(
+        !summary.has_authorization(),
+        "with no ACL access, a partially allowlisted batch must be denied",
+    );
+    Ok(())
+}
+
+/// What it tests: `from_check_union` applies the same unanimity rule as
+/// `from_checks` when merging checks reported by several sources.
+/// Expected: one non-allowlisted check in the union denies the whole request.
+#[mononoke::test]
+fn test_summary_union_rollout_allowlist_requires_every_check() -> Result<()> {
+    let allowlisted = AuthorizationCheckResult::new(false, false, true, false);
+    let not_allowlisted = AuthorizationCheckResult::new(false, false, false, false);
+
+    let allowlisted_check = check_with_authorization("tent_a", allowlisted)?;
+    let other_allowlisted_check = check_with_authorization("tent_b", allowlisted)?;
+    assert!(
+        SourceRestrictionSummary::from_check_union([&allowlisted_check, &other_allowlisted_check])
+            .is_rollout_allowlisted(),
+        "every check in the union allowlists the caller",
+    );
+
+    let denied_check = check_with_authorization("tent_b", not_allowlisted)?;
+    assert!(
+        !SourceRestrictionSummary::from_check_union([&allowlisted_check, &denied_check])
+            .is_rollout_allowlisted(),
+        "one non-allowlisted check in the union denies the whole request",
+    );
+    Ok(())
+}
+
+/// What it tests: an empty check batch is not reported as rollout-allowlisted.
+/// Expected: `is_rollout_allowlisted` is false even though `all` is vacuously
+/// true over an empty batch, while `has_authorization` stays true. Nothing was
+/// restricted, so the access is allowed — but it was not allowlisted, and
+/// logging it as such would pollute the `is_rollout_allowlisted` column.
+#[mononoke::test]
+fn test_summary_empty_batch_is_not_rollout_allowlisted() -> Result<()> {
+    let empty: [PathRestrictionCheckResult; 0] = [];
+    let summary = SourceRestrictionSummary::from_checks(&empty);
+
+    assert!(
+        !summary.is_rollout_allowlisted(),
+        "an unrestricted access must not be reported as rollout-allowlisted",
+    );
+    assert!(
+        summary.has_authorization(),
+        "no restriction matched, so the access is authorized",
+    );
+    Ok(())
+}
+
+/// What it tests: the tooling and admin-bypass flags keep `any` aggregation.
+/// Expected: both are repo-wide grants, so a single matching check is enough.
+/// Only the per-tent rollout allowlist requires unanimity.
+#[mononoke::test]
+fn test_summary_repo_wide_flags_use_any() -> Result<()> {
+    let tooling_only = AuthorizationCheckResult::new(false, true, false, false);
+    let admin_only = AuthorizationCheckResult::new(false, false, false, true);
+    let neither = AuthorizationCheckResult::new(false, false, false, false);
+
+    let checks = [
+        check_with_authorization("tent_a", tooling_only)?,
+        check_with_authorization("tent_b", admin_only)?,
+        check_with_authorization("tent_c", neither)?,
+    ];
+    let summary = SourceRestrictionSummary::from_checks(&checks);
+
+    assert!(
+        summary.is_allowlisted_tooling(),
+        "the tooling allowlist is repo-wide, so one matching check is enough",
+    );
+    assert!(
+        summary.is_admin_bypass(),
+        "the admin bypass is repo-wide, so one matching check is enough",
+    );
+    assert!(
+        !summary.is_rollout_allowlisted(),
+        "no check in the batch is rollout-allowlisted",
+    );
+    Ok(())
+}
+
+/// What it tests: a caller in a tent's own rollout allowlist group is granted
+/// access to that tent, and the grant is attributed to the rollout allowlist
+/// rather than to direct ACL access.
+/// Expected: authorized, `is_rollout_allowlisted` set, `has_acl_access` clear.
+#[mononoke::fbinit_test]
+async fn test_per_tent_rollout_group_member_is_authorized(fb: FacebookInit) -> Result<()> {
+    let acl_provider = rollout_allowlist_acl_provider()?;
+    // dave is only in tent_a's rollout group, with no direct read access.
+    let ctx = ctx_with_identities(fb, &["USER:dave"])?;
+    let tent_a = MononokeIdentity::from_str("REPO_REGION:repos/hg/fbsource/=tent_a")?;
+    let tent_a_rollout = MononokeIdentity::from_str("GROUP:tent_a_rollout")?;
+
+    let authorization = super::check_authorization(
+        &ctx,
+        &acl_provider,
+        &[(&tent_a, Some(&tent_a_rollout))],
+        None,
+        None,
+    )
+    .await?;
+
+    assert!(
+        authorization.is_rollout_allowlisted(),
+        "rollout-group member should be flagged as rollout-allowlisted",
+    );
+    assert!(
+        !authorization.has_acl_access(),
+        "a rollout grant must not be mislabeled as direct ACL read access",
+    );
+    assert!(
+        authorization.has_authorization(),
+        "rollout-group member should be authorized overall",
+    );
+    Ok(())
+}
+
+/// What it tests: an access spanning two tents where the caller is allowlisted
+/// for only one of them.
+/// Expected: denied. Being allowlisted for `tent_a` must not authorize reads of
+/// `tent_b` caught by the same access.
+#[mononoke::fbinit_test]
+async fn test_rollout_allowlist_does_not_leak_across_tents(fb: FacebookInit) -> Result<()> {
+    let acl_provider = rollout_allowlist_acl_provider()?;
+    // dave is in tent_a's rollout group but not tent_b's.
+    let ctx = ctx_with_identities(fb, &["USER:dave"])?;
+    let tent_a = MononokeIdentity::from_str("REPO_REGION:repos/hg/fbsource/=tent_a")?;
+    let tent_b = MononokeIdentity::from_str("REPO_REGION:repos/hg/fbsource/=tent_b")?;
+    let tent_a_rollout = MononokeIdentity::from_str("GROUP:tent_a_rollout")?;
+    let tent_b_rollout = MononokeIdentity::from_str("GROUP:tent_b_rollout")?;
+
+    let authorization = super::check_authorization(
+        &ctx,
+        &acl_provider,
+        &[
+            (&tent_a, Some(&tent_a_rollout)),
+            (&tent_b, Some(&tent_b_rollout)),
+        ],
+        None,
+        None,
+    )
+    .await?;
+
+    assert!(
+        !authorization.is_rollout_allowlisted(),
+        "allowlisted on tent_a but not tent_b must not count as rollout-allowlisted",
+    );
+    assert!(
+        !authorization.has_authorization(),
+        "the access spans a tent the caller is not allowlisted for, so it must be denied",
+    );
+    Ok(())
+}
+
+/// What it tests: a tent that configures no rollout allowlist group.
+/// Expected: the caller is never rollout-allowlisted for it. An absent group
+/// grants nothing — it must not be treated as vacuously satisfied, nor inherit
+/// another tent's group.
+#[mononoke::fbinit_test]
+async fn test_absent_rollout_group_never_allowlists(fb: FacebookInit) -> Result<()> {
+    let acl_provider = rollout_allowlist_acl_provider()?;
+    let ctx = ctx_with_identities(fb, &["USER:dave"])?;
+    let tent_b = MononokeIdentity::from_str("REPO_REGION:repos/hg/fbsource/=tent_b")?;
+
+    let authorization =
+        super::check_authorization(&ctx, &acl_provider, &[(&tent_b, None)], None, None).await?;
+
+    assert!(
+        !authorization.is_rollout_allowlisted(),
+        "a tent with no rollout group must never report the caller as allowlisted",
+    );
+    assert!(
+        !authorization.has_authorization(),
+        "caller has neither ACL access nor an applicable allowlist",
+    );
+    Ok(())
+}
+
+// What it tests: the logged enforcement decision for every enforcement result,
+// with and without a matching exemption.
+// Expected: the decision carries whether an exemption matched for
+// `no_condition_matched` and `error`, and the exempted outcome maps to
+// `Exempted`.
+#[mononoke::test]
+fn test_enforcement_decision_from_outcome() {
+    let cases = [
+        (
+            Ok(AccessEnforcementOutcome::NotEnforced),
+            false,
+            EnforcementDecision::NoConditionMatched {
+                exemption_matched: false,
+            },
+        ),
+        (
+            Ok(AccessEnforcementOutcome::NotEnforced),
+            true,
+            EnforcementDecision::NoConditionMatched {
+                exemption_matched: true,
+            },
+        ),
+        (
+            Ok(AccessEnforcementOutcome::Enforced {
+                denial_permission_request_group: None,
+            }),
+            false,
+            EnforcementDecision::Enforced,
+        ),
+        (
+            Ok(AccessEnforcementOutcome::Exempted),
+            true,
+            EnforcementDecision::Exempted,
+        ),
+        (
+            Err(anyhow::anyhow!("source failed")),
+            false,
+            EnforcementDecision::Error {
+                exemption_matched: false,
+            },
+        ),
+        (
+            Err(anyhow::anyhow!("source failed")),
+            true,
+            EnforcementDecision::Error {
+                exemption_matched: true,
+            },
+        ),
+    ];
+    for (outcome, exemption_matched, expected) in cases {
+        assert_eq!(
+            EnforcementDecision::from_outcome(&outcome, exemption_matched),
+            expected,
+            "outcome {outcome:?} with exemption_matched={exemption_matched}",
+        );
+    }
+}
+
 fn path_restriction_check() -> Result<PathRestrictionCheckResult> {
     path_restriction_check_with("restricted", "REPO_REGION:test_acl", true)
+}
+
+/// Build an `InternalAclProvider` for the per-tent rollout allowlist tests.
+/// `tent_a` and `tent_b` are separate restrictions with separate rollout
+/// groups: `dave` is allowlisted for `tent_a` only, `erin` for `tent_b` only,
+/// and neither has direct read access to either tent.
+fn rollout_allowlist_acl_provider() -> Result<Arc<dyn AclProvider>> {
+    let acls: Acls = serde_json::from_str(
+        r#"
+        {
+            "repo_regions": {
+                "repos/hg/fbsource/=tent_a": {
+                    "actions": {
+                        "read": ["USER:alice"]
+                    }
+                },
+                "repos/hg/fbsource/=tent_b": {
+                    "actions": {
+                        "read": ["USER:alice"]
+                    }
+                }
+            },
+            "groups": {
+                "tent_a_rollout": ["USER:dave"],
+                "tent_b_rollout": ["USER:erin"]
+            }
+        }
+        "#,
+    )?;
+    Ok(InternalAclProvider::new(acls))
+}
+
+/// Build a check carrying an explicit authorization result, for the summary
+/// aggregation tests. `restriction_root` only needs to be unique per check;
+/// these tests assert on the aggregated flags, not on paths or ACLs.
+fn check_with_authorization(
+    restriction_root: &str,
+    authorization: AuthorizationCheckResult,
+) -> Result<PathRestrictionCheckResult> {
+    let acl = MononokeIdentity::from_str("REPO_REGION:test_acl")?;
+    Ok(PathRestrictionCheckResult::new(
+        PathRestrictionInfo {
+            restriction_root: NonRootMPath::new(restriction_root)?,
+            repo_region_acl: acl.to_string(),
+            permission_request_group: acl.clone(),
+            rollout_allowlist_group: None,
+        },
+        authorization,
+        acl,
+    ))
 }
 
 fn path_restriction_check_with(
@@ -239,6 +597,7 @@ fn path_restriction_check_with(
             restriction_root: NonRootMPath::new(restriction_root)?,
             repo_region_acl: acl.to_string(),
             permission_request_group: acl.clone(),
+            rollout_allowlist_group: None,
         },
         AuthorizationCheckResult::new(has_acl_access, false, false, false),
         acl,

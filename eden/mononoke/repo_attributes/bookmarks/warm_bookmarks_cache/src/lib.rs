@@ -78,6 +78,7 @@ use futures_stats::TimedFutureExt;
 use futures_watchdog::WatchdogExt;
 use git_types::MappedGitCommitId;
 use git_types::RootGitDeltaManifestV2Id;
+use history_manifest::RootHistoryManifestDirectoryId;
 use inferred_copy_from::RootInferredCopyFromId;
 use itertools::Itertools;
 use lock_ext::RwLockExt;
@@ -373,7 +374,7 @@ impl WarmBookmarksCacheBuilder {
 
         let config = repo_derived_data.config();
         for ty in types.iter() {
-            if config.is_enabled(**ty) {
+            if config.is_enabled(**ty) && !config.is_excluded_from_wbc(**ty) {
                 self.warmers
                     .extend(self.derived_data_warmer(ty, repo_derived_data));
             }
@@ -517,7 +518,13 @@ impl WarmBookmarksCacheBuilder {
             DerivableType::AclManifests => None,
             DerivableType::TestManifests => None,
             DerivableType::TestShardedManifests => None,
-            DerivableType::HistoryManifests => None,
+            DerivableType::HistoryManifests => Some(create_derived_data_warmer::<
+                RootHistoryManifestDirectoryId,
+            >(
+                &self.ctx,
+                repo_derived_data.clone(),
+                vec![WarmerTag::Hg, WarmerTag::Git],
+            )),
         }
     }
 

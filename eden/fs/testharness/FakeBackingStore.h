@@ -13,6 +13,7 @@
 #include <initializer_list>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 
@@ -119,6 +120,23 @@ class FakeBackingStore final : public BackingStore {
       const std::initializer_list<TreeEntryData>& entries);
 
   /**
+   * Replace an existing tree with an empty restricted response under the same
+   * object ID, simulating access revocation between fetches.
+   */
+  StoredTree* replaceTreeWithRestricted(ObjectId id) {
+    auto data = data_.wlock();
+    auto it = data->trees.find(id);
+    if (it == data->trees.end()) {
+      throw std::domain_error{"tree not found"};
+    }
+    it->second = std::make_unique<StoredTree>(Tree{
+        Tree::Restricted{},
+        Tree::container{kPathMapDefaultCaseSensitive},
+        std::move(id)});
+    return it->second.get();
+  }
+
+  /**
    * Add a tree to the backing store, or return the StoredTree already present
    * with this id.
    *
@@ -142,13 +160,6 @@ class FakeBackingStore final : public BackingStore {
       const FakeTreeBuilder& builder);
 
   /**
-   * Add a Glob to the backing store
-   */
-  StoredGlob* putGlob(
-      std::pair<RootId, std::string> suffixQuery,
-      std::vector<std::string> contents);
-
-  /**
    * Look up a StoredTree.
    *
    * Throws an error if the specified id does not exist.  Never returns null.
@@ -161,13 +172,6 @@ class FakeBackingStore final : public BackingStore {
    * Throws an error if the specified id does not exist.  Never returns null.
    */
   StoredBlob* getStoredBlob(ObjectId id);
-
-  /**
-   * Look up a StoredGlob.
-   *
-   * Throws an error if the specified id does not exist.  Never returns null.
-   */
-  StoredGlob* getStoredGlob(std::pair<RootId, std::string> suffixQuery);
 
   /**
    * Manually clear the list of outstanding requests to avoid cycles during
@@ -205,6 +209,12 @@ class FakeBackingStore final : public BackingStore {
   }
 
   /**
+   * Configure the TreeAuxData returned for an object ID. Passing nullptr
+   * simulates aux data that is absent from the backing store.
+   */
+  void putTreeAuxData(ObjectId id, TreeAuxDataPtr treeAuxData);
+
+  /**
    * Configure the result of checkPermission for a specific manifest ID.
    * If not configured, checkPermission defaults to true (fail-open).
    */
@@ -222,13 +232,10 @@ class FakeBackingStore final : public BackingStore {
     std::unordered_map<RootId, std::unique_ptr<StoredId>> commits;
     std::unordered_map<ObjectId, std::unique_ptr<StoredTree>> trees;
     std::unordered_map<ObjectId, std::unique_ptr<StoredBlob>> blobs;
-    std::unordered_map<
-        std::pair<RootId, std::string>,
-        std::unique_ptr<StoredGlob>>
-        globs;
 
     std::unordered_map<RootId, size_t> commitAccessCounts;
     std::unordered_map<ObjectId, size_t> accessCounts;
+    folly::F14FastMap<ObjectId, TreeAuxDataPtr> treeAuxData;
     std::vector<ObjectId> auxDataLookups;
     folly::F14FastMap<ObjectId, bool> permissionResults;
     folly::F14FastMap<ObjectId, size_t> permissionCheckCounts;
@@ -252,11 +259,10 @@ class FakeBackingStore final : public BackingStore {
   FRIEND_TEST(FakeBackingStoreTest, getBlob);
   FRIEND_TEST(FakeBackingStoreTest, getTree);
   FRIEND_TEST(FakeBackingStoreTest, getRootTree);
-  FRIEND_TEST(FakeBackingStoreTest, getGlobFiles);
 
   ImmediateFuture<GetRootTreeResult> getRootTree(
       const RootId& commitID,
-      const ObjectFetchContextPtr& context) override;
+      const ObjectFetchContextPtr& context);
   folly::coro::now_task<GetRootTreeResult> co_getRootTree(
       const RootId& rootId,
       const ObjectFetchContextPtr& context) override;
@@ -271,9 +277,6 @@ class FakeBackingStore final : public BackingStore {
   folly::coro::now_task<GetTreeResult> co_getTree(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
-  folly::SemiFuture<GetTreeAuxResult> getTreeAuxData(
-      const ObjectId& /*id*/,
-      const ObjectFetchContextPtr& /*context*/) override;
   folly::coro::now_task<GetTreeAuxResult> co_getTreeAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
@@ -283,20 +286,9 @@ class FakeBackingStore final : public BackingStore {
   folly::coro::Task<GetBlobResult> co_getBlob(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
-  folly::SemiFuture<GetBlobAuxResult> getBlobAuxData(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) override;
   folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
-  ImmediateFuture<GetGlobFilesResult> getGlobFiles(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes) override;
-  folly::coro::now_task<GetGlobFilesResult> co_getGlobFiles(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes) override;
 
   std::shared_ptr<ServerState> serverState_;
   folly::Synchronized<Data> data_;

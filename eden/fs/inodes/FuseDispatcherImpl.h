@@ -43,6 +43,7 @@ class FuseDispatcherImpl : public FuseDispatcher {
 
   void forget(InodeNumber ino, unsigned long nlookup) override;
   ImmediateFuture<uint64_t> open(InodeNumber ino, int flags) override;
+  ImmediateFuture<folly::Unit> release(InodeNumber ino, uint64_t fh) override;
   ImmediateFuture<std::string> readlink(
       InodeNumber ino,
       bool kernelCachesReadlink,
@@ -76,6 +77,13 @@ class FuseDispatcherImpl : public FuseDispatcher {
       PathComponentPiece name,
       InodeNumber newparent,
       PathComponentPiece newname,
+      const ObjectFetchContextPtr& context) override;
+  ImmediateFuture<folly::Unit> rename2(
+      InodeNumber parent,
+      PathComponentPiece name,
+      InodeNumber newparent,
+      PathComponentPiece newname,
+      uint32_t flags,
       const ObjectFetchContextPtr& context) override;
 
   ImmediateFuture<fuse_entry_out> link(
@@ -126,6 +134,14 @@ class FuseDispatcherImpl : public FuseDispatcher {
   ImmediateFuture<std::vector<std::string>> listxattr(InodeNumber ino) override;
 
  private:
+  ImmediateFuture<folly::Unit> renameImpl(
+      InodeNumber parent,
+      PathComponentPiece name,
+      InodeNumber newparent,
+      PathComponentPiece newname,
+      bool noReplace,
+      const ObjectFetchContextPtr& context);
+
   /**
    * Compute the FUSE cache TTL based on current inode pressure.
    * Returns dynamic TTL when pressure-based GC is enabled, or the
@@ -149,6 +165,12 @@ class FuseDispatcherImpl : public FuseDispatcher {
    * lookups.
    */
   uint64_t computeNegativeEntryTtl() const;
+
+  /**
+   * The reply for a name that does not exist: inode number 0 with the
+   * negative-entry TTL, which the kernel caches as a negative dentry.
+   */
+  fuse_entry_out negativeLookupEntry() const;
 
   // The EdenMount associated with this dispatcher.
   EdenMount* const mount_;

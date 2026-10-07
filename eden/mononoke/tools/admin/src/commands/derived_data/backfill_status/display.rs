@@ -152,7 +152,7 @@ fn truncate_str(s: &str, max: usize) -> String {
 }
 
 /// Render the "Repo Names" column for a backfill list row: the repo names,
-/// truncated to a reasonable width. Unknown ids fall back to `repo_id: <id>`.
+/// truncated to a reasonable width. Unknown ids fall back to the bare id.
 /// The repo count lives in its own column, so it isn't repeated here.
 fn format_repo_names_cell(repo_ids: &[i64], repo_names: &HashMap<i64, String>) -> String {
     /// Max width of the names portion before we truncate with an ellipsis.
@@ -163,7 +163,7 @@ fn format_repo_names_cell(repo_ids: &[i64], repo_names: &HashMap<i64, String>) -
             // Fall back to the id for unknown or empty names so we never render
             // a blank entry.
             Some(name) if !name.is_empty() => name.clone(),
-            _ => format!("repo_id: {}", format_number(repo_id.max(0) as usize)),
+            _ => format_number(repo_id.max(0) as usize),
         }
     };
 
@@ -521,6 +521,42 @@ pub(super) fn display_child_request_detail(
                 println!("       base: {}", segment.base);
             }
         }
+        BackfillChildParams::DeriveBackfillRepo {
+            repo_id,
+            derived_data_type,
+            cs_id_count,
+            slice_size,
+            boundaries_concurrency,
+            num_boundary_requests,
+            reslice,
+            auto_enable,
+            config_name,
+        } => {
+            println!("Derive Backfill Repo Params:");
+            println!("  Repo:              {}", format_repo(*repo_id, repo_names));
+            println!("  Derived Data Type: {derived_data_type}");
+            println!(
+                "  Config Name:       {}",
+                format_optional_str(config_name.as_deref())
+            );
+            println!("  Head Changesets:   {}", format_number(*cs_id_count));
+            println!(
+                "  Slice Size:        {}",
+                format_number((*slice_size).max(0) as usize)
+            );
+            println!("  Boundaries Concurrency: {boundaries_concurrency}");
+            println!("  Num Boundary Requests:  {num_boundary_requests}");
+            println!("  Reslice:           {reslice}");
+            println!("  Auto Enable:       {auto_enable}");
+        }
+        BackfillChildParams::MarkTypeEnabled {
+            repo_id,
+            derived_data_type,
+        } => {
+            println!("Mark Type Enabled Params:");
+            println!("  Repo:              {}", format_repo(*repo_id, repo_names));
+            println!("  Derived Data Type: {derived_data_type}");
+        }
     }
 
     if let Some(result) = &data.result {
@@ -536,6 +572,30 @@ pub(super) fn display_child_request_detail(
                 error_message,
             } => {
                 println!("  Derived Count:     {derived_count}");
+                println!(
+                    "  Error Message:     {}",
+                    format_optional_str(error_message.as_deref())
+                );
+            }
+            BackfillChildResult::DeriveBackfillRepo {
+                total_sub_requests,
+                error_message,
+            } => {
+                println!("  Sub-requests:      {total_sub_requests}");
+                println!(
+                    "  Error Message:     {}",
+                    format_optional_str(error_message.as_deref())
+                );
+            }
+            BackfillChildResult::MarkTypeEnabled {
+                repo_id,
+                derived_data_type,
+                enabled,
+                error_message,
+            } => {
+                println!("  Repo:              {}", format_repo(*repo_id, repo_names));
+                println!("  Derived Data Type: {derived_data_type}");
+                println!("  Enabled:           {enabled}");
                 println!(
                     "  Error Message:     {}",
                     format_optional_str(error_message.as_deref())
@@ -865,9 +925,9 @@ mod tests {
 
     #[test]
     fn test_format_repo_names_cell_single_unknown_id() {
-        // An id with no known name falls back to "repo_id: <grouped id>".
+        // An id with no known name falls back to the bare grouped id.
         let names = HashMap::new();
-        assert_eq!(format_repo_names_cell(&[12345], &names), "repo_id: 12_345");
+        assert_eq!(format_repo_names_cell(&[12345], &names), "12_345");
     }
 
     #[test]

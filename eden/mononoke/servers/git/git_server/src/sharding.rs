@@ -19,6 +19,7 @@ use sharding_observability::WeightTracker;
 use tracing::info;
 
 use crate::Repo;
+use crate::lazy_repo_build_enabled;
 
 /// Struct representing the Mononoke Git Server process when sharding by
 /// repo.
@@ -42,7 +43,14 @@ impl RepoShardedProcess for MononokeGitServerProcess {
         // shallow-sharded repo, in which case it would already be initialized during service startup.
         if self.repos_mgr.repos().get_by_name(repo_name).is_none() {
             // The input repo is a deep-sharded repo, so it needs to be added now.
-            self.repos_mgr.add_repo(repo_name).await.with_context(|| {
+            let added = if lazy_repo_build_enabled() {
+                self.repos_mgr
+                    .add_repo_for_service(repo_name, Some(ShardedService::MononokeGitServer))
+                    .await
+            } else {
+                self.repos_mgr.add_repo(repo_name).await.map(|_| ())
+            };
+            added.with_context(|| {
                 format!("Failure in setting up repo {repo_name} in Mononoke Git Server")
             })?;
             info!("Completed repo {} setup in Mononoke Git Server", repo_name);
@@ -80,7 +88,7 @@ impl RepoShardedProcessExecutor for MononokeGitServerExecutor {
             .with_context(|| {
                 format!(
                     "Failure in stopping repo {}. The config for repo doesn't exist",
-                    &self.repo_name
+                    self.repo_name
                 )
             })?;
         // Check if the current repo is a deep-sharded or shallow-sharded repo. If the

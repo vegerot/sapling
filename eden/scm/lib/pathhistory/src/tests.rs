@@ -144,7 +144,7 @@ impl TestHistory {
 
     /// Obtain the access log.
     pub fn take_access_log(&self) -> Vec<String> {
-        self.inner.lock().unwrap().access_log.drain(..).collect()
+        std::mem::take(&mut self.inner.lock().unwrap().access_log)
     }
 
     fn commit_to_tree(&self, commit_id: HgId) -> HgId {
@@ -237,11 +237,11 @@ impl KeyStore for TestHistory {
         let key = Key::new(path.to_owned(), hgid);
         let inner = self.inner.lock().unwrap();
         if !inner.prefetched_trees.contains(&key) {
-            bail!("not prefetched: {:?}", &key);
+            bail!("not prefetched: {key:?}");
         }
         match inner.trees.get(&hgid) {
             Some(v) => Ok(Some(Blob::Bytes(v.clone()))),
-            None => bail!("{:?} not found", &key),
+            None => bail!("{key:?} not found"),
         }
     }
 

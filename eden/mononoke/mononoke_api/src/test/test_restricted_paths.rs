@@ -5,6 +5,8 @@
  * GNU General Public License version 2.
  */
 
+mod test_restricted_paths_bypassing;
+
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -15,6 +17,7 @@ use fbinit::FacebookInit;
 use metaconfig_types::AclManifestMode;
 use metaconfig_types::PathRestrictionMetadata;
 use metaconfig_types::RestrictedPathsConfig;
+use metaconfig_types::RestrictedPathsManifestIdStoreConfig;
 use mononoke_macros::mononoke;
 use mononoke_types::NonRootMPath;
 use mononoke_types::RepositoryId;
@@ -56,6 +59,7 @@ async fn test_restriction_info_exact_match(fb: FacebookInit) -> Result<()> {
             restriction_root: NonRootMPath::new("restricted/dir")?,
             repo_region_acl: "GROUP:my-acl".to_string(),
             permission_request_group: MononokeIdentity::from_str("GROUP:my-acl")?,
+            rollout_allowlist_group: None,
         },
         has_access: Some(true),
     }];
@@ -82,6 +86,7 @@ async fn test_restriction_info_nested_path(fb: FacebookInit) -> Result<()> {
             restriction_root: NonRootMPath::new("restricted")?,
             repo_region_acl: "GROUP:my-acl".to_string(),
             permission_request_group: MononokeIdentity::from_str("GROUP:my-acl")?,
+            rollout_allowlist_group: None,
         },
         has_access: Some(true),
     }];
@@ -143,6 +148,7 @@ async fn test_restriction_info_multiple_restrictions(fb: FacebookInit) -> Result
             restriction_root: NonRootMPath::new("first")?,
             repo_region_acl: "GROUP:first-acl".to_string(),
             permission_request_group: MononokeIdentity::from_str("GROUP:first-acl")?,
+            rollout_allowlist_group: None,
         },
         has_access: Some(true),
     }];
@@ -161,6 +167,7 @@ async fn test_restriction_info_multiple_restrictions(fb: FacebookInit) -> Result
             restriction_root: NonRootMPath::new("second")?,
             repo_region_acl: "GROUP:second-acl".to_string(),
             permission_request_group: MononokeIdentity::from_str("GROUP:second-acl")?,
+            rollout_allowlist_group: None,
         },
         has_access: Some(true),
     }];
@@ -226,6 +233,7 @@ async fn test_restriction_info_nested_roots(fb: FacebookInit) -> Result<()> {
                 restriction_root: NonRootMPath::new("foo")?,
                 repo_region_acl: "GROUP:outer-acl".to_string(),
                 permission_request_group: MononokeIdentity::from_str("GROUP:outer-acl")?,
+                rollout_allowlist_group: None,
             },
             has_access: Some(true),
         },
@@ -234,6 +242,7 @@ async fn test_restriction_info_nested_roots(fb: FacebookInit) -> Result<()> {
                 restriction_root: NonRootMPath::new("foo/bar")?,
                 repo_region_acl: "GROUP:inner-acl".to_string(),
                 permission_request_group: MononokeIdentity::from_str("GROUP:inner-acl")?,
+                rollout_allowlist_group: None,
             },
             has_access: Some(true),
         },
@@ -534,6 +543,7 @@ async fn test_find_descendants_root_returns_all(fb: FacebookInit) -> Result<()> 
                 restriction_root: NonRootMPath::new("first/path")?,
                 repo_region_acl: "GROUP:first-acl".to_string(),
                 permission_request_group: MononokeIdentity::from_str("GROUP:first-acl")?,
+                rollout_allowlist_group: None,
             },
             has_access: None,
         },
@@ -542,6 +552,7 @@ async fn test_find_descendants_root_returns_all(fb: FacebookInit) -> Result<()> 
                 restriction_root: NonRootMPath::new("second/path")?,
                 repo_region_acl: "GROUP:second-acl".to_string(),
                 permission_request_group: MononokeIdentity::from_str("GROUP:second-acl")?,
+                rollout_allowlist_group: None,
             },
             has_access: None,
         },
@@ -569,6 +580,7 @@ async fn test_find_descendants_check_permissions_populates_access(fb: FacebookIn
             restriction_root: NonRootMPath::new("restricted/path")?,
             repo_region_acl: "GROUP:restricted-acl".to_string(),
             permission_request_group: MononokeIdentity::from_str("GROUP:restricted-acl")?,
+            rollout_allowlist_group: None,
         },
         has_access: Some(true),
     }];
@@ -603,6 +615,7 @@ async fn test_find_descendants_filter_exact_match(fb: FacebookInit) -> Result<()
             restriction_root: NonRootMPath::new("first/path")?,
             repo_region_acl: "GROUP:first-acl".to_string(),
             permission_request_group: MononokeIdentity::from_str("GROUP:first-acl")?,
+            rollout_allowlist_group: None,
         },
         has_access: None,
     }];
@@ -629,6 +642,7 @@ async fn test_find_descendants_filter_parent_of_root(fb: FacebookInit) -> Result
             restriction_root: NonRootMPath::new("foo/bar/restricted")?,
             repo_region_acl: "GROUP:my-acl".to_string(),
             permission_request_group: MononokeIdentity::from_str("GROUP:my-acl")?,
+            rollout_allowlist_group: None,
         },
         has_access: None,
     }];
@@ -715,6 +729,7 @@ async fn test_find_descendants_nested_roots(fb: FacebookInit) -> Result<()> {
                 restriction_root: NonRootMPath::new("foo")?,
                 repo_region_acl: "GROUP:outer-acl".to_string(),
                 permission_request_group: MononokeIdentity::from_str("GROUP:outer-acl")?,
+                rollout_allowlist_group: None,
             },
             has_access: None,
         },
@@ -723,6 +738,7 @@ async fn test_find_descendants_nested_roots(fb: FacebookInit) -> Result<()> {
                 restriction_root: NonRootMPath::new("foo/bar")?,
                 repo_region_acl: "GROUP:inner-acl".to_string(),
                 permission_request_group: MononokeIdentity::from_str("GROUP:inner-acl")?,
+                rollout_allowlist_group: None,
             },
             has_access: None,
         },
@@ -761,6 +777,7 @@ async fn test_batch_find_descendants_multiple_roots(fb: FacebookInit) -> Result<
                 restriction_root: NonRootMPath::new("first/path")?,
                 repo_region_acl: "GROUP:first-acl".to_string(),
                 permission_request_group: MononokeIdentity::from_str("GROUP:first-acl")?,
+                rollout_allowlist_group: None,
             },
             has_access: None,
         },
@@ -769,6 +786,7 @@ async fn test_batch_find_descendants_multiple_roots(fb: FacebookInit) -> Result<
                 restriction_root: NonRootMPath::new("third/path")?,
                 repo_region_acl: "GROUP:third-acl".to_string(),
                 permission_request_group: MononokeIdentity::from_str("GROUP:third-acl")?,
+                rollout_allowlist_group: None,
             },
             has_access: None,
         },
@@ -796,6 +814,7 @@ async fn test_batch_find_descendants_deduplicates(fb: FacebookInit) -> Result<()
             restriction_root: NonRootMPath::new("shared/path")?,
             repo_region_acl: "GROUP:my-acl".to_string(),
             permission_request_group: MononokeIdentity::from_str("GROUP:my-acl")?,
+            rollout_allowlist_group: None,
         },
         has_access: None,
     }];
@@ -833,6 +852,7 @@ async fn test_batch_find_descendants_nested_roots_and_queries(fb: FacebookInit) 
                 restriction_root: NonRootMPath::new("foo")?,
                 repo_region_acl: "GROUP:outer-acl".to_string(),
                 permission_request_group: MononokeIdentity::from_str("GROUP:outer-acl")?,
+                rollout_allowlist_group: None,
             },
             has_access: None,
         },
@@ -841,6 +861,7 @@ async fn test_batch_find_descendants_nested_roots_and_queries(fb: FacebookInit) 
                 restriction_root: NonRootMPath::new("foo/bar")?,
                 repo_region_acl: "GROUP:inner-acl".to_string(),
                 permission_request_group: MononokeIdentity::from_str("GROUP:inner-acl")?,
+                rollout_allowlist_group: None,
             },
             has_access: None,
         },
@@ -883,6 +904,7 @@ async fn test_restricted_paths_changes_with_restricted_files(fb: FacebookInit) -
                     restriction_root: NonRootMPath::new("restricted")?,
                     repo_region_acl: "GROUP:my-acl".to_string(),
                     permission_request_group: MononokeIdentity::from_str("GROUP:my-acl")?,
+                    rollout_allowlist_group: None,
                 },
                 has_access: None,
             },
@@ -964,6 +986,7 @@ async fn test_restricted_paths_changes_nested_roots(fb: FacebookInit) -> Result<
                         restriction_root: NonRootMPath::new("first")?,
                         repo_region_acl: "GROUP:first-acl".to_string(),
                         permission_request_group: MononokeIdentity::from_str("GROUP:first-acl")?,
+                        rollout_allowlist_group: None,
                     },
                     has_access: None,
                 },
@@ -979,6 +1002,7 @@ async fn test_restricted_paths_changes_nested_roots(fb: FacebookInit) -> Result<
                         restriction_root: NonRootMPath::new("first/second")?,
                         repo_region_acl: "GROUP:second-acl".to_string(),
                         permission_request_group: MononokeIdentity::from_str("GROUP:second-acl")?,
+                        rollout_allowlist_group: None,
                     },
                     has_access: None,
                 },
@@ -1030,6 +1054,7 @@ async fn test_restricted_paths_changes_multiple_unrelated_roots(fb: FacebookInit
                         restriction_root: NonRootMPath::new("alpha")?,
                         repo_region_acl: "GROUP:alpha-acl".to_string(),
                         permission_request_group: MononokeIdentity::from_str("GROUP:alpha-acl")?,
+                        rollout_allowlist_group: None,
                     },
                     has_access: None,
                 },
@@ -1044,6 +1069,7 @@ async fn test_restricted_paths_changes_multiple_unrelated_roots(fb: FacebookInit
                         restriction_root: NonRootMPath::new("beta")?,
                         repo_region_acl: "GROUP:beta-acl".to_string(),
                         permission_request_group: MononokeIdentity::from_str("GROUP:beta-acl")?,
+                        rollout_allowlist_group: None,
                     },
                     has_access: None,
                 },
@@ -1075,8 +1101,11 @@ async fn create_test_restricted_paths_with_mode(
 
     let config = RestrictedPathsConfig {
         path_restriction_metadata,
-        use_manifest_id_cache: false,
-        cache_update_interval_ms: 100,
+        manifest_id_store_config: RestrictedPathsManifestIdStoreConfig {
+            use_manifest_id_cache: false,
+            cache_update_interval_ms: 100,
+            ..Default::default()
+        },
         acl_manifest_mode,
         ..Default::default()
     };
@@ -1116,8 +1145,11 @@ async fn create_both_mode_test_changeset(
     let repo_id = RepositoryId::new(0);
     let config = RestrictedPathsConfig {
         path_restriction_metadata: build_path_restriction_metadata(config_path_acls)?,
-        use_manifest_id_cache: false,
-        cache_update_interval_ms: 100,
+        manifest_id_store_config: RestrictedPathsManifestIdStoreConfig {
+            use_manifest_id_cache: false,
+            cache_update_interval_ms: 100,
+            ..Default::default()
+        },
         acl_manifest_mode: AclManifestMode::Both,
         ..Default::default()
     };
@@ -1174,6 +1206,7 @@ fn build_path_restriction_metadata(
                 PathRestrictionMetadata {
                     repo_region_acl: MononokeIdentity::from_str(acl_str)?,
                     permission_request_group: None,
+                    rollout_allowlist_group: None,
                     read_only: false,
                 },
             ))

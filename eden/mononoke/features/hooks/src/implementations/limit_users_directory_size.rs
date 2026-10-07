@@ -14,8 +14,6 @@ use bookmarks::BookmarkKey;
 use content_manifest_derivation::RootContentManifestId;
 use context::CoreContext;
 use derivation_queue_thrift::DerivationPriority;
-use either::Either;
-use fsnodes::RootFsnodeId;
 use futures::future;
 use futures::stream;
 use futures::stream::StreamExt;
@@ -23,9 +21,9 @@ use futures::stream::TryStreamExt;
 use manifest::Entry;
 use manifest::ManifestOps;
 use mononoke_types::BonsaiChangeset;
+use mononoke_types::ContentManifestId;
 use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
-use mononoke_types::content_manifest::compat;
 use mononoke_types::path::MPath;
 use repo_blobstore::RepoBlobstoreArc;
 use repo_derived_data::RepoDerivedDataRef;
@@ -38,6 +36,7 @@ use crate::HookExecution;
 use crate::HookRejectionInfo;
 use crate::HookRepo;
 use crate::PushAuthoredBy;
+use crate::Pushvars;
 
 const MAX_CONCURRENCY: usize = 100;
 
@@ -87,6 +86,7 @@ impl ChangesetHook for LimitUsersDirectorySizeHook {
         changeset: &'cs BonsaiChangeset,
         _cross_repo_push_source: CrossRepoPushSource,
         _push_authored_by: PushAuthoredBy,
+        _maybe_pushvars: Option<&'cs Pushvars>,
     ) -> Result<HookExecution> {
         let prefix = NonRootMPath::new(self.config.path_prefix.as_bytes())?;
         let prefix_len = prefix.num_components();
@@ -110,28 +110,11 @@ impl ChangesetHook for LimitUsersDirectorySizeHook {
 
         let cs_id = changeset.get_changeset_id();
 
-        let repo_name = hook_repo.repo_identity.name();
-        let use_content_manifests = justknobs::eval(
-            "scm/mononoke:derived_data_use_content_manifests",
-            None,
-            Some(repo_name),
-        );
-
-        let root_manifest_id: compat::ContentManifestId = if use_content_manifests {
-            hook_repo
-                .repo_derived_data()
-                .derive::<RootContentManifestId>(ctx, cs_id, DerivationPriority::LOW)
-                .await?
-                .into_content_manifest_id()
-                .into()
-        } else {
-            hook_repo
-                .repo_derived_data()
-                .derive::<RootFsnodeId>(ctx, cs_id, DerivationPriority::LOW)
-                .await?
-                .into_fsnode_id()
-                .into()
-        };
+        let root_manifest_id = hook_repo
+            .repo_derived_data()
+            .derive::<RootContentManifestId>(ctx, cs_id, DerivationPriority::LOW)
+            .await?
+            .into_content_manifest_id();
 
         // Check all depth-2 directories concurrently with bounded parallelism.
         let rejection = stream::iter(depth2_paths)
@@ -162,7 +145,7 @@ async fn check_dir_size(
     config: &LimitUsersDirectorySizeConfig,
     ctx: &CoreContext,
     hook_repo: &HookRepo,
-    root_manifest_id: &compat::ContentManifestId,
+    root_manifest_id: &ContentManifestId,
     depth2_path: &[MPathElement],
 ) -> Result<Option<HookExecution>> {
     let blobstore = hook_repo.repo_blobstore_arc();
@@ -175,20 +158,14 @@ async fn check_dir_size(
         .await?;
 
     let size = match entry {
-        Some(Entry::Tree(tree_id)) => match tree_id {
-            Either::Left(cm_id) => {
-                let cm = cm_id.load(ctx, &blobstore).await?;
-                cm.subentries
-                    .rollup_data()
-                    .descendant_counts
-                    .files_total_size
-            }
-            Either::Right(fsnode_id) => {
-                let fsnode: mononoke_types::fsnode::Fsnode =
-                    fsnode_id.load(ctx, &blobstore).await?;
-                fsnode.summary().descendant_files_total_size
-            }
-        },
+        Some(Entry::Tree(tree_id)) => {
+            let manifest = tree_id.load(ctx, &blobstore).await?;
+            manifest
+                .subentries
+                .rollup_data()
+                .descendant_counts
+                .files_total_size
+        }
         _ => return Ok(None),
     };
 
@@ -249,6 +226,7 @@ mod test {
             changeset,
             CrossRepoPushSource::NativeToThisRepo,
             PushAuthoredBy::User,
+            None,
         )
         .await
     }
@@ -410,6 +388,7 @@ mod test {
                 &bcs,
                 CrossRepoPushSource::NativeToThisRepo,
                 PushAuthoredBy::Service,
+                None,
             )
             .await?;
         assert_matches!(result.result, HookResult::Rejected(_));
@@ -423,6 +402,7 @@ mod test {
                 &bcs,
                 CrossRepoPushSource::PushRedirected,
                 PushAuthoredBy::User,
+                None,
             )
             .await?;
         assert_matches!(result.result, HookResult::Rejected(_));

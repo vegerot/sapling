@@ -357,9 +357,11 @@ Test extension help:
        clonebundles  advertise pre-generated bundles to seed clones
        crdump        (no help text available)
        debugnetwork  test network connections to the server
+       debugpathcreation
+                     find the creation commit of a tracked path
        dialect       replace terms with more widely used equivalents
        dirsync
-       drop          drop specified changeset from the stack
+       drop          drop specified changesets from the stack
        edensparse    allow sparse EdenFS checkouts
        extdiff       command to allow external programs to compare revisions
        extorder
@@ -375,9 +377,6 @@ Test extension help:
        histedit      interactive history editing
        interactiveui
                      (no help text available)
-       logginghelper
-                     this extension logs different pieces of information that
-                     will be used
        megarepo      provides support for cross repo commit resolution
        morestatus    make status give a bit more context
        myparent
@@ -1207,14 +1206,16 @@ Test -e / -c / -k combinations
   Commands:
   $ sl help -e|grep -E '^[A-Z].*:|^ debug'
   Extensions:
-   debugnetwork    test network connections to the server
-   debugshell      a python shell with repo, changelog & manifest objects
+   debugnetwork      test network connections to the server
+   debugpathcreation find the creation commit of a tracked path
+   debugshell        a python shell with repo, changelog & manifest objects
   $ sl help -k|grep -E '^[A-Z].*:|^ debug'
   Topics:
   Commands:
   Extensions:
-   debugnetwork    test network connections to the server
-   debugshell      a python shell with repo, changelog & manifest objects
+   debugnetwork      test network connections to the server
+   debugpathcreation find the creation commit of a tracked path
+   debugshell        a python shell with repo, changelog & manifest objects
   Extension Commands:
   $ sl help -c -k dates |grep -E '^(Topics|Extensions|Commands):'
   Commands:

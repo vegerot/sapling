@@ -7,7 +7,6 @@
 
 #include "eden/fs/store/EmptyBackingStore.h"
 
-#include <folly/coro/Invoke.h>
 #include <folly/coro/Task.h>
 #include <folly/futures/Future.h>
 #include "eden/fs/model/Blob.h"
@@ -39,34 +38,10 @@ std::string EmptyBackingStore::renderObjectId(const ObjectId& /*objectId*/) {
   throw std::domain_error("empty backing store");
 }
 
-ImmediateFuture<BackingStore::GetRootTreeResult> EmptyBackingStore::getRootTree(
-    const RootId& rootId,
-    const ObjectFetchContextPtr& context) {
-  return ImmediateFuture{
-      // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
-      folly::coro::co_invoke(
-          [this](auto rootId, auto context)
-              -> folly::coro::Task<GetRootTreeResult> {
-            co_return co_await co_getRootTree(
-                std::move(rootId), std::move(context));
-          },
-          RootId{rootId},
-          context.copy())
-          .semi()};
-}
-
 SemiFuture<BackingStore::GetTreeResult> EmptyBackingStore::getTree(
     const ObjectId& /* id */,
     const ObjectFetchContextPtr& /* context */) {
   return makeSemiFuture<GetTreeResult>(
-      std::domain_error("empty backing store"));
-}
-
-folly::SemiFuture<BackingStore::GetTreeAuxResult>
-EmptyBackingStore::getTreeAuxData(
-    const ObjectId& /*id*/,
-    const ObjectFetchContextPtr& /*context*/) {
-  return makeSemiFuture<BackingStore::GetTreeAuxResult>(
       std::domain_error("empty backing store"));
 }
 
@@ -97,34 +72,10 @@ folly::coro::Task<BackingStore::GetBlobResult> EmptyBackingStore::co_getBlob(
   throw std::domain_error("empty backing store");
 }
 
-SemiFuture<BackingStore::GetBlobAuxResult> EmptyBackingStore::getBlobAuxData(
-    const ObjectId& /* id */,
-    const ObjectFetchContextPtr& /* context */) {
-  return makeSemiFuture<GetBlobAuxResult>(
-      std::domain_error("empty backing store"));
-}
-
 folly::coro::now_task<BackingStore::GetBlobAuxResult>
 EmptyBackingStore::co_getBlobAuxData(
     const ObjectId& /* id */,
     const ObjectFetchContextPtr& /* context */) {
-  co_yield folly::coro::co_error(std::domain_error("empty backing store"));
-}
-
-ImmediateFuture<BackingStore::GetGlobFilesResult>
-EmptyBackingStore::getGlobFiles(
-    const RootId& /* id */,
-    const std::vector<std::string>& /* globs */,
-    const std::vector<std::string>& /* prefixes */) {
-  return makeSemiFuture<GetGlobFilesResult>(
-      std::domain_error("empty backing store"));
-}
-
-folly::coro::now_task<BackingStore::GetGlobFilesResult>
-EmptyBackingStore::co_getGlobFiles(
-    const RootId& /* id */,
-    const std::vector<std::string>& /* globs */,
-    const std::vector<std::string>& /* prefixes */) {
   co_yield folly::coro::co_error(std::domain_error("empty backing store"));
 }
 

@@ -11,7 +11,7 @@ import type {CommitMessageFields} from './types';
 import {ErrorNotice} from 'isl-components/ErrorNotice';
 import {atom} from 'jotai';
 import {InternalFieldName} from 'shared/constants';
-import {firstLine} from 'shared/utils';
+import {firstLine, splitCommitMessage} from 'shared/utils';
 import serverAPI from '../ClientToServerAPI';
 import {successionTracker} from '../SuccessionTracker';
 import {tracker} from '../analytics';
@@ -250,8 +250,7 @@ registerDisposable(
         continue;
       }
 
-      const [title] = message.split(/\n+/, 1);
-      const description = message.slice(title.length);
+      const [title, description] = splitCommitMessage(message);
 
       tracker.track('RecoverCommitMessageFromOperationError');
 
@@ -301,6 +300,11 @@ export const unsavedFieldsBeingEdited = atomFamilyWeak((hashOrHead: Hash | 'head
 
 export const hasUnsavedEditedCommitMessage = atomFamilyWeak((hashOrHead: Hash | 'head') => {
   return atom(get => {
+    // Every smartlog row asks this. Answering from the edited message alone, when there is none,
+    // keeps the rows from depending on the schema and the whole commit message chain.
+    if (hashOrHead !== 'head' && Object.keys(get(editedCommitMessages(hashOrHead))).length === 0) {
+      return false;
+    }
     const beingEdited = get(unsavedFieldsBeingEdited(hashOrHead));
     if (Object.values(beingEdited).some(Boolean)) {
       // Some fields are being edited, let's look more closely to see if anything is actually different.

@@ -31,6 +31,7 @@ use futures::TryStreamExt;
 use futures::stream;
 use futures_retry::retry;
 use futures_stats::TimedTryFutureExt;
+use metaconfig_types::DerivationPipelineConfig;
 use mononoke_api::Mononoke;
 use mononoke_api::Repo;
 use mononoke_api::RepoContext;
@@ -62,6 +63,11 @@ const JK_BACKFILL_SEGMENT_CHUNK_SIZE: &str =
 
 /// JustKnob for per-chunk retry limit during slice derivation
 const JK_BACKFILL_CHUNK_RETRY_LIMIT: &str = "scm/mononoke:derived_data_backfill_chunk_retry_limit";
+
+/// JustKnob (repo-scoped) gating use of the derivation pipeline for slice
+/// backfill. Off by default; when off, slices derive via the canonical path so
+/// enabling/rolling back is instant and per-repo.
+const JK_BACKFILL_USE_PIPELINE: &str = "scm/mononoke:derived_data_backfill_use_pipeline";
 const CHUNK_RETRY_BASE_BACKOFF: Duration = Duration::from_secs(1);
 const CHUNK_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -110,18 +116,43 @@ fn get_throttled_manager(manager: &DerivedDataManager) -> Result<DerivedDataMana
     Ok(manager.with_replaced_blobstore(throttled_blobstore))
 }
 
-/// Returns a manager with the given derived data type enabled in its config.
-/// If the type is already enabled, returns a clone of the existing manager.
-/// This is needed for backfill operations where the type may not yet be in the repo config.
+/// Returns a manager with the given derived data type enabled in its config, and
+/// optionally deriving under `mapping_key_prefix` instead of the config's own prefix.
+///
+/// Enabling the type in-memory is what lets a backfill run before the type is in the
+/// repo config. Overriding the prefix serves the other half of a version rollout: the
+/// new data lands in a fresh key namespace (`derived_root_<ty>.<prefix><csid>`) that
+/// production, still reading the config's prefix, cannot see. The prefix must be
+/// applied to *every* manager in the campaign — including the one used for slicing,
+/// which decides what counts as already-derived — or the run silently mixes namespaces.
+///
+/// Returns a clone of the existing manager when there is nothing to change.
 fn with_type_enabled(
     manager: &DerivedDataManager,
     derived_data_type: DerivableType,
+    mapping_key_prefix: Option<&str>,
 ) -> DerivedDataManager {
-    if manager.config().types.contains(&derived_data_type) {
+    let type_already_enabled = manager.config().types.contains(&derived_data_type);
+    // `mapping_key_prefix()` treats absent and empty as the same thing, so compare
+    // against the effective prefix rather than the map entry.
+    let prefix_already_set = mapping_key_prefix.is_none_or(|prefix| {
+        manager
+            .config()
+            .mapping_key_prefixes
+            .get(&derived_data_type)
+            .map_or("", String::as_str)
+            == prefix
+    });
+    if type_already_enabled && prefix_already_set {
         return manager.clone();
     }
     let mut config = manager.config().clone();
     config.types.insert(derived_data_type);
+    if let Some(prefix) = mapping_key_prefix {
+        config
+            .mapping_key_prefixes
+            .insert(derived_data_type, prefix.to_string());
+    }
     manager.with_replaced_config(manager.config_name(), config)
 }
 
@@ -207,11 +238,12 @@ pub(crate) async fn compute_derive_boundaries(
         .map_err(AsyncRequestsError::request)?;
 
     info!(
-        "Deriving {} boundary changesets for repo {} type {:?} config_name {:?}",
+        "Deriving {} boundary changesets for repo {} type {:?} config_name {:?} mapping_key_prefix {:?}",
         boundary_cs_ids.len(),
         params.repo_id,
         derived_data_type,
         params.config_name,
+        params.mapping_key_prefix,
     );
 
     let derived_count = Arc::new(AtomicUsize::new(0));
@@ -220,7 +252,11 @@ pub(crate) async fn compute_derive_boundaries(
         params.config_name.as_deref(),
     )?;
     let manager = get_throttled_manager(base_manager).map_err(AsyncRequestsError::internal)?;
-    let manager = with_type_enabled(&manager, derived_data_type);
+    let manager = with_type_enabled(
+        &manager,
+        derived_data_type,
+        params.mapping_key_prefix.as_deref(),
+    );
     let concurrency = params.concurrency.max(1) as usize;
     let use_predecessor = params.use_predecessor_derivation;
     let opportunistic = justknobs::eval(JK_BACKFILL_OPPORTUNISTIC_BOUNDARIES, None, None);
@@ -286,6 +322,111 @@ pub(crate) async fn compute_derive_boundaries(
     })
 }
 
+/// Decide whether slice backfill should derive `derived_data_type` via the
+/// derivation pipeline for this repo. Returns the repo's pipeline config when
+/// all of the following hold, else `None` (canonical path):
+///   - the repo has a pipeline config whose managed `types` include the type,
+///   - the type actually supports pipeline derivation, and
+///   - the repo-scoped rollout JustKnob is enabled.
+fn should_use_pipeline<'a>(
+    manager: &'a DerivedDataManager,
+    derived_data_type: DerivableType,
+) -> Option<&'a DerivationPipelineConfig> {
+    let config = manager.pipeline_config()?;
+    if !config.types.contains(&derived_data_type) {
+        return None;
+    }
+    if derived_data_type.into_pipeline_derivable_variant().is_err() {
+        return None;
+    }
+    if !justknobs::eval(JK_BACKFILL_USE_PIPELINE, None, Some(manager.repo_name())) {
+        return None;
+    }
+    Some(config)
+}
+
+/// Derive a slice's segments via the derivation pipeline instead of the
+/// canonical path. Each segment is enumerated, flipped to forward-topological
+/// order, split into chokepoint-aware batches, then derived stage-by-stage
+/// (deepest first) via the shared `derivation_pipeline_driver`. Segments are
+/// processed sequentially to preserve topological ordering, and each segment's
+/// batches carry the same per-chunk retry/backoff as the canonical path.
+///
+/// Returns the number of changesets derived across all segments.
+async fn derive_slice_pipeline(
+    ctx: &CoreContext,
+    manager: &DerivedDataManager,
+    pipeline_config: &DerivationPipelineConfig,
+    derived_data_type: DerivableType,
+    segments: Vec<(ChangesetId, ChangesetId)>,
+) -> Result<i64, AsyncRequestsError> {
+    let order = derivation_pipeline_driver::plan_stages_and_types(
+        manager,
+        pipeline_config,
+        &[derived_data_type],
+    );
+    // Reuse the (possibly throttled) manager's blobstore and commit graph.
+    let commit_graph = manager.commit_graph();
+    let blobstore = manager.repo_blobstore();
+
+    let max_attempts =
+        (justknobs::get_as::<i64>(JK_BACKFILL_CHUNK_RETRY_LIMIT, None).max(0) as usize) + 1;
+
+    let mut derived_count: i64 = 0;
+    for (base, head) in segments {
+        // `range_stream` yields the segment in forward topological order
+        // (parents before children), which is exactly what the pipeline needs:
+        // each batch is derived assuming its out-of-batch parents are already
+        // derived.
+        let segment_cs_ids: Vec<ChangesetId> = commit_graph
+            .range_stream(ctx, base, head)
+            .await
+            .map_err(AsyncRequestsError::internal)?
+            .collect()
+            .await;
+        let count = segment_cs_ids.len() as i64;
+
+        let batches = derivation_pipeline_driver::plan_batches(
+            ctx,
+            blobstore,
+            pipeline_config,
+            segment_cs_ids,
+        )
+        .await
+        .map_err(AsyncRequestsError::internal)?;
+
+        retry(
+            |_attempt| {
+                derivation_pipeline_driver::run_pipeline_batches(
+                    manager,
+                    ctx,
+                    pipeline_config,
+                    &order.sorted_stages,
+                    &order.sorted_types,
+                    &batches,
+                )
+            },
+            CHUNK_RETRY_BASE_BACKOFF,
+        )
+        .binary_exponential_backoff()
+        .max_interval(CHUNK_RETRY_MAX_BACKOFF)
+        .max_attempts(max_attempts)
+        .inspect_err(|attempt, err| {
+            warn!(
+                "Pipeline slice derivation failed (attempt {}/{}, type {:?}): {:#}",
+                attempt, max_attempts, derived_data_type, err,
+            );
+        })
+        .await
+        .map(|(_result, _attempt)| ())
+        .map_err(AsyncRequestsError::internal)?;
+
+        derived_count += count;
+    }
+
+    Ok(derived_count)
+}
+
 /// Compute derive_slice request - derives a slice of commits (segments defined by head..base ranges)
 pub(crate) async fn compute_derive_slice(
     ctx: &CoreContext,
@@ -315,11 +456,12 @@ pub(crate) async fn compute_derive_slice(
         DerivableType::from_name(&params.derived_data_type).map_err(AsyncRequestsError::request)?;
 
     info!(
-        "Deriving slice with {} segments for repo {} type {:?} config_name {:?}",
+        "Deriving slice with {} segments for repo {} type {:?} config_name {:?} mapping_key_prefix {:?}",
         params.segments.len(),
         params.repo_id,
         derived_data_type,
         params.config_name,
+        params.mapping_key_prefix,
     );
 
     let base_manager = resolve_manager(
@@ -327,7 +469,11 @@ pub(crate) async fn compute_derive_slice(
         params.config_name.as_deref(),
     )?;
     let manager = get_throttled_manager(base_manager).map_err(AsyncRequestsError::internal)?;
-    let manager = with_type_enabled(&manager, derived_data_type);
+    let manager = with_type_enabled(
+        &manager,
+        derived_data_type,
+        params.mapping_key_prefix.as_deref(),
+    );
 
     let segment_chunk_size =
         justknobs::get_as::<i64>(JK_BACKFILL_SEGMENT_CHUNK_SIZE, None) as usize;
@@ -349,6 +495,24 @@ pub(crate) async fn compute_derive_slice(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(AsyncRequestsError::request)?;
+
+    // Pipeline path: when the repo+type is pipeline-enabled (and the rollout JK
+    // is on), derive each segment via the derivation pipeline instead of the
+    // canonical batch path.
+    if let Some(pipeline_config) = should_use_pipeline(&manager, derived_data_type) {
+        info!(
+            "Deriving slice via derivation pipeline for repo {} type {:?}",
+            params.repo_id, derived_data_type,
+        );
+        let derived_count =
+            derive_slice_pipeline(ctx, &manager, pipeline_config, derived_data_type, segments)
+                .await?;
+        return Ok(thrift::DeriveSliceResponse {
+            derived_count,
+            error_message: None,
+            ..Default::default()
+        });
+    }
 
     let max_attempts =
         (justknobs::get_as::<i64>(JK_BACKFILL_CHUNK_RETRY_LIMIT, None).max(0) as usize) + 1;
@@ -437,6 +601,21 @@ pub(crate) async fn compute_derive_backfill_repo(
 
     let slice_size = params.slice_size.max(1) as u64;
 
+    // MarkTypeEnabled records enablement for the reconcile tool, which writes the type
+    // into config but has no way to write a mapping key prefix. Auto-enabling a
+    // prefixed backfill would therefore land a config that reads the *unprefixed*
+    // namespace, hiding everything just derived. Reject the combination rather than
+    // enable a repo into data it cannot see.
+    if params.auto_enable && params.mapping_key_prefix.is_some() {
+        return Err(AsyncRequestsError::request(anyhow::anyhow!(
+            "auto_enable cannot be combined with mapping_key_prefix ({:?}): the enablement \
+             path does not write mapping_key_prefixes, so the enabled config would point at \
+             a different key namespace than the backfill. Enable the type in config manually \
+             with the same prefix instead.",
+            params.mapping_key_prefix,
+        )));
+    }
+
     let enqueued_row_ids = process_repo_backfill(
         ctx,
         &repo,
@@ -448,6 +627,7 @@ pub(crate) async fn compute_derive_backfill_repo(
         params.boundaries_concurrency,
         params.num_boundary_requests,
         params.config_name.as_deref(),
+        params.mapping_key_prefix.as_deref(),
         &repo_id,
         &root_request_id,
         created_by.as_deref(),
@@ -531,6 +711,7 @@ pub(crate) async fn enqueue_repo_backfill(
         config_name: params.config_name.clone(),
         reslice: params.reslice,
         auto_enable: params.auto_enable.unwrap_or(false),
+        mapping_key_prefix: params.mapping_key_prefix.clone(),
         ..Default::default()
     };
 
@@ -787,6 +968,7 @@ async fn enqueue_boundary_and_slice_requests(
     num_boundary_requests: i32,
     boundaries_concurrency: i32,
     config_name: Option<&str>,
+    mapping_key_prefix: Option<&str>,
     repo_id: &RepositoryId,
     root_request_id: &RowId,
     created_by: Option<&str>,
@@ -824,6 +1006,7 @@ async fn enqueue_boundary_and_slice_requests(
                 concurrency: boundaries_concurrency,
                 use_predecessor_derivation: true,
                 config_name: config_name.map(|s| s.to_string()),
+                mapping_key_prefix: mapping_key_prefix.map(|s| s.to_string()),
                 ..Default::default()
             };
 
@@ -887,6 +1070,7 @@ async fn enqueue_boundary_and_slice_requests(
             derived_data_type: derived_data_type.name().to_string(),
             segments,
             config_name: config_name.map(|s| s.to_string()),
+            mapping_key_prefix: mapping_key_prefix.map(|s| s.to_string()),
             ..Default::default()
         };
 
@@ -962,20 +1146,24 @@ async fn process_repo_backfill(
     boundaries_concurrency: i32,
     num_boundary_requests: i32,
     config_name: Option<&str>,
+    mapping_key_prefix: Option<&str>,
     repo_id: &RepositoryId,
     root_request_id: &RowId,
     created_by: Option<&str>,
 ) -> Result<Vec<RowId>, AsyncRequestsError> {
     let inner_repo = repo.repo();
     let manager = resolve_manager(inner_repo.repo_derived_data(), config_name)?;
-    let manager = with_type_enabled(manager, derived_data_type);
+    // Slicing decides which changesets count as already-derived, so it has to look at
+    // the same namespace the sub-requests will write to.
+    let manager = with_type_enabled(manager, derived_data_type, mapping_key_prefix);
 
     info!(
-        "DeriveBackfill for repo {} type {:?}: {} changesets, slice_size {}",
+        "DeriveBackfill for repo {} type {:?}: {} changesets, slice_size {}, mapping_key_prefix {:?}",
         repo_id.id(),
         derived_data_type,
         cs_ids.len(),
         slice_size,
+        mapping_key_prefix,
     );
 
     // Phase 1: Compute slices and boundaries
@@ -1005,6 +1193,7 @@ async fn process_repo_backfill(
         num_boundary_requests,
         boundaries_concurrency,
         config_name,
+        mapping_key_prefix,
         repo_id,
         root_request_id,
         created_by,
@@ -1014,16 +1203,26 @@ async fn process_repo_backfill(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::num::NonZeroU64;
+
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::Bookmarks;
     use commit_graph::CommitGraph;
     use commit_graph::CommitGraphWriter;
     use context::CoreContext;
     use derivation_queue_thrift::DerivationPriority;
+    use derived_data_manager::StageId;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use fsnodes::RootFsnodeId;
+    use futures::FutureExt;
+    use justknobs::test_helpers::JustKnobsInMemory;
+    use justknobs::test_helpers::KnobVal;
+    use justknobs::test_helpers::with_just_knobs_async;
+    use metaconfig_types::DerivationPipelineStageConfig;
     use mononoke_macros::mononoke;
+    use mononoke_types::MPath;
     use repo_blobstore::RepoBlobstore;
     use repo_derived_data::RepoDerivedData;
     use repo_derived_data::RepoDerivedDataRef;
@@ -1031,6 +1230,137 @@ mod tests {
     use tests_utils::CreateCommitContext;
 
     use super::*;
+
+    /// A minimal single-stage (terminal ROOT only) pipeline config listing the
+    /// given types. Not validated (`DerivationPipelineConfig::validate` is not
+    /// called) — just enough to drive `should_use_pipeline` / the driver.
+    fn root_only_pipeline_config(
+        types: impl IntoIterator<Item = DerivableType>,
+        batch_size: u64,
+    ) -> DerivationPipelineConfig {
+        DerivationPipelineConfig {
+            types: types.into_iter().collect(),
+            bookmarks: vec![],
+            stages: HashMap::from([(
+                MPath::ROOT,
+                DerivationPipelineStageConfig {
+                    dependencies: vec![],
+                },
+            )]),
+            batch_size: NonZeroU64::new(batch_size).expect("batch size must be non-zero"),
+        }
+    }
+
+    /// Evaluate `should_use_pipeline` with the repo-scoped rollout JustKnob
+    /// forced to `jk_enabled`.
+    async fn use_pipeline_with_jk(
+        manager: &DerivedDataManager,
+        derived_data_type: DerivableType,
+        jk_enabled: bool,
+    ) -> bool {
+        with_just_knobs_async(
+            JustKnobsInMemory::new(HashMap::from([(
+                JK_BACKFILL_USE_PIPELINE.to_string(),
+                KnobVal::Bool(jk_enabled),
+            )])),
+            async move { should_use_pipeline(manager, derived_data_type).is_some() }.boxed(),
+        )
+        .await
+    }
+
+    /// A pipeline config with a terminal ROOT stage depending on two sibling
+    /// stages `dir1` and `dir2`. Deriving ROOT is one phase; `dir1`+`dir2` are
+    /// an earlier phase of two mutually-independent stages (the parallelized
+    /// case).
+    fn multi_stage_pipeline_config(
+        types: impl IntoIterator<Item = DerivableType>,
+        batch_size: u64,
+    ) -> Result<DerivationPipelineConfig> {
+        let dir1 = MPath::new("dir1")?;
+        let dir2 = MPath::new("dir2")?;
+        let stages = HashMap::from([
+            (
+                MPath::ROOT,
+                DerivationPipelineStageConfig {
+                    dependencies: vec![dir1.clone(), dir2.clone()],
+                },
+            ),
+            (
+                dir1,
+                DerivationPipelineStageConfig {
+                    dependencies: vec![],
+                },
+            ),
+            (
+                dir2,
+                DerivationPipelineStageConfig {
+                    dependencies: vec![],
+                },
+            ),
+        ]);
+        Ok(DerivationPipelineConfig {
+            types: types.into_iter().collect(),
+            bookmarks: vec![],
+            stages,
+            batch_size: NonZeroU64::new(batch_size).expect("batch size must be non-zero"),
+        })
+    }
+
+    /// Derive canonically as the source of truth, then assert every pipeline
+    /// stage output byte-matches canonical for every commit — the same
+    /// equivalence the pipeline test harness checks, but reached through the
+    /// backfill `derive_slice_pipeline` entry point.
+    async fn verify_all_stages_match_canonical(
+        manager: &DerivedDataManager,
+        ctx: &CoreContext,
+        config: &DerivationPipelineConfig,
+        cs_ids: &[ChangesetId],
+        derived_data_type: DerivableType,
+    ) -> Result<()> {
+        manager
+            .derive_bulk_locally(ctx, cs_ids, None, &[derived_data_type], None, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let variant = derived_data_type.into_pipeline_derivable_variant()?;
+        for &cs in cs_ids {
+            for stage_path in config.stages.keys() {
+                assert!(
+                    bulk_derivation::verify_stage_output(
+                        manager,
+                        ctx,
+                        cs,
+                        &StageId::Manifest(stage_path.clone()),
+                        variant,
+                    )
+                    .await?,
+                    "pipeline stage {stage_path:?} for {cs} diverged from canonical",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Run one pipeline slice over `(base, head)` with the per-chunk retry-limit
+    /// JK pinned, returning the derived count.
+    async fn run_pipeline_slice(
+        ctx: &CoreContext,
+        manager: &DerivedDataManager,
+        config: &DerivationPipelineConfig,
+        derived_data_type: DerivableType,
+        base: ChangesetId,
+        head: ChangesetId,
+    ) -> Result<i64> {
+        with_just_knobs_async(
+            JustKnobsInMemory::new(HashMap::from([(
+                JK_BACKFILL_CHUNK_RETRY_LIMIT.to_string(),
+                KnobVal::Int(0),
+            )])),
+            derive_slice_pipeline(ctx, manager, config, derived_data_type, vec![(base, head)])
+                .boxed(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:#}"))
+    }
 
     #[facet::container]
     struct TestRepo(
@@ -1149,5 +1479,261 @@ mod tests {
             "changeset should be derived after the waiter resolved",
         );
         Ok(())
+    }
+
+    /// `with_type_enabled` is the only thing keeping a prefixed backfill out of
+    /// production's key namespace, and every manager in a campaign has to agree on
+    /// the prefix. Assert through `DerivationContext::mapping_key_prefix` — the
+    /// accessor `format_key` actually calls — rather than the config map, since an
+    /// absent entry and an empty one are indistinguishable to derivation.
+    #[mononoke::fbinit_test]
+    async fn with_type_enabled_applies_mapping_key_prefix(fb: FacebookInit) -> Result<()> {
+        let repo: TestRepo = test_repo_factory::build_empty(fb)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let base = repo.repo_derived_data().manager();
+
+        // No prefix requested: the type is enabled, the namespace is untouched.
+        let plain = with_type_enabled(base, DerivableType::Fsnodes, None);
+        assert!(plain.config().types.contains(&DerivableType::Fsnodes));
+        assert_eq!(
+            plain
+                .derivation_context(None)
+                .mapping_key_prefix::<RootFsnodeId>(),
+            "",
+        );
+
+        // Prefix requested: derivation writes into the fresh namespace.
+        let prefixed = with_type_enabled(base, DerivableType::Fsnodes, Some("r5."));
+        assert!(prefixed.config().types.contains(&DerivableType::Fsnodes));
+        assert_eq!(
+            prefixed
+                .derivation_context(None)
+                .mapping_key_prefix::<RootFsnodeId>(),
+            "r5.",
+        );
+
+        // Only the backfilled type is renamespaced; siblings keep their own keys.
+        assert_eq!(prefixed.config().mapping_key_prefixes.len(), 1);
+
+        // The type already being enabled must not short-circuit the prefix. Repos
+        // partway through a version rollout already carry the type, and returning
+        // early there would silently derive into the config's namespace instead.
+        let rederived = with_type_enabled(&prefixed, DerivableType::Fsnodes, Some("r6."));
+        assert_eq!(
+            rederived
+                .derivation_context(None)
+                .mapping_key_prefix::<RootFsnodeId>(),
+            "r6.",
+        );
+        Ok(())
+    }
+
+    /// The gating decision must require all of: a repo pipeline config, the type
+    /// listed in it, the type being pipeline-derivable, and the rollout JK on.
+    #[mononoke::fbinit_test]
+    async fn should_use_pipeline_gating(fb: FacebookInit) -> Result<()> {
+        let repo: TestRepo = test_repo_factory::build_empty(fb)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let base_manager = repo.repo_derived_data().manager();
+
+        // No pipeline config on the repo: never use the pipeline, even with the
+        // JK on.
+        assert!(
+            !use_pipeline_with_jk(base_manager, DerivableType::Fsnodes, true).await,
+            "no pipeline config should disable the pipeline path",
+        );
+
+        // Pipeline config present and listing Fsnodes (a pipeline-derivable type).
+        let manager = base_manager.with_replaced_pipeline_config(Some(root_only_pipeline_config(
+            [DerivableType::Fsnodes],
+            1,
+        )));
+        assert!(
+            use_pipeline_with_jk(&manager, DerivableType::Fsnodes, true).await,
+            "config + eligible type + JK on should enable the pipeline path",
+        );
+        assert!(
+            !use_pipeline_with_jk(&manager, DerivableType::Fsnodes, false).await,
+            "JK off should disable the pipeline path (safe rollback)",
+        );
+        assert!(
+            !use_pipeline_with_jk(&manager, DerivableType::Unodes, true).await,
+            "a type absent from the config's types should not use the pipeline",
+        );
+
+        // A type present in the config but not pipeline-derivable is rejected.
+        let ci_manager = base_manager.with_replaced_pipeline_config(Some(
+            root_only_pipeline_config([DerivableType::ChangesetInfo], 1),
+        ));
+        assert!(
+            !use_pipeline_with_jk(&ci_manager, DerivableType::ChangesetInfo, true).await,
+            "a non-pipeline-derivable type should not use the pipeline",
+        );
+
+        Ok(())
+    }
+
+    /// `derive_slice_pipeline` must derive an entire segment via the pipeline,
+    /// in parents-first order. `range_stream` already yields that order; a stray
+    /// reverse would derive a child before its in-batch parent and fail to find
+    /// the parent's stage output — this test guards that ordering.
+    #[mononoke::fbinit_test]
+    async fn derive_slice_pipeline_derives_linear_stack(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: TestRepo = test_repo_factory::build_empty(fb)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let manager = repo.repo_derived_data().manager().clone();
+
+        // Linear stack c1 <- c2 <- c3.
+        let c1 = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("a", "1")
+            .commit()
+            .await?;
+        let c2 = CreateCommitContext::new(&ctx, &repo, vec![c1])
+            .add_file("b", "2")
+            .commit()
+            .await?;
+        let c3 = CreateCommitContext::new(&ctx, &repo, vec![c2])
+            .add_file("c", "3")
+            .commit()
+            .await?;
+
+        // batch_size large enough that the whole segment is a single batch, so
+        // parents-first ordering is exercised intra-batch: fsnodes derives each
+        // commit from its parent's stage output, which for a mis-ordered batch
+        // would not yet exist for an in-batch parent.
+        let config = root_only_pipeline_config([DerivableType::Fsnodes], 10);
+        let variant = DerivableType::Fsnodes.into_pipeline_derivable_variant()?;
+
+        // Pin the per-chunk retry-limit JK so the retry wrapper reads a defined
+        // value under test.
+        let derived = with_just_knobs_async(
+            JustKnobsInMemory::new(HashMap::from([(
+                JK_BACKFILL_CHUNK_RETRY_LIMIT.to_string(),
+                KnobVal::Int(0),
+            )])),
+            derive_slice_pipeline(
+                &ctx,
+                &manager,
+                &config,
+                DerivableType::Fsnodes,
+                vec![(c1, c3)],
+            )
+            .boxed(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+
+        // `range_stream(c1, c3)` is inclusive, so the whole c1..=c3 stack is
+        // derived.
+        assert_eq!(
+            derived, 3,
+            "all three commits in the segment should be derived"
+        );
+        // Every terminal ROOT stage must be stored; a mis-ordered batch would
+        // fail to derive a child before its parent.
+        for cs in [c1, c2, c3] {
+            assert!(
+                bulk_derivation::is_stage_derived(
+                    &manager,
+                    &ctx,
+                    cs,
+                    &StageId::Manifest(MPath::ROOT),
+                    variant,
+                )
+                .await?,
+                "terminal ROOT stage should be stored by the pipeline for {cs}",
+            );
+        }
+        Ok(())
+    }
+
+    /// Multi-stage pipeline through the backfill entry point for a serial type
+    /// (fsnodes). `batch_size` 2 over 3 commits forces multiple batches (so
+    /// cross-batch parent resolution is exercised), and the `dir1`/`dir2` phase
+    /// derives two independent stages concurrently. Output must match canonical.
+    #[mononoke::fbinit_test]
+    async fn derive_slice_pipeline_multi_stage(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: TestRepo = test_repo_factory::build_empty(fb)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let manager = repo.repo_derived_data().manager().clone();
+
+        let c1 = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("dir1/a", "1")
+            .add_file("dir2/b", "1")
+            .commit()
+            .await?;
+        let c2 = CreateCommitContext::new(&ctx, &repo, vec![c1])
+            .add_file("dir1/a", "2")
+            .add_file("top", "r")
+            .commit()
+            .await?;
+        let c3 = CreateCommitContext::new(&ctx, &repo, vec![c2])
+            .add_file("dir2/b", "3")
+            .commit()
+            .await?;
+
+        let config = multi_stage_pipeline_config([DerivableType::Fsnodes], 2)?;
+        let derived =
+            run_pipeline_slice(&ctx, &manager, &config, DerivableType::Fsnodes, c1, c3).await?;
+        assert_eq!(derived, 3, "the whole c1..=c3 stack should be derived");
+        verify_all_stages_match_canonical(
+            &manager,
+            &ctx,
+            &config,
+            &[c1, c2, c3],
+            DerivableType::Fsnodes,
+        )
+        .await
+    }
+
+    /// A cross-stage copy (a file copied from the `dir1` stage into the `dir2`
+    /// stage) is a chokepoint: `plan_batches` must isolate that commit into its
+    /// own single-commit batch. Verify the backfill pipeline still produces
+    /// canonical output with such a commit in the slice.
+    #[mononoke::fbinit_test]
+    async fn derive_slice_pipeline_cross_stage_copy(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let repo: TestRepo = test_repo_factory::build_empty(fb)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let manager = repo.repo_derived_data().manager().clone();
+
+        let c1 = CreateCommitContext::new_root(&ctx, &repo)
+            .add_file("dir1/a", "1")
+            .add_file("dir2/b", "1")
+            .commit()
+            .await?;
+        // Copy dir1/a -> dir2/c: the source (dir1) and dest (dir2) are in
+        // different stages, so c2 is a cross-stage-copy chokepoint.
+        let c2 = CreateCommitContext::new(&ctx, &repo, vec![c1])
+            .add_file_with_copy_info("dir2/c", "1", (c1, "dir1/a"))
+            .commit()
+            .await?;
+        let c3 = CreateCommitContext::new(&ctx, &repo, vec![c2])
+            .add_file("dir1/a", "2")
+            .commit()
+            .await?;
+
+        let config = multi_stage_pipeline_config([DerivableType::Fsnodes], 2)?;
+        let derived =
+            run_pipeline_slice(&ctx, &manager, &config, DerivableType::Fsnodes, c1, c3).await?;
+        assert_eq!(
+            derived, 3,
+            "the whole stack including the chokepoint should be derived"
+        );
+        verify_all_stages_match_canonical(
+            &manager,
+            &ctx,
+            &config,
+            &[c1, c2, c3],
+            DerivableType::Fsnodes,
+        )
+        .await
     }
 }

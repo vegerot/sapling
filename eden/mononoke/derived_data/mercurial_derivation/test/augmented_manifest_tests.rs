@@ -5,12 +5,15 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
+use acl_manifest::DirectoryAclInputs;
 use acl_manifest::RootAclManifestId;
+use acl_manifest::acl_node_for_directory;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -38,19 +41,29 @@ use mercurial_derivation::MappedHgChangesetId;
 use mercurial_derivation::RootHgAugmentedManifestId;
 use mercurial_derivation::RootHgAugmentedManifestV2Id;
 use mercurial_derivation::derive_hg_augmented_manifest;
+use mercurial_derivation::upload_augmented_manifest::UploadTreeBuildError;
+use mercurial_derivation::upload_augmented_manifest::build_augmented_manifests_for_uploaded_trees;
+use mercurial_derivation::upload_augmented_manifest::store_uploaded_tree_envelopes;
+use mercurial_types::HgAugmentedManifestEntry;
 use mercurial_types::HgAugmentedManifestEnvelope;
 use mercurial_types::HgAugmentedManifestId;
+use mercurial_types::HgFileNodeId;
+use mercurial_types::HgManifestEnvelope;
 use mercurial_types::HgManifestId;
 use mercurial_types::HgParents;
+use mercurial_types::blobs::fetch_manifest_envelope;
 use metaconfig_types::PathRestrictionMetadata;
 use metaconfig_types::RestrictedPathsConfig;
 use mononoke_macros::mononoke;
 use mononoke_types::ChangesetId;
+use mononoke_types::ContentMetadataV2Id;
 use mononoke_types::FileChange;
 use mononoke_types::MPath;
+use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
 use mononoke_types::RepoPath;
 use mononoke_types::SubtreeChange;
+use mononoke_types::sharded_map_v2::ShardedMapV2Value;
 use mononoke_types::typed_hash::AclManifestId;
 use mononoke_types::typed_hash::BlobstoreKey;
 use permission_checker::MononokeIdentity;
@@ -65,14 +78,59 @@ use tests_utils::drawdag::extend_from_dag_with_actions;
 use crate::Repo;
 
 #[derive(Clone, Debug)]
+enum DeniedGet {
+    Keys(HashSet<String>),
+    /// Denies a whole blobstore namespace, e.g. every `hgmanifest.sha1.*` key.
+    Prefix(String),
+}
+
+impl DeniedGet {
+    fn matches(&self, key: &str) -> bool {
+        match self {
+            Self::Keys(denied) => denied.contains(key),
+            Self::Prefix(prefix) => key.starts_with(prefix.as_str()),
+        }
+    }
+}
+
+/// Whether a denied key is an assertion failure or a stand-in for a blob that
+/// has not been written yet.
+#[derive(Clone, Copy, Debug)]
+enum DeniedGetResult {
+    Error,
+    Missing,
+}
+
+#[derive(Clone, Debug)]
 struct DenyGetKeyedBlobstore<B> {
     inner: B,
-    denied_key: String,
+    denied: DeniedGet,
+    result: DeniedGetResult,
 }
 
 impl<B> DenyGetKeyedBlobstore<B> {
     fn new(inner: B, denied_key: String) -> Self {
-        Self { inner, denied_key }
+        Self {
+            inner,
+            denied: DeniedGet::Keys(HashSet::from([denied_key])),
+            result: DeniedGetResult::Error,
+        }
+    }
+
+    fn new_denying_prefix(inner: B, denied_prefix: &str) -> Self {
+        Self {
+            inner,
+            denied: DeniedGet::Prefix(denied_prefix.to_string()),
+            result: DeniedGetResult::Error,
+        }
+    }
+
+    fn missing(inner: B, denied_keys: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            inner,
+            denied: DeniedGet::Keys(denied_keys.into_iter().collect()),
+            result: DeniedGetResult::Missing,
+        }
     }
 }
 
@@ -89,8 +147,13 @@ impl<B: KeyedBlobstore + Clone> KeyedBlobstore for DenyGetKeyedBlobstore<B> {
         ctx: &'a CoreContext,
         key: &'a str,
     ) -> Result<Option<BlobstoreGetData>> {
-        if key == self.denied_key {
-            return Err(anyhow!("unexpected load of denied blobstore key {key}"));
+        if self.denied.matches(key) {
+            return match self.result {
+                DeniedGetResult::Error => {
+                    Err(anyhow!("unexpected load of denied blobstore key {key}"))
+                }
+                DeniedGetResult::Missing => Ok(None),
+            };
         }
         self.inner.get(ctx, key).await
     }
@@ -669,8 +732,11 @@ async fn test_resolve_copy_from_filenodes(fb: FacebookInit) -> Result<()> {
     let result = derive_hg_augmented_manifest::resolve_copy_from_filenodes(
         &ctx,
         repo.repo_blobstore(),
+        &MPath::new("copied_file")?,
         &file_changes,
-        &[Some((root, root_aug)), None],
+        (Some(root), None),
+        &[],
+        &HashMap::from([(root, root_aug)]),
     )
     .await?;
 
@@ -775,8 +841,11 @@ async fn test_resolve_copy_from_filenodes_missing_source(fb: FacebookInit) -> Re
     let result = derive_hg_augmented_manifest::resolve_copy_from_filenodes(
         &ctx,
         repo.repo_blobstore(),
+        &MPath::new("new_file")?,
         &file_changes,
-        &[Some((child, child_aug)), None],
+        (Some(child), None),
+        &[],
+        &HashMap::from([(child, child_aug)]),
     )
     .await?;
 
@@ -1311,6 +1380,7 @@ async fn build_repo_with_restricted_path_config(
                         "test_acl",
                     ),
                     permission_request_group: None,
+                    rollout_allowlist_group: None,
                     read_only: false,
                 },
             )
@@ -1372,6 +1442,23 @@ async fn derive_augmented_manifest_directly_for_test(
     .await
 }
 
+async fn lookup_augmented_root_child(
+    ctx: &CoreContext,
+    repo: &Repo,
+    root: HgAugmentedManifestId,
+    child: &[u8],
+) -> Result<Option<HgAugmentedManifestEntry>> {
+    root.load(ctx, repo.repo_blobstore())
+        .await?
+        .augmented_manifest
+        .lookup(
+            ctx,
+            repo.repo_blobstore(),
+            &MPathElement::new_from_slice(child)?,
+        )
+        .await
+}
+
 async fn store_augmented_manifest_with_supplied_root(
     ctx: &CoreContext,
     repo: &Repo,
@@ -1430,6 +1517,447 @@ async fn test_direct_augmented_manifest_matches_existing_path_for_root_commit(
         direct_id.load(&ctx, repo.repo_blobstore()).await.is_ok(),
         "directly derived root envelope should be loadable",
     );
+
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_direct_augmented_manifest_entry_matches_canonical_non_root_acl_entry(
+    fb: FacebookInit,
+) -> Result<()> {
+    // Given: a root commit whose non-root stage has a nested ACL subtree.
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let commit = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("README.md", "hello")
+        .add_file(
+            "src/restricted/.slacl",
+            b"repo_region_acl = \"REPO_REGION:repos/hg/fbsource/=project1\"\n",
+        )
+        .add_file("src/restricted/lib.rs", "pub fn value() -> u8 { 1 }")
+        .commit()
+        .await?;
+    let root_acl_id = derive_acl_overlay(&ctx, &repo, commit)
+        .await?
+        .context("fixture must have a non-empty ACL manifest")?;
+    let stage_path = MPath::new("src")?;
+    let stage_acl_id = root_acl_id
+        .find_entry(
+            ctx.clone(),
+            repo.repo_blobstore().clone(),
+            stage_path.clone(),
+        )
+        .await?
+        .and_then(Entry::into_tree)
+        .context("fixture must have an ACL tree at src")?;
+    let canonical_root = derive_hg_augmented_manifest::derive_augmented_manifest_from_bonsai(
+        &ctx,
+        repo.repo_blobstore(),
+        vec![],
+        file_changes_from_bonsai(&ctx, &repo, commit).await?,
+        vec![],
+        (None, None),
+        &Default::default(),
+        repo.restricted_paths().config_based(),
+        Some(root_acl_id),
+    )
+    .await?;
+    let expected_entry = lookup_augmented_root_child(&ctx, &repo, canonical_root, b"src")
+        .await?
+        .context("fixture must contain src")?;
+    let HgAugmentedManifestEntry::DirectoryNode(expected_dir) = &expected_entry else {
+        return Err(anyhow!("fixture src entry must be a directory"));
+    };
+    assert_eq!(
+        expected_dir.acl_manifest_directory_id,
+        Some(stage_acl_id),
+        "canonical V2 must retain the ACL pointer for src",
+    );
+
+    // When: deriving only src from the ACL id already rooted at src.
+    let stage_entry = derive_hg_augmented_manifest::derive_augmented_manifest_entry_from_bonsai(
+        &ctx,
+        repo.repo_blobstore(),
+        stage_path,
+        vec![],
+        HashMap::new(),
+        file_changes_from_bonsai(&ctx, &repo, commit).await?,
+        vec![],
+        (None, None),
+        &HashMap::new(),
+        &Default::default(),
+        repo.restricted_paths().config_based(),
+        Some(stage_acl_id),
+    )
+    .await?;
+
+    // Then: the stage entry retains the same ACL pointer as canonical V2.
+    assert_eq!(stage_entry, Some(expected_entry));
+
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_direct_augmented_manifest_entry_writes_restricted_paths_like_canonical(
+    fb: FacebookInit,
+) -> Result<()> {
+    with_just_knobs_async(
+        restricted_paths_access_logging_knobs(true),
+        async move {
+            // Given: equivalent repos with one configured restricted directory.
+            let ctx = CoreContext::test_mock(fb);
+            let canonical_repo =
+                build_repo_with_restricted_path_config(fb, vec![NonRootMPath::new("restricted")?])
+                    .await?;
+            let staged_repo =
+                build_repo_with_restricted_path_config(fb, vec![NonRootMPath::new("restricted")?])
+                    .await?;
+            let canonical_commit = CreateCommitContext::new_root(&ctx, &canonical_repo)
+                .add_file("restricted/secret.txt", "hidden")
+                .commit()
+                .await?;
+            let staged_commit = CreateCommitContext::new_root(&ctx, &staged_repo)
+                .add_file("restricted/secret.txt", "hidden")
+                .commit()
+                .await?;
+
+            // When: one repo derives the canonical root and the other derives only
+            // the non-root stage containing the restricted directory.
+            let canonical_root = derive_augmented_manifest_directly_for_test(
+                &ctx,
+                &canonical_repo,
+                canonical_commit,
+                vec![],
+                (None, None),
+            )
+            .await?;
+            let expected_entry =
+                lookup_augmented_root_child(&ctx, &canonical_repo, canonical_root, b"restricted")
+                    .await?
+                    .context("canonical fixture must contain restricted")?;
+            let staged_entry =
+                derive_hg_augmented_manifest::derive_augmented_manifest_entry_from_bonsai(
+                    &ctx,
+                    staged_repo.repo_blobstore(),
+                    MPath::new("restricted")?,
+                    vec![],
+                    HashMap::new(),
+                    file_changes_from_bonsai(&ctx, &staged_repo, staged_commit).await?,
+                    vec![],
+                    (None, None),
+                    &HashMap::new(),
+                    &Default::default(),
+                    staged_repo.restricted_paths().config_based(),
+                    None,
+                )
+                .await?;
+            let canonical_entries =
+                hg_augmented_restricted_path_entries(&ctx, &canonical_repo).await?;
+            let staged_entries = hg_augmented_restricted_path_entries(&ctx, &staged_repo).await?;
+
+            // Then: the staged entry and its restricted-path row match canonical.
+            assert_eq!(staged_entry, Some(expected_entry));
+            assert_eq!(staged_entries, canonical_entries);
+            assert_eq!(
+                staged_entries
+                    .iter()
+                    .map(RestrictedPathManifestIdEntry::repo_path)
+                    .collect::<Result<Vec<_>>>()?,
+                vec![RepoPath::dir("restricted")?],
+            );
+
+            Ok(())
+        }
+        .boxed(),
+    )
+    .await
+}
+
+#[mononoke::fbinit_test]
+async fn test_direct_augmented_manifest_entry_preserves_absent_parent_position(
+    fb: FacebookInit,
+) -> Result<()> {
+    // Given: only p2 has an entry at the non-root stage path.
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let p1 = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("p1-only", "p1")
+        .commit()
+        .await?;
+    let p2 = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("src/p2-only", "p2")
+        .commit()
+        .await?;
+    let p1_aug =
+        derive_augmented_manifest_directly_for_test(&ctx, &repo, p1, vec![], (None, None)).await?;
+    let p2_aug =
+        derive_augmented_manifest_directly_for_test(&ctx, &repo, p2, vec![], (None, None)).await?;
+    assert!(
+        lookup_augmented_root_child(&ctx, &repo, p1_aug, b"src")
+            .await?
+            .is_none(),
+        "fixture p1 must not contain src",
+    );
+    let p2_entry = lookup_augmented_root_child(&ctx, &repo, p2_aug, b"src")
+        .await?
+        .context("fixture p2 must contain src")?;
+    let merge = CreateCommitContext::new(&ctx, &repo, vec![p1, p2])
+        .add_file("src/merged", "merge")
+        .commit()
+        .await?;
+    let canonical_root = derive_augmented_manifest_directly_for_test(
+        &ctx,
+        &repo,
+        merge,
+        vec![p1_aug, p2_aug],
+        (Some(p1), Some(p2)),
+    )
+    .await?;
+    let expected_entry = lookup_augmented_root_child(&ctx, &repo, canonical_root, b"src")
+        .await?
+        .context("canonical merge must contain src")?;
+
+    // When: deriving the stage with the absent p1 slot preserved.
+    let stage_entry = derive_hg_augmented_manifest::derive_augmented_manifest_entry_from_bonsai(
+        &ctx,
+        repo.repo_blobstore(),
+        MPath::new("src")?,
+        vec![None, Some(p2_entry)],
+        HashMap::new(),
+        file_changes_from_bonsai(&ctx, &repo, merge).await?,
+        vec![],
+        (Some(p1), Some(p2)),
+        &HashMap::new(),
+        &Default::default(),
+        repo.restricted_paths().config_based(),
+        None,
+    )
+    .await?;
+
+    // Then: p2 remains p2 and the staged entry matches canonical direct V2.
+    assert_eq!(stage_entry, Some(expected_entry));
+
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_direct_augmented_manifest_entry_reuses_known_child(fb: FacebookInit) -> Result<()> {
+    // Given: a nested child stage has already produced its augmented entry.
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let commit = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("outside", "outside")
+        .add_file("src/lib.rs", "lib")
+        .add_file("src/generated/output.rs", "generated")
+        .commit()
+        .await?;
+    let file_changes = file_changes_from_bonsai(&ctx, &repo, commit).await?;
+    let known_entry = derive_hg_augmented_manifest::derive_augmented_manifest_entry_from_bonsai(
+        &ctx,
+        repo.repo_blobstore(),
+        MPath::new("src/generated")?,
+        vec![],
+        HashMap::new(),
+        file_changes.clone(),
+        vec![],
+        (None, None),
+        &HashMap::new(),
+        &Default::default(),
+        repo.restricted_paths().config_based(),
+        None,
+    )
+    .await?
+    .context("generated stage must produce an entry")?;
+    let denied_key = match &known_entry {
+        HgAugmentedManifestEntry::DirectoryNode(dir) => {
+            HgAugmentedManifestId::new(dir.treenode).blobstore_key()
+        }
+        HgAugmentedManifestEntry::FileNode(_) => {
+            return Err(anyhow!("generated stage must produce a directory"));
+        }
+    };
+    let denying_blobstore = DenyGetKeyedBlobstore::new(repo.repo_blobstore().clone(), denied_key);
+    let canonical_root =
+        derive_augmented_manifest_directly_for_test(&ctx, &repo, commit, vec![], (None, None))
+            .await?;
+    let expected_entry = lookup_augmented_root_child(&ctx, &repo, canonical_root, b"src")
+        .await?
+        .context("canonical manifest must contain src")?;
+
+    // When: deriving the parent stage with the nested result supplied as known.
+    let stage_entry = derive_hg_augmented_manifest::derive_augmented_manifest_entry_from_bonsai(
+        &ctx,
+        &denying_blobstore,
+        MPath::new("src")?,
+        vec![],
+        HashMap::from([(MPath::new("src/generated")?, Some(known_entry))]),
+        file_changes,
+        vec![],
+        (None, None),
+        &HashMap::new(),
+        &Default::default(),
+        repo.restricted_paths().config_based(),
+        None,
+    )
+    .await?;
+
+    // Then: the known child is reused without loading it and output stays canonical.
+    assert_eq!(stage_entry, Some(expected_entry));
+
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_direct_augmented_manifest_entry_matches_canonical_file(
+    fb: FacebookInit,
+) -> Result<()> {
+    // Given: the non-root stage path is itself a file.
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let commit = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("outside", "outside")
+        .add_file("src", "contents")
+        .commit()
+        .await?;
+    let canonical_root =
+        derive_augmented_manifest_directly_for_test(&ctx, &repo, commit, vec![], (None, None))
+            .await?;
+    let expected_entry = lookup_augmented_root_child(&ctx, &repo, canonical_root, b"src")
+        .await?
+        .context("canonical manifest must contain src")?;
+    assert!(
+        matches!(expected_entry, HgAugmentedManifestEntry::FileNode(_)),
+        "canonical src entry must be a file",
+    );
+
+    // When: deriving directly at the file path.
+    let stage_entry = derive_hg_augmented_manifest::derive_augmented_manifest_entry_from_bonsai(
+        &ctx,
+        repo.repo_blobstore(),
+        MPath::new("src")?,
+        vec![],
+        HashMap::new(),
+        file_changes_from_bonsai(&ctx, &repo, commit).await?,
+        vec![],
+        (None, None),
+        &HashMap::new(),
+        &Default::default(),
+        repo.restricted_paths().config_based(),
+        None,
+    )
+    .await?;
+
+    // Then: the staged file entry matches canonical direct V2.
+    assert_eq!(stage_entry, Some(expected_entry));
+
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_direct_augmented_manifest_entry_matches_canonical_absence(
+    fb: FacebookInit,
+) -> Result<()> {
+    // Given: a child commit deletes the file at the non-root stage path.
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let parent = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("outside", "outside")
+        .add_file("src", "contents")
+        .commit()
+        .await?;
+    let parent_aug =
+        derive_augmented_manifest_directly_for_test(&ctx, &repo, parent, vec![], (None, None))
+            .await?;
+    let parent_entry = lookup_augmented_root_child(&ctx, &repo, parent_aug, b"src")
+        .await?
+        .context("parent manifest must contain src")?;
+    let child = CreateCommitContext::new(&ctx, &repo, vec![parent])
+        .delete_file("src")
+        .commit()
+        .await?;
+    let canonical_root = derive_augmented_manifest_directly_for_test(
+        &ctx,
+        &repo,
+        child,
+        vec![parent_aug],
+        (Some(parent), None),
+    )
+    .await?;
+    assert!(
+        lookup_augmented_root_child(&ctx, &repo, canonical_root, b"src")
+            .await?
+            .is_none(),
+        "canonical child must not contain src",
+    );
+
+    // When: deriving the deleted stage from its parent file entry.
+    let stage_entry = derive_hg_augmented_manifest::derive_augmented_manifest_entry_from_bonsai(
+        &ctx,
+        repo.repo_blobstore(),
+        MPath::new("src")?,
+        vec![Some(parent_entry)],
+        HashMap::new(),
+        file_changes_from_bonsai(&ctx, &repo, child).await?,
+        vec![],
+        (Some(parent), None),
+        &HashMap::new(),
+        &Default::default(),
+        repo.restricted_paths().config_based(),
+        None,
+    )
+    .await?;
+
+    // Then: the stage reports absence rather than inventing a directory.
+    assert_eq!(stage_entry, None);
+
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_direct_augmented_manifest_entry_skips_copy_lookup_without_copies(
+    fb: FacebookInit,
+) -> Result<()> {
+    // Given: an unchanged directory stage with no copy-from changes.
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let parent = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("src/original", "contents")
+        .commit()
+        .await?;
+    let parent_augmented_manifest_id = derive_parent_aug(&ctx, &repo, parent).await?;
+    let parent_entry =
+        lookup_augmented_root_child(&ctx, &repo, parent_augmented_manifest_id, b"src")
+            .await?
+            .context("parent manifest must contain src")?;
+    let denied_key = match &parent_entry {
+        HgAugmentedManifestEntry::DirectoryNode(dir) => {
+            HgAugmentedManifestId::new(dir.treenode).blobstore_key()
+        }
+        HgAugmentedManifestEntry::FileNode(_) => {
+            return Err(anyhow!("parent src must be a directory"));
+        }
+    };
+    let denying_blobstore = DenyGetKeyedBlobstore::new(repo.repo_blobstore().clone(), denied_key);
+
+    // When: deriving the unchanged stage while denying loads of its parent envelope.
+    let stage_entry = derive_hg_augmented_manifest::derive_augmented_manifest_entry_from_bonsai(
+        &ctx,
+        &denying_blobstore,
+        MPath::new("src")?,
+        vec![Some(parent_entry.clone())],
+        HashMap::new(),
+        vec![],
+        vec![],
+        (Some(parent), None),
+        &HashMap::new(),
+        &Default::default(),
+        repo.restricted_paths().config_based(),
+        None,
+    )
+    .await?;
+
+    // Then: the parent entry is reused without a copy-source manifest lookup.
+    assert_eq!(stage_entry, Some(parent_entry));
 
     Ok(())
 }
@@ -2681,6 +3209,7 @@ where
         ctx,
         overlay,
         &bonsai,
+        &MPath::ROOT,
         subtree_source_augs,
     )
     .await?;
@@ -3302,6 +3831,7 @@ async fn test_direct_merge_acl_lookup_does_not_load_unrelated_acl_subtree(
     let root_only_acl_map = derive_hg_augmented_manifest::targeted_acl_overlay_map(
         &ctx,
         repo.repo_blobstore(),
+        &MPath::ROOT,
         acl_root_overlay,
         &[MPath::ROOT].into_iter().collect(),
     )
@@ -3376,6 +3906,7 @@ async fn test_targeted_acl_overlay_map_is_scoped_to_changed_frontier(
     let map = derive_hg_augmented_manifest::targeted_acl_overlay_map(
         &ctx,
         repo.repo_blobstore(),
+        &MPath::ROOT,
         root_acl_id,
         &target_dirs,
     )
@@ -3608,6 +4139,120 @@ fn subtree_copy(
         MPath::new(to_path)?,
         SubtreeChange::copy(MPath::new(from_path)?, from_cs_id),
     ))
+}
+
+#[mononoke::fbinit_test]
+async fn test_augmented_subtree_copy_skips_disjoint_stage(fb: FacebookInit) -> Result<()> {
+    // Given: a subtree copy into top1 and a sibling top2 pipeline stage.
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let source = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("src/file", "contents")
+        .commit()
+        .await?;
+    let child = save_bonsai_with_subtree_changes(
+        &ctx,
+        &repo,
+        vec![source],
+        vec![subtree_copy("top1/copied", "src", source)?],
+        vec![],
+    )
+    .await?;
+    let bonsai = child.load(&ctx, repo.repo_blobstore()).await?;
+    let stage_path = MPath::new("top2")?;
+
+    // When: collecting sources and replacements for the disjoint stage.
+    let source_csids =
+        derive_hg_augmented_manifest::subtree_copy_source_changesets(&bonsai, &stage_path);
+    let replacements = derive_hg_augmented_manifest::build_augmented_subtree_replacements(
+        &ctx,
+        repo.repo_blobstore(),
+        &bonsai,
+        &stage_path,
+        &HashMap::new(),
+    )
+    .await?;
+
+    // Then: the stage does not fetch or inspect the unrelated subtree source.
+    assert!(source_csids.is_empty());
+    assert!(replacements.is_empty());
+
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_augmented_subtree_copy_applies_to_stage_below_destination(
+    fb: FacebookInit,
+) -> Result<()> {
+    // Given: a subtree copy whose destination contains a nested pipeline stage.
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let source = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("src/nested/file", "contents")
+        .commit()
+        .await?;
+    let source_aug = derive_parent_aug(&ctx, &repo, source).await?;
+    let child = save_bonsai_with_subtree_changes(
+        &ctx,
+        &repo,
+        vec![source],
+        vec![subtree_copy("top1", "src", source)?],
+        vec![],
+    )
+    .await?;
+    let bonsai = child.load(&ctx, repo.repo_blobstore()).await?;
+    let stage_path = MPath::new("top1/nested")?;
+    let source_csids =
+        derive_hg_augmented_manifest::subtree_copy_source_changesets(&bonsai, &stage_path);
+    assert_eq!(source_csids, vec![source]);
+    let source_aug_roots = HashMap::from([(source, source_aug)]);
+    let subtree_replacements = derive_hg_augmented_manifest::build_augmented_subtree_replacements(
+        &ctx,
+        repo.repo_blobstore(),
+        &bonsai,
+        &stage_path,
+        &source_aug_roots,
+    )
+    .await?;
+
+    // When: deriving the nested stage below the subtree-copy destination.
+    let stage_entry = derive_hg_augmented_manifest::derive_augmented_manifest_entry_from_bonsai(
+        &ctx,
+        repo.repo_blobstore(),
+        stage_path,
+        vec![None],
+        HashMap::new(),
+        file_changes_from_bonsai(&ctx, &repo, child).await?,
+        subtree_replacements,
+        (Some(source), None),
+        &HashMap::new(),
+        &Default::default(),
+        repo.restricted_paths().config_based(),
+        None,
+    )
+    .await?;
+
+    // Then: the stage reuses the matching nested tree from the copy source.
+    let expected = source_aug
+        .find_entry(
+            ctx.clone(),
+            repo.repo_blobstore().clone(),
+            MPath::new("src/nested")?,
+        )
+        .await?
+        .and_then(Entry::into_tree)
+        .context("source must contain src/nested")?;
+    let actual = stage_entry
+        .and_then(|entry| match entry {
+            HgAugmentedManifestEntry::DirectoryNode(dir) => {
+                Some(HgAugmentedManifestId::new(dir.treenode))
+            }
+            HgAugmentedManifestEntry::FileNode(_) => None,
+        })
+        .context("nested stage must produce a directory")?;
+    assert_eq!(actual, expected);
+
+    Ok(())
 }
 
 /// Exact directory subtree copy.
@@ -4484,4 +5129,968 @@ async fn test_augmented_manifest_skip_writes_uses_mapped_hg_roots(fb: FacebookIn
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Upload-time ACL node construction.
+//
+// The oracle throughout is `derive_acl_overlay`: the ACL node the per-changeset
+// derivation stamps on the root augmented manifest. Each test rebuilds that
+// same node through `acl_manifest::acl_node_for_directory`, which sees no
+// changeset and no path, and asserts the two agree.
+//
+// Every fixture keeps its ACL file at the repository root, so the root
+// directory has no child carrying an ACL node and the child map is honestly
+// empty. These tests therefore exercise only the directory's own ACL file.
+// Children are covered by the `acl_manifest` unit tests, and composition
+// across directories end to end by the byte-identity tests of the batch
+// builder.
+// ---------------------------------------------------------------------------
+
+const TEST_ACL_CONTENT: &str = "repo_region_acl = \"REPO_REGION:repos/hg/fbsource/=project1\"\n";
+
+/// The filenode of the ACL file at the root of `cs_id`'s manifest, if any.
+async fn root_acl_file(
+    ctx: &CoreContext,
+    repo: &Repo,
+    cs_id: ChangesetId,
+    acl_file_name: &str,
+) -> Result<Option<HgFileNodeId>> {
+    let hg_manifest_id = repo
+        .derive_hg_changeset(ctx, cs_id)
+        .await?
+        .load(ctx, repo.repo_blobstore())
+        .await?
+        .manifestid();
+    let entry = hg_manifest_id
+        .find_entry(
+            ctx.clone(),
+            repo.repo_blobstore().clone(),
+            MPath::new(acl_file_name)?,
+        )
+        .await?;
+    Ok(match entry {
+        Some(Entry::Leaf((_, filenode_id))) => Some(filenode_id),
+        Some(Entry::Tree(_)) | None => None,
+    })
+}
+
+/// Build the root directory's ACL node the way the tree-upload path does,
+/// alongside the node the per-changeset derivation produces for comparison.
+async fn upload_and_derived_root_acl(
+    ctx: &CoreContext,
+    repo: &Repo,
+    cs_id: ChangesetId,
+) -> Result<(Option<AclManifestId>, Option<AclManifestId>)> {
+    let blobstore: Arc<dyn KeyedBlobstore> = Arc::new(repo.repo_blobstore().clone());
+    let acl_file_name = repo
+        .restricted_paths()
+        .config_based()
+        .config()
+        .acl_file_name()
+        .to_string();
+
+    // No parent appears anywhere below: the node is a function of this
+    // commit's own root directory, which is the property under test.
+    let own_acl_file = match root_acl_file(ctx, repo, cs_id, &acl_file_name).await? {
+        Some(filenode_id) => Some(filenode_id.load(ctx, &blobstore).await?.content_id()),
+        None => None,
+    };
+
+    let via_upload = acl_node_for_directory(
+        ctx,
+        &blobstore,
+        DirectoryAclInputs {
+            acl_file_name: &acl_file_name,
+            own_acl_file,
+            children: BTreeMap::new(),
+        },
+    )
+    .await?
+    .map(|entry| entry.id);
+
+    let via_derivation = derive_acl_overlay(ctx, repo, cs_id).await?;
+    Ok((via_upload, via_derivation))
+}
+
+/// A repository with no ACL file has no ACL node anywhere, and the upload path
+/// must agree rather than inventing an empty one.
+#[mononoke::fbinit_test]
+async fn test_upload_acl_node_is_absent_without_an_acl_file(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let root = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("dir/file.rs", "fn main() {}")
+        .commit()
+        .await?;
+
+    let (via_upload, via_derivation) = upload_and_derived_root_acl(&ctx, &repo, root).await?;
+
+    assert_eq!(
+        via_derivation, None,
+        "no .slacl anywhere, so derivation should produce no ACL node"
+    );
+    assert_eq!(via_upload, via_derivation);
+    Ok(())
+}
+
+/// Adding the ACL file creates the node, and the upload path must produce the
+/// same id from the manifest alone.
+#[mononoke::fbinit_test]
+async fn test_upload_acl_node_matches_derivation_for_a_new_acl_file(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let root = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file(".slacl", TEST_ACL_CONTENT)
+        .add_file("dir/file.rs", "fn main() {}")
+        .commit()
+        .await?;
+
+    let (via_upload, via_derivation) = upload_and_derived_root_acl(&ctx, &repo, root).await?;
+
+    assert!(
+        via_derivation.is_some(),
+        "a root .slacl should produce an ACL node, otherwise this compares nothing"
+    );
+    assert_eq!(via_upload, via_derivation);
+    Ok(())
+}
+
+/// A commit that leaves the ACL file alone carries the parent's node forward.
+/// This is the case that would silently diverge if the upload path rebuilt the
+/// node instead of reusing it.
+#[mononoke::fbinit_test]
+async fn test_upload_acl_node_carries_forward_an_unchanged_acl_file(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let root = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file(".slacl", TEST_ACL_CONTENT)
+        .add_file("dir/file.rs", "fn main() {}")
+        .commit()
+        .await?;
+    let child = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .add_file("dir/other.rs", "fn other() {}")
+        .commit()
+        .await?;
+
+    let parent_acl = derive_acl_overlay(&ctx, &repo, root).await?;
+    assert!(parent_acl.is_some(), "the parent should have an ACL node");
+
+    let (via_upload, via_derivation) = upload_and_derived_root_acl(&ctx, &repo, child).await?;
+
+    assert!(
+        via_derivation.is_some(),
+        "the restriction still exists in the child, so its node should too"
+    );
+    assert_eq!(via_upload, via_derivation);
+    Ok(())
+}
+
+/// Deleting the ACL file drops the node rather than reusing the parent's, which
+/// is the negative case: reuse here would keep a restriction alive after it was
+/// removed.
+#[mononoke::fbinit_test]
+async fn test_upload_acl_node_is_dropped_when_the_acl_file_is_deleted(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let root = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file(".slacl", TEST_ACL_CONTENT)
+        .add_file("dir/file.rs", "fn main() {}")
+        .commit()
+        .await?;
+    let child = CreateCommitContext::new(&ctx, &repo, vec![root])
+        .delete_file(".slacl")
+        .commit()
+        .await?;
+
+    // The parent really did have a node, so the child dropping it is a
+    // transition and not just two absences.
+    let parent_acl = derive_acl_overlay(&ctx, &repo, root).await?;
+    assert!(parent_acl.is_some(), "the parent should have an ACL node");
+
+    let (via_upload, via_derivation) = upload_and_derived_root_acl(&ctx, &repo, child).await?;
+
+    assert_eq!(
+        via_derivation, None,
+        "the only .slacl was deleted, so the node should be gone"
+    );
+    assert_eq!(via_upload, via_derivation);
+    Ok(())
+}
+
+async fn hg_manifest_id_of(
+    ctx: &CoreContext,
+    repo: &Repo,
+    cs_id: ChangesetId,
+) -> Result<HgManifestId> {
+    Ok(repo
+        .derive_hg_changeset(ctx, cs_id)
+        .await?
+        .load(ctx, repo.repo_blobstore())
+        .await?
+        .manifestid())
+}
+
+/// The hg manifest id of a directory inside `manifest_id`. An empty path is the
+/// root itself.
+async fn tree_id_at_path(
+    ctx: &CoreContext,
+    repo: &Repo,
+    manifest_id: HgManifestId,
+    path: &str,
+) -> Result<HgManifestId> {
+    if path.is_empty() {
+        return Ok(manifest_id);
+    }
+    let path = MPath::new(path)?;
+    manifest_id
+        .find_entry(ctx.clone(), repo.repo_blobstore().clone(), path.clone())
+        .await?
+        .and_then(|entry| entry.into_tree())
+        .with_context(|| format!("no directory at {path}"))
+}
+
+/// Run one tree through the tree-upload path, reading the uploaded bytes back
+/// out of the stored manifest blob the way a client would have sent them.
+///
+/// The blobstore handed to the builder denies every `hgmanifest.sha1.*` read,
+/// so this is also the assertion that the path derives a tree without touching
+/// a single legacy manifest blob. The envelope is fetched through the plain
+/// blobstore first, because that fetch stands in for the client upload.
+async fn build_one_uploaded_tree(
+    ctx: &CoreContext,
+    repo: &Repo,
+    overlay: &Arc<dyn KeyedBlobstore>,
+    tree_id: HgManifestId,
+) -> Result<()> {
+    let envelope = fetch_manifest_envelope(ctx, repo.repo_blobstore(), tree_id).await?;
+    let denying: Arc<dyn KeyedBlobstore> = Arc::new(DenyGetKeyedBlobstore::new_denying_prefix(
+        overlay.clone(),
+        "hgmanifest.sha1.",
+    ));
+    // A batch of one, so every child directory is resolved from the blobstore.
+    let built = build_augmented_manifests_for_uploaded_trees(
+        ctx,
+        &denying,
+        repo.restricted_paths().config_based(),
+        vec![envelope],
+    )
+    .await
+    .with_context(|| format!("building uploaded tree {tree_id}"))?;
+    // As the store knob does: later builds resolve this tree as an
+    // out-of-batch child.
+    store_uploaded_tree_envelopes(ctx, overlay, &built).await?;
+    Ok(())
+}
+
+/// Build each of `build_order` through the tree-upload path, one tree at a
+/// time, and assert every envelope is byte-identical to the one the
+/// per-changeset derivation produces for the same tree.
+///
+/// `build_order` is spelled out by the caller rather than computed. A
+/// one-tree batch needs every directory inside the tree already derived, and
+/// making that dependency explicit is the point: the paths are listed
+/// children-first, and `""` is the root.
+async fn assert_upload_path_matches_derivation(
+    ctx: &CoreContext,
+    repo: &Repo,
+    parent: ChangesetId,
+    child: ChangesetId,
+    build_order: &[&str],
+) -> Result<()> {
+    let parent_manifest = hg_manifest_id_of(ctx, repo, parent).await?;
+    let child_manifest = hg_manifest_id_of(ctx, repo, child).await?;
+    let restricted_paths_config = repo.restricted_paths().config_based();
+
+    // The upload path reuses the parent's envelopes, so derive them first.
+    let parent_root = derive_hg_augmented_manifest::derive_from_hg_manifest_and_parents(
+        ctx,
+        repo.repo_blobstore(),
+        parent_manifest,
+        vec![],
+        &Default::default(),
+        restricted_paths_config,
+        derive_acl_overlay(ctx, repo, parent).await?,
+    )
+    .await?;
+
+    let mut uploaded = Vec::with_capacity(build_order.len());
+    for path in build_order {
+        uploaded.push(tree_id_at_path(ctx, repo, child_manifest, path).await?);
+    }
+
+    // Build via the upload path into an overlay, so the canonical derivation
+    // below cannot mask a divergence by overwriting the same keys. Producer F
+    // (`derive_hg_augmented_manifest_with_hg_changeset`, on in tests) already
+    // stored these envelopes underneath, so hide them: the overlay must only
+    // ever hold what the upload path wrote.
+    let hidden_inner = DenyGetKeyedBlobstore::missing(
+        repo.repo_blobstore().clone(),
+        uploaded
+            .iter()
+            .map(|id| HgAugmentedManifestId::new(id.into_nodehash()).blobstore_key()),
+    );
+    let overlay: Arc<dyn KeyedBlobstore> = Arc::new(MemWritesKeyedBlobstore::new(hidden_inner));
+
+    for tree_id in &uploaded {
+        // A failure here means `build_order` did not list this tree's children
+        // before it; the error names the input that was missing.
+        build_one_uploaded_tree(ctx, repo, &overlay, *tree_id).await?;
+    }
+
+    let mut via_upload = HashMap::new();
+    for id in &uploaded {
+        let key = HgAugmentedManifestId::new(id.into_nodehash()).blobstore_key();
+        let bytes = overlay
+            .get(ctx, &key)
+            .await?
+            .with_context(|| format!("upload path stored no envelope for {id}"))?
+            .into_raw_bytes();
+        via_upload.insert(*id, bytes);
+    }
+
+    let child_root = derive_hg_augmented_manifest::derive_from_hg_manifest_and_parents(
+        ctx,
+        repo.repo_blobstore(),
+        child_manifest,
+        vec![parent_root],
+        &Default::default(),
+        restricted_paths_config,
+        derive_acl_overlay(ctx, repo, child).await?,
+    )
+    .await?;
+    assert_eq!(child_root.into_nodehash(), child_manifest.into_nodehash());
+
+    for id in &uploaded {
+        let key = HgAugmentedManifestId::new(id.into_nodehash()).blobstore_key();
+        let via_derivation = repo
+            .repo_blobstore()
+            .get(ctx, &key)
+            .await?
+            .with_context(|| format!("derivation stored no envelope for {id}"))?
+            .into_raw_bytes();
+        assert_eq!(
+            via_upload[id], via_derivation,
+            "the upload path envelope for {id} must be byte-identical to the derived one",
+        );
+    }
+
+    Ok(())
+}
+
+/// What it tests: the envelopes the tree-upload path builds are byte-identical
+/// to the ones the per-changeset derivation builds for the same trees.
+///
+/// Why it matters: the blobstore key is the hg node id alone and the digest
+/// excludes the ACL pointer, so a divergent envelope would silently win over
+/// the canonical one under the default if-absent put behaviour.
+#[mononoke::fbinit_test]
+async fn test_upload_path_augmented_manifests_are_byte_identical(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+
+    let parent = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("README.md", "hello")
+        .add_file("src/lib.rs", "one")
+        .add_file("src/deep/nested.rs", "deep")
+        .add_file("untouched/file.txt", "untouched")
+        .commit()
+        .await?;
+    let child = CreateCommitContext::new(&ctx, &repo, vec![parent])
+        .add_file("src/lib.rs", "two")
+        .add_file("src/deep/nested.rs", "deeper")
+        .add_file("src/deep/added.rs", "added")
+        .add_file("top.txt", "top")
+        .commit()
+        .await?;
+
+    // The root, src and src/deep are new; untouched/ is reused unchanged, so it
+    // is resolved from its stored envelope and spliced in.
+    assert_upload_path_matches_derivation(&ctx, &repo, parent, child, &["src/deep", "src", ""])
+        .await
+}
+
+/// One file past the point where the entry map stops inlining, read off the
+/// limit so that raising it cannot silently shrink this fixture below it.
+const WIDE_DIRECTORY_FILES: usize = HgAugmentedManifestEntry::WEIGHT_LIMIT + 1;
+
+/// What it tests: a directory too wide for its entry map to inline still builds
+/// byte-identically through the tree-upload path.
+///
+/// Why it matters: canonical derivation splices unchanged runs out of the
+/// parent's map while the upload path rebuilds every entry from scratch, and
+/// the two are only known to agree while the map inlines into a single node.
+/// Every other byte-identity fixture here is small enough that it does, so
+/// nothing covers the case where how the map was assembled can change the
+/// bytes -- and `PutBehaviour::IfAbsent` makes the first envelope written
+/// permanent.
+#[mononoke::fbinit_test]
+async fn test_upload_path_matches_derivation_above_the_shard_weight_limit(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+
+    let wide_files = (0..WIDE_DIRECTORY_FILES)
+        .map(|i| Ok((NonRootMPath::new(format!("wide/f{i:05}"))?, format!("v{i}"))))
+        .collect::<Result<Vec<_>>>()?;
+    let parent = CreateCommitContext::new_root(&ctx, &repo)
+        .add_files(wide_files)
+        .commit()
+        .await?;
+    // One changed file out of thousands is what gives canonical derivation a
+    // long unchanged run to splice and the upload path nothing to reuse.
+    let child = CreateCommitContext::new(&ctx, &repo, vec![parent])
+        .add_file("wide/f00000", "changed")
+        .commit()
+        .await?;
+
+    assert_upload_path_matches_derivation(&ctx, &repo, parent, child, &["wide", ""]).await?;
+
+    // A fully inlined map weighs exactly its entry count, and a sharded one
+    // counts each stored child as one, so a lower weight is proof it sharded.
+    let wide = tree_id_at_path(
+        &ctx,
+        &repo,
+        hg_manifest_id_of(&ctx, &repo, child).await?,
+        "wide",
+    )
+    .await?;
+    let envelope = HgAugmentedManifestEnvelope::load(
+        &ctx,
+        repo.repo_blobstore(),
+        HgAugmentedManifestId::new(wide.into_nodehash()),
+    )
+    .await?
+    .context("no augmented envelope for the wide directory")?;
+    let subentries = &envelope.augmented_manifest.subentries;
+    assert!(
+        subentries.weight() < subentries.size(),
+        "the fixture must exceed the shard weight limit, but its map inlined at weight {}",
+        subentries.weight(),
+    );
+
+    Ok(())
+}
+
+/// What it tests: a directory whose own files are all unchanged is built
+/// without reading a single file blob.
+///
+/// Why it matters: an uploaded manifest lists every file in the directory, not
+/// just the changed ones, so rebuilding each leaf cost one filenode load plus
+/// one content-metadata lookup per file however little changed. Denying every
+/// file read is what keeps that from coming back.
+#[mononoke::fbinit_test]
+async fn test_upload_path_reuses_unchanged_file_leaves(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+
+    let mut files = vec![(NonRootMPath::new("wide/sub/x")?, "one".to_string())];
+    for i in 0..8 {
+        files.push((NonRootMPath::new(format!("wide/f{i:03}"))?, format!("v{i}")));
+    }
+    let parent = CreateCommitContext::new_root(&ctx, &repo)
+        .add_files(files)
+        .commit()
+        .await?;
+    // Only the subdirectory changes, so every file wide/ lists is unchanged and
+    // can only come from the parent's envelope.
+    let child = CreateCommitContext::new(&ctx, &repo, vec![parent])
+        .add_file("wide/sub/x", "two")
+        .commit()
+        .await?;
+
+    let restricted_paths_config = repo.restricted_paths().config_based();
+    derive_hg_augmented_manifest::derive_from_hg_manifest_and_parents(
+        &ctx,
+        repo.repo_blobstore(),
+        hg_manifest_id_of(&ctx, &repo, parent).await?,
+        vec![],
+        &Default::default(),
+        restricted_paths_config,
+        derive_acl_overlay(&ctx, &repo, parent).await?,
+    )
+    .await?;
+
+    let child_manifest = hg_manifest_id_of(&ctx, &repo, child).await?;
+    let overlay: Arc<dyn KeyedBlobstore> =
+        Arc::new(MemWritesKeyedBlobstore::new(repo.repo_blobstore().clone()));
+    build_one_uploaded_tree(
+        &ctx,
+        &repo,
+        &overlay,
+        tree_id_at_path(&ctx, &repo, child_manifest, "wide/sub").await?,
+    )
+    .await?;
+
+    let no_file_reads: Arc<dyn KeyedBlobstore> = Arc::new(
+        DenyGetKeyedBlobstore::new_denying_prefix(overlay.clone(), "hgfilenode.sha1."),
+    );
+    let wide = tree_id_at_path(&ctx, &repo, child_manifest, "wide").await?;
+    build_one_uploaded_tree(&ctx, &repo, &no_file_reads, wide)
+        .await
+        .context("wide/ must build from the parent's leaves without reading any file blob")?;
+
+    Ok(())
+}
+
+/// What it tests: a file whose content metadata is missing fails the build
+/// instead of having its metadata recomputed.
+///
+/// Why it matters: content is uploaded before the trees that list it, so a miss
+/// means something is already wrong. Recomputing would stream the whole file
+/// back inside the user's upload request, an unbounded cost on a best-effort
+/// pass.
+#[mononoke::fbinit_test]
+async fn test_upload_path_fails_on_missing_content_metadata(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+
+    // A root commit, so there is no parent leaf to reuse and the file's leaf
+    // has to be built.
+    let commit = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("src/deep/nested.rs", "deep")
+        .commit()
+        .await?;
+    let content_id = file_changes_from_bonsai(&ctx, &repo, commit)
+        .await?
+        .into_iter()
+        .find_map(|(_, change)| change.map(|change| change.content_id()))
+        .context("the commit adds one file")?;
+    let metadata_key = ContentMetadataV2Id::from(content_id).blobstore_key();
+
+    let manifest = hg_manifest_id_of(&ctx, &repo, commit).await?;
+    let tree = tree_id_at_path(&ctx, &repo, manifest, "src/deep").await?;
+    let without_metadata: Arc<dyn KeyedBlobstore> = Arc::new(DenyGetKeyedBlobstore::missing(
+        MemWritesKeyedBlobstore::new(repo.repo_blobstore().clone()),
+        [metadata_key],
+    ));
+
+    let err = build_one_uploaded_tree(&ctx, &repo, &without_metadata, tree)
+        .await
+        .err()
+        .context("a file with no content metadata must fail the build")?;
+    assert!(
+        format!("{err:#}").contains(&format!("missing content metadata for {content_id}")),
+        "the error must name the content, got: {err:#}"
+    );
+
+    Ok(())
+}
+
+/// What it tests: a directory whose children are all files is built from the
+/// uploaded bytes alone, with no dependency on anything else being uploaded.
+///
+/// Why it matters: this is the atom the rest of the path is made of. `src/deep`
+/// has no child directories, so the only inputs are the uploaded manifest, its
+/// parent's augmented envelope, and one filenode plus content metadata per
+/// file -- and `build_one_uploaded_tree` denies every `hgmanifest.sha1.*` read.
+#[mononoke::fbinit_test]
+async fn test_upload_path_builds_a_leaf_directory_alone(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+
+    let parent = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("src/deep/nested.rs", "deep")
+        .commit()
+        .await?;
+    let child = CreateCommitContext::new(&ctx, &repo, vec![parent])
+        .add_file("src/deep/nested.rs", "deeper")
+        .add_file("src/deep/added.rs", "added")
+        .commit()
+        .await?;
+
+    assert_upload_path_matches_derivation(&ctx, &repo, parent, child, &["src/deep"]).await
+}
+
+/// What it tests: a tree whose child directory has not been derived yet fails,
+/// and leaves nothing behind.
+///
+/// Why it matters: that child is a precondition, not a guarantee. The entry the
+/// tree has to record for it carries the child's augmented id and size, so
+/// building anyway would either invent them or silently reuse the parent's
+/// stale child -- and `PutBehaviour::IfAbsent` would make that permanent.
+/// Reporting success having built nothing would be just as bad: the coverage
+/// hole this path exists to close would reopen silently.
+#[mononoke::fbinit_test]
+async fn test_upload_path_fails_when_a_child_is_not_derived(fb: FacebookInit) -> Result<()> {
+    with_just_knobs_async(
+        // `derive_hg_changeset` derives augmented manifests alongside the hg
+        // changeset. Left on, the setup below would derive the child commit's
+        // trees and leave no undrived child to test against.
+        JustKnobsInMemory::new(HashMap::from([(
+            "scm/mononoke:derive_hg_augmented_manifest_with_hg_changeset".to_string(),
+            KnobVal::Bool(false),
+        )])),
+        async {
+            let ctx = CoreContext::test_mock(fb);
+            let repo: Repo = test_repo_factory::build_empty(fb).await?;
+
+            let parent = CreateCommitContext::new_root(&ctx, &repo)
+                .add_file("src/deep/nested.rs", "deep")
+                .commit()
+                .await?;
+            let child = CreateCommitContext::new(&ctx, &repo, vec![parent])
+                .add_file("src/deep/nested.rs", "deeper")
+                .commit()
+                .await?;
+
+            let parent_manifest = hg_manifest_id_of(&ctx, &repo, parent).await?;
+            let child_manifest = hg_manifest_id_of(&ctx, &repo, child).await?;
+            derive_hg_augmented_manifest::derive_from_hg_manifest_and_parents(
+                &ctx,
+                repo.repo_blobstore(),
+                parent_manifest,
+                vec![],
+                &Default::default(),
+                repo.restricted_paths().config_based(),
+                derive_acl_overlay(&ctx, &repo, parent).await?,
+            )
+            .await?;
+
+            let overlay: Arc<dyn KeyedBlobstore> =
+                Arc::new(MemWritesKeyedBlobstore::new(repo.repo_blobstore().clone()));
+
+            // `src` is built without building `src/deep` first, so the child's
+            // new augmented manifest does not exist.
+            let src = tree_id_at_path(&ctx, &repo, child_manifest, "src").await?;
+            let deep = tree_id_at_path(&ctx, &repo, child_manifest, "src/deep").await?;
+            let err = build_one_uploaded_tree(&ctx, &repo, &overlay, src)
+                .await
+                .expect_err("a tree whose child is not derived must fail, not build");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("deep") && message.contains("already derived"),
+                "the error should name the missing input and why, got: {message}"
+            );
+            // The handler's counter split downcasts to this variant, so a
+            // matching message alone is not enough.
+            let typed = err
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<UploadTreeBuildError>());
+            assert!(
+                matches!(
+                    typed,
+                    Some(UploadTreeBuildError::MissingChild { tree, name, child })
+                        if *tree == src.into_nodehash()
+                            && name.as_ref() == b"deep"
+                            && *child == deep.into_nodehash()
+                ),
+                "the error should be MissingChild for src/deep, got: {typed:?}"
+            );
+
+            let key = HgAugmentedManifestId::new(src.into_nodehash()).blobstore_key();
+            assert!(
+                overlay.get(&ctx, &key).await?.is_none(),
+                "a failed tree must not leave an envelope behind"
+            );
+
+            // Building the child first is all it takes for the same call to
+            // succeed.
+            build_one_uploaded_tree(&ctx, &repo, &overlay, deep).await?;
+            build_one_uploaded_tree(&ctx, &repo, &overlay, src).await?;
+
+            Ok(())
+        }
+        .boxed(),
+    )
+    .await
+}
+
+/// Same byte-identity gate with ACL pointers on: the pointer is excluded from
+/// the digest but not from the stored envelope, so it has to match too.
+#[mononoke::fbinit_test]
+async fn test_upload_path_augmented_manifests_are_byte_identical_with_slacl(
+    fb: FacebookInit,
+) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+
+    let parent = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file(
+            "restricted/code/.slacl",
+            "repo_region_acl = \"REPO_REGION:repos/hg/fbsource/=project1\"\n",
+        )
+        .add_file("restricted/code/secret.rs", "fn secret() {}")
+        .add_file("restricted/other/plain.rs", "fn plain() {}")
+        .add_file("public/readme.md", "hello")
+        .commit()
+        .await?;
+    // Adds a second restriction root, so the child changes the ACL tree too.
+    let child = CreateCommitContext::new(&ctx, &repo, vec![parent])
+        .add_file("restricted/code/more.rs", "fn more() {}")
+        .add_file(
+            "restricted/other/.slacl",
+            "repo_region_acl = \"REPO_REGION:repos/hg/fbsource/=project2\"\n",
+        )
+        .commit()
+        .await?;
+    let grandchild = CreateCommitContext::new(&ctx, &repo, vec![child])
+        .delete_file("restricted/other/.slacl")
+        .commit()
+        .await?;
+
+    with_just_knobs_async(
+        JustKnobsInMemory::new(HashMap::from([(
+            "scm/mononoke:add_acl_manifest_pointer".to_string(),
+            KnobVal::Bool(true),
+        )])),
+        async {
+            // The root, restricted, restricted/code and restricted/other are new.
+            assert_upload_path_matches_derivation(
+                &ctx,
+                &repo,
+                parent,
+                child,
+                &["restricted/code", "restricted/other", "restricted", ""],
+            )
+            .await?;
+            // Removing the ACL file has to drop the ACL node, not reuse it.
+            assert_upload_path_matches_derivation(
+                &ctx,
+                &repo,
+                child,
+                grandchild,
+                &["restricted/other", "restricted", ""],
+            )
+            .await
+        }
+        .boxed(),
+    )
+    .await
+}
+
+/// Rebuild the client-side view of a set of uploaded trees from the stored
+/// Mercurial manifest blobs.
+async fn uploaded_trees_for(
+    ctx: &CoreContext,
+    repo: &Repo,
+    ids: &[HgManifestId],
+) -> Result<Vec<HgManifestEnvelope>> {
+    let mut trees = Vec::with_capacity(ids.len());
+    for id in ids {
+        trees.push(fetch_manifest_envelope(ctx, repo.repo_blobstore(), *id).await?);
+    }
+    Ok(trees)
+}
+
+/// What it tests: handed every directory at once in hash order, the batch
+/// entry point orders them itself and produces the same bytes as the
+/// per-changeset derivation.
+///
+/// Why it matters: a one-tree batch requires its children to exist already,
+/// so ordering is the batch layer's whole job. Feeding it hash order
+/// means the fixture cannot accidentally be in dependency order.
+async fn assert_batch_upload_matches_derivation(
+    ctx: &CoreContext,
+    repo: &Repo,
+    parent: ChangesetId,
+    child: ChangesetId,
+    paths: &[&str],
+) -> Result<()> {
+    let parent_manifest = hg_manifest_id_of(ctx, repo, parent).await?;
+    let child_manifest = hg_manifest_id_of(ctx, repo, child).await?;
+    let restricted_paths_config = repo.restricted_paths().config_based();
+
+    let parent_root = derive_hg_augmented_manifest::derive_from_hg_manifest_and_parents(
+        ctx,
+        repo.repo_blobstore(),
+        parent_manifest,
+        vec![],
+        &Default::default(),
+        restricted_paths_config,
+        derive_acl_overlay(ctx, repo, parent).await?,
+    )
+    .await?;
+
+    let mut uploaded = Vec::with_capacity(paths.len());
+    for path in paths {
+        uploaded.push(tree_id_at_path(ctx, repo, child_manifest, path).await?);
+    }
+    uploaded.sort_by_key(|id| id.into_nodehash());
+
+    // Producer F (`derive_hg_augmented_manifest_with_hg_changeset`, on in
+    // tests) already stored these envelopes underneath, so hide them: the
+    // overlay must only ever hold what the upload path wrote.
+    let hidden_inner = DenyGetKeyedBlobstore::missing(
+        repo.repo_blobstore().clone(),
+        uploaded
+            .iter()
+            .map(|id| HgAugmentedManifestId::new(id.into_nodehash()).blobstore_key()),
+    );
+    let overlay: Arc<dyn KeyedBlobstore> = Arc::new(MemWritesKeyedBlobstore::new(hidden_inner));
+    let outcomes = build_augmented_manifests_for_uploaded_trees(
+        ctx,
+        &overlay,
+        restricted_paths_config,
+        uploaded_trees_for(ctx, repo, &uploaded).await?,
+    )
+    .await?;
+    assert_eq!(
+        outcomes.len(),
+        uploaded.len(),
+        "every tree in the batch should have been built"
+    );
+    for id in &uploaded {
+        let key = HgAugmentedManifestId::new(id.into_nodehash()).blobstore_key();
+        assert!(
+            overlay.get(ctx, &key).await?.is_none(),
+            "the build should leave storing {id}'s envelope to store_uploaded_tree_envelopes",
+        );
+    }
+    store_uploaded_tree_envelopes(ctx, &overlay, &outcomes).await?;
+
+    let mut via_upload = HashMap::new();
+    for id in &uploaded {
+        let key = HgAugmentedManifestId::new(id.into_nodehash()).blobstore_key();
+        let bytes = overlay
+            .get(ctx, &key)
+            .await?
+            .with_context(|| format!("upload path stored no envelope for {id}"))?
+            .into_raw_bytes();
+        via_upload.insert(*id, bytes);
+    }
+
+    let child_root = derive_hg_augmented_manifest::derive_from_hg_manifest_and_parents(
+        ctx,
+        repo.repo_blobstore(),
+        child_manifest,
+        vec![parent_root],
+        &Default::default(),
+        restricted_paths_config,
+        derive_acl_overlay(ctx, repo, child).await?,
+    )
+    .await?;
+    assert_eq!(child_root.into_nodehash(), child_manifest.into_nodehash());
+
+    for id in &uploaded {
+        let key = HgAugmentedManifestId::new(id.into_nodehash()).blobstore_key();
+        let via_derivation = repo
+            .repo_blobstore()
+            .get(ctx, &key)
+            .await?
+            .with_context(|| format!("derivation stored no envelope for {id}"))?
+            .into_raw_bytes();
+        assert_eq!(
+            via_upload[id], via_derivation,
+            "the batch envelope for {id} must be byte-identical to the derived one",
+        );
+    }
+
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_batch_upload_augmented_manifests_are_byte_identical(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+
+    let parent = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("README.md", "hello")
+        .add_file("src/lib.rs", "one")
+        .add_file("src/deep/nested.rs", "deep")
+        .add_file("untouched/file.txt", "untouched")
+        .commit()
+        .await?;
+    let child = CreateCommitContext::new(&ctx, &repo, vec![parent])
+        .add_file("src/lib.rs", "two")
+        .add_file("src/deep/nested.rs", "deeper")
+        .add_file("src/deep/added.rs", "added")
+        .add_file("top.txt", "top")
+        .commit()
+        .await?;
+
+    assert_batch_upload_matches_derivation(&ctx, &repo, parent, child, &["src/deep", "src", ""])
+        .await
+}
+
+/// A batch whose trees cannot all be built fails outright, and stores nothing.
+///
+/// A child that is neither in the batch nor already derived means the client
+/// broke the children-before-parents contract, and nothing about the rest of
+/// the batch is trustworthy once that is true.
+async fn assert_upload_fails_with_missing_children(
+    ctx: &CoreContext,
+    repo: &Repo,
+    uploaded: &[HgManifestId],
+    missing: &[HgManifestId],
+    failing_tree: HgManifestId,
+) -> Result<()> {
+    let hidden_inner = DenyGetKeyedBlobstore::missing(
+        repo.repo_blobstore().clone(),
+        uploaded
+            .iter()
+            .chain(missing)
+            .map(|id| HgAugmentedManifestId::new(id.into_nodehash()).blobstore_key()),
+    );
+    let blobstore: Arc<dyn KeyedBlobstore> = Arc::new(MemWritesKeyedBlobstore::new(hidden_inner));
+    let err = build_augmented_manifests_for_uploaded_trees(
+        ctx,
+        &blobstore,
+        repo.restricted_paths().config_based(),
+        uploaded_trees_for(ctx, repo, uploaded).await?,
+    )
+    .await
+    .expect_err("a missing child should fail the uploaded tree batch");
+
+    assert!(
+        format!("{err:#}").contains(&failing_tree.to_string()),
+        "the error should identify the first tree whose child is missing",
+    );
+    for id in uploaded {
+        assert!(
+            HgAugmentedManifestEnvelope::load(
+                ctx,
+                &blobstore,
+                HgAugmentedManifestId::new(id.into_nodehash()),
+            )
+            .await?
+            .is_none(),
+            "a failed batch should not store an envelope for {id}",
+        );
+    }
+
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_upload_fails_when_direct_child_is_missing(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let cs_id = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("child/file.rs", "fn main() {}")
+        .commit()
+        .await?;
+    let root = hg_manifest_id_of(&ctx, &repo, cs_id).await?;
+    let child = tree_id_at_path(&ctx, &repo, root, "child").await?;
+
+    assert_upload_fails_with_missing_children(&ctx, &repo, &[root], &[child], root).await
+}
+
+#[mononoke::fbinit_test]
+async fn test_upload_fails_when_transitive_child_is_missing(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb);
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
+    let cs_id = CreateCommitContext::new_root(&ctx, &repo)
+        .add_file("child/grandchild/file.rs", "fn main() {}")
+        .commit()
+        .await?;
+    let root = hg_manifest_id_of(&ctx, &repo, cs_id).await?;
+    let child = tree_id_at_path(&ctx, &repo, root, "child").await?;
+    let grandchild = tree_id_at_path(&ctx, &repo, root, "child/grandchild").await?;
+
+    assert_upload_fails_with_missing_children(
+        &ctx,
+        &repo,
+        &[root, child],
+        &[child, grandchild],
+        child,
+    )
+    .await
 }

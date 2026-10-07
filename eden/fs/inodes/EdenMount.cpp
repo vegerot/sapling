@@ -292,6 +292,8 @@ EdenMount::EdenMount(
           serverState_->getReloadableConfig(),
           stats.copy(),
           serverState_->getEdenFsEventsLogger())},
+      inodePathCache_{
+          serverState_->getEdenConfig()->inodePathCacheSize.getValue()},
       objectStore_{std::move(objectStore)},
       blobCache_{std::move(blobCache)},
       blobAccess_{objectStore_, blobCache_},
@@ -394,7 +396,8 @@ InodeCatalogOptions EdenMount::getInodeCatalogOptions(
           .value();
 
   static auto context = ObjectFetchContext::getNullContextWithCauseDetail(
-      "EdenMount::initialize");
+      ObjectFetchContext::StaticCauseDetail::fromLiteral(
+          "EdenMount::initialize"));
   return serverState_->getFaultInjector()
       .checkAsync("mount", getPath().view())
       .thenValue([this, parent](auto&&) {
@@ -495,8 +498,9 @@ ImmediateFuture<Unit> ensureDotEdenSymlink(
     UnlinkThenSymlink,
   };
 
-  static auto context =
-      ObjectFetchContext::getNullContextWithCauseDetail("ensureDotEdenSymlink");
+  static auto context = ObjectFetchContext::getNullContextWithCauseDetail(
+      ObjectFetchContext::StaticCauseDetail::fromLiteral(
+          "ensureDotEdenSymlink"));
   return directory->getOrLoadChild(symlinkName, context)
       .thenTry([=](Try<InodePtr>&& result) -> ImmediateFuture<Action> {
         if (!result.hasValue()) {
@@ -577,8 +581,8 @@ ImmediateFuture<Unit> ensureDotEdenSymlink(
 
 ImmediateFuture<folly::Unit> EdenMount::setupDotEden(TreeInodePtr root) {
   // Set up the magic .eden dir
-  static auto context =
-      ObjectFetchContext::getNullContextWithCauseDetail("setupDotEden");
+  static auto context = ObjectFetchContext::getNullContextWithCauseDetail(
+      ObjectFetchContext::StaticCauseDetail::fromLiteral("setupDotEden"));
   return root->getOrLoadChildTree(PathComponentPiece{kDotEdenName}, context)
       .thenTry([=, this](Try<TreeInodePtr>&& lookupResult) {
         TreeInodePtr dotEdenInode;
@@ -650,6 +654,7 @@ ImmediateFuture<folly::Unit> EdenMount::setupDotEden(TreeInodePtr root) {
 
 folly::SemiFuture<Unit> EdenMount::performBindMounts() {
   auto mountPath = getPath();
+  auto edenDir = getEdenConfig()->edenDir.getValue();
   auto systemConfigDir = getEdenConfig()->getSystemConfigDir();
   SpawnedProcess::Options opts;
 #ifdef _WIN32
@@ -661,6 +666,8 @@ folly::SemiFuture<Unit> EdenMount::performBindMounts() {
   return folly::makeSemiFutureWith([&] {
            std::vector<std::string> argv{
                FLAGS_edenfsctlPath,
+               "--config-dir",
+               edenDir.c_str(),
                "--etc-eden-dir",
                systemConfigDir.c_str(),
                "redirect",
@@ -860,6 +867,9 @@ ImmediateFuture<SetPathObjectIdResultAndTimes> EdenMount::setPathsToObjectIds(
         nullptr,
         context->getRequestInfo(),
         context->getCancellationToken());
+    if (!ctx->isDryRun()) {
+      ctx->inhibitInodeGC();
+    }
 
     /**
      * This will update the timestamp for the entire mount,
@@ -1192,6 +1202,59 @@ void EdenMount::updateInodePressurePolicy() {
       gcPeriodMax.count());
 }
 
+// Below this many invalidations, rerunning GC is cheap enough that reclaim
+// tracking isn't worthwhile.
+constexpr uint64_t kPressureGcReclaimMinInvalidated = 10'000;
+
+void EdenMount::recordPressureGcOutcome(
+    uint64_t numInvalidated,
+    uint64_t numUnloaded,
+    bool pinScanFailed) {
+  // GC flushes the invalidation queue between invalidating entries and
+  // sweeping, and the kernel FORGETs triggered by the invalidations arrive
+  // quickly in practice, so most of a run's invalidations should be unloaded
+  // by the run's own sweep. A healthy run reclaims far more than the default
+  // 10%; should a run be misjudged anyway, the cost is one cycle at the
+  // regular GC cadence. The sweep's own count is used rather than the change
+  // in the mount's inode count, which concurrent lookups (a build, a crawl)
+  // can push the other way while GC runs.
+  auto minReclaimPercent =
+      getEdenConfig()->pressureBasedGcMinReclaimPercent.getValue();
+  const bool stalled = minReclaimPercent > 0 &&
+      numInvalidated >= kPressureGcReclaimMinInvalidated &&
+      numUnloaded * 100 <= numInvalidated * minReclaimPercent;
+  // Without a pin set the run reclaimed files only, and every run until a
+  // scan succeeds would do the same; each costs a full scan of every
+  // process, so it is not worth the pressure-derived rate either.
+  const bool backOff = stalled || pinScanFailed;
+
+  if (pressureGcBackoff_.exchange(backOff, std::memory_order_relaxed) !=
+      backOff) {
+    if (pinScanFailed) {
+      XLOGF(
+          INFO,
+          "Pressure-based GC for {} ran without a pin set because the pin "
+          "scan failed. Falling back to the regular GC period.",
+          getPath());
+    } else if (backOff) {
+      XLOGF(
+          INFO,
+          "Pressure-based GC for {} invalidated {} inodes but only reclaimed "
+          "{}; the kernel may no longer hold the invalidated entries. "
+          "Falling back to the regular GC period.",
+          getPath(),
+          numInvalidated,
+          numUnloaded);
+    } else {
+      XLOGF(
+          INFO,
+          "Pressure-based GC for {} completed, resuming the pressure-based GC "
+          "period",
+          getPath());
+    }
+  }
+}
+
 std::optional<int64_t> EdenMount::getCheckoutProgress() const {
   auto parentLock = parentState_.rlock();
   if (!std::holds_alternative<ParentCommitState::CheckoutInProgress>(
@@ -1228,6 +1291,26 @@ FuseChannel* FOLLY_NULLABLE EdenMount::getFuseChannel() const {
   return nullptr;
 #endif
 }
+
+#ifndef _WIN32
+std::shared_ptr<FuseChannel> EdenMount::getFuseChannelShared() const {
+  auto channel = channel_.load().getStdShared();
+  auto* fuseChannel = dynamic_cast<FuseChannel*>(channel.get());
+  if (fuseChannel == nullptr) {
+    return {};
+  }
+  return {std::move(channel), fuseChannel};
+}
+
+std::shared_ptr<UnboundedQueueExecutor>
+EdenMount::getInodeGCInvalidationExecutor() const {
+  folly::call_once(inodeGCInvalidationExecutorOnce_, [this] {
+    inodeGCInvalidationExecutor_ =
+        std::make_shared<UnboundedQueueExecutor>(1, "inode-gc-inval");
+  });
+  return inodeGCInvalidationExecutor_;
+}
+#endif
 
 PrjfsChannel* FOLLY_NULLABLE EdenMount::getPrjfsChannel() const {
 #ifdef _WIN32
@@ -1578,6 +1661,19 @@ struct EdenMount::CheckoutInProgressGuard {
     XCHECK(mount_ != nullptr);
     auto mount = mount_;
     mount_ = nullptr;
+    if (res.hasException()) {
+      XLOGF(ERR, "checkout error: {}", folly::exceptionStr(res.exception()));
+    } else {
+      for (const auto& conflict : res.value()) {
+        if (conflict.type() == ConflictType::ERROR) {
+          XLOGF(
+              ERR,
+              "checkout error for {}: {}",
+              conflict.path().value(),
+              conflict.message().value());
+        }
+      }
+    }
     if (applyResetState(mount, res.hasException())) {
       res.exception().with_exception([&](const std::exception& ex) {
         mount->getServerState()->getErrorLogger().log(
@@ -1708,6 +1804,10 @@ folly::Try<EdenMount::CheckoutSetup> EdenMount::beginCheckout(
     setup.ctx->getFetchContext()->setDetachedExecutor(
         fetchContext->getDetachedExecutor());
   } // parentState_ wlock released here.
+
+  if (!setup.ctx->isDryRun()) {
+    setup.ctx->inhibitInodeGC();
+  }
 
   // Eagerly register the first fault check so unblock() can find it.
   // See struct comment for details. Done OUTSIDE the wlock scope so
@@ -1841,9 +1941,21 @@ folly::Try<CheckoutResult> EdenMount::finalizeCheckout(
       std::chrono::duration<double>{stopWatch.elapsed()};
 
   uint64_t numConflicts = 0;
+  uint64_t numErrors = 0;
+  std::string firstError;
   if (result.hasValue()) {
     auto& conflicts = result.value().conflicts;
     numConflicts = conflicts.size();
+
+    for (const auto& conflict : conflicts) {
+      if (conflict.type() == ConflictType::ERROR) {
+        ++numErrors;
+        if (firstError.empty()) {
+          firstError = fmt::format(
+              "{}: {}", conflict.path().value(), conflict.message().value());
+        }
+      }
+    }
 
     if (!ctx->isDryRun()) {
       const auto maxConflictsToPrint =
@@ -1866,6 +1978,9 @@ folly::Try<CheckoutResult> EdenMount::finalizeCheckout(
         printedConflicts++;
       }
     }
+  } else {
+    numErrors = 1;
+    firstError = folly::exceptionStr(result.exception()).toStdString();
   }
 
   // Don't log aux data fetches, because our backends don't yet support
@@ -1886,6 +2001,7 @@ folly::Try<CheckoutResult> EdenMount::finalizeCheckout(
       inodeCounts.unloadedInodeCount,
       inodeCounts.periodicLinkedUnloadInodeCount,
       inodeCounts.periodicUnlinkedUnloadInodeCount};
+  finishedCheckout.populateError(numErrors, std::move(firstError));
   if (result.hasValue()) {
     finishedCheckout.populateCheckoutDurations(
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2031,8 +2147,13 @@ ImmediateFuture<CheckoutResult> EdenMount::checkout(
                   return treeResults;
                 });
           })
-      .thenValue([this, rootInode, ctx, checkoutTimes, stopWatch, snapshotId](
-                     RootTreeTuple treeResults) {
+      .thenValue([this,
+                  rootInode,
+                  ctx,
+                  checkoutTimes,
+                  stopWatch,
+                  oldParent,
+                  snapshotId](RootTreeTuple treeResults) {
         checkoutTimes->didDiff = stopWatch.elapsed();
 
         // Perform the requested checkout operation after the journal diff
@@ -2046,6 +2167,7 @@ ImmediateFuture<CheckoutResult> EdenMount::checkout(
         ctx->start(
             std::move(renameLock),
             parentState_.wlock(),
+            oldParent,
             snapshotId,
             std::get<1>(treeResults).tree);
 
@@ -2073,13 +2195,9 @@ ImmediateFuture<CheckoutResult> EdenMount::checkout(
         // checkout code will take care of doing the right invalidation for
         // these.
         //
-        // We pass mustPersistInodeNumbers=false here because we don't want the
-        // user to wait for us to just-in-time write a lot of directories to the
-        // overlay. The assumption is it is okay to regenerate inode numbers at
-        // checkout time for inodes with fs-ref-count==0.
         {
           auto unloadSpan = ctx->createSpan("unloadChildrenUnreferencedByFs");
-          rootInode->unloadChildrenUnreferencedByFs(false);
+          rootInode->unloadChildrenUnreferencedByFs();
         }
 
         return serverState_->getFaultInjector()
@@ -2213,6 +2331,7 @@ folly::coro::now_task<CheckoutResult> EdenMount::co_checkout(
       ctx->start(
           std::move(renameLock),
           parentState_.wlock(),
+          oldParent,
           snapshotId,
           toTreeRes.tree);
     }
@@ -2221,7 +2340,7 @@ folly::coro::now_task<CheckoutResult> EdenMount::co_checkout(
 
     {
       auto unloadSpan = ctx->createSpan("unloadChildrenUnreferencedByFs");
-      rootInode->unloadChildrenUnreferencedByFs(false);
+      rootInode->unloadChildrenUnreferencedByFs();
     }
 
     co_await serverState_->getFaultInjector().co_checkAsync(
@@ -2373,268 +2492,8 @@ std::unique_ptr<DiffContext> EdenMount::createDiffContext(
       getCheckoutConfig()->getCaseSensitive(),
       getObjectStore(),
       serverState_->getTopLevelIgnores(),
-      getEdenConfig()->throwOnCancel.getValue());
-}
-
-ImmediateFuture<Unit> EdenMount::diff(
-    TreeInodePtr rootInode,
-    DiffContext* ctxPtr,
-    const RootId& commitId) const {
-  auto faultTry = this->serverState_->getFaultInjector().checkTry(
-      "EdenMount::diff", commitId.value());
-  if (faultTry.hasException()) {
-    return folly::Try<folly::Unit>{faultTry.exception()};
-  }
-  return objectStore_->getRootTree(commitId, ctxPtr->getFetchContext())
-      .thenValue([this](ObjectStore::GetRootTreeResult rootTree) {
-        return waitForPendingWrites().thenValue(
-            [rootTree = std::move(rootTree)](auto&&) { return rootTree; });
-      })
-      .thenValue([ctxPtr, rootInode = std::move(rootInode)](
-                     ObjectStore::GetRootTreeResult rootTree) {
-        return rootInode->diff(
-            ctxPtr,
-            RelativePathPiece{},
-            std::vector{std::move(rootTree.tree)},
-            ctxPtr->getToplevelIgnore(),
-            false);
-      });
-}
-
-ImmediateFuture<Unit> EdenMount::diff(
-    TreeInodePtr rootInode,
-    ScmStatusDiffCallback* callback,
-    const RootId& commitId,
-    bool listIgnored,
-    bool enforceCurrentParent,
-    folly::CancellationToken cancellation,
-    const ObjectFetchContextPtr& fetchContext) const {
-  RootId currentWorkingCopyParentRootId;
-  {
-    auto parentInfo = parentState_.rlock();
-    currentWorkingCopyParentRootId = parentInfo->workingCopyParentRootId;
-    if (enforceCurrentParent) {
-      if (std::holds_alternative<ParentCommitState::CheckoutInProgress>(
-              parentInfo->checkoutState)) {
-        return makeImmediateFuture<Unit>(newEdenError(
-            EdenErrorType::CHECKOUT_IN_PROGRESS,
-            "cannot compute status while a checkout is currently in progress"));
-      } else if (
-          auto* interrupted =
-              std::get_if<ParentCommitState::InterruptedCheckout>(
-                  &parentInfo->checkoutState)) {
-        return makeImmediateFuture<Unit>(newEdenError(
-            EdenErrorType::CHECKOUT_IN_PROGRESS,
-            fmt::format(
-                interruptedCheckoutAdvice,
-                folly::hexlify(
-                    objectStore_->renderRootId(interrupted->toCommit)))));
-      }
-
-      if (objectStore_->compareRootsById(
-              currentWorkingCopyParentRootId, commitId) !=
-          ObjectComparison::Identical) {
-        // TODO: We should really add a method to FilteredBackingStore that
-        // allows us to render a FOID as the underlying ObjectId. This would
-        // avoid the round trip we're doing here.
-        auto renderedParentRootId =
-            objectStore_->renderRootId(currentWorkingCopyParentRootId);
-        auto renderedCommitId = objectStore_->renderRootId(commitId);
-
-        // Log this occurrence to Scuba
-        getServerState()->getEdenFsEventsLogger()->logEvent(
-            ParentMismatch{
-                commitId.value(), currentWorkingCopyParentRootId.value()});
-        return makeImmediateFuture<Unit>(newEdenError(
-            EdenErrorType::OUT_OF_DATE_PARENT,
-            "error computing status: requested parent commit is out-of-date: requested ",
-            folly::hexlify(renderedCommitId),
-            ", but current parent commit is ",
-            folly::hexlify(renderedParentRootId),
-            ".\nTry running `eden doctor` to remediate"));
-      }
-
-      // TODO: Should we perhaps hold the parentInfo read-lock for the duration
-      // of the status operation?  This would block new checkout operations from
-      // starting until we have finished computing this status call.
-    }
-  }
-
-  // Create a DiffContext object for this diff operation.
-  auto context = createDiffContext(
-      callback, std::move(cancellation), fetchContext, listIgnored);
-  DiffContext* ctxPtr = context.get();
-
-  // stateHolder() exists to ensure that the DiffContext and the EdenMount
-  // exists until the diff completes.
-  auto stateHolder = [ctx = std::move(context), rootInode]() {};
-
-  // only check/update the cache if config is enabled
-  if (getEdenConfig()->hgEnableCachedResultForStatusRequest.getValue()) {
-    auto latestInfo = getJournal().peekLatest();
-    if (latestInfo.has_value()) {
-      auto key = ScmStatusCache::makeKey(commitId, listIgnored);
-      XLOGF(
-          DBG7,
-          "ScmStatusCache: id={}, listIgnored={}, key={}",
-          commitId.value(),
-          listIgnored,
-          key);
-      auto curSequenceID = latestInfo.value().sequenceID;
-      std::variant<StatusResultFuture, StatusResultPromise> getResult{nullptr};
-      {
-        auto lockedCachePtr = scmStatusCache_.wlock();
-        auto& cache = *lockedCachePtr;
-
-        // if there is a root update, we can invalidate the cache as a whole
-        // so we don't need to invalidate each entry item individually as we
-        // fetch them.
-        if (!cache->isCachedWorkingDirValid(currentWorkingCopyParentRootId)) {
-          cache->clear();
-          cache->resetCachedWorkingDir(currentWorkingCopyParentRootId);
-        }
-        getResult = cache->get(key, curSequenceID);
-      }
-
-      if (std::holds_alternative<StatusResultFuture>(getResult)) {
-        auto future = std::move(std::get<StatusResultFuture>(getResult));
-        getStats()->increment(&JournalStats::journalStatusCacheHit);
-        if (future.isReady()) {
-          callback->setStatus(std::move(future).get());
-          return folly::unit;
-        }
-        getStats()->increment(&JournalStats::journalStatusCachePend);
-        return std::move(future)
-            .thenValue(
-                [callback](auto&& status) { callback->setStatus(status); })
-            .ensure(std::move(stateHolder));
-      }
-
-      getStats()->increment(&JournalStats::journalStatusCacheMiss);
-
-      auto promise = std::get<StatusResultPromise>(getResult);
-
-      // we fall back to the no-cache flow if somehow the promise is nullptr
-      if (promise.get() != nullptr) {
-        return diff(rootInode, ctxPtr, commitId)
-            .thenTry([this,
-                      curSequenceID,
-                      callback,
-                      promise,
-                      key = std::move(key)](folly::Try<Unit>&& result) mutable {
-              // handling exceptions from the future chain
-              if (result.hasException()) {
-                promise->setTry(folly::Try<ScmStatus>{result.exception()});
-                // remove the promise from cache so future requests can retry
-                {
-                  // this operations should be performaned with the lock held
-                  auto lockedCachePtr = scmStatusCache_.wlock();
-                  (*lockedCachePtr)->dropPromise(key, curSequenceID);
-                  return makeImmediateFuture<folly::Unit>(result.exception());
-                }
-              }
-
-              bool shouldInsert = true;
-
-              ScmStatus newStatus = callback->peekStatus();
-
-              // no need to insert a status result which contains exceptions
-              if (newStatus.errors()->size() > 0) {
-                shouldInsert = false;
-              }
-
-              // don't cache a status if it's too large so the cache size does
-              // not explode easily
-              if (newStatus.entries().value().size() >
-                  getEdenConfig()->scmStatusCacheMaxEntriesPerItem.getValue()) {
-                getStats()->increment(&JournalStats::journalStatusCacheSkip);
-                shouldInsert = false;
-              }
-
-              // FaultInjector check point: for testing only
-              this->serverState_->getFaultInjector().check(
-                  "scmStatusCache", "blocking setValue");
-
-              // set value for the shared promise so the pending requests get
-              // notified
-              // we do this without holding the lock for security concerns
-              promise->setValue(newStatus);
-
-              // FaultInjector check point: for testing only
-              this->serverState_->getFaultInjector().check(
-                  "scmStatusCache", "blocking insert");
-              {
-                // this operations should be performaned with the lock held
-                auto lockedCachePtr = scmStatusCache_.wlock();
-                if (shouldInsert) {
-                  (*lockedCachePtr)
-                      ->insert(key, curSequenceID, std::move(newStatus));
-                }
-
-                // FaultInjector check point: for testing only
-                this->serverState_->getFaultInjector().check(
-                    "scmStatusCache", "blocking dropPromise");
-
-                // remove the promise from cache
-                (*lockedCachePtr)->dropPromise(key, curSequenceID);
-              }
-              return ImmediateFuture<Unit>(folly::unit);
-            })
-            .ensure(std::move(stateHolder));
-      }
-      XLOGF(
-          ERR,
-          "ScmStatusCache returned nullptr for promise: key={}, commitId={}, listIgnored={}, curSequenceID={}. Falling back to no-cache path for this request",
-          key,
-          commitId,
-          listIgnored,
-          curSequenceID);
-    }
-  }
-
-  return diff(rootInode, ctxPtr, commitId).ensure(std::move(stateHolder));
-}
-
-ImmediateFuture<std::unique_ptr<ScmStatus>> EdenMount::diff(
-    TreeInodePtr rootInode,
-    const RootId& commitId,
-    folly::CancellationToken cancellation,
-    const ObjectFetchContextPtr& fetchContext,
-    bool listIgnored,
-    bool enforceCurrentParent) {
-  if (getEdenConfig()->enableCoroutinesPhase3.getValue()) {
-    return ImmediateFuture{
-        // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
-        folly::coro::co_invoke(
-            [self = shared_from_this()](auto&&... args)
-                -> folly::coro::Task<std::unique_ptr<ScmStatus>> {
-              co_return co_await self->co_diff(
-                  std::forward<decltype(args)>(args)...);
-            },
-            std::move(rootInode),
-            commitId,
-            std::move(cancellation),
-            fetchContext.copy(),
-            listIgnored,
-            enforceCurrentParent)
-            .semi()};
-  }
-
-  auto callback = std::make_unique<ScmStatusDiffCallback>();
-  auto callbackPtr = callback.get();
-
-  return this
-      ->diff(
-          std::move(rootInode),
-          callbackPtr,
-          commitId,
-          listIgnored,
-          enforceCurrentParent,
-          std::move(cancellation),
-          fetchContext)
-      .thenValue([callback = std::move(callback)](auto&&) {
-        return std::make_unique<ScmStatus>(callback->extractStatus());
-      });
+      getEdenConfig()->throwOnCancel.getValue(),
+      serverState_->getGlobMatchOptions());
 }
 
 folly::coro::now_task<std::unique_ptr<ScmStatus>> EdenMount::co_diff(
@@ -2768,6 +2627,15 @@ folly::coro::now_task<std::unique_ptr<ScmStatus>> EdenMount::co_diff(
             (*lockedCachePtr)->dropPromise(key, curSequenceID);
           }
           throw;
+        }
+
+        if (ctxPtr->isCancelled()) {
+          promise->setException(folly::OperationCancelled{});
+          {
+            auto lockedCachePtr = scmStatusCache_.wlock();
+            (*lockedCachePtr)->dropPromise(key, curSequenceID);
+          }
+          co_return std::make_unique<ScmStatus>(callback->extractStatus());
         }
 
         bool shouldInsert = true;
@@ -2906,7 +2774,7 @@ EdenMount::getFsChannelCompletionFuture() {
   return fsChannelCompletionPromise_.getFuture();
 }
 
-#ifndef _WIN32
+#ifdef __linux__
 namespace {
 std::unique_ptr<FuseChannel, FsChannelDeleter> makeFuseChannel(
     EdenMount* mount,
@@ -2929,7 +2797,6 @@ std::unique_ptr<FuseChannel, FsChannelDeleter> makeFuseChannel(
       std::chrono::duration_cast<folly::Duration>(
           edenConfig->fuseRequestTimeout.getValue()),
       mount->getServerState()->getNotifier(),
-      mount->getCheckoutConfig()->getCaseSensitive(),
       mount->getCheckoutConfig()->getRequireUtf8Path(),
       edenConfig->fuseMaximumBackgroundRequests.getValue(),
       edenConfig->maxFsChannelInflightRequests.getValue(),
@@ -2939,10 +2806,15 @@ std::unique_ptr<FuseChannel, FsChannelDeleter> makeFuseChannel(
       mount->getServerState()->getEdenConfig()->FuseTraceBusCapacity.getValue(),
       edenConfig->fuseBdiReadAheadKb.getValue(),
       edenConfig->fuseMaxPages.getValue(),
+      edenConfig->experimentalFuseHandleKillPrivV2.getValue(),
       edenConfig->fuseUseIoUring.getValue(),
       edenConfig->fuseIoUringKernelReleaseRegex.getValue(),
       edenConfig->fuseIoUringQueueDepth.getValue(),
-      edenConfig->fuseIoUringDisableIoWait.getValue());
+      edenConfig->fuseIoUringDisableIoWait.getValue(),
+      edenConfig->experimentalFuseIoUringSkipSelfWakeup.getValue(),
+      edenConfig->fuseIoUringPreCreateQueues.getValue(),
+      edenConfig->fuseNumInvalidationThreads.getValue(),
+      edenConfig->fuseBusyPoll.getValue());
 }
 } // namespace
 #endif
@@ -2953,12 +2825,11 @@ folly::Future<NfsServer::NfsMountInfo> makeNfsChannel(
     std::optional<folly::File> connectedSocket = std::nullopt) {
   auto edenConfig = mount->getEdenConfig();
   auto nfsServer = mount->getServerState()->getNfsServer();
-  auto iosize = edenConfig->nfsIoSize.getValue();
   auto mountPath = mount->getPath();
   // Make sure that we are running on the EventBase while registering
   // the mount point.
   return via(nfsServer->getEventBase(),
-             [mount, mountPath, nfsServer, iosize, edenConfig]() {
+             [mount, mountPath, nfsServer, edenConfig]() {
                return nfsServer->registerMount(
                    mountPath,
                    mount->getRootInode()->getNodeId(),
@@ -2972,9 +2843,12 @@ folly::Future<NfsServer::NfsMountInfo> makeNfsChannel(
                        edenConfig->nfsRequestTimeout.getValue()),
                    mount->getServerState()->getNotifier(),
                    mount->getCheckoutConfig()->getCaseSensitive(),
-                   iosize,
+                   edenConfig->nfsReadIoSize.getValue(),
+                   edenConfig->nfsWriteIoSize.getValue(),
                    edenConfig->nfsTraceBusCapacity.getValue(),
-                   edenConfig->nfsFastPathRPCs.getValue());
+                   edenConfig->nfsFastPathRPCs.getValue(),
+                   mount->getServerState()->getReloadableConfig(),
+                   mount->getServerState()->getFaultInjector());
              })
       .thenValue([mount,
                   nfsServer,
@@ -2993,10 +2867,11 @@ folly::Future<NfsServer::NfsMountInfo> makeNfsChannel(
           // the listening one is the one we wanna register. So we need to
           // transfer that socket to be able to register it.
         } else {
+          // The kernel requires a checkout's mountd and nfsd sockets to be
+          // of the same type, so follow the running mountd rather than
+          // nfs:use-uds, which only applies when a mountd is created.
           std::optional<AbsolutePath> unixSocketPath;
-          if (mount->getServerState()
-                  ->getEdenConfig()
-                  ->useUnixSocket.getValue()) {
+          if (nfsServer->getMountdAddr().getFamily() == AF_UNIX) {
             unixSocketPath = mount->getCheckoutConfig()->getClientDirectory() +
                 kNfsdSocketName;
             XLOGF(
@@ -3029,7 +2904,6 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
 
         if (shouldBeOrIsNfsChannel()) {
           NFSMountOptions options;
-          options.iosize = edenConfig->nfsIoSize.getValue();
           options.useReaddirplus = edenConfig->useReaddirplus.getValue();
           options.useSoftMount = edenConfig->useSoftMounts.getValue();
           options.readOnly = readOnly;
@@ -3131,6 +3005,15 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
         // that mimics privhelper mount failing
         serverState_->getFaultInjector().check(
             "failMountInitialization", mountPath.view());
+#ifdef __APPLE__
+        (void)readOnly;
+        auto error = folly::make_exception_wrapper<std::system_error>(
+            ENOTSUP,
+            std::generic_category(),
+            "FUSE mounts are not supported on macOS");
+        mountPromise->setException(error);
+        return folly::makeFuture<folly::Unit>(std::move(error));
+#else
         return serverState_->getPrivHelper()
             ->fuseMount(
                 mountPath.view(), readOnly, edenConfig->fuseVfsType.getValue())
@@ -3171,6 +3054,7 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
                       makeFuseChannel(this, std::move(fuseDevice).value()));
                   return folly::makeFuture(folly::unit);
                 });
+#endif
 #endif
       });
 }
@@ -3287,6 +3171,13 @@ void EdenMount::fsChannelInitSuccessful(
 folly::Future<folly::Unit> EdenMount::takeoverFuse(
     FuseChannelData takeoverData) {
 #ifndef _WIN32
+#ifdef __APPLE__
+  (void)takeoverData;
+  return folly::makeFuture<folly::Unit>(std::system_error(
+      ENOTSUP,
+      std::generic_category(),
+      "FUSE mounts are not supported on macOS"));
+#else
   transitionState(State::INITIALIZED, State::STARTING);
 
   try {
@@ -3313,6 +3204,7 @@ folly::Future<folly::Unit> EdenMount::takeoverFuse(
     return folly::makeFuture<folly::Unit>(
         folly::exception_wrapper(std::current_exception()));
   }
+#endif
 #else
   (void)takeoverData;
   return folly::makeFuture<folly::Unit>(
@@ -3488,20 +3380,94 @@ std::optional<TreePrefetchLease> EdenMount::tryStartTreePrefetch(
   }
 }
 
-std::optional<EdenMount::WorkingCopyGCLease> EdenMount::tryStartWorkingCopyGC(
-    TreeInodePtr inode) {
-  bool expectedInProgress = false;
-  if (!workingCopyGCInProgress_.compare_exchange_strong(
-          expectedInProgress, true, std::memory_order_acq_rel)) {
+std::optional<EdenMount::InodeGCLease> EdenMount::tryStartInodeGC() {
+  auto mount = shared_from_this();
+  auto failureLimit = getEdenConfig()->gcMaxTreeLoadFailures.getValue();
+  auto state = inodeGCState_.wlock();
+  if (state->gcRunning || state->inhibitorCount != 0) {
     return std::nullopt;
   }
 
-  return EdenMount::WorkingCopyGCLease{
-      &workingCopyGCInProgress_, std::move(inode)};
+  state->cancellationSource = folly::CancellationSource{};
+  state->treeLoadFailureLimit = failureLimit;
+  state->remainingTreeLoadFailures = failureLimit;
+  auto cancellationToken = state->cancellationSource.getToken();
+  state->gcRunning = true;
+  return InodeGCLease{
+      std::move(mount),
+      /*representsRunningGc=*/true,
+      std::move(cancellationToken)};
 }
 
-bool EdenMount::isWorkingCopyGCRunning() const {
-  return workingCopyGCInProgress_.load(std::memory_order_acquire);
+bool EdenMount::isInodeGCRunning() const {
+  return inodeGCState_.rlock()->gcRunning;
+}
+
+void EdenMount::recordInodeGCTreeLoadFailure() {
+  auto cancellationSource = folly::CancellationSource::invalid();
+  uint64_t failureLimit;
+  {
+    auto state = inodeGCState_.wlock();
+    if (!state->gcRunning || state->remainingTreeLoadFailures == 0 ||
+        --state->remainingTreeLoadFailures != 0) {
+      return;
+    }
+    pressureGcBackoff_.store(true, std::memory_order_relaxed);
+    cancellationSource = state->cancellationSource;
+    failureLimit = state->treeLoadFailureLimit;
+  }
+  // Cancellation callbacks may run inline and acquire the GC state lock.
+  cancellationSource.requestCancellation();
+  XLOGF(
+      WARN,
+      "Cancelling inode GC for {} after {} tree-load failures; pressure-based "
+      "GC will wait the regular GC period before running again",
+      getPath(),
+      failureLimit);
+}
+
+EdenMount::InodeGCLease EdenMount::stealInodeGCLease() {
+  auto mount = shared_from_this();
+  folly::CancellationSource cancellationSource;
+  {
+    auto state = inodeGCState_.wlock();
+    cancellationSource = state->cancellationSource;
+    ++state->inhibitorCount;
+  }
+  // Cancellation callbacks may run inline, so request cancellation only after
+  // reserving GC admission and releasing the state lock.
+  cancellationSource.requestCancellation();
+  return InodeGCLease{
+      std::move(mount),
+      /*representsRunningGc=*/false,
+      folly::CancellationToken{}};
+}
+
+EdenMount::InodeGCLease::~InodeGCLease() {
+  release();
+}
+
+EdenMount::InodeGCLease::InodeGCLease(InodeGCLease&& other) noexcept
+    : mount_{std::move(other.mount_)},
+      representsRunningGc_{other.representsRunningGc_},
+      cancellationToken_{std::move(other.cancellationToken_)} {}
+
+void EdenMount::InodeGCLease::release() noexcept {
+  if (mount_) {
+    mount_->releaseInodeGCLease(representsRunningGc_);
+    mount_.reset();
+  }
+}
+
+void EdenMount::releaseInodeGCLease(bool representsRunningGc) noexcept {
+  auto state = inodeGCState_.wlock();
+  if (representsRunningGc) {
+    XDCHECK(state->gcRunning);
+    state->gcRunning = false;
+  } else {
+    XDCHECK_GT(state->inhibitorCount, 0u);
+    --state->inhibitorCount;
+  }
 }
 
 void EdenMount::treePrefetchFinished() noexcept {

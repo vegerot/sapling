@@ -272,8 +272,6 @@ impl PrefetchCmd {
 #[async_trait]
 impl crate::Subcommand for PrefetchCmd {
     async fn run(&self) -> Result<ExitCode> {
-        #[cfg(fbcode_build)]
-        crate::init_enable_xplatlogger_events().await;
         let instance = get_edenfs_instance();
         let client = instance.get_client();
         let (mount_point, search_root) = self.common.get_mount_point_and_search_root()?;
@@ -298,7 +296,6 @@ impl crate::Subcommand for PrefetchCmd {
                 None,
                 optional_search_root,
                 Some(self.background),
-                None,
                 return_prefetched_files,
                 self.stats,
             )

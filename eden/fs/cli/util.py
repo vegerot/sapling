@@ -809,6 +809,17 @@ def is_edenfs_mount_device(device: bytes) -> bool:
     return device == b"eden" or device == b"edenfs" or device.startswith(b"edenfs:")
 
 
+def is_edenfs_mount(device: bytes, vfstype: bytes) -> bool:
+    """Whether a mount table entry is an EdenFS checkout.
+
+    On macOS the kernel replaces the device of an NFS mount served over a
+    Unix domain socket with the socket path, so the device alone does not
+    identify EdenFS there; the filesystem type, which EdenFS overrides to
+    "edenfs:", still does.
+    """
+    return is_edenfs_mount_device(device) or vfstype == b"edenfs:"
+
+
 def get_eden_cli_cmd(argv: List[str] = sys.argv) -> List[str]:
     # We likely only need to do this on windows to make sure we run the
     # edenfsctl in a python environment that isn't frozen. But this should
@@ -862,11 +873,13 @@ def is_atlas() -> bool:
     return "ATLAS" in os.environ
 
 
-def is_apple_silicon() -> bool:
-    if sys.platform == "darwin":
-        return "ARM64" in os.uname().version
+def get_platform_default_mount_protocol() -> str:
+    if sys.platform == "win32":
+        return PRJFS_MOUNT_PROTOCOL_STRING
+    elif sys.platform == "darwin":
+        return NFS_MOUNT_PROTOCOL_STRING
     else:
-        return False
+        return FUSE_MOUNT_PROTOCOL_STRING
 
 
 def get_protocol(nfs: bool) -> str:
@@ -1087,7 +1100,15 @@ def maybe_edensparse_migration(
         """
         SL_CONFIG_TO_ALLOW_MIGRATION = "experimental.allow-edensparse-migration"
         sl_args = ["config", "-Tjson", SL_CONFIG_TO_ALLOW_MIGRATION]
-        output = json.loads(checkout.get_backing_repo()._run_hg(sl_args))
+        try:
+            output = json.loads(checkout.get_backing_repo()._run_hg(sl_args))
+        except Exception as ex:
+            log(
+                f"failed to determine whether to migrate {checkout.name}: {ex}; "
+                "skipping migration"
+            )
+            return False
+
         if len(output) == 0:
             log(
                 f"{SL_CONFIG_TO_ALLOW_MIGRATION} not set for {checkout.name}, skipping migration"

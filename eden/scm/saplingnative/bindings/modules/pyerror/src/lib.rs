@@ -239,6 +239,7 @@ fn register_error_handlers() {
                     e.path.to_string(),
                     format!("{}", e.hgid),
                     e.request_acl.clone(),
+                    e.denial_message.clone(),
                 ),
             ))
         } else if e.is::<pathmatcher::Error>() {
@@ -277,7 +278,6 @@ fn register_error_handlers() {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
 
     use types::HgId;
     use types::RepoPathBuf;
@@ -294,11 +294,7 @@ mod tests {
             ("sampling.filepath", output_file_str.as_ref()),
             ("sampling.key.acl_error", "acl_error"),
         ]);
-        sampling::CONFIG
-            .set(Some(Arc::new(
-                sampling::SamplingConfig::new(&config).unwrap(),
-            )))
-            .ok();
+        sampling::init(&config);
 
         let gil = Python::acquire_gil();
         let py = gil.python();
@@ -306,6 +302,7 @@ mod tests {
             path: RepoPathBuf::from_string("restricted".to_string()).unwrap(),
             hgid: HgId::from_hex(b"1111111111111111111111111111111111111111").unwrap(),
             request_acl: "some-acl".to_string(),
+            denial_message: None,
         };
 
         log_permission_denied_binding(py, &err);

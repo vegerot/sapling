@@ -220,18 +220,36 @@ export const latestUncommittedChangesData = atom<{
 // to insert debugLabel.
 latestUncommittedChangesData.debugLabel = 'latestUncommittedChangesData';
 
+/**
+ * If `reused` has exactly the same elements as `oldArray`, return `oldArray` so
+ * downstream derived atoms see an unchanged (reference-equal) value and skip
+ * recomputation. This makes no-op refetches (e.g. the catch-up fetch when the
+ * window regains focus) render-free when nothing actually changed.
+ */
+function reuseArrayIfUnchanged<T>(oldArray: Array<T>, reused: Array<T>): Array<T> {
+  return reused.length === oldArray.length && reused.every((v, i) => v === oldArray[i])
+    ? oldArray
+    : reused;
+}
+
 registerCleanup(
   latestUncommittedChangesData,
   subscriptionEffect('uncommittedChanges', data => {
-    writeAtom(latestUncommittedChangesData, last => ({
-      ...data,
-      files:
+    writeAtom(latestUncommittedChangesData, last => {
+      const newFiles =
         data.files.value ??
         // leave existing files in place if there was no error
         (last.error == null ? [] : last.files) ??
-        [],
-      error: data.files.error,
-    }));
+        [];
+      return {
+        ...data,
+        files: reuseArrayIfUnchanged(
+          last.files,
+          reuseEqualObjects(last.files, newFiles, f => f.path),
+        ),
+        error: data.files.error,
+      };
+    });
   }),
   import.meta.hot,
 );
@@ -275,7 +293,10 @@ registerCleanup(
       const newCommits = data.commits.value;
       if (newCommits != null) {
         // leave existing commits in place if there was no error
-        commits = reuseEqualObjects(commits, newCommits, c => c.hash);
+        commits = reuseArrayIfUnchanged(
+          commits,
+          reuseEqualObjects(commits, newCommits, c => c.hash),
+        );
       }
       return {
         ...data,
@@ -373,10 +394,23 @@ function filterBookmarks(
 
   return {
     ...commit,
-    remoteBookmarks: commit.remoteBookmarks.filter(bookmarkFilter),
-    bookmarks: commit.bookmarks.filter(bookmarkFilter),
-    stableCommitMetadata: commit.stableCommitMetadata?.filter(b => !hiddenBookmarks.has(b.value)),
+    remoteBookmarks: filterOrReuse(commit.remoteBookmarks, bookmarkFilter),
+    bookmarks: filterOrReuse(commit.bookmarks, bookmarkFilter),
+    stableCommitMetadata:
+      commit.stableCommitMetadata == null
+        ? commit.stableCommitMetadata
+        : filterOrReuse(commit.stableCommitMetadata, b => !hiddenBookmarks.has(b.value)),
   };
+}
+
+/**
+ * `items.filter(keep)`, but `items` itself when nothing is filtered out. The dag is rebuilt on every
+ * smartlog fetch, and a fresh array makes the commit unequal to its previous version, which
+ * re-renders its row.
+ */
+function filterOrReuse<T>(items: ReadonlyArray<T>, keep: (item: T) => boolean): ReadonlyArray<T> {
+  const kept = items.filter(keep);
+  return kept.length === items.length ? items : kept;
 }
 
 export const commitFetchError = atom(get => {

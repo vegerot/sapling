@@ -85,16 +85,61 @@ struct RpcRequestTimeline {
 class RpcServerProcessor {
  public:
   virtual ~RpcServerProcessor() = default;
-  virtual auth_stat checkAuthentication(const call_body& call_body);
+
+  /**
+   * Whether the server should parse the AUTH_SYS credential of incoming
+   * calls at all. This is the single gate for the credential fast path:
+   * when it returns false the parse is skipped entirely and
+   * checkAuthentication/dispatchRpc see std::nullopt, which every
+   * credential consumer already treats as "do nothing". Processors whose
+   * credential-consuming features are all disabled should return false so
+   * credential handling costs nothing on the per-request hot path.
+   * Defaults to true.
+   */
+  virtual bool shouldParseAuthSysCreds();
+
+  /**
+   * Decide whether the call is allowed. authSysCreds carries the parsed
+   * AUTH_SYS credential when the call had one (see parseAuthSysCreds and
+   * shouldParseAuthSysCreds); it is std::nullopt for other flavors, for
+   * malformed credential bodies, and when the parse was skipped. The
+   * reference is only valid for the duration of the call.
+   */
+  virtual auth_stat checkAuthentication(
+      const call_body& call_body,
+      const std::optional<authsys_parms>& authSysCreds);
+
+  /**
+   * Handle one RPC call. authSysCreds is the parsed AUTH_SYS credential (see
+   * checkAuthentication above); the reference is only valid until this
+   * function returns, so implementations must copy what they need before
+   * deferring work to the returned future.
+   */
   virtual ImmediateFuture<folly::Unit> dispatchRpc(
       folly::io::Cursor deser,
       folly::io::QueueAppender ser,
       uint32_t xid,
       uint32_t progNumber,
       uint32_t progVersion,
-      uint32_t procNumber);
+      uint32_t procNumber,
+      const std::optional<authsys_parms>& authSysCreds);
   virtual void clientConnected();
   virtual void onShutdown(RpcStopData stopData);
+  virtual void onExtraConnection();
+  virtual void onExtraConnectionRefused();
+
+  /**
+   * Whether this server may serve more than one concurrently connected
+   * client. Mountd carries each mount protocol exchange on its own
+   * short-lived connection, so it must keep accepting new connections.
+   * Nfsd3 serves exactly one client — the kernel — and does not support
+   * reconnects; since EOF on an accepted connection is treated as an
+   * unmount, a single-client server must refuse extra connections rather
+   * than accept them.
+   */
+  virtual bool acceptsMultipleConnections() const {
+    return true;
+  }
 
   /**
    * Return true to enable fast-path handling of certain RPCs directly on
@@ -154,6 +199,17 @@ class RpcServerProcessor {
 };
 
 class RpcServer;
+
+/**
+ * Size of each freshly allocated recv(2) buffer.
+ *
+ * This is folly::IOBufQueue::preallocate's `newAllocationSize` argument, whose
+ * signature is preallocate(min, newAllocationSize, max = SIZE_MAX). It sizes a
+ * newly allocated buffer; it is not a cap on how much a single recv(2) may
+ * return. We leave `max` at its default, and preallocate's fast path returns
+ * the whole available tailroom, which can exceed this value.
+ */
+inline constexpr size_t kDefaultReadBufferAllocationSize = 64 * 1024;
 
 /**
  * RpcConnectionHandler manages connected RPC sockets, whether for NFS or Mountd
@@ -273,6 +329,20 @@ class RpcConnectionHandler : public folly::DelayedDestruction,
       std::unique_ptr<RequestPermit> permit,
       RpcRequestTimeline timeline);
 
+  using ReplyResult =
+      std::pair<std::unique_ptr<folly::IOBuf>, RpcRequestTimeline>;
+
+  /**
+   * Write a finished reply to the socket. Must run on the EventBase thread.
+   */
+  void writeReply(folly::Try<ReplyResult> result);
+
+  /**
+   * Account for a request that has been answered, completing shutdown if it
+   * was the last one. Must run on the EventBase thread.
+   */
+  void finishRequest();
+
   /**
    * Reply to an rpc call with an error.
    * This function assumes that some data may have already been written to the
@@ -386,7 +456,8 @@ class RpcServer final : public std::enable_shared_from_this<RpcServer>,
       std::shared_ptr<folly::Executor> threadPool,
       const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
       size_t maximumInFlightRequests,
-      std::chrono::nanoseconds highNfsRequestsLogInterval);
+      std::chrono::nanoseconds highNfsRequestsLogInterval,
+      size_t socketBufferSize = 0);
 
   /**
    * RpcServer must be torn down on its EventBase. destroy() is called by the
@@ -459,9 +530,15 @@ class RpcServer final : public std::enable_shared_from_this<RpcServer>,
       std::shared_ptr<folly::Executor> threadPool,
       const std::shared_ptr<EdenFsEventsLogger>& edenFsEventsLogger,
       size_t maximumInFlightRequests,
-      std::chrono::nanoseconds highNfsRequestsLogInterval);
+      std::chrono::nanoseconds highNfsRequestsLogInterval,
+      size_t socketBufferSize);
 
   ~RpcServer() override;
+
+  /**
+   * Apply socketBufferSize_ to a connected socket, if configured.
+   */
+  void configureSocket(folly::AsyncSocket& socket);
 
   // AsyncServerSocket::AcceptCallback
 
@@ -518,6 +595,10 @@ class RpcServer final : public std::enable_shared_from_this<RpcServer>,
   // We log when the number of pending requests exceeds maximumInFlightRequests,
   // however to avoid spamming the logs once per highNfsRequestsLogInterval.
   std::chrono::nanoseconds highNfsRequestsLogInterval_;
+
+  // Send and receive buffer size for connected Unix domain sockets, 0 for
+  // the kernel default.
+  size_t socketBufferSize_;
 };
 
 } // namespace facebook::eden

@@ -226,8 +226,6 @@ class CheckoutConfig(typing.NamedTuple):
     redirections: Dict[str, "RedirectionType"]
     redirection_targets: Dict[str, str]
     active_prefetch_profiles: List[str]
-    predictive_prefetch_profiles_active: bool
-    predictive_prefetch_num_dirs: int
     enable_sqlite_overlay: bool
     use_write_back_cache: bool
     re_use_case: str
@@ -243,6 +241,7 @@ class ListMountInfo(typing.NamedTuple):
     backing_repo: Optional[Path]
     fs_channel_type: Optional[str] = None
     fuse_transport: Optional[str] = None
+    nfs_transport: Optional[str] = None
     visible_in_daemon_namespace: Optional[bool] = None
 
     def to_json_dict(self) -> Dict[str, Any]:
@@ -265,6 +264,8 @@ class ListMountInfo(typing.NamedTuple):
             d["fs_channel_type"] = self.fs_channel_type
         if self.fuse_transport is not None:
             d["fuse_transport"] = self.fuse_transport
+        if self.nfs_transport is not None:
+            d["nfs_transport"] = self.nfs_transport
         if self.visible_in_daemon_namespace is not None:
             d["visible_in_daemon_namespace"] = self.visible_in_daemon_namespace
         return d
@@ -446,19 +447,21 @@ class EdenInstance(AbstractEdenInstance):
         return logger
 
     def _create_telemetry_logger(self) -> telemetry.TelemetryLogger:
-        if "INTEGRATION_TEST" in os.environ or "EDENFS_UNITTEST" in os.environ:
+        if telemetry.telemetry_disabled_by_env():
             return telemetry.NullTelemetryLogger()
 
-        if self.get_config_bool("telemetry.enable-xplatlogger-events", default=False):
-            try:
-                # pyre-fixme [21]: Undefined import Could not find a module corresponding to import
-                from eden.fs.cli.facebook.xplat_logger import XplatLogger  # @manual
+        try:
+            # pyre-fixme [21]: Undefined import Could not find a module corresponding to import
+            from eden.fs.cli.facebook.xplat_logger import get_xplat_logger  # @manual
 
-                return XplatLogger()
-            except ImportError:
-                pass
-            except Exception as ex:
-                log.warning(f"XplatLogger construction failed, falling back: {ex}")
+            # Python CLI telemetry continues to use edenfs_events. Other
+            # destinations request their own view from the same transport.
+            return get_xplat_logger()
+        except ImportError:
+            # OSS / non-internal builds do not ship XplatLogger; use the legacy loggers.
+            pass
+        except Exception as ex:
+            log.warning(f"XplatLogger construction failed, falling back: {ex}")
 
         try:
             # pyre-fixme [21]: Undefined import Could not find a module corresponding to import
@@ -664,6 +667,7 @@ class EdenInstance(AbstractEdenInstance):
                 backing_repo=backing_repo,
                 fs_channel_type=thrift_mount.fsChannelType,
                 fuse_transport=thrift_mount.fuseTransport,
+                nfs_transport=thrift_mount.nfsTransport,
                 visible_in_daemon_namespace=thrift_mount.visibleInDaemonNamespace,
             )
 
@@ -1515,18 +1519,10 @@ class EdenCheckout:
             "profiles": {
                 "active": checkout_config.active_prefetch_profiles,
             },
-            "predictive-prefetch": {
-                "predictive-prefetch-active": checkout_config.predictive_prefetch_profiles_active,
-            },
             "recas": {
                 "use-case": checkout_config.re_use_case,
             },
         }
-
-        if checkout_config.predictive_prefetch_num_dirs:
-            config_data["predictive-prefetch"]["predictive-prefetch-num-dirs"] = (
-                checkout_config.predictive_prefetch_num_dirs  # pyrefly: ignore [bad-assignment, bad-typed-dict-key]
-            )
 
         util.write_file_atomically(
             self._config_path(), toml.dumps(config_data).encode()
@@ -1579,7 +1575,7 @@ class EdenCheckout:
 
         mount_protocol = repository.get("protocol")
         if not isinstance(mount_protocol, str):
-            mount_protocol = "prjfs" if sys.platform == "win32" else "fuse"
+            mount_protocol = util.get_platform_default_mount_protocol()
         if mount_protocol not in SUPPORTED_MOUNT_PROTOCOLS:
             raise CheckoutConfigCorruptedError(
                 f'repository "{config_path}" has unsupported mount protocol '
@@ -1645,22 +1641,6 @@ class EdenCheckout:
 
                     prefetch_profiles.append(profile)
 
-        predictive_prefetch_active = False
-        predictive_num_dirs = 0
-        predictive_prefetch_profiles_config = config.get("predictive-prefetch")
-
-        if predictive_prefetch_profiles_config is not None:
-            predictive_prefetch_active = predictive_prefetch_profiles_config.get(
-                "predictive-prefetch-active"
-            )
-            predictive_num_dirs = predictive_prefetch_profiles_config.get(
-                "predictive-prefetch-num-dirs"
-            )
-            # if predictive-prefetch-num-dirs is not set in config.toml, set
-            # predictive_num_dirs to 0 to avoid None != 0 comparisons elsewhere
-            if predictive_num_dirs is None:
-                predictive_num_dirs = 0
-
         enable_sqlite_overlay = repository.get("enable-sqlite-overlay")
         # SqliteOverlay is default on Windows
         if not isinstance(enable_sqlite_overlay, bool):
@@ -1723,9 +1703,6 @@ class EdenCheckout:
                 repository.get("default-revision") or DEFAULT_REVISION[scm_type]
             ),
             active_prefetch_profiles=prefetch_profiles,
-            # pyrefly: ignore [bad-argument-type]
-            predictive_prefetch_profiles_active=predictive_prefetch_active,
-            predictive_prefetch_num_dirs=predictive_num_dirs,
             enable_sqlite_overlay=enable_sqlite_overlay,
             use_write_back_cache=use_write_back_cache,
             re_use_case=re_use_case,
@@ -1884,8 +1861,6 @@ def parse_snapshot_component(buf: bytes, scm_type: str) -> Tuple[str, Optional[b
     return decoded_hash, filter_bytes
 
 
-_MIGRATE_EXISTING_TO_NFS = "core.migrate_existing_to_nfs"
-_MIGRATE_EXISTING_TO_NFS_ALL_MACOS = "core.migrate_existing_to_nfs_all_macos"
 _FUSE_USE_IO_URING = "fuse.use-io-uring"
 _FUSE_IO_URING_KERNEL_RELEASE_REGEX = "fuse.io-uring-kernel-release-regex"
 _FUSE_RESTART_ON_TRANSPORT_MISMATCH = "fuse.restart-on-transport-mismatch"
@@ -1894,31 +1869,24 @@ _DEFAULT_FUSE_IO_URING_KERNEL_RELEASE_REGEX = r"^6\.13\."
 FUSE_TRANSPORT_DEVFUSE = "devfuse"
 FUSE_TRANSPORT_IO_URING = "io_uring"
 
+_NFS_USE_UDS = "nfs.use-uds"
+_NFS_RESTART_ON_TRANSPORT_MISMATCH = "nfs.restart-on-transport-mismatch"
 
-class FuseTransportMismatch(typing.NamedTuple):
+NFS_TRANSPORT_TCP = "tcp"
+NFS_TRANSPORT_UNIX = "unix"
+
+
+class TransportMismatch(typing.NamedTuple):
+    """A mount whose channel transport differs from the configured one."""
+
     mount: Path
     active_transport: str
     desired_transport: str
+    # "fuse" or "nfs"
+    channel: str = "fuse"
 
 
-# Fuse is still not functional on Ventura, so users will need to use NFS on
-# Ventura.
-def should_migrate_mount_protocol_to_nfs(instance: AbstractEdenInstance) -> bool:
-    if sys.platform != "darwin":
-        return False
-
-    if util.is_sandcastle():
-        return False
-
-    if instance.get_config_bool(_MIGRATE_EXISTING_TO_NFS_ALL_MACOS, default=False):
-        return True
-
-    ventura_os_version = "22.0.0"
-
-    if tuple(os.uname().release.split(".")) >= tuple(ventura_os_version.split(".")):
-        return instance.get_config_bool(_MIGRATE_EXISTING_TO_NFS, default=False)
-
-    return False
+FuseTransportMismatch = TransportMismatch
 
 
 def is_fuse_transport_mismatch_restart_enabled(
@@ -1982,6 +1950,55 @@ def get_fuse_transport_mismatches(
     return mismatches
 
 
+def is_nfs_transport_mismatch_restart_enabled(
+    instance: AbstractEdenInstance,
+) -> bool:
+    return sys.platform != "win32" and instance.get_config_bool(
+        _NFS_RESTART_ON_TRANSPORT_MISMATCH, default=False
+    )
+
+
+def get_desired_nfs_transport(instance: AbstractEdenInstance) -> str:
+    if instance.get_config_bool(_NFS_USE_UDS, default=False):
+        return NFS_TRANSPORT_UNIX
+    return NFS_TRANSPORT_TCP
+
+
+def get_nfs_transport_mismatches(
+    instance: AbstractEdenInstance,
+) -> List[TransportMismatch]:
+    """NFS mounts whose transport differs from nfs.use-uds.
+
+    A running daemon keeps the transport its mountd was created with, so
+    after the setting changes every NFS mount mismatches until a full
+    restart.
+    """
+    desired_transport = get_desired_nfs_transport(instance)
+    return [
+        TransportMismatch(
+            mount=mount_info.path,
+            active_transport=mount_info.nfs_transport,
+            desired_transport=desired_transport,
+            channel="nfs",
+        )
+        for mount_info in instance.get_mounts().values()
+        if mount_info.nfs_transport is not None
+        and mount_info.nfs_transport != desired_transport
+    ]
+
+
+def get_transport_mismatches(
+    instance: AbstractEdenInstance,
+) -> List[TransportMismatch]:
+    """Mismatches of every channel whose restart-on-mismatch flag is on."""
+    mismatches: List[TransportMismatch] = []
+    if is_fuse_transport_mismatch_restart_enabled(instance):
+        mismatches.extend(get_fuse_transport_mismatches(instance))
+    if is_nfs_transport_mismatch_restart_enabled(instance):
+        mismatches.extend(get_nfs_transport_mismatches(instance))
+    return mismatches
+
+
 _MIGRATE_EXISTING_TO_IN_MEMORY_CATALOG = "core.migrate_existing_to_in_memory_catalog"
 
 
@@ -1999,14 +2016,6 @@ def should_migrate_inode_catalog_to_in_memory(instance: AbstractEdenInstance) ->
     return False
 
 
-def count_non_nfs_mounts(instance: AbstractEdenInstance) -> int:
-    count = 0
-    for checkout in instance.get_checkouts():
-        if checkout.get_config().mount_protocol != util.NFS_MOUNT_PROTOCOL_STRING:
-            count += 1
-    return count
-
-
 def count_non_in_memory_inode_catalogs(instance: AbstractEdenInstance) -> int:
     count = 0
     for checkout in instance.get_checkouts():
@@ -2016,35 +2025,6 @@ def count_non_in_memory_inode_catalogs(instance: AbstractEdenInstance) -> int:
         ):
             count += 1
     return count
-
-
-def count_nfs_migrations_needing_full_restart(instance: AbstractEdenInstance) -> int:
-    if sys.platform != "darwin":
-        return 0
-
-    if not instance.get_config_bool(_MIGRATE_EXISTING_TO_NFS_ALL_MACOS, default=False):
-        return 0
-
-    return count_non_nfs_mounts(instance)
-
-
-# Checks for any non NFS mounts and migrates them to NFS.
-def _do_nfs_migration(
-    instance: EdenInstance, get_migration_success_message: Callable[[str], str]
-) -> None:
-    if count_non_nfs_mounts(instance) == 0:
-        # most the time this should be the case. we only need to migrate mounts
-        # once, and then we should just be able to skip this all other times.
-        return
-
-    print("migrating mounts to NFS ...")
-
-    for checkout in instance.get_checkouts():
-        if checkout.get_config().mount_protocol != util.NFS_MOUNT_PROTOCOL_STRING:
-            checkout.migrate_mount_protocol(util.NFS_MOUNT_PROTOCOL_STRING)
-
-    instance.log_sample("migrate_existing_clones_to_nfs")
-    print(get_migration_success_message(util.NFS_MOUNT_PROTOCOL_STRING))
 
 
 # Checks for any non in memory catalogs and migrates them to in memory.
@@ -2432,8 +2412,6 @@ def create_checkout_config(
         redirections={},
         redirection_targets={},
         active_prefetch_profiles=[],
-        predictive_prefetch_profiles_active=False,
-        predictive_prefetch_num_dirs=0,
         enable_sqlite_overlay=enable_sqlite_overlay,
         use_write_back_cache=False,
         re_use_case=re_use_case or "buck2-default",

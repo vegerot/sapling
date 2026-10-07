@@ -115,6 +115,7 @@ pub struct EagerRepo {
     pub(crate) mut_store: Mutex<MutationStore>,
     pub(crate) ext: OnceLock<Arc<dyn EagerRepoExtension>>,
     enforce_server_acls: AtomicBool,
+    server_denial_message: RwLock<Option<String>>,
 }
 
 /// Storage used by `EagerRepo`. See [`Id20Store`] for details.
@@ -274,6 +275,10 @@ impl EagerRepo {
         let ident = identity::sniff_dir(&dir)?.unwrap_or_else(identity::default);
         // Attempt to match directory layout of a real client repo.
         let hg_dir = dir.join(ident.dot_dir());
+        if !hg_dir.is_dir() {
+            std::fs::create_dir_all(&hg_dir)?;
+            win32_8dot3::remove_short_name_at(&hg_dir)?;
+        }
         let store_dir = hg_dir.join("store");
         let dag = Dag::open(store_dir.join("segments").join("v1"))?;
         let store = EagerRepoStore::open(&store_dir.join("hgcommits").join("v1"), format)?;
@@ -289,6 +294,7 @@ impl EagerRepo {
             mut_store: Mutex::new(mut_store),
             ext: Default::default(),
             enforce_server_acls: AtomicBool::new(true),
+            server_denial_message: RwLock::new(None),
         };
 
         // If EagerRepoStore picks up an extension, also enable it for the EagerRepo.
@@ -604,6 +610,15 @@ impl EagerRepo {
 
     pub fn enforce_server_acls(&self) -> bool {
         self.enforce_server_acls.load(Ordering::Relaxed)
+    }
+
+    /// Denial text the fake server attaches to restricted-path denials.
+    pub fn set_server_denial_message(&self, val: Option<String>) {
+        *self.server_denial_message.write() = val;
+    }
+
+    pub fn server_denial_message(&self) -> Option<String> {
+        self.server_denial_message.read().clone()
     }
 
     /// Insert a commit. Return the commit hash.

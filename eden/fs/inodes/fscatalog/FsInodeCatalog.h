@@ -9,9 +9,13 @@
 
 #include <folly/File.h>
 #include <folly/Range.h>
+#include <folly/Synchronized.h>
+#include <folly/container/EvictingCacheMap.h>
 #include <gtest/gtest_prod.h>
+#include <algorithm>
 #include <array>
 #include <map>
+#include <memory>
 #include <optional>
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/inodes/FileContentStore.h"
@@ -38,8 +42,19 @@ class WalPath;
  */
 class FsFileContentStore : public FileContentStore {
  public:
-  explicit FsFileContentStore(AbsolutePathPiece localDir)
-      : localDir_{localDir} {}
+  explicit FsFileContentStore(
+      AbsolutePathPiece localDir,
+      bool directFileCreate = false,
+      bool cacheWalFiles = false,
+      size_t walFileCacheSize = kDefaultWalFileCacheSize,
+      WalFormat walFormat = WalFormat::Version1)
+      : localDir_{localDir},
+        directFileCreate_{directFileCreate},
+        cacheWalFiles_{cacheWalFiles},
+        walFormat_{walFormat},
+        walFileCache_{std::in_place, walFileCacheSize} {}
+
+  static constexpr size_t kDefaultWalFileCacheSize = 64;
 
   /**
    * Initialize the FileContentStore, acquire the "info" file lock and load the
@@ -159,6 +174,10 @@ class FsFileContentStore : public FileContentStore {
 
   std::optional<fsck::InodeInfo> loadInodeInfo(InodeNumber number);
 
+  std::optional<fsck::InodeInfo> loadInodeInfoAndEntries(
+      InodeNumber number,
+      InodeCatalog::OverlayEntryLoader loader);
+
   /**
    * Get the path to the WAL file for the given inode, relative to localDir.
    * Same "XX/<inode>" layout as getFilePath, with ".wal" suffix appended.
@@ -180,7 +199,7 @@ class FsFileContentStore : public FileContentStore {
    * concurrent calls for the same parent would interleave the
    * lseek + writeFull + ftruncate short-write recovery sequence and could
    * drop a successful neighbor's write. Calls for different parents are
-   * safe — each opens its own fd against a distinct WAL file.
+   * safe — each uses a distinct cached fd for its WAL file.
    */
   uint64_t appendWalEntry(
       InodeNumber parent,
@@ -203,12 +222,8 @@ class FsFileContentStore : public FileContentStore {
    * permanently invisible to future loads. Removing the WAL after read
    * lets the next append start from a clean file.
    *
-   * The result.delta is a sorted std::map. Sorted iteration order matters
-   * for the direct-serialization load path in Overlay.cpp (introduced in a
-   * later commit): it feeds entries into a PathMapMutator whose
-   * insert_or_assign path falls into an O(N) compact() step on every
-   * out-of-order key. Returning sorted keys keeps that merge
-   * O(N + K log K) instead of O(K · N) for K WAL keys against N base entries.
+   * The result.delta is a sorted std::map, giving the WAL replay in
+   * Overlay.cpp a deterministic merge order.
    *
    * result.rawEntriesParsed counts well-formed WAL entries that were
    * successfully decoded, regardless of whether they collapse against an
@@ -230,6 +245,9 @@ class FsFileContentStore : public FileContentStore {
    *
    * Used by cold paths (recursive remove, GC, fsck). The hot direct-
    * serialization load path uses loadWalDelta directly.
+   *
+   * This method supports concurrent calls when each call receives a distinct
+   * OverlayDir. Callers must separately synchronize concurrent WAL mutations.
    */
   LoadWalResult replayWal(
       InodeNumber parent,
@@ -276,6 +294,12 @@ class FsFileContentStore : public FileContentStore {
   static constexpr folly::StringPiece kHeaderIdentifierFile{"OVFL"};
   static constexpr uint32_t kHeaderVersion = 1;
   static constexpr size_t kHeaderLength = 64;
+  // Unmarked WAL files use the original record format. Versioned WALs start
+  // with this identifier followed by a big-endian uint32_t version.
+  static constexpr folly::StringPiece kWalHeaderIdentifier{"OVWL"};
+  // Version 2 header: the identifier and big-endian version only.
+  static constexpr uint32_t kWalVersion2 = 2;
+  static constexpr size_t kWalVersion2HeaderLength = 8;
   static constexpr uint32_t kNumShards = 256;
   static constexpr size_t kShardDirPathLength = 2;
 
@@ -346,15 +370,60 @@ class FsFileContentStore : public FileContentStore {
    * When crashSafe is true, uses temp-file + rename to protect against
    * partial writes on process crash. When false, writes directly to the
    * final path for better performance.
+   *
+   * On a write failure the temporary file is always removed. In direct
+   * mode the final path is removed only when removeOnFailure is set: a
+   * new inode's file should not linger as an orphan, but a rewrite of an
+   * existing directory record is left truncated so that loading it fails
+   * instead of reading back as an empty directory.
    */
   folly::File createOverlayFileImpl(
       InodeNumber inodeNumber,
       iovec* iov,
       size_t iovCount,
-      bool crashSafe = true);
+      bool crashSafe,
+      bool removeOnFailure);
+
+  struct CachedWalFile {
+    CachedWalFile(folly::File file, uint64_t size, WalFormat format)
+        : file{std::move(file)}, size{size}, format{format} {}
+
+    folly::File file;
+    uint64_t size;
+    WalFormat format;
+  };
+
+  using CachedWalFilePtr = std::shared_ptr<CachedWalFile>;
+
+  struct WalFileCache {
+    explicit WalFileCache(size_t size) : entries{std::max<size_t>(size, 1)} {}
+
+    folly::EvictingCacheMap<InodeNumber, CachedWalFilePtr> entries;
+  };
+
+  CachedWalFilePtr getCachedWalFile(InodeNumber parent);
+  void invalidateCachedWalFile(InodeNumber parent);
 
   /** Path to ".eden/CLIENT/local" */
   const AbsolutePath localDir_;
+
+  /**
+   * Skip the temp-file + rename dance when creating a new overlay file.
+   * Gated by experimental:overlay-direct-file-create.
+   */
+  const bool directFileCreate_{false};
+
+  /**
+   * Keep WAL files open across appends. Gated by
+   * experimental:overlay-cache-wal-files.
+   */
+  const bool cacheWalFiles_{false};
+
+  /**
+   * Format for newly created WAL files. Existing files keep the format
+   * named by their header regardless of this setting.
+   */
+  const WalFormat walFormat_{WalFormat::Version1};
 
   /**
    * An open file descriptor to the overlay info file.
@@ -371,6 +440,8 @@ class FsFileContentStore : public FileContentStore {
    * We maintain this so we can use openat(), unlinkat(), etc.
    */
   folly::File dirFile_;
+
+  folly::Synchronized<WalFileCache> walFileCache_;
 };
 
 /**
@@ -380,7 +451,8 @@ class FsFileContentStore : public FileContentStore {
  */
 class FsInodeCatalog : public InodeCatalog {
  public:
-  explicit FsInodeCatalog(FsFileContentStore* core) : core_(core) {}
+  explicit FsInodeCatalog(FsFileContentStore* FOLLY_NONNULL core)
+      : core_(core) {}
 
   bool supportsSemanticOperations() const override {
     return false;
@@ -446,6 +518,10 @@ class FsInodeCatalog : public InodeCatalog {
 
   std::optional<fsck::InodeInfo> loadInodeInfo(InodeNumber number) override;
 
+  std::optional<fsck::InodeInfo> loadInodeInfoAndEntries(
+      InodeNumber number,
+      OverlayEntryLoader loader) override;
+
   uint64_t appendWalEntry(
       InodeNumber parent,
       WalOpType op,
@@ -476,7 +552,7 @@ class FsInodeCatalog : public InodeCatalog {
   }
 
  private:
-  FsFileContentStore* core_;
+  FsFileContentStore* const FOLLY_NONNULL core_;
 };
 
 } // namespace facebook::eden

@@ -57,7 +57,37 @@ use crate::actions::Action;
 use crate::actions::UpdateAction;
 use crate::actions::changed_metadata_to_action;
 use crate::check_conflicts;
+use crate::errors::DirectoryConflictsError;
 use crate::errors::EdenConflictError;
+
+fn check_directory_conflicts(
+    config: &dyn Config,
+    target_manifest: &impl Manifest,
+    conflicts: &[CheckoutConflict],
+) -> Result<()> {
+    if !config.get_or_default::<bool>("experimental", "abort-on-eden-directory-conflict")? {
+        return Ok(());
+    }
+    let mut blocked = Vec::new();
+    for conflict in conflicts {
+        if conflict.conflict_type != ConflictType::DirectoryNotEmpty {
+            continue;
+        }
+        let blocks_file = match target_manifest.get(conflict.path.as_repo_path()) {
+            Ok(Some(FsNodeMetadata::File(_))) => true,
+            Ok(_) => false,
+            Err(err) if err.downcast_ref::<PermissionDenied>().is_some() => true,
+            Err(err) => return Err(err),
+        };
+        if blocks_file {
+            blocked.push(conflict.path.clone());
+        }
+    }
+    if !blocked.is_empty() {
+        return Err(DirectoryConflictsError { paths: blocked }.into());
+    }
+    Ok(())
+}
 
 fn actionmap_from_eden_conflicts(
     config: &dyn Config,
@@ -66,6 +96,8 @@ fn actionmap_from_eden_conflicts(
     target_manifest: &impl Manifest,
     conflicts: Vec<CheckoutConflict>,
 ) -> Result<(ActionMap, Status)> {
+    abort_on_eden_conflict_error(config, &conflicts)?;
+    check_directory_conflicts(config, target_manifest, &conflicts)?;
     let mut modified = Vec::new();
     let mut removed = Vec::new();
     let mut added = Vec::new();
@@ -91,15 +123,27 @@ fn actionmap_from_eden_conflicts(
     let mut map = HashMap::new();
     for conflict in conflicts {
         let action = match conflict.conflict_type {
-            ConflictType::Error => {
-                abort_on_eden_conflict_error(config, vec![conflict.clone()])?;
-                None
-            }
+            ConflictType::Error => None,
             ConflictType::VisibleRestricted => {
-                return Err(CheckoutConflictsError {
-                    conflicts: vec![conflict.path.clone()],
+                let conflict_path = conflict.path.as_repo_path();
+                let file_state = treestate
+                    .normalized_get(conflict_path.as_str().as_bytes())?
+                    .map_or(StateFlags::empty(), |f| f.state);
+                let is_untracked = !file_state.intersects(
+                    StateFlags::EXIST_P1 | StateFlags::EXIST_P2 | StateFlags::EXIST_NEXT,
+                );
+                if is_untracked
+                    && wc
+                        .ignore_matcher
+                        .match_relative(conflict_path.to_path().as_path(), false)
+                {
+                    None
+                } else {
+                    return Err(CheckoutConflictsError {
+                        conflicts: vec![conflict.path.clone()],
+                    }
+                    .into());
                 }
-                .into());
             }
             ConflictType::UntrackedAdded | ConflictType::RemovedModified => {
                 let conflict_path = conflict.path.as_repo_path();
@@ -368,7 +412,8 @@ fn edenfs_noconflict_checkout(
     if let Some(parent_pb) = &parent_pb {
         parent_pb.increase_position(1);
     }
-    abort_on_eden_conflict_error(repo.config(), actual_conflicts)?;
+    abort_on_eden_conflict_error(repo.config(), &actual_conflicts)?;
+    check_directory_conflicts(repo.config(), &target_mf, &actual_conflicts)?;
 
     // Execute the plan, applying changes to conflicting-ish files
     let apply_result = plan.apply_store(repo.file_store()?.as_ref())?;
@@ -401,7 +446,14 @@ fn edenfs_force_checkout(
         parent_pb.increase_position(1);
     }
 
-    abort_on_eden_conflict_error(repo.config(), conflicts)?;
+    abort_on_eden_conflict_error(repo.config(), &conflicts)?;
+    if conflicts
+        .iter()
+        .any(|c| c.conflict_type == ConflictType::DirectoryNotEmpty)
+    {
+        let target_mf = repo.tree_resolver()?.get(&target_commit)?;
+        check_directory_conflicts(repo.config(), &target_mf, &conflicts)?;
+    }
 
     wc.clear_merge_state()?;
 
@@ -519,10 +571,19 @@ pub fn edenfs_redirect_fixup(
     let mut cmd0 = Command::new(arg0.as_ref());
     let cmd = cmd0
         .args(args_raw.split_whitespace())
+        .envs(distributed_tracing::outgoing_env())
         .current_dir(wc.vfs().root());
     if is_okay {
         cmd.spawn_detached()?;
     } else {
+        // The background branch above hides the console window as part of
+        // `spawn_detached`. This one runs `edenfsctl` in the foreground, so it
+        // cannot take `CREATE_NO_WINDOW` unconditionally without risking the
+        // output an interactive user is waiting on — hence the headless gate,
+        // which only fires when there is no console to print to anyway. Without
+        // it, a checkout driven from an IDE (ISL in VS Code spawns `sl` with no
+        // console) pops a console window for the length of the fixup.
+        cmd.hide_console_if_headless();
         lgr.io().disable_progress(true)?;
         let status = cmd.status();
         lgr.io().disable_progress(false)?;
@@ -604,7 +665,7 @@ fn is_edenfs_redirect_okay(wc: &WorkingCopy) -> anyhow::Result<Option<bool>> {
 #[cfg(feature = "eden")]
 pub fn abort_on_eden_conflict_error(
     config: &dyn Config,
-    conflicts: Vec<CheckoutConflict>,
+    conflicts: &[CheckoutConflict],
 ) -> Result<(), EdenConflictError> {
     let propagate_error = config
         .get_or_default::<bool>("experimental", "abort-on-eden-conflict-error")
@@ -615,8 +676,8 @@ pub fn abort_on_eden_conflict_error(
             if propagate_error {
                 hg_metrics::increment_counter("abort_on_eden_conflict_error", 1);
                 return Err(EdenConflictError {
-                    path: conflict.path.into_string(),
-                    message: conflict.message,
+                    path: conflict.path.to_string(),
+                    message: conflict.message.clone(),
                 });
             } else {
                 hg_metrics::increment_counter("ignore_eden_conflict_error", 1);
@@ -630,7 +691,7 @@ pub fn abort_on_eden_conflict_error(
 #[cfg(not(feature = "eden"))]
 pub fn abort_on_eden_conflict_error(
     config: &dyn Config,
-    conflicts: Vec<CheckoutConflict>,
+    conflicts: &[CheckoutConflict],
 ) -> Result<(), EdenConflictError> {
     let (_, _) = (config, conflicts);
     Ok(())

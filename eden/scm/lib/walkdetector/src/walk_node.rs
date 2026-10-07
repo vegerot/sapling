@@ -336,7 +336,7 @@ impl WalkNode {
             WalkType::Directory => self.file_walk.as_ref().or(self.dir_walk.as_ref()),
         };
 
-        walk.and_then(|walk| if self.expired() { None } else { Some(walk) })
+        walk.filter(|&walk| !self.expired())
     }
 
     pub(crate) fn get_walk_for_type(&self, walk_type: WalkType) -> Option<&Walk> {
@@ -345,7 +345,7 @@ impl WalkNode {
             WalkType::Directory => self.dir_walk.as_ref(),
         };
 
-        walk.and_then(|walk| if self.expired() { None } else { Some(walk) })
+        walk.filter(|&walk| !self.expired())
     }
 
     /// Set walk of `walk_type` to new_walk. Returns old walk, if any.
@@ -695,6 +695,8 @@ impl WalkNode {
 
                 if !keep {
                     tracing::trace!(%path, has_walk=child.has_walk(), "GC deleting node");
+                    // Finalize any walks before dropping the node.
+                    child.clear_except_children(path);
                 }
 
                 path.pop();

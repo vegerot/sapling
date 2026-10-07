@@ -175,7 +175,7 @@ def mononoke(args: List[str], stderr: BinaryIO, fs: ShellFS, env: Env) -> int:
                 stderr=outfile,
                 env=localenv,
             )
-        except:
+        except Exception:
             stderr.write(
                 f"Error when running mononoke with command {mononoke_command} and stdout file {test_tmp}/mononoke.out\n".encode()
             )
@@ -913,6 +913,9 @@ concurrency = 24
     if env.getenv("REDACTION_DISABLED"):
         append_config("redaction=false")
 
+    if env.getenv("MIRROR_UPLOAD_REDACTION_BYPASS_ENABLED"):
+        append_config("mirror_upload_redaction_bypass_enabled=true")
+
     if env.getenv("LIST_KEYS_PATTERNS_MAX"):
         list_keys_patterns_max = env.getenv("LIST_KEYS_PATTERNS_MAX")
         append_config(f"list_keys_patterns_max={list_keys_patterns_max}")
@@ -1015,11 +1018,6 @@ forbid_p2_root_rebases=false
 
     if env.getenv("ALLOW_CHANGE_XREPO_MAPPING_EXTRA"):
         append_config("allow_change_xrepo_mapping_extra=true")
-
-    if env.getenv("PUSHREBASE_PESSIMISTIC_LOCKING_BOOKMARKS"):
-        bookmarks = env.getenv("PUSHREBASE_PESSIMISTIC_LOCKING_BOOKMARKS").split()
-        toml_list = ", ".join(f'"{b}"' for b in bookmarks)
-        append_config(f"pessimistic_locking_bookmarks = [{toml_list}]")
 
     append_config(
         """
@@ -1448,6 +1446,7 @@ mutation = {{ db_address = "{db_shard_name}" }}
 commit_cloud = {{ db_address = "{db_shard_name}" }}
 git_bundles = {{ db_address = "{db_shard_name}" }}
 restricted_paths = {{ db_address = "{db_shard_name}" }}
+repo_manifest_mapping = {{ db_address = "{db_shard_name}" }}
 derived_data_mapping = {{ unsharded = {{ db_address = "{db_shard_name}" }} }}
 """
     else:

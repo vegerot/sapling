@@ -9,358 +9,53 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use cached_config::ConfigStore;
+use cached_config::ModificationTime;
+use cached_config::TestSource;
 use config_reconcile::RepoGeneration;
 use metaconfig_parser::RepoConfigs;
 use metaconfig_parser::StorageConfigs;
+use metaconfig_types::CommitIdentityScheme;
+use metaconfig_types::CommitIdentityScheme::GIT;
+use metaconfig_types::CommitIdentityScheme::HG;
+use metaconfig_types::CommitIdentityScheme::UNKNOWN;
 use metaconfig_types::CommonConfig;
+use metaconfig_types::LazyLoadingConfig;
 use metaconfig_types::RepoConfig;
 use metaconfig_types::ShardedService;
-use metaconfig_types::ShardingModeConfig;
 use mononoke_configs::ConfigUpdateReceiver;
+use mononoke_configs::MononokeConfigs;
 use mononoke_macros::mononoke;
+use mononoke_types::RepositoryId;
+use repos::RawAllowlistIdentity;
+use repos::RawBlobstoreConfig;
+use repos::RawBlobstoreDisabled;
+use repos::RawCommonConfig;
+use repos::RawDbLocal;
+use repos::RawMetadataConfig;
+use repos::RawRedactionConfig;
+use repos::RawStorageConfig;
+use repos::TierManifest;
+use repos::TierRepoEntry;
 use tokio::sync::Notify;
 
+use super::MononokeConfigUpdateReceiver;
 use super::ReconcileTrigger;
 use super::apply_generation;
-use super::compute_reloadable_repos;
-use super::filter_repos_with_changed_config;
+use super::lazy_for_service;
 use super::memoized_spec_hash;
 use super::reconcile_loop;
+use super::repo_names_from_manifest;
 use super::retain_live_cache_entries;
 use super::run_exclusive;
-use super::should_reload_single_repo;
+use super::scheme_from_config_path;
 use super::tick_interval_secs;
-
-/// Helper to create a RepoConfig with the specified enabled state and sharding config
-fn make_repo_config(enabled: bool, deep_sharding_config: Option<ShardingModeConfig>) -> RepoConfig {
-    RepoConfig {
-        enabled,
-        deep_sharding_config,
-        ..Default::default()
-    }
-}
-
-/// Helper to create a ShardingModeConfig with the given service marked as deep-sharded or not
-fn make_sharding_config(service: ShardedService, is_deep_sharded: bool) -> ShardingModeConfig {
-    let mut status = HashMap::new();
-    status.insert(service, is_deep_sharded);
-    ShardingModeConfig { status }
-}
-
-/// Helper to create RepoConfigs from a list of (name, config) pairs
-fn make_repo_configs(repos: Vec<(String, RepoConfig)>) -> RepoConfigs {
-    RepoConfigs::new(repos.into_iter().collect(), CommonConfig::default())
-}
-
-/// Helper to get repo names from result
-fn get_repo_names(result: &[(String, RepoConfig)]) -> Vec<&str> {
-    let mut names: Vec<_> = result.iter().map(|(name, _)| name.as_str()).collect();
-    names.sort();
-    names
-}
-
-/// Helper to create a repo_exists function from a set of existing repo names
-fn existing_repos(names: &[&str]) -> impl Fn(&str) -> bool {
-    let set: HashSet<String> = names.iter().map(|s| s.to_string()).collect();
-    move |name: &str| set.contains(name)
-}
-
-#[mononoke::test]
-fn test_existing_repo_always_reloaded() {
-    // Repos already present on the server should always be reloaded,
-    // regardless of service_name or deep_sharding_config
-    let repo_configs = make_repo_configs(vec![(
-        "existing_repo".to_string(),
-        make_repo_config(true, None),
-    )]);
-
-    let result = compute_reloadable_repos(&repo_configs, None, existing_repos(&["existing_repo"]));
-    assert_eq!(get_repo_names(&result), vec!["existing_repo"]);
-}
-
-#[mononoke::test]
-fn test_existing_disabled_repo_still_reloaded() {
-    // Even disabled repos should be reloaded if they're already on the server
-    let repo_configs = make_repo_configs(vec![(
-        "existing_repo".to_string(),
-        make_repo_config(false, None),
-    )]);
-
-    let result = compute_reloadable_repos(&repo_configs, None, existing_repos(&["existing_repo"]));
-    assert_eq!(get_repo_names(&result), vec!["existing_repo"]);
-}
-
-#[mononoke::test]
-fn test_new_repo_no_service_name() {
-    // New repos should be loaded when no service_name is provided
-    // This is the key bug fix: previously these repos were not loaded
-    let repo_configs =
-        make_repo_configs(vec![("new_repo".to_string(), make_repo_config(true, None))]);
-
-    let result = compute_reloadable_repos(&repo_configs, None, existing_repos(&[]));
-    assert_eq!(get_repo_names(&result), vec!["new_repo"]);
-}
-
-#[mononoke::test]
-fn test_new_repo_no_service_name_with_sharding_config() {
-    // New repos with sharding config should still be loaded when no service_name is provided
-    let sharding_config = make_sharding_config(ShardedService::SaplingRemoteApi, true);
-    let repo_configs = make_repo_configs(vec![(
-        "new_repo".to_string(),
-        make_repo_config(true, Some(sharding_config)),
-    )]);
-
-    let result = compute_reloadable_repos(&repo_configs, None, existing_repos(&[]));
-    assert_eq!(get_repo_names(&result), vec!["new_repo"]);
-}
-
-#[mononoke::test]
-fn test_new_repo_with_service_name_no_sharding_config() {
-    // New repos without sharding config should be loaded (shallow-sharded by default)
-    let repo_configs =
-        make_repo_configs(vec![("new_repo".to_string(), make_repo_config(true, None))]);
-
-    let result = compute_reloadable_repos(
-        &repo_configs,
-        Some(&ShardedService::SaplingRemoteApi),
-        existing_repos(&[]),
-    );
-    assert_eq!(get_repo_names(&result), vec!["new_repo"]);
-}
-
-#[mononoke::test]
-fn test_new_repo_shallow_sharded_for_service() {
-    // New repos explicitly marked as shallow-sharded (false) should be loaded
-    let sharding_config = make_sharding_config(ShardedService::SaplingRemoteApi, false);
-    let repo_configs = make_repo_configs(vec![(
-        "new_repo".to_string(),
-        make_repo_config(true, Some(sharding_config)),
-    )]);
-
-    let result = compute_reloadable_repos(
-        &repo_configs,
-        Some(&ShardedService::SaplingRemoteApi),
-        existing_repos(&[]),
-    );
-    assert_eq!(get_repo_names(&result), vec!["new_repo"]);
-}
-
-#[mononoke::test]
-fn test_new_repo_deep_sharded_for_service() {
-    // New repos marked as deep-sharded (true) for the service should NOT be loaded
-    let sharding_config = make_sharding_config(ShardedService::SaplingRemoteApi, true);
-    let repo_configs = make_repo_configs(vec![(
-        "new_repo".to_string(),
-        make_repo_config(true, Some(sharding_config)),
-    )]);
-
-    let result = compute_reloadable_repos(
-        &repo_configs,
-        Some(&ShardedService::SaplingRemoteApi),
-        existing_repos(&[]),
-    );
-    assert!(result.is_empty(), "Deep-sharded repos should not be loaded");
-}
-
-#[mononoke::test]
-fn test_new_repo_deep_sharded_for_different_service() {
-    // Repos deep-sharded for a different service should be loaded
-    // Repo is deep-sharded for SourceControlService, but we're SaplingRemoteApi
-    let sharding_config = make_sharding_config(ShardedService::SourceControlService, true);
-    let repo_configs = make_repo_configs(vec![(
-        "new_repo".to_string(),
-        make_repo_config(true, Some(sharding_config)),
-    )]);
-
-    let result = compute_reloadable_repos(
-        &repo_configs,
-        Some(&ShardedService::SaplingRemoteApi),
-        existing_repos(&[]),
-    );
-    assert_eq!(get_repo_names(&result), vec!["new_repo"]);
-}
-
-#[mononoke::test]
-fn test_disabled_new_repo_not_loaded() {
-    // Disabled new repos should not be loaded
-    let repo_configs = make_repo_configs(vec![(
-        "disabled_repo".to_string(),
-        make_repo_config(false, None),
-    )]);
-
-    let result = compute_reloadable_repos(&repo_configs, None, existing_repos(&[]));
-    assert!(result.is_empty(), "Disabled new repos should not be loaded");
-}
-
-#[mononoke::test]
-fn test_mixed_repos() {
-    // Test a mix of existing, new, enabled, disabled, and sharded repos
-    let deep_sharded = make_sharding_config(ShardedService::SaplingRemoteApi, true);
-    let shallow_sharded = make_sharding_config(ShardedService::SaplingRemoteApi, false);
-
-    let repo_configs = make_repo_configs(vec![
-        ("existing_enabled".to_string(), make_repo_config(true, None)),
-        (
-            "existing_disabled".to_string(),
-            make_repo_config(false, None),
-        ),
-        (
-            "new_enabled_no_sharding".to_string(),
-            make_repo_config(true, None),
-        ),
-        ("new_disabled".to_string(), make_repo_config(false, None)),
-        (
-            "new_shallow_sharded".to_string(),
-            make_repo_config(true, Some(shallow_sharded)),
-        ),
-        (
-            "new_deep_sharded".to_string(),
-            make_repo_config(true, Some(deep_sharded)),
-        ),
-    ]);
-
-    let result = compute_reloadable_repos(
-        &repo_configs,
-        Some(&ShardedService::SaplingRemoteApi),
-        existing_repos(&["existing_enabled", "existing_disabled"]),
-    );
-    let names = get_repo_names(&result);
-
-    // Should include: existing repos (both), new enabled repos that are not deep-sharded
-    assert!(names.contains(&"existing_enabled"));
-    assert!(names.contains(&"existing_disabled"));
-    assert!(names.contains(&"new_enabled_no_sharding"));
-    assert!(names.contains(&"new_shallow_sharded"));
-
-    // Should NOT include: new disabled repos, new deep-sharded repos
-    assert!(!names.contains(&"new_disabled"));
-    assert!(!names.contains(&"new_deep_sharded"));
-}
-
-#[mononoke::test]
-fn test_filter_skips_repo_with_unchanged_config() {
-    // Repos whose RepoConfig is byte-identical to the applied config should be
-    // filtered out — no reload needed.
-    let config = make_repo_config(true, None);
-    let candidates = vec![("repo".to_string(), config.clone())];
-    let mut applied: im::HashMap<String, Arc<RepoConfig>> = im::HashMap::new();
-    applied.insert("repo".to_string(), Arc::new(config));
-
-    let result = filter_repos_with_changed_config(candidates, &applied);
-    assert!(
-        result.is_empty(),
-        "Repo with unchanged config should not be reloaded, got {:?}",
-        get_repo_names(&result),
-    );
-}
-
-#[mononoke::test]
-fn test_filter_keeps_repo_with_changed_config() {
-    // Repo whose RepoConfig differs from the applied config must be reloaded.
-    let old_config = make_repo_config(true, None);
-    let new_config = make_repo_config(false, None);
-    let candidates = vec![("repo".to_string(), new_config)];
-    let mut applied: im::HashMap<String, Arc<RepoConfig>> = im::HashMap::new();
-    applied.insert("repo".to_string(), Arc::new(old_config));
-
-    let result = filter_repos_with_changed_config(candidates, &applied);
-    assert_eq!(get_repo_names(&result), vec!["repo"]);
-}
-
-#[mononoke::test]
-fn test_filter_keeps_repo_not_in_applied_map() {
-    // A repo absent from the applied map (e.g., never loaded before) must be
-    // passed through so it gets loaded.
-    let config = make_repo_config(true, None);
-    let candidates = vec![("new_repo".to_string(), config)];
-    let applied: im::HashMap<String, Arc<RepoConfig>> = im::HashMap::new();
-
-    let result = filter_repos_with_changed_config(candidates, &applied);
-    assert_eq!(get_repo_names(&result), vec!["new_repo"]);
-}
-
-#[mononoke::test]
-fn test_filter_mixed_candidates() {
-    // Mix of unchanged, changed, and brand-new repos.
-    let config_a = make_repo_config(true, None);
-    let config_b = make_repo_config(false, None);
-
-    let candidates = vec![
-        ("unchanged".to_string(), config_a.clone()),
-        ("changed".to_string(), config_b.clone()),
-        ("brand_new".to_string(), config_a.clone()),
-    ];
-    let mut applied: im::HashMap<String, Arc<RepoConfig>> = im::HashMap::new();
-    applied.insert("unchanged".to_string(), Arc::new(config_a));
-    applied.insert(
-        "changed".to_string(),
-        Arc::new(make_repo_config(true, None)),
-    );
-
-    let result = filter_repos_with_changed_config(candidates, &applied);
-    let names = get_repo_names(&result);
-    assert!(!names.contains(&"unchanged"));
-    assert!(names.contains(&"changed"));
-    assert!(names.contains(&"brand_new"));
-}
-
-#[mononoke::test]
-fn test_applied_configs_accumulate_and_share() {
-    // Mirrors record_applied_configs' CoW merge: repeated adds accumulate all
-    // entries, and an entry untouched by a later add stays the same Arc across
-    // the clone (the O(1)-clone structural-sharing property the fix relies on).
-    let applied: ArcSwap<im::HashMap<String, Arc<RepoConfig>>> =
-        ArcSwap::from_pointee(im::HashMap::new());
-    let record = |entries: Vec<(String, RepoConfig)>| {
-        let mut next = (**applied.load()).clone();
-        next.extend(entries.into_iter().map(|(n, c)| (n, Arc::new(c))));
-        applied.store(Arc::new(next));
-    };
-
-    record(vec![
-        ("a".to_string(), make_repo_config(true, None)),
-        ("b".to_string(), make_repo_config(false, None)),
-    ]);
-    let after_first = applied.load_full();
-    record(vec![("c".to_string(), make_repo_config(true, None))]);
-
-    let map = applied.load();
-    assert_eq!(map.len(), 3, "all three repos must be tracked");
-    assert_eq!(
-        map.get("a").map(|c| (**c).clone()),
-        Some(make_repo_config(true, None)),
-        "entry a must compare equal via deref",
-    );
-    assert_eq!(
-        map.get("c").map(|c| (**c).clone()),
-        Some(make_repo_config(true, None)),
-        "entry c must compare equal via deref",
-    );
-
-    let before = after_first.get("a").expect("present after first add");
-    let now = map.get("a").expect("still present");
-    assert!(
-        Arc::ptr_eq(before, now),
-        "unchanged entry must be shared by Arc across the CoW update",
-    );
-}
-
-#[mononoke::test]
-fn test_should_reload_single_repo() {
-    // Enabled + served -> rebuild.
-    assert!(should_reload_single_repo(true, true));
-    // Not served on this host -> skip (don't rebuild a repo we don't serve
-    // even though a per-repo watcher fired for it).
-    assert!(!should_reload_single_repo(true, false));
-    // Disabled -> skip regardless of serving.
-    assert!(!should_reload_single_repo(false, true));
-    assert!(!should_reload_single_repo(false, false));
-}
 
 #[mononoke::test]
 fn test_tick_interval_off_uses_fixed_backstop() {
@@ -384,12 +79,7 @@ async fn test_reconcile_trigger_wakes_on_bulk_update() {
         notify: notify.clone(),
     };
     trigger
-        .apply_update(
-            Arc::new(RepoConfigs::new(HashMap::new(), CommonConfig::default())),
-            Arc::new(StorageConfigs {
-                storage: HashMap::new(),
-            }),
-        )
+        .apply_update(empty_cache(), storage())
         .await
         .expect("apply_update is infallible");
     // notify_one leaves a permit, so notified() resolves at once; the timeout
@@ -753,4 +443,342 @@ fn test_apply_generation_truth_table() {
         None,
         "a deep repo that was not present must not record a generation",
     );
+}
+
+// --- repo_names_from_manifest ----------------------------------------------
+
+fn git_path(name: &str) -> String {
+    format!("scm/mononoke/repos/git/ab/{name}")
+}
+
+fn hg_path(name: &str) -> String {
+    format!("scm/mononoke/repos/hg/cd/{name}")
+}
+
+fn entry(name: &str, config_path: &str) -> TierRepoEntry {
+    TierRepoEntry {
+        repo_name: name.to_owned(),
+        config_path: config_path.to_owned(),
+        is_deep_sharded: true,
+        ..Default::default()
+    }
+}
+
+fn manifest_of(entries: &[(&str, String)]) -> TierManifest {
+    TierManifest {
+        repos: entries.iter().map(|(n, p)| entry(n, p)).collect(),
+        ..Default::default()
+    }
+}
+
+fn served_of(entries: &[(&str, bool, CommitIdentityScheme)]) -> RepoConfigs {
+    let mut configs = RepoConfigs::new(HashMap::new(), CommonConfig::default());
+    for (i, (name, enabled, scheme)) in entries.iter().enumerate() {
+        let repoid = RepositoryId::new(i as i32 + 1);
+        let default_commit_identity_scheme = scheme.clone();
+        configs.insert_repo(
+            name.to_string(),
+            RepoConfig {
+                repoid,
+                enabled: *enabled,
+                default_commit_identity_scheme,
+                ..Default::default()
+            },
+        );
+    }
+    configs
+}
+
+fn names_of(entries: &[(&str, CommitIdentityScheme)]) -> HashMap<String, CommitIdentityScheme> {
+    entries
+        .iter()
+        .map(|(n, s)| (n.to_string(), s.clone()))
+        .collect()
+}
+
+// The layout convention is the only source of the scheme: git/ and hg/ trees
+// map to their schemes, anything else is UNKNOWN rather than a guess.
+#[mononoke::test]
+fn test_scheme_from_config_path_follows_the_tree_layout() {
+    assert_eq!(scheme_from_config_path(&git_path("org/repo")), GIT);
+    assert_eq!(scheme_from_config_path(&hg_path("fbsource")), HG);
+    assert_eq!(
+        scheme_from_config_path("scm/mononoke/repos/common/x"),
+        UNKNOWN
+    );
+    assert_eq!(scheme_from_config_path("test/repos/x"), UNKNOWN);
+    assert_eq!(scheme_from_config_path(""), UNKNOWN);
+}
+
+// Every manifest entry is listed, enabled or not, served or not; an empty
+// manifest yields an empty map.
+#[mononoke::test]
+fn test_repo_names_from_manifest_lists_every_entry() {
+    let names = repo_names_from_manifest(&manifest_of(&[
+        ("a", git_path("a")),
+        ("fbsource", hg_path("fbsource")),
+        ("odd", "elsewhere/odd".to_string()),
+    ]));
+    assert_eq!(
+        names,
+        names_of(&[("a", GIT), ("fbsource", HG), ("odd", UNKNOWN)])
+    );
+    assert!(repo_names_from_manifest(&manifest_of(&[])).is_empty());
+}
+
+// --- MononokeConfigUpdateReceiver ------------------------------------------
+
+fn storage() -> Arc<StorageConfigs> {
+    Arc::new(StorageConfigs {
+        storage: HashMap::new(),
+    })
+}
+
+fn empty_cache() -> Arc<RepoConfigs> {
+    Arc::new(RepoConfigs::new(HashMap::new(), CommonConfig::default()))
+}
+
+// Legacy (blob) mode or knob off: no manifest source, rebuild from the cache as before.
+#[mononoke::test]
+async fn test_receiver_no_manifest_source_rebuilds_from_cache() {
+    let map = Arc::new(ArcSwap::from_pointee(names_of(&[("a", GIT), ("b", GIT)])));
+    let receiver = MononokeConfigUpdateReceiver::new(map.clone(), None);
+    receiver
+        .apply_update(Arc::new(served_of(&[("a", true, GIT)])), storage())
+        .await
+        .unwrap();
+    assert_eq!(**map.load(), names_of(&[("a", GIT)]));
+}
+
+// Legacy mode: a per-repo update still patches the map by `enabled`.
+#[mononoke::test]
+async fn test_receiver_no_manifest_source_patches_on_repo_update() {
+    let map = Arc::new(ArcSwap::from_pointee(names_of(&[("a", GIT)])));
+    let receiver = MononokeConfigUpdateReceiver::new(map.clone(), None);
+    let disabled = RepoConfig {
+        enabled: false,
+        ..Default::default()
+    };
+    receiver.apply_repo_update("a", &disabled).await.unwrap();
+    assert!(map.load().is_empty());
+}
+
+// MononokeConfigs gone (teardown): fall back to the cache-derived map, no panic.
+#[mononoke::test]
+async fn test_receiver_dead_manifest_source_rebuilds_from_cache() {
+    let map = Arc::new(ArcSwap::from_pointee(names_of(&[("a", GIT)])));
+    let receiver = MononokeConfigUpdateReceiver::new(map.clone(), Some(Weak::new()));
+    receiver
+        .apply_update(empty_cache(), storage())
+        .await
+        .unwrap();
+    assert!(map.load().is_empty());
+}
+
+const TIER_CONFIG_PATH: &str = "configerator://scm/mononoke/repos/tiers/scs";
+const MANIFEST_PATH: &str = "scm/mononoke/repos/tiers/scs_manifest";
+const STORAGE: &str = "test_storage";
+
+fn manifest_json(entries: &[(&str, String)]) -> String {
+    let manifest = TierManifest {
+        repos: entries.iter().map(|(n, p)| entry(n, p)).collect(),
+        common: RawCommonConfig {
+            trusted_parties_hipster_tier: Some("tier".to_string()),
+            internal_identity: RawAllowlistIdentity {
+                identity_type: "SERVICE_IDENTITY".to_string(),
+                identity_data: "internal".to_string(),
+            },
+            redaction_config: RawRedactionConfig {
+                blobstore: STORAGE.to_string(),
+                redaction_sets_location: "test/redaction_sets".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        storage: HashMap::from([(
+            STORAGE.to_string(),
+            RawStorageConfig {
+                metadata: RawMetadataConfig::local(RawDbLocal {
+                    local_db_path: "/tmp/test_db".to_string(),
+                }),
+                blobstore: RawBlobstoreConfig::disabled(RawBlobstoreDisabled {}),
+                ephemeral_blobstore: None,
+                mutable_blobstore: RawBlobstoreConfig::disabled(RawBlobstoreDisabled {}),
+            },
+        )]),
+        ..Default::default()
+    };
+    serde_json::to_string(&manifest).unwrap()
+}
+
+/// Manifest-mode MononokeConfigs over a TestSource. Every entry is deep-sharded
+/// so the watcher subscribes nothing; no spec is readable because none is read.
+/// Leaves the store's poller thread sleeping (as the mononoke_configs tests do).
+fn manifest_configs(
+    entries: &[(&str, String)],
+) -> (Arc<MononokeConfigs>, Arc<TestSource>, ConfigStore) {
+    let source = Arc::new(TestSource::new());
+    source.insert_config(
+        MANIFEST_PATH,
+        &manifest_json(entries),
+        ModificationTime::UnixTimestamp(0),
+    );
+    let store = ConfigStore::new(source.clone(), Duration::from_secs(3600), None);
+    let configs = Arc::new(
+        MononokeConfigs::new(
+            TIER_CONFIG_PATH,
+            &store,
+            Some(MANIFEST_PATH),
+            tokio::runtime::Handle::current(),
+        )
+        .expect("manifest mode constructs"),
+    );
+    (configs, source, store)
+}
+
+// Manifest source live: the map is exactly the manifest, whatever the cache
+// holds. A stale entry drops, a never-cached entry appears, and a second pass
+// over the same manifest is stable.
+#[mononoke::test]
+async fn test_receiver_manifest_source_derives_from_manifest() {
+    let (configs, _source, _store) = manifest_configs(&[
+        ("a", git_path("a")),
+        ("b", git_path("b")),
+        ("hg", hg_path("hg")),
+    ]);
+    let map = Arc::new(ArcSwap::from_pointee(names_of(&[
+        ("a", GIT),
+        ("gone", GIT),
+    ])));
+    let receiver = MononokeConfigUpdateReceiver::new(map.clone(), Some(Arc::downgrade(&configs)));
+
+    let expected = names_of(&[("a", GIT), ("b", GIT), ("hg", HG)]);
+    receiver
+        .apply_update(empty_cache(), storage())
+        .await
+        .unwrap();
+    assert_eq!(**map.load(), expected);
+
+    receiver
+        .apply_update(empty_cache(), storage())
+        .await
+        .unwrap();
+    assert_eq!(**map.load(), expected, "second pass is stable");
+}
+
+// Manifest source live: a per-repo update is not a writer. A served repo
+// flipping disabled neither removes it nor adds anything.
+#[mononoke::test]
+async fn test_receiver_manifest_source_ignores_repo_updates() {
+    let (configs, _source, _store) = manifest_configs(&[("a", git_path("a"))]);
+    let map = Arc::new(ArcSwap::from_pointee(names_of(&[("a", GIT)])));
+    let receiver = MononokeConfigUpdateReceiver::new(map.clone(), Some(Arc::downgrade(&configs)));
+    let disabled = RepoConfig {
+        enabled: false,
+        ..Default::default()
+    };
+    receiver.apply_repo_update("a", &disabled).await.unwrap();
+    receiver
+        .apply_repo_update("new", &RepoConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(**map.load(), names_of(&[("a", GIT)]));
+}
+
+// A manifest change reaches the map through the real handle: a new entry
+// appears and a removed one drops on the next pass.
+#[mononoke::test]
+async fn test_receiver_manifest_change_is_picked_up() {
+    let (configs, source, store) = manifest_configs(&[("a", git_path("a")), ("b", git_path("b"))]);
+    let map = Arc::new(ArcSwap::from_pointee(HashMap::new()));
+    let receiver = MononokeConfigUpdateReceiver::new(map.clone(), Some(Arc::downgrade(&configs)));
+    receiver
+        .apply_update(empty_cache(), storage())
+        .await
+        .unwrap();
+    assert_eq!(**map.load(), names_of(&[("a", GIT), ("b", GIT)]));
+
+    source.insert_config(
+        MANIFEST_PATH,
+        &manifest_json(&[("a", git_path("a")), ("c", hg_path("c"))]),
+        ModificationTime::UnixTimestamp(1),
+    );
+    // TestSource only reports paths it has been told changed; the real
+    // configerator source reports every changed path on its own.
+    source.insert_to_refresh(MANIFEST_PATH.to_string());
+    store.force_update_configs();
+    receiver
+        .apply_update(empty_cache(), storage())
+        .await
+        .unwrap();
+    assert_eq!(**map.load(), names_of(&[("a", GIT), ("c", HG)]));
+}
+
+/// A repo config whose only interesting field is its lazy loading config.
+fn repo_config_with(lazy_loading_config: Option<LazyLoadingConfig>) -> RepoConfig {
+    RepoConfig {
+        lazy_loading_config,
+        ..Default::default()
+    }
+}
+
+#[mononoke::test]
+fn test_no_lazy_loading_config_is_eager() {
+    let repo_config = repo_config_with(None);
+
+    assert!(!lazy_for_service(
+        &repo_config,
+        Some(ShardedService::MononokeGitServer)
+    ));
+    assert!(!lazy_for_service(&repo_config, None));
+}
+
+#[mononoke::test]
+fn test_lazy_only_for_the_service_it_names() {
+    let repo_config = repo_config_with(Some(LazyLoadingConfig {
+        sharded: HashMap::from([(ShardedService::MononokeGitServer, true)]),
+        unsharded: false,
+    }));
+
+    assert!(lazy_for_service(
+        &repo_config,
+        Some(ShardedService::MononokeGitServer)
+    ));
+    // A service with no entry has no opinion, which is eager rather than
+    // inheriting the answer given to another service.
+    assert!(!lazy_for_service(
+        &repo_config,
+        Some(ShardedService::SourceControlService)
+    ));
+    assert!(!lazy_for_service(&repo_config, None));
+}
+
+#[mononoke::test]
+fn test_explicit_false_is_eager() {
+    let repo_config = repo_config_with(Some(LazyLoadingConfig {
+        sharded: HashMap::from([(ShardedService::MononokeGitServer, false)]),
+        unsharded: false,
+    }));
+
+    assert!(!lazy_for_service(
+        &repo_config,
+        Some(ShardedService::MononokeGitServer)
+    ));
+    assert!(!lazy_for_service(&repo_config, None));
+}
+
+#[mononoke::test]
+fn test_unsharded_is_independent_of_the_sharded_map() {
+    let repo_config = repo_config_with(Some(LazyLoadingConfig {
+        sharded: HashMap::from([(ShardedService::MononokeGitServer, false)]),
+        unsharded: true,
+    }));
+
+    // A task with no service identity reads `unsharded` and nothing else, so
+    // an eager sharded entry does not hold it back.
+    assert!(lazy_for_service(&repo_config, None));
+    assert!(!lazy_for_service(
+        &repo_config,
+        Some(ShardedService::MononokeGitServer)
+    ));
 }

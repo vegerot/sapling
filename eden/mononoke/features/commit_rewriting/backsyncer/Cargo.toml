@@ -8,7 +8,7 @@ edition = "2024"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.103"
+anyhow = "1.0.104"
 blobstore = { version = "0.1.0", path = "../../../blobstore" }
 bonsai_git_mapping = { version = "0.1.0", path = "../../../repo_attributes/bonsai_git_mapping" }
 bonsai_globalrev_mapping = { version = "0.1.0", path = "../../../repo_attributes/bonsai_globalrev_mapping" }
@@ -18,11 +18,10 @@ cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rus
 commit_graph = { version = "0.1.0", path = "../../../repo_attributes/commit_graph/commit_graph" }
 context = { version = "0.1.0", path = "../../../servers/slapi/slapi_server/context" }
 cross_repo_sync = { version = "0.1.0", path = "../../cross_repo_sync" }
-dbbookmarks = { version = "0.1.0", path = "../../../repo_attributes/bookmarks/dbbookmarks" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main", features = ["impl_never_type"] }
 filenodes = { version = "0.1.0", path = "../../../repo_attributes/filenodes" }
 filestore = { version = "0.1.0", path = "../../../repo_attributes/filestore" }
-futures = { version = "0.3.31", features = ["async-await", "compat"] }
+futures = { version = "0.3.34", features = ["async-await", "compat"] }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 git_source_of_truth = { version = "0.1.0", path = "../../../repo_attributes/git_source_of_truth" }
 justknobs_ext = { version = "0.1.0", path = "../../../common/rust/justknobs_ext" }
@@ -41,8 +40,8 @@ repo_update_logger = { version = "0.1.0", path = "../../repo_update_logger" }
 scuba_ext = { version = "0.1.0", path = "../../../common/scuba_ext" }
 sql_ext = { version = "0.1.0", path = "../../../common/rust/sql_ext" }
 sql_query_config = { version = "0.1.0", path = "../../../repo_attributes/sql_query_config" }
-thiserror = "2.0.18"
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 wireproto_handler = { version = "0.1.0", path = "../../../servers/slapi/wireproto_handler" }
 

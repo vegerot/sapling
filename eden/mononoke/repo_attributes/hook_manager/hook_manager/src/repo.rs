@@ -30,7 +30,6 @@ use commit_rate_limit_config::CommitRateLimit;
 use content_manifest_derivation::RootContentManifestId;
 use context::CoreContext;
 use derivation_queue_thrift::DerivationPriority;
-use fsnodes::RootFsnodeId;
 use futures::future;
 use futures::stream::TryStreamExt;
 use manifest::Diff;
@@ -40,11 +39,11 @@ use metaconfig_types::RepoConfig;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
+use mononoke_types::ContentManifestId;
 use mononoke_types::ContentMetadataV2;
 use mononoke_types::MPath;
 use mononoke_types::ManifestUnodeId;
 use mononoke_types::NonRootMPath;
-use mononoke_types::content_manifest::compat;
 use mononoke_types::hash::GitSha1;
 use repo_blobstore::RepoBlobstore;
 use repo_cross_repo::RepoCrossRepo;
@@ -121,12 +120,26 @@ impl HookRepo {
         ctx: &'a CoreContext,
         id: ContentId,
     ) -> Result<Option<Bytes>> {
-        let file_bytes = self.get_file_bytes(ctx, id).await?;
+        if !justknobs::eval(
+            "scm/mononoke:enable_hook_skip_binary_blob_fetch",
+            None,
+            None,
+        ) {
+            let file_bytes = self.get_file_bytes(ctx, id).await?;
+            let file_bytes = file_bytes.filter(|b| !b.contains(&0));
+            return Ok(file_bytes);
+        }
 
-        // Filter out files with null bytes
-        let file_bytes = file_bytes.filter(|b| !b.contains(&0));
+        let metadata = self.get_file_metadata(ctx, id).await?;
 
-        Ok(file_bytes)
+        // Don't fetch content if we know the object is too large, or if it's
+        // binary. `is_binary` in the metadata means "contains a null byte",
+        // which is exactly the filter text hooks want.
+        if metadata.total_size > self.repo_config.hook_max_file_size || metadata.is_binary {
+            return Ok(None);
+        }
+
+        Ok(Some(self.fetch_file_bytes(ctx, id).await?))
     }
 
     pub async fn get_file_bytes<'a>(
@@ -140,11 +153,13 @@ impl HookRepo {
             return Ok(None);
         }
 
-        let file_bytes = filestore::fetch_concat_opt(&self.repo_blobstore, ctx, &id.into())
-            .await?
-            .ok_or_else(|| anyhow!("Content with id '{id}' not found"))?;
+        Ok(Some(self.fetch_file_bytes(ctx, id).await?))
+    }
 
-        Ok(Some(file_bytes))
+    async fn fetch_file_bytes<'a>(&'a self, ctx: &'a CoreContext, id: ContentId) -> Result<Bytes> {
+        filestore::fetch_concat_opt(&self.repo_blobstore, ctx, &id.into())
+            .await?
+            .ok_or_else(|| anyhow!("Content with id '{id}' not found"))
     }
 
     pub async fn find_content<'a>(
@@ -170,13 +185,7 @@ impl HookRepo {
         changeset_id: ChangesetId,
         paths: Vec<NonRootMPath>,
     ) -> Result<HashMap<NonRootMPath, PathContent>> {
-        let manifest_id = derive_manifest(
-            ctx,
-            self.repo_identity.name(),
-            &self.repo_derived_data,
-            changeset_id,
-        )
-        .await?;
+        let manifest_id = derive_manifest(ctx, &self.repo_derived_data, changeset_id).await?;
 
         manifest_id
             .find_entries(ctx.clone(), self.repo_blobstore.clone(), paths)
@@ -185,8 +194,7 @@ impl HookRepo {
                     match entry {
                         Entry::Tree(_) => Ok(Some((path, PathContent::Directory))),
                         Entry::Leaf(file) => {
-                            let file: compat::ContentManifestFile = file.into();
-                            let content_id = file.content_id();
+                            let content_id = file.content_id;
                             Ok(Some((path, PathContent::File(content_id))))
                         }
                     }
@@ -206,18 +214,8 @@ impl HookRepo {
         new_cs_id: ChangesetId,
         old_cs_id: ChangesetId,
     ) -> Result<Vec<(NonRootMPath, FileChangeType)>> {
-        let new_mf_fut = derive_manifest(
-            ctx,
-            self.repo_identity.name(),
-            &self.repo_derived_data,
-            new_cs_id,
-        );
-        let old_mf_fut = derive_manifest(
-            ctx,
-            self.repo_identity.name(),
-            &self.repo_derived_data,
-            old_cs_id,
-        );
+        let new_mf_fut = derive_manifest(ctx, &self.repo_derived_data, new_cs_id);
+        let old_mf_fut = derive_manifest(ctx, &self.repo_derived_data, old_cs_id);
 
         let (new_mf, old_mf) = future::try_join(new_mf_fut, old_mf_fut).await?;
 
@@ -228,9 +226,8 @@ impl HookRepo {
                     Diff::Added(path, entry) => match Option::<NonRootMPath>::from(path) {
                         Some(path) => match entry {
                             Entry::Tree(_) => Ok(None),
-                            Entry::Leaf(c) => {
-                                let file: compat::ContentManifestFile = c.into();
-                                Ok(Some((path, FileChangeType::Added(file.content_id()))))
+                            Entry::Leaf(file) => {
+                                Ok(Some((path, FileChangeType::Added(file.content_id))))
                             }
                         },
                         None => Ok(None),
@@ -238,17 +235,13 @@ impl HookRepo {
                     Diff::Changed(path, old_entry, entry) if !path.is_root() => {
                         match Option::<NonRootMPath>::from(path) {
                             Some(path) => match (old_entry, entry) {
-                                (Entry::Leaf(old_c), Entry::Leaf(c)) => {
-                                    let old_file: compat::ContentManifestFile = old_c.into();
-                                    let new_file: compat::ContentManifestFile = c.into();
-                                    Ok(Some((
-                                        path,
-                                        FileChangeType::Changed(
-                                            old_file.content_id(),
-                                            new_file.content_id(),
-                                        ),
-                                    )))
-                                }
+                                (Entry::Leaf(old_file), Entry::Leaf(new_file)) => Ok(Some((
+                                    path,
+                                    FileChangeType::Changed(
+                                        old_file.content_id,
+                                        new_file.content_id,
+                                    ),
+                                ))),
                                 _ => Ok(None),
                             },
                             None => Ok(None),
@@ -336,7 +329,7 @@ impl HookRepo {
             .clone();
         sk_mf
             .find_entries(ctx.clone(), self.repo_blobstore.clone(), paths)
-            .try_filter_map(|(path, entry)| async move {
+            .map_ok(|(path, entry)| async move {
                 match entry {
                     Entry::Tree(tree_id) => {
                         let tree = tree_id.load(ctx, &self.repo_blobstore).await?;
@@ -349,6 +342,8 @@ impl HookRepo {
                     _ => Ok(None),
                 }
             })
+            .try_buffer_unordered(100)
+            .try_filter_map(future::ok)
             .try_collect()
             .await
     }
@@ -427,33 +422,14 @@ impl HookRepo {
 
 async fn derive_manifest(
     ctx: &CoreContext,
-    repo_name: &str,
     repo_derived_data: &RepoDerivedData,
     changeset_id: ChangesetId,
-) -> Result<compat::ContentManifestId> {
-    let use_content_manifests = justknobs::eval(
-        "scm/mononoke:derived_data_use_content_manifests",
-        None,
-        Some(repo_name),
-    );
-
-    if use_content_manifests {
-        let root_id = repo_derived_data
-            .derive::<RootContentManifestId>(ctx, changeset_id.clone(), DerivationPriority::LOW)
-            .await
-            .with_context(|| {
-                format!("Error deriving content manifest for bonsai: {changeset_id}")
-            })?;
-        Ok(root_id.into_content_manifest_id().into())
-    } else {
-        let root_id = repo_derived_data
-            .derive::<RootFsnodeId>(ctx, changeset_id.clone(), DerivationPriority::LOW)
-            .await
-            .with_context(|| {
-                format!("Error deriving fsnode manifest for bonsai: {changeset_id}")
-            })?;
-        Ok(root_id.into_fsnode_id().into())
-    }
+) -> Result<ContentManifestId> {
+    let root_id = repo_derived_data
+        .derive::<RootContentManifestId>(ctx, changeset_id.clone(), DerivationPriority::LOW)
+        .await
+        .with_context(|| format!("Error deriving content manifest for bonsai: {changeset_id}"))?;
+    Ok(root_id.into_content_manifest_id())
 }
 
 async fn derive_unode_manifest(

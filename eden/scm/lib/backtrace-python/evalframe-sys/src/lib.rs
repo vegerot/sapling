@@ -113,6 +113,19 @@ pub fn get_last_frame() -> usize {
     unsafe { sapling_cext_evalframe_get_last_frame() }
 }
 
+/// Read one machine word from a native stack address during offset probing.
+///
+/// # Safety
+/// - `ptr` must be readable for `usize` bytes.
+/// - `ptr` must be aligned to `align_of::<usize>()`: the C implementation
+///   performs a typed `*(const volatile uintptr_t*)ptr` read, and a
+///   readability check alone does not establish alignment.
+/// - This is only intended for the bounded `Sapling_PyEvalFrame` stack scan
+///   performed by the offset probe.
+pub unsafe fn probe_read_stack_word(ptr: *const libc::c_void) -> usize {
+    unsafe { sapling_cext_evalframe_probe_read_stack_word(ptr) }
+}
+
 // Raw FFI declarations for evalframe.c
 unsafe extern "C" {
     fn sapling_cext_evalframe_set_mode(mode: libc::c_int);
@@ -135,7 +148,95 @@ unsafe extern "C" {
     fn sapling_cext_evalframe_get_last_code() -> usize;
     fn sapling_cext_evalframe_get_last_line_no() -> isize;
 
+    fn sapling_cext_evalframe_probe_read_stack_word(ptr: *const libc::c_void) -> usize;
+
     // The pass-through eval frame function. We use its address and scans its stack.
     // It's not called directly.
     fn Sapling_PyEvalFrame(tstate: usize, f: usize, exc: libc::c_int);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CStr;
+    use std::ffi::CString;
+    use std::ptr;
+    use std::sync::Once;
+
+    use super::*;
+
+    unsafe extern "C" {
+        fn Py_InitializeEx(initsigs: libc::c_int);
+        fn PyEval_SaveThread() -> *mut libc::c_void;
+        fn PyGILState_Ensure() -> libc::c_int;
+        fn PyGILState_Release(state: libc::c_int);
+        fn Py_CompileString(
+            source: *const libc::c_char,
+            filename: *const libc::c_char,
+            start: libc::c_int,
+        ) -> *mut libc::c_void;
+        fn PyObject_GetAttrString(
+            object: *mut libc::c_void,
+            attr: *const libc::c_char,
+        ) -> *mut libc::c_void;
+        fn PyTuple_GetItem(tuple: *mut libc::c_void, index: isize) -> *mut libc::c_void;
+    }
+
+    const PY_FILE_INPUT: libc::c_int = 257;
+
+    /// Run `func` with the GIL held, initializing Python on first use.
+    fn with_gil<T>(func: impl FnOnce() -> T) -> T {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| unsafe {
+            Py_InitializeEx(0);
+            PyEval_SaveThread();
+        });
+        let state = unsafe { PyGILState_Ensure() };
+        let result = func();
+        unsafe { PyGILState_Release(state) };
+        result
+    }
+
+    /// Resolve the code object of the first function defined in `source`.
+    fn resolve_first_function(source: &str, filename: &str) -> Option<(String, String)> {
+        let source = CString::new(source).unwrap();
+        let filename = CString::new(filename).unwrap();
+        with_gil(|| unsafe {
+            let module = Py_CompileString(source.as_ptr(), filename.as_ptr(), PY_FILE_INPUT);
+            assert!(!module.is_null(), "source should compile");
+            let consts = PyObject_GetAttrString(module, c"co_consts".as_ptr());
+            let code = PyTuple_GetItem(consts, 0);
+
+            let mut filename: *const libc::c_char = ptr::null();
+            let name = resolve_code_object(code, &mut filename);
+            if name.is_null() || filename.is_null() {
+                return None;
+            }
+            Some((
+                CStr::from_ptr(name).to_str().unwrap().to_string(),
+                CStr::from_ptr(filename).to_str().unwrap().to_string(),
+            ))
+        })
+    }
+
+    #[test]
+    fn test_resolve_code_object_ascii() {
+        assert_eq!(
+            resolve_first_function("def ascii_name(): pass\n", "ascii.py"),
+            Some(("ascii_name".to_string(), "ascii.py".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_resolve_code_object_non_ascii_placeholder() {
+        // A non-ASCII str needs the GIL to encode, so a placeholder stands in
+        // for it and the frame still resolves.
+        assert_eq!(
+            resolve_first_function("def 名字(): pass\n", "ascii.py"),
+            Some(("<non-ascii>".to_string(), "ascii.py".to_string()))
+        );
+        assert_eq!(
+            resolve_first_function("def ascii_name(): pass\n", "目录/file.py"),
+            Some(("ascii_name".to_string(), "<non-ascii>".to_string()))
+        );
+    }
 }

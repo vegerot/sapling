@@ -9,6 +9,7 @@
 
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 #include <folly/Function.h>
@@ -60,6 +61,22 @@ enum class WalOpType : uint8_t {
   ADD = 1,
   REMOVE = 2,
   MATERIALIZE = 3,
+};
+
+// Version1 WAL files have no header; later versions start with an OVWL
+// header that names their version.
+enum class WalFormat : uint8_t { Version1, Version2 };
+
+/**
+ * Thrown by `appendWalEntry` when the entry has a field the existing WAL
+ * file's format cannot encode (a v1 WAL cannot hold an object ID longer than
+ * 255 bytes). No record has been written, though a WAL that did not exist
+ * yet may have been created empty. The caller should persist the directory
+ * with a full `saveOverlayDir` instead, which retires the WAL either way.
+ */
+class WalEntryTooLargeError : public std::runtime_error {
+ public:
+  using std::runtime_error::runtime_error;
 };
 
 /**
@@ -178,7 +195,11 @@ class InodeCatalog {
   virtual bool initialized() const = 0;
 
   /**
-   * Load the directory content associated with the given `InodeNumber`
+   * Load the directory content associated with the given `InodeNumber`.
+   *
+   * Implementations must support concurrent calls to this method and
+   * loadOverlayEntries(). These calls only read directory records; callers
+   * must separately synchronize concurrent mutations.
    */
   virtual std::optional<overlay::OverlayDir> loadOverlayDir(
       InodeNumber inodeNumber) = 0;
@@ -227,6 +248,9 @@ class InodeCatalog {
    * Returns false if no overlay exists for this inode.
    *
    * Default implementation calls loadOverlayDir() and iterates the result.
+   * Implementations must support concurrent calls to this method and
+   * loadOverlayDir(). These calls only read directory records; callers must
+   * separately synchronize concurrent mutations.
    */
   using OverlayEntryIterator =
       folly::FunctionRef<void(OverlayEntryVisitor visitor)>;
@@ -234,6 +258,17 @@ class InodeCatalog {
       folly::FunctionRef<void(size_t count, OverlayEntryIterator iterate)>;
 
   virtual bool loadOverlayEntries(
+      InodeNumber inodeNumber,
+      OverlayEntryLoader loader);
+
+  /**
+   * Load inode metadata and stream directory entries when the inode is a
+   * directory. Catalogs may override this to perform both operations from one
+   * underlying read. Parsing and loader exceptions propagate, and the loader
+   * may have observed a partial directory before an exception. Callers must
+   * not commit streamed results until this method returns successfully.
+   */
+  virtual std::optional<fsck::InodeInfo> loadInodeInfoAndEntries(
       InodeNumber inodeNumber,
       OverlayEntryLoader loader);
 

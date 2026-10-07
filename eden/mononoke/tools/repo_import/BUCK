@@ -5,11 +5,6 @@ oncall("scm_server_treehugger")
 rust_binary(
     name = "repo_import",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {
-        "cargo_toml_config": {
-            "dependencies_override": {"dependencies": {"gix-hash": {"features": ["sha1"]}}},
-        }
-    },
     test_deps = [
         "fbsource//third-party/rust:ascii",
         "fbsource//third-party/rust:tokio",
@@ -64,7 +59,6 @@ rust_binary(
         "//eden/mononoke/repo_attributes/bonsai_tag_mapping:bonsai_tag_mapping",
         "//eden/mononoke/repo_attributes/bookmarks:bookmarks",
         "//eden/mononoke/repo_attributes/bookmarks/bookmarks_movement:bookmarks_movement",
-        "//eden/mononoke/repo_attributes/bookmarks/dbbookmarks:dbbookmarks",
         "//eden/mononoke/repo_attributes/commit_graph/commit_graph:commit_graph",
         "//eden/mononoke/repo_attributes/filenodes:filenodes",
         "//eden/mononoke/repo_attributes/filestore:filestore",

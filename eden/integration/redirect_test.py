@@ -12,6 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from eden.fs.cli.redirect import is_bind_mount
 from eden.fs.cli.util import mkscratch_bin
 from eden.fs.service.eden.thrift_types import (
     ListRedirectionsRequest,
@@ -61,6 +62,22 @@ via-profile = "bind"
 """,
         )
         self.repo.commit("Initial commit.")
+
+    def test_doctor_preserves_dot_prefixed_mounted_bind(self) -> None:
+        if sys.platform != "linux":
+            self.skipTest("Linux bind mount behavior")
+        redirection = Path(self.mount, "via-profile")
+        self.assertTrue(is_bind_mount(redirection))
+        contents = redirection / "contents"
+        contents.write_text("preserve me\n")
+        Path(self.mount, ".eden-redirections").write_text(
+            '[redirections]\n"./via-profile" = "bind"\n'
+        )
+
+        self.eden.run_cmd("doctor", "--current-edenfs-only", "--fast")
+
+        self.assertTrue(is_bind_mount(redirection))
+        self.assertEqual("preserve me\n", contents.read_text())
 
     def test_list_no_legacy_bind_mounts(self) -> None:
         output = self.eden.run_cmd("redirect", "list", "--json", "--mount", self.mount)
@@ -327,6 +344,61 @@ via-profile = "bind"
         self.assertFalse(
             os.path.exists(os.path.join(self.mount, "a", "new-one")),
             msg="symlink is gone",
+        )
+
+    def test_add_symlink_redirect_recreates_missing_symlink(self) -> None:
+        repo_path = os.path.join("a", "new-symlink")
+        output = self.eden.run_cmd(
+            "redirect", "add", "--mount", self.mount, repo_path, "symlink"
+        )
+        self.assertEqual(output, "", msg="we believe we created a symlink redirection")
+        link_path = os.path.join(self.mount, repo_path)
+        self.assertTrue(
+            os.path.islink(link_path), msg="the redirection symlink exists on disk"
+        )
+
+        # The symlink can go missing while staying configured: `eden stop`,
+        # `eden rm`, and `eden redirect unmount` all delete symlink
+        # redirections from disk without touching the configuration, as can a
+        # user's cleaning script.
+        os.remove(link_path)
+
+        output = self.eden.run_cmd(
+            "redirect", "add", "--mount", self.mount, repo_path, "symlink"
+        )
+        self.assertTrue(
+            os.path.islink(link_path),
+            msg="the redirection symlink was recreated by add",
+        )
+
+        self.eden.run_cmd("redirect", "del", "--mount", self.mount, repo_path)
+
+    def test_del_rejects_repo_source_redirect(self) -> None:
+        repo_path = "via-profile"
+
+        # A redirection defined by the repo's .eden-redirections file cannot
+        # be deleted: the CLI cannot edit the source-controlled file, so
+        # nothing could persist the deletion, and `redirect fixup` (which the
+        # daemon runs on every mount) would silently bring it back.
+        proc = self.eden.run_unchecked(
+            "redirect",
+            "del",
+            "--mount",
+            self.mount,
+            repo_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+        )
+        self.assertNotEqual(0, proc.returncode, msg="del is rejected")
+        self.assertIn("cannot be removed", proc.stderr + proc.stdout)
+
+        list_output = self.eden.run_cmd(
+            "redirect", "list", "--json", "--mount", self.mount
+        )
+        entries = {r["repo_path"]: r["state"] for r in json.loads(list_output)}
+        self.assertEqual(
+            "ok", entries.get(repo_path), msg="the redirection is untouched"
         )
 
     async def test_list_with_thrift(self) -> None:

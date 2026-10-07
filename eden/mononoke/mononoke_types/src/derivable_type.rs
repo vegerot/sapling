@@ -73,9 +73,9 @@ pub enum DerivableType {
 #[derive(Clone, Copy, Debug, EnumIter, Eq, PartialEq)]
 pub enum DerivableUntopologicallyVariant {
     AclManifests,
+    BlameV3,
     BssmV3,
     Ccsm,
-    ContentManifests,
     HgAugmentedManifests,
     GitDeltaManifestsV3,
     InferredCopyFrom,
@@ -96,6 +96,7 @@ pub enum PipelineDerivableVariant {
     AclManifests,
     HgChangesets,
     HgAugmentedManifests,
+    HgAugmentedManifestsV2,
     ContentManifests,
     DeletedManifests,
 }
@@ -238,6 +239,7 @@ impl DerivableType {
     pub fn into_derivable_untopologically_variant(self) -> Result<DerivableUntopologicallyVariant> {
         match self {
             DerivableType::AclManifests => Ok(DerivableUntopologicallyVariant::AclManifests),
+            DerivableType::BlameV3 => Ok(DerivableUntopologicallyVariant::BlameV3),
             DerivableType::BssmV3 => Ok(DerivableUntopologicallyVariant::BssmV3),
             DerivableType::Ccsm => Ok(DerivableUntopologicallyVariant::Ccsm),
             DerivableType::HgAugmentedManifests => {
@@ -248,9 +250,6 @@ impl DerivableType {
             }
             DerivableType::InferredCopyFrom => {
                 Ok(DerivableUntopologicallyVariant::InferredCopyFrom)
-            }
-            DerivableType::ContentManifests => {
-                Ok(DerivableUntopologicallyVariant::ContentManifests)
             }
             DerivableType::SkeletonManifestsV2 => {
                 Ok(DerivableUntopologicallyVariant::SkeletonManifestsV2)
@@ -277,6 +276,9 @@ impl DerivableType {
             DerivableType::HgAugmentedManifests => {
                 Ok(PipelineDerivableVariant::HgAugmentedManifests)
             }
+            DerivableType::HgAugmentedManifestsV2 => {
+                Ok(PipelineDerivableVariant::HgAugmentedManifestsV2)
+            }
             DerivableType::ContentManifests => Ok(PipelineDerivableVariant::ContentManifests),
             DerivableType::DeletedManifests => Ok(PipelineDerivableVariant::DeletedManifests),
             _ => bail!("{} does not support derivation pipeline", self.name()),
@@ -296,6 +298,9 @@ impl PipelineDerivableVariant {
             PipelineDerivableVariant::AclManifests => DerivableType::AclManifests,
             PipelineDerivableVariant::HgChangesets => DerivableType::HgChangesets,
             PipelineDerivableVariant::HgAugmentedManifests => DerivableType::HgAugmentedManifests,
+            PipelineDerivableVariant::HgAugmentedManifestsV2 => {
+                DerivableType::HgAugmentedManifestsV2
+            }
             PipelineDerivableVariant::ContentManifests => DerivableType::ContentManifests,
             PipelineDerivableVariant::DeletedManifests => DerivableType::DeletedManifests,
         }
@@ -306,9 +311,9 @@ impl DerivableUntopologicallyVariant {
     pub fn into_derivable_type(self) -> DerivableType {
         match self {
             DerivableUntopologicallyVariant::AclManifests => DerivableType::AclManifests,
+            DerivableUntopologicallyVariant::BlameV3 => DerivableType::BlameV3,
             DerivableUntopologicallyVariant::BssmV3 => DerivableType::BssmV3,
             DerivableUntopologicallyVariant::Ccsm => DerivableType::Ccsm,
-            DerivableUntopologicallyVariant::ContentManifests => DerivableType::ContentManifests,
             DerivableUntopologicallyVariant::HgAugmentedManifests => {
                 DerivableType::HgAugmentedManifests
             }

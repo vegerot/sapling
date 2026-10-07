@@ -73,7 +73,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 try:
     # pyre-fixme[21]: Could not find module `features`.
     import features
-except:
+except Exception:
     features = None
 
 import queue
@@ -1151,6 +1151,7 @@ class Test(unittest.TestCase):
         self._out = None
         self._skipped = None
         self._testtmp = None
+        self._edenfsmanager = None
 
         self._refout = self.readrefout()
 
@@ -1366,6 +1367,22 @@ class Test(unittest.TestCase):
             killdaemons(entry)
         self._daemonpids = []
 
+        # EdenFS must stop before the tmp dirs are removed: on Linux its control
+        # socket lives under threadtmp, and without it the stop falls back to
+        # SIGKILL, leaving the test's FUSE mounts behind.
+        edenfsmanager = self._edenfsmanager
+        eden = edenfsmanager.eden if edenfsmanager is not None else None
+        if eden is not None:
+            try:
+                eden.kill()
+                if self._keeptmpdir:
+                    log(f"Keeping edenfs dir: {edenfsmanager.test_dir}\n")
+                else:
+                    eden.cleanup()
+                    shutil.rmtree(edenfsmanager.test_dir, ignore_errors=True)
+            except Exception as e:
+                log(f"\nFailed to stop edenfs: {e}\n")
+
         if self._keeptmpdir:
             log(
                 "\nKeeping testtmp dir: %s\nKeeping threadtmp dir: %s"
@@ -1391,17 +1408,6 @@ class Test(unittest.TestCase):
                     )
                 else:
                     shutil.rmtree(self._watchmandir, ignore_errors=True)
-            except Exception:
-                pass
-
-        if use_edenfs:
-            try:
-                self._edenfsmanager.eden.kill()
-                if self._keeptmpdir:
-                    log(f"Keeping edenfs dir: {self._edenfsmanager.test_dir}\n")
-                else:
-                    self._edenfsmanager.eden.cleanup()
-                    shutil.rmtree(self._edenfsmanager.test_dir, ignore_errors=True)
             except Exception:
                 pass
 
@@ -1587,6 +1593,8 @@ class Test(unittest.TestCase):
 
         # Claim that 256 colors is not supported.
         env["HGCOLORS"] = "16"
+        # Python 3.14 colorizes tracebacks and unittest output by default.
+        env["PYTHON_COLORS"] = "0"
         # Normalize TERM to avoid control sequence variations.
         # We use a non-existent terminal to avoid any terminfo dependency.
         env["TERM"] = "fake-term"

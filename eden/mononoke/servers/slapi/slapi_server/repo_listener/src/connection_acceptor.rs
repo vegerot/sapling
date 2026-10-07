@@ -48,7 +48,6 @@ use metadata::Metadata;
 use mononoke_api::Mononoke;
 use mononoke_api::Repo;
 use mononoke_app::monitoring::ReadyFlagService;
-use mononoke_configs::MononokeConfigs;
 use mononoke_macros::mononoke;
 use openssl::ssl::Ssl;
 use openssl::ssl::SslAcceptor;
@@ -80,7 +79,6 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 
-use crate::errors::ErrorKind;
 use crate::http_service::MononokeHttpService;
 use crate::request_handler::request_handler;
 use crate::wireproto_sink::WireprotoSink;
@@ -118,7 +116,6 @@ pub async fn wait_for_connections_closed() {
 
 pub async fn connection_acceptor(
     fb: FacebookInit,
-    configs: Arc<MononokeConfigs>,
     common_config: CommonConfig,
     sockname: String,
     service: ReadyFlagService,
@@ -183,7 +180,6 @@ pub async fn connection_acceptor(
         config_store: config_store.clone(),
         qps,
         wireproto_scuba,
-        configs,
         common_config,
         readonly,
         mtls_disabled,
@@ -197,6 +193,21 @@ pub async fn connection_acceptor(
             },
             sock_tuple = listener.accept().fuse() => match sock_tuple {
                 Ok((stream, addr)) => {
+                    // Disable Nagle's algorithm. Without this, the kernel holds the
+                    // response-body segment until the peer ACKs the response head,
+                    // which interlocks with the peer's delayed ACK (40ms minimum on
+                    // Linux) and stalls latency-sensitive SLAPI responses.
+                    //
+                    // The JK is a kill-switch, on by default.
+                    if justknobs::eval(
+                        "scm/mononoke:connection_acceptor_set_nodelay",
+                        None,
+                        None,
+                    ) {
+                        if let Err(err) = stream.set_nodelay(true) {
+                            warn!(error = ?err, "Failed to set TCP_NODELAY on connection from {addr}");
+                        }
+                    }
                     let conn = PendingConnection { acceptor: acceptor.clone(), addr };
                     let task = handle_connection(conn.clone(), stream);
                     conn.spawn_task(task, "Failed to handle_connection");
@@ -224,7 +235,6 @@ pub struct Acceptor<R> {
     pub config_store: ConfigStore,
     pub qps: Option<Arc<Qps>>,
     pub wireproto_scuba: MononokeScubaSampleBuilder,
-    pub configs: Arc<MononokeConfigs>,
     pub common_config: CommonConfig,
     pub readonly: bool,
     pub mtls_disabled: bool,
@@ -305,7 +315,7 @@ async fn handle_connection(conn: PendingConnection, sock: TcpStream) -> Result<(
         false => {
             let identities = match ssl_socket.ssl().peer_certificate() {
                 Some(cert) => MononokeIdentity::try_from_x509(&cert),
-                None => Err(ErrorKind::ConnectionNoClientCertificate.into()),
+                None => Err(anyhow!("connection does not have a client certificate")),
             }?;
 
             let is_trusted = conn
@@ -382,7 +392,6 @@ where
         conn.pending.acceptor.fb,
         reponame,
         Arc::clone(&conn.pending.acceptor.mononoke),
-        conn.pending.acceptor.configs.clone(),
         &conn.pending.acceptor.security_checker,
         stdio,
         conn.pending.acceptor.rate_limiter.clone(),

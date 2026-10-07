@@ -37,8 +37,7 @@ class FilteredBackingStore
   FilteredBackingStore(
       std::shared_ptr<BackingStore> backingStore,
       std::unique_ptr<Filter> filter,
-      std::shared_ptr<ReloadableConfig> config,
-      bool optimizeUnfilteredTrees);
+      std::shared_ptr<ReloadableConfig> config);
 
   ~FilteredBackingStore() override;
 
@@ -130,10 +129,6 @@ class FilteredBackingStore
    */
   std::shared_ptr<ReloadableConfig> config_;
 
-  // Whether we should optimize unfiltered trees to directly use underlying
-  // SaplingBackingStore's ObjectIds.
-  bool optimizeUnfilteredTrees_ = false;
-
   // Allows FilteredBackingStore creator to specify how they want to filter
   // paths. This returns true if the given path is filtered in the given
   // filterId
@@ -153,20 +148,10 @@ class FilteredBackingStore
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, co_getBlobAuxData);
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getTree);
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getRootTree);
-  FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getGlobFiles);
-  FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, co_getGlobFiles);
   FRIEND_TEST(
       FakeSubstringFilteredBackingStoreTest,
       restrictedTreePreservedAfterFiltering);
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, treeEntryHasAclPreserved);
-
-  /**
-   * DEPRECATED: use co_getRootTree directly. Futures wrapper kept for
-   * non-coroutine callers; remove once all callers have migrated.
-   */
-  ImmediateFuture<GetRootTreeResult> getRootTree(
-      const RootId& rootId,
-      const ObjectFetchContextPtr& context) override;
 
   folly::coro::now_task<GetRootTreeResult> co_getRootTree(
       const RootId& rootId,
@@ -200,10 +185,6 @@ class FilteredBackingStore
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
 
-  folly::SemiFuture<GetBlobAuxResult> getBlobAuxData(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) override;
-
   folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
@@ -217,16 +198,6 @@ class FilteredBackingStore
       const RootId& rootId,
       const std::vector<std::string>& paths,
       const ObjectFetchContextPtr& context) override;
-
-  ImmediateFuture<GetGlobFilesResult> getGlobFiles(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes) override;
-
-  folly::coro::now_task<GetGlobFilesResult> co_getGlobFiles(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes) override;
 
   ImmediateFuture<bool> checkPermission(const ObjectId& manifestId) override;
 

@@ -13,8 +13,6 @@ use mononoke_api::Repo;
 use repo_client::PushRedirectorArgs;
 use scuba_ext::MononokeScubaSampleBuilder;
 
-use crate::errors::ErrorKind;
-
 #[derive(Clone)]
 pub struct RepoHandler {
     pub scuba: MononokeScubaSampleBuilder,
@@ -23,19 +21,16 @@ pub struct RepoHandler {
 }
 
 pub fn repo_handler(mononoke: Arc<Mononoke<Repo>>, repo_name: &str) -> anyhow::Result<RepoHandler> {
-    let source_repo = mononoke.raw_repo(repo_name).ok_or_else(|| {
-        anyhow!(
-            "Requested repo {} is not being served by this server",
-            &repo_name
-        )
-    })?;
+    let source_repo = mononoke
+        .raw_repo(repo_name)
+        .ok_or_else(|| anyhow!("Requested repo {repo_name} is not being served by this server"))?;
     let base = source_repo.repo_handler_base.clone();
     let maybe_push_redirector_args = match &base.maybe_push_redirector_base {
         Some(push_redirector_base) => {
             let large_repo_id = push_redirector_base.common_commit_sync_config.large_repo_id;
             let target_repo = mononoke
                 .raw_repo_by_id(large_repo_id.id())
-                .ok_or(ErrorKind::LargeRepoNotFound(large_repo_id))?;
+                .ok_or_else(|| anyhow!("Large repo not found: {large_repo_id}"))?;
             Some(PushRedirectorArgs::new(
                 target_repo,
                 Arc::clone(&source_repo),

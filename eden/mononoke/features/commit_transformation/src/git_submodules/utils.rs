@@ -22,8 +22,6 @@ use cloned::cloned;
 use content_manifest_derivation::RootContentManifestId;
 use context::CoreContext;
 use derivation_queue_thrift::DerivationPriority;
-use either::Either;
-use fsnodes::RootFsnodeId;
 use futures::future;
 use futures::stream;
 use futures::stream::Stream;
@@ -39,6 +37,7 @@ use mononoke_types::BlobstoreValue;
 use mononoke_types::BonsaiChangesetMut;
 use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
+use mononoke_types::ContentManifestId;
 use mononoke_types::FileChange;
 use mononoke_types::FileContents;
 use mononoke_types::FileType;
@@ -46,7 +45,6 @@ use mononoke_types::GitLfs;
 use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
 use mononoke_types::RepositoryId;
-use mononoke_types::content_manifest::compat;
 use mononoke_types::hash::GitSha1;
 use mononoke_types::hash::RichGitSha1;
 use movers::Mover;
@@ -61,6 +59,25 @@ use crate::git_submodules::expand::SubmoduleExpansionData;
 use crate::types::Repo;
 use crate::types::SubmoduleDeps;
 use crate::types::SubmodulePath;
+
+pub(crate) async fn derive_root_manifest_id<R>(
+    ctx: &CoreContext,
+    repo: &R,
+    cs_id: ChangesetId,
+) -> Result<ContentManifestId>
+where
+    R: RepoDerivedDataRef + RepoIdentityRef,
+{
+    let repo_name = repo.repo_identity().name();
+    Ok(repo
+        .repo_derived_data()
+        .derive::<RootContentManifestId>(ctx, cs_id, DerivationPriority::LOW)
+        .await
+        .with_context(|| {
+            format!("Failed to derive RootContentManifestId of {cs_id} from repo {repo_name}")
+        })?
+        .into_content_manifest_id())
+}
 
 /// Get the git hash from a submodule file, which represents the commit from the
 /// given submodule that the source repo depends on at that revision.
@@ -97,8 +114,7 @@ where
       .await
       .with_context(|| {
           format!(
-              "Failed to fetch content from content id {} file containing the submodule's git commit hash",
-              &submodule_file_content_id
+              "Failed to fetch content from content id {submodule_file_content_id} file containing the submodule's git commit hash"
           )
       })?;
 
@@ -170,27 +186,19 @@ pub async fn submodule_diff<T: Repo>(
     cs_id: ChangesetId,
     parents: Vec<ChangesetId>,
 ) -> Result<impl Stream<Item = Result<BonsaiDiffFileChange<(FileType, ContentId, u64)>>> + use<T>> {
-    let fsnode_id = sm_repo
-        .repo_derived_data()
-        .derive::<RootFsnodeId>(ctx, cs_id, DerivationPriority::LOW)
+    let root_id = derive_root_manifest_id(ctx, sm_repo, cs_id)
         .await
-        .with_context(|| format!("Failed to get fsnode id form changeset id {cs_id}"))?
-        .into_fsnode_id();
+        .with_context(|| format!("Failed to get root manifest id from changeset id {cs_id}"))?;
 
-    let parent_fsnode_ids = stream::iter(parents)
+    let parent_root_ids = stream::iter(parents)
         .then(|parent_cs_id| async move {
-            anyhow::Ok(
-                sm_repo
-                    .repo_derived_data()
-                    .derive::<RootFsnodeId>(ctx, parent_cs_id, DerivationPriority::LOW)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to get parent's fsnode id from its changeset id: {parent_cs_id}"
-                        )
-                    })?
-                    .into_fsnode_id(),
-            )
+            derive_root_manifest_id(ctx, sm_repo, parent_cs_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to get parent's root manifest id from its changeset id: {parent_cs_id}"
+                    )
+                })
         })
         .try_collect::<HashSet<_>>()
         .await?;
@@ -198,18 +206,10 @@ pub async fn submodule_diff<T: Repo>(
     Ok(bonsai_diff(
         ctx.clone(),
         sm_repo.repo_blobstore_arc().clone(),
-        fsnode_id,
-        parent_fsnode_ids,
+        root_id,
+        parent_root_ids,
     )
-    .map_ok(|change| {
-        change.map_leaf(|fsnode| {
-            (
-                fsnode.file_type().clone(),
-                fsnode.content_id().clone(),
-                fsnode.size(),
-            )
-        })
-    }))
+    .map_ok(|change| change.map_leaf(|file| (file.file_type, file.content_id, file.size))))
 }
 
 /// Returns the content id of the given path if it is a submodule file.
@@ -236,25 +236,19 @@ pub async fn content_id_of_file_with_type<R>(
 where
     R: RepoDerivedDataRef + RepoBlobstoreArc + RepoIdentityRef,
 {
-    let fsnode_id = repo
-        .repo_derived_data()
-        .derive::<RootFsnodeId>(ctx, cs_id, DerivationPriority::LOW)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to derive RootFsnodeId of {cs_id} from repo {0}",
-                repo.repo_identity().name()
-            )
-        })?
-        .into_fsnode_id();
+    let root_id = derive_root_manifest_id(ctx, repo, cs_id).await?;
 
-    let entry = fsnode_id
+    let entry = root_id
         .find_entry(ctx.clone(), repo.repo_blobstore_arc(), path.clone().into())
         .await?;
 
     match entry {
-        Some(Entry::Leaf(file)) if *file.file_type() == expected_file_type => {
-            Ok(Some(file.content_id().clone()))
+        Some(Entry::Leaf(file)) => {
+            if file.file_type == expected_file_type {
+                Ok(Some(file.content_id))
+            } else {
+                Ok(None)
+            }
         }
         _ => Ok(None),
     }
@@ -269,27 +263,17 @@ pub async fn list_non_submodule_files_under<R>(
 where
     R: RepoDerivedDataRef + RepoBlobstoreArc + RepoIdentityRef,
 {
-    let fsnode_id = repo
-        .repo_derived_data()
-        .derive::<RootFsnodeId>(ctx, cs_id, DerivationPriority::LOW)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to derive RootFsnodeId of {cs_id} from repo {0}",
-                repo.repo_identity().name()
-            )
-        })?
-        .into_fsnode_id();
+    let root_id = derive_root_manifest_id(ctx, repo, cs_id).await?;
 
-    Ok(fsnode_id
+    Ok(root_id
         .list_leaf_entries_under(
             ctx.clone(),
             repo.repo_blobstore_arc(),
             vec![submodule_path.0],
         )
-        .try_filter_map(|(path, fsnode_file)| {
+        .try_filter_map(|(path, file)| {
             future::ready(Ok(
-                (*fsnode_file.file_type() != FileType::GitSubmodule).then_some(path)
+                (file.file_type != FileType::GitSubmodule).then_some(path)
             ))
         }))
 }
@@ -297,34 +281,17 @@ where
 /// Gets the root directory's manifest id from a submodule commit provided as
 /// as a git hash. This is used for working copy validation of submodule
 /// expansion.
-/// When `use_content_manifests` is true, derives `RootContentManifestId`
-/// instead of `RootFsnodeId`.
 pub async fn root_manifest_id_from_submodule_git_commit(
     ctx: &CoreContext,
     repo: &impl Repo,
     git_hash: GitSha1,
     dangling_submodule_pointers: &[GitSha1],
-    use_content_manifests: bool,
-) -> Result<compat::ContentManifestId> {
+) -> Result<ContentManifestId> {
     let cs_id = get_submodule_bonsai_changeset_id(ctx, repo, git_hash, dangling_submodule_pointers)
         .await
         .context("Failed to get submodule bonsai changeset id")?;
 
-    if use_content_manifests {
-        let root_id = repo
-            .repo_derived_data()
-            .derive::<RootContentManifestId>(ctx, cs_id, DerivationPriority::LOW)
-            .await
-            .context("Failed to derive RootContentManifestId")?;
-        Ok(Either::Left(root_id.into_content_manifest_id()))
-    } else {
-        let root_id = repo
-            .repo_derived_data()
-            .derive::<RootFsnodeId>(ctx, cs_id, DerivationPriority::LOW)
-            .await
-            .context("Failed to derive RootFsnodeId")?;
-        Ok(Either::Right(root_id.into_fsnode_id()))
-    }
+    derive_root_manifest_id(ctx, repo, cs_id).await
 }
 
 /// Build a new submodule dependency map to expand/validate recursive submodules
@@ -423,8 +390,8 @@ pub async fn get_submodule_bonsai_changeset_id<R: Repo>(
         // Not a known dangling pointer, so it's an unexpected failure
         return Err(anyhow!(
             "Failed to get changeset id from git submodule commit hash {} in repo {}",
-            &git_submodule_sha1,
-            &submodule_repo.repo_identity().name()
+            git_submodule_sha1,
+            submodule_repo.repo_identity().name()
         ));
     };
 

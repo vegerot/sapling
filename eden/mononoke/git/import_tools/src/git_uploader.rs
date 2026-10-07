@@ -283,19 +283,22 @@ pub async fn upload_file(
         // 1. actual file the pointer is pointing at
         let (meta, fetch_result) = lfs
             .with(ctx.clone(), lfs_pointer_data.clone(), {
-                move |ctx, lfs_pointer_data, req, bstream, fetch_result| async move {
-                    info!(
-                        "Uploading LFS {} sha256:{} size:{}",
-                        path,
-                        lfs_pointer_data.sha256.to_brief(),
-                        lfs_pointer_data.size,
-                    );
-                    Ok((
-                        filestore::store(&blobstore, filestore_config, &ctx, &req, bstream)
-                            .await
-                            .context("filestore (lfs contents)")?,
-                        fetch_result,
-                    ))
+                move |ctx, lfs_pointer_data, req, bstream, fetch_result| {
+                    cloned!(blobstore, path);
+                    async move {
+                        info!(
+                            "Uploading LFS {} sha256:{} size:{}",
+                            path,
+                            lfs_pointer_data.sha256.to_brief(),
+                            lfs_pointer_data.size,
+                        );
+                        Ok((
+                            filestore::store(&blobstore, filestore_config, &ctx, &req, bstream)
+                                .await
+                                .context("filestore (lfs contents)")?,
+                            fetch_result,
+                        ))
+                    }
                 }
             })
             .await?;
@@ -435,10 +438,27 @@ pub async fn finalize_batch(
             _ => true,
         })
         .collect::<Vec<_>>();
-    repo.repo_derived_data()
-        .manager()
-        .derive_bulk_locally(ctx, &csids, None, &non_git_types, Some(batch_size), None)
-        .await?;
+    // Retry derivation on transient errors (e.g. blobstore/MySQL read timeouts).
+    // First-time derivation is idempotent, so re-running after a partial timeout
+    // only re-derives what didn't complete. Mirrors the save_changesets/bulk_add
+    // retries above.
+    retry(
+        |_| {
+            repo.repo_derived_data().manager().derive_bulk_locally(
+                ctx,
+                &csids,
+                None,
+                &non_git_types,
+                Some(batch_size),
+                None,
+            )
+        },
+        BASE_RETRY_DELAY,
+    )
+    .binary_exponential_backoff()
+    .max_attempts(RETRY_ATTEMPTS)
+    .inspect_err(|attempt, _err| info!("attempt {attempt} of {RETRY_ATTEMPTS} failed"))
+    .await?;
 
     // Upload all bonsai git mappings.
     // This is done instead of deriving git commits. It is not equivalent as roundtrip from
@@ -466,10 +486,25 @@ pub async fn finalize_batch(
             _ => false,
         })
         .collect::<Vec<_>>();
-    repo.repo_derived_data()
-        .manager()
-        .derive_bulk_locally(ctx, &csids, None, &delta_manifests, Some(batch_size), None)
-        .await?;
+    // Retry derivation on transient errors (see note on the non-git-types
+    // derivation above).
+    retry(
+        |_| {
+            repo.repo_derived_data().manager().derive_bulk_locally(
+                ctx,
+                &csids,
+                None,
+                &delta_manifests,
+                Some(batch_size),
+                None,
+            )
+        },
+        BASE_RETRY_DELAY,
+    )
+    .binary_exponential_backoff()
+    .max_attempts(RETRY_ATTEMPTS)
+    .inspect_err(|attempt, _err| info!("attempt {attempt} of {RETRY_ATTEMPTS} failed"))
+    .await?;
 
     Ok(ret)
 }

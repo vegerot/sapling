@@ -68,7 +68,7 @@ use crate::commit_sync_outcome::PluralCommitSyncOutcome;
 use crate::sync_commit::CommitSyncData;
 use crate::sync_commit::sync_commit;
 use crate::sync_config_version_utils::get_mapping_change_version;
-use crate::types::ErrorKind;
+use crate::types::CrossRepoSyncError;
 use crate::types::Repo;
 use crate::types::Source;
 use crate::types::Target;
@@ -87,14 +87,14 @@ pub(crate) async fn remap_parents<'a, R: Repo>(
             .get_commit_sync_outcome_with_hint(ctx, Source(*commit), hint.clone())
             .await?;
         let sync_outcome: Result<_, Error> =
-            maybe_sync_outcome.ok_or_else(|| ErrorKind::ParentNotRemapped(*commit).into());
+            maybe_sync_outcome.ok_or_else(|| CrossRepoSyncError::ParentNotRemapped(*commit).into());
         let sync_outcome = sync_outcome?;
 
         use CommitSyncOutcome::*;
         let remapped_parent = match sync_outcome {
             RewrittenAs(cs_id, _) | EquivalentWorkingCopyAncestor(cs_id, _) => cs_id,
             NotSyncCandidate(_) => {
-                return Err(ErrorKind::ParentNotSyncCandidate(*commit).into());
+                return Err(CrossRepoSyncError::ParentNotSyncCandidate(*commit).into());
             }
         };
 
@@ -378,8 +378,7 @@ where
     log_debug(
         ctx,
         format!(
-            "Getting version and parent map for target bookmark {}, parent version {} and synced_ancestors_versions {2:#?}",
-            target_bookmark, &parent_version, synced_ancestors_versions,
+            "Getting version and parent map for target bookmark {target_bookmark}, parent version {parent_version} and synced_ancestors_versions {synced_ancestors_versions:#?}",
         ),
     );
 
@@ -547,9 +546,7 @@ where
     log_debug(ctx, format!("target bookmark csid: {target_bookmark_csid}"));
 
     let mut parent_mapping = HashMap::new();
-    for (_source_parent_csid, (target_parent_csid, _version)) in
-        synced_ancestors_versions.rewritten_ancestors.iter()
-    {
+    for (target_parent_csid, _version) in synced_ancestors_versions.rewritten_ancestors.values() {
         // If the bookmark value is descendant of our parent it should have equivalent working
         // copy.
         if target_repo
@@ -570,10 +567,7 @@ where
     } else if parent_mapping.len() == 1 {
         log_info(
             ctx,
-            format!(
-                "all validations passed with parent_mapping {0:#?}",
-                &parent_mapping,
-            ),
+            format!("all validations passed with parent_mapping {parent_mapping:#?}",),
         );
         // There's exactly one parent that's ancestor of target_bookmark.
         // let's assume that the target_bookmark is still equivalent to what it represents.
@@ -849,7 +843,7 @@ pub async fn update_mapping_with_version<'a, R: Repo>(
     let xrepo_sync_disable_all_syncs =
         justknobs::eval("scm/mononoke:xrepo_sync_disable_all_syncs", None, None);
     if xrepo_sync_disable_all_syncs {
-        return Err(ErrorKind::XRepoSyncDisabled.into());
+        return Err(CrossRepoSyncError::XRepoSyncDisabled.into());
     }
 
     let commit_sync_repos = syncer.repos.clone();

@@ -10,12 +10,14 @@ import type {ThemeColor} from '../theme';
 import type {OneIndexedLineNumber, RepoRelativePath} from '../types';
 
 import {makeBrowserLikePlatformImpl} from './browserPlatformImpl';
+import {makeParentVisibilitySource} from './parentVisibility';
 
 // important: this file should not try to import other code from 'isl',
 // since it will end up getting duplicated when bundling.
 
 const obsidianPlatform: Platform = {
   ...makeBrowserLikePlatformImpl('obsidian'),
+  visibility: makeParentVisibilitySource(window),
 
   // Override file opening to send messages to Obsidian via postMessage
   openFile: (path: RepoRelativePath, options?: {line?: OneIndexedLineNumber}) => {
@@ -56,26 +58,7 @@ const obsidianPlatform: Platform = {
   // Theme integration
   theme: {
     getTheme(): ThemeColor {
-      // Seed the initial theme from the `theme` URL query param that the
-      // embedding host (e.g. Agent Conductor) appends to the iframe `src`,
-      // so ISL paints in the correct mode on its very first render.
-      //
-      // Without this, getTheme() returned a hardcoded 'dark' and ISL relied
-      // entirely on the async `obsidian/themeChanged` postMessage (handled
-      // by onDidChangeTheme below) to correct the theme. On a cold mount
-      // that push loses a race: the host sends it on the iframe `load`
-      // event, which fires before this module's dynamic import registers
-      // the listener below, so the initial push is dropped and ISL stays on
-      // 'dark' until the user toggles. Reading the param synchronously here
-      // removes the race; live theme changes still flow through
-      // onDidChangeTheme. (browserPlatformImpl already parses this same
-      // param, but the Obsidian platform overrides the whole `theme` object
-      // to add postMessage support, so it must read the param itself.)
-      const themeParam =
-        typeof window !== 'undefined'
-          ? new URLSearchParams(window.location.search).get('theme')
-          : null;
-      return themeParam === 'light' ? 'light' : 'dark';
+      return obsidianPlatform.initialUrlParams?.get('theme') === 'light' ? 'light' : 'dark';
     },
 
     onDidChangeTheme(callback: (theme: ThemeColor) => unknown) {

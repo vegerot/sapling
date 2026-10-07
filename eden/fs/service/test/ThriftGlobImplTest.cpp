@@ -5,6 +5,9 @@
  * GNU General Public License version 2.
  */
 
+#include <fb303/ServiceData.h>
+#include <folly/coro/GtestHelpers.h>
+#include <folly/coro/Task.h>
 #include <gtest/gtest.h>
 #include <cstddef>
 #include <memory>
@@ -13,9 +16,11 @@
 #include "eden/fs/service/ThriftGlobImpl.h"
 #include "eden/fs/service/gen-cpp2/eden_types.h"
 #include "eden/fs/store/ObjectFetchContext.h"
+#include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
 #include "eden/fs/testharness/TestMount.h"
 #include "eden/fs/testharness/TestServerState.h"
+#include "eden/fs/utils/GlobMatcher.h"
 
 namespace facebook::eden {
 
@@ -35,23 +40,29 @@ void assertInodeCounters(
   ASSERT_EQ(unloaded, expectedUnloaded);
 }
 
-class ThriftGlobImplTest : public ::testing::TestWithParam<bool> {
+std::vector<std::string> getMatchingFiles(const Glob& result) {
+  std::vector<std::string> matchingFiles;
+  for (const auto& path : *result.matchingFiles()) {
+    matchingFiles.emplace_back(path.asString());
+  }
+  return matchingFiles;
+}
+
+class ThriftGlobImplTest : public ::testing::Test {
  protected:
   void SetUp() override {
     builder_.setFile("foo/bar/dir1/file.txt", "contents");
     builder_.setFile("foo/bar/dir2/file.txt", "contents");
+    builder_.setFile("foo/.hidden/file.txt", "contents");
+    builder_.setFile("other/bar/dir1/file.txt", "contents");
     mount_.initialize(builder_);
-
-    if (GetParam()) {
-      enableCoroutinesConfig(mount_);
-    }
   }
 
   FakeTreeBuilder builder_;
   TestMount mount_;
 };
 
-TEST_P(ThriftGlobImplTest, testGlobFilesNotLoadingInode) {
+CO_TEST_F(ThriftGlobImplTest, testGlobFilesNotLoadingInode) {
   auto serverState = createTestServerState();
   auto edenMount = mount_.getEdenMount();
   auto* inodeMap = edenMount->getInodeMap();
@@ -62,13 +73,18 @@ TEST_P(ThriftGlobImplTest, testGlobFilesNotLoadingInode) {
 
   std::string glob{"**/*.txt"};
   auto globber = ThriftGlobImpl{GlobParams{}};
-  auto globFuture = globber.glob(
+  auto result = co_await globber.glob(
       edenMount,
       serverState,
       std::vector<std::string>{"**/*.txt"},
       ObjectFetchContext::getNullContext());
 
-  auto _result = std::move(globFuture).get();
+  const std::vector<std::string> expectedFiles{
+      "foo/bar/dir1/file.txt",
+      "foo/bar/dir2/file.txt",
+      "other/bar/dir1/file.txt",
+  };
+  EXPECT_EQ(expectedFiles, getMatchingFiles(*result));
 
   // Then we compare the number, both counter should remain the same before and
   // after the call.
@@ -88,12 +104,139 @@ TEST_P(ThriftGlobImplTest, testGlobFilesNotLoadingInode) {
   assertInodeCounters(inodeMap, loaded + 6, unloaded);
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    ThriftGlobImplTestVariants,
-    ThriftGlobImplTest,
-    ::testing::Bool(),
-    [](const ::testing::TestParamInfo<bool>& info) {
-      return info.param ? "Coroutines" : "Futures";
-    });
+CO_TEST_F(ThriftGlobImplTest, returnsExactAndWildcardPaths) {
+  auto serverState = createTestServerState();
+  auto edenMount = mount_.getEdenMount();
+  auto fetchContext = ObjectFetchContext::getNullContext();
+
+  auto exactGlobber = ThriftGlobImpl{GlobParams{}};
+  auto exactResult = co_await exactGlobber.glob(
+      edenMount, serverState, {"foo/bar/dir1/file.txt"}, fetchContext);
+  const std::vector<std::string> expectedExact{"foo/bar/dir1/file.txt"};
+  EXPECT_EQ(expectedExact, getMatchingFiles(*exactResult));
+
+  auto wildcardGlobber = ThriftGlobImpl{GlobParams{}};
+  auto wildcardResult = co_await wildcardGlobber.glob(
+      edenMount, serverState, {"foo/bar/*/file.txt"}, fetchContext);
+  const std::vector<std::string> expectedWildcard{
+      "foo/bar/dir1/file.txt", "foo/bar/dir2/file.txt"};
+  EXPECT_EQ(expectedWildcard, getMatchingFiles(*wildcardResult));
+}
+
+CO_TEST_F(ThriftGlobImplTest, returnsPathsRelativeToSearchRoot) {
+  auto serverState = createTestServerState();
+  auto edenMount = mount_.getEdenMount();
+  GlobParams params;
+  params.searchRoot() = "foo/bar";
+
+  auto globber = ThriftGlobImpl{params};
+  auto result = co_await globber.glob(
+      edenMount,
+      serverState,
+      {"*/file.txt"},
+      ObjectFetchContext::getNullContext());
+
+  const std::vector<std::string> expected{"dir1/file.txt", "dir2/file.txt"};
+  EXPECT_EQ(expected, getMatchingFiles(*result));
+}
+
+CO_TEST_F(ThriftGlobImplTest, suppressesResultPathsForPrefetch) {
+  auto serverState = createTestServerState();
+  auto edenMount = mount_.getEdenMount();
+  PrefetchParams params;
+  params.returnPrefetchedFiles() = false;
+
+  auto globber = ThriftGlobImpl{params};
+  auto result = co_await globber.glob(
+      edenMount,
+      serverState,
+      {"**/*.txt"},
+      ObjectFetchContext::getNullContext());
+
+  EXPECT_TRUE(result->matchingFiles()->empty());
+}
+
+CO_TEST_F(ThriftGlobImplTest, testRecursiveGlobMatchesMultiComponentSuffix) {
+  auto serverState = createTestServerState();
+  auto edenMount = mount_.getEdenMount();
+
+  auto globber = ThriftGlobImpl{GlobParams{}};
+  auto result = co_await globber.glob(
+      edenMount,
+      serverState,
+      std::vector<std::string>{"**/bar/dir1/file.txt"},
+      ObjectFetchContext::getNullContext());
+
+  const std::vector<std::string> expectedFiles{
+      "foo/bar/dir1/file.txt",
+      "other/bar/dir1/file.txt",
+  };
+  EXPECT_EQ(expectedFiles, getMatchingFiles(*result));
+}
+
+CO_TEST_F(ThriftGlobImplTest, handlesAdjacentRecursiveComponents) {
+  auto serverState = createTestServerState();
+  auto edenMount = mount_.getEdenMount();
+
+  auto globber = ThriftGlobImpl{GlobParams{}};
+  auto result = co_await globber.glob(
+      edenMount,
+      serverState,
+      {"**/**/file.txt"},
+      ObjectFetchContext::getNullContext());
+  const std::vector<std::string> expected{
+      "foo/bar/dir1/file.txt",
+      "foo/bar/dir2/file.txt",
+      "other/bar/dir1/file.txt",
+  };
+  EXPECT_EQ(expected, getMatchingFiles(*result));
+}
+
+CO_TEST_F(ThriftGlobImplTest, dedupesOverlappingSuffixPatterns) {
+  auto serverState = createTestServerState();
+  auto edenMount = mount_.getEdenMount();
+
+  auto globber = ThriftGlobImpl{GlobParams{}};
+  auto result = co_await globber.glob(
+      edenMount,
+      serverState,
+      {"**/bar/dir1/file.txt", "**/bar/dir2/file.txt"},
+      ObjectFetchContext::getNullContext());
+  const std::vector<std::string> expected{
+      "foo/bar/dir1/file.txt",
+      "foo/bar/dir2/file.txt",
+      "other/bar/dir1/file.txt",
+  };
+  EXPECT_EQ(expected, getMatchingFiles(*result));
+}
+
+TEST_F(ThriftGlobImplTest, recordsMemoLimitBreachesInOds) {
+  auto serverState = createTestServerState();
+  auto& stats = serverState->getStats();
+  auto counterName = std::string{
+      stats->getName(&GlobStats::memoizedFailureStateLimitExceeded)};
+  stats->flush();
+  auto before = facebook::fb303::ServiceData::get()
+                    ->getCounterIfExists(counterName + ".sum")
+                    .value_or(0);
+
+  std::string text(8, 'a');
+  std::string glob;
+  for (size_t idx = 0; idx < 8; ++idx) {
+    glob += "*a";
+  }
+  glob += "b";
+
+  auto matcher = GlobMatcher::create(glob, GlobOptions::DEFAULT).value();
+  auto options = serverState->getGlobMatchOptions();
+  options.maxMemoizedFailureStates = 4;
+  EXPECT_FALSE(matcher.match(text, options));
+
+  stats->flush();
+  auto after = facebook::fb303::ServiceData::get()
+                   ->getCounterIfExists(counterName + ".sum")
+                   .value_or(0);
+  EXPECT_EQ(before + 1, after);
+}
 
 } // namespace facebook::eden

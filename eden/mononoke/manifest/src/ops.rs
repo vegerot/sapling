@@ -5,11 +5,8 @@
  * GNU General Public License version 2.
  */
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::marker::PhantomData;
 
-use anyhow::Context;
 use anyhow::Error;
 use anyhow::anyhow;
 use borrowed::borrowed;
@@ -25,9 +22,7 @@ use futures::pin_mut;
 use futures::stream;
 use futures::stream::BoxStream;
 use futures::stream::Stream;
-use futures_watchdog::WatchdogExt;
 use mononoke_macros::mononoke;
-use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
 use mononoke_types::path::MPath;
 
@@ -36,6 +31,8 @@ use crate::Manifest;
 use crate::PathOrPrefix;
 use crate::PathTree;
 use crate::StoreLoadable;
+use crate::TrieMapOps;
+use crate::comparison::diff_manifest_node;
 use crate::select::select_path_tree;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,14 +43,6 @@ pub enum Diff<Entry> {
 }
 
 impl<Entry> Diff<Entry> {
-    pub fn replace_left(self, new_entry: Entry) -> Diff<Entry> {
-        match self {
-            Diff::Added(path, entry) => Diff::Changed(path, new_entry, entry),
-            Diff::Removed(path, _) => Diff::Removed(path, new_entry),
-            Diff::Changed(path, _, entry) => Diff::Changed(path, new_entry, entry),
-        }
-    }
-
     pub fn path(&self) -> &MPath {
         match self {
             Diff::Added(path, _) => path,
@@ -325,7 +314,14 @@ where
             Diff<Entry<Self, <<Self as StoreLoadable<Store>>::Value as Manifest<Store>>::Leaf>>,
             Error,
         >,
-    > {
+    >
+    where
+        <<Self as StoreLoadable<Store>>::Value as Manifest<Store>>::Leaf: Sync,
+        <<Self as StoreLoadable<Store>>::Value as Manifest<Store>>::TrieMapType: TrieMapOps<
+                Store,
+                Entry<Self, <<Self as StoreLoadable<Store>>::Value as Manifest<Store>>::Leaf>,
+            > + Eq,
+    {
         self.filtered_diff(
             ctx,
             store.clone(),
@@ -338,9 +334,13 @@ where
     }
 
     /// Do a diff, but with knobs to filter_map output and prune some subtrees.
-    /// `output_filter` let's us configure what will be returned from filtered_diff. it accepts
+    /// `output_filter` lets us configure what will be returned from filtered_diff. it accepts
     /// every diff entry and returns Option<Out>, so it acts similar to filter_map() function
     /// recurse_pruner is a function that allows us to skip iterating over some subtrees
+    ///
+    /// Identical sub-shards are pruned by their content-addressed IDs without
+    /// loading them. Manifest replacements only disable pruning along the trie
+    /// paths leading to those replacements. Results are unordered.
     fn filtered_diff<FilterMap, Out, RecursePruner>(
         &self,
         ctx: CoreContext,
@@ -363,9 +363,20 @@ where
             + 'static,
         RecursePruner: Fn(&Diff<Self>) -> bool + Clone + Send + 'static,
         Out: Send + 'static,
+        <<Self as StoreLoadable<Store>>::Value as Manifest<Store>>::Leaf: Sync,
+        <<Self as StoreLoadable<Store>>::Value as Manifest<Store>>::TrieMapType: TrieMapOps<
+                Store,
+                Entry<Self, <<Self as StoreLoadable<Store>>::Value as Manifest<Store>>::Leaf>,
+            > + Eq,
     {
-        let (replacement, child_replacements) =
-            ReplacementsHolder::new(manifest_replacements).deconstruct();
+        let PathTree {
+            value: replacement,
+            subentries: child_replacements,
+        } = PathTree::from_iter(
+            manifest_replacements
+                .into_iter()
+                .map(|(path, entry)| (path, Some(entry))),
+        );
         let this = match replacement {
             None => self.clone(),
             Some(Entry::Tree(replacement)) => replacement,
@@ -383,290 +394,28 @@ where
             return stream::empty().boxed();
         }
 
-        let input = Diff::Changed(MPath::ROOT, this, other);
+        let init = Some((Diff::Changed(MPath::ROOT, this, other), child_replacements));
 
-        bounded_traversal::bounded_traversal_stream(
-            256,
-            Some((input, child_replacements)),
-            move |(input, mut replacements)| {
-                cloned!(ctx, output_filter, recurse_pruner, store, other_store);
-                async move {
-                    borrowed!(ctx);
-                    let mut output = OutputHolder::new(output_filter);
-                    let mut recurse = RecurseHolder::new(recurse_pruner);
-
-                    match input {
-                        Diff::Changed(path, left, right) => {
-                            let l = mononoke::spawn_task({
-                                cloned!(ctx, left, store);
-                                async move { left.load(&ctx, &store).watched().await }
-                            });
-                            let r = mononoke::spawn_task({
-                                cloned!(ctx, right, other_store);
-                                async move { right.load(&ctx, &other_store).watched().await }
-                            });
-                            let (left_mf, right_mf) = future::try_join(l, r).await?;
-                            let (left_mf, right_mf) = (left_mf?, right_mf?);
-
-                            let mut stream = left_mf.list(ctx, &store).await?;
-                            while let Some((name, left)) = stream.try_next().await? {
-                                tokio::task::consume_budget().await;
-
-                                let path = path.join(&name);
-                                let (replacement, child_replacements) =
-                                    replacements.remove(&name).unwrap_or_default().deconstruct();
-                                let left = replacement.unwrap_or(left);
-
-                                if let Some(right) =
-                                    right_mf.lookup(ctx, &other_store, &name).await?
-                                {
-                                    if left != right {
-                                        match (left, right) {
-                                            (left @ Entry::Leaf(_), right @ Entry::Leaf(_)) => {
-                                                output.push(Diff::Changed(path, left, right));
-                                            }
-                                            (Entry::Tree(tree), right @ Entry::Leaf(_)) => {
-                                                output.push(Diff::Added(path.clone(), right));
-                                                recurse.push(
-                                                    Diff::Removed(path, tree),
-                                                    child_replacements,
-                                                );
-                                            }
-                                            (left @ Entry::Leaf(_), Entry::Tree(tree)) => {
-                                                output.push(Diff::Removed(path.clone(), left));
-                                                recurse.push(
-                                                    Diff::Added(path, tree),
-                                                    child_replacements,
-                                                );
-                                            }
-                                            (Entry::Tree(left), Entry::Tree(right)) => recurse
-                                                .push(
-                                                    Diff::Changed(path, left, right),
-                                                    child_replacements,
-                                                ),
-                                        }
-                                    }
-                                } else {
-                                    match left {
-                                        Entry::Tree(tree) => recurse
-                                            .push(Diff::Removed(path, tree), child_replacements),
-                                        _ => output.push(Diff::Removed(path, left)),
-                                    }
-                                }
-                            }
-
-                            let mut stream = right_mf.list(ctx, &other_store).await?;
-                            while let Some((name, right)) = stream.try_next().await? {
-                                tokio::task::consume_budget().await;
-
-                                if left_mf.lookup(ctx, &store, &name).await?.is_none() {
-                                    let path = path.join(&name);
-                                    let (replacement, child_replacements) = replacements
-                                        .remove(&name)
-                                        .unwrap_or_default()
-                                        .deconstruct();
-                                    match (replacement, right) {
-                                        (None, Entry::Tree(tree)) => recurse
-                                            .push(Diff::Added(path, tree), child_replacements),
-                                        (None, right) => output.push(Diff::Added(path, right)),
-                                        (Some(left @ Entry::Leaf(_)), right @ Entry::Leaf(_)) => {
-                                            output.push(Diff::Changed(path, left, right));
-                                        }
-                                        (Some(Entry::Tree(tree)), right @ Entry::Leaf(_)) => {
-                                            output.push(Diff::Added(path.clone(), right));
-                                            recurse.push(
-                                                Diff::Removed(path, tree),
-                                                child_replacements,
-                                            );
-                                        }
-                                        (Some(left @ Entry::Leaf(_)), Entry::Tree(tree)) => {
-                                            output.push(Diff::Removed(path.clone(), left));
-                                            recurse
-                                                .push(Diff::Added(path, tree), child_replacements);
-                                        }
-                                        (Some(Entry::Tree(left)), Entry::Tree(right)) => recurse
-                                            .push(
-                                                Diff::Changed(path, left, right),
-                                                child_replacements,
-                                            ),
-                                    }
-                                }
-                            }
-                            ReplacementsHolder::finalize(&path, replacements)
-                                .context("Failed to finalize replacements for changed tree")?;
-                            output.push(Diff::Changed(path, Entry::Tree(left), Entry::Tree(right)));
-                            anyhow::Ok((output.into_output(), recurse.into_diffs()))
-                        }
-                        Diff::Added(path, tree) => {
-                            let manifest = tree.load(ctx, &other_store).await?;
-                            let mut stream = manifest.list(ctx, &other_store).await?;
-                            while let Some((name, right)) = stream.try_next().await? {
-                                tokio::task::consume_budget().await;
-
-                                let path = path.join(&name);
-                                let (replacement, child_replacements) =
-                                    replacements.remove(&name).unwrap_or_default().deconstruct();
-                                match (replacement, right) {
-                                    (None, Entry::Tree(tree)) => {
-                                        recurse.push(Diff::Added(path, tree), child_replacements)
-                                    }
-                                    (None, right) => output.push(Diff::Added(path, right)),
-                                    (Some(left @ Entry::Leaf(_)), right @ Entry::Leaf(_)) => {
-                                        output.push(Diff::Changed(path, left, right));
-                                    }
-                                    (Some(Entry::Tree(tree)), right @ Entry::Leaf(_)) => {
-                                        output.push(Diff::Added(path.clone(), right));
-                                        recurse.push(Diff::Removed(path, tree), child_replacements);
-                                    }
-                                    (Some(left @ Entry::Leaf(_)), Entry::Tree(tree)) => {
-                                        output.push(Diff::Removed(path.clone(), left));
-                                        recurse.push(Diff::Added(path, tree), child_replacements);
-                                    }
-                                    (Some(Entry::Tree(left)), Entry::Tree(right)) => recurse
-                                        .push(Diff::Changed(path, left, right), child_replacements),
-                                }
-                            }
-                            ReplacementsHolder::finalize(&path, replacements)
-                                .context("Failed to finalize replacements for added tree")?;
-                            output.push(Diff::Added(path, Entry::Tree(tree)));
-                            anyhow::Ok((output.into_output(), recurse.into_diffs()))
-                        }
-                        Diff::Removed(path, tree) => {
-                            let manifest = tree.load(ctx, &store).await?;
-                            let mut stream = manifest.list(ctx, &store).await?;
-                            while let Some((name, entry)) = stream.try_next().await? {
-                                tokio::task::consume_budget().await;
-
-                                let path = path.join(&name);
-                                let (replacement, child_replacements) =
-                                    replacements.remove(&name).unwrap_or_default().deconstruct();
-                                let entry = replacement.unwrap_or(entry);
-                                match entry {
-                                    Entry::Tree(tree) => {
-                                        recurse.push(Diff::Removed(path, tree), child_replacements)
-                                    }
-                                    _ => output.push(Diff::Removed(path, entry)),
-                                }
-                            }
-                            ReplacementsHolder::finalize(&path, replacements)
-                                .context("Failed to finalize replacements for removed tree")?;
-                            output.push(Diff::Removed(path, Entry::Tree(tree)));
-                            anyhow::Ok((output.into_output(), recurse.into_diffs()))
-                        }
-                    }
-                }
-                .boxed()
-            },
-        )
+        bounded_traversal::bounded_traversal_stream(256, init, move |(work, replacements)| {
+            cloned!(ctx, output_filter, recurse_pruner, store, other_store);
+            async move {
+                let (outs, recurse) = diff_manifest_node(
+                    &ctx,
+                    &store,
+                    &other_store,
+                    work,
+                    replacements,
+                    recurse_pruner,
+                )
+                .await?;
+                let outs: Vec<Out> = outs.into_iter().filter_map(&output_filter).collect();
+                anyhow::Ok((outs, recurse))
+            }
+            .boxed()
+        })
         .map_ok(|entries| stream::iter(entries.into_iter().map(Ok)))
         .try_flatten()
         .boxed()
-    }
-}
-
-// Stores output of diff_filtered_function() for a single iterator of bounded traversal.
-// It's just a simple vector together with a function that converts the output
-struct OutputHolder<Entry, FilterMap, Out> {
-    output: Vec<Out>,
-    filter_map: FilterMap,
-    __phantom: PhantomData<Entry>,
-}
-
-impl<Entry, FilterMap, Out> OutputHolder<Entry, FilterMap, Out>
-where
-    FilterMap: Fn(Diff<Entry>) -> Option<Out>,
-{
-    fn new(filter_map: FilterMap) -> Self {
-        Self {
-            output: vec![],
-            filter_map,
-            __phantom: PhantomData,
-        }
-    }
-
-    fn push(&mut self, diff: Diff<Entry>) {
-        self.output.extend((self.filter_map)(diff));
-    }
-
-    fn into_output(self) -> Vec<Out> {
-        self.output
-    }
-}
-
-// Stores bounded traversal recursion
-// It's just a simple vector with a filter function
-struct RecurseHolder<Entry, Pruner, Replacements> {
-    diffs: Vec<(Diff<Entry>, Replacements)>,
-    pruner: Pruner,
-}
-
-impl<Entry, Pruner, Replacements> RecurseHolder<Entry, Pruner, Replacements>
-where
-    Pruner: Fn(&Diff<Entry>) -> bool,
-{
-    fn new(pruner: Pruner) -> Self {
-        Self {
-            diffs: vec![],
-            pruner,
-        }
-    }
-
-    fn push(&mut self, diff: Diff<Entry>, replacements: Replacements) {
-        if (self.pruner)(&diff) {
-            self.diffs.push((diff, replacements));
-        }
-    }
-
-    fn into_diffs(self) -> Vec<(Diff<Entry>, Replacements)> {
-        self.diffs
-    }
-}
-
-pub(crate) struct ReplacementsHolder<Entry> {
-    replacements: PathTree<Option<Entry>>,
-}
-
-impl<Entry> ReplacementsHolder<Entry> {
-    /// Create a new replacements holder for manifest entry replacements.  These entries will replace the entries at the given paths.
-    pub fn new(replacements: HashMap<MPath, Entry>) -> Self {
-        Self {
-            replacements: replacements
-                .into_iter()
-                .map(|(path, entry)| (path, Some(entry)))
-                .collect(),
-        }
-    }
-
-    /// Deconstruct one level of replacements, returning the replacement entry at the current level (if any), and a collection of child replacement holders.
-    pub fn deconstruct(self) -> (Option<Entry>, BTreeMap<MPathElement, Self>) {
-        let (replacement, child_replacements) = self.replacements.deconstruct();
-        let child_replacements: BTreeMap<_, _> = child_replacements
-            .into_iter()
-            .map(|(elem, replacements)| (elem, Self { replacements }))
-            .collect();
-        (replacement, child_replacements)
-    }
-
-    /// Complete processing of a collection of ReplacementsHolders, ensuring that all values have been consumed.
-    pub fn finalize(
-        path: &MPath,
-        mut replacements: BTreeMap<MPathElement, Self>,
-    ) -> Result<(), Error> {
-        if let Some((name, _replacement)) = replacements.pop_first() {
-            let path = path.join(&name);
-            return Err(anyhow!(
-                "Manifest replacement at {path} which doesn't exist in the comparison manifest"
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl<Entry> Default for ReplacementsHolder<Entry> {
-    fn default() -> Self {
-        Self {
-            replacements: PathTree::default(),
-        }
     }
 }
 
@@ -687,7 +436,9 @@ where
     TreeId: StoreLoadable<Store> + Clone + Send + Sync + Eq + Unpin + 'static,
     <TreeId as StoreLoadable<Store>>::Value:
         Manifest<Store, TreeId = TreeId, Leaf = Leaf> + Send + Sync,
-    Leaf: Clone + Send + Eq + Unpin + 'static,
+    Leaf: Clone + Send + Sync + Eq + Unpin + 'static,
+    <<TreeId as StoreLoadable<Store>>::Value as Manifest<Store>>::TrieMapType:
+        TrieMapOps<Store, Entry<TreeId, Leaf>> + Eq,
 {
     find_intersection_of_diffs_and_parents(ctx, store, mf_id, diff_against)
         .map_ok(|(path, entry, _)| (path, entry))
@@ -709,7 +460,9 @@ where
     TreeId: StoreLoadable<Store> + Clone + Send + Sync + Eq + Unpin + 'static,
     <TreeId as StoreLoadable<Store>>::Value:
         Manifest<Store, TreeId = TreeId, Leaf = Leaf> + Send + Sync,
-    Leaf: Clone + Send + Eq + Unpin + 'static,
+    Leaf: Clone + Send + Sync + Eq + Unpin + 'static,
+    <<TreeId as StoreLoadable<Store>>::Value as Manifest<Store>>::TrieMapType:
+        TrieMapOps<Store, Entry<TreeId, Leaf>> + Eq,
     RecursePruner: Fn(&Diff<TreeId>) -> bool + Clone + Send + Sync + 'static,
 {
     find_intersection_of_diffs_and_parents_pruned(ctx, store, mf_id, diff_against, recurse_pruner)
@@ -729,7 +482,9 @@ where
     TreeId: StoreLoadable<Store> + Clone + Send + Sync + Eq + Unpin + 'static,
     <TreeId as StoreLoadable<Store>>::Value:
         Manifest<Store, TreeId = TreeId, Leaf = Leaf> + Send + Sync,
-    Leaf: Clone + Send + Eq + Unpin + 'static,
+    Leaf: Clone + Send + Sync + Eq + Unpin + 'static,
+    <<TreeId as StoreLoadable<Store>>::Value as Manifest<Store>>::TrieMapType:
+        TrieMapOps<Store, Entry<TreeId, Leaf>> + Eq,
 {
     find_intersection_of_diffs_and_parents_pruned(ctx, store, mf_id, diff_against, |_| true)
 }
@@ -748,36 +503,36 @@ where
     TreeId: StoreLoadable<Store> + Clone + Send + Sync + Eq + Unpin + 'static,
     <TreeId as StoreLoadable<Store>>::Value:
         Manifest<Store, TreeId = TreeId, Leaf = Leaf> + Send + Sync,
-    Leaf: Clone + Send + Eq + Unpin + 'static,
+    Leaf: Clone + Send + Sync + Eq + Unpin + 'static,
+    <<TreeId as StoreLoadable<Store>>::Value as Manifest<Store>>::TrieMapType:
+        TrieMapOps<Store, Entry<TreeId, Leaf>> + Eq,
     RecursePruner: Fn(&Diff<TreeId>) -> bool + Clone + Send + Sync + 'static,
 {
     match diff_against.first().cloned() {
         Some(parent) => async move {
             mononoke::spawn_task(async move {
-                let mut new_entries = Vec::new();
-                let mut parent_diff = parent.filtered_diff(
-                    ctx.clone(),
-                    store.clone(),
-                    mf_id,
-                    store.clone(),
-                    Some,
-                    recurse_pruner,
-                    Default::default(),
-                );
-                while let Some(diff_entry) = parent_diff.try_next().await? {
-                    match diff_entry {
-                        Diff::Added(path, entry) => new_entries.push((path, entry, vec![])),
-                        Diff::Removed(..) => continue,
-                        Diff::Changed(path, parent_entry, entry) => {
-                            new_entries.push((path, entry, vec![parent_entry]))
-                        }
-                    }
-                }
+                let new_entries: Vec<_> = parent
+                    .filtered_diff(
+                        ctx.clone(),
+                        store.clone(),
+                        mf_id,
+                        store.clone(),
+                        |diff| match diff {
+                            Diff::Added(path, entry) => Some((path, entry, vec![])),
+                            Diff::Changed(path, parent_entry, entry) => {
+                                Some((path, entry, vec![parent_entry]))
+                            }
+                            Diff::Removed(..) => None,
+                        },
+                        move |diff| !matches!(diff, Diff::Removed(..)) && recurse_pruner(diff),
+                        Default::default(),
+                    )
+                    .try_collect()
+                    .await?;
 
                 let paths: Vec<_> = new_entries
-                    .clone()
-                    .into_iter()
-                    .map(|(path, _, _)| path)
+                    .iter()
+                    .map(|(path, _, _)| path.clone())
                     .collect();
 
                 let futs = diff_against.into_iter().skip(1).map(move |p| {

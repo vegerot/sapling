@@ -38,13 +38,6 @@ class EmptyBackingStore final : public BijectiveBackingStore {
   }
 
  private:
-  /**
-   * DEPRECATED: use co_getRootTree directly. Futures wrapper kept for
-   * non-coroutine callers; remove once all callers have migrated.
-   */
-  ImmediateFuture<GetRootTreeResult> getRootTree(
-      const RootId& rootId,
-      const ObjectFetchContextPtr& context) override;
   folly::coro::now_task<GetRootTreeResult> co_getRootTree(
       const RootId& /* rootId */,
       const ObjectFetchContextPtr& /* context */) override {
@@ -62,9 +55,6 @@ class EmptyBackingStore final : public BijectiveBackingStore {
   folly::coro::now_task<GetTreeResult> co_getTree(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
-  folly::SemiFuture<GetTreeAuxResult> getTreeAuxData(
-      const ObjectId& /*id*/,
-      const ObjectFetchContextPtr& /*context*/) override;
   folly::coro::now_task<GetTreeAuxResult> co_getTreeAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
@@ -74,21 +64,9 @@ class EmptyBackingStore final : public BijectiveBackingStore {
   folly::coro::Task<GetBlobResult> co_getBlob(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
-  folly::SemiFuture<GetBlobAuxResult> getBlobAuxData(
-      const ObjectId& /*id*/,
-      const ObjectFetchContextPtr& /*context*/) override;
   folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
-
-  ImmediateFuture<GetGlobFilesResult> getGlobFiles(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes) override;
-  folly::coro::now_task<GetGlobFilesResult> co_getGlobFiles(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes) override;
 };
 
 } // namespace facebook::eden

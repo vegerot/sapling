@@ -243,8 +243,6 @@ class FileInode final : public InodeBaseMetadata<FileInodeState> {
 
   ImmediateFuture<Hash20> getSha1(const ObjectFetchContextPtr& fetchContext);
 
-  ImmediateFuture<Hash32> getBlake3(const ObjectFetchContextPtr& fetchContext);
-
   folly::coro::now_task<Hash20> co_getSha1(
       const ObjectFetchContextPtr& fetchContext);
 
@@ -429,6 +427,13 @@ class FileInode final : public InodeBaseMetadata<FileInodeState> {
   /// Not const: takes the inode state lock via LockedState, which
   /// mutates the Synchronized<> wrapper.
   std::optional<struct stat> tryGetCachedStat();
+
+  /**
+   * Attributes of a file this process just created, for the entry reply.
+   * Logs the access like stat() does, but does not feed the parent's readdir
+   * prefetch heuristic: the client asked to create the file, not to stat it.
+   */
+  struct stat statNewlyCreated(const ObjectFetchContext& context);
 
  private:
   using State = FileInodeState;

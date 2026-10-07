@@ -19,7 +19,6 @@
 namespace facebook::eden {
 
 class IXplatLogger;
-class StructuredLogger;
 class EdenMount;
 
 struct InodeAccess {
@@ -34,9 +33,8 @@ class InodeAccessLogger {
  public:
   InodeAccessLogger(
       std::shared_ptr<ReloadableConfig> reloadableConfig,
-      std::shared_ptr<StructuredLogger> structuredLogger,
       EdenStatsPtr edenStats,
-      IXplatLogger* xplatLogger = nullptr);
+      std::shared_ptr<IXplatLogger> xplatLogger = nullptr);
   virtual ~InodeAccessLogger();
 
   InodeAccessLogger(const InodeAccessLogger&) = delete;
@@ -70,9 +68,9 @@ class InodeAccessLogger {
 
   /**
    * Logs a file access event via the XplatLogger Thrift path (Compact
-   * Protocol
-   * + StructuredProducerService RPC to local ScribeD). Gated by the
-   * enableXplatLoggerFileAccess config flag.
+   * Protocol + StructuredProducerService RPC to local ScribeD). This is the
+   * only file-access logging backend; callers must ensure xplatLogger_ is
+   * non-null before invoking.
    */
   void logFileAccessViaXplat(
       folly::StringPiece repo,
@@ -93,9 +91,8 @@ class InodeAccessLogger {
   std::thread workerThread_;
 
   std::shared_ptr<ReloadableConfig> reloadableConfig_;
-  std::shared_ptr<StructuredLogger> structuredLogger_;
   EdenStatsPtr edenStats_;
-  IXplatLogger* xplatLogger_;
+  std::shared_ptr<IXplatLogger> xplatLogger_;
 };
 
 } // namespace facebook::eden

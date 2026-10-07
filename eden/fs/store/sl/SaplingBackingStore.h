@@ -8,6 +8,7 @@
 #pragma once
 
 #include <folly/ExceptionWrapper.h>
+#include <folly/Expected.h>
 #include <folly/Function.h>
 #include <folly/Range.h>
 #include <folly/Synchronized.h>
@@ -264,6 +265,14 @@ class SaplingBackingStore final
     sapling::sapling_flush_counters();
   }
 
+  /**
+   * Mirrors telemetry:enable-scribe-logging into the Rust tracing-to-Scuba
+   * sink, which cannot read EdenConfig itself. Process wide.
+   */
+  static void setScribeLoggingEnabled(bool enabled) {
+    sapling::sapling_backingstore_set_scribe_logging_enabled(enabled);
+  }
+
   ObjectComparison compareObjectsById(const ObjectId& one, const ObjectId& two)
       override;
 
@@ -331,6 +340,15 @@ class SaplingBackingStore final
 
   ObjectId stripObjectId(const ObjectId& id) const override;
 
+  /**
+   * Get statistics about the hgcache (Sapling disk cache). The error side
+   * (a message) is distinct from a successful result reporting "no cache
+   * configured" (see HgCacheStats::cache_path_configured and the per-cache
+   * *_state fields) - callers must not conflate a genuine lookup failure
+   * with a cache that simply isn't configured.
+   */
+  folly::Expected<sapling::HgCacheStats, std::string> getCacheStats() const;
+
  private:
   FRIEND_TEST(
       SaplingBackingStoreNoFaultInjectorTest,
@@ -339,19 +357,12 @@ class SaplingBackingStore final
   FRIEND_TEST(SaplingBackingStoreWithFaultInjectorTest, getTree);
   FRIEND_TEST(SaplingBackingStoreNoFaultInjectorTest, getBlob);
   FRIEND_TEST(SaplingBackingStoreWithFaultInjectorTest, getBlob);
-  FRIEND_TEST(SaplingBackingStoreNoFaultInjectorTest, getGlobFilesSingle);
-  FRIEND_TEST(SaplingBackingStoreNoFaultInjectorTest, getGlobFilesMultiple);
-  FRIEND_TEST(SaplingBackingStoreNoFaultInjectorTest, getGlobFilesNested);
-  FRIEND_TEST(SaplingBackingStoreNoFaultInjectorTest, getGlobFilesNone);
   FRIEND_TEST(
       SaplingBackingStoreNoFaultInjectorTest,
       sameRequestsDifferentFetchCause);
   FRIEND_TEST(
       SaplingBackingStoreNoFaultInjectorTest,
-      prefetchBlobsWithDuplicatesNoOptimizations);
-  FRIEND_TEST(
-      SaplingBackingStoreNoFaultInjectorTest,
-      prefetchBlobsWithDuplicatesWithOptimizations);
+      prefetchBlobsWithDuplicates);
   FRIEND_TEST(
       SaplingBackingStoreNoFaultInjectorTest,
       prefetchBlobsWithDuplicatesResolvesAllCallbacks);
@@ -362,9 +373,6 @@ class SaplingBackingStore final
   FRIEND_TEST(
       SaplingBackingStoreNoFaultInjectorTest,
       getTreeBatchConvertsPermissionDeniedToRestrictedTree);
-  FRIEND_TEST(
-      SaplingBackingStoreWithFaultInjectorTest,
-      getRootTreeFutureChainCanBePausedAndResumed);
   FRIEND_TEST(
       SaplingBackingStoreWithFaultInjectorTest,
       getTreeEnqueueFutureChainCanBePausedAndResumed);
@@ -404,13 +412,6 @@ class SaplingBackingStore final
       const ObjectFetchContextPtr& context,
       const ObjectFetchContext::ObjectType type);
 
-  /**
-   * DEPRECATED: use co_getRootTree directly. Futures wrapper kept for
-   * non-coroutine callers; remove once all callers have migrated.
-   */
-  ImmediateFuture<GetRootTreeResult> getRootTree(
-      const RootId& rootId,
-      const ObjectFetchContextPtr& context) override;
   folly::coro::now_task<GetRootTreeResult> co_getRootTree(
       const RootId& rootId,
       const ObjectFetchContextPtr& context) override;
@@ -593,10 +594,6 @@ class SaplingBackingStore final
         std::move(slOid), context, sapling::FetchMode::RemoteOnly);
   }
 
-  folly::SemiFuture<GetBlobAuxResult> getBlobAuxData(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) override;
-
   folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
@@ -609,10 +606,6 @@ class SaplingBackingStore final
    * the blob aux data is present locally, as this function will always push
    * the request at the end of the queue.
    */
-  ImmediateFuture<GetBlobAuxResult> getBlobAuxDataEnqueue(
-      const SlOid& slOid,
-      const ObjectFetchContextPtr& context);
-
   folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxDataEnqueue(
       const SlOid& slOid,
       const ObjectFetchContextPtr& context);
@@ -672,15 +665,6 @@ class SaplingBackingStore final
       ObjectFetchContext::FetchedSource fetchedSource,
       ObjectFetchContext::FetchResult fetchResult,
       folly::stop_watch<std::chrono::milliseconds> watch);
-
-  ImmediateFuture<GetGlobFilesResult> getGlobFiles(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes) override;
-  folly::coro::now_task<GetGlobFilesResult> co_getGlobFiles(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes) override;
 
   ImmediateFuture<bool> checkPermission(const ObjectId& manifestId) override;
   folly::coro::now_task<std::vector<folly::Try<std::vector<EntryAcl>>>>

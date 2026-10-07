@@ -56,7 +56,9 @@ use futures_lazy_shared::LazyShared;
 use futures_watchdog::WatchdogExt;
 use git_types::MappedGitCommitId;
 use hooks::CrossRepoPushSource;
+use hooks::HookExecutionPurpose;
 use hooks::HookOutcome;
+use hooks::LogOnlyRejections;
 use hooks::PushAuthoredBy;
 use itertools::Itertools;
 use manifest::Diff as ManifestDiff;
@@ -68,17 +70,18 @@ use mercurial_derivation::MappedHgChangesetId;
 use mercurial_types::Globalrev;
 use metaconfig_types::RepoConfigRef;
 use mononoke_types::BonsaiChangeset;
+use mononoke_types::ContentManifestId;
 use mononoke_types::FileChange;
 pub use mononoke_types::Generation;
 use mononoke_types::NonRootMPath;
 use mononoke_types::SkeletonManifestId;
 use mononoke_types::SubtreeChange;
 use mononoke_types::Svnrev;
-use mononoke_types::content_manifest::compat;
 use mononoke_types::directory_branch_cluster_manifest::DirectoryBranchClusterManifest;
 use mononoke_types::path::MPath;
 use mononoke_types::skeleton_manifest_v2::SkeletonManifestV2;
 use mutable_renames::MutableRenamesArc;
+use permission_checker::MononokeIdentitySet;
 use phases::PhasesRef;
 use repo_blobstore::RepoBlobstoreArc;
 use repo_blobstore::RepoBlobstoreRef;
@@ -124,7 +127,7 @@ pub enum FingerprintVersion {
     /// repo derives Fsnodes — but not the long-term recommendation.
     V1,
     /// V2: root ContentManifestId blake2 hash. Recommended long-term default.
-    /// Requires `scm/mononoke:derived_data_use_content_manifests` enabled for
+    /// Requires ContentManifests derived data enabled for
     /// the repo; otherwise the request fails with InvalidRequest (no
     /// auto-fallback, to keep the fingerprint bytes stable for consumers).
     V2,
@@ -233,7 +236,7 @@ pub struct ChangesetContext<R> {
     bonsai_changeset: LazyShared<Result<BonsaiChangeset, MononokeError>>,
     changeset_info: LazyShared<Result<ChangesetInfo, MononokeError>>,
     root_unode_manifest_id: LazyShared<Result<RootUnodeManifestId, MononokeError>>,
-    root_content_manifest_id: LazyShared<Result<compat::ContentManifestId, MononokeError>>,
+    root_content_manifest_id: LazyShared<Result<ContentManifestId, MononokeError>>,
     root_skeleton_manifest_id: LazyShared<Result<RootSkeletonManifestId, MononokeError>>,
     root_skeleton_manifest_v2_id: LazyShared<Result<RootSkeletonManifestV2Id, MononokeError>>,
     root_deleted_manifest_v2_id: LazyShared<Result<RootDeletedManifestV2Id, MononokeError>>,
@@ -512,30 +515,19 @@ impl<R: RepoDerivedDataArc> ChangesetContext<R> {
 impl<R: RepoDerivedDataArc + RepoIdentityRef> ChangesetContext<R> {
     pub(crate) async fn root_content_manifest_id(
         &self,
-    ) -> Result<compat::ContentManifestId, MononokeError> {
+    ) -> Result<ContentManifestId, MononokeError> {
         self.root_content_manifest_id
             .get_or_init(|| {
-                let repo_name = self.repo_ctx().name().to_string();
-                let use_content_manifests = justknobs::eval(
-                    "scm/mononoke:derived_data_use_content_manifests",
-                    None,
-                    Some(&repo_name),
-                );
-                if use_content_manifests {
-                    let fut = self.derive::<RootContentManifestId>();
-                    either::Either::Left(async move {
-                        let id = fut.await?;
-                        Ok(id.into_content_manifest_id().into())
-                    })
-                } else {
-                    let fut = self.derive::<RootFsnodeId>();
-                    either::Either::Right(async move {
-                        let id = fut.await?;
-                        Ok(id.into_fsnode_id().into())
-                    })
-                }
+                let fut = self.derive::<RootContentManifestId>();
+                async move { Ok(fut.await?.into_content_manifest_id()) }
             })
             .await
+    }
+
+    /// Derive the root content manifest, memoizing it on this context and its clones.
+    pub async fn prewarm_root_content_manifest(&self) -> Result<(), MononokeError> {
+        self.root_content_manifest_id().await?;
+        Ok(())
     }
 }
 
@@ -561,7 +553,7 @@ impl<R: CommitGraphRef + Clone> ChangesetContext<R> {
             .changeset_generation(self.ctx(), self.id)
             .await
             .map_err(|_| {
-                MononokeError::NotAvailable(format!("Generation number missing for {:?}", &self.id))
+                MononokeError::NotAvailable(format!("Generation number missing for {:?}", self.id))
             })
     }
 
@@ -572,7 +564,7 @@ impl<R: CommitGraphRef + Clone> ChangesetContext<R> {
             .changeset_linear_depth(self.ctx(), self.id)
             .await
             .map_err(|_| {
-                MononokeError::NotAvailable(format!("Linear depth missing for {:?}", &self.id))
+                MononokeError::NotAvailable(format!("Linear depth missing for {:?}", self.id))
             })
     }
 
@@ -1008,7 +1000,23 @@ impl<R: MononokeRepo> ChangesetContext<R> {
             .await?;
         Ok(public.contains(&self.id))
     }
+}
 
+impl<R> ChangesetContext<R>
+where
+    R: RepoPermissionCheckerRef
+        + AclRegionsRef
+        + RepoIdentityRef
+        + RestrictedPathsArc
+        + RepoBlobstoreArc
+        + RepoBlobstoreRef
+        + RepoDerivedDataArc
+        + RepoDerivedDataRef
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
     /// Query a path within the repository. This could be a file or a
     /// directory.
     ///
@@ -1029,7 +1037,9 @@ impl<R: MononokeRepo> ChangesetContext<R> {
         )
         .await
     }
+}
 
+impl<R: MononokeRepo> ChangesetContext<R> {
     /// Query a path within the repository. This could be a file or a
     /// directory.
     ///
@@ -1133,7 +1143,7 @@ impl<R: MononokeRepo> ChangesetContext<R> {
                         ChangesetPathContentContext::new_with_manifest_entry(
                             changeset.clone(),
                             mpath,
-                            entry.map_leaf(Into::into),
+                            entry,
                         )
                         .await
                     }
@@ -1543,7 +1553,6 @@ where
                     other.repo_ctx().repo().repo_blobstore().clone(),
                     copy_path_map.keys().cloned(),
                 )
-                .map_ok(|(path, entry)| (path, entry.map_leaf(Into::into)))
                 .try_collect::<HashMap<_, _>>();
 
             // At the same time, find out whether the destinations of copies
@@ -1700,18 +1709,9 @@ where
                                     let manifest = manifest_id
                                         .load(self.ctx(), self.repo_ctx().repo().repo_blobstore())
                                         .await?;
-                                    let weight = match &manifest {
-                                        either::Either::Left(cm) => {
-                                            let counts =
-                                                &cm.subentries.rollup_data().descendant_counts;
-                                            counts.files_count + counts.dirs_count
-                                        }
-                                        either::Either::Right(fsnode) => {
-                                            let summary = fsnode.summary();
-                                            summary.descendant_files_count
-                                                + summary.child_dirs_count
-                                        }
-                                    };
+                                    let counts =
+                                        manifest.subentries.rollup_data().descendant_counts;
+                                    let weight = counts.files_count + counts.dirs_count;
                                     anyhow::Ok((
                                         path,
                                         ManifestEntry::Tree((weight as usize, manifest_id)),
@@ -1743,18 +1743,8 @@ where
             }
         };
 
-        let convert_entry = |e: ManifestEntry<compat::ContentManifestId, _>| e.map_leaf(Into::into);
-
         let mut change_contexts: Vec<ChangesetPathDiffContext<R>> = diff
-            .map_ok(|diff_entry| match diff_entry {
-                ManifestDiff::Added(path, entry) => ManifestDiff::Added(path, convert_entry(entry)),
-                ManifestDiff::Removed(path, entry) => {
-                    ManifestDiff::Removed(path, convert_entry(entry))
-                }
-                ManifestDiff::Changed(path, from, to) => {
-                    ManifestDiff::Changed(path, convert_entry(from), convert_entry(to))
-                }
-            })
+            .map_err(MononokeError::from)
             .try_filter_map(|diff_entry| {
                 async {
                     let entry = match diff_entry {
@@ -2115,17 +2105,51 @@ impl<R: MononokeRepo> ChangesetContext<R> {
         &self,
         bookmark: impl AsRef<str>,
         pushvars: Option<&HashMap<String, Bytes>>,
+        run_as: Option<MononokeIdentitySet>,
+        override_commit_message: Option<String>,
+        log_only_rejections: LogOnlyRejections,
     ) -> Result<Vec<HookOutcome>, MononokeError> {
+        // When `run_as` is provided, run the hooks against a context derived from
+        // the caller's session with only the metadata identities swapped for the
+        // `run_as` set (via `with_overridden_metadata`, which shares the rest of
+        // the session -- rate limiters, session class, etc. -- and the caller's
+        // logging container -- scuba, perf counters, scribe, sampling), so hooks
+        // see them as the pusher while observability is otherwise unchanged. The
+        // real caller's identities are captured for audit logging. Repository
+        // access control has already been applied using the caller's real
+        // identity when this `ChangesetContext` was created; `run_as` only
+        // changes what the hooks observe. The request-level context
+        // (`self.ctx()`) is left untouched, so logging after the hooks finish --
+        // and at the end of the request -- still reflects the real caller.
+        let run_as_original_identities = run_as
+            .as_ref()
+            .map(|_| self.ctx().metadata().identities().clone());
+        let run_as_ctx = run_as.map(|identities| {
+            let metadata = self.ctx().metadata().clone().set_identities(identities);
+            self.ctx().with_overridden_metadata(Arc::new(metadata))
+        });
+        let ctx = run_as_ctx.as_ref().unwrap_or_else(|| self.ctx());
+        // The override keeps the stored changeset id so hooks that look data
+        // up by id (e.g. file lists) still resolve the real commit; only the
+        // message hooks parse changes. The resulting value violates
+        // id == hash(content) and exists solely for this in-memory dry run.
+        let mut bonsai = self.bonsai_changeset().await?;
+        if let Some(message) = override_commit_message {
+            bonsai = bonsai.replace_message_keeping_id(message)?;
+        }
         Ok(self
             .repo_ctx()
             .hook_manager()
             .run_changesets_hooks_for_bookmark(
-                self.ctx(),
-                &[self.bonsai_changeset().await?],
+                ctx,
+                &[bonsai],
                 &BookmarkKey::new(bookmark.as_ref())?,
                 pushvars,
                 CrossRepoPushSource::NativeToThisRepo,
                 PushAuthoredBy::User,
+                HookExecutionPurpose::DryRun,
+                run_as_original_identities.as_ref(),
+                log_only_rejections,
             )
             .await?)
     }

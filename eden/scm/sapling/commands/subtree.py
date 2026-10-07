@@ -12,7 +12,6 @@ from typing import List
 from .. import (
     cloneuri,
     cmdutil,
-    context,
     error,
     hg,
     match as matchmod,
@@ -49,7 +48,6 @@ from ..utils.subtreeutil import (
 from .cmdtable import command
 
 MAX_SUBTREE_COPY_FILE_COUNT = 10_000
-COPY_REUSE_TREE = False
 
 MERGE_BASE_STRATEGIES = [
     # Walk only the from‑path’s history when searching for a merge base.
@@ -113,6 +111,7 @@ subtree_subcmd = subtree.subcommand(
         ),
         ("f", "force", None, _("forcibly copy over an existing file")),
         ("", "filter", "", _("filter profile path")),
+        ("", "commit", True, _("create a commit")),
     ]
     + subtree_path_opts
     + commitopts
@@ -136,6 +135,9 @@ def subtree_copy(ui, repo, *args, **opts):
     The "--filter" option allows specifying a sparse profile to filter which
     files are copied. Only files matching the sparse profile will be included
     in the copy operation.
+
+    Use ``--no-commit`` to leave the copied files and subtree metadata pending
+    for a later :prog:`commit`.
     """
     with repo.wlock(), repo.lock():
         return _docopy(ui, repo, *args, **opts)
@@ -351,6 +353,9 @@ def subtree_merge(ui, repo, **opts):
     - only-from: walk only the from-path's history
     - only-to: walk only the to-path's history
     """
+    cmdutil.checkunfinished(repo)
+    cmdutil.bailifchanged(repo)
+
     if url := opts.get("url"):
         if opts.get("merge_base_strategy"):
             raise error.Abort(_("cannot specify both url and merge-base-strategy"))
@@ -708,6 +713,7 @@ def _subtree_merge_base(
 
 
 def _docopy(ui, repo, *args, **opts):
+    cmdutil.checkunfinished(repo)
     cmdutil.bailifchanged(repo)
 
     # if 'rev' is not specified, copy from the working copy parent
@@ -732,13 +738,10 @@ def _docopy(ui, repo, *args, **opts):
     subtreeutil.validate_path_overlap(from_paths, to_paths)
     subtreeutil.validate_source_commit(ui, from_ctx, "copy")
 
-    if COPY_REUSE_TREE:
-        _do_cheap_copy(repo, from_ctx, to_ctx, from_paths, to_paths, opts)
-    else:
-        matcher = _compute_filter_matcher(repo, to_ctx, filter_path)
-        _do_normal_copy(
-            repo, from_ctx, to_ctx, from_paths, to_paths, opts, filter_matcher=matcher
-        )
+    matcher = _compute_filter_matcher(repo, to_ctx, filter_path)
+    _do_normal_copy(
+        repo, from_ctx, to_ctx, from_paths, to_paths, opts, filter_matcher=matcher
+    )
 
 
 def _compute_filter_matcher(repo, ctx, filter_path=None):
@@ -760,41 +763,6 @@ def _compute_filter_matcher(repo, ctx, filter_path=None):
     return matcher
 
 
-def _do_cheap_copy(repo, from_ctx, to_ctx, from_paths, to_paths, opts):
-    user = opts.get("user")
-    date = opts.get("date")
-    text = opts.get("message")
-
-    extra = {}
-    extra.update(
-        gen_branch_info(
-            repo, from_ctx.hex(), from_paths, to_paths, BranchType.SHALLOW_COPY
-        )
-    )
-
-    summaryfooter = subtreeutil.gen_copy_commit_msg(from_ctx, from_paths, to_paths)
-    editform = cmdutil.mergeeditform(repo[None], "subtree.copy")
-    editor = cmdutil.getcommiteditor(
-        editform=editform, summaryfooter=summaryfooter, **opts
-    )
-
-    newctx = context.subtreecopyctx(
-        repo,
-        from_ctx,
-        to_ctx,
-        from_paths,
-        to_paths,
-        text=text,
-        user=user,
-        date=date,
-        extra=extra,
-        editor=editor,
-    )
-
-    newid = repo.commitctx(newctx)
-    hg.update(repo, newid)
-
-
 def _do_normal_copy(
     repo, from_ctx, to_ctx, from_paths, to_paths, opts, filter_matcher=None
 ):
@@ -811,13 +779,15 @@ def _do_normal_copy(
         filter_matcher=filter_matcher,
     )
 
-    extra = {}
-    extra.update(
-        gen_branch_info(
-            repo, from_ctx.hex(), from_paths, to_paths, BranchType.DEEP_COPY
-        )
+    branch_info = gen_branch_info(
+        repo, from_ctx.hex(), from_paths, to_paths, BranchType.DEEP_COPY
     )
+    subtreeutil.write_subtree_copy_state(repo, branch_info)
+    if not opts.get("commit"):
+        ui.status(_("(subtree copy changes awaiting commit)\n"))
+        return
 
+    extra = branch_info
     summaryfooter = subtreeutil.gen_copy_commit_msg(from_ctx, from_paths, to_paths)
     editform = cmdutil.mergeeditform(repo[None], "subtree.copy")
     editor = cmdutil.getcommiteditor(
@@ -834,7 +804,9 @@ def _do_normal_copy(
             extra=extra,
         )
 
-    cmdutil.commit(ui, repo, commitfunc, [], opts)
+    node = cmdutil.commit(ui, repo, commitfunc, [], opts)
+    subtreeutil.clear_subtree_copy_state(repo)
+    return node
 
 
 @contextlib.contextmanager
@@ -846,6 +818,7 @@ def _shallow_clone_git_repo(ui, url, from_rev):
     """
     from .. import git
 
+    subtreeutil.validate_subtree_url(url)
     git_repo_dir = tempfile.mkdtemp(prefix="sl-subtree-")
     # disable partial clone when shallow clone is enabled
     overrides = {("git", "depth"): 1, ("git", "filter"): None}

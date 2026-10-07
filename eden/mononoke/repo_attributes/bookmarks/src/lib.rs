@@ -25,6 +25,7 @@ pub mod saturation;
 mod subscription;
 mod transaction;
 
+pub use bookmarks_types::AnnotatedTags;
 pub use bookmarks_types::Bookmark;
 pub use bookmarks_types::BookmarkCategory;
 pub use bookmarks_types::BookmarkKey;
@@ -43,9 +44,11 @@ pub use log::BookmarkUpdateLogId;
 pub use log::BookmarkUpdateLogRef;
 pub use log::BookmarkUpdateReason;
 pub use subscription::BookmarksSubscription;
+pub use transaction::BookmarkMoveAlreadyProcessed;
 pub use transaction::BookmarkTransaction;
 pub use transaction::BookmarkTransactionError;
 pub use transaction::BookmarkTransactionHook;
+pub use transaction::MirrorBookmarkMove;
 
 #[facet::facet]
 #[async_trait]

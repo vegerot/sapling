@@ -7,6 +7,7 @@
 
 use std::any::TypeId;
 use std::collections::HashMap;
+use std::process::exit;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,10 +26,12 @@ use blobstore_factory::ReadOnlyStorage;
 use blobstore_factory::ReadOnlyStorageArgs;
 use blobstore_factory::ThrottleOptions;
 use cached_config::ConfigStore;
+use clap::ArgMatches;
 use clap::Args;
 use clap::Command;
 use clap::CommandFactory;
 use clap::FromArgMatches;
+use clap::error::ErrorKind;
 use clientinfo::ClientEntryPoint;
 use cmdlib_caching::CachelibArgs;
 use cmdlib_caching::CachelibSettings;
@@ -43,6 +46,7 @@ use fbinit::FacebookInit;
 use megarepo_config::MegarepoConfigsArgs;
 use megarepo_config::MononokeMegarepoConfigsOptions;
 use permission_checker::AclProvider;
+#[cfg(not(fbcode_build))]
 use permission_checker::DefaultAclProvider;
 use permission_checker::InternalAclProvider;
 use rendezvous::RendezVousArgs;
@@ -77,7 +81,9 @@ pub struct MononokeAppBuilder {
     bookmark_cache_options: BookmarkCacheOptions,
     client_entry_point_for_service: ClientEntryPoint,
     override_cmd_args: Option<Vec<String>>,
+    paged_help: bool,
     with_logging: bool,
+    lazy_acl_provider: bool,
 }
 
 #[derive(Args, Debug)]
@@ -152,7 +158,9 @@ impl MononokeAppBuilder {
             bookmark_cache_options: Default::default(),
             client_entry_point_for_service: Default::default(),
             override_cmd_args: None,
+            paged_help: false,
             with_logging: true,
+            lazy_acl_provider: false,
         }
     }
 
@@ -204,6 +212,26 @@ impl MononokeAppBuilder {
     /// Allows overriding the command line arguments and build the app with ad-hoc arguments.
     pub fn with_cmd_args(mut self, cmd_args: Vec<String>) -> Self {
         self.override_cmd_args = Some(cmd_args);
+        self
+    }
+
+    /// Page help output (`--help`, `help`, and missing-subcommand help)
+    /// through `$PAGER` when it is set.
+    ///
+    /// Paging only happens for interactive use (stdout is a terminal); when
+    /// the pager cannot be started, help is printed directly as usual.
+    pub fn with_paged_help(mut self, paged_help: bool) -> Self {
+        self.paged_help = paged_help;
+        self
+    }
+
+    /// Defer the `AccessCheckerProvider` REPO/REPO_REGION preload until the
+    /// first ACL check instead of blocking startup on it. Intended for CLIs
+    /// like `mononoke_admin`, where most invocations never check permissions.
+    /// Services keep the eager default so they fail fast when the ACL backend
+    /// is unreachable.
+    pub fn with_lazy_acl_provider(mut self, lazy_acl_provider: bool) -> Self {
+        self.lazy_acl_provider = lazy_acl_provider;
         self
     }
 
@@ -273,6 +301,8 @@ impl MononokeAppBuilder {
 
         let args = if let Some(ref override_cmd_args) = self.override_cmd_args {
             app.get_matches_from(override_cmd_args)
+        } else if self.paged_help {
+            get_matches_with_paged_help(app)
         } else {
             app.get_matches()
         };
@@ -387,7 +417,7 @@ impl MononokeAppBuilder {
 
         let remote_diff_options = remote_diff_args.into();
 
-        let acl_provider = create_acl_provider(self.fb, &acl_args, runtime)
+        let acl_provider = create_acl_provider(self.fb, &acl_args, runtime, self.lazy_acl_provider)
             .context("Failed to create ACL provider")?;
 
         let commit_graph_options = commit_graph_args.into();
@@ -427,6 +457,28 @@ impl MononokeAppBuilder {
     }
 }
 
+fn get_matches_with_paged_help(app: Command) -> ArgMatches {
+    match app.try_get_matches() {
+        Ok(matches) => matches,
+        Err(err) => {
+            // Preserve clap's exit status: `--help`/`help` succeed, while a
+            // bare invocation prints help as an error.
+            let exit_code = match err.kind() {
+                ErrorKind::DisplayHelp => Some(0),
+                ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => Some(2),
+                _ => None,
+            };
+            let Some(exit_code) = exit_code else {
+                err.exit()
+            };
+            if crate::pager::page_text(&err.to_string()) {
+                exit(exit_code);
+            }
+            err.exit()
+        }
+    }
+}
+
 fn create_runtime(runtime_args: &RuntimeArgs) -> Result<Runtime> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
@@ -438,12 +490,8 @@ fn create_runtime(runtime_args: &RuntimeArgs) -> Result<Runtime> {
         builder.thread_stack_size(thread_stack_size);
     }
     // Propagate the ambient folly RequestContext across tokio::spawn boundaries
-    // (Artillery trace continuity). In OSS this is a no-op. A startup-only CLI
-    // flag, not a JustKnob: the hooks are installed once when the runtime is
-    // built, so a runtime flip couldn't take effect without a restart.
-    if runtime_args.enable_artillery_rctx_hooks {
-        request_context_ext::install_request_context_hooks(&mut builder);
-    }
+    // (Artillery trace continuity). In OSS this is a no-op.
+    request_context_ext::install_request_context_hooks(&mut builder);
     let runtime = builder.build()?;
     Ok(runtime)
 }
@@ -542,6 +590,17 @@ fn init_just_knobs_worker(
     logger: impl justknobs::cached_config::IntoLogger,
     handle: Handle,
 ) -> Result<()> {
+    if !just_knobs_args.just_knob_overrides.is_empty() {
+        let overrides = just_knobs_args
+            .just_knob_overrides
+            .iter()
+            .map(|arg| justknobs::overrides::parse_override(arg))
+            .collect::<Result<_>>()?;
+        justknobs::overrides::set_debug_overrides(overrides)?;
+        if let Some(overrides) = justknobs::overrides::debug_overrides() {
+            tracing::warn!("JustKnobs pinned by --just-knob: {:?}", overrides);
+        }
+    }
     if let Some(just_knobs_config_path) = &just_knobs_args.just_knobs_config_path {
         let config_handle =
             config_store.get_config_handle(parse_config_spec_to_path(just_knobs_config_path)?)?;
@@ -556,31 +615,21 @@ fn create_acl_provider(
     fb: FacebookInit,
     acl_args: &AclArgs,
     runtime: &Runtime,
+    lazy_acl_provider: bool,
 ) -> Result<Arc<dyn AclProvider>> {
     if let Some(acl_file) = &acl_args.acl_file {
         return InternalAclProvider::from_file(acl_file)
             .with_context(|| format!("Failed to load ACLs from '{}'", acl_file.to_string_lossy()));
     }
-    if acl_args.access_checker_shadow_enabled {
-        let verifier = parse_access_checker_verifier(acl_args)?;
-        let primary = DefaultAclProvider::new(fb).context("Failed to create DefaultAclProvider")?;
-        let shadow = runtime
-            .block_on(permission_checker::AccessCheckerProvider::new(fb, verifier))
-            .context("Failed to create AccessCheckerProvider for shadow mode")?;
-        return Ok(permission_checker::ShadowAclProvider::new(
-            fb,
-            primary,
-            shadow,
-            acl_args.access_checker_shadow_sample_rate,
+    let verifier = parse_access_checker_verifier(acl_args)?;
+    if lazy_acl_provider {
+        return Ok(Arc::new(
+            permission_checker::AccessCheckerProvider::new_lazy(fb, verifier),
         ));
     }
-    if acl_args.access_checker_enabled {
-        let verifier = parse_access_checker_verifier(acl_args)?;
-        return runtime
-            .block_on(permission_checker::AccessCheckerProvider::new(fb, verifier))
-            .context("Failed to create AccessCheckerProvider");
-    }
-    DefaultAclProvider::new(fb).context("Failed to create DefaultAclProvider")
+    runtime
+        .block_on(permission_checker::AccessCheckerProvider::new(fb, verifier))
+        .context("Failed to create AccessCheckerProvider")
 }
 
 #[cfg(fbcode_build)]
@@ -601,6 +650,7 @@ fn create_acl_provider(
     fb: FacebookInit,
     acl_args: &AclArgs,
     _runtime: &Runtime,
+    _lazy_acl_provider: bool,
 ) -> Result<Arc<dyn AclProvider>> {
     if let Some(acl_file) = &acl_args.acl_file {
         return InternalAclProvider::from_file(acl_file)

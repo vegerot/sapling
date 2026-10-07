@@ -26,49 +26,27 @@ class GlobNode : public GlobNodeImpl {
   explicit GlobNode(
       bool includeDotfiles,
       CaseSensitivity caseSensitive,
-      bool prefetchOptimizations = false,
-      uint32_t recursiveAsyncDepth = 3)
+      uint32_t recursiveAsyncDepth = 3,
+      GlobMatchOptions matchOptions = {})
       : GlobNodeImpl(
             includeDotfiles,
             caseSensitive,
-            prefetchOptimizations,
-            recursiveAsyncDepth) {}
+            recursiveAsyncDepth,
+            std::move(matchOptions)) {}
 
   using PrefetchList = folly::Synchronized<std::vector<ObjectId>>;
-
-  GlobNode(
-      folly::StringPiece pattern,
-      bool includeDotfiles,
-      bool hasSpecials,
-      CaseSensitivity caseSensitive,
-      bool prefetchOptimizations = false)
-      : GlobNodeImpl(
-            pattern,
-            includeDotfiles,
-            hasSpecials,
-            caseSensitive,
-            prefetchOptimizations) {}
 
   /**
    * Evaluate the compiled glob against the provided TreeInode and path.
    *
    * When globResult is non-null, the results are appended to the globResult
    * list which the caller is responsible for ensuring that its lifetime will
-   * exceed the lifetime of the returned ImmediateFuture.
+   * exceed the lifetime of the returned Task.
    *
    * When fileBlobsToPrefetch is non-null, the Hash of the globbed files will
    * be appended to it.
    */
-  ImmediateFuture<folly::Unit> evaluate(
-      std::shared_ptr<ObjectStore> store,
-      const ObjectFetchContextPtr& context,
-      RelativePathPiece rootPath,
-      TreeInodePtr root,
-      PrefetchList* fileBlobsToPrefetch,
-      ResultList* globResult,
-      const RootId& originRootId) const;
-
-  folly::coro::now_task<folly::Unit> co_evaluate(
+  folly::coro::now_task<folly::Unit> evaluate(
       std::shared_ptr<ObjectStore> store,
       const ObjectFetchContextPtr& context,
       RelativePathPiece rootPath,

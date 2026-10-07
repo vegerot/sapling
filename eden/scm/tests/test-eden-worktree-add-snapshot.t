@@ -1,7 +1,7 @@
 
 #require eden
 
-  $ setconfig worktree.enabled=true worktree.snapshot-direct-copy=true
+  $ setconfig worktree.snapshot-direct-copy=true
 
 setup backing repo
 
@@ -11,6 +11,14 @@ setup backing repo
   $ echo nested > dir/subdir/nested.txt
   $ sl add file.txt dir/subdir/nested.txt
   $ sl commit -m "init"
+
+test worktree add --snapshot rejects --rev
+
+  $ sl worktree add --snapshot --rev . $TESTTMP/wt_snapshot_rev
+  abort: cannot use --rev with --snapshot
+  [255]
+  $ test -d $TESTTMP/wt_snapshot_rev
+  [1]
 
 test worktree add --snapshot - modified file
 

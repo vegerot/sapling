@@ -9,6 +9,8 @@
 import os
 import stat
 import unittest
+from pathlib import Path
+from unittest.mock import MagicMock
 
 from eden.fs.service.eden.thrift_types import (
     TreeInodeDebugInfo,
@@ -19,6 +21,36 @@ from .. import util
 
 
 class UtilTest(unittest.TestCase):
+    def test_is_edenfs_mount(self) -> None:
+        self.assertTrue(util.is_edenfs_mount(b"edenfs:", b"nfs"))
+        self.assertTrue(util.is_edenfs_mount(b"edenfs:", b"edenfs:"))
+        # An NFS checkout served over a Unix domain socket on macOS.
+        self.assertTrue(
+            util.is_edenfs_mount(
+                b"</Users/me/.eden/clients/repo/nfsd.socket>:/Users/me/repo",
+                b"edenfs:",
+            )
+        )
+        self.assertFalse(util.is_edenfs_mount(b"/dev/disk3s5", b"apfs"))
+        self.assertFalse(util.is_edenfs_mount(b"server:/export", b"nfs"))
+
+    def test_missing_backing_repo_does_not_block_edensparse_migration(self) -> None:
+        backing_repo = MagicMock()
+        backing_repo._run_hg.side_effect = FileNotFoundError("backing repo deleted")
+
+        checkout = MagicMock()
+        checkout.path = Path("/deleted/backing/repo")
+        checkout.get_backing_repo.return_value = backing_repo
+
+        instance = MagicMock()
+        instance.get_checkouts.return_value = [checkout]
+
+        util.maybe_edensparse_migration(
+            instance, util.EdensparseMigrationStep.PRE_EDEN_START
+        )
+
+        instance.log_sample.assert_not_called()
+
     def test_is_valid_sha1(self) -> None:
         def is_valid(sha1: str) -> bool:
             return util.is_valid_sha1(sha1)

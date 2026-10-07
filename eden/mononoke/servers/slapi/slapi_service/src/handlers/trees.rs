@@ -5,10 +5,15 @@
  * GNU General Public License version 2.
  */
 
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Instant;
+
 use anyhow::Context;
 use anyhow::Error;
 use async_trait::async_trait;
 use bytes::Bytes;
+use cloned::cloned;
 use context::PerfCounterType;
 use edenapi_types::AnyId;
 use edenapi_types::Batch;
@@ -36,6 +41,7 @@ use futures::FutureExt;
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
+use futures::future;
 use futures::stream;
 use gotham::state::FromState;
 use gotham::state::State;
@@ -51,16 +57,20 @@ use manifest::Manifest;
 use mercurial_types::HgAugmentedManifestEntry;
 use mercurial_types::HgAugmentedManifestId;
 use mercurial_types::HgFileNodeId;
+use mercurial_types::HgManifestEnvelope;
 use mercurial_types::HgManifestId;
 use mercurial_types::HgNodeHash;
 use mononoke_api::MononokeRepo;
 use mononoke_api::Repo;
 use mononoke_api::errors::MononokeError;
+use mononoke_api_hg::DirectoryAcl;
 use mononoke_api_hg::HgAugmentedTreeRestrictionContext;
 use mononoke_api_hg::HgDataContext;
 use mononoke_api_hg::HgDataId;
 use mononoke_api_hg::HgRepoContext;
 use mononoke_api_hg::HgTreeContext;
+use mononoke_api_hg::UploadTreeAugmented;
+use mononoke_api_hg::UploadTreeBuildError;
 use mononoke_types::MPath;
 use mononoke_types::MPathElement;
 use permission_checker::MononokeIdentitySetExt;
@@ -68,8 +78,10 @@ use rate_limiting::Metric;
 use rate_limiting::Scope;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_identity::RepoIdentityRef;
+use restricted_paths::RestrictedPathsArc;
 use serde::Deserialize;
 use stats::define_stats;
+use stats::prelude::DynamicHistogram;
 use stats::prelude::TimeseriesStatic;
 use types::Key;
 use types::RepoPathBuf;
@@ -80,7 +92,7 @@ use super::SaplingRemoteApiHandler;
 use super::SaplingRemoteApiMethod;
 use super::handler::SaplingRemoteApiContext;
 use crate::context::ServerContext;
-use crate::errors::ErrorKind;
+use crate::errors::SaplingRemoteApiServiceError;
 use crate::handlers::git_objects::fetch_git_object;
 use crate::middleware::request_dumper::RequestDumper;
 use crate::utils::custom_cbor_stream;
@@ -92,6 +104,20 @@ define_stats! {
     prefix = "mononoke.trees";
     manifests_served: timeseries(Rate, Sum),
     trees_batch_keys_requested: timeseries(Rate, Sum),
+    upload_augmented_manifests_attempted: timeseries(Rate, Sum),
+    upload_augmented_manifests_built: timeseries(Rate, Sum),
+    upload_augmented_manifests_skipped_no_acl_work: timeseries(Rate, Sum),
+    upload_augmented_manifests_failed: timeseries(Rate, Sum),
+    upload_augmented_manifests_failed_missing_child: timeseries(Rate, Sum),
+    upload_augmented_manifests_build_ms: dynamic_histogram(
+        "{}.upload_augmented_manifests_build_ms", (repo: String);
+        20, 0, 10_000, Average, Count; P 50; P 90; P 99),
+    upload_augmented_manifests_batch_trees: dynamic_histogram(
+        "{}.upload_augmented_manifests_batch_trees", (repo: String);
+        10, 0, 1_000, Average, Count; P 50; P 90; P 99),
+    upload_augmented_manifests_batch_levels: dynamic_histogram(
+        "{}.upload_augmented_manifests_batch_levels", (repo: String);
+        1, 0, 50, Average, Count; P 50; P 90; P 99),
 }
 
 // The size is optimized for the batching settings in EdenFs.
@@ -102,6 +128,8 @@ const LARGE_TREE_METADATA_LIMIT: usize = 25000;
 
 const ROUTE_ORIGINAL_TO_AUGMENTED_HG_MANIFEST: &str =
     "scm/mononoke:route_original_to_augmented_hg_manifest";
+const BUILD_AUGMENTED_MANIFESTS_AT_TREE_UPLOAD: &str =
+    "scm/mononoke:build_augmented_manifests_at_tree_upload";
 
 #[derive(Debug, Deserialize, StateData, StaticResponseExtender)]
 pub struct TreeParams {
@@ -127,7 +155,7 @@ pub async fn trees(state: &mut State) -> Result<impl TryIntoResponse + use<>, Ht
         rd.add_request(&request);
     };
 
-    ScubaMiddlewareState::try_set_sampling_rate(state, nonzero_ext::nonzero!(256_u64));
+    ScubaMiddlewareState::try_set_sampling_rate(state, nonzero_ext::nonzero!(1024_u64));
 
     Ok(custom_cbor_stream(
         super::monitor_request(state, fetch_all_trees(repo, request, slapi_flavour)),
@@ -164,22 +192,26 @@ fn fetch_all_trees<R: MononokeRepo>(
 }
 
 fn tree_fetch_error_to_slapi_error(key: Key, err: Error) -> SaplingRemoteApiServerError {
-    let permission_request_group =
+    let manifest_denial =
         err.chain()
             .find_map(|cause| match cause.downcast_ref::<MononokeError>() {
                 Some(MononokeError::RestrictedPathsAuthorizationError(err))
                     if err.is_manifest_access() =>
                 {
-                    Some(err.permission_request_group().to_string())
+                    Some((
+                        err.permission_request_group().to_string(),
+                        err.denial_message().map(str::to_string),
+                    ))
                 }
                 _ => None,
             });
 
-    if let Some(permission_request_group) = permission_request_group {
+    if let Some((permission_request_group, denial_message)) = manifest_denial {
         SaplingRemoteApiServerError {
             err: SaplingRemoteApiServerErrorKind::PermissionDenied {
                 tree_id: key.hgid,
                 request_acl: permission_request_group,
+                denial_message,
             },
             key: Some(key),
         }
@@ -240,7 +272,7 @@ async fn fetch_tree<R: MononokeRepo>(
         let maybe_ctx = id
             .context(repo.clone())
             .await
-            .with_context(|| ErrorKind::TreeFetchFailed(key.clone()))?;
+            .with_context(|| SaplingRemoteApiServiceError::TreeFetchFailed(key.clone()))?;
 
         if let Some(ctx) = maybe_ctx {
             let populate_all_metadata = route_to_augmented;
@@ -282,7 +314,7 @@ async fn fetch_tree<R: MononokeRepo>(
                 let (data, _) = ctx
                     .content()
                     .await
-                    .with_context(|| ErrorKind::TreeFetchFailed(key.clone()))?;
+                    .with_context(|| SaplingRemoteApiServiceError::TreeFetchFailed(key.clone()))?;
 
                 entry.with_data(Some(data.into()));
             }
@@ -328,8 +360,8 @@ async fn fetch_tree<R: MononokeRepo>(
     let ctx = id
         .context(repo.clone())
         .await
-        .with_context(|| ErrorKind::TreeFetchFailed(key.clone()))?
-        .with_context(|| ErrorKind::KeyDoesNotExist(key.clone()))?;
+        .with_context(|| SaplingRemoteApiServiceError::TreeFetchFailed(key.clone()))?
+        .with_context(|| SaplingRemoteApiServiceError::KeyDoesNotExist(key.clone()))?;
 
     if attributes.manifest_blob {
         repo.ctx()
@@ -339,7 +371,7 @@ async fn fetch_tree<R: MononokeRepo>(
         let (data, _) = ctx
             .content()
             .await
-            .with_context(|| ErrorKind::TreeFetchFailed(key.clone()))?;
+            .with_context(|| SaplingRemoteApiServiceError::TreeFetchFailed(key.clone()))?;
 
         entry.with_data(Some(data.into()));
     }
@@ -454,7 +486,7 @@ async fn fetch_child_file_metadata<R: MononokeRepo>(
     let ctx = repo
         .file(HgFileNodeId::new(child_key.hgid.into()))
         .await?
-        .ok_or_else(|| ErrorKind::FileFetchFailed(child_key.clone()))?;
+        .ok_or_else(|| SaplingRemoteApiServiceError::FileFetchFailed(child_key.clone()))?;
 
     let metadata = ctx.content_metadata().await?;
     Ok(TreeChildEntry::new_file_entry(
@@ -469,27 +501,102 @@ async fn fetch_child_file_metadata<R: MononokeRepo>(
     ))
 }
 
-/// Store the content of a single tree
+/// Store the content of a single tree, returning its token and its envelope.
 async fn store_tree<R: MononokeRepo>(
     repo: HgRepoContext<R>,
     item: UploadTreeRequest,
-) -> Result<UploadTreeResponse, Error> {
+) -> Result<(UploadTreeResponse, HgManifestEnvelope), Error> {
     let upload_node_id = HgNodeHash::from(item.entry.node_id);
-    let contents = item.entry.data;
+    let contents = Bytes::from(item.entry.data);
     let p1 = item.entry.parents.p1().cloned().map(HgNodeHash::from);
     let p2 = item.entry.parents.p2().cloned().map(HgNodeHash::from);
     let computed_node_id = item.entry.computed_node_id.map(HgNodeHash::from);
-    repo.store_tree(
-        upload_node_id,
-        p1,
-        p2,
-        Bytes::from(contents),
-        computed_node_id,
-    )
-    .await?;
-    Ok(UploadTreeResponse {
-        token: UploadToken::new_fake_token(AnyId::HgTreeId(item.entry.node_id), None),
+    let envelope = repo
+        .store_tree(upload_node_id, p1, p2, contents, computed_node_id)
+        .await?;
+    Ok((
+        UploadTreeResponse {
+            token: UploadToken::new_fake_token(AnyId::HgTreeId(item.entry.node_id), None),
+        },
+        envelope,
+    ))
+}
+
+/// A batch the client built wrong: a parent uploaded before a child it
+/// contains. Counted apart from genuine server failures.
+fn is_client_fault(err: &Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<UploadTreeBuildError>(),
+            Some(UploadTreeBuildError::MissingChild { .. })
+        )
     })
+}
+
+/// Bump the counters for one batch of augmented-manifest builds.
+///
+/// A batch builds completely or fails, so the only thing that varies per tree
+/// is whether it provably had no ACL work to do.
+fn record_augmented_manifest_outcomes(built: &[UploadTreeAugmented]) {
+    STATS::upload_augmented_manifests_built.add_value(built.len() as i64);
+    let no_acl_work = built
+        .iter()
+        .filter(|tree| matches!(tree.acl, DirectoryAcl::NotNeeded))
+        .count();
+    STATS::upload_augmented_manifests_skipped_no_acl_work.add_value(no_acl_work as i64);
+}
+
+/// Build augmented manifests for the trees one request stored.
+///
+/// The trees themselves are already stored, so a failure here must not fail
+/// the upload.
+async fn build_and_record_augmented_manifests<R: MononokeRepo>(
+    repo: &HgRepoContext<R>,
+    trees: Vec<HgManifestEnvelope>,
+    batch_len: usize,
+) {
+    // A store that failed drops its tree here, so a parent still in the batch
+    // can look like it is missing a child the client did send. Only a complete
+    // batch can tell the client's mistake from our own.
+    let complete_batch = trees.len() == batch_len;
+    let repo_name = repo.repo().repo_identity().name().to_string();
+    STATS::upload_augmented_manifests_attempted.add_value(trees.len() as i64);
+    STATS::upload_augmented_manifests_batch_trees
+        .add_value(trees.len() as i64, (repo_name.clone(),));
+    // Runs before the response stream ends, so this is time the client waits
+    // on top of storing the trees. With the store knob on it includes writing
+    // the envelopes, which the metric name predates.
+    let started = Instant::now();
+    let result = repo
+        .build_and_store_augmented_manifests_for_uploaded_trees(trees)
+        .await;
+    STATS::upload_augmented_manifests_build_ms
+        .add_value(started.elapsed().as_millis() as i64, (repo_name.clone(),));
+    match result {
+        Ok(built) => {
+            record_augmented_manifest_outcomes(&built);
+            let levels = built.iter().map(|tree| tree.level + 1).max().unwrap_or(0);
+            STATS::upload_augmented_manifests_batch_levels.add_value(levels as i64, (repo_name,));
+        }
+        Err(err) => {
+            let failure_kind = if complete_batch && is_client_fault(&err) {
+                STATS::upload_augmented_manifests_failed_missing_child.add_value(1);
+                "missing_child"
+            } else {
+                STATS::upload_augmented_manifests_failed.add_value(1);
+                "server"
+            };
+            repo.ctx()
+                .scuba()
+                .clone()
+                .add("repo", repo.repo().repo_identity().name())
+                .add("failure_kind", failure_kind)
+                .log_with_msg(
+                    "Failed to build augmented Hg manifests at tree upload",
+                    Some(format!("{err:#}")),
+                );
+        }
+    }
 }
 
 /// Upload list of trees requested by the client (batch request).
@@ -509,13 +616,51 @@ impl SaplingRemoteApiHandler for UploadTreesHandler {
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
-        let tokens = request
-            .batch
-            .into_iter()
-            .map(move |item| store_tree(repo.clone(), item));
+        let build_augmented_manifests = justknobs::eval(
+            BUILD_AUGMENTED_MANIFESTS_AT_TREE_UPLOAD,
+            repo.ctx()
+                .metadata()
+                .client_request_info()
+                .map(|c| c.correlator.as_str()),
+            Some(repo.repo().repo_identity().name()),
+        );
 
-        Ok(stream::iter(tokens)
-            .buffer_unordered(MAX_CONCURRENT_UPLOAD_TREES_PER_REQUEST)
+        let batch_len = request.batch.len();
+        let stored = stream::iter(request.batch.into_iter().map({
+            cloned!(repo);
+            move |item| store_tree(repo.clone(), item)
+        }))
+        .buffer_unordered(MAX_CONCURRENT_UPLOAD_TREES_PER_REQUEST);
+
+        if !build_augmented_manifests {
+            return Ok(stored.map_ok(|(token, _tree)| token).boxed());
+        }
+
+        // The build orders the batch by containment, so it runs once every
+        // tree has stored, after the last token has gone back.
+        let trees = Arc::new(Mutex::new(Vec::new()));
+        let tokens = stored.map_ok({
+            cloned!(trees);
+            move |(token, tree)| {
+                trees
+                    .lock()
+                    .expect("should not be poisoned, nothing panics while holding it")
+                    .push(tree);
+                token
+            }
+        });
+        let build = async move {
+            let trees = std::mem::take(
+                &mut *trees
+                    .lock()
+                    .expect("should not be poisoned, nothing panics while holding it"),
+            );
+            build_and_record_augmented_manifests(&repo, trees, batch_len).await;
+            None
+        };
+
+        Ok(tokens
+            .chain(stream::once(build).filter_map(future::ready))
             .boxed())
     }
 }
@@ -602,10 +747,21 @@ impl SaplingRemoteApiHandler for CheckManifestPermissionHandler {
                             .log_with_msg("Checked manifest permission", None);
                     }
 
+                    let denial_message = if has_access {
+                        None
+                    } else {
+                        repo.repo()
+                            .restricted_paths_arc()
+                            .config()
+                            .denial_message
+                            .clone()
+                    };
+
                     Ok(CheckManifestPermissionResponse {
                         manifest_id,
                         has_access,
                         request_acl: permission_request_group,
+                        denial_message,
                     })
                 }
             })
@@ -718,6 +874,7 @@ mod tests {
                 "1111111111111111111111111111111111111111",
             )),
             "REPO_REGION:test_acl",
+            None,
         )?;
 
         let slapi_error = tree_fetch_error_to_slapi_error(key.clone(), err);
@@ -725,13 +882,39 @@ mod tests {
             SaplingRemoteApiServerErrorKind::PermissionDenied {
                 tree_id,
                 request_acl: permission_request_group,
+                denial_message,
             } => {
                 assert_eq!(tree_id, key.hgid);
                 assert_eq!(permission_request_group, "REPO_REGION:test_acl");
+                assert_eq!(denial_message, None);
             }
             err => anyhow::bail!("expected PermissionDenied, got {err:?}"),
         }
         assert_eq!(slapi_error.key, Some(key));
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn test_tree_fetch_error_to_slapi_error_carries_denial_message() -> Result<()> {
+        let key = test_key()?;
+        let err = restricted_paths_error(
+            RestrictedPathAccess::Manifest(RestrictedManifestId::from(
+                "1111111111111111111111111111111111111111",
+            )),
+            "REPO_REGION:test_acl",
+            Some("Ask the repo owners for access."),
+        )?;
+
+        let slapi_error = tree_fetch_error_to_slapi_error(key, err);
+        match slapi_error.err {
+            SaplingRemoteApiServerErrorKind::PermissionDenied { denial_message, .. } => {
+                assert_eq!(
+                    denial_message.as_deref(),
+                    Some("Ask the repo owners for access.")
+                );
+            }
+            err => anyhow::bail!("expected PermissionDenied, got {err:?}"),
+        }
         Ok(())
     }
 
@@ -741,6 +924,7 @@ mod tests {
         let err = restricted_paths_error(
             RestrictedPathAccess::Path(MPath::new("restricted")?),
             "REPO_REGION:test_acl",
+            None,
         )?;
 
         let slapi_error = tree_fetch_error_to_slapi_error(key.clone(), err);
@@ -754,10 +938,15 @@ mod tests {
     fn restricted_paths_error(
         access: RestrictedPathAccess,
         permission_request_group: &str,
+        denial_message: Option<&str>,
     ) -> Result<Error> {
         let permission_request_group: PermissionRequestGroup = permission_request_group.parse()?;
         Ok(Error::new(MononokeError::RestrictedPathsAuthorizationError(
-            RestrictedPathsAuthorizationError::new(access, permission_request_group),
+            RestrictedPathsAuthorizationError::new(
+                access,
+                permission_request_group,
+                denial_message.map(str::to_string),
+            ),
         ))
         .context("failed to fetch tree"))
     }

@@ -24,6 +24,7 @@ from . import (
     encoding,
     error,
     git,
+    hintutil,
     identity,
     lock as lockmod,
     mutation,
@@ -1281,6 +1282,36 @@ def mainbookmark(repo):
         return "main"
     else:
         return names[0]
+
+
+def checkagentpreferredtarget(repo, target, command):
+    preferred = repo.ui.config("experimental", "preferred-target")
+    if not target or not preferred or not repo.ui.agent() or repo.ui.plain():
+        return
+
+    main = mainbookmark(repo)
+    hoist = repo.ui.config("remotenames", "hoist")
+    target_is_main = target == main or (bool(hoist) and target == f"{hoist}/{main}")
+    # Only reject the main bookmark name, not hashes or revsets that happen to
+    # resolve to the same commit as main.
+    if preferred == main or not target_is_main:
+        return
+
+    repo.ui.log(
+        "preferred_target",
+        preferred_target=preferred,
+        requested_bookmark=target,
+        suggested_command=command,
+        blocking=False,
+    )
+    hintutil.triggershow(
+        repo.ui,
+        "preferred-target",
+        target,
+        main,
+        command,
+        preferred,
+    )
 
 
 def selectivepullinitbookmarknames(repo):

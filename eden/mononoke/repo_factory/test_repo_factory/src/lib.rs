@@ -130,6 +130,8 @@ use repo_identity::RepoIdentity;
 use repo_lock::AlwaysUnlockedRepoLock;
 use repo_lock::ArcRepoLock;
 use repo_lock::SqlRepoLock;
+use repo_manifest_mapping::ArcRepoManifestMapping;
+use repo_manifest_mapping::SqlRepoManifestMappingBuilder;
 use repo_metadata_checkpoint::ArcRepoMetadataCheckpoint;
 use repo_metadata_checkpoint::SqlRepoMetadataCheckpointBuilder;
 use repo_permission_checker::AlwaysAllowRepoPermissionChecker;
@@ -519,7 +521,12 @@ impl TestRepoFactory {
     ) -> ArcPhases {
         let sql_phases_builder = SqlPhasesBuilder::from_sql_connections(self.metadata_db.clone());
         let heads_fetcher = bookmark_heads_fetcher(bookmarks.clone());
-        sql_phases_builder.build(repo_identity.id(), commit_graph.clone(), heads_fetcher)
+        sql_phases_builder.build(
+            repo_identity.id(),
+            commit_graph.clone(),
+            heads_fetcher,
+            RendezVousOptions::for_test(),
+        )
     }
 
     /// Construct Bonsai Hg Mapping using the in-memory metadata database.
@@ -639,6 +646,14 @@ impl TestRepoFactory {
         ))
     }
 
+    /// Construct the repo-manifest routing store using the in-memory metadata
+    /// database.
+    pub fn repo_manifest_mapping(&self) -> Result<ArcRepoManifestMapping> {
+        Ok(Arc::new(
+            SqlRepoManifestMappingBuilder::from_sql_connections(self.metadata_db.clone()).build(),
+        ))
+    }
+
     /// Construct the enabled-derived-data-types facet using the in-memory
     /// metadata database.
     pub fn enabled_derived_data_types(&self) -> Result<ArcEnabledDerivedDataTypes> {
@@ -719,9 +734,9 @@ impl TestRepoFactory {
             repo_config.derived_data_config.clone(),
             None, // derivation_service_client = None
             restricted_paths_config_based.clone(),
-            Arc::new(CommitDerivedDataMapping {
-                sql: SqlCommitDerivedDataMapping::from_sql_connections(self.metadata_db.clone()),
-            }),
+            Arc::new(CommitDerivedDataMapping::new(
+                SqlCommitDerivedDataMapping::from_sql_connections(self.metadata_db.clone()),
+            )),
         )?))
     }
 
@@ -786,14 +801,11 @@ impl TestRepoFactory {
 
         let restricted_paths_config = repo_config.restricted_paths_config.clone();
 
-        // Build the manifest id cache with the specified refresh interval
         let cache = RestrictedPathsManifestIdCacheBuilder::new(
             self.ctx.clone(),
             restricted_paths_manifest_id_store.clone(),
         )
-        .with_refresh_interval(std::time::Duration::from_millis(
-            restricted_paths_config.cache_update_interval_ms,
-        ))
+        .with_manifest_id_store_cache(restricted_paths_config.manifest_id_store_config.clone())
         .build()
         .await?;
 

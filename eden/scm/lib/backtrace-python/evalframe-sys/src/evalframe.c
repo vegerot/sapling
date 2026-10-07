@@ -27,6 +27,7 @@ To learn examples about the APIs, check  cpython/Modules/_testinternalcapi.c.
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h> // @manual=fbsource//third-party/python:python
+#include <stdint.h>
 
 #if defined(_WIN32)
 #define EXPORT __declspec(dllexport)
@@ -72,6 +73,9 @@ EXPORT PyCodeObject* sapling_cext_evalframe_extract_code_lineno_from_frame(
     PyFrame* f,
     volatile ssize_t* pline_no) {
   if (!f) {
+    return NULL;
+  }
+  if (!pline_no) {
     return NULL;
   }
   // 3.11: f is _PyInterpreterFrame. Need Py_BUILD_CORE_MODULE to access.
@@ -120,9 +124,29 @@ EXPORT PyCodeObject* sapling_cext_evalframe_extract_code_lineno_from_frame(
 
 // Only used by codegen (offset-probe) in a controlled way.
 // Not used by regular runs. Set by Sapling_PyEvalFrameProbe.
+// NOLINTNEXTLINE(facebook-avoid-non-const-global-variables)
 static size_t last_frame = 0;
+// NOLINTNEXTLINE(facebook-avoid-non-const-global-variables)
 static size_t last_code = 0;
+// NOLINTNEXTLINE(facebook-avoid-non-const-global-variables)
 static volatile ssize_t last_line_no = 0;
+
+#if defined(__clang__) || defined(__GNUC__)
+#define NO_SANITIZE_ADDRESS __attribute__((no_sanitize("address")))
+#else
+#define NO_SANITIZE_ADDRESS
+#endif
+
+// Only used by offset-probe to scan Sapling_PyEvalFrame stack slots. The
+// scanned range is bounded by the caller, but ASan poisons stack redzones and
+// reports the intentional probe reads as stack-buffer-underflow.
+EXPORT uintptr_t NO_SANITIZE_ADDRESS
+sapling_cext_evalframe_probe_read_stack_word(const void* p) {
+  if (!p) {
+    return 0;
+  }
+  return *(const volatile uintptr_t*)p;
+}
 
 // Runtime evalframe: minimal overhead, does not track last_frame.
 EXPORT PyObject* NO_OPT
@@ -196,11 +220,35 @@ void sapling_cext_evalframe_set_mode(int mode) {
 }
 
 /**
+ * Return the inline UTF-8 data of a compact ASCII `str`, a placeholder for
+ * any other `str`, or NULL for anything that is not a `str`.
+ *
+ * `PyUnicode_AsUTF8` is not usable here: for a non-ASCII `str` it allocates
+ * and caches the UTF-8 form on the object, and the callers of this function
+ * run without the GIL, possibly on a thread that has no Python thread state
+ * at all (the sampling profiler thread), where the allocator dereferences a
+ * NULL thread state. The placeholder keeps the frame, and its line number,
+ * in the backtrace.
+ */
+static const char* ascii_str_data(PyObject* obj) {
+  if (!obj || !PyUnicode_Check(obj)) {
+    return NULL;
+  }
+  if (!PyUnicode_IS_COMPACT_ASCII(obj)) {
+    return "<non-ascii>";
+  }
+  return (const char*)PyUnicode_DATA(obj);
+}
+
+/**
  * Resolve a Python code object to function name.
  * Also report the filename to `pfilename`.
  *
+ * Non-ASCII names and filenames come back as a placeholder; see
+ * `ascii_str_data`. This function might be called without the GIL. It does
+ * not allocate, mutate, or DECREF Python objects.
+ *
  * See also `sapling_cext_evalframe_stringify_code_lineno`.
- * This function does not DECREF the code object.
  */
 EXPORT const char* sapling_cext_evalframe_resolve_code_object(
     PyCodeObject* code,
@@ -208,14 +256,11 @@ EXPORT const char* sapling_cext_evalframe_resolve_code_object(
   if (!code) {
     goto out;
   }
-  PyObject* filename_obj = code->co_filename;
-  PyObject* name_obj = code->co_name;
-  if (!filename_obj || !name_obj || !PyUnicode_Check(filename_obj) ||
-      !PyUnicode_Check(name_obj)) {
+  if (!pfilename) {
     goto out;
   }
-  const char* name = PyUnicode_AsUTF8(name_obj);
-  const char* filename = PyUnicode_AsUTF8(filename_obj);
+  const char* name = ascii_str_data(code->co_name);
+  const char* filename = ascii_str_data(code->co_filename);
   if (filename == NULL || name == NULL) {
     goto out;
   }
@@ -279,6 +324,7 @@ out:
  * if the type mismatches.
  */
 EXPORT const char* sapling_cext_evalframe_resolve_frame(size_t address) {
+  // NOLINTNEXTLINE(performance-no-int-to-ptr)
   PyFrame* f = (PyFrame*)address;
   ssize_t line_no = 0;
   PyCodeObject* code =

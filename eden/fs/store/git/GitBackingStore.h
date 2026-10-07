@@ -54,13 +54,6 @@ class GitBackingStore final : public BijectiveBackingStore {
   GitBackingStore(GitBackingStore const&) = delete;
   GitBackingStore& operator=(GitBackingStore const&) = delete;
 
-  /**
-   * DEPRECATED: use co_getRootTree directly. Futures wrapper kept for
-   * non-coroutine callers; remove once all callers have migrated.
-   */
-  ImmediateFuture<GetRootTreeResult> getRootTree(
-      const RootId& rootId,
-      const ObjectFetchContextPtr& context) override;
   folly::coro::now_task<GetRootTreeResult> co_getRootTree(
       const RootId& rootId,
       const ObjectFetchContextPtr& context) override;
@@ -88,21 +81,9 @@ class GitBackingStore final : public BijectiveBackingStore {
   folly::coro::Task<BackingStore::GetBlobResult> co_getBlob(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
-  folly::SemiFuture<BackingStore::GetBlobAuxResult> getBlobAuxData(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) override;
   folly::coro::now_task<BackingStore::GetBlobAuxResult> co_getBlobAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
-  ImmediateFuture<GetGlobFilesResult> getGlobFiles(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes) override;
-  folly::coro::now_task<GetGlobFilesResult> co_getGlobFiles(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes) override;
-
   GetRootTreeResult getRootTreeImpl(const RootId& rootId);
   TreePtr getTreeImpl(const ObjectId& id);
   BlobPtr getBlobImpl(const ObjectId& id);

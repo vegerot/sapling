@@ -158,6 +158,9 @@ export function Tooltip({
   }, [visible, onVisible]);
 
   const ref = useRef<HTMLDivElement>(null);
+  // The portaled tooltip content div, so handlers can tell whether events or
+  // focus belong to this tooltip instance rather than any tooltip on the page.
+  const contentRef = useRef<HTMLDivElement | null>(null);
   const getContent = () => {
     if (visible === 'title') {
       return title;
@@ -225,7 +228,11 @@ export function Tooltip({
         } else if (
           e.target !== document &&
           e.target !== document.documentElement &&
-          !eventIsFromInsideTooltip(e as unknown as MouseEvent)
+          !eventIsFromInsideTooltip(e as unknown as MouseEvent) &&
+          // Typing in a tooltip's input can shrink content elsewhere on the page,
+          // firing a scrollTop-clamp scroll event. Don't dismiss out from under
+          // the user while focus is inside this tooltip.
+          !(contentRef.current?.contains(document.activeElement) ?? false)
         ) {
           setVisible(false);
         }
@@ -298,6 +305,7 @@ export function Tooltip({
       {visible && ref.current && (
         <RenderTooltipOnto
           delayMs={realDelayMs}
+          tooltipRef={contentRef}
           element={ref.current}
           placement={placement}
           interactive={interactive}
@@ -334,6 +342,7 @@ function RenderTooltipOnto({
   children,
   delayMs,
   interactive,
+  tooltipRef,
   onTooltipMouseEnter,
   onTooltipMouseLeave,
 }: {
@@ -342,11 +351,11 @@ function RenderTooltipOnto({
   children: ReactNode;
   delayMs?: number;
   interactive?: boolean;
+  tooltipRef: React.MutableRefObject<HTMLDivElement | null>;
   onTooltipMouseEnter?: () => void;
   onTooltipMouseLeave?: () => void;
 }) {
   const sourceBoundingRect = element.getBoundingClientRect();
-  const tooltipRef = useRef<HTMLDivElement | null>(null);
 
   const zoom = getZoomLevel();
   let effectivePlacement = placement;
@@ -382,10 +391,10 @@ function RenderTooltipOnto({
   style.width = 'max-content';
   style.maxWidth = viewportDimensions.width - 2 * pad;
   style.boxSizing = 'border-box';
+  const contentStyle: React.CSSProperties = {overflowY: 'auto'};
   const availableHeight = viewportDimensions.height - (position.top + viewportAdjust.top) - 3 * pad;
   if (availableHeight > 0) {
-    style.maxHeight = availableHeight;
-    style.overflowY = 'auto';
+    contentStyle.maxHeight = Math.max(availableHeight - 2 * pad, 0);
   }
 
   // Use a portal so the tooltip element is rendered into the global list of tooltips,
@@ -410,7 +419,10 @@ function RenderTooltipOnto({
           // we also need to move the arrow the opposite direction so it still lines up.
           style={{transform: `translate(${-viewportAdjust.left}px, ${-viewportAdjust.top}px)`}}
         />
-        {children}
+        {/* Keep the arrow outside the scroll container so its overflow does not create a scrollbar. */}
+        <div className="tooltip-content" style={contentStyle}>
+          {children}
+        </div>
       </div>
     </ViewportOverlay>
   );

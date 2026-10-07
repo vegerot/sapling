@@ -14,6 +14,7 @@ use gotham::state::FromState;
 use gotham::state::State;
 use gotham_derive::StateData;
 use gotham_ext::middleware::request_context::RequestContext;
+use gotham_ext::middleware::scuba::ScubaMiddlewareState;
 use metaconfig_parser::RepoConfigs;
 use metaconfig_types::RepoConfigRef;
 use mononoke_api::Mononoke;
@@ -58,7 +59,17 @@ impl RepositoryRequestContext {
         let req_ctx = state.borrow_mut::<RequestContext>();
         let ctx = req_ctx.ctx.clone();
         let git_ctx = GitServerContext::borrow_from(state);
-        git_ctx.request_context(ctx, method_info, pushvars).await
+        let request_context = git_ctx.request_context(ctx, method_info, pushvars).await?;
+
+        // Per-repo config provenance; mutation id is always None until plumbed.
+        let repo_config = request_context.repo.repo_config();
+        ScubaMiddlewareState::try_borrow_add_repo_config_provenance(
+            state,
+            repo_config.config_version.as_deref(),
+            repo_config.config_mutation_id,
+        );
+
+        Ok(request_context)
     }
 
     pub fn bundle_uri_trusted_only(&self) -> bool {
@@ -92,7 +103,7 @@ pub struct GitServerContextInner {
     tls_args: Option<TLSArgs>,
     // ACL provider for checking group membership
     acl_provider: Arc<dyn AclProvider>,
-    // Optional address (host:port) for the RL Land Service
+    // Optional address (host:port) for the Multi-Repo Land Service
     multi_repo_land_service_address: Option<String>,
     // See `GitimportPreferences::persist_partial_mappings`.
     persist_partial_mappings: bool,
@@ -183,19 +194,37 @@ impl GitServerContext {
             .enforce_auth
     }
 
+    fn repos(&self) -> GitRepos {
+        self.inner
+            .read()
+            .expect("poisoned lock in git server context")
+            .repos
+            .clone()
+    }
+
     pub async fn request_context(
         &self,
         ctx: CoreContext,
         method_info: GitMethodInfo,
         pushvars: Pushvars,
     ) -> Result<RepositoryRequestContext, GitServerContextErrorKind> {
-        // First, try to get the repo from the already loaded repos
+        // First, try the repos assigned to this task, building one that was
+        // assigned lazily. A failed build is reported as is rather than
+        // falling through to the on-demand path below, which would build it
+        // again.
+        let assigned_repo = self.repos().get(&method_info.repo).await.map_err(|e| {
+            GitServerContextErrorKind::RepoSetupError {
+                repo_name: method_info.repo.to_string(),
+                error: e.to_string(),
+            }
+        })?;
+
         let initial_lookup = {
             let inner = self
                 .inner
                 .read()
                 .expect("poisoned lock in git server context");
-            match inner.repos.get(&method_info.repo) {
+            match assigned_repo {
                 Some(repo) => Ok((
                     repo,
                     inner.repos.repo_mgr.repos().clone(),

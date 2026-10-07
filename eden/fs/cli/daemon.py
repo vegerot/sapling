@@ -6,6 +6,7 @@
 
 # pyre-strict
 
+import contextlib
 import datetime
 import os
 import re
@@ -14,7 +15,10 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Tuple, Union
+
+if sys.platform != "win32":
+    import fcntl
 
 from eden.fs.cli.util import (
     EdensparseMigrationStep,
@@ -22,9 +26,9 @@ from eden.fs.cli.util import (
     maybe_edensparse_migration,
 )
 
-from . import daemon_util, proc_utils as proc_utils_mod
+from . import configutil, daemon_util, proc_utils as proc_utils_mod
 from .config import EdenInstance
-from .util import is_apple_silicon, poll_until, print_stderr, ShutdownError
+from .util import get_pid_using_lockfile, poll_until, print_stderr, ShutdownError
 
 # The amount of time to wait for the edenfs process to exit after we send SIGKILL.
 # We normally expect the process to be killed and reaped fairly quickly in this
@@ -41,6 +45,7 @@ DEFAULT_SIGKILL_TIMEOUT = 30.0
 EDENFS_UNIT_NAME_TEMPLATE = "edenfs@{escaped_state_dir}.service"
 EDENFS_SYSTEMD_SERVICE_UNIT = Path("/usr/lib/systemd/user/edenfs@.service")
 EDENFS_SYSTEMD_SLICE_UNIT = Path("/usr/lib/systemd/user/edenfs.slice")
+ENVIRONMENT_VARIABLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _sanitize_unit_name(eden_dir: str) -> str:
@@ -55,13 +60,15 @@ def _sanitize_unit_name(eden_dir: str) -> str:
     return f"edenfs_{sanitized}_{os.getpid()}_{int(time.time())}"
 
 
-def _build_systemd_run_cmd(edenfs_cmd: List[str], eden_dir: str) -> List[str]:
+def _build_systemd_run_cmd(
+    edenfs_cmd: List[str], eden_dir: str, eden_env: Dict[str, str]
+) -> List[str]:
     """Wrap an edenfs command in systemd-run for cgroup isolation.
 
     Places edenfs in a transient scope under a dedicated eden.slice
     """
     unit_name = _sanitize_unit_name(eden_dir)
-    return [
+    cmd = [
         "systemd-run",
         "--user",
         "--scope",
@@ -70,27 +77,31 @@ def _build_systemd_run_cmd(edenfs_cmd: List[str], eden_dir: str) -> List[str]:
         "--property=Delegate=yes",
         "--slice=edenfs",
         f"--unit={unit_name}",
-    ] + edenfs_cmd
+    ]
+    for name, value in eden_env.items():
+        cmd.extend(["-E", f"{name}={value}"])
+    cmd.append("--")
+    cmd.extend(edenfs_cmd)
+    return cmd
 
 
 def _ensure_dbus_env(env: Dict[str, str]) -> bool:
-    """Ensure D-Bus session vars are present in *env*.
+    """Ensure D-Bus session vars are present and correct in *env*.
 
-    If ``XDG_RUNTIME_DIR`` or ``DBUS_SESSION_BUS_ADDRESS`` are missing,
-    falls back to the standard systemd paths derived from the UID.
+    Always computes the expected runtime directory from the current UID
+    rather than trusting inherited environment variables, which may point
+    to a different user's bus after `su`.
 
     Returns True if the vars are now set, False if the D-Bus socket does
     not exist.
     """
-    if "XDG_RUNTIME_DIR" in env and "DBUS_SESSION_BUS_ADDRESS" in env:
-        return True
     uid = os.getuid()
-    xdg_runtime_dir = env.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+    xdg_runtime_dir = f"/run/user/{uid}"
     dbus_socket = f"{xdg_runtime_dir}/bus"
     if not os.path.exists(dbus_socket):
         return False
-    env.setdefault("XDG_RUNTIME_DIR", xdg_runtime_dir)
-    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={dbus_socket}")
+    env["XDG_RUNTIME_DIR"] = xdg_runtime_dir
+    env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={dbus_socket}"
     return True
 
 
@@ -103,24 +114,19 @@ def get_systemd_user_env() -> Optional[Dict[str, str]]:
 
 
 def _try_setup_systemd_env(
-    eden_env: Dict[str, str],
+    systemd_env: Dict[str, str],
     instance: "EdenInstance",
 ) -> bool:
-    """Ensure the D-Bus session env vars are available for systemd --user commands.
+    """Prepare *systemd_env* for systemd --user commands via _ensure_dbus_env.
 
-    get_edenfs_environment() preserves them from os.environ when present.
-    When invoked from a system service (e.g. edenfs_restarter timer), they may
-    be missing.  Fall back to the standard systemd paths derived from the UID.
-    If the D-Bus socket does not exist, skip systemd entirely.
-
-    Returns True if the env is ready, False to fall back to direct daemon
-    management.
+    Logs a telemetry sample and returns False (fall back to direct daemon
+    management) when the D-Bus socket is unavailable; returns True otherwise.
     """
-    if not _ensure_dbus_env(eden_env):
+    if not _ensure_dbus_env(systemd_env):
         instance.log_sample(
             "systemd_setup",
             success=False,
-            reason=f"dbus_socket_not_found at {eden_env.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')}/bus",
+            reason=f"dbus_socket_not_found at /run/user/{os.getuid()}/bus",
         )
         return False
     return True
@@ -212,6 +218,57 @@ def _send_sigkill(
         )
 
 
+def _may_remove_restart_sentinel(pid: int, config_dir: Path) -> bool:
+    """Whether pid's killer may remove config_dir's restart sentinel.
+
+    True when pid holds the lock, or when the lock file is absent so that no
+    daemon owns the state dir. A lock file that exists but cannot be read or
+    parsed counts as a live owner.
+    """
+    try:
+        return get_pid_using_lockfile(config_dir) == pid
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+@contextlib.contextmanager
+def _restart_lock(config_dir: Path) -> Iterator[None]:
+    """Serialize restart arming with a deliberate SIGKILL.
+
+    Raises ShutdownError rather than proceeding unlocked: killing while a
+    daemon arms would let the privhelper relaunch the daemon this kill is
+    meant to retire.
+    """
+    lock_path = config_dir / daemon_util.RESTART_SENTINEL_LOCK_NAME
+    with contextlib.ExitStack() as stack:
+        try:
+            lock_file = stack.enter_context(lock_path.open("a"))
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except OSError as ex:
+            raise ShutdownError(
+                f"Failed to acquire restart lock {lock_path}: {ex}"
+            ) from ex
+        yield
+
+
+def _remove_restart_sentinels(pid: int, config_dir: Path) -> None:
+    prefix = f"{daemon_util.RESTART_SENTINEL_NAME_PREFIX}{pid}."
+    try:
+        sentinels = list(config_dir.glob(f"{prefix}*"))
+    except OSError as ex:
+        print_stderr(f"Failed to list restart sentinels in {config_dir}: {ex}")
+        return
+    for sentinel in sentinels:
+        try:
+            sentinel.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as ex:
+            print_stderr(f"Failed to delete restart sentinel {sentinel}: {ex}")
+
+
 def sigkill_process(
     pid: int,
     config_dir: Path,
@@ -244,7 +301,18 @@ def sigkill_process(
         except Exception as e:
             print_stderr(f"Failed to delete heartbeat file {heartbeat_file}: {e}")
 
-    _send_sigkill(pid, instance)
+        if sys.platform == "darwin":
+            with _restart_lock(config_dir):
+                # Only pid's own sentinels are removed. A concurrent generation
+                # that took ownership while this call waited is left alone.
+                if _may_remove_restart_sentinel(pid, config_dir):
+                    _remove_restart_sentinels(pid, config_dir)
+                _send_sigkill(pid, instance)
+        else:
+            _send_sigkill(pid, instance)
+
+    else:
+        _send_sigkill(pid, instance)
 
     if timeout <= 0:
         return
@@ -301,6 +369,54 @@ def gracefully_restart_edenfs_service(
     return result
 
 
+def _daemon_args_file(instance: EdenInstance) -> Path:
+    return instance.state_dir / daemon_util.DAEMON_ARGS_FILENAME
+
+
+def _try_write_daemon_args_file(
+    instance: EdenInstance,
+    cmd: List[str],
+    eden_env: Dict[str, str],
+    restart_cmd: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Record the daemon command and environment in the state directory.
+
+    Returns the failure message, or None if the file was written.
+    """
+    try:
+        instance.state_dir.mkdir(parents=True, exist_ok=True)
+        daemon_util.write_daemon_args_file(
+            instance.state_dir, cmd, eden_env, restart_cmd
+        )
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            _daemon_args_file(instance).unlink(missing_ok=True)
+        return str(e)
+    except Exception as e:
+        # best-effort
+        return str(e)
+    return None
+
+
+def _warn_daemon_args_file_failure(instance: EdenInstance, error: str) -> None:
+    """Warn that the daemon command could not be recorded."""
+    # A state directory that refuses the write usually refuses the removal of
+    # the earlier file too, which leaves that command armed instead of none.
+    # An unreadable state directory gets the same benefit of the doubt.
+    try:
+        stale_file_survives = _daemon_args_file(instance).exists()
+    except OSError:
+        stale_file_survives = True
+    consequence = (
+        "edenfs may be auto-restarted from an earlier start's command"
+        if stale_file_survives
+        else "edenfs will not be auto-restarted after a crash"
+    )
+    print_stderr(
+        f"warning: failed to write the daemon args file: {error}; {consequence}"
+    )
+
+
 def _start_edenfs_service(
     instance: EdenInstance,
     daemon_binary: Optional[str] = None,
@@ -312,39 +428,75 @@ def _start_edenfs_service(
     daemon_binary = daemon_util.find_daemon_binary(daemon_binary)
     cmd, privhelper = get_edenfs_cmd(instance, daemon_binary)
 
+    # Snapshot the relaunch command before `--takeover` and the sudo wrapper,
+    # neither of which may be replayed. Must stay above
+    # `prepare_edenfs_privileges`.
+    restart_cmd = list(cmd)
+
     if takeover:
         cmd.append("--takeover")
     if edenfs_args:
+        # A restarted daemon should behave like the one it replaces.
         cmd.extend(edenfs_args)
+        restart_cmd.extend(edenfs_args)
 
-    eden_env = get_edenfs_environment(preserved_env)
+    eden_env = get_edenfs_environment(instance, preserved_env)
+    systemd_env = os.environ.copy()
 
     # Wrap the command in sudo, if necessary. See help text in
     # prepare_edenfs_privileges for more info.
     cmd, eden_env = prepare_edenfs_privileges(daemon_binary, cmd, eden_env, privhelper)
 
-    if should_use_systemd_lifecycle_management(instance) and _try_setup_systemd_env(
-        eden_env, instance
-    ):
-        return _systemctl_start_or_reload(instance, cmd, eden_env, takeover)
+    use_systemd = should_use_systemd_lifecycle_management(
+        instance
+    ) and _try_setup_systemd_env(systemd_env, instance)
+
+    # Windows has neither systemd nor a privhelper, so nothing there reads the
+    # file back. Off systemd the only reader is privhelper restart, which the
+    # daemon arms from this same knob.
+    write_args_file = sys.platform != "win32" and (
+        use_systemd
+        or instance.get_config_bool("privhelper.restart-edenfs-on-crash", default=False)
+    )
+
+    args_file_error = (
+        _try_write_daemon_args_file(instance, cmd, eden_env, restart_cmd)
+        if write_args_file
+        else None
+    )
+
+    if use_systemd:
+        if args_file_error is not None:
+            # systemd launches the daemon from the file rather than from this
+            # command, so there is nothing left for it to start.
+            print_stderr(
+                f"error: failed to write the daemon args file: {args_file_error}"
+            )
+            return 1
+        return _systemctl_start_or_reload(instance, systemd_env, takeover)
+
+    if args_file_error is not None:
+        _warn_daemon_args_file_failure(instance, args_file_error)
 
     if (
         sys.platform == "linux"
         and instance.get_config_bool(
             "experimental.systemd-cgroup-isolation", default=False
         )
-        and _try_setup_systemd_env(eden_env, instance)
+        and _try_setup_systemd_env(systemd_env, instance)
     ):
-        cmd = _build_systemd_run_cmd(cmd, str(instance.state_dir))
+        cmd = _build_systemd_run_cmd(cmd, str(instance.state_dir), eden_env)
+        launch_env = systemd_env
         use_systemd_cgroup = True
     else:
+        launch_env = eden_env
         use_systemd_cgroup = False
 
     creation_flags = 0
 
     maybe_edensparse_migration(instance, EdensparseMigrationStep.PRE_EDEN_START)
     exit_code = subprocess.call(
-        cmd, stdin=subprocess.DEVNULL, env=eden_env, creationflags=creation_flags
+        cmd, stdin=subprocess.DEVNULL, env=launch_env, creationflags=creation_flags
     )
     maybe_edensparse_migration(instance, EdensparseMigrationStep.POST_EDEN_START)
 
@@ -492,17 +644,10 @@ def _extract_daemon_error(startup_log_content: str) -> Optional[str]:
 
 def _systemctl_start_or_reload(
     instance: EdenInstance,
-    cmd: List[str],
-    eden_env: Dict[str, str],
+    systemd_env: Dict[str, str],
     takeover: bool,
 ) -> int:
-    """Start or reload the edenfs systemd service.
-
-    Writes the daemon command and environment to an args file, then calls
-    systemctl start (fresh start) or systemctl reload (takeover).
-    """
-    instance.state_dir.mkdir(parents=True, exist_ok=True)
-    daemon_util.write_systemd_args_file(instance.state_dir, cmd, eden_env)
+    """Start or reload the edenfs systemd service."""
     unit = _get_systemd_unit(instance)
     if takeover and _is_systemd_unit_active(unit):
         action = "reload"
@@ -521,7 +666,7 @@ def _systemctl_start_or_reload(
         ["systemctl", "--user", action, unit],
         capture_output=True,
         text=True,
-        env=eden_env,
+        env=systemd_env,
     )
     rc = result.returncode
 
@@ -580,12 +725,7 @@ def get_edenfs_cmd(
 ) -> Tuple[List[str], str]:
     """Get the command line arguments to use to start the edenfs daemon."""
 
-    cmd = []
-    if is_apple_silicon():
-        # Prefer native arch on ARM64, fallback to x86_64 otherwise
-        cmd += ["arch", "-arch", "arm64", "-arch", "x86_64"]
-
-    cmd += [
+    cmd = [
         daemon_binary,
         "--edenfs",
         "--edenfsctlPath",
@@ -668,7 +808,44 @@ def prepare_edenfs_privileges(
     return cmd, env
 
 
+def _apply_configured_environment(
+    instance: EdenInstance, eden_env: Dict[str, str]
+) -> None:
+    configured_environment = instance.get_config_strs(
+        "daemon.environment", default=configutil.Strs([])
+    )
+    _apply_environment_entries(configured_environment, eden_env)
+
+
+def _apply_environment_entries(
+    configured_environment: configutil.Strs, eden_env: Dict[str, str]
+) -> None:
+    for index, entry in enumerate(configured_environment):
+        name, separator, value = entry.partition("=")
+        if not separator or not name:
+            print_stderr(
+                "warning: ignoring invalid daemon.environment entry at index "
+                f"{index}: expected NAME=value with a non-empty name"
+            )
+            continue
+        if "\0" in name or "\0" in value:
+            print_stderr(
+                f"warning: ignoring invalid daemon.environment entry at index {index}: "
+                "names and values must not contain NUL"
+            )
+            continue
+        if ENVIRONMENT_VARIABLE_NAME_RE.fullmatch(name) is None:
+            print_stderr(
+                f"warning: ignoring invalid daemon.environment entry at index {index}: "
+                "name must contain only ASCII letters, digits, and underscores, and "
+                "must not start with a digit"
+            )
+            continue
+        eden_env[name] = value
+
+
 def get_edenfs_environment(
+    instance: EdenInstance,
     extra_preserve: Optional[List[str]],
 ) -> Dict[str, str]:
     """Get the environment to use to start the edenfs daemon."""
@@ -722,6 +899,7 @@ def get_edenfs_environment(
         "ATLAS",
         # Identifier of dev docker containers
         "ATLAS_ENV_ID",
+        "CI_PURPOSE",
         "SANDCASTLE",
         "SANDCASTLE_ALIAS",
         "SANDCASTLE_INSTANCE_ID",
@@ -761,16 +939,7 @@ def get_edenfs_environment(
         # when starting edenfs with cgroup isolation.
         "XDG_RUNTIME_DIR",
         "DBUS_SESSION_BUS_ADDRESS",
-        # Used to identify if edenfs was started by a coding agent
-        "CODING_AGENT_METADATA",
     ]
-
-    # Add user-specified environment variables to preserve
-    #
-    # TODO: If users specify problematic environment variables, we may consider
-    # adding a blocklist to prevent them from being preserved.
-    if extra_preserve is not None:
-        preserve.extend(extra_preserve)
 
     if sys.platform == "win32":
         preserve += [
@@ -800,4 +969,9 @@ def get_edenfs_environment(
             # Drop any environment variable not matching the above cases
             pass
 
+    _apply_configured_environment(instance, eden_env)
+    if extra_preserve is not None:
+        for name in extra_preserve:
+            if name in os.environ:
+                eden_env[name] = os.environ[name]
     return eden_env

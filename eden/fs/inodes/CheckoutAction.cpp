@@ -11,19 +11,41 @@
 #include <folly/coro/Invoke.h>
 #include <folly/coro/Task.h>
 #include <folly/logging/xlog.h>
+#include <cerrno>
 
 #include "eden/fs/inodes/CheckoutContext.h"
+#include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/FileInode.h"
 #include "eden/fs/inodes/InodeBase.h"
+#include "eden/fs/inodes/InodeError.h"
 #include "eden/fs/inodes/TreeInode.h"
+#include "eden/fs/journal/Journal.h"
 #include "eden/fs/model/Tree.h"
 #include "eden/fs/model/TreeEntry.h"
 #include "eden/fs/service/gen-cpp2/eden_types.h"
 #include "eden/fs/store/ObjectStore.h"
+#include "eden/fs/telemetry/EdenStats.h"
 
 using folly::exception_wrapper;
 
 namespace facebook::eden {
+
+namespace {
+/**
+ * The commit transition journaled at the end of a checkout only covers tracked
+ * paths, so removing an untracked file has to be recorded on its own.
+ * replaceFileEntry() requests invalidation only after unlinking the entry.
+ */
+void journalRemovedFile(
+    EdenMount* mount,
+    const std::optional<RelativePath>& path,
+    dtype_t dtype,
+    const CheckoutActionResult& result) {
+  if (path && result.invalidationRequired == InvalidationRequired::Yes) {
+    mount->getJournal().recordRemoved(*path, dtype);
+  }
+}
+} // namespace
 
 CheckoutAction::CheckoutAction(
     CheckoutContext* ctx,
@@ -186,6 +208,7 @@ ImmediateFuture<CheckoutActionResult> CheckoutAction::run(
                   self->errors_[0]);
             }
 
+            self->handleOldTreeRestriction();
             return self->doAction();
           });
 }
@@ -321,6 +344,7 @@ folly::coro::now_task<CheckoutActionResult> CheckoutAction::co_run(
     errors_[0].throw_exception();
   }
 
+  handleOldTreeRestriction();
   co_return co_await co_doAction();
 }
 
@@ -360,6 +384,37 @@ void CheckoutAction::error(
   errors_.push_back(std::move(ew));
 }
 
+void CheckoutAction::handleOldTreeRestriction() {
+  auto treeInode = inode_.asTreePtrOrNull();
+  const bool oldTreeBecameRestricted = oldScmEntry_ &&
+      oldScmEntry_->second.isTree() && oldTree_ && oldTree_->isRestricted() &&
+      treeInode && !treeInode->isRestricted();
+  // The destination-restricted condition is load bearing, not a narrowing
+  // heuristic. A restricted tree fetches as empty, so this is the exact
+  // transition that reaches the restricted-destination local-only handling:
+  // the now-restricted old tree is taken as an authoritative empty source, and
+  // NORMAL removes the live entries before installing the placeholder, wiping
+  // locally modified files. A non-restricted destination, or a removal of the
+  // entry outright, instead runs through the existing conflict detection and
+  // non-empty-directory safeguards, which already refuse to discard that data.
+  const bool destinationIsRestricted =
+      (newScmEntry_ && newScmEntry_->second.isTree() &&
+       newScmEntry_->second.isRestricted()) ||
+      (newTree_ && newTree_->isRestricted());
+  if (!oldTreeBecameRestricted || !destinationIsRestricted) {
+    return;
+  }
+
+  if (ctx_->forceUpdate()) {
+    oldTree_.reset();
+    oldScmEntry_.reset();
+    return;
+  }
+
+  throw InodeError(
+      EACCES, inode_, "old source tree became restricted during checkout");
+}
+
 ImmediateFuture<CheckoutActionResult> CheckoutAction::doAction() {
   // All the data is ready and we're ready to go!
 
@@ -377,21 +432,21 @@ ImmediateFuture<CheckoutActionResult> CheckoutAction::doAction() {
           auto treeInode = self->inode_.asTreeOrNull();
           auto increase = treeInode ? treeInode->getInMemoryDescendants() : 0;
           self->ctx_->increaseCheckoutCounter(1 + increase);
-          // We only report conflicts for files, not directories. The only
-          // possible conflict that can occur here if this inode is a TreeInode
-          // is that the old source control state was for a file. There aren't
-          // really any other conflicts than this to report, even if we recurse.
-          // Anything inside this directory is basically just untracked (or
-          // possibly ignored) files.
           return CheckoutActionResult{
               InvalidationRequired::No, /*hadConflicts=*/true};
         }
 
         if (!self->oldScmEntry_ && !self->newScmEntry_) {
           auto treeInode = self->inode_.asTreePtrOrNull();
-          if (self->ctx_->forceUpdate() && !self->ctx_->isDryRun() &&
-              !treeInode) {
+          if (!self->ctx_->isDryRun() &&
+              (!treeInode || treeInode->isRestricted())) {
             auto parent = self->inode_->getParent(self->ctx_->renameLock());
+            std::optional<RelativePath> removedPath;
+            if (!treeInode) {
+              removedPath = self->inode_->getPath();
+            }
+            auto dtype = self->inode_->getType();
+            auto* mount = self->inode_->getMount();
             return parent
                 ->checkoutUpdateEntry(
                     self->ctx_,
@@ -399,12 +454,16 @@ ImmediateFuture<CheckoutActionResult> CheckoutAction::doAction() {
                     std::move(self->inode_),
                     nullptr,
                     nullptr,
-                    std::nullopt)
-                .thenValue(
-                    [conflictWasAddedToCtx](CheckoutActionResult result) {
-                      result.hadConflicts |= conflictWasAddedToCtx;
-                      return result;
-                    });
+                    std::nullopt,
+                    /*removeLocalOnly=*/false)
+                .thenValue([conflictWasAddedToCtx,
+                            removedPath = std::move(removedPath),
+                            dtype,
+                            mount](CheckoutActionResult result) {
+                  journalRemovedFile(mount, removedPath, dtype, result);
+                  result.hadConflicts |= conflictWasAddedToCtx;
+                  return result;
+                });
           }
           if (!treeInode) {
             return CheckoutActionResult{
@@ -420,7 +479,7 @@ ImmediateFuture<CheckoutActionResult> CheckoutAction::doAction() {
                   [self, conflictWasAddedToCtx](CheckoutSubtreeResult result)
                       -> ImmediateFuture<CheckoutActionResult> {
                     result.hadConflicts |= conflictWasAddedToCtx;
-                    if (self->ctx_->forceUpdate() && !self->ctx_->isDryRun()) {
+                    if (!self->ctx_->isDryRun()) {
                       auto parent =
                           self->inode_->getParent(self->ctx_->renameLock());
                       return parent
@@ -430,7 +489,8 @@ ImmediateFuture<CheckoutActionResult> CheckoutAction::doAction() {
                               std::move(self->inode_),
                               nullptr,
                               nullptr,
-                              std::nullopt)
+                              std::nullopt,
+                              /*removeLocalOnly=*/false)
                           .thenValue([hadConflicts = result.hadConflicts](
                                          CheckoutActionResult actionResult) {
                             actionResult.hadConflicts |= hadConflicts;
@@ -458,7 +518,8 @@ ImmediateFuture<CheckoutActionResult> CheckoutAction::doAction() {
                 std::move(self->inode_),
                 std::move(self->oldTree_),
                 std::move(self->newTree_),
-                self->newScmEntry_)
+                self->newScmEntry_,
+                self->removeLocalOnly_)
             .thenValue([conflictWasAddedToCtx](CheckoutActionResult result) {
               result.hadConflicts |= conflictWasAddedToCtx;
               return result;
@@ -478,20 +539,20 @@ folly::coro::now_task<CheckoutActionResult> CheckoutAction::co_doAction() {
     auto treeInode = inode_.asTreeOrNull();
     auto increase = treeInode ? treeInode->getInMemoryDescendants() : 0;
     ctx_->increaseCheckoutCounter(1 + increase);
-    // We only report conflicts for files, not directories. The only
-    // possible conflict that can occur here if this inode is a TreeInode
-    // is that the old source control state was for a file. There aren't
-    // really any other conflicts than this to report, even if we recurse.
-    // Anything inside this directory is basically just untracked (or
-    // possibly ignored) files.
     co_return CheckoutActionResult{
         InvalidationRequired::No, /*hadConflicts=*/true};
   }
 
   if (!oldScmEntry_ && !newScmEntry_) {
     auto treeInode = inode_.asTreePtrOrNull();
-    if (ctx_->forceUpdate() && !ctx_->isDryRun() && !treeInode) {
+    if (!ctx_->isDryRun() && (!treeInode || treeInode->isRestricted())) {
       auto parent = inode_->getParent(ctx_->renameLock());
+      std::optional<RelativePath> removedPath;
+      if (!treeInode) {
+        removedPath = inode_->getPath();
+      }
+      auto dtype = inode_->getType();
+      auto* mount = inode_->getMount();
       auto result = co_await parent
                         ->checkoutUpdateEntry(
                             ctx_,
@@ -499,8 +560,10 @@ folly::coro::now_task<CheckoutActionResult> CheckoutAction::co_doAction() {
                             std::move(inode_),
                             nullptr,
                             nullptr,
-                            std::nullopt)
+                            std::nullopt,
+                            /*removeLocalOnly=*/false)
                         .semi();
+      journalRemovedFile(mount, removedPath, dtype, result);
       result.hadConflicts |= conflictWasAddedToCtx;
       co_return result;
     }
@@ -511,7 +574,7 @@ folly::coro::now_task<CheckoutActionResult> CheckoutAction::co_doAction() {
     auto result = co_await treeInode->co_checkout(
         ctx_, nullptr, nullptr, /*reportLocalOnlyAsConflicts=*/true);
     bool hadConflicts = result.hadConflicts || conflictWasAddedToCtx;
-    if (ctx_->forceUpdate() && !ctx_->isDryRun()) {
+    if (!ctx_->isDryRun()) {
       auto parent = inode_->getParent(ctx_->renameLock());
       auto actionResult = co_await parent
                               ->checkoutUpdateEntry(
@@ -520,7 +583,8 @@ folly::coro::now_task<CheckoutActionResult> CheckoutAction::co_doAction() {
                                   std::move(inode_),
                                   nullptr,
                                   nullptr,
-                                  std::nullopt)
+                                  std::nullopt,
+                                  /*removeLocalOnly=*/false)
                               .semi();
       actionResult.hadConflicts |= hadConflicts;
       co_return actionResult;
@@ -543,7 +607,8 @@ folly::coro::now_task<CheckoutActionResult> CheckoutAction::co_doAction() {
       std::move(inode_),
       std::move(oldTree_),
       std::move(newTree_),
-      newScmEntry_);
+      newScmEntry_,
+      removeLocalOnly_);
   result.hadConflicts |= conflictWasAddedToCtx;
   co_return result;
 }
@@ -553,7 +618,8 @@ ImmediateFuture<bool> CheckoutAction::hasConflict() {
     return *syncResult;
   }
 
-  // Async tail: compare file contents against the old source control entry.
+  // Compare the source first to avoid fetching the destination in the common
+  // case where the working copy is unmodified.
   auto fileInode = inode_.asFilePtrOrNull();
   return fileInode
       ->isSameAs(
@@ -561,9 +627,25 @@ ImmediateFuture<bool> CheckoutAction::hasConflict() {
           oldBlobSha1_.value(),
           oldScmEntry_.value().second.getType(),
           ctx_->getFetchContext())
-      .thenValue([self = shared_from_this()](bool isSame) {
-        return self->classifyFileContentConflict(isSame);
-      });
+      .thenValue(
+          [self = shared_from_this()](
+              bool isSameAsSource) -> ImmediateFuture<bool> {
+            if (isSameAsSource || !self->newBlobMarker_) {
+              return self->classifyFileContentConflict(isSameAsSource);
+            }
+
+            auto fileInode = self->inode_.asFilePtrOrNull();
+            const auto& destination = self->newScmEntry_.value().second;
+            return fileInode
+                ->isSameAs(
+                    destination.getObjectId(),
+                    destination.getType(),
+                    self->ctx_->getFetchContext())
+                .thenValue([self](bool isSameAsDestination) {
+                  return self->classifyFileDestinationConflict(
+                      isSameAsDestination);
+                });
+          });
 }
 
 std::optional<bool> CheckoutAction::checkSyncConflict() {
@@ -571,7 +653,10 @@ std::optional<bool> CheckoutAction::checkSyncConflict() {
     auto treeInode = inode_.asTreePtrOrNull();
     if (!treeInode) {
       // This was a directory, but has been replaced with a file on disk
-      ctx_->addConflict(ConflictType::MODIFIED_MODIFIED, inode_.get());
+      ctx_->addConflict(
+          newScmEntry_ ? ConflictType::MODIFIED_MODIFIED
+                       : ConflictType::MODIFIED_REMOVED,
+          inode_.get());
       return true;
     }
 
@@ -585,9 +670,8 @@ std::optional<bool> CheckoutAction::checkSyncConflict() {
   } else if (oldBlobSha1_) {
     auto fileInode = inode_.asFilePtrOrNull();
     if (!fileInode) {
-      // This was a file, but has been replaced with a directory on disk
-      ctx_->addConflict(ConflictType::MODIFIED_MODIFIED, inode_.get());
-      return true;
+      // The local directory's children must be compared with the destination.
+      return false;
     }
 
     // Caller must perform the async FileInode::isSameAs check.
@@ -601,7 +685,10 @@ std::optional<bool> CheckoutAction::checkSyncConflict() {
     if (inode_.asTreePtrOrNull()) {
       return false;
     }
-    ctx_->addConflict(ConflictType::UNTRACKED_ADDED, inode_.get());
+    if (!ctx_->isDryRun()) {
+      return false;
+    }
+    ctx_->addConflict(ConflictType::VISIBLE_RESTRICTED, inode_.get());
     return true;
   }
 
@@ -638,17 +725,37 @@ bool CheckoutAction::classifyFileContentConflict(bool isSame) {
   return true;
 }
 
+bool CheckoutAction::classifyFileDestinationConflict(bool isSameAsDestination) {
+  if (isSameAsDestination) {
+    if (!ctx_->isDryRun()) {
+      inode_->getMount()->getStats()->increment(
+          &CheckoutStats::avoidedDestinationConflicts);
+    }
+    return false;
+  }
+  return classifyFileContentConflict(false);
+}
+
 folly::coro::now_task<bool> CheckoutAction::co_hasConflict() {
   if (auto syncResult = checkSyncConflict()) {
     co_return *syncResult;
   }
 
   auto fileInode = inode_.asFilePtrOrNull();
-  bool isSame = co_await fileInode->co_isSameAs(
+  bool isSameAsSource = co_await fileInode->co_isSameAs(
       oldScmEntry_.value().second.getObjectId(),
       oldBlobSha1_.value(),
       oldScmEntry_.value().second.getType(),
       ctx_->getFetchContext());
-  co_return classifyFileContentConflict(isSame);
+  if (isSameAsSource || !newBlobMarker_) {
+    co_return classifyFileContentConflict(isSameAsSource);
+  }
+
+  const auto& destination = newScmEntry_.value().second;
+  bool isSameAsDestination = co_await fileInode->co_isSameAs(
+      destination.getObjectId(),
+      destination.getType(),
+      ctx_->getFetchContext());
+  co_return classifyFileDestinationConflict(isSameAsDestination);
 }
 } // namespace facebook::eden

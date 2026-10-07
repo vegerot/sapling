@@ -10,6 +10,7 @@
 #include "eden/fs/inodes/fscatalog/FsInodeCatalog.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 
 #include <boost/filesystem.hpp>
@@ -21,6 +22,8 @@
 #include <folly/File.h>
 #include <folly/FileUtil.h>
 #include <folly/Range.h>
+#include <folly/String.h>
+#include <folly/Varint.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
 #include <folly/lang/ToAscii.h>
@@ -29,6 +32,7 @@
 
 #include <thrift/lib/cpp2/protocol/CompactProtocol.h>
 
+#include "eden/common/utils/Bug.h"
 #include "eden/common/utils/FileUtils.h"
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/common/utils/Throw.h"
@@ -220,6 +224,7 @@ struct statfs FsFileContentStore::statFs() const {
 }
 
 void FsFileContentStore::close() {
+  walFileCache_.wlock()->entries.clear();
   dirFile_.close();
   infoFile_.close();
 }
@@ -416,7 +421,11 @@ void FsInodeCatalog::saveOverlayDir(
   iov[1].iov_base = const_cast<char*>(serializedData.data());
   iov[1].iov_len = serializedData.size();
   (void)core_->createOverlayFileImpl(
-      inodeNumber, iov.data(), iov.size(), crashSafe);
+      inodeNumber,
+      iov.data(),
+      iov.size(),
+      crashSafe,
+      /*removeOnFailure=*/false);
 }
 
 void FsInodeCatalog::saveOverlayEntries(
@@ -457,20 +466,22 @@ void FsInodeCatalog::saveOverlayEntries(
   iov[0].iov_len = header.size();
   serializedBuf->appendToIov(&iov);
   (void)core_->createOverlayFileImpl(
-      inodeNumber, iov.data(), iov.size(), crashSafe);
+      inodeNumber,
+      iov.data(),
+      iov.size(),
+      crashSafe,
+      /*removeOnFailure=*/false);
 }
 
-bool FsInodeCatalog::loadOverlayEntries(
+namespace {
+
+void loadOverlayEntriesFromData(
     InodeNumber inodeNumber,
-    OverlayEntryLoader loader) {
+    folly::StringPiece rawData,
+    InodeCatalog::OverlayEntryLoader loader) {
   using apache::thrift::protocol::TType;
 
-  auto rawData = core_->loadRawOverlayDir(inodeNumber);
-  if (!rawData) {
-    return false;
-  }
-
-  auto buf = folly::IOBuf::wrapBuffer(rawData->data(), rawData->size());
+  auto buf = folly::IOBuf::wrapBuffer(rawData.data(), rawData.size());
   apache::thrift::CompactProtocolReader reader;
   reader.setInput(buf.get());
 
@@ -513,17 +524,17 @@ bool FsInodeCatalog::loadOverlayEntries(
 
   // Each map entry is at least a few bytes (varint string length + struct
   // stop field), so mapSize cannot plausibly exceed the raw data size.
-  if (mapSize > rawData->size()) {
+  if (mapSize > rawData.size()) {
     throw_<std::runtime_error>(
         "corrupt overlay for inode ",
         inodeNumber,
         ": map size ",
         mapSize,
         " exceeds data size ",
-        rawData->size());
+        rawData.size());
   }
 
-  loader(mapSize, [&](OverlayEntryVisitor visitor) {
+  loader(mapSize, [&](InodeCatalog::OverlayEntryVisitor visitor) {
     std::string name;
     for (uint32_t i = 0; i < mapSize; ++i) {
       reader.readString(name);
@@ -539,7 +550,90 @@ bool FsInodeCatalog::loadOverlayEntries(
     reader.readFieldBegin(fieldName, fieldType, fieldId);
     reader.readStructEnd();
   });
+}
 
+template <typename... Args>
+fsck::InodeInfo makeInodeError(InodeNumber number, Args&&... args) {
+  return fsck::InodeInfo(
+      number,
+      fsck::InodeType::Error,
+      fmt::to_string(
+          fmt::join(std::make_tuple(std::forward<Args>(args)...), "")));
+}
+
+fsck::InodeInfo readInodeInfoFromFile(InodeNumber number, folly::File& file) {
+  std::array<char, FsFileContentStore::kHeaderLength> headerContents{};
+  auto readResult =
+      folly::readFull(file.fd(), headerContents.data(), headerContents.size());
+  if (readResult < 0) {
+    return makeInodeError(
+        number, "error reading from file: ", folly::errnoStr(errno));
+  } else if (readResult != FsFileContentStore::kHeaderLength) {
+    return makeInodeError(
+        number,
+        fmt::format(
+            "file was too short to contain overlay header: read {} bytes, expected {} bytes",
+            readResult,
+            FsFileContentStore::kHeaderLength));
+  }
+
+  static_assert(
+      FsFileContentStore::kHeaderIdentifierDir.size() ==
+          FsFileContentStore::kHeaderIdentifierFile.size(),
+      "both header IDs must have the same length");
+  StringPiece typeID(
+      headerContents.data(),
+      headerContents.data() + FsFileContentStore::kHeaderIdentifierDir.size());
+
+  uint32_t versionBE;
+  memcpy(
+      &versionBE,
+      headerContents.data() + FsFileContentStore::kHeaderIdentifierDir.size(),
+      sizeof(uint32_t));
+  auto version = folly::Endian::big(versionBE);
+  if (version != FsFileContentStore::kHeaderVersion) {
+    return makeInodeError(
+        number, "unknown overlay file format version ", version);
+  }
+
+  if (typeID == FsFileContentStore::kHeaderIdentifierDir) {
+    return fsck::InodeInfo(number, fsck::InodeType::Dir);
+  } else if (typeID == FsFileContentStore::kHeaderIdentifierFile) {
+    return fsck::InodeInfo(number, fsck::InodeType::File);
+  }
+  return makeInodeError(
+      number,
+      "unknown overlay file type ID: ",
+      folly::hexlify(ByteRange{typeID}));
+}
+
+folly::File openFileNoVerifyWithFlags(
+    int dirFd,
+    AbsolutePathPiece localDir,
+    InodeNumber inodeNumber,
+    const InodePath& path,
+    int flags) {
+  int fd = openat(dirFd, path.c_str(), flags | O_CLOEXEC | O_NOFOLLOW);
+  folly::checkUnixError(
+      fd,
+      fmt::format(
+          "error opening overlay file for inode {} in {}",
+          inodeNumber,
+          localDir.view()));
+  return folly::File{fd, /* ownsFd */ true};
+}
+
+} // namespace
+
+bool FsInodeCatalog::loadOverlayEntries(
+    InodeNumber inodeNumber,
+    OverlayEntryLoader loader) {
+  auto rawData = core_->loadRawOverlayDir(inodeNumber);
+  if (!rawData) {
+    return false;
+  }
+
+  loadOverlayEntriesFromData(inodeNumber, *rawData, loader);
   return true;
 }
 
@@ -583,142 +677,433 @@ WalPath FsFileContentStore::getWalPath(InodeNumber inodeNumber) {
   return walPath;
 }
 
+namespace {
+constexpr size_t kWalVersionOffset =
+    FsFileContentStore::kWalHeaderIdentifier.size();
+constexpr size_t kWalVersionedPrefixLength =
+    kWalVersionOffset + sizeof(uint32_t);
+
+// The v2 header is only the shared identifier and version prefix.
+static_assert(
+    FsFileContentStore::kWalVersion2HeaderLength == kWalVersionedPrefixLength);
+
+/** Bytes before the first record in a file of `format`; v1 is headerless. */
+size_t walHeaderLength(WalFormat format) {
+  switch (format) {
+    case WalFormat::Version1:
+      return 0;
+    case WalFormat::Version2:
+      return FsFileContentStore::kWalVersion2HeaderLength;
+  }
+  throw std::runtime_error(
+      fmt::format(
+          "cannot size WAL header for format {}", static_cast<int>(format)));
+}
+
+// A v1 frame needs at least an entryLen and an op byte. Anything shorter
+// cannot be a record in any format.
+constexpr size_t kWalMinFrameSize = sizeof(uint32_t) + sizeof(uint8_t);
+
+/** Map an OVWL header version to its format; throws for unknown versions. */
+WalFormat walFormatForVersion(uint32_t version, InodeNumber parent) {
+  // Add a case here when introducing a new on-disk WAL version.
+  switch (version) {
+    case FsFileContentStore::kWalVersion2:
+      return WalFormat::Version2;
+    default:
+      throw std::runtime_error(
+          fmt::format(
+              "unsupported WAL format version {} for inode {}",
+              version,
+              parent));
+  }
+}
+
+struct WalHeader {
+  WalFormat format{WalFormat::Version1};
+  size_t recordsOffset{0};
+  // The file is too short to hold any record, or ends inside its versioned
+  // header. Either way it holds nothing recoverable; callers treat it as a
+  // torn write to heal rather than an error to surface.
+  bool torn{false};
+};
+
+/**
+ * Classify a WAL from its leading bytes. `prefix` is the first
+ * min(fileSize, kWalVersionedPrefixLength) bytes of a file of `fileSize`
+ * bytes; the reader passes the whole file. Headerless files are Version1.
+ * Throws for an unknown version, so a newer file is never misread as
+ * Version1 records.
+ */
+WalHeader
+readWalHeader(folly::StringPiece prefix, size_t fileSize, InodeNumber parent) {
+  XDCHECK_GE(
+      prefix.size(), std::min(fileSize, size_t{kWalVersionedPrefixLength}));
+  if (fileSize < kWalMinFrameSize) {
+    return {.torn = true};
+  }
+  if (!prefix.starts_with(FsFileContentStore::kWalHeaderIdentifier)) {
+    return {};
+  }
+  if (fileSize < kWalVersionedPrefixLength) {
+    return {.torn = true};
+  }
+  uint32_t versionBE;
+  memcpy(&versionBE, prefix.data() + kWalVersionOffset, sizeof(versionBE));
+  const auto format =
+      walFormatForVersion(folly::Endian::big(versionBE), parent);
+  const auto headerLength = walHeaderLength(format);
+  if (fileSize < headerLength) {
+    return {.torn = true};
+  }
+  return {.format = format, .recordsOffset = headerLength};
+}
+
+/**
+ * Write the header for a new WAL of `format` into `dest`, which must hold
+ * walHeaderLength(format) bytes. Returns the number of bytes written.
+ */
+size_t writeWalHeader(uint8_t* dest, WalFormat format) {
+  switch (format) {
+    case WalFormat::Version1:
+      return 0;
+    case WalFormat::Version2: {
+      memcpy(
+          dest,
+          FsFileContentStore::kWalHeaderIdentifier.data(),
+          FsFileContentStore::kWalHeaderIdentifier.size());
+      const auto versionBE =
+          folly::Endian::big(FsFileContentStore::kWalVersion2);
+      memcpy(dest + kWalVersionOffset, &versionBE, sizeof(versionBE));
+      return FsFileContentStore::kWalVersion2HeaderLength;
+    }
+  }
+  throw std::runtime_error(
+      fmt::format(
+          "cannot write WAL header for format {}", static_cast<int>(format)));
+}
+} // namespace
+
+FsFileContentStore::CachedWalFilePtr FsFileContentStore::getCachedWalFile(
+    InodeNumber parent) {
+  if (cacheWalFiles_) {
+    auto cache = walFileCache_.wlock();
+    auto iter = cache->entries.find(parent);
+    if (iter != cache->entries.end()) {
+      return iter->second;
+    }
+  }
+
+  auto walPath = getWalPath(parent);
+  int fd = openat(
+      dirFile_.fd(),
+      walPath.c_str(),
+      O_APPEND | O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW,
+      0600);
+  folly::checkUnixError(
+      fd, fmt::format("error opening WAL file for inode {}", parent));
+  folly::File file{fd, /* ownsFd */ true};
+
+  off_t size = ::lseek(fd, 0, SEEK_END);
+  folly::checkUnixError(
+      size, fmt::format("error stat'ing WAL file for inode {}", parent));
+  // A new or empty file takes the configured format; an existing file keeps
+  // whatever its header says, so a config change never mixes formats within
+  // one file.
+  auto format = walFormat_;
+  if (size != 0) {
+    // Classify from the file size plus the leading bytes. A short read of
+    // a regular file at a known size is an I/O failure, not a short file.
+    std::array<char, kWalVersionedPrefixLength> prefix{};
+    const auto want = std::min(static_cast<size_t>(size), prefix.size());
+    const auto count = folly::preadFull(fd, prefix.data(), want, 0);
+    folly::checkUnixError(
+        count, fmt::format("error reading WAL header for inode {}", parent));
+    if (static_cast<size_t>(count) != want) {
+      folly::throwSystemErrorExplicit(
+          EIO,
+          fmt::format(
+              "short read of WAL header for inode {} ({} of {} bytes)",
+              parent,
+              count,
+              want));
+    }
+    const auto header = readWalHeader(
+        folly::StringPiece{prefix.data(), want},
+        static_cast<size_t>(size),
+        parent);
+    if (header.torn) {
+      // Nothing recoverable is in the file. Start it over rather than
+      // wedging every append behind bytes that can never be parsed, or
+      // appending v1 records after a partial versioned header.
+      XLOGF(
+          WARN,
+          "WAL for inode {} is {} bytes and holds no record; truncating",
+          parent,
+          size);
+      folly::checkUnixError(
+          ::ftruncate(fd, 0),
+          fmt::format("error truncating torn WAL for inode {}", parent));
+      size = 0;
+    } else {
+      format = header.format;
+    }
+  }
+  auto cached = std::make_shared<CachedWalFile>(
+      std::move(file), static_cast<uint64_t>(size), format);
+
+  if (!cacheWalFiles_) {
+    // The caller drops the last reference once the append completes, which
+    // closes the fd, matching the uncached behavior.
+    return cached;
+  }
+
+  auto cache = walFileCache_.wlock();
+  auto iter = cache->entries.find(parent);
+  if (iter != cache->entries.end()) {
+    return iter->second;
+  }
+  cache->entries.set(parent, cached);
+  return cached;
+}
+
+void FsFileContentStore::invalidateCachedWalFile(InodeNumber parent) {
+  walFileCache_.wlock()->entries.erase(parent);
+}
+
+namespace {
+/**
+ * Integer fields of a WAL record. Version1 stores each at a fixed width in
+ * native little-endian byte order. Version2 stores every one as an unsigned
+ * LEB128 varint, so a v2 record has no byte-order dependence.
+ */
+enum class WalField { EntryLen, NameLen, Mode, InodeNumber, ObjectIdLen };
+
+/** Largest value the reader accepts for a field in any format. */
+uint64_t walFieldMax(WalField field) {
+  return field == WalField::InodeNumber ? std::numeric_limits<uint64_t>::max()
+                                        : std::numeric_limits<uint32_t>::max();
+}
+
+/** Encoded size of `value` in `field`; v1 widths do not depend on the value. */
+size_t walFieldSize(uint64_t value, WalFormat format, WalField field) {
+  switch (format) {
+    case WalFormat::Version1:
+      switch (field) {
+        case WalField::EntryLen:
+          return sizeof(uint32_t);
+        case WalField::NameLen:
+          return sizeof(uint16_t);
+        case WalField::Mode:
+          return sizeof(int32_t);
+        case WalField::InodeNumber:
+          return sizeof(int64_t);
+        case WalField::ObjectIdLen:
+          return sizeof(uint8_t);
+      }
+      throw std::runtime_error(
+          fmt::format("unknown WAL field {}", static_cast<int>(field)));
+    case WalFormat::Version2:
+      return static_cast<size_t>(folly::encodeVarintSize(value));
+  }
+  throw std::runtime_error(
+      fmt::format(
+          "cannot size WAL field for format {}", static_cast<int>(format)));
+}
+
+/**
+ * Encode `value` at the front of `dest` and advance `dest` past it. Checks
+ * that the field fits before writing. Version1 callers must have checked
+ * that the value fits the field's fixed width.
+ */
+void writeWalField(
+    folly::MutableByteRange& dest,
+    uint64_t value,
+    WalFormat format,
+    WalField field) {
+  const auto size = walFieldSize(value, format, field);
+  if (size > dest.size()) {
+    EDEN_BUG() << "WAL record buffer too small for field "
+               << static_cast<int>(field) << ": need " << size << ", have "
+               << dest.size();
+  }
+  switch (format) {
+    case WalFormat::Version1:
+      // Little-endian host: the low bytes of `value` are the fixed-width
+      // encoding.
+      memcpy(dest.data(), &value, size);
+      break;
+    case WalFormat::Version2: {
+      [[maybe_unused]] const auto written =
+          folly::encodeVarint(value, dest.data());
+      XDCHECK_EQ(written, size);
+      break;
+    }
+  }
+  dest.advance(size);
+}
+} // namespace
+
 uint64_t FsFileContentStore::appendWalEntry(
     InodeNumber parent,
     WalOpType op,
     PathComponentPiece childName,
     const overlay::OverlayEntry* entry) {
-  // Wire format (little-endian native on all platforms EdenFS ships to):
-  //   [uint32_t entryLen]
+  // Framed WAL records:
+  //   [entryLen]
   //   [uint8_t op]
-  //   [uint16_t nameLen]
+  //   [nameLen]
   //   [name bytes]
   // For ADD, the payload additionally contains:
-  //   [int32_t mode][int64_t inodeNumber][uint8_t hashLen][hash bytes]
+  //   [mode][inodeNumber][hashLen][hash bytes]
   //   [uint8_t isRestricted][uint8_t aclRootState]
-  // entryLen covers everything after the entryLen field itself, and is
-  // used during replay to detect torn writes.
+  // Headerless v1 WALs store the bracketed integers at fixed widths
+  // (uint32_t, uint16_t, int32_t, int64_t, uint8_t) in native byte order.
+  // V2 WALs have an OVWL+version header and store every one of them as an
+  // unsigned varint. entryLen covers everything after the entryLen field
+  // itself, and is used during replay to detect torn writes.
   static_assert(
       std::endian::native == std::endian::little,
-      "WAL wire format is native little-endian; a big-endian target needs "
-      "explicit byte-swapping in both appendWalEntry and loadWalDelta.");
+      "The v1 WAL wire format is native little-endian; a big-endian target "
+      "needs explicit byte-swapping in writeWalField and readWalField.");
 
   // Precondition: entry must be non-null iff op == ADD. Catches caller
   // bugs where a stale entry pointer is passed for REMOVE/MATERIALIZE
   // (silently ignored otherwise) or a missing entry for ADD.
   switch (op) {
     case WalOpType::ADD:
-      XCHECK(entry != nullptr) << "ADD WAL entry requires an OverlayEntry";
+      if (entry == nullptr) {
+        EDEN_BUG() << "ADD WAL entry requires an OverlayEntry";
+      }
       break;
     case WalOpType::REMOVE:
     case WalOpType::MATERIALIZE:
-      XCHECK(entry == nullptr)
-          << "REMOVE/MATERIALIZE WAL entry must not carry an OverlayEntry";
+      if (entry != nullptr) {
+        EDEN_BUG() << "REMOVE/MATERIALIZE WAL entry must not carry an "
+                      "OverlayEntry";
+      }
       break;
   }
 
-  auto nameStr = childName.view();
-  XCHECK_LE(
-      nameStr.size(),
-      static_cast<size_t>(std::numeric_limits<uint16_t>::max()));
-  auto nameLen = static_cast<uint16_t>(nameStr.size());
+  const auto nameStr = childName.view();
+  const size_t hashSize = op == WalOpType::ADD && entry->hash().has_value()
+      ? entry->hash()->size()
+      : 0;
 
-  // Compute hashLen once and reuse for both the size calculation and the
-  // payload write below.
-  uint8_t hashLen = 0;
-  if (op == WalOpType::ADD && entry->hash().has_value() &&
-      !entry->hash()->empty()) {
-    // Wire-format hashLen is uint8_t; XCHECK rather than truncating
-    // the cast so a future >255-byte hash type fails loudly.
-    XCHECK_LE(
-        entry->hash()->size(),
-        static_cast<size_t>(std::numeric_limits<uint8_t>::max()));
-    hashLen = static_cast<uint8_t>(entry->hash()->size());
+  auto walFile = getCachedWalFile(parent);
+  const auto format = walFile->format;
+
+  // Sizes come from the filesystem and the backing store, so an entry that
+  // does not fit is an input condition, not a bug: throw and let the Overlay
+  // persist the directory with a full write instead. Checked against the
+  // file's actual format, so a brand-new WAL may be left empty on rejection;
+  // the Overlay's full write removes it.
+  size_t maxName = std::numeric_limits<uint32_t>::max();
+  size_t maxHash = std::numeric_limits<uint32_t>::max();
+  if (format == WalFormat::Version1) {
+    maxName = std::numeric_limits<uint16_t>::max();
+    maxHash = std::numeric_limits<uint8_t>::max();
+  }
+  if (nameStr.size() > maxName) {
+    throw WalEntryTooLargeError(
+        fmt::format(
+            "name of {} bytes does not fit the WAL for inode {}",
+            nameStr.size(),
+            parent));
+  }
+  if (hashSize > maxHash) {
+    throw WalEntryTooLargeError(
+        fmt::format(
+            "object ID of {} bytes does not fit the WAL for inode {}",
+            hashSize,
+            parent));
   }
 
-  size_t payloadSize = sizeof(uint8_t) + sizeof(uint16_t) + nameLen;
+  const auto nameLen = static_cast<uint32_t>(nameStr.size());
+  const auto hashLen = static_cast<uint32_t>(hashSize);
+  // Written as unsigned so negative values round-trip bit-for-bit; the
+  // reader casts back to the Thrift field types.
+  uint32_t mode = 0;
+  uint64_t inodeNum = 0;
   if (op == WalOpType::ADD) {
-    payloadSize += sizeof(int32_t) + sizeof(int64_t) + sizeof(uint8_t) +
-        hashLen + kWalAclRootStateTailSize;
+    mode = static_cast<uint32_t>(*entry->mode());
+    inodeNum = static_cast<uint64_t>(*entry->inodeNumber());
   }
 
-  size_t totalSize = sizeof(uint32_t) + payloadSize;
-  // 1024-byte inline cap covers NAME_MAX (255) entries; non-FUSE paths
-  // can produce larger names (uint16_t nameLen) and heap-fall-back.
+  size_t payloadSize = sizeof(uint8_t) +
+      walFieldSize(nameLen, format, WalField::NameLen) + nameLen;
+  if (op == WalOpType::ADD) {
+    payloadSize += walFieldSize(mode, format, WalField::Mode) +
+        walFieldSize(inodeNum, format, WalField::InodeNumber) +
+        walFieldSize(hashLen, format, WalField::ObjectIdLen) + hashLen +
+        kWalAclRootStateTailSize;
+  }
+  if (payloadSize > std::numeric_limits<uint32_t>::max()) {
+    throw WalEntryTooLargeError(
+        fmt::format(
+            "WAL record of {} bytes exceeds the frame limit for inode {}",
+            payloadSize,
+            parent));
+  }
+
+  const auto headerSize = walFile->size == 0 ? walHeaderLength(format) : 0;
+  size_t totalSize = headerSize +
+      walFieldSize(payloadSize, format, WalField::EntryLen) + payloadSize;
+  // 1024-byte inline cap covers NAME_MAX (255) entries; larger records
+  // fall back to heap storage.
   folly::small_vector<uint8_t, 1024> buf(totalSize);
-  size_t offset = 0;
+  folly::MutableByteRange out{buf.data(), buf.size()};
+  auto writeBytes = [&](const void* src, size_t size) {
+    if (size > out.size()) {
+      EDEN_BUG() << "WAL record buffer too small: need " << size << ", have "
+                 << out.size();
+    }
+    memcpy(out.data(), src, size);
+    out.advance(size);
+  };
+  auto writeByte = [&](uint8_t byte) { writeBytes(&byte, sizeof(byte)); };
 
-  auto entryLen = static_cast<uint32_t>(payloadSize);
-  memcpy(buf.data() + offset, &entryLen, sizeof(uint32_t));
-  offset += sizeof(uint32_t);
+  if (headerSize != 0) {
+    if (headerSize > out.size()) {
+      EDEN_BUG() << "WAL record buffer too small for its header";
+    }
+    out.advance(writeWalHeader(out.data(), format));
+  }
 
-  auto opByte = static_cast<uint8_t>(op);
-  memcpy(buf.data() + offset, &opByte, sizeof(uint8_t));
-  offset += sizeof(uint8_t);
-
-  memcpy(buf.data() + offset, &nameLen, sizeof(uint16_t));
-  offset += sizeof(uint16_t);
-
-  memcpy(buf.data() + offset, nameStr.data(), nameLen);
-  offset += nameLen;
+  writeWalField(out, payloadSize, format, WalField::EntryLen);
+  writeByte(static_cast<uint8_t>(op));
+  writeWalField(out, nameLen, format, WalField::NameLen);
+  writeBytes(nameStr.data(), nameLen);
 
   if (op == WalOpType::ADD) {
-    auto mode = static_cast<int32_t>(*entry->mode());
-    memcpy(buf.data() + offset, &mode, sizeof(int32_t));
-    offset += sizeof(int32_t);
-
-    auto inodeNum = static_cast<int64_t>(*entry->inodeNumber());
-    memcpy(buf.data() + offset, &inodeNum, sizeof(int64_t));
-    offset += sizeof(int64_t);
-
-    memcpy(buf.data() + offset, &hashLen, sizeof(uint8_t));
-    offset += sizeof(uint8_t);
-
+    writeWalField(out, mode, format, WalField::Mode);
+    writeWalField(out, inodeNum, format, WalField::InodeNumber);
+    writeWalField(out, hashLen, format, WalField::ObjectIdLen);
     if (hashLen > 0) {
-      memcpy(
-          buf.data() + offset,
-          apache::thrift::can_throw(entry->hash())->data(),
-          hashLen);
-      offset += hashLen;
+      writeBytes(apache::thrift::can_throw(entry->hash())->data(), hashLen);
     }
 
-    auto aclRootState = getWalEntryAclRootState(*entry);
-    auto isRestricted =
-        static_cast<uint8_t>(aclRootState == AclRootState::RestrictedAclRoot);
-    memcpy(buf.data() + offset, &isRestricted, sizeof(uint8_t));
-    offset += sizeof(uint8_t);
-
-    auto aclRootStateValue = static_cast<uint8_t>(aclRootState);
-    memcpy(buf.data() + offset, &aclRootStateValue, sizeof(uint8_t));
-    offset += sizeof(uint8_t);
+    const auto aclRootState = getWalEntryAclRootState(*entry);
+    writeByte(
+        static_cast<uint8_t>(aclRootState == AclRootState::RestrictedAclRoot));
+    writeByte(static_cast<uint8_t>(aclRootState));
   }
 
-  XCHECK_EQ(offset, totalSize);
+  if (!out.empty()) {
+    EDEN_BUG() << "WAL record sized " << totalSize << " but " << out.size()
+               << " bytes were left unwritten";
+  }
 
-  auto walPath = getWalPath(parent);
-  int fd = openat(
-      dirFile_.fd(),
-      walPath.c_str(),
-      O_APPEND | O_CREAT | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
-      0600);
-  folly::checkUnixError(
-      fd, fmt::format("error opening WAL file for inode {}", parent));
-  SCOPE_EXIT {
-    ::close(fd);
+  auto fd = walFile->file.fd();
+  auto sizeBefore = walFile->size;
+  // The tracked size must match the on-disk size exactly: the short-write
+  // recovery below truncates to sizeBefore, so a stale-low value would chop
+  // off valid entries. A mismatch means a writer bypassed appendWalEntry or
+  // the per-parent serialization contract broke.
+  XDCHECK_EQ(static_cast<off_t>(sizeBefore), ::lseek(fd, 0, SEEK_END));
+  SCOPE_FAIL {
+    invalidateCachedWalFile(parent);
   };
-
-  // Record the pre-write file size so we can truncate the torn tail if
-  // the kernel returns a short write below. lseek(SEEK_END) on an
-  // O_APPEND fd returns the current size without affecting where the
-  // next write lands (the kernel always positions O_APPEND writes at
-  // end-of-file atomically). Cheap: kernel-only, no disk I/O.
-  //
-  // The lseek + writeFull + ftruncate sequence is NOT atomic across
-  // syscalls; it relies on the per-parent serialization documented on
-  // appendWalEntry's declaration.
-  off_t sizeBefore = ::lseek(fd, 0, SEEK_END);
-  folly::checkUnixError(
-      sizeBefore, fmt::format("error stat'ing WAL file for inode {}", parent));
 
   // No fsync after the write. EdenFS does not promise power-loss
   // durability for overlay state — saveOverlayDir takes the same stance
@@ -726,21 +1111,20 @@ uint64_t FsFileContentStore::appendWalEntry(
   // below). Adding fsync to every WAL append would dominate the fast-
   // path cost and erase the latency win over a full directory rewrite.
   auto written = folly::writeFull(fd, buf.data(), totalSize);
-  folly::checkUnixError(
-      written, fmt::format("error writing WAL entry for inode {}", parent));
-  if (FOLLY_UNLIKELY(static_cast<size_t>(written) != totalSize)) {
-    // Short write (e.g. ENOSPC, signal interrupt). Truncate the torn tail
+  if (FOLLY_UNLIKELY(
+          written < 0 || static_cast<size_t>(written) != totalSize)) {
+    // Failed or short write (e.g. ENOSPC). Truncate the torn tail
     // so subsequent O_APPEND writes land on a valid prefix instead of
     // burying the tear mid-file. Capture errno before ftruncate clobbers it.
     int writeErrno = errno;
     int truncErrno = 0;
-    if (::ftruncate(fd, sizeBefore) != 0) {
+    if (::ftruncate(fd, static_cast<off_t>(sizeBefore)) != 0) {
       truncErrno = errno;
     }
     folly::throwSystemErrorExplicit(
         writeErrno != 0 ? writeErrno : EIO,
         fmt::format(
-            "short WAL write for inode {} ({} of {} bytes; "
+            "failed or short WAL write for inode {} ({} of {} bytes; "
             "ftruncate-recovery errno={})",
             parent,
             written,
@@ -748,7 +1132,8 @@ uint64_t FsFileContentStore::appendWalEntry(
             truncErrno));
   }
 
-  return static_cast<uint64_t>(sizeBefore) + static_cast<uint64_t>(written);
+  walFile->size = sizeBefore + static_cast<uint64_t>(written);
+  return walFile->size;
 }
 
 bool FsFileContentStore::hasWal(InodeNumber parent) {
@@ -770,6 +1155,63 @@ bool FsFileContentStore::hasWal(InodeNumber parent) {
   folly::throwSystemErrorExplicit(
       err, fmt::format("error stat'ing WAL file for inode {}", parent));
 }
+
+namespace {
+bool isValidPathComponent(const std::string& name) {
+  try {
+    PathComponentPiece{name};
+    return true;
+  } catch (const PathComponentValidationError&) {
+    return false;
+  }
+}
+
+/**
+ * Read one integer field without consuming bytes outside its frame. Returns
+ * nullopt when the frame ends early, a v2 varint is overlong or not the
+ * shortest encoding of its value, or the value exceeds what the field may
+ * hold.
+ */
+std::optional<uint64_t> readWalField(
+    folly::ByteRange frame,
+    size_t& offset,
+    WalField field,
+    WalFormat format) {
+  switch (format) {
+    case WalFormat::Version1: {
+      const auto size = walFieldSize(/*value=*/0, format, field);
+      if (offset > frame.size() || frame.size() - offset < size) {
+        return std::nullopt;
+      }
+      uint64_t value = 0;
+      memcpy(&value, frame.data() + offset, size);
+      offset += size;
+      return value;
+    }
+    case WalFormat::Version2: {
+      if (offset > frame.size()) {
+        return std::nullopt;
+      }
+      auto rest = frame.subpiece(offset);
+      const auto value = folly::tryDecodeVarint(rest);
+      if (!value || *value > walFieldMax(field)) {
+        return std::nullopt;
+      }
+      // The writer emits the shortest encoding, so a padded one (trailing
+      // 0x80 0x00 style continuation) is corruption, not a value.
+      const auto consumed = frame.size() - offset - rest.size();
+      if (consumed != static_cast<size_t>(folly::encodeVarintSize(*value))) {
+        return std::nullopt;
+      }
+      offset = frame.size() - rest.size();
+      return *value;
+    }
+  }
+  throw std::runtime_error(
+      fmt::format(
+          "cannot read WAL field for format {}", static_cast<int>(format)));
+}
+} // namespace
 
 LoadWalResult FsFileContentStore::loadWalDelta(
     InodeNumber parent,
@@ -811,19 +1253,31 @@ LoadWalResult FsFileContentStore::loadWalDelta(
     return result;
   }
 
-  size_t offset = 0;
+  const auto header = readWalHeader(data, data.size(), parent);
+  if (header.torn) {
+    ++result.parseErrors;
+    return result;
+  }
+  const auto format = header.format;
+  size_t offset = header.recordsOffset;
 
-  while (offset + sizeof(uint32_t) <= data.size()) {
-    uint32_t entryLen;
-    memcpy(&entryLen, data.data() + offset, sizeof(uint32_t));
-
-    if (entryLen == 0 || offset + sizeof(uint32_t) + entryLen > data.size()) {
+  while (offset < data.size()) {
+    const folly::ByteRange rest{
+        reinterpret_cast<const uint8_t*>(data.data()) + offset,
+        data.size() - offset};
+    size_t entryStart = 0;
+    const auto entryLenField =
+        readWalField(rest, entryStart, WalField::EntryLen, format);
+    // A missing or torn entryLen is a torn tail, as is a frame that claims
+    // more bytes than remain.
+    if (!entryLenField || *entryLenField == 0 ||
+        entryStart + *entryLenField > rest.size()) {
       ++result.parseErrors;
       break;
     }
-
-    const uint8_t* entryData = reinterpret_cast<const uint8_t*>(data.data()) +
-        offset + sizeof(uint32_t);
+    const auto entryLen = static_cast<size_t>(*entryLenField);
+    const uint8_t* entryData = rest.data() + entryStart;
+    const folly::ByteRange frame{entryData, entryLen};
     size_t entryOffset = 0;
 
     if (entryOffset + sizeof(uint8_t) > entryLen) {
@@ -833,117 +1287,143 @@ LoadWalResult FsFileContentStore::loadWalDelta(
     auto opType = static_cast<WalOpType>(entryData[entryOffset]);
     entryOffset += sizeof(uint8_t);
 
-    if (entryOffset + sizeof(uint16_t) > entryLen) {
+    auto nameLen = readWalField(frame, entryOffset, WalField::NameLen, format);
+    if (!nameLen) {
       ++result.parseErrors;
       break;
     }
-    uint16_t nameLen;
-    memcpy(&nameLen, entryData + entryOffset, sizeof(uint16_t));
-    entryOffset += sizeof(uint16_t);
 
-    if (entryOffset + nameLen > entryLen) {
+    if (entryOffset + *nameLen > entryLen) {
       ++result.parseErrors;
       break;
     }
     std::string name(
-        reinterpret_cast<const char*>(entryData + entryOffset), nameLen);
-    entryOffset += nameLen;
+        reinterpret_cast<const char*>(entryData + entryOffset), *nameLen);
+    entryOffset += *nameLen;
 
     bool valid = true;
     bool skipped = false;
-    switch (opType) {
-      case WalOpType::ADD: {
-        if (entryOffset + sizeof(int32_t) > entryLen) {
-          valid = false;
-          break;
-        }
-        int32_t mode;
-        memcpy(&mode, entryData + entryOffset, sizeof(int32_t));
-        entryOffset += sizeof(int32_t);
-
-        if (entryOffset + sizeof(int64_t) > entryLen) {
-          valid = false;
-          break;
-        }
-        int64_t inodeNum;
-        memcpy(&inodeNum, entryData + entryOffset, sizeof(int64_t));
-        entryOffset += sizeof(int64_t);
-
-        if (entryOffset + sizeof(uint8_t) > entryLen) {
-          valid = false;
-          break;
-        }
-        uint8_t hashLen = entryData[entryOffset];
-        entryOffset += sizeof(uint8_t);
-
-        if (entryOffset + hashLen > entryLen) {
-          valid = false;
-          break;
-        }
-
-        overlay::OverlayEntry overlayEntry;
-        overlayEntry.mode() = mode;
-        overlayEntry.inodeNumber() = inodeNum;
-        if (hashLen > 0) {
-          overlayEntry.hash() = std::string(
-              reinterpret_cast<const char*>(entryData + entryOffset), hashLen);
-        }
-        entryOffset += hashLen;
-
-        auto remaining = entryLen - entryOffset;
-        if (remaining > 0) {
-          if (remaining != kWalAclRootStateTailSize) {
+    if (!isValidPathComponent(name)) {
+      // The frame is intact, so skip just this entry. Letting the name
+      // reach the delta map would throw from its comparator and leave the
+      // directory unloadable until the WAL is removed by hand.
+      ++result.parseErrors;
+      XLOGF(
+          WARN,
+          "Skipping WAL entry for inode {} whose name is not a valid path component",
+          parent);
+      skipped = true;
+    } else {
+      switch (opType) {
+        case WalOpType::ADD: {
+          const auto modeField =
+              readWalField(frame, entryOffset, WalField::Mode, format);
+          if (!modeField) {
             valid = false;
             break;
           }
-          auto isRestricted = entryData[entryOffset] != 0;
-          entryOffset += sizeof(uint8_t);
+          const auto mode =
+              static_cast<int32_t>(static_cast<uint32_t>(*modeField));
 
-          auto aclRootState = entryData[entryOffset];
-          entryOffset += sizeof(uint8_t);
+          const auto inodeField =
+              readWalField(frame, entryOffset, WalField::InodeNumber, format);
+          if (!inodeField) {
+            valid = false;
+            break;
+          }
+          const auto inodeNum = static_cast<int64_t>(*inodeField);
 
-          overlayEntry.isRestricted() = isRestricted;
-          overlayEntry.aclRootState() = static_cast<int32_t>(aclRootState);
+          if (inodeNum <= 0) {
+            ++result.parseErrors;
+            XLOGF(
+                WARN,
+                "Skipping WAL ADD entry {} for inode {} with invalid inode number {}",
+                name,
+                parent,
+                inodeNum);
+            skipped = true;
+            break;
+          }
+
+          auto hashLen =
+              readWalField(frame, entryOffset, WalField::ObjectIdLen, format);
+          if (!hashLen) {
+            valid = false;
+            break;
+          }
+
+          if (entryOffset + *hashLen > entryLen) {
+            valid = false;
+            break;
+          }
+
+          overlay::OverlayEntry overlayEntry;
+          overlayEntry.mode() = mode;
+          overlayEntry.inodeNumber() = inodeNum;
+          if (*hashLen > 0) {
+            overlayEntry.hash() = std::string(
+                reinterpret_cast<const char*>(entryData + entryOffset),
+                *hashLen);
+          }
+          entryOffset += *hashLen;
+
+          auto remaining = entryLen - entryOffset;
+          if (remaining > 0) {
+            if (remaining != kWalAclRootStateTailSize) {
+              valid = false;
+              break;
+            }
+            auto isRestricted = entryData[entryOffset] != 0;
+            entryOffset += sizeof(uint8_t);
+
+            auto aclRootState = entryData[entryOffset];
+            entryOffset += sizeof(uint8_t);
+
+            overlayEntry.isRestricted() = isRestricted;
+            overlayEntry.aclRootState() = static_cast<int32_t>(aclRootState);
+          }
+
+          assignDelta(
+              std::move(name),
+              WalDelta{WalOpType::ADD, std::move(overlayEntry)});
+          break;
         }
 
-        assignDelta(
-            std::move(name), WalDelta{WalOpType::ADD, std::move(overlayEntry)});
-        break;
-      }
-
-      case WalOpType::REMOVE: {
-        assignDelta(std::move(name), WalDelta{WalOpType::REMOVE, {}});
-        break;
-      }
-
-      case WalOpType::MATERIALIZE: {
-        auto it = delta.find(name);
-        if (it == delta.end()) {
-          // No prior delta for this name — record the MATERIALIZE so the
-          // mutator merge can clear the hash on the base entry.
-          delta.emplace(std::move(name), WalDelta{WalOpType::MATERIALIZE, {}});
-        } else if (it->second.type == WalOpType::ADD) {
-          // Materialize an ADD we already have — clear the hash in place.
-          it->second.entry.hash().reset();
+        case WalOpType::REMOVE: {
+          assignDelta(std::move(name), WalDelta{WalOpType::REMOVE, {}});
+          break;
         }
-        // REMOVE stays REMOVE; mirrors replayWal's MATERIALIZE-on-missing
-        // no-op (covered by loadWalDelta_materializeAfterRemoveLeavesRemove).
-        break;
-      }
 
-      default:
-        // Forward-compat: an unknown opcode with a valid entryLen frame is
-        // safe to skip — the entryLen prefix told us exactly how many bytes
-        // this entry occupies. Older binaries reading a newer WAL log and
-        // continue rather than dropping every entry past the unknown op.
-        ++result.parseErrors;
-        XLOGF(
-            WARN,
-            "Unknown WAL op {} for inode {}; skipping entry",
-            static_cast<int>(opType),
-            parent);
-        skipped = true;
-        break;
+        case WalOpType::MATERIALIZE: {
+          auto it = delta.find(name);
+          if (it == delta.end()) {
+            // No prior delta for this name — record the MATERIALIZE so the
+            // mutator merge can clear the hash on the base entry.
+            delta.emplace(
+                std::move(name), WalDelta{WalOpType::MATERIALIZE, {}});
+          } else if (it->second.type == WalOpType::ADD) {
+            // Materialize an ADD we already have — clear the hash in place.
+            it->second.entry.hash().reset();
+          }
+          // REMOVE stays REMOVE; mirrors replayWal's MATERIALIZE-on-missing
+          // no-op (covered by loadWalDelta_materializeAfterRemoveLeavesRemove).
+          break;
+        }
+
+        default:
+          // Forward-compat: an unknown opcode with a valid entryLen frame is
+          // safe to skip — the entryLen prefix told us exactly how many bytes
+          // this entry occupies. Older binaries reading a newer WAL log and
+          // continue rather than dropping every entry past the unknown op.
+          ++result.parseErrors;
+          XLOGF(
+              WARN,
+              "Unknown WAL op {} for inode {}; skipping entry",
+              static_cast<int>(opType),
+              parent);
+          skipped = true;
+          break;
+      }
     }
 
     if (!valid) {
@@ -953,7 +1433,7 @@ LoadWalResult FsFileContentStore::loadWalDelta(
     if (!skipped) {
       ++result.rawEntriesParsed;
     }
-    offset += sizeof(uint32_t) + entryLen;
+    offset += entryStart + entryLen;
   }
 
   return result;
@@ -1008,6 +1488,7 @@ LoadWalResult FsFileContentStore::replayWal(
 }
 
 void FsFileContentStore::removeWal(InodeNumber parent) {
+  invalidateCachedWalFile(parent);
   auto walPath = getWalPath(parent);
   if (::unlinkat(dirFile_.fd(), walPath.c_str(), 0) != 0) {
     int err = errno;
@@ -1236,16 +1717,9 @@ std::variant<folly::File, InodeNumber> FsFileContentStore::openFile(
 
 std::variant<folly::File, InodeNumber> FsFileContentStore::openFileNoVerify(
     InodeNumber inodeNumber) {
-  auto path = FsFileContentStore::getFilePath(inodeNumber);
-
-  int fd = openat(dirFile_.fd(), path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
-  folly::checkUnixError(
-      fd,
-      fmt::format(
-          "error opening overlay file for inode {} in {}",
-          inodeNumber,
-          localDir_.view()));
-  return folly::File{fd, /* ownsFd */ true};
+  auto path = getFilePath(inodeNumber);
+  return openFileNoVerifyWithFlags(
+      dirFile_.fd(), localDir_, inodeNumber, path, O_RDWR);
 }
 
 namespace {
@@ -1286,7 +1760,8 @@ folly::File FsFileContentStore::createOverlayFileImpl(
     InodeNumber inodeNumber,
     iovec* iov,
     size_t iovCount,
-    bool crashSafe) {
+    bool crashSafe,
+    bool removeOnFailure) {
   auto path = getFilePath(inodeNumber);
 
   // For the root inode, always use the crash-safe path regardless of the
@@ -1314,10 +1789,16 @@ folly::File FsFileContentStore::createOverlayFileImpl(
           inodeNumber,
           localDir_.view()));
   folly::File file{fd, /* ownsFd */ true};
-  bool success = !useTmpFile;
+  bool success = false;
   SCOPE_EXIT {
-    if (!success) {
-      unlinkat(dirFile_.fd(), tmpPath.data(), 0);
+    if (!success && (useTmpFile || removeOnFailure) &&
+        unlinkat(dirFile_.fd(), openPath, 0) != 0 && errno != ENOENT) {
+      XLOGF(
+          WARN,
+          "failed to remove overlay file {} for inode {} after its creation failed: {}",
+          openPath,
+          inodeNumber,
+          folly::errnoStr(errno));
     }
   };
 
@@ -1375,9 +1856,9 @@ folly::File FsFileContentStore::createOverlayFileImpl(
             "error committing overlay file for inode {} in {}",
             inodeNumber,
             localDir_.view()));
-    success = true;
   }
 
+  success = true;
   return file;
 }
 
@@ -1391,7 +1872,12 @@ std::variant<folly::File, InodeNumber> FsFileContentStore::createOverlayFile(
   iov[0].iov_len = header.size();
   iov[1].iov_base = const_cast<uint8_t*>(contents.data());
   iov[1].iov_len = contents.size();
-  return createOverlayFileImpl(inodeNumber, iov.data(), iov.size());
+  return createOverlayFileImpl(
+      inodeNumber,
+      iov.data(),
+      iov.size(),
+      /*crashSafe=*/!directFileCreate_,
+      /*removeOnFailure=*/true);
 }
 
 std::variant<folly::File, InodeNumber> FsFileContentStore::createOverlayFile(
@@ -1413,7 +1899,12 @@ std::variant<folly::File, InodeNumber> FsFileContentStore::createOverlayFile(
   iov[0].iov_len = header.size();
   contents.appendToIov(&iov);
 
-  return createOverlayFileImpl(inodeNumber, iov.data(), iov.size());
+  return createOverlayFileImpl(
+      inodeNumber,
+      iov.data(),
+      iov.size(),
+      /*crashSafe=*/!directFileCreate_,
+      /*removeOnFailure=*/true);
 }
 
 void FsFileContentStore::validateHeader(
@@ -1490,94 +1981,55 @@ bool FsInodeCatalog::hasOverlayDir(InodeNumber inodeNumber) {
   return core_->hasOverlayFile(inodeNumber);
 }
 
-namespace {
-overlay::OverlayDir loadDirectoryChildren(folly::File& file) {
-  std::string serializedData;
-  if (!folly::readFile(file.fd(), serializedData)) {
-    folly::throwSystemError("read failed");
-  }
-
-  return CompactSerializer::deserialize<overlay::OverlayDir>(serializedData);
-}
-} // namespace
-
 std::optional<fsck::InodeInfo> FsFileContentStore::loadInodeInfo(
     InodeNumber number) {
-  auto inodeError = [number](auto&&... args) -> std::optional<fsck::InodeInfo> {
-    return {fsck::InodeInfo(
-        number,
-        fsck::InodeType::Error,
-        fmt::to_string(fmt::join(std::make_tuple(args...), "")))};
-  };
-
-  // Open the inode file
   folly::File file;
   try {
     file = std::get<folly::File>(openFileNoVerify(number));
   } catch (const std::exception& ex) {
-    return inodeError("error opening file: ", folly::exceptionStr(ex));
+    return makeInodeError(
+        number, "error opening file: ", folly::exceptionStr(ex));
   }
 
-  // Read the file header
-  std::array<char, FsFileContentStore::kHeaderLength> headerContents;
-  auto readResult =
-      folly::readFull(file.fd(), headerContents.data(), headerContents.size());
-  if (readResult < 0) {
-    int errnum = errno;
-    return inodeError("error reading from file: ", folly::errnoStr(errnum));
-  } else if (readResult != FsFileContentStore::kHeaderLength) {
-    return inodeError(
-        fmt::format(
-            "file was too short to contain overlay header: read {} bytes, expected {} bytes",
-            readResult,
-            FsFileContentStore::kHeaderLength));
-  }
-
-  // The first 4 bytes of the header are the file type identifier.
-  static_assert(
-      FsFileContentStore::kHeaderIdentifierDir.size() ==
-          FsFileContentStore::kHeaderIdentifierFile.size(),
-      "both header IDs must have the same length");
-  StringPiece typeID(
-      headerContents.data(),
-      headerContents.data() + FsFileContentStore::kHeaderIdentifierDir.size());
-
-  // The next 4 bytes are the version ID.
-  uint32_t versionBE;
-  memcpy(
-      &versionBE,
-      headerContents.data() + FsFileContentStore::kHeaderIdentifierDir.size(),
-      sizeof(uint32_t));
-  auto version = folly::Endian::big(versionBE);
-  if (version != FsFileContentStore::kHeaderVersion) {
-    return inodeError("unknown overlay file format version ", version);
-  }
-
-  fsck::InodeType type;
-  if (typeID == FsFileContentStore::kHeaderIdentifierDir) {
-    type = fsck::InodeType::Dir;
-  } else if (typeID == FsFileContentStore::kHeaderIdentifierFile) {
-    type = fsck::InodeType::File;
-  } else {
-    return inodeError(
-        "unknown overlay file type ID: ", folly::hexlify(ByteRange{typeID}));
-  }
-
-  if (type == fsck::InodeType::Dir) {
-    try {
-      return {fsck::InodeInfo(number, loadDirectoryChildren(file))};
-    } catch (const std::exception& ex) {
-      return inodeError(
-          "error parsing directory contents: ", folly::exceptionStr(ex));
-    }
-  } else {
-    return {fsck::InodeInfo(number, type)};
-  }
+  return readInodeInfoFromFile(number, file);
 }
 
 std::optional<fsck::InodeInfo> FsInodeCatalog::loadInodeInfo(
     InodeNumber number) {
   return core_->loadInodeInfo(number);
+}
+
+std::optional<fsck::InodeInfo> FsFileContentStore::loadInodeInfoAndEntries(
+    InodeNumber number,
+    InodeCatalog::OverlayEntryLoader loader) {
+  folly::File file;
+  try {
+    auto path = getFilePath(number);
+    file = openFileNoVerifyWithFlags(
+        dirFile_.fd(), localDir_, number, path, O_RDONLY);
+  } catch (const std::exception& ex) {
+    return makeInodeError(
+        number, "error opening file: ", folly::exceptionStr(ex));
+  }
+
+  auto info = readInodeInfoFromFile(number, file);
+  if (info.type != fsck::InodeType::Dir) {
+    return info;
+  }
+
+  std::string rawData;
+  if (!folly::readFile(file.fd(), rawData)) {
+    return makeInodeError(
+        number, "error reading directory contents: ", folly::errnoStr(errno));
+  }
+  loadOverlayEntriesFromData(number, rawData, loader);
+  return info;
+}
+
+std::optional<fsck::InodeInfo> FsInodeCatalog::loadInodeInfoAndEntries(
+    InodeNumber number,
+    OverlayEntryLoader loader) {
+  return core_->loadInodeInfoAndEntries(number, loader);
 }
 } // namespace facebook::eden
 

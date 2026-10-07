@@ -299,6 +299,11 @@ class ui:
                 val = str(bool(get(opt)))
                 self.setconfig("ui", opt, val, "--" + opt)
 
+        if get("agent_quiet_ignored"):
+            # A lone --quiet from an agent was ignored; also override any
+            # ui.quiet value the native dispatch pinned from the same flag.
+            self.setconfig("ui", "quiet", "False", "--quiet")
+
         if get("traceback"):
             self.setconfig("ui", "traceback", "on", "--traceback")
 
@@ -511,6 +516,11 @@ class ui:
         - True otherwise
         """
         return bindings.util.is_plain(feature)
+
+    @staticmethod
+    def agent():
+        """is run by a coding agent?"""
+        return bindings.agentdetect.is_agent()
 
     def username(self, acceptempty=False):
         """Return default username to be used in commits.
@@ -895,10 +905,13 @@ class ui:
 
         Then histedit will use the text interface and chunkselector will use
         the default curses interface (crecord at the moment).
-        """
-        alldefaults = frozenset(["text", "curses"])
 
-        featureinterfaces = {"chunkselector": ["text", "curses"]}
+        If ui.interface is unset, infer the default from agent detection and
+        TERM. Feature-specific configuration still takes precedence.
+        """
+        alldefaults = frozenset(["text", "curses", "repl"])
+
+        featureinterfaces = {"chunkselector": ["text", "curses", "repl"]}
 
         # Feature-specific interface
         if feature not in featureinterfaces.keys():
@@ -917,7 +930,16 @@ class ui:
             return "text"
 
         # Default interface for all the features
-        defaultinterface = "text"
+        term = self.environ.get("TERM")
+        if self.agent():
+            defaultinterface = "repl"
+        elif (not term and sys.platform != "win32") or term in (
+            "dumb",
+            "fake-term",  # internally used by tests
+        ):
+            defaultinterface = "text"
+        else:
+            defaultinterface = "curses"
         i = self.config("ui", "interface")
         if i in alldefaults:
             defaultinterface = i
@@ -1046,6 +1068,13 @@ class ui:
             line = line[:-1]
         return line
 
+    def promptecho(self):
+        """whether responses read from stdin should be echoed to output"""
+        configured = self.configbool("ui", "promptecho", None)
+        if configured is not None:
+            return configured
+        return not self._isatty(self.fin)
+
     def prompt(self, msg, default="y"):
         """Prompt user with msg, read response.
         If ui is not interactive, the default is returned.
@@ -1058,7 +1087,7 @@ class ui:
                 r = self._readline(self.label(msg, "ui.prompt"))
                 if not r:
                     r = default
-                if self.configbool("ui", "promptecho"):
+                if self.promptecho():
                     self.write(r, "\n")
                 return r
         except EOFError:
@@ -1197,6 +1226,7 @@ class ui:
         user,
         extra=None,
         editform=None,
+        env=None,
         pending=None,
         sharedpending=None,
         repopath=None,
@@ -1256,7 +1286,8 @@ class ui:
             f.write(util.tonativeeol(text).encode())
             f.close()
 
-            environ = {"HGUSER": user}
+            environ = dict(env or {})
+            environ["HGUSER"] = user
             if "transplant_source" in extra:
                 environ.update({"HGREVISION": hex(extra["transplant_source"])})
             for label in ("intermediate-source", "source", "rebase_source"):

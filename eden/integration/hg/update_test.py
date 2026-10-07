@@ -9,17 +9,19 @@
 import asyncio
 import logging
 import os
+import pathlib
 import re
+import signal
 import sys
 import threading
 from contextlib import asynccontextmanager
 from enum import Enum
+from itertools import product
 from textwrap import dedent
 from threading import Thread
-from typing import AsyncGenerator, Dict, List, Optional, Set
+from typing import AsyncGenerator, Awaitable, Dict, List, Optional, Set
 
 from eden.fs.cli import util
-from eden.fs.cli.mp import get_context
 from eden.fs.service.eden.thrift_types import (
     CheckoutMode,
     CheckOutRevisionParams,
@@ -28,6 +30,7 @@ from eden.fs.service.eden.thrift_types import (
     EdenErrorType,
     FaultDefinition,
     GetScmStatusParams,
+    MountState,
     SyncBehavior,
     UnblockFaultArg,
 )
@@ -244,6 +247,7 @@ class UpdateTest(EdenHgTestCase):
 
         self.repo.update(base_commit)
         self.assert_status_empty()
+        self.wait_for_path_absent("bar")
         self.write_file("bar/some_new_file.txt", file_contents)
         self.hg("add", "bar/some_new_file.txt")
         self.assert_status({"bar/some_new_file.txt": "A"})
@@ -287,6 +291,7 @@ class UpdateTest(EdenHgTestCase):
 
         self.repo.update(base_commit)
         self.assert_status_empty()
+        self.wait_for_path_absent("bar")
         self.write_file("bar/some_new_file.txt", file_contents)
 
         # the update succeeds because some_new_file has the same contents
@@ -299,6 +304,7 @@ class UpdateTest(EdenHgTestCase):
         )
 
         self.repo.update(base_commit)
+        self.wait_for_path_absent("bar")
         new_file_contents = "some OTHER contents\n"
         self.write_file("bar/some_new_file.txt", new_file_contents)
         self.assert_status({"bar/some_new_file.txt": "?"})
@@ -538,6 +544,59 @@ class UpdateTest(EdenHgTestCase):
                     UnblockFaultArg(keyClass="inodeCheckout", keyValueRegex=".*")
                 )
 
+    async def get_async_error(
+        self, awaitable: Optional[Awaitable[object]]
+    ) -> Optional[Exception]:
+        if awaitable is None:
+            return None
+        try:
+            await awaitable
+        except Exception as ex:
+            return ex
+        return None
+
+    async def wait_for_mount_shutting_down(self) -> None:
+        async def state_shutting_down() -> Optional[bool]:
+            state = await self.eden.get_mount_state_async(pathlib.Path(self.mount))
+            if state == MountState.SHUTTING_DOWN:
+                return True
+            if state in (None, MountState.SHUT_DOWN, MountState.DESTROYING):
+                self.fail(
+                    "mount should not list status as not mounted while "
+                    "checkout is in progress"
+                )
+            return None
+
+        await util.poll_until_async(state_shutting_down, timeout=30)
+
+    def wait_for_path_absent(self, path: str) -> None:
+        def path_absent() -> Optional[bool]:
+            if not os.path.exists(self.get_path(path)):
+                return True
+            return None
+
+        util.poll_until(path_absent, timeout=30)
+
+    def check_unmount_checkout_errors(
+        self,
+        update_error: Optional[Exception],
+        unmount_error: Optional[Exception],
+    ) -> None:
+        if unmount_error is not None:
+            raise unmount_error
+
+        if update_error is None:
+            return
+
+        if not isinstance(update_error, hgrepo.HgError):
+            raise update_error
+
+        stderr = update_error.stderr or b""
+        if isinstance(stderr, str):
+            stderr = stderr.encode()
+        if b"No such file or directory" not in stderr or b"/.hg/" not in stderr:
+            raise update_error
+
     async def test_mount_state_during_unmount_with_in_progress_checkout(self) -> None:
         mounts = self.eden.run_cmd("list")
         self.assertEqual(f"{self.mount}\n", mounts)
@@ -545,37 +604,29 @@ class UpdateTest(EdenHgTestCase):
         self.backing_repo.write_file("foo/bar.txt", "new contents")
         new_commit = self.backing_repo.commit("Update foo/bar.txt")
 
-        async with self.block_checkout():
-            # Run a checkout
-            p1 = get_context().Process(target=self.repo.update, args=(new_commit,))
-            p1.start()
+        update_task: Optional[asyncio.Task[str]] = None
+        unmount_task: Optional[asyncio.Task[None]] = None
+        update_error: Optional[Exception] = None
+        unmount_error: Optional[Exception] = None
+        try:
+            async with self.block_checkout():
+                update_task = asyncio.create_task(
+                    self.repo.update_async(new_commit), name="hg-update"
+                )
 
-            # Ensure the checkout has started
-            await self.wait_for_checkout_in_progress()
+                await self.wait_for_checkout_in_progress()
 
-            p2 = get_context().Process(target=self.eden.unmount, args=(self.mount,))
-            p2.start()
+                unmount_task = asyncio.create_task(
+                    self.eden.unmount_async(pathlib.Path(self.mount)),
+                    name="eden-unmount",
+                )
 
-            # Wait for the state to be shutting down
-            def state_shutting_down() -> Optional[bool]:
-                mounts = self.eden.run_cmd("list")
-                print(mounts)
-                if mounts.find("SHUTTING_DOWN") != -1:
-                    return True
-                if mounts.find("(not mounted)") != -1:
-                    self.fail(
-                        "mount should not list status as not mounted while "
-                        "checkout is in progress"
-                    )
-                return None
+                await self.wait_for_mount_shutting_down()
+        finally:
+            update_error = await self.get_async_error(update_task)
+            unmount_error = await self.get_async_error(unmount_task)
 
-            util.poll_until(state_shutting_down, timeout=30)
-            # Unblock the server shutdown and wait for the checkout to complete.
-
-        # join the checkout before the unmount because the unmount call
-        # won't finish until the checkout has finished
-        p1.join()
-        p2.join()
+        self.check_unmount_checkout_errors(update_error, unmount_error)
 
     def test_dir_locking(self) -> None:
         """
@@ -894,6 +945,121 @@ class UpdateTest(EdenHgTestCase):
             self.assertFalse(dir2.loaded and inodes["dir2"].materialized)
             self.assertNotIn("dir3", inodes)
 
+    async def test_resume_interrupted_update_with_applied_file_loaded(self) -> None:
+        self.backing_repo.write_file("dir1/foo.txt", "Content 1")
+        self.backing_repo.write_file("dir2/bar.txt", "Content 1")
+        self.backing_repo.write_file("dir3/dog.txt", "Content 1")
+        bottom = self.backing_repo.commit("Add files")
+        self.backing_repo.write_file("dir1/foo.txt", "Content 2")
+        self.backing_repo.write_file("dir2/bar.txt", "Content 2")
+        self.backing_repo.write_file("dir3/dog.txt", "Content 2")
+        top = self.backing_repo.commit("Edit files")
+        self.repo.update(top)
+
+        self.repo.write_file("dir1/foo.txt", "Content 2")
+        self.assertTrue(os.path.isdir(self.get_path("dir2")))
+
+        with self.eden.get_thrift_client() as client:
+            client.injectFault(
+                FaultDefinition(
+                    keyClass="TreeInode::checkout",
+                    keyValueRegex="dir2, false",
+                    block=True,
+                )
+            )
+
+        checkout_error = []
+
+        def update_to_bottom() -> None:
+            try:
+                self.repo.update(bottom)
+            except hgrepo.HgError as ex:
+                checkout_error.append(ex)
+
+        checkout_thread = Thread(target=update_to_bottom)
+        checkout_thread.start()
+        try:
+            self.wait_on_fault_hit(key_class="TreeInode::checkout")
+            util.poll_until(
+                lambda: self.read_file("dir1/foo.txt") == "Content 1", timeout=30
+            )
+        finally:
+            with self.eden.get_thrift_client() as client:
+                daemon_pid = client.getPid()
+            # On Windows, os.kill(SIGTERM) calls TerminateProcess.
+            kill_signal = signal.SIGTERM if sys.platform == "win32" else signal.SIGKILL
+            os.kill(daemon_pid, kill_signal)
+            checkout_thread.join(timeout=30)
+        self.assertFalse(checkout_thread.is_alive())
+        self.assertEqual(1, len(checkout_error))
+
+        if self.eden._process is not None:
+            util.poll_until(self.eden._process.poll, timeout=30)
+        self.eden = self.init_eden_client()
+        self.eden.start()
+
+        self.assertEqual("Content 1", self.read_file("dir1/foo.txt"))
+
+        async with self.eden.get_async_thrift_client() as client:
+            conflicts = await client.checkOutRevision(
+                mountPoint=self.mount_path_bytes,
+                snapshotHash=bottom.encode(),
+                checkoutMode=CheckoutMode.DRY_RUN,
+                params=CheckOutRevisionParams(),
+            )
+        self.assertEqual([], conflicts)
+
+        output = self.repo.update(bottom)
+        self.assertEqual("update complete\n", output)
+        self.assertEqual("Content 1", self.read_file("dir1/foo.txt"))
+        self.assertEqual("Content 1", self.read_file("dir2/bar.txt"))
+        self.assertEqual("Content 1", self.read_file("dir3/dog.txt"))
+        self.assert_status_empty()
+
+    async def test_restart_after_failed_interrupted_update_resume(self) -> None:
+        if sys.platform == "win32":
+            self.skipTest("PrjFS projects destination content after EdenFS restarts")
+
+        self.backing_repo.write_file("dir1/foo.txt", "Content 1")
+        self.backing_repo.write_file("dir2/bar.txt", "Content 1")
+        bottom = self.backing_repo.commit("Add files")
+        self.backing_repo.write_file("dir1/foo.txt", "Content 2")
+        self.backing_repo.write_file("dir2/bar.txt", "Content 2")
+        top = self.backing_repo.commit("Edit files")
+        self.repo.update(top)
+
+        self.assertEqual("Content 2", self.read_file("dir1/foo.txt"))
+        self.assertTrue(os.path.isdir(self.get_path("dir2")))
+
+        await self.kill_eden_during_checkout_and_restart(bottom, "<root>, false")
+
+        self.assertEqual("Content 2", self.read_file("dir1/foo.txt"))
+        self.assertEqual("Content 2", self.read_file("dir2/bar.txt"))
+
+        async with self.eden.get_async_thrift_client() as client:
+            await client.injectFault(
+                FaultDefinition(
+                    keyClass="TreeInode::checkout",
+                    keyValueRegex="<root>, false",
+                    errorType="runtime_error",
+                    errorMessage="intentional checkout error",
+                    count=1,
+                )
+            )
+
+        with self.assertRaisesRegex(hgrepo.HgError, "intentional checkout error"):
+            self.repo.update(bottom)
+        self.assertEqual("Content 2", self.read_file("dir1/foo.txt"))
+        self.assertEqual("Content 2", self.read_file("dir2/bar.txt"))
+
+        self.eden.restart()
+
+        output = self.repo.update(bottom)
+        self.assertEqual("update complete\n", output)
+        self.assertEqual("Content 1", self.read_file("dir1/foo.txt"))
+        self.assertEqual("Content 1", self.read_file("dir2/bar.txt"))
+        self.assert_status_empty()
+
     async def test_resume_interrupted_with_concurrent_update(self) -> None:
         self.repo.write_file("foo/baz.txt", "Content 3")
         await self.kill_eden_during_checkout_and_restart(self.commit1, "foo, false")
@@ -955,6 +1121,45 @@ class UpdateTest(EdenHgTestCase):
         # Setting the experimental.repair-eden-dirstate config option to true (the default) will fix the issue
         self.hg("config", "--local", "experimental.repair-eden-dirstate", "True")
         self.repo.status()
+
+    async def test_update_reports_checkout_error(self) -> None:
+        self.write_configs(
+            {"experimental": ["propagate-checkout-errors = false"]},
+            self.eden.user_rc_path,
+        )
+        async with self.eden.get_async_thrift_client() as client:
+            await client.reloadConfig()
+            for use_rust, clean in product((False, True), repeat=2):
+                with self.subTest(use_rust=use_rust, clean=clean):
+                    self.hg("config", "--local", "checkout.use-rust", str(use_rust))
+                    self.repo.update(self.commit3, clean=True)
+                    # Materialized files are applied after the fault point.
+                    self.write_file("foo/bar.txt", "updated in commit 3\n")
+                    await client.injectFault(
+                        FaultDefinition(
+                            keyClass="TreeInode::checkout",
+                            keyValueRegex="foo, false",
+                            errorType="runtime_error",
+                            errorMessage="intentional checkout error",
+                            count=1,
+                        )
+                    )
+                    with self.assertRaisesRegex(
+                        hgrepo.HgError, "intentional checkout error"
+                    ):
+                        self.repo.update(self.commit2, clean=clean)
+                    self.assertEqual(
+                        "updated in commit 3\n", self.read_file("foo/bar.txt")
+                    )
+                    # Eden already moved to the destination before reporting
+                    # the error. The dirstate parent stays behind, status is
+                    # computed against Eden's parent, and rerunning the update
+                    # resynchronizes the two.
+                    self.assertEqual(self.commit3, self.repo.get_head_hash())
+                    self.assertEqual({"foo/bar.txt": "M"}, self.repo.status())
+                    self.assertEqual(self.commit3, self.repo.get_head_hash())
+                    self.repo.update(self.commit2, clean=clean)
+                    self.assertEqual(self.commit2, self.repo.get_head_hash())
 
 
 class PrjFsState(Enum):

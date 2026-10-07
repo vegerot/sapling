@@ -153,7 +153,6 @@ from eden.fs.cli.telemetry import TelemetrySample
 from eden.fs.cli.util import (
     check_health_using_lockfile,
     EdenStartError,
-    is_apple_silicon,
     wait_for_instance_healthy,
 )
 from eden.fs.service.eden.thrift_types import EdenError
@@ -220,15 +219,31 @@ except ImportError:
 
 subcmd = subcmd_mod.Decorator()
 
+# The AI-backed commands shell out to a local `claude` and log to internal
+# telemetry, so they live under facebook/ and are absent from the OSS export.
+_AI_DIAGNOSIS_MODULE = "eden.fs.cli.facebook.ai_diagnosis"
+try:
+    from .facebook.ai_diagnosis import register as _register_ai_commands
+except ImportError as ex:
+    # Only tolerate the module itself being absent, which is how the OSS export
+    # is built. An ImportError from *inside* it means the module is present but
+    # broken, and swallowing that would drop both commands with no signal.
+    if ex.name is None or not _AI_DIAGNOSIS_MODULE.startswith(ex.name):
+        raise
+else:
+    _register_ai_commands(subcmd)
+
 # For a non-unix system (like Windows), we will define our own error codes.
 try:
     EX_OK: int = os.EX_OK
     EX_SOFTWARE: int = os.EX_SOFTWARE
     EX_OSFILE: int = os.EX_OSFILE
+    EX_UNAVAILABLE: int = os.EX_UNAVAILABLE
 except AttributeError:  # On a non-unix system
     EX_OK: int = 0
     EX_SOFTWARE: int = 70
     EX_OSFILE: int = 72
+    EX_UNAVAILABLE: int = 69
 
 # The Rust CLI depends on this value staying constant. Instead of fetching it
 # from the os library, let's just define it here.
@@ -479,10 +494,9 @@ class ListCmd(Subcmd):
 
             transport_str = ""
             if verbose and mount_info.fs_channel_type is not None:
-                if mount_info.fuse_transport is not None:
-                    transport_str = (
-                        f" ({mount_info.fs_channel_type}, {mount_info.fuse_transport})"
-                    )
+                transport = mount_info.fuse_transport or mount_info.nfs_transport
+                if transport is not None:
+                    transport_str = f" ({mount_info.fs_channel_type}, {transport})"
                 else:
                     transport_str = f" ({mount_info.fs_channel_type})"
 
@@ -535,7 +549,10 @@ class CloneCmd(Subcmd):
             "--nfs",
             dest="nfs",
             action="store_true",
-            default=is_apple_silicon(),
+            default=(
+                util.get_platform_default_mount_protocol()
+                == util.NFS_MOUNT_PROTOCOL_STRING
+            ),
             help=argparse.SUPPRESS,
         )
 
@@ -628,12 +645,12 @@ class CloneCmd(Subcmd):
         # pyre-fixme[53]: Captured variable `instance` is not annotated.
         # pyre-fixme[3]: Return type must be annotated.
         def is_nfs_default():
-            default_protocol = "PrjFS" if sys.platform == "win32" else "FUSE"
+            default_protocol = util.get_platform_default_mount_protocol()
             return (
                 instance.get_config_value(
                     "clone.default-mount-protocol", default_protocol
-                ).upper()
-                == "NFS"
+                ).lower()
+                == util.NFS_MOUNT_PROTOCOL_STRING
             )
 
         args.path = os.path.realpath(args.path)
@@ -739,7 +756,9 @@ is case-sensitive. This is not recommended and is intended only for testing."""
                 off_mount_repo_dir=instance.get_config_bool(
                     "clone.off-mount-repo-dir",
                     # Enable by default in tests.
-                    any(v in os.environ for v in ("INTEGRATION_TEST", "TESTTMP")),
+                    any(
+                        v in os.environ for v in ("EDENFS_INTEGRATION_TEST", "TESTTMP")
+                    ),
                 ),
             )
         except util.RepoError as ex:
@@ -2289,7 +2308,8 @@ class StartCmd(Subcmd):
         parser.add_argument(
             "--if-necessary",
             action="store_true",
-            help="Only start edenfs daemon if there are EdenFS checkouts configured.",
+            help="Only start edenfs daemon if there are EdenFS checkouts configured. "
+            "Implies --if-not-running.",
         )
         parser.add_argument(
             "--if-not-running",
@@ -2403,7 +2423,10 @@ class StartCmd(Subcmd):
                 msg = f"EdenFS is already starting (pid {health_info.pid})"
 
             if msg:
-                if args.if_not_running:
+                # --if-necessary means "start only if this host needs EdenFS", so a
+                # daemon that is already up satisfies the request. Callers reach for
+                # it expecting that and are surprised by a nonzero exit.
+                if args.if_not_running or args.if_necessary:
                     print(msg)
                     return 0
                 raise subcmd_mod.CmdError(msg)
@@ -2416,8 +2439,6 @@ class StartCmd(Subcmd):
                 instance, daemon_binary, args.edenfs_args, args.preserved_vars
             )
 
-        if config_mod.should_migrate_mount_protocol_to_nfs(instance):
-            config_mod._do_nfs_migration(instance, get_migration_success_message)
         if config_mod.should_migrate_inode_catalog_to_in_memory(instance):
             config_mod._do_in_memory_inode_catalog_migration(instance)
         result = daemon.start_edenfs_service(
@@ -2492,7 +2513,7 @@ class StartCmd(Subcmd):
                 cmd = ["strace", "-fttT", "-o", args.strace] + cmd
 
         # Wrap the command in sudo, if necessary
-        eden_env = daemon.get_edenfs_environment(args.preserved_vars)
+        eden_env = daemon.get_edenfs_environment(instance, args.preserved_vars)
         cmd, eden_env = daemon.prepare_edenfs_privileges(
             daemon_binary, cmd, eden_env, privhelper
         )
@@ -2568,10 +2589,10 @@ class SystemdStartCmd(Subcmd):
 def unmount_redirections_for_path(
     repo_path: str, complain_about_failing_to_unmount_redirs: bool
 ) -> None:
-    parser = create_parser()
-    args = parser.parse_args(["redirect", "unmount", "--mount", repo_path])
     try:
-        args.func(args)
+        args = create_parser().parse_args([])
+        instance, checkout, _rel_path = require_checkout(args, repo_path)
+        redirect_mod.unmount_redirections(instance, checkout)
     except Exception as exc:
         if complain_about_failing_to_unmount_redirs:
             print(
@@ -2922,8 +2943,15 @@ class RestartCmd(Subcmd):
         return normalized, is_default_config_dir
 
     @staticmethod
-    def _get_fuse_transport_mismatch_direction(
-        transport_mismatches: Sequence[config_mod.FuseTransportMismatch],
+    def _get_transport_mismatch_channel(
+        transport_mismatches: Sequence[config_mod.TransportMismatch],
+    ) -> str:
+        channels = {mismatch.channel for mismatch in transport_mismatches}
+        return next(iter(channels)) if len(channels) == 1 else "mixed"
+
+    @staticmethod
+    def _get_transport_mismatch_direction(
+        transport_mismatches: Sequence[config_mod.TransportMismatch],
     ) -> str:
         def get_transport_name(transports: Set[str]) -> str:
             if len(transports) == 1:
@@ -2950,21 +2978,18 @@ class RestartCmd(Subcmd):
             )
             telemetry_sample.add_string("eden_dir", eden_dir_normalized)
             telemetry_sample.add_bool("is_default_config_dir", is_default_config_dir)
-            if config_mod.is_fuse_transport_mismatch_restart_enabled(instance):
-                transport_mismatches = config_mod.get_fuse_transport_mismatches(
-                    instance
-                )
-            else:
-                transport_mismatches = []
+            transport_mismatches = config_mod.get_transport_mismatches(instance)
 
             if transport_mismatches:
-                telemetry_sample.add_string("reason", "fuse_transport_mismatch")
+                channel = self._get_transport_mismatch_channel(transport_mismatches)
+                reason = f"{channel}_transport_mismatch"
+                telemetry_sample.add_string("reason", reason)
                 telemetry_sample.add_string(
                     "transport_name",
-                    self._get_fuse_transport_mismatch_direction(transport_mismatches),
+                    self._get_transport_mismatch_direction(transport_mismatches),
                 )
                 print(
-                    "FUSE transport config changed; performing a full restart instead of graceful restart."
+                    f"{channel.upper()} transport config changed; performing a full restart instead of graceful restart."
                 )
                 for mismatch in transport_mismatches:
                     print(
@@ -2974,7 +2999,7 @@ class RestartCmd(Subcmd):
                 edenfs_pid = health.pid
                 if edenfs_pid is None:
                     telemetry_sample.fail(
-                        "FUSE transport mismatch required full restart, but EdenFS was not running"
+                        "Transport mismatch required a full restart, but EdenFS was not running"
                     )
                     return self._start(instance)
 
@@ -2988,11 +3013,11 @@ class RestartCmd(Subcmd):
                 instance.log_sample(
                     "full_restart",
                     success=status == 0,
-                    triggered_by="fuse_transport_mismatch",
+                    triggered_by=reason,
                 )
                 if status != 0:
                     telemetry_sample.fail(
-                        "FUSE transport mismatch fallback full restart failed"
+                        "Transport mismatch fallback full restart failed"
                     )
                 return status
 
@@ -3053,18 +3078,26 @@ Any programs using files or directories inside the EdenFS mounts will need to
 re-open these files after EdenFS is restarted.
 """
         )
-        if not self.args.force_restart and sys.stdin.isatty():
+        # Only prompt when the user can actually see the prompt. If stdout is
+        # redirected (e.g. to a log file) the prompt is invisible and input()
+        # would block forever, so fall through to the same non-interactive
+        # behavior used for non-TTY stdin instead, with a notice so the skip
+        # is visible in the log or pipe output.
+        if not self.args.force_restart and sys.stdin.isatty() and sys.stdout.isatty():
             if prompt and not prompt_confirmation("Proceed?"):
                 print("Not confirmed.")
                 return 1
+        elif not self.args.force_restart and prompt and sys.stdin.isatty():
+            print(
+                "stdout is not a terminal; skipping confirmation and proceeding "
+                "with full restart"
+            )
 
         self._do_stop(instance, old_pid, timeout=DEFAULT_STOP_TIMEOUT)
         if migrate_to is not None:
             config_mod._do_manual_migration(
                 instance, migrate_to, get_migration_success_message
             )
-        elif config_mod.should_migrate_mount_protocol_to_nfs(instance):
-            config_mod._do_nfs_migration(instance, get_migration_success_message)
         return self._finish_restart(instance, allow_root=allow_root)
 
     def _force_restart(
@@ -3420,7 +3453,6 @@ def create_parser() -> argparse.ArgumentParser:
         subcmd_mod.HelpCmd,
         stats_mod.StatsCmd,
         trace_mod.TraceCmd,
-        redirect_mod.RedirectCmd,
         prefetch_mod.GlobCmd,
         prefetch_mod.PrefetchCmd,
     ]
@@ -3568,7 +3600,7 @@ async def async_main(parser: argparse.ArgumentParser, args: argparse.Namespace) 
         return EX_SOFTWARE
     except daemon_util.DaemonBinaryNotFound as ex:
         print(f"error: {ex}", file=sys.stderr)
-        return EX_SOFTWARE
+        return EX_UNAVAILABLE
     except config_mod.UsageError as ex:
         print(f"error: {ex}", file=sys.stderr)
         return EX_USAGE

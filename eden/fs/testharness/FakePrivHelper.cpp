@@ -87,6 +87,12 @@ void FakePrivHelper::registerMountDelegate(
   }
 }
 
+void FakePrivHelper::unregisterMount(AbsolutePathPiece mountPath) {
+  if (mountDelegates_.erase(mountPath.asString()) == 0) {
+    throwf<std::range_error>("mount {} not defined", mountPath);
+  }
+}
+
 void FakePrivHelper::attachEventBase(folly::EventBase* /* eventBase */) {}
 
 void FakePrivHelper::detachEventBase() {}
@@ -178,15 +184,6 @@ std::shared_ptr<FakePrivHelper::MountDelegate> FakePrivHelper::getMountDelegate(
   return it->second;
 }
 
-folly::Future<folly::Unit> FakePrivHelper::setDaemonTimeout(
-    std::chrono::nanoseconds /* duration */) {
-  return folly::Unit{};
-}
-
-folly::Future<folly::Unit> FakePrivHelper::setUseEdenFs(bool /* useEdenFs */) {
-  return folly::unit;
-}
-
 folly::Future<pid_t> FakePrivHelper::getServerPid() {
   return -1;
 }
@@ -201,7 +198,8 @@ folly::Future<pid_t> FakePrivHelper::startFam(
     const std::vector<std::string>& /* paths */,
     const std::string& /* tmpOutputPath */,
     const std::string& /* specifiedOutputPath */,
-    const bool /* shouldUpload */) {
+    const bool /* shouldUpload */,
+    folly::File /* outputFile */) {
   return makeFuture<pid_t>(
       runtime_error("FakePrivHelper::startFam() not implemented"));
 }

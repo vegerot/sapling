@@ -13,6 +13,9 @@ rust_library(
             "MononokeAppStats_ods3_types": "//eden/mononoke/facebook/ods3_schemas:MononokeAppStats_ods3-rust",
         }
     ),
+    test_deps = [
+        "fbsource//third-party/rust:serde_json",
+    ],
     deps = (
         [
             "fbsource//third-party/rust:anyhow",
@@ -21,7 +24,6 @@ rust_library(
             "fbsource//third-party/rust:clap",
             "fbsource//third-party/rust:futures",
             "fbsource//third-party/rust:futures-util",
-            "fbsource//third-party/rust:im",
             "fbsource//third-party/rust:itertools",
             "fbsource//third-party/rust:regex",
             "fbsource//third-party/rust:strum",
@@ -32,7 +34,6 @@ rust_library(
             "//common/rust/shed/cached_config:cached_config",
             "//common/rust/shed/facet:facet",
             "//common/rust/shed/fbinit:fbinit",
-            "//common/rust/shed/futures_retry:futures_retry",
             "//common/rust/shed/memcache_stub:memcache",
             "//common/rust/shed/services:services",
             "//common/rust/shed/stats:stats",
@@ -83,6 +84,7 @@ rust_library(
             []
             if rust_oss.is_oss_build()
             else [
+                "//common/rust/srserver:srserver",
                 "//configerator/structs/infrasec/if:acl-rust",
                 "//eden/mononoke/facebook/ods3_schemas:MononokeAppStats_ods3-rs_bindings",
             ]

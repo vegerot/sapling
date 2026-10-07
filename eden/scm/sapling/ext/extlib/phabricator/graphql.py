@@ -80,7 +80,9 @@ class Client:
         self._auth_token_regex = ui.config(
             "phabricator",
             "auth-expired-regex",
-            r"invalid auth token|the provided crypto auth token\(s\) are expired",
+            # interngraph prefixes every CAT rejection (expired / empty list /
+            # wrong format) with this stem.
+            r"invalid auth token|the provided crypto auth token",
         )
         if not self._mock:
             self._app_id = ui.config("phabricator", "graphql_app_id")
@@ -358,9 +360,13 @@ class Client:
                                         }
                                     }
                                 }
-                                phabricator_diff_commit {
+                                phabricator_diff_commit(first: 20, from_commit_message_only: true) {
                                     nodes {
                                         commit_identifier
+                                    }
+                                    page_info {
+                                        has_next_page
+                                        end_cursor
                                     }
                                 }
                             }
@@ -413,8 +419,15 @@ class Client:
                 _status = result["diff_status_name"]
                 if _status in diff_status_list:
                     difftostatus[diffid] = _status
-                    nodes = result["phabricator_diff_commit"]["nodes"]
-                    for n in nodes:
+                    commit_connection = result["phabricator_diff_commit"]
+                    if commit_connection.get("page_info", {}).get("has_next_page"):
+                        repo.ui.debug(
+                            _(
+                                "only checking the 20 most recent landed commits for D%s\n"
+                            )
+                            % diffid
+                        )
+                    for n in commit_connection["nodes"]:
                         diffidentifiers[n["commit_identifier"]] = diffid
 
                     allversionnodes = result["phabricator_versions"]["nodes"]

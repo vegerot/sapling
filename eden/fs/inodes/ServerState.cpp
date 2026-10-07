@@ -15,7 +15,6 @@
 #include <vector>
 
 #include "eden/common/telemetry/SessionInfo.h"
-#include "eden/common/telemetry/StructuredLoggerFactory.h"
 #include "eden/common/utils/FaultInjector.h"
 #include "eden/common/utils/UnboundedQueueExecutor.h"
 #include "eden/fs/config/EdenConfig.h"
@@ -26,7 +25,6 @@
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/ErrorLogger.h"
-#include "eden/fs/telemetry/FileAccessStructuredLogger.h"
 #include "eden/fs/telemetry/FsEventLogger.h"
 #include "eden/fs/telemetry/IXplatLogger.h"
 #include "eden/fs/utils/Clock.h"
@@ -69,10 +67,11 @@ constexpr std::chrono::hours kMaxStrandedLifetime{1};
 ServerState::ServerState(
     UserInfo userInfo,
     EdenStatsPtr edenStats,
-    SessionInfo sessionInfo, // NOLINT(performance-unnecessary-value-param)
+    [[maybe_unused]] SessionInfo
+        sessionInfo, // NOLINT(performance-unnecessary-value-param)
     std::shared_ptr<PrivHelper> privHelper,
     std::shared_ptr<UnboundedQueueExecutor> threadPool,
-    std::shared_ptr<folly::Executor> fsChannelThreadPool,
+    std::shared_ptr<UnboundedQueueExecutor> fsChannelThreadPool,
     std::shared_ptr<Clock> clock,
     std::shared_ptr<ProcessInfoCache> processInfoCache,
     std::shared_ptr<StructuredLogger> structuredLogger,
@@ -81,11 +80,11 @@ ServerState::ServerState(
     std::shared_ptr<IScribeLogger> scribeLogger,
     std::shared_ptr<ReloadableConfig> reloadableConfig,
     const EdenConfig& initialConfig,
-    [[maybe_unused]] folly::EventBase* mainEventBase,
+    [[maybe_unused]] folly::EventBase* nfsEventBase,
     std::shared_ptr<Notifier> notifier,
     bool enableFaultDetection,
     std::shared_ptr<InodeAccessLogger> inodeAccessLogger,
-    IXplatLogger* xplatLogger)
+    std::shared_ptr<IXplatLogger> xplatLogger)
     : userInfo_{std::move(userInfo)},
       edenStats_{std::move(edenStats)},
       privHelper_{std::move(privHelper)},
@@ -94,11 +93,7 @@ ServerState::ServerState(
       clock_{std::move(clock)},
       processInfoCache_{std::move(processInfoCache)},
       structuredLogger_{std::move(structuredLogger)},
-      edenFsEventsLogger_{std::make_shared<EdenFsEventsLogger>(
-          structuredLogger_,
-          xplatLogger,
-          reloadableConfig,
-          edenStats_.copy())},
+      edenFsEventsLogger_{std::make_shared<EdenFsEventsLogger>(xplatLogger)},
       notificationsStructuredLogger_{std::move(notificationsStructuredLogger)},
       errorLogger_{std::move(errorLogger)},
       scribeLogger_{std::move(scribeLogger)},
@@ -107,7 +102,7 @@ ServerState::ServerState(
           initialConfig.enableNfsServer.getValue()
               ? std::make_shared<NfsServer>(
                     privHelper_.get(),
-                    mainEventBase,
+                    nfsEventBase,
                     fsChannelThreadPool_,
                     initialConfig.runInternalRpcbind.getValue(),
                     edenFsEventsLogger_,
@@ -124,20 +119,11 @@ ServerState::ServerState(
           kSystemIgnoreMinPollSeconds}},
       notifier_{std::move(notifier)},
       inodeAccessLogger_{
-          inodeAccessLogger
-              ? std::move(inodeAccessLogger)
-              : std::make_shared<InodeAccessLogger>(
-                    config_,
-                    makeDefaultStructuredLogger<
-                        FileAccessStructuredLogger,
-                        EdenStatsPtr>(
-                        config_->getEdenConfig()->scribeLogger.getValue(),
-                        config_->getEdenConfig()
-                            ->fileAccessScribeCategory.getValue(),
-                        std::move(sessionInfo),
-                        edenStats_.copy()),
-                    edenStats_.copy(),
-                    xplatLogger)},
+          inodeAccessLogger ? std::move(inodeAccessLogger)
+                            : std::make_shared<InodeAccessLogger>(
+                                  config_,
+                                  edenStats_.copy(),
+                                  std::move(xplatLogger))},
       fsEventLogger_{
           initialConfig.requestSamplesPerMinute.getValue()
               ? std::make_shared<FsEventLogger>(config_, scribeLogger_)
@@ -165,8 +151,55 @@ ServerState::ServerState(
 
 ServerState::~ServerState() {
   // Stop the cleanup scheduler before any of the members it touches are
-  // destroyed (notably preloadProgressMap_).
-  preloadCleanupScheduler_.shutdown();
+  // destroyed (notably preloadProgressMap_). Executor shutdown is explicit via
+  // shutdown(), since the final ServerState reference may be released on an
+  // executor thread.
+  shutdownPreloadCleanup();
+}
+
+void ServerState::shutdownPreloadCleanup() {
+  folly::call_once(preloadCleanupShutdownOnceFlag_, [this] {
+    preloadCleanupScheduler_.shutdown();
+  });
+}
+
+void ServerState::shutdown() {
+  shutdownPreloadCleanup();
+
+  folly::call_once(executorShutdownOnceFlag_, [this] {
+    // Synchronize with lazy initialization without creating the preload pool
+    // solely to shut it down.
+    folly::call_once(preloadThreadPoolOnceFlag_, [] {});
+    if (preloadThreadPool_) {
+      preloadThreadPool_->join();
+    }
+
+    if (fsChannelThreadPool_.get() != threadPool_.get()) {
+      fsChannelThreadPool_->join();
+    }
+    threadPool_->join();
+  });
+}
+
+GlobMatchOptions ServerState::getGlobMatchOptions() {
+  auto config = getEdenConfig();
+  GlobMatchOptions options;
+  options.enableFailureMemoization =
+      config->globEnableFailureMemoization.getValue();
+  options.maxMemoizedFailureStates =
+      config->globMaxMemoizedFailureStates.getValue();
+  options.maxBacktrackingSteps = config->globMaxBacktrackingSteps.getValue();
+  // RefPtr is move-only, while std::function requires a copyable callable.
+  auto stats = std::make_shared<EdenStatsPtr>(edenStats_.copy());
+  options.limitReachedCallback = [stats =
+                                      std::move(stats)](GlobMatchLimit limit) {
+    if (limit == GlobMatchLimit::MemoizedFailureStates) {
+      (*stats)->increment(&GlobStats::memoizedFailureStateLimitExceeded);
+    } else {
+      (*stats)->increment(&GlobStats::backtrackingStepLimitExceeded);
+    }
+  };
+  return options;
 }
 
 const std::shared_ptr<folly::IOThreadPoolExecutor>&

@@ -40,17 +40,19 @@ use mercurial_types::subtree::HgSubtreeChanges;
 use mononoke_macros::mononoke;
 use mononoke_types::BlobstoreValue;
 use mononoke_types::BonsaiChangeset;
+use mononoke_types::ChangesetId;
 use mononoke_types::FileType;
 use mononoke_types::MPath;
 use mononoke_types::NonRootMPath;
 use mononoke_types::subtree_change::SubtreeChange;
 use repo_blobstore::RepoBlobstoreArc;
+use restricted_paths::RestrictedPaths;
+use restricted_paths_common::ArcRestrictedPathsConfigBased;
 use scuba_ext::MononokeScubaSampleBuilder;
 use sorted_vector_map::SortedVectorMap;
 use stats::prelude::*;
 use uuid::Uuid;
 
-use crate::ErrorKind;
 use crate::bonsai_generation::create_bonsai_changeset_object;
 use crate::bonsai_generation::save_bonsai_changeset_object;
 use crate::repo_commit::*;
@@ -61,6 +63,42 @@ define_stats! {
     create_changeset_compute_cf: timeseries("create_changeset.compute_changed_files"; Rate, Sum),
     create_changeset_expected_cf: timeseries("create_changeset.expected_changed_files"; Rate, Sum),
     create_changeset_cf_count: timeseries("create_changeset.changed_files_count"; Average, Sum),
+}
+
+/// Validates `.slacl` changes in each changeset derived by [`CreateChangeset`],
+/// before the changeset becomes reachable (commit graph and bonsai-hg mapping).
+pub struct AclFileValidation {
+    pub restricted_paths: Arc<RestrictedPaths>,
+    pub repo_name: String,
+}
+
+impl AclFileValidation {
+    /// Validate the bonsai's `.slacl` changes against its parents. The bonsai
+    /// file changes come from the manifest diff, so this doesn't trust the
+    /// client-supplied list of changed files.
+    async fn validate(&self, ctx: &CoreContext, bonsai: &BonsaiChangeset) -> Result<()> {
+        let acl_file_name = self.restricted_paths.config().acl_file_name().as_bytes();
+        let touched_acl_files: Vec<NonRootMPath> = bonsai
+            .file_changes()
+            .map(|(path, _)| path)
+            .filter(|path| path.basename().as_ref() == acl_file_name)
+            .cloned()
+            .collect();
+        if touched_acl_files.is_empty() {
+            return Ok(());
+        }
+
+        let parents: Vec<ChangesetId> = bonsai.parents().collect();
+        self.restricted_paths
+            .validate_acl_file_changes_in_changesets(
+                ctx,
+                &self.repo_name,
+                &parents,
+                &[touched_acl_files.as_slice()],
+            )
+            .await
+            .map_err(Error::from)
+    }
 }
 
 pub struct CreateChangeset {
@@ -78,6 +116,9 @@ pub struct CreateChangeset {
     /// manually after this call. Effectively, the commit will be in the blobstore, but
     /// unreachable.
     pub upload_to_blobstore_only: bool,
+    /// If set, reject the changeset before it becomes reachable when it
+    /// modifies `.slacl` files the caller may not modify.
+    pub acl_file_validation: Option<AclFileValidation>,
 }
 
 impl CreateChangeset {
@@ -85,6 +126,7 @@ impl CreateChangeset {
         self,
         ctx: CoreContext,
         repo: &(impl RepoBlobstoreArc + CommitGraphWriterArc + BonsaiHgMappingArc + Send + Sync),
+        restricted_paths: ArcRestrictedPathsConfigBased,
         bonsai: Option<BonsaiChangeset>,
         mut scuba_logger: MononokeScubaSampleBuilder,
     ) -> ChangesetHandle {
@@ -94,8 +136,11 @@ impl CreateChangeset {
         let uuid = Uuid::new_v4();
         scuba_logger.add("changeset_uuid", format!("{uuid}"));
 
-        let entry_processor =
-            UploadEntries::new(repo.repo_blobstore().clone(), scuba_logger.clone());
+        let entry_processor = UploadEntries::new(
+            repo.repo_blobstore().clone(),
+            restricted_paths,
+            scuba_logger.clone(),
+        );
         let (signal_parent_ready, can_be_parent) = oneshot::channel();
         let signal_parent_ready = Arc::new(Mutex::new(Some(signal_parent_ready)));
         let expected_nodeid = self.expected_nodeid;
@@ -189,17 +234,15 @@ impl CreateChangeset {
                 };
                 let bonsai_blob = bonsai_cs.clone().into_blob();
                 let bcs_id = bonsai_blob.id().clone();
-                let cs_id = hg_cs.get_changeset_id().into_nodehash();
+                let hg_cs_id = hg_cs.get_changeset_id();
+                let cs_id = hg_cs_id.into_nodehash();
                 let manifest_id = hg_cs.manifestid();
 
                 if let Some(expected_nodeid) = expected_nodeid {
                     if cs_id != expected_nodeid {
-                        return Err(ErrorKind::InconsistentChangesetHash(
-                            expected_nodeid,
-                            cs_id,
-                            hg_cs,
-                        )
-                        .into());
+                        return Err(anyhow!(
+                            "Inconsistent node hash for changeset: provided: {expected_nodeid}, computed: {cs_id} for blob: {hg_cs:#?}"
+                        ));
                     }
                 }
 
@@ -227,7 +270,7 @@ impl CreateChangeset {
                     bcs_fut,
                     hg_cs.save(&ctx, &blobstore),
                     entry_processor
-                        .finalize(&ctx, root_mf_id, parent_manifest_hashes)
+                        .finalize(&ctx, hg_cs_id, root_mf_id, parent_manifest_hashes)
                         .map_err(|err| err.context("While finalizing processing")),
                 )?;
 
@@ -262,8 +305,18 @@ impl CreateChangeset {
 
         let commit_graph_writer = repo.commit_graph_writer_arc();
         let bonsai_hg_mapping = repo.bonsai_hg_mapping_arc();
+        let acl_file_validation = self.acl_file_validation;
         let changeset_complete_fut = async move {
             let ((hg_cs, bonsai_cs), _) = future::try_join(changeset, parents_complete).await?;
+
+            // Parents are complete (and so reachable) here, so their
+            // restrictions can be looked up.
+            if let Some(acl_file_validation) = acl_file_validation {
+                acl_file_validation
+                    .validate(&ctx, &bonsai_cs)
+                    .await
+                    .context("While validating ACL file changes")?;
+            }
 
             if !self.upload_to_blobstore_only {
                 // update changeset mapping

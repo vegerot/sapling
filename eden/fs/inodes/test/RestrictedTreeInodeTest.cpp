@@ -7,12 +7,18 @@
 
 #include "eden/fs/inodes/TreeInode.h"
 
+#include <folly/ScopeGuard.h>
 #include <folly/coro/GtestHelpers.h>
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <chrono>
+#include <memory>
 #include <system_error>
 
 #include "eden/common/utils/CaseSensitivity.h"
+#include "eden/fs/config/EdenConfig.h"
+#include "eden/fs/config/RestrictedContentMode.h"
+#include "eden/fs/fuse/FuseDirList.h"
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/FileInode.h"
 #include "eden/fs/inodes/InodeMap.h"
@@ -21,14 +27,18 @@
 #include "eden/fs/inodes/VirtualInode.h"
 #include "eden/fs/model/Tree.h"
 #include "eden/fs/model/TreeAuxData.h"
+#include "eden/fs/nfs/NfsDirList.h"
 #include "eden/fs/store/ObjectFetchContext.h"
+#include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/testharness/FakeBackingStore.h"
+#include "eden/fs/testharness/FakeFuse.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
 #include "eden/fs/testharness/TestMount.h"
 
 using namespace facebook::eden;
 
 namespace {
+
 template <typename Fn>
 void expectEacces(Fn&& fn) {
   try {
@@ -76,22 +86,53 @@ TreeInodePtr makeTreeInodeChildWithoutParentEntry(
   testMount.getEdenMount()->getInodeMap()->inodeCreated(inode);
   return inode;
 }
+
+// The mount's ObjectStore snapshots acl:restricted-content-mode at
+// construction, so it must be set on the EdenConfig before TestMount is built,
+// not via updateEdenConfig().
+void setOmittedMode(EdenConfig& config) {
+  config.restrictedContentMode.setValue(
+      RestrictedContentMode::Omitted, ConfigSourceType::CommandLine);
+}
+
+// Mount the given tree with acl:restricted-content-mode = omitted.
+std::unique_ptr<TestMount> makeOmittedModeTestMount(FakeTreeBuilder& builder) {
+  return std::make_unique<TestMount>(
+      builder,
+      /*startReady=*/true,
+      /*enableActivityBuffer=*/true,
+      kPathMapDefaultCaseSensitive,
+      /*errorLogger=*/nullptr,
+      setOmittedMode);
+}
+
+// Shared setup for the omittedMode_* tests: a parent directory with one
+// normal child and one restricted child.
+std::unique_ptr<TestMount> makeOmittedModeTestMount() {
+  FakeTreeBuilder builder;
+  builder.setFile("parent/normal.txt", "normal content");
+  builder.setFile("parent/restricted_child/secret.txt", "secret content");
+  builder.setDirIsRestricted("parent/restricted_child");
+  return makeOmittedModeTestMount(builder);
+}
 } // namespace
 
-TEST(RestrictedTreeInode, normalTreeInodeAllowsReaddir) {
+CO_TEST(RestrictedTreeInode, normalTreeInodeAllowsReaddir) {
   FakeTreeBuilder builder;
   builder.setFile("dir/file.txt", "content");
   TestMount testMount{builder};
 
   auto rootInode = testMount.getEdenMount()->getRootInode();
   auto context = ObjectFetchContext::getNullContext();
-  auto children = rootInode->getChildren(context, /*loadInodes=*/false);
+  auto children =
+      co_await rootInode->getChildren(context, /*loadInodes=*/false);
 
   auto iter =
       std::find_if(children.begin(), children.end(), [](const auto& entry) {
         return entry.first == "dir"_pc;
       });
-  ASSERT_NE(iter, children.end());
+  CO_ASSERT_NE(iter, children.end());
+  CO_ASSERT_TRUE(iter->second.hasValue());
 }
 
 TEST(RestrictedTreeInode, restrictedFlagDeniesAccess) {
@@ -288,6 +329,10 @@ class RestrictedTreeInodeEndToEnd : public ::testing::Test {
     builder.setFile("restricted/secret.txt", "secret content");
     builder.setDirIsRestricted("restricted");
     testMount_ = std::make_unique<TestMount>(builder);
+    auto restrictedObjectId =
+        builder.getRoot()->get().find("restricted"_pc)->second.getObjectId();
+    testMount_->getBackingStore()->setCheckPermissionResult(
+        restrictedObjectId, false);
   }
 
   TreeInodePtr getRestrictedInode() {
@@ -433,6 +478,8 @@ TEST(RestrictedTreeInode, nestedRestrictedDirBlocksAccess) {
   auto restrictedInode =
       testMount.getTreeInode("parent/restricted_child"_relpath);
   EXPECT_TRUE(restrictedInode->isRestricted());
+  testMount.getBackingStore()->setCheckPermissionResult(
+      restrictedInode->getObjectId().value(), false);
 
   auto context = ObjectFetchContext::getNullContext();
   expectEacces([&] {
@@ -531,7 +578,7 @@ TEST(RestrictedTreeInode, renameIntoRestrictedDirReturnsEACCES) {
   });
 }
 
-CO_TEST(RestrictedTreeInode, co_getChildrenOnRestrictedTreeReturnsEACCES) {
+CO_TEST(RestrictedTreeInode, getChildrenOnRestrictedTreeReturnsEACCES) {
   FakeTreeBuilder builder;
   builder.setFile("restricted/secret.txt", "secret");
   builder.setDirIsRestricted("restricted");
@@ -541,7 +588,7 @@ CO_TEST(RestrictedTreeInode, co_getChildrenOnRestrictedTreeReturnsEACCES) {
   auto vi = testMount.getVirtualInode("restricted"_relpath);
   auto context = ObjectFetchContext::getNullContext();
 
-  auto result = co_await folly::coro::co_awaitTry(vi.co_getChildren(
+  auto result = co_await folly::coro::co_awaitTry(vi.getChildren(
       "restricted"_relpath, edenMount->getObjectStore(), context));
   CO_ASSERT_TRUE(result.hasException());
   EXPECT_TRUE(result.hasException<std::system_error>());
@@ -552,7 +599,7 @@ CO_TEST(RestrictedTreeInode, co_getChildrenOnRestrictedTreeReturnsEACCES) {
 
 CO_TEST(
     RestrictedTreeInode,
-    co_getChildrenSkipsBackingStoreFetchForRestrictedChild) {
+    getChildrenSkipsBackingStoreFetchForRestrictedChild) {
   // Parent is unrestricted; one child entry is restricted. The coro path
   // must hand back a synthesized restricted VirtualInode for that child
   // instead of fetching its tree from the backing store.
@@ -566,7 +613,7 @@ CO_TEST(
   auto vi = testMount.getVirtualInode("parent"_relpath);
   auto context = ObjectFetchContext::getNullContext();
 
-  auto results = co_await vi.co_getChildren(
+  auto results = co_await vi.getChildren(
       "parent"_relpath, edenMount->getObjectStore(), context);
   bool sawRestrictedChild = false;
   bool sawNormalChild = false;
@@ -578,7 +625,7 @@ CO_TEST(
       // surface EACCES — it is a real restricted view, not the underlying
       // tree contents.
       auto childResult =
-          co_await folly::coro::co_awaitTry(tryVi.value().co_getChildren(
+          co_await folly::coro::co_awaitTry(tryVi.value().getChildren(
               "parent/restricted_child"_relpath,
               edenMount->getObjectStore(),
               context));
@@ -598,7 +645,7 @@ CO_TEST(
 
 // Exercises the InodePtr branch — the dominant production path after a
 // mount has loaded inodes.
-CO_TEST(RestrictedTreeInode, co_getChildren_inodePtrBranchReturnsEntries) {
+CO_TEST(RestrictedTreeInode, getChildren_inodePtrBranchReturnsEntries) {
   FakeTreeBuilder builder;
   builder.setFile("dir/a.txt", "a");
   builder.setFile("dir/b.txt", "b");
@@ -610,7 +657,7 @@ CO_TEST(RestrictedTreeInode, co_getChildren_inodePtrBranchReturnsEntries) {
   VirtualInode vi{InodePtr{dirInode}};
   auto context = ObjectFetchContext::getNullContext();
 
-  auto results = co_await vi.co_getChildren(
+  auto results = co_await vi.getChildren(
       "dir"_relpath, edenMount->getObjectStore(), context);
   EXPECT_EQ(results.size(), 2);
   for (auto& [name, tryVi] : results) {
@@ -620,7 +667,7 @@ CO_TEST(RestrictedTreeInode, co_getChildren_inodePtrBranchReturnsEntries) {
 
 // Catches a regression where the early isDirectory() guard drifts out of
 // sync with the variant arms.
-CO_TEST(RestrictedTreeInode, co_getChildren_onFileReturnsENOTDIR) {
+CO_TEST(RestrictedTreeInode, getChildren_onFileReturnsENOTDIR) {
   FakeTreeBuilder builder;
   builder.setFile("dir/file.txt", "content");
   TestMount testMount{builder};
@@ -629,7 +676,7 @@ CO_TEST(RestrictedTreeInode, co_getChildren_onFileReturnsENOTDIR) {
   auto vi = testMount.getVirtualInode("dir/file.txt"_relpath);
   auto context = ObjectFetchContext::getNullContext();
 
-  auto result = co_await folly::coro::co_awaitTry(vi.co_getChildren(
+  auto result = co_await folly::coro::co_awaitTry(vi.getChildren(
       "dir/file.txt"_relpath, edenMount->getObjectStore(), context));
   CO_ASSERT_TRUE(result.hasException());
   EXPECT_TRUE(result.hasException<std::system_error>());
@@ -776,6 +823,27 @@ TEST(RestrictedTreeInode, isRestricted_reflectsVariant) {
   EXPECT_FALSE(VirtualInode{InodePtr{normalInode}}.isRestricted());
 }
 
+CO_TEST(
+    RestrictedTreeInode,
+    co_getDigestHash_restrictedTreePtrWithholdsDigestHash) {
+  FakeTreeBuilder builder;
+  builder.setFile("restricted/secret.txt", "secret");
+  builder.setDirIsRestricted("restricted");
+  TestMount testMount{builder};
+
+  auto restricted = testMount.getVirtualInode("restricted"_relpath);
+  CO_ASSERT_EQ(
+      VirtualInode::ContainedType::Tree, restricted.testGetContainedType());
+  CO_ASSERT_TRUE(restricted.isRestricted());
+
+  auto result = co_await folly::coro::co_awaitTry(restricted.co_getDigestHash(
+      "restricted"_relpath,
+      testMount.getEdenMount()->getObjectStore(),
+      ObjectFetchContext::getNullContext()));
+  CO_ASSERT_TRUE(result.hasValue());
+  EXPECT_FALSE(result.value().has_value());
+}
+
 TEST(RestrictedTreeInode, tryGetEntryAttributesSync_restrictedDirWithholdsAux) {
   FakeTreeBuilder builder;
   builder.setFile("normal/file.txt", "ok");
@@ -809,13 +877,13 @@ TEST(RestrictedTreeInode, tryGetEntryAttributesSync_restrictedDirWithholdsAux) {
 }
 
 // ============================================================================
-// Coroutine readdir ACL parity (regression for TreeInode coro recheck gate).
-// Mirrors the futures-side gate in TreeInode::getChildren
-// (recheckPermissionIfExpired before lock) so the coroutine variant does not
-// stick on stale EACCES after a TTL-expired permission grant.
+// Coroutine getChildren ACL parity (regression for TreeInode recheck gate).
+// Ensures recheckPermissionIfExpired runs before the contents lock so
+// getChildren does not stick on stale EACCES after a TTL-expired permission
+// grant.
 // ============================================================================
 
-CO_TEST(RestrictedTreeInode, co_getChildren_returnsEntriesOnUnrestrictedRoot) {
+CO_TEST(RestrictedTreeInode, getChildren_returnsEntriesOnUnrestrictedRoot) {
   // Smoke test for the success path: recheck short-circuits on a
   // non-restricted directory and entries are returned without EACCES.
   FakeTreeBuilder builder;
@@ -825,7 +893,7 @@ CO_TEST(RestrictedTreeInode, co_getChildren_returnsEntriesOnUnrestrictedRoot) {
   auto rootInode = testMount.getEdenMount()->getRootInode();
   auto context = ObjectFetchContext::getNullContext();
 
-  auto results = co_await rootInode->co_getChildren(context);
+  auto results = co_await rootInode->getChildren(context);
   bool sawDir = false;
   for (auto& [name, tryVi] : results) {
     if (name == "dir"_pc) {
@@ -837,12 +905,12 @@ CO_TEST(RestrictedTreeInode, co_getChildren_returnsEntriesOnUnrestrictedRoot) {
 }
 
 // Exercises the wlock + loadChild + inodeLoadCleanUps + SCOPE_EXIT
-// discipline in TreeInode::co_getChildren that the loadInodes=false default
+// discipline in TreeInode::getChildren that the loadInodes=false default
 // never reaches (rlockCheckChild returns an inline VirtualInode for
 // unmaterialized entries). loadInodes=true forces every non-loaded entry
 // through loadChild, which queues a LoadChildCleanUp drained by SCOPE_EXIT
 // after the lock releases.
-CO_TEST(RestrictedTreeInode, co_getChildren_loadInodesTrueExercisesLoadChild) {
+CO_TEST(RestrictedTreeInode, getChildren_loadInodesTrueExercisesLoadChild) {
   FakeTreeBuilder builder;
   builder.setFile("dir/a.txt", "a");
   builder.setFile("dir/b.txt", "b");
@@ -852,8 +920,7 @@ CO_TEST(RestrictedTreeInode, co_getChildren_loadInodesTrueExercisesLoadChild) {
   auto dirInode = testMount.getTreeInode("dir"_relpath);
   auto context = ObjectFetchContext::getNullContext();
 
-  auto results =
-      co_await dirInode->co_getChildren(context, /*loadInodes=*/true);
+  auto results = co_await dirInode->getChildren(context, /*loadInodes=*/true);
   EXPECT_EQ(results.size(), 3);
   for (auto& [name, tryVi] : results) {
     CO_ASSERT_TRUE(tryVi.hasValue());
@@ -864,7 +931,7 @@ CO_TEST(RestrictedTreeInode, co_getChildren_loadInodesTrueExercisesLoadChild) {
 // Exercises the EACCES-on-lockContentsWrite path. The SCOPE_EXIT is already
 // registered when lockContentsWrite() throws — this verifies the empty
 // inodeLoadCleanUps unwind branch is benign.
-CO_TEST(RestrictedTreeInode, co_getChildren_restrictedThrowsEACCES) {
+CO_TEST(RestrictedTreeInode, getChildren_restrictedThrowsEACCES) {
   FakeTreeBuilder builder;
   builder.setFile("dir/file.txt", "content");
   TestMount testMount{builder};
@@ -873,9 +940,560 @@ CO_TEST(RestrictedTreeInode, co_getChildren_restrictedThrowsEACCES) {
   auto context = ObjectFetchContext::getNullContext();
 
   auto result = co_await folly::coro::co_awaitTry(
-      restricted->co_getChildren(context, /*loadInodes=*/false));
+      restricted->getChildren(context, /*loadInodes=*/false));
   CO_ASSERT_TRUE(result.hasException());
   auto* err = result.tryGetExceptionObject<std::system_error>();
   CO_ASSERT_NE(err, nullptr);
   EXPECT_EQ(err->code().value(), EACCES);
 }
+
+// ============================================================================
+// acl:restricted-content-mode = omitted
+//
+// Under omitted mode, restricted ACL roots are hidden from enumeration
+// (readdir, getChildren, co_getChildrenAttributes) while explicit lookup
+// by name keeps returning EACCES on access.
+// ============================================================================
+
+TEST(RestrictedTreeInode, omittedMode_objectStoreSnapshotsMode) {
+  auto testMount = makeOmittedModeTestMount();
+
+  EXPECT_EQ(
+      RestrictedContentMode::Omitted,
+      testMount->getEdenMount()->getObjectStore()->getRestrictedContentMode());
+}
+
+CO_TEST(RestrictedTreeInode, omittedMode_getChildrenOmitsRestrictedChild) {
+  auto testMount = makeOmittedModeTestMount();
+
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto context = ObjectFetchContext::getNullContext();
+  auto children =
+      co_await parentInode->getChildren(context, /*loadInodes=*/false);
+
+  auto restrictedIter =
+      std::find_if(children.begin(), children.end(), [](const auto& entry) {
+        return entry.first == "restricted_child"_pc;
+      });
+  EXPECT_EQ(restrictedIter, children.end());
+
+  auto normalIter =
+      std::find_if(children.begin(), children.end(), [](const auto& entry) {
+        return entry.first == "normal.txt"_pc;
+      });
+  EXPECT_NE(normalIter, children.end());
+}
+
+CO_TEST(RestrictedTreeInode, omittedMode_coGetChildrenOmitsRestrictedChild) {
+  auto testMount = makeOmittedModeTestMount();
+
+  auto edenMount = testMount->getEdenMount();
+  auto vi = testMount->getVirtualInode("parent"_relpath);
+  auto context = ObjectFetchContext::getNullContext();
+
+  auto results = co_await vi.getChildren(
+      "parent"_relpath, edenMount->getObjectStore(), context);
+  bool sawRestrictedChild = false;
+  bool sawNormalChild = false;
+  for (auto& [name, tryVi] : results) {
+    if (name == "restricted_child"_pc) {
+      sawRestrictedChild = true;
+    } else if (name == "normal.txt"_pc) {
+      sawNormalChild = true;
+    }
+  }
+  EXPECT_FALSE(sawRestrictedChild);
+  EXPECT_TRUE(sawNormalChild);
+}
+
+CO_TEST(
+    RestrictedTreeInode,
+    omittedMode_coGetChildrenAttributesOmitsRestrictedChild) {
+  auto testMount = makeOmittedModeTestMount();
+
+  auto edenMount = testMount->getEdenMount();
+  auto vi = testMount->getVirtualInode("parent"_relpath);
+  auto context = ObjectFetchContext::getNullContext();
+  auto attrs = ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE;
+
+  auto results = co_await vi.co_getChildrenAttributes(
+      attrs,
+      RelativePath{"parent"},
+      edenMount->getObjectStore(),
+      edenMount->getLastCheckoutTime().toTimespec(),
+      context);
+  bool sawRestrictedChild = false;
+  bool sawNormalChild = false;
+  for (auto& [name, tryAttrs] : results) {
+    if (name == "restricted_child"_pc) {
+      sawRestrictedChild = true;
+    } else if (name == "normal.txt"_pc) {
+      sawNormalChild = true;
+    }
+  }
+  EXPECT_FALSE(sawRestrictedChild);
+  EXPECT_TRUE(sawNormalChild);
+}
+
+#ifndef _WIN32
+TEST(RestrictedTreeInode, omittedMode_fuseReaddirOmitsRestrictedChild) {
+  auto testMount = makeOmittedModeTestMount();
+
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto result =
+      parentInode
+          ->fuseReaddir(
+              FuseDirList{4096}, 0, ObjectFetchContext::getNullContext())
+          .extract();
+
+  auto restrictedIter =
+      std::find_if(result.begin(), result.end(), [](const auto& entry) {
+        return entry.name == "restricted_child";
+      });
+  EXPECT_EQ(restrictedIter, result.end());
+
+  auto normalIter =
+      std::find_if(result.begin(), result.end(), [](const auto& entry) {
+        return entry.name == "normal.txt";
+      });
+  EXPECT_NE(normalIter, result.end());
+}
+
+TEST(RestrictedTreeInode, omittedMode_fuseReaddirResumesAcrossOmittedEntry) {
+  // The restricted child's name sorts between two normal siblings, so its
+  // (omitted) inode number falls between theirs and resumed readdir calls
+  // cross the hole it leaves in the offset sequence.
+  FakeTreeBuilder builder;
+  builder.setFile("parent/a.txt", "a");
+  builder.setFile("parent/m_restricted/secret.txt", "secret");
+  builder.setFile("parent/z.txt", "z");
+  builder.setDirIsRestricted("parent/m_restricted");
+  auto testMount = makeOmittedModeTestMount(builder);
+
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto context = ObjectFetchContext::getNullContext();
+
+  auto full = parentInode->fuseReaddir(FuseDirList{4096}, 0, context).extract();
+  std::vector<std::string> fullNames;
+  fullNames.reserve(full.size());
+  for (const auto& entry : full) {
+    fullNames.push_back(entry.name);
+  }
+  const std::vector<std::string> expectedFull{".", "..", "a.txt", "z.txt"};
+  EXPECT_EQ(expectedFull, fullNames);
+
+  // Resuming from each entry's offset must return exactly the remaining
+  // visible entries: omission may not shift offsets between calls, re-list
+  // earlier entries, skip later ones, or surface the omitted entry.
+  for (size_t i = 0; i < full.size(); ++i) {
+    auto rest =
+        parentInode->fuseReaddir(FuseDirList{4096}, full[i].offset, context)
+            .extract();
+    std::vector<std::string> restNames;
+    restNames.reserve(rest.size());
+    for (const auto& entry : rest) {
+      restNames.push_back(entry.name);
+    }
+    const std::vector<std::string> expectedRest(
+        fullNames.begin() + i + 1, fullNames.end());
+    EXPECT_EQ(expectedRest, restNames)
+        << "mismatch resuming from offset of " << fullNames[i];
+  }
+}
+
+CO_TEST(RestrictedTreeInode, omittedMode_readdirIndexReflectsPermissionGrant) {
+  // Granting access clears the restricted bit in place, which leaves the
+  // entries' mutation count alone. An index cached by a listing that was
+  // abandoned before its end therefore stays usable, and must list the
+  // entry that just became visible.
+  FakeTreeBuilder builder;
+  builder.setFile("parent/a.txt", "a");
+  builder.setFile("parent/b.txt", "b");
+  builder.setFile("parent/c.txt", "c");
+  builder.setFile("parent/z_restricted/secret.txt", "secret");
+  builder.setDirIsRestricted("parent/z_restricted");
+  auto testMount = makeOmittedModeTestMount(builder);
+
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto restrictedInode = testMount->getTreeInode("parent/z_restricted"_relpath);
+  auto context = ObjectFetchContext::getNullContext();
+  CO_ASSERT_TRUE(restrictedInode->isRestricted());
+
+  // Too small for ".", "..", "a.txt", "b.txt" and "c.txt", so the listing
+  // ends early and leaves its index behind.
+  auto firstPage =
+      parentInode->fuseReaddir(FuseDirList{128}, 0, context).extract();
+  CO_ASSERT_FALSE(firstPage.empty());
+  CO_ASSERT_LT(firstPage.size(), 5u);
+
+  testMount->getBackingStore()->setCheckPermissionResult(
+      restrictedInode->getObjectId().value(), true);
+  co_await restrictedInode->co_stat(context);
+  CO_ASSERT_FALSE(restrictedInode->isRestricted());
+
+  auto relisted =
+      parentInode->fuseReaddir(FuseDirList{4096}, 0, context).extract();
+  EXPECT_NE(
+      std::find_if(
+          relisted.begin(),
+          relisted.end(),
+          [](const auto& entry) { return entry.name == "z_restricted"; }),
+      relisted.end());
+}
+
+TEST(
+    RestrictedTreeInode,
+    omittedMode_nfsReaddirReportsEofWithTrailingOmittedEntry) {
+  // NFS is the only consumer of readdirImpl's EOF bit, and the planned
+  // batched enumeration-time permission refresh will rework this loop, so
+  // pin now that a drain whose trailing entry is omitted still reports EOF.
+  //
+  // Inode numbers are allocated in name order, so z_restricted's inode
+  // number (and thus readdir offset) is the largest — the omitted entry
+  // is the trailing one in the index.
+  FakeTreeBuilder builder;
+  builder.setFile("parent/a.txt", "a");
+  builder.setFile("parent/z_restricted/secret.txt", "secret");
+  builder.setDirIsRestricted("parent/z_restricted");
+  auto testMount = makeOmittedModeTestMount(builder);
+
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto [list, isEof] = parentInode->nfsReaddir(
+      NfsDirList{4096, nfsv3Procs::readdir},
+      0,
+      ObjectFetchContext::getNullContext());
+
+  EXPECT_TRUE(isEof);
+  std::vector<std::string> names;
+  for (const auto& entry : list.extractList<entry3>().list) {
+    names.push_back(entry.name);
+  }
+  const std::vector<std::string> expected{".", "..", "a.txt"};
+  EXPECT_EQ(expected, names);
+}
+#endif
+
+TEST(RestrictedTreeInode, omittedMode_explicitLookupStillReturnsEACCES) {
+  // Regression guard for the omission diff: omitted mode must only affect
+  // enumeration. Explicit lookup by name still resolves the restricted child,
+  // and reading its contents still fails with EACCES.
+  auto testMount = makeOmittedModeTestMount();
+
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto context = ObjectFetchContext::getNullContext();
+  auto child =
+      parentInode
+          ->getOrFindChild("restricted_child"_pc, context, /*loadInodes=*/false)
+          .get();
+  EXPECT_TRUE(child.isRestricted());
+
+  auto restrictedInode =
+      testMount->getTreeInode("parent/restricted_child"_relpath);
+  testMount->getBackingStore()->setCheckPermissionResult(
+      restrictedInode->getObjectId().value(), false);
+  expectEacces([&] {
+    restrictedInode->getOrFindChild("secret.txt"_pc, context, false).get();
+  });
+}
+
+CO_TEST(
+    RestrictedTreeInode,
+    omittedMode_checkoutStillProcessesHiddenRestrictedRoot) {
+  // The all() side of DirEntries: an entry hidden from enumeration is still
+  // walked by checkout, so it picks up the new commit's unrestricted content.
+  auto testMount = makeOmittedModeTestMount();
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto context = ObjectFetchContext::getNullContext();
+  auto findChild = [](const auto& children) {
+    return std::find_if(children.begin(), children.end(), [](const auto& e) {
+      return e.first == "restricted_child"_pc;
+    });
+  };
+
+  auto before = co_await parentInode->getChildren(context, false);
+  EXPECT_EQ(findChild(before), before.end());
+
+  FakeTreeBuilder builder2;
+  builder2.setFile("parent/normal.txt", "normal content");
+  builder2.setFile("parent/restricted_child/public.txt", "now public");
+  builder2.finalize(testMount->getBackingStore(), true);
+  testMount->getBackingStore()->putCommit(RootId{"2"}, builder2)->setReady();
+
+  testMount->drainServerExecutor();
+  auto checkoutFuture =
+      testMount->getEdenMount()
+          ->checkout(testMount->getRootInode(), RootId{"2"}, context, __func__)
+          .semi()
+          .via(testMount->getServerExecutor().get());
+  testMount->drainServerExecutor();
+  CO_ASSERT_TRUE(checkoutFuture.isReady());
+  EXPECT_EQ(0, std::move(checkoutFuture).get().conflicts.size());
+
+  auto after = co_await parentInode->getChildren(context, false);
+  auto iter = findChild(after);
+  CO_ASSERT_NE(iter, after.end());
+  EXPECT_FALSE(iter->second.value().isRestricted());
+  EXPECT_EQ(
+      "now public", testMount->readFile("parent/restricted_child/public.txt"));
+}
+
+#ifdef __linux__
+constexpr auto kTimeout = std::chrono::seconds{10};
+
+namespace {
+void stopFakeFuse(TestMount& testMount, FakeFuse& fuse) {
+  fuse.close();
+  testMount.getEdenMount()
+      ->getFsChannelCompletionFuture()
+      .within(kTimeout)
+      .getVia(testMount.getServerExecutor().get());
+}
+
+bool sawInodeInvalidation(FakeFuse& fuse, InodeNumber ino) {
+  const auto responses = fuse.getAllResponses();
+  return std::any_of(
+      responses.begin(), responses.end(), [ino](const auto& response) {
+        return response.header.error == FUSE_NOTIFY_INVAL_INODE &&
+            reinterpret_cast<const fuse_notify_inval_inode_out*>(
+                response.body.data())
+                ->ino == ino.get();
+      });
+}
+} // namespace
+
+CO_TEST(
+    RestrictedTreeInode,
+    omittedMode_transitionToUnrestrictedInvalidatesParentDirCache) {
+  auto testMount = makeOmittedModeTestMount();
+  auto fuse = std::make_shared<FakeFuse>();
+  testMount->startFuseAndWait(fuse);
+  SCOPE_EXIT {
+    stopFakeFuse(*testMount, *fuse);
+  };
+
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto restrictedInode =
+      testMount->getTreeInode("parent/restricted_child"_relpath);
+  CO_ASSERT_TRUE(restrictedInode->isRestricted());
+  testMount->getBackingStore()->setCheckPermissionResult(
+      restrictedInode->getObjectId().value(), true);
+
+  // The first stat rechecks permission and transitions to unrestricted.
+  co_await restrictedInode->co_stat(ObjectFetchContext::getNullContext());
+  EXPECT_FALSE(restrictedInode->isRestricted());
+
+  testMount->getEdenMount()->flushInvalidations().get(kTimeout);
+  // The parent's cached listing must be dropped too.
+  EXPECT_TRUE(sawInodeInvalidation(*fuse, parentInode->getNodeId()));
+}
+
+TEST(
+    RestrictedTreeInode,
+    omittedMode_loadTimeRestrictionInvalidatesParentDirCache) {
+  // The parent entry says unrestricted but the fetched child tree is
+  // restricted, so loading the child backfills the parent entry and, in
+  // omitted mode, hides it from the parent's listing.
+  TestMount testMount{/*enableActivityBuffer=*/true,
+                      kPathMapDefaultCaseSensitive,
+                      /*errorLogger=*/nullptr,
+                      setOmittedMode};
+  auto backingStore = testMount.getBackingStore();
+  auto [secretBlob, secretBlobId] = backingStore->putBlob("secret content");
+  secretBlob->setReady();
+  auto* restrictedTree =
+      backingStore->putRestrictedTree({{"secret.txt", secretBlobId}});
+  restrictedTree->setReady();
+
+  Tree::container parentEntries{kPathMapDefaultCaseSensitive};
+  parentEntries.emplace(
+      "restricted"_pc,
+      ObjectId{restrictedTree->get().getObjectId()},
+      TreeEntryType::TREE,
+      /* isRestricted */ false,
+      /* hasACL */ std::nullopt);
+  auto* parentTree = backingStore->putTree(std::move(parentEntries));
+  parentTree->setReady();
+  Tree::container rootEntries{kPathMapDefaultCaseSensitive};
+  rootEntries.emplace(
+      "parent"_pc,
+      ObjectId{parentTree->get().getObjectId()},
+      TreeEntryType::TREE);
+  auto* rootTree = backingStore->putTree(std::move(rootEntries));
+  rootTree->setReady();
+  backingStore->putCommit(RootId{"1"}, rootTree)->setReady();
+  testMount.initialize(RootId{"1"});
+  ASSERT_EQ(
+      RestrictedContentMode::Omitted,
+      testMount.getEdenMount()->getObjectStore()->getRestrictedContentMode());
+
+  auto fuse = std::make_shared<FakeFuse>();
+  testMount.startFuseAndWait(fuse);
+  SCOPE_EXIT {
+    stopFakeFuse(testMount, *fuse);
+  };
+
+  auto parentInode = testMount.getTreeInode("parent"_relpath);
+  auto restrictedInode = testMount.getTreeInode("parent/restricted"_relpath);
+  ASSERT_TRUE(restrictedInode->isRestricted());
+
+  testMount.getEdenMount()->flushInvalidations().get(kTimeout);
+  // The entry just vanished from the listing; the cache must be dropped.
+  EXPECT_TRUE(sawInodeInvalidation(*fuse, parentInode->getNodeId()));
+}
+#endif // __linux__
+
+#ifndef _WIN32
+namespace {
+// Reads the restricted bit of parent/restricted_child straight out of the
+// parent's DirContents, bypassing the omitted-mode listing filter.
+bool entryIsRestricted(
+    const TreeInodePtr& parentInode,
+    PathComponentPiece name) {
+  auto contents = parentInode->lockContentsRead();
+  return contents->entries.find(name)->second.isRestricted();
+}
+
+ObjectId entryObjectId(
+    const TreeInodePtr& parentInode,
+    PathComponentPiece name) {
+  auto contents = parentInode->lockContentsRead();
+  return contents->entries.find(name)->second.getObjectId();
+}
+
+bool restrictedChildIsHidden(const TreeInodePtr& parentInode) {
+  return entryIsRestricted(parentInode, "restricted_child"_pc);
+}
+
+ObjectId restrictedChildId(const TreeInodePtr& parentInode) {
+  return entryObjectId(parentInode, "restricted_child"_pc);
+}
+
+bool listsRestrictedChild(const TreeInodePtr& parentInode) {
+  auto context = ObjectFetchContext::getNullContext();
+  auto result =
+      parentInode->fuseReaddir(FuseDirList{4096}, 0, context).extract();
+  return std::any_of(result.begin(), result.end(), [](const auto& entry) {
+    return entry.name == "restricted_child";
+  });
+}
+} // namespace
+
+TEST(
+    RestrictedTreeInode,
+    omittedMode_backgroundRefreshRechecksHiddenRestrictedChild) {
+  auto testMount = makeOmittedModeTestMount();
+  auto rootInode = testMount->getEdenMount()->getRootInode();
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto context = ObjectFetchContext::getNullContext();
+  auto childId = restrictedChildId(parentInode);
+  auto* backingStore = testMount->getBackingStore().get();
+  backingStore->setCheckPermissionResult(childId, true);
+
+  // The kernel holds the parent's listing, so the walk has something to
+  // refresh.
+  parentInode->incFsRefcount();
+
+  EXPECT_FALSE(listsRestrictedChild(parentInode));
+  EXPECT_EQ(0, backingStore->getCheckPermissionCount(childId));
+
+  rootInode->recheckHiddenRestrictedDescendants(context);
+  testMount->drainServerExecutor();
+
+  EXPECT_EQ(1, backingStore->getCheckPermissionCount(childId));
+  EXPECT_FALSE(restrictedChildIsHidden(parentInode));
+  EXPECT_TRUE(listsRestrictedChild(parentInode));
+}
+
+TEST(
+    RestrictedTreeInode,
+    omittedMode_backgroundRefreshSkipsTreeTheKernelDoesNotHold) {
+  auto testMount = makeOmittedModeTestMount();
+  auto rootInode = testMount->getEdenMount()->getRootInode();
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto context = ObjectFetchContext::getNullContext();
+  auto childId = restrictedChildId(parentInode);
+  auto* backingStore = testMount->getBackingStore().get();
+  backingStore->setCheckPermissionResult(childId, true);
+
+  ASSERT_EQ(0, parentInode->debugGetFsRefcount());
+  rootInode->recheckHiddenRestrictedDescendants(context);
+  testMount->drainServerExecutor();
+  EXPECT_EQ(0, backingStore->getCheckPermissionCount(childId));
+  EXPECT_TRUE(restrictedChildIsHidden(parentInode));
+
+  // The refcount is the only thing that was holding the check back.
+  parentInode->incFsRefcount();
+  rootInode->recheckHiddenRestrictedDescendants(context);
+  testMount->drainServerExecutor();
+  EXPECT_EQ(1, backingStore->getCheckPermissionCount(childId));
+  EXPECT_FALSE(restrictedChildIsHidden(parentInode));
+}
+
+TEST(
+    RestrictedTreeInode,
+    omittedMode_backgroundRefreshLeavesDeniedChildHidden) {
+  auto testMount = makeOmittedModeTestMount();
+  auto rootInode = testMount->getEdenMount()->getRootInode();
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto context = ObjectFetchContext::getNullContext();
+  auto childId = restrictedChildId(parentInode);
+  auto* backingStore = testMount->getBackingStore().get();
+  backingStore->setCheckPermissionResult(childId, false);
+  parentInode->incFsRefcount();
+
+  rootInode->recheckHiddenRestrictedDescendants(context);
+  testMount->drainServerExecutor();
+  EXPECT_EQ(1, backingStore->getCheckPermissionCount(childId));
+  EXPECT_TRUE(restrictedChildIsHidden(parentInode));
+  EXPECT_FALSE(listsRestrictedChild(parentInode));
+
+  // Within the TTL a second walk schedules no new check.
+  rootInode->recheckHiddenRestrictedDescendants(context);
+  testMount->drainServerExecutor();
+  EXPECT_EQ(1, backingStore->getCheckPermissionCount(childId));
+  EXPECT_TRUE(restrictedChildIsHidden(parentInode));
+}
+
+TEST(
+    RestrictedTreeInode,
+    omittedMode_backgroundRefreshSkipsLoadedRestrictedDirTheKernelHolds) {
+  // An explicit lookup loads a restricted directory and hands the kernel a
+  // reference to it. The walk must step over it, not read its contents, or
+  // the rest of the mount after it in traversal order is never visited.
+  FakeTreeBuilder builder;
+  // Distinct contents so the two restricted trees get distinct ObjectIds.
+  builder.setFile("early_restricted/secret.txt", "early secret content");
+  builder.setDirIsRestricted("early_restricted");
+  builder.setFile("parent/normal.txt", "normal content");
+  builder.setFile("parent/restricted_child/secret.txt", "secret content");
+  builder.setDirIsRestricted("parent/restricted_child");
+  auto testMount = makeOmittedModeTestMount(builder);
+  auto rootInode = testMount->getEdenMount()->getRootInode();
+  auto parentInode = testMount->getTreeInode("parent"_relpath);
+  auto earlyInode = testMount->getTreeInode("early_restricted"_relpath);
+  ASSERT_TRUE(earlyInode->isRestricted());
+  auto context = ObjectFetchContext::getNullContext();
+  auto earlyId = entryObjectId(rootInode, "early_restricted"_pc);
+  auto childId = restrictedChildId(parentInode);
+  ASSERT_NE(earlyId, childId);
+  auto* backingStore = testMount->getBackingStore().get();
+  backingStore->setCheckPermissionResult(earlyId, false);
+  backingStore->setCheckPermissionResult(childId, true);
+
+  rootInode->incFsRefcount();
+  earlyInode->incFsRefcount();
+  parentInode->incFsRefcount();
+
+  rootInode->recheckHiddenRestrictedDescendants(context);
+  testMount->drainServerExecutor();
+
+  // The still-denied directory was rechecked by its parent and stays hidden.
+  EXPECT_EQ(1, backingStore->getCheckPermissionCount(earlyId));
+  EXPECT_TRUE(entryIsRestricted(rootInode, "early_restricted"_pc));
+  EXPECT_TRUE(earlyInode->isRestricted());
+  // The walk went on past it and refreshed the directory further along.
+  EXPECT_EQ(1, backingStore->getCheckPermissionCount(childId));
+  EXPECT_FALSE(restrictedChildIsHidden(parentInode));
+  EXPECT_TRUE(listsRestrictedChild(parentInode));
+}
+#endif // _WIN32

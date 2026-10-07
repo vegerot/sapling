@@ -18,6 +18,9 @@ from eden.fs.service.eden.thrift_types import (
     AclInfo,
     AclInfoOrError,
     AttributesRequestScope,
+    CheckoutMode,
+    CheckOutRevisionParams,
+    ConflictType,
     DirListAttributeDataOrError,
     FileAttributes,
     GetAttributesFromFilesParams,
@@ -39,6 +42,7 @@ class _RestrictedTreeTestBase(EdenHgTestCase, metaclass=abc.ABCMeta):
     initial_commit: str = ""
     swapped_commit: str = ""
     added_restricted_commit: str = ""
+    ignored_file_restricted_commit: str = ""
     # Subclasses flip this to False to disable client-side enforcement.
     enable_restricted_tree_mode: bool = True
     # Subclasses flip this to True to enable server-side PermissionDenied.
@@ -97,6 +101,8 @@ class _RestrictedTreeTestBase(EdenHgTestCase, metaclass=abc.ABCMeta):
         eager.write_file("parent/nested_restricted/.slacl", "acl config")
         eager.write_file("parent/nested_restricted/deep.txt", "deep secret")
         eager.write_file("hello.txt", "hello")
+        eager.write_file("ignored_local_only_restricted/tracked.txt", "tracked")
+        eager.write_file(".gitignore", "ignored_local_only_restricted/local.txt\n")
         self.initial_commit = eager.commit("Initial commit.")
 
         # Swapped commit: restricted/ loses .slacl, regular/ gains it.
@@ -111,6 +117,11 @@ class _RestrictedTreeTestBase(EdenHgTestCase, metaclass=abc.ABCMeta):
         eager.write_file("local_only_restricted/server.txt", "server content")
         self.added_restricted_commit = eager.commit("Add restricted tree.")
 
+        eager.write_file("ignored_local_only_restricted/.slacl", "acl config")
+        self.ignored_file_restricted_commit = eager.commit(
+            "Restrict tree containing ignored file."
+        )
+
         # Pull the commits into the backing repo via SLAPI. ``fetch_edenapi``
         # populates ``indexedlog_cache`` with entries that include
         # ``acl_children_indices`` derived from ``has_acl`` on children.
@@ -119,6 +130,7 @@ class _RestrictedTreeTestBase(EdenHgTestCase, metaclass=abc.ABCMeta):
         repo.hg("pull", "-r", self.initial_commit)
         repo.hg("pull", "-r", self.swapped_commit)
         repo.hg("pull", "-r", self.added_restricted_commit)
+        repo.hg("pull", "-r", self.ignored_file_restricted_commit)
         repo.hg("update", self.initial_commit)
 
 
@@ -513,6 +525,32 @@ class _RestrictedTreeTestMethods(_MethodsBase, metaclass=abc.ABCMeta):
             entries = os.listdir(os.path.join(self.mount, "regular"))
             self.assertIn("file.txt", entries)
 
+    async def test_checkout_unrestricted_to_restricted_with_deleted_file(
+        self,
+    ) -> None:
+        """A locally deleted tracked file does not block the transition."""
+        self.repo.hg("update", self.initial_commit)
+        os.unlink(os.path.join(self.mount, "regular", "file.txt"))
+
+        async with self.eden.get_async_thrift_client() as client:
+            conflicts = await client.checkOutRevision(
+                mountPoint=self.mount_path_bytes,
+                snapshotHash=self.swapped_commit.encode(),
+                checkoutMode=CheckoutMode.NORMAL,
+                params=CheckOutRevisionParams(),
+            )
+        # An unrestricted destination leaves the unchanged entry alone and
+        # reports nothing for it.
+        expected = (
+            [(b"regular/file.txt", ConflictType.MISSING_REMOVED)]
+            if self.expect_restricted
+            else []
+        )
+        self.assertEqual(
+            expected, [(conflict.path, conflict.type) for conflict in conflicts]
+        )
+        self._assert_dir_blocked(os.path.join(self.mount, "regular"))
+
     def test_checkout_unrestricted_to_restricted_force(self) -> None:
         """Force checkout (-C) of unrestricted -> restricted with dirty
         subtree should drive the transition through and restrict the dir."""
@@ -695,7 +733,22 @@ class _RestrictedTreeServerOnlyBase(
 class RestrictedTreeTest(_RestrictedTreeTestMethods, _RestrictedTreeTestBase):
     """Client-side enforcement via has_acl metadata."""
 
-    pass
+    def test_checkout_restricted_tree_over_ignored_file(self) -> None:
+        """Ignored files are discarded when their parent becomes restricted."""
+        self.repo.hg("update", self.initial_commit)
+
+        local_dir = os.path.join(self.mount, "ignored_local_only_restricted")
+        local_file = os.path.join(local_dir, "local.txt")
+        with open(local_file, "w") as f:
+            f.write("local content")
+        self.assert_status({"ignored_local_only_restricted/local.txt": "I"})
+
+        self.repo.hg("update", self.ignored_file_restricted_commit)
+
+        with self.assertRaises(OSError) as ctx:
+            os.listdir(local_dir)
+        self.assertEqual(errno.EACCES, ctx.exception.errno)
+        self.assert_status_empty()
 
 
 @hg_test
@@ -734,6 +787,72 @@ class RestrictedTreeConfigOffTest(
     """Feature disabled — all directories accessible."""
 
     expect_restricted: bool = False
+
+
+@hg_test
+# pyre-ignore[13]: T62487924
+class RestrictedTreeOmittedModeTest(_RestrictedTreeTestBase):
+    """acl:restricted-content-mode = omitted: restricted roots are hidden
+    from enumeration while explicit descendant access still returns EACCES.
+
+    Stat/lookup OF the restricted root itself intentionally still behaves
+    like restricted mode (mode-000 placeholder); only enumeration changes.
+    """
+
+    def edenfs_extra_config(self) -> dict[str, list[str]] | None:
+        configs = super().edenfs_extra_config()
+        if configs is None:
+            configs = {}
+        # Snapshotted onto ServerState at daemon startup, which is when this
+        # config file is read.
+        configs.setdefault("acl", []).append('restricted-content-mode = "omitted"')
+        return configs
+
+    def test_listdir_omits_restricted_roots(self) -> None:
+        root_entries = os.listdir(self.mount)
+        self.assertNotIn("restricted", root_entries)
+        self.assertIn("regular", root_entries)
+        self.assertIn("parent", root_entries)
+        self.assertIn("hello.txt", root_entries)
+
+        parent_entries = os.listdir(os.path.join(self.mount, "parent"))
+        self.assertNotIn("nested_restricted", parent_entries)
+        self.assertIn("normal_file.txt", parent_entries)
+
+    def test_explicit_descendant_access_returns_eacces(self) -> None:
+        secret_path = os.path.join(self.mount, "restricted", "secret.txt")
+        with self.assertRaises(OSError) as ctx:
+            with open(secret_path, "r") as f:
+                f.read()
+        self.assertEqual(errno.EACCES, ctx.exception.errno)
+
+    async def test_thrift_readdir_omits_restricted_root(self) -> None:
+        async with self.get_async_thrift_client() as client:
+            result = await client.readdir(
+                ReaddirParams(
+                    mountPoint=self.mount_path_bytes,
+                    directoryPaths=[b"", b"parent"],
+                    sync=SyncBehavior(),
+                )
+            )
+
+        root_data = result.dirLists[0]
+        self.assertEqual(
+            DirListAttributeDataOrError.Type.dirListAttributeData, root_data.type
+        )
+        root_entries = root_data.dirListAttributeData
+        self.assertNotIn(b"restricted", root_entries)
+        self.assertIn(b"regular", root_entries)
+        self.assertIn(b"parent", root_entries)
+        self.assertIn(b"hello.txt", root_entries)
+
+        parent_data = result.dirLists[1]
+        self.assertEqual(
+            DirListAttributeDataOrError.Type.dirListAttributeData, parent_data.type
+        )
+        parent_entries = parent_data.dirListAttributeData
+        self.assertNotIn(b"nested_restricted", parent_entries)
+        self.assertIn(b"normal_file.txt", parent_entries)
 
 
 @hg_test

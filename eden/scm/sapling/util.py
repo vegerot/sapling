@@ -491,10 +491,16 @@ def versionagedays() -> int:
     """Returns approximate age in days of the current version, or 0 if not available."""
     try:
         v = version()
-        parts = remod.split("_", v)
-        approxbuilddate = datetime.datetime.strptime(parts[1], "%Y%m%d")
-        now = datetime.datetime.now()
-        return (now - approxbuilddate).days
+        parts = remod.split(r"[_\.\-+]", v)
+        for part in parts:
+            if len(part) == 8 and part.isdigit():
+                try:
+                    approxbuilddate = datetime.datetime.strptime(part, "%Y%m%d")
+                    now = datetime.datetime.now()
+                    return max(0, (now - approxbuilddate).days)
+                except ValueError:
+                    pass
+        return 0
     except Exception:
         return 0
 
@@ -545,7 +551,7 @@ def versiontuple(v=None, n=4):
     """
     if not v:
         v = version()
-    parts = remod.split("[\\+-]", v, 1)
+    parts = remod.split("[\\+-]", v, maxsplit=1)
     if len(parts) == 1:
         vparts, extra = parts[0], None
     else:
@@ -1295,6 +1301,7 @@ def shellenviron(environ=None):
         env.update((k, py2shell(v)) for k, v in environ.items())
     env["HG"] = hgexecutable()
     env.pop("NODE_CHANNEL_FD", None)
+    env.update(bindings.clientinfo.outgoing_trace_env())
     return env
 
 
@@ -4889,6 +4896,8 @@ def spawndetached(args, cwd=None, env=None, shell=False):
         cmd.currentdir(cwd)
     if env is not None:
         cmd.envclear().envs(sorted(env.items()))
+    else:
+        cmd.envs(bindings.clientinfo.outgoing_trace_env())
     return cmd.spawndetached().id()
 
 
@@ -5064,7 +5073,25 @@ def getdoc(obj):
     if isinstance(obj, str):
         return obj
     doc = getattr(obj, "__doc__", None)
-    return doc
+    if doc is None or isinstance(obj, types.ModuleType):
+        return doc
+    return _normalizedoc(doc)
+
+
+def _normalizedoc(doc):
+    """Restore the body indentation help rendering expects.
+
+    Python 3.13 made the compiler strip a docstring's common leading
+    indentation, so `__doc__` differs between interpreter versions. Normalize
+    both shapes to the indented one rather than branching on the version, so
+    help output is identical either way.
+    """
+    lines = doc.expandtabs().splitlines()
+    if len(lines) < 2:
+        return doc
+    body = textwrap.dedent("\n".join(lines[1:]))
+    indented = textwrap.indent(body, "    ", lambda line: line.strip() != "")
+    return "\n".join([lines[0], indented])
 
 
 def parse_email(fp):

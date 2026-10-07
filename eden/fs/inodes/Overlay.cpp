@@ -9,7 +9,14 @@
 
 #include <boost/filesystem.hpp>
 #include <algorithm>
+#include <array>
+#include <charconv>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#endif
+
+#include <fmt/format.h>
 #include <folly/Exception.h>
 #include <folly/File.h>
 #include <folly/FileUtil.h>
@@ -19,13 +26,15 @@
 #include <folly/io/IOBuf.h>
 #include <folly/logging/xlog.h>
 #include <folly/stop_watch.h>
+#include <folly/system/ThreadName.h>
+#include <sigbus_memops.h>
 #include <thrift/lib/cpp2/protocol/Serializer.h>
 
 #include "eden/common/telemetry/DurationScope.h"
 #include "eden/common/utils/Bug.h"
 #include "eden/common/utils/PathFuncs.h"
-#include "eden/common/utils/PathMapMutator.h"
 #include "eden/fs/config/EdenConfig.h"
+#include "eden/fs/eden-config.h"
 #include "eden/fs/inodes/DirEntry.h"
 #include "eden/fs/inodes/FileContentStore.h"
 #include "eden/fs/inodes/InodeBase.h"
@@ -33,16 +42,18 @@
 #include "eden/fs/inodes/OverlayFile.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/inodes/memcatalog/MemInodeCatalog.h"
+#if EDEN_HAVE_SQLITE3
 #include "eden/fs/inodes/sqlitecatalog/BufferedSqliteInodeCatalog.h"
 #include "eden/fs/inodes/sqlitecatalog/SqliteInodeCatalog.h"
 #include "eden/fs/sqlite/SqliteDatabase.h"
+#endif
 #include "eden/fs/telemetry/EdenErrorInfoBuilder.h"
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/ErrorLogger.h"
 #include "eden/fs/telemetry/LogEvent.h"
 
-#ifndef _WIN32
+#if !defined(_WIN32) && EDEN_HAVE_LMDB
 #include "eden/fs/inodes/lmdbcatalog/BufferedLMDBInodeCatalog.h" // @manual
 #include "eden/fs/inodes/lmdbcatalog/LMDBFileContentStore.h" // @manual
 #include "eden/fs/inodes/lmdbcatalog/LMDBInodeCatalog.h" // @manual
@@ -53,6 +64,41 @@ namespace facebook::eden {
 namespace {
 constexpr uint64_t ioCountMask = 0x7FFFFFFFFFFFFFFFull;
 constexpr uint64_t ioClosedMask = 1ull << 63;
+
+#ifndef _WIN32
+constexpr folly::StringPiece kInodeReservationFile{"inode-reservation"};
+constexpr folly::StringPiece kInodeReservationTempFile{"inode-reservation.tmp"};
+constexpr uint64_t kInodeReservationSize = 4096;
+
+// Load on-disk inode reservation state. Returns nullopt on unexpected on-disk
+// state.
+std::optional<uint64_t> loadInodeReservation(AbsolutePathPiece localDir) {
+  const auto path = localDir + PathComponentPiece{kInodeReservationFile};
+  std::array<char, 32> target{};
+  const auto size = ::readlink(path.c_str(), target.data(), target.size());
+  if (size < 0) {
+    if (errno == ENOENT) {
+      return std::nullopt;
+    }
+    XLOGF(
+        WARN,
+        "Failed to read inode reservation {}: {}",
+        path,
+        folly::errnoStr(errno));
+    return std::nullopt;
+  }
+
+  uint64_t reservation;
+  const auto result = std::from_chars(
+      target.data(), target.data() + size, reservation, /*base=*/10);
+  if (result.ec != std::errc{} || result.ptr != target.data() + size ||
+      reservation <= kRootNodeId.get()) {
+    XLOGF(WARN, "Invalid inode reservation in {}", path);
+    return std::nullopt;
+  }
+  return reservation;
+}
+#endif
 
 bool getOverlayEntryIsRestricted(const overlay::OverlayEntry& entry) {
   return apache::thrift::is_non_optional_field_set_manually_or_by_serializer(
@@ -82,7 +128,16 @@ std::unique_ptr<InodeCatalog> makeInodeCatalog(
     const EdenConfig& config,
     FileContentStore* fileContentStore,
     const std::shared_ptr<EdenFsEventsLogger>& logger) {
+#if !EDEN_HAVE_SQLITE3
+  (void)localDir;
+  (void)logger;
+#endif
+#if !EDEN_HAVE_SQLITE3 && !EDEN_HAVE_LMDB
+  (void)inodeCatalogOptions;
+  (void)config;
+#endif
   if (inodeCatalogType == InodeCatalogType::Sqlite) {
+#if EDEN_HAVE_SQLITE3
     // Controlled via EdenConfig::unsafeInMemoryOverlay
     if (inodeCatalogOptions.containsAllOf(INODE_CATALOG_UNSAFE_IN_MEMORY)) {
       // Controlled via EdenConfig::overlayBuffered
@@ -123,6 +178,10 @@ std::unique_ptr<InodeCatalog> makeInodeCatalog(
     }
     XLOG(DBG4, "Sqlite overlay being used.");
     return std::make_unique<SqliteInodeCatalog>(localDir, logger);
+#else
+    throw std::runtime_error(
+        "Sqlite overlay type is not supported. Please reclone.");
+#endif
   } else if (inodeCatalogType == InodeCatalogType::InMemory) {
     XLOG(DBG4, "In-memory overlay being used.");
     return std::make_unique<MemInodeCatalog>();
@@ -138,10 +197,16 @@ std::unique_ptr<InodeCatalog> makeInodeCatalog(
     throw std::runtime_error(
         "LMDB overlay type is not supported. Please reclone.");
   }
+#if EDEN_HAVE_SQLITE3
   XLOG(DBG4, "Sqlite overlay being used.");
   return std::make_unique<SqliteInodeCatalog>(localDir, logger);
 #else
+  throw std::runtime_error(
+      "Sqlite overlay type is not supported. Please reclone.");
+#endif
+#else
   if (inodeCatalogType == InodeCatalogType::LMDB) {
+#if EDEN_HAVE_LMDB
     if (inodeCatalogOptions.containsAllOf(INODE_CATALOG_BUFFERED)) {
       XLOG(DBG4, "Buffered LMDB overlay being used");
       return std::make_unique<BufferedLMDBInodeCatalog>(
@@ -150,6 +215,10 @@ std::unique_ptr<InodeCatalog> makeInodeCatalog(
     XLOG(DBG4, "LMDB overlay being used");
     return std::make_unique<LMDBInodeCatalog>(
         static_cast<LMDBFileContentStore*>(fileContentStore));
+#else
+    throw std::runtime_error(
+        "LMDB overlay type is not supported. Please reclone.");
+#endif
   }
   if (inodeCatalogType == InodeCatalogType::LegacyDev) {
     XLOG(DBG4, "LegacyDev overlay being used.");
@@ -172,21 +241,36 @@ std::unique_ptr<InodeCatalog> makeInodeCatalog(
 std::unique_ptr<FileContentStore> makeFileContentStore(
     AbsolutePathPiece localDir,
     const std::shared_ptr<EdenFsEventsLogger>& logger,
-    InodeCatalogType inodeCatalogType) {
+    InodeCatalogType inodeCatalogType,
+    bool directFileCreate,
+    bool cacheWalFiles,
+    size_t walFileCacheSize,
+    WalFormat walFormat) {
 #ifdef _WIN32
   (void)localDir;
   (void)logger;
+  (void)directFileCreate;
+  (void)cacheWalFiles;
+  (void)walFileCacheSize;
+  (void)walFormat;
   return nullptr;
 #else
   // LegacyEphemeral only applies to the inode catalog, not the file content
   // store
   if (inodeCatalogType == InodeCatalogType::Legacy ||
       inodeCatalogType == InodeCatalogType::LegacyEphemeral) {
-    return std::make_unique<FsFileContentStore>(localDir);
+    return std::make_unique<FsFileContentStore>(
+        localDir, directFileCreate, cacheWalFiles, walFileCacheSize, walFormat);
   } else if (inodeCatalogType == InodeCatalogType::LegacyDev) {
     return std::make_unique<FsFileContentStoreDev>(localDir);
   } else {
+#if EDEN_HAVE_LMDB
     return std::make_unique<LMDBFileContentStore>(localDir, logger);
+#else
+    (void)localDir;
+    (void)logger;
+    return nullptr;
+#endif
   }
 #endif
 }
@@ -204,6 +288,10 @@ std::shared_ptr<Overlay> Overlay::create(
     ErrorLogger& errorLogger,
     EdenStatsPtr stats,
     const EdenConfig& config) {
+  if (!folly::kIsWindows && inodeCatalogType == InodeCatalogType::InMemory) {
+    throw std::runtime_error(
+        "InMemory overlay type is only supported on Windows.");
+  }
   // This allows us to access the private constructor.
   struct MakeSharedEnabler : public Overlay {
     explicit MakeSharedEnabler(
@@ -248,7 +336,12 @@ Overlay::Overlay(
     : fileContentStore_{makeFileContentStore(
           localDir,
           logger,
-          inodeCatalogType)},
+          inodeCatalogType,
+          config.experimentalOverlayDirectFileCreate.getValue(),
+          config.experimentalOverlayCacheWalFiles.getValue(),
+          config.overlayWalFileCacheSize.getValue(),
+          config.overlayWalWriteV2.getValue() ? WalFormat::Version2
+                                              : WalFormat::Version1)},
       inodeCatalog_{makeInodeCatalog(
           localDir,
           inodeCatalogType,
@@ -267,11 +360,34 @@ Overlay::Overlay(
       errorLogger_(errorLogger),
       stats_{std::move(stats)},
       useDirectFileWrites_(config.overlayDirectFileWrites.getValue()),
+      useInodeReservation_{
+          !folly::kIsWindows && config.overlayInodeReservation.getValue() &&
+          (inodeCatalogType == InodeCatalogType::Legacy ||
+           inodeCatalogType == InodeCatalogType::LegacyDev)},
       useWal_{config.overlayUseWal.getValue() && inodeCatalog_->supportsWal()},
+      backgroundInodeRemoval_{config.overlayBackgroundInodeRemoval.getValue()},
       walCompactionMultiplier_{
           config.overlayWalCompactionMultiplier.getValue()},
       walCompactionByteCap_{config.overlayWalCompactionByteCap.getValue()},
-      walCompactionRng_{[] { return folly::Random::rand32(); }} {}
+      walMinCompactionThreshold_{static_cast<size_t>(
+          config.experimentalOverlayWalMinCompactionThreshold.getValue())},
+      walCompactionRng_{[] { return folly::Random::rand32(); }} {
+#ifndef _WIN32
+  if (fileContentStore_) {
+    filePreallocPoolSize_ = config.overlayFilePreallocPoolSize.getValue();
+  }
+  // Only the Fs catalog pays a file creation (tmp file + rename) per dir
+  // record; DB-backed catalogs write records cheaply and would only gain
+  // orphan rows from preallocation.
+  if (inodeCatalogType == InodeCatalogType::Legacy ||
+      inodeCatalogType == InodeCatalogType::LegacyDev ||
+      inodeCatalogType == InodeCatalogType::LegacyEphemeral) {
+    dirPreallocPoolSize_ = config.overlayDirPreallocPoolSize.getValue();
+  }
+  preallocPool_.reserve(filePreallocPoolSize_);
+  preallocDirPool_.reserve(dirPreallocPoolSize_);
+#endif
+}
 
 Overlay::~Overlay() {
   close();
@@ -285,6 +401,10 @@ void Overlay::close() {
   if (gcThread_.joinable()) {
     gcThread_.join();
   }
+
+#ifndef _WIN32
+  stopPreallocThread();
+#endif
 
   // Make sure everything is shut down in reverse of construction order.
   // Cleanup is not necessary if tree overlay was not initialized and either
@@ -346,6 +466,7 @@ folly::SemiFuture<Unit> Overlay::initialize(
   // before waiting for GC work to do.
   auto [initPromise, initFuture] = folly::makePromiseContract<Unit>();
 
+  reloadableConfig_ = config;
   gcThread_ = std::thread([this,
                            config,
                            mountPath = std::move(mountPath),
@@ -368,6 +489,12 @@ folly::SemiFuture<Unit> Overlay::initialize(
       promise.setException(std::move(ew));
       return;
     }
+#ifndef _WIN32
+    if (filePreallocPoolSize_ > 0 || dirPreallocPoolSize_ > 0) {
+      preallocThread_ = std::thread([this] { preallocThreadLoop(); });
+    }
+#endif
+
     promise.setValue();
 
     gcThread();
@@ -477,7 +604,8 @@ void Overlay::initOverlay(
         std::nullopt,
         lookupCallback,
         config->getEdenConfig()->fsckNumErrorDiscoveryThreads.getValue(),
-        caseSensitive_);
+        caseSensitive_,
+        config->getEdenConfig()->fsckUseMemoryEfficientScan.getValue());
     folly::stop_watch<> fsckRuntime;
     auto result = checker.repairErrors(progressCallback);
     auto fsckRuntimeInSeconds =
@@ -506,6 +634,12 @@ void Overlay::initOverlay(
     hadCleanStartup_ = true;
   }
 
+#ifndef _WIN32
+  const bool useSigbusProtection =
+      config->getEdenConfig()->overlayUseSigbusProtection.getValue() &&
+      sigbus_is_protected();
+#endif
+
   // On Windows, we need to scan the state of the repository every time at
   // start up to find any potential changes happened when EdenFS is not
   // running.
@@ -525,15 +659,48 @@ void Overlay::initOverlay(
             false /*attempted_repair*/});
   }
 
-  nextInodeNumber_.store(optNextInodeNumber->get(), std::memory_order_relaxed);
+  auto nextInodeNumber = optNextInodeNumber->get();
+#ifndef _WIN32
+  if (useInodeReservation_) {
+    initializeInodeReservation(nextInodeNumber);
+  }
+#endif
+  nextInodeNumber_.store(nextInodeNumber, std::memory_order_relaxed);
 
 #ifndef _WIN32
+  if (useSigbusProtection) {
+    if (auto error = sigbus_install_handler()) {
+      folly::throwSystemErrorExplicit(
+          error, "failed to install sigbus-memops SIGBUS handler");
+    }
+    XLOG(DBG2, "Enabled SIGBUS protection for the inode metadata table");
+  }
+
   // Open after infoFile_'s lock is acquired because the InodeTable acquires
   // its own lock, which should be released prior to infoFile_.
   inodeMetadataTable_ = InodeMetadataTable::open(
       (localDir_ + PathComponentPiece{FsFileContentStore::kMetadataFile})
           .c_str(),
-      stats_.copy());
+      stats_.copy(),
+      MappedDiskVectorOptions{
+          .useSigbusProtection = useSigbusProtection,
+      });
+  if (!hadCleanStartup_) {
+    // The next inode number was rediscovered by scanning the overlay, so
+    // numbers at or above it will be handed out again. Records for them
+    // belong to inodes that no longer exist.
+    auto freed =
+        inodeMetadataTable_->freeInodesFrom(InodeNumber{nextInodeNumber});
+    if (freed > 0) {
+      XLOGF(
+          INFO,
+          "Overlay {}: dropped {} inode metadata records at or above the "
+          "rediscovered next inode number {}",
+          localDir_,
+          freed,
+          nextInodeNumber);
+    }
+  }
 #endif // !_WIN32
 }
 
@@ -553,6 +720,11 @@ InodeNumber Overlay::allocateInodeNumber() {
   // might on ARM.
   auto previous = nextInodeNumber_++;
   XDCHECK_NE(0u, previous) << "allocateInodeNumber called before initialize";
+#ifndef _WIN32
+  if (useInodeReservation_) {
+    ensureInodeReservation(previous + 1);
+  }
+#endif
   return InodeNumber{previous};
 }
 
@@ -565,10 +737,81 @@ InodeNumber Overlay::allocateInodeNumbers(uint64_t count) {
 
   auto previous = nextInodeNumber_.fetch_add(count);
   XDCHECK_NE(0u, previous) << "allocateInodeNumbers called before initialize";
+#ifndef _WIN32
+  if (useInodeReservation_ && count != 0) {
+    ensureInodeReservation(previous + count);
+  }
+#endif
   return InodeNumber{previous};
 }
 
+#ifndef _WIN32
+void Overlay::initializeInodeReservation(uint64_t nextInodeNumber) {
+  auto reservation = loadInodeReservation(localDir_);
+  // Inode reservation should be >= nextInodeNumber.
+  if (!reservation || *reservation <= nextInodeNumber) {
+    reservation = nextInodeNumber + kInodeReservationSize;
+    saveInodeReservation(*reservation);
+  }
+  inodeReservation_.store(*reservation, std::memory_order_release);
+}
+
+void Overlay::ensureInodeReservation(uint64_t allocatedEnd) {
+  auto reservation = inodeReservation_.load(std::memory_order_acquire);
+  if (allocatedEnd <= reservation) {
+    return;
+  }
+
+  auto reservationUpdateLock = inodeReservationUpdateLock_.lock();
+  reservation = inodeReservation_.load(std::memory_order_relaxed);
+  if (allocatedEnd <= reservation) {
+    return;
+  }
+
+  auto reservationsNeeded =
+      (allocatedEnd - reservation) / kInodeReservationSize + 1;
+  reservation += reservationsNeeded * kInodeReservationSize;
+  saveInodeReservation(reservation);
+  inodeReservation_.store(reservation, std::memory_order_release);
+}
+
+// Update on-disk inode reservation state. Throws on I/O error.
+void Overlay::saveInodeReservation(uint64_t reservation) {
+  const auto path = localDir_ + PathComponentPiece{kInodeReservationFile};
+  const auto tempPath =
+      localDir_ + PathComponentPiece{kInodeReservationTempFile};
+  if (::unlink(tempPath.c_str()) != 0 && errno != ENOENT) {
+    folly::throwSystemError(
+        "Failed to remove temporary inode reservation ", tempPath.view());
+  }
+
+  SCOPE_FAIL {
+    ::unlink(tempPath.c_str());
+  };
+
+  const auto target = fmt::format("{}", reservation);
+  folly::checkUnixError(
+      ::symlink(target.c_str(), tempPath.c_str()),
+      "Failed to create temporary inode reservation ",
+      tempPath.view());
+  folly::checkUnixError(
+      ::rename(tempPath.c_str(), path.c_str()),
+      "Failed to replace inode reservation ",
+      path.view());
+
+  folly::File directory{localDir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC};
+#ifdef __APPLE__
+  const auto fsyncResult = ::fcntl(directory.fd(), F_FULLFSYNC);
+#else
+  const auto fsyncResult = ::fsync(directory.fd());
+#endif
+  folly::checkUnixError(
+      fsyncResult, "Failed to persist inode reservation in ", localDir_.view());
+}
+#endif
+
 bool Overlay::buildDirEntries(
+    InodeNumber inodeNumber,
     OverlayEntrySource source,
     folly::fbvector<std::pair<PathComponent, DirEntry>>& entries) {
   bool shouldRewriteOverlay = false;
@@ -578,6 +821,21 @@ bool Overlay::buildDirEntries(
       shouldRewriteOverlay = true;
       return;
     }
+
+    auto rawMode = static_cast<uint32_t>(*value.mode());
+    if (!DirEntry::isValidInitialMode(rawMode)) {
+      // Corrupt on-disk data; DirEntry would abort on it. fsck can also
+      // fold a corrupt WAL entry into the base, since it cannot check modes.
+      XLOGF(
+          ERR,
+          "Dropping entry {} from overlay dir {}: invalid mode {:o}",
+          name,
+          inodeNumber,
+          rawMode);
+      shouldRewriteOverlay = true;
+      return;
+    }
+    auto mode = static_cast<mode_t>(rawMode);
 
     InodeNumber ino;
     if (*value.inodeNumber()) {
@@ -591,13 +849,10 @@ bool Overlay::buildDirEntries(
     if (value.hash() && !value.hash()->empty()) {
       auto hash = ObjectId{folly::ByteRange{folly::StringPiece{*value.hash()}}};
       entries.emplace_back(
-          PathComponent{name},
-          DirEntry{
-              static_cast<mode_t>(*value.mode()), ino, hash, aclRootState});
+          PathComponent{name}, DirEntry{mode, ino, hash, aclRootState});
     } else {
       entries.emplace_back(
-          PathComponent{name},
-          DirEntry{static_cast<mode_t>(*value.mode()), ino, aclRootState});
+          PathComponent{name}, DirEntry{mode, ino, aclRootState});
     }
   });
 
@@ -619,7 +874,7 @@ DirContents Overlay::loadOverlayDir(InodeNumber inodeNumber) {
       inodeNumber,
       [&](uint32_t count, InodeCatalog::OverlayEntryIterator iterate) {
         entries.reserve(count);
-        shouldRewriteOverlay = buildDirEntries(iterate, entries);
+        shouldRewriteOverlay = buildDirEntries(inodeNumber, iterate, entries);
       });
   if (!found && !hasWal) {
     stats_->increment(&OverlayStats::loadOverlayDirFailure);
@@ -641,29 +896,42 @@ DirContents Overlay::loadOverlayDir(InodeNumber inodeNumber) {
 
   if (hasWal) {
     // Pre-process WAL into a collapsed net delta and merge it into the
-    // streamed-load PathMap via PathMapMutator. saveOverlayDir below
-    // flushes the merged base file and clearWalAfterFullWrite removes
-    // the WAL.
+    // streamed-load PathMap. saveOverlayDir below flushes the merged
+    // base file and clearWalAfterFullWrite removes the WAL.
     auto walResult = inodeCatalog_->loadWalDelta(inodeNumber, caseSensitive_);
     auto& delta = walResult.delta;
-    stats_->increment(&OverlayStats::walReplay);
-    stats_->increment(
-        &OverlayStats::walEntriesReplayed,
-        static_cast<double>(walResult.rawEntriesParsed));
-    if (walResult.parseErrors > 0) {
-      stats_->increment(
-          &OverlayStats::walParseFailure,
-          static_cast<double>(walResult.parseErrors));
-    }
 
-    DirContents base{std::move(entries), caseSensitive_};
-    PathMapMutator<DirEntry> mutator{std::move(base)};
+    DirContents merged{std::move(entries), caseSensitive_};
 
     for (auto& [name, walDelta] : delta) {
       switch (walDelta.type) {
         case WalOpType::ADD: {
-          auto mode = static_cast<mode_t>(*walDelta.entry.mode());
-          auto ino = InodeNumber::fromThrift(*walDelta.entry.inodeNumber());
+          auto rawMode = static_cast<uint32_t>(*walDelta.entry.mode());
+          auto rawIno = *walDelta.entry.inodeNumber();
+          auto nextIno = nextInodeNumber_.load(std::memory_order_relaxed);
+          // The WAL reader already rejects malformed frames and invalid
+          // names, but only the Overlay knows which inode numbers exist and
+          // which mode bits a DirEntry can hold. Dropping the entry here
+          // beats aborting on the DirEntry or visitDirEntries checks below.
+          bool validMode = DirEntry::isValidInitialMode(rawMode);
+          bool validIno = rawIno > 0 && static_cast<uint64_t>(rawIno) < nextIno;
+          if (!validMode || !validIno) {
+            XLOGF(
+                ERR,
+                "Dropping WAL entry {} in overlay dir {}: {} (mode {:o}, inode number {}, next inode number {})",
+                name,
+                inodeNumber,
+                validMode ? "inode number not allocated" : "invalid mode",
+                rawMode,
+                rawIno,
+                nextIno);
+            ++walResult.parseErrors;
+            // The WAL reader counted this entry as parsed; it is not replayed.
+            --walResult.rawEntriesParsed;
+            break;
+          }
+          auto mode = static_cast<mode_t>(rawMode);
+          auto ino = InodeNumber::fromThrift(rawIno);
           const auto aclRootState = getOverlayEntryAclRootState(walDelta.entry);
           DirEntry entry{mode, ino, aclRootState};
           if (walDelta.entry.hash().has_value() &&
@@ -676,33 +944,54 @@ DirContents Overlay::loadOverlayDir(InodeNumber inodeNumber) {
             // WAL key matches the stored key exactly — no rekey needed, so
             // insert_or_assign is sufficient (vs. the erase+emplace in the
             // case-insensitive branch).
-            mutator.insert_or_assign(
-                PathComponentPiece{name}, std::move(entry));
+            merged.insert_or_assign(PathComponentPiece{name}, std::move(entry));
           } else {
             // On case-insensitive mounts the stored key spelling may differ
             // from the WAL ADD's spelling (e.g., base "foo" with WAL ADD
             // "FOO"). Erase any case-equivalent entry first so the inserted
             // key uses the WAL casing.
-            mutator.erase(PathComponentPiece{name});
-            mutator.emplace(PathComponentPiece{name}, std::move(entry));
+            merged.erase(PathComponentPiece{name});
+            merged.emplace(PathComponentPiece{name}, std::move(entry));
           }
           break;
         }
         case WalOpType::REMOVE:
-          mutator.erase(PathComponentPiece{name});
+          merged.erase(PathComponentPiece{name});
           break;
         case WalOpType::MATERIALIZE: {
-          auto it = mutator.find(PathComponentPiece{name});
-          if (it != mutator.end()) {
+          auto it = merged.find(PathComponentPiece{name});
+          if (it != merged.end()) {
             it->second.setMaterialized();
           }
           break;
         }
       }
     }
+    // The replayed map becomes the directory's live contents; fold the
+    // pending inserts and tombstones now instead of leaving lookups and
+    // iteration on the two-region path until the next mutation.
+    merged.compact();
 
-    DirContents merged{mutator.finalize()};
-    saveOverlayDir(inodeNumber, merged, /*isMaterialized=*/true);
+    stats_->increment(&OverlayStats::walReplay);
+    stats_->increment(
+        &OverlayStats::walEntriesReplayed,
+        static_cast<double>(walResult.rawEntriesParsed));
+    if (walResult.parseErrors > 0) {
+      stats_->increment(
+          &OverlayStats::walParseFailure,
+          static_cast<double>(walResult.parseErrors));
+    }
+
+    if (!shouldDeferWalFlush() || walResult.parseErrors > 0 ||
+        shouldRewriteOverlay) {
+      // The clean-WAL rewrite is opportunistic compaction, redundant with what
+      // saveOverlayPostCheckout does, so it's deferred during checkout. But a
+      // torn WAL (parseErrors) needs its heal now, and a legacy base
+      // (shouldRewriteOverlay: freshly allocated inode numbers or filtered
+      // AppleDouble entries) needs to be persisted now -- neither is guaranteed
+      // to reach a post-checkout save for directories the checkout only reads.
+      saveOverlayDir(inodeNumber, merged, /*isMaterialized=*/true);
+    }
     stats_->increment(&OverlayStats::loadOverlayDirSuccessful);
     return merged;
   }
@@ -870,8 +1159,12 @@ void Overlay::maybeCompactWal(
     // Below the cap: probabilistic roll. Expected appends between
     // compactions = `threshold`, so amortized rewrite cost is O(1) per
     // append.
-    size_t threshold = walCompactionMultiplier_ *
-        std::max(content.size(), static_cast<size_t>(10));
+    size_t threshold = walMinCompactionThreshold_
+        ? std::max(
+              walMinCompactionThreshold_,
+              walCompactionMultiplier_ * content.size())
+        : walCompactionMultiplier_ *
+            std::max(content.size(), static_cast<size_t>(10));
     if (walCompactionRng_() % threshold != 0) {
       return;
     }
@@ -898,8 +1191,20 @@ void Overlay::appendWalEntryAndCompact(
     PathComponentPiece childName,
     const overlay::OverlayEntry* entry,
     const DirContents& content) {
-  uint64_t walFileSizeBytes =
-      inodeCatalog_->appendWalEntry(parent, op, childName, entry);
+  uint64_t walFileSizeBytes = 0;
+  try {
+    walFileSizeBytes =
+        inodeCatalog_->appendWalEntry(parent, op, childName, entry);
+  } catch (const WalEntryTooLargeError& ex) {
+    // `content` already includes this mutation, so a full rewrite persists
+    // it and retires the incompatible WAL; the next append starts a fresh
+    // file in the configured format.
+    XLOGF(DBG4, "{}; rewriting directory instead", ex.what());
+    DurationScope<EdenStats> compactScope{
+        stats_, &OverlayStats::walCompactionInline};
+    saveOverlayDir(parent, content, /*isMaterialized=*/true);
+    return;
+  }
   stats_->increment(&OverlayStats::walAppend);
   maybeCompactWal(parent, content, walFileSizeBytes);
 }
@@ -911,6 +1216,11 @@ void Overlay::freeInodeFromMetadataTable(InodeNumber ino) {
 #else
   (void)ino;
 #endif
+}
+
+void Overlay::freeInodeMetadata(InodeNumber inodeNumber) {
+  IORequest req{this};
+  freeInodeFromMetadataTable(inodeNumber);
 }
 
 void Overlay::removeOverlayFile(InodeNumber inodeNumber) {
@@ -991,6 +1301,28 @@ void Overlay::recursivelyRemoveOverlayDirBackground(InodeNumber inodeNumber) {
   gcCondVar_.notify_one();
 }
 
+bool Overlay::removeOverlayDataInBackground(
+    InodeNumber inodeNumber,
+    bool isDir,
+    std::shared_ptr<void>&& openFile) {
+  // Each queued request may hold an open descriptor; the GC thread removes
+  // about 20k inodes per second, so this is a fraction of a second of work.
+  constexpr size_t kMaxQueuedInodeRemovals = 4096;
+  if (!backgroundInodeRemoval_) {
+    return false;
+  }
+  {
+    auto gcQueue = gcQueue_.lock();
+    if (gcQueue->queue.size() >= kMaxQueuedInodeRemovals) {
+      return false;
+    }
+    gcQueue->queue.emplace_back(
+        GCRequest::RemoveInodeRequest{inodeNumber, isDir, std::move(openFile)});
+  }
+  gcCondVar_.notify_one();
+  return true;
+}
+
 #ifndef _WIN32
 folly::Future<folly::Unit> Overlay::flushPendingAsync() {
   folly::Promise<folly::Unit> promise;
@@ -998,6 +1330,11 @@ folly::Future<folly::Unit> Overlay::flushPendingAsync() {
   gcQueue_.lock()->queue.emplace_back(std::move(promise));
   gcCondVar_.notify_one();
   return future;
+}
+#else
+folly::Future<folly::Unit> Overlay::flushPendingAsync() {
+  // Windows has no overlay GC thread, so nothing is ever pending.
+  return folly::makeFuture();
 }
 #endif // !_WIN32
 
@@ -1125,6 +1462,250 @@ OverlayFile Overlay::createOverlayFile(
   }
 }
 
+std::optional<std::pair<InodeNumber, OverlayFile>>
+Overlay::tryClaimPreparedFile(folly::ByteRange contents) {
+  if (filePreallocPoolSize_ == 0) {
+    return std::nullopt;
+  }
+  IORequest req{this};
+  PreparedFile prepared;
+  bool needRefill;
+  {
+    std::lock_guard<std::mutex> guard{preallocMutex_};
+    if (preallocPool_.empty()) {
+      stats_->increment(&OverlayStats::preallocFileMissed);
+      if (!preallocBroken_) {
+        preallocCondVar_.notify_one();
+      }
+      return std::nullopt;
+    }
+    prepared = std::move(preallocPool_.back());
+    preallocPool_.pop_back();
+    // Only wake the refill thread once half the pool has drained, so a
+    // steady stream of creates costs one wakeup and one refill batch per
+    // half-pool of claims rather than a futex wake per claim.
+    needRefill = preallocPool_.size() <= filePreallocPoolSize_ / 2;
+  }
+  if (needRefill) {
+    preallocCondVar_.notify_one();
+  }
+  if (!contents.empty()) {
+    // The fd is positioned just past the header, so this appends the
+    // contents (e.g. a symlink target) in the right place.
+    auto written =
+        folly::writeFull(prepared.file.fd(), contents.data(), contents.size());
+    if (written < 0) {
+      // Remove the file so a failed claim doesn't leave a partial
+      // payload behind for fsck to report.
+      int writeErrno = errno;
+      stats_->increment(&OverlayStats::preallocFileClaimFailed);
+      try {
+        fileContentStore_->removeOverlayFile(prepared.number);
+      } catch (const std::exception& ex) {
+        XLOGF(
+            WARN,
+            "failed to remove overlay file {} after a failed claim write: {}",
+            prepared.number,
+            folly::exceptionStr(ex));
+      }
+      folly::throwSystemErrorExplicit(
+          writeErrno, "failed to write contents to preallocated overlay file");
+    }
+  }
+  stats_->increment(&OverlayStats::preallocFileClaimed);
+  return std::make_pair(
+      prepared.number, OverlayFile{std::move(prepared.file), weak_from_this()});
+}
+
+std::optional<InodeNumber> Overlay::tryClaimPreparedDir() {
+  if (dirPreallocPoolSize_ == 0) {
+    return std::nullopt;
+  }
+  InodeNumber number;
+  bool needRefill;
+  {
+    std::lock_guard<std::mutex> guard{preallocMutex_};
+    if (preallocDirPool_.empty()) {
+      stats_->increment(&OverlayStats::preallocDirMissed);
+      preallocCondVar_.notify_one();
+      return std::nullopt;
+    }
+    number = preallocDirPool_.back();
+    preallocDirPool_.pop_back();
+    // Match the file pool's refill hysteresis: one wakeup per half-pool of
+    // claims rather than a futex wake per mkdir.
+    needRefill = preallocDirPool_.size() <= dirPreallocPoolSize_ / 2;
+  }
+  if (needRefill) {
+    preallocCondVar_.notify_one();
+  }
+  stats_->increment(&OverlayStats::preallocDirClaimed);
+  return number;
+}
+
+void Overlay::preallocThreadLoop() {
+  folly::setThreadName("OverlayPrealloc");
+  bool backoff = false;
+  bool filePoolBroken = false;
+  while (true) {
+    size_t wantFiles;
+    size_t wantDirs;
+    {
+      std::unique_lock<std::mutex> lock{preallocMutex_};
+      if (backoff) {
+        preallocCondVar_.wait_for(
+            lock, std::chrono::seconds(1), [&] { return preallocStop_; });
+        backoff = false;
+      } else {
+        preallocCondVar_.wait(lock, [&] {
+          return preallocStop_ ||
+              (!preallocBroken_ &&
+               preallocPool_.size() < filePreallocPoolSize_) ||
+              preallocDirPool_.size() < dirPreallocPoolSize_;
+        });
+      }
+      if (preallocStop_) {
+        return;
+      }
+      wantFiles =
+          preallocBroken_ ? 0 : filePreallocPoolSize_ - preallocPool_.size();
+      wantDirs = dirPreallocPoolSize_ - preallocDirPool_.size();
+    }
+    for (size_t i = 0; i < wantFiles; ++i) {
+      // If creation fails below, this number stays consumed; the inode
+      // number space is 64 bits, so the gap is harmless.
+      auto number = allocateInodeNumber();
+      try {
+        auto created =
+            fileContentStore_->createOverlayFile(number, folly::ByteRange{});
+        auto* file = std::get_if<folly::File>(&created);
+        if (!file) {
+          XLOG(
+              WARN,
+              "overlay file preallocation is not supported by this "
+              "FileContentStore; disabling the file pool");
+          filePoolBroken = true;
+          // The store may have persisted the file even though it did not
+          // return an fd (the LMDB store does); remove it so the probe
+          // leaves no orphan behind.
+          try {
+            fileContentStore_->removeOverlayFile(number);
+          } catch (const std::exception& removeEx) {
+            XLOGF(
+                WARN,
+                "failed to remove prealloc probe file {}: {}",
+                number,
+                folly::exceptionStr(removeEx));
+          }
+          break;
+        }
+        // A whole batch takes milliseconds, long enough for claimers to
+        // drain the pool, so each entry is published as soon as it exists.
+        std::lock_guard<std::mutex> guard{preallocMutex_};
+        preallocPool_.push_back(PreparedFile{number, std::move(*file)});
+      } catch (const std::exception& ex) {
+        // Likely ENOSPC or an unusable overlay directory. Keep what we
+        // have and retry after a delay instead of spinning.
+        XLOGF(
+            WARN,
+            "overlay file preallocation failed for {}: {}",
+            number,
+            folly::exceptionStr(ex));
+        backoff = true;
+        break;
+      }
+    }
+    for (size_t i = 0; i < wantDirs; ++i) {
+      auto number = allocateInodeNumber();
+      try {
+        // Publish a complete record before making its inode number claimable.
+        inodeCatalog_->saveOverlayEntries(
+            number, 0, [](auto) {}, /*crashSafe=*/true);
+        std::lock_guard<std::mutex> guard{preallocMutex_};
+        preallocDirPool_.push_back(number);
+      } catch (const std::exception& ex) {
+        XLOGF(
+            WARN,
+            "overlay dir preallocation failed for {}: {}; retrying after "
+            "backoff",
+            number,
+            folly::exceptionStr(ex));
+        // Best-effort cleanup in case the record was partially created.
+        try {
+          inodeCatalog_->removeOverlayDir(number);
+        } catch (const std::exception& removeEx) {
+          XLOGF(
+              WARN,
+              "failed to remove preallocated overlay dir {} after a failed "
+              "write: {}",
+              number,
+              folly::exceptionStr(removeEx));
+        }
+        backoff = true;
+        break;
+      }
+    }
+    bool allPoolsInactive;
+    {
+      std::lock_guard<std::mutex> guard{preallocMutex_};
+      if (filePoolBroken) {
+        preallocBroken_ = true;
+      }
+      allPoolsInactive = (filePreallocPoolSize_ == 0 || preallocBroken_) &&
+          dirPreallocPoolSize_ == 0;
+    }
+    if (allPoolsInactive) {
+      return;
+    }
+  }
+}
+
+void Overlay::stopPreallocThread() {
+  {
+    std::lock_guard<std::mutex> guard{preallocMutex_};
+    preallocStop_ = true;
+  }
+  preallocCondVar_.notify_all();
+  if (preallocThread_.joinable()) {
+    preallocThread_.join();
+  }
+  // Remove any unclaimed pre-created files so they don't linger as orphans
+  // in the overlay directory.
+  std::vector<PreparedFile> leftover;
+  {
+    std::lock_guard<std::mutex> guard{preallocMutex_};
+    leftover.swap(preallocPool_);
+  }
+  for (auto& entry : leftover) {
+    entry.file.closeNoThrow();
+    try {
+      fileContentStore_->removeOverlayFile(entry.number);
+    } catch (const std::exception& ex) {
+      XLOGF(
+          WARN,
+          "failed to remove unclaimed preallocated overlay file {}: {}",
+          entry.number,
+          folly::exceptionStr(ex));
+    }
+  }
+  std::vector<InodeNumber> dirLeftover;
+  {
+    std::lock_guard<std::mutex> guard{preallocMutex_};
+    dirLeftover.swap(preallocDirPool_);
+  }
+  for (auto number : dirLeftover) {
+    try {
+      inodeCatalog_->removeOverlayDir(number);
+    } catch (const std::exception& ex) {
+      XLOGF(
+          WARN,
+          "failed to remove unclaimed preallocated overlay dir {}: {}",
+          number,
+          folly::exceptionStr(ex));
+    }
+  }
+}
+
 #endif // !_WIN32
 
 InodeNumber Overlay::getMaxInodeNumber() {
@@ -1219,6 +1800,28 @@ void Overlay::handleGCRequest(GCRequest& request) {
   if (auto* flush =
           std::get_if<GCRequest::FlushRequest>(&request.requestType)) {
     flush->setValue();
+    return;
+  }
+
+  if (auto* remove =
+          std::get_if<GCRequest::RemoveInodeRequest>(&request.requestType)) {
+    // Closing the last descriptor of an unlinked file is where btrfs evicts
+    // the inode, so it is dropped here rather than wherever the open-file
+    // cache would otherwise have evicted it.
+    remove->openFile.reset();
+    try {
+      if (remove->isDir) {
+        removeOverlayDir(remove->ino);
+      } else {
+        removeOverlayFile(remove->ino);
+      }
+    } catch (const std::exception& ex) {
+      // removeOverlayDir/removeOverlayFile logged and counted the failure;
+      // this is the structured record the inline removal path also emits.
+      errorLogger_.log(
+          EdenErrorInfo::overlay(ex, remove->ino.get())
+              .withErrorType("overlay_unload_failed"));
+    }
     return;
   }
 
@@ -1377,11 +1980,15 @@ void Overlay::renameChild(
     if (supportsSemanticOperations_) {
       inodeCatalog_->renameChild(src, dst, srcName, dstName);
     } else if (useWal()) {
-      // Fall back to a full rewrite when dstContent does not yet contain
-      // the renamed entry — there is nothing concrete for the ADD WAL
-      // entry to carry.
+      // An absent destination cannot be serialized as an ADD WAL entry.
       auto dstIt = dstContent.find(dstName);
       if (dstIt == dstContent.end()) {
+        if (reloadableConfig_->getEdenConfig()
+                ->experimentalOverlayRenameRequireDestination.getValue()) {
+          EDEN_BUG() << "rename destination '" << dstName
+                     << "' is missing from directory " << dst.get();
+        }
+        // The legacy full rewrite can lose the child if both snapshots omit it.
         saveOverlayDir(src, srcContent);
         if (dst.get() != src.get()) {
           saveOverlayDir(dst, dstContent);
@@ -1426,6 +2033,12 @@ void Overlay::renameChild(
         }
       }
     } else {
+      if (dstContent.find(dstName) == dstContent.end() &&
+          reloadableConfig_->getEdenConfig()
+              ->experimentalOverlayRenameRequireDestination.getValue()) {
+        EDEN_BUG() << "rename destination '" << dstName
+                   << "' is missing from directory " << dst.get();
+      }
       saveOverlayDir(src, srcContent);
       if (dst.get() != src.get()) {
         saveOverlayDir(dst, dstContent);

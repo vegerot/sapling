@@ -16,6 +16,7 @@ use context::CoreContext;
 use context::SessionContainer;
 use fbinit::FacebookInit;
 use metaconfig_types::AclManifestMode;
+use metadata::ClientPathAclCompatibility;
 use metadata::Metadata;
 use mononoke_macros::mononoke;
 use mononoke_types::NonRootMPath;
@@ -27,10 +28,12 @@ use serde_json::json;
 
 use super::RestrictedPathAccessData;
 use super::log_source_results_to_scuba;
+use super::log_source_results_to_scuba_with_enforcement;
 use super::restriction_check_result_for_source_results;
 use crate::ManifestType;
 use crate::RestrictedManifestId;
 use crate::restriction_check::AuthorizationCheckResult;
+use crate::restriction_check::EnforcementDecision;
 use crate::restriction_check::ManifestRestrictionCheckResult;
 use crate::restriction_check::PathRestrictionCheckResult;
 use crate::restriction_check::SourceRestrictionCheck;
@@ -87,6 +90,20 @@ impl<T: SourceRestrictionCheck> ShadowComparisonFieldFixture<T> {
     /// User-Agent, which `log_access_to_scuba` records as `http_user_agent`.
     fn with_user_agent(self, user_agent: &str) -> Self {
         let ctx = ctx_with_user_agent(self.fb, user_agent);
+        Self { ctx, ..self }
+    }
+
+    fn with_client_path_acl_compatibility(
+        self,
+        client_path_acl_compatibility: ClientPathAclCompatibility,
+    ) -> Self {
+        let metadata = Metadata::default();
+        let mut metadata = metadata;
+        metadata.add_client_path_acl_compatibility(client_path_acl_compatibility);
+        let session = SessionContainer::builder(self.fb)
+            .metadata(Arc::new(metadata))
+            .build();
+        let ctx = session.new_context(MononokeScubaSampleBuilder::with_discard());
         Self { ctx, ..self }
     }
 
@@ -561,6 +578,146 @@ async fn test_shadow_unrestricted_sources_do_not_log_rows(fb: FacebookInit) -> R
     Ok(())
 }
 
+// What it tests: every enforcement decision is logged as `enforcement_decision`
+// with whether an exemption matched, and `access_enforcement_enabled` keeps its
+// legacy values.
+// Expected: `enforced` logs true, `no_condition_matched` and `exempted` log
+// false, and `disabled` / `error` omit `access_enforcement_enabled`;
+// `has_enforcement_exemption` is omitted only for `disabled`.
+#[mononoke::fbinit_test]
+async fn test_enforcement_decision_is_logged(fb: FacebookInit) -> Result<()> {
+    let cases = [
+        (EnforcementDecision::Disabled, "disabled", None, None),
+        (
+            EnforcementDecision::NoConditionMatched {
+                exemption_matched: false,
+            },
+            "no_condition_matched",
+            Some("false"),
+            Some("false"),
+        ),
+        (
+            EnforcementDecision::NoConditionMatched {
+                exemption_matched: true,
+            },
+            "no_condition_matched",
+            Some("false"),
+            Some("true"),
+        ),
+        (
+            EnforcementDecision::Enforced,
+            "enforced",
+            Some("true"),
+            Some("false"),
+        ),
+        (
+            EnforcementDecision::Exempted,
+            "exempted",
+            Some("false"),
+            Some("true"),
+        ),
+        (
+            EnforcementDecision::Error {
+                exemption_matched: true,
+            },
+            "error",
+            None,
+            Some("true"),
+        ),
+        (
+            EnforcementDecision::Error {
+                exemption_matched: false,
+            },
+            "error",
+            None,
+            Some("false"),
+        ),
+    ];
+
+    for (decision, expected_decision, expected_enabled, expected_exemption) in cases {
+        let samples = ShadowComparisonFieldFixture::new(
+            fb,
+            restricted_path_result(false, false, "config_acl", "config/restricted")?,
+            Some(restricted_path_result(
+                false,
+                false,
+                "config_acl",
+                "config/restricted",
+            )?),
+            full_path_access_data()?,
+        )?
+        .log_with(
+            |ctx, repo_id, config, acl_manifest, mode, access_data, scuba| {
+                log_source_results_to_scuba_with_enforcement(
+                    ctx,
+                    repo_id,
+                    config,
+                    acl_manifest,
+                    mode,
+                    Some(decision),
+                    access_data,
+                    scuba,
+                )
+            },
+        )?;
+
+        assert_eq!(samples.len(), 1, "{decision:?} should log one row");
+        assert_eq!(
+            sample_field(&samples[0], "enforcement_decision").as_deref(),
+            Some(expected_decision),
+            "{decision:?} should be logged as {expected_decision}",
+        );
+        assert_eq!(
+            sample_field(&samples[0], "access_enforcement_enabled").as_deref(),
+            expected_enabled,
+            "{decision:?} should keep the legacy access_enforcement_enabled value",
+        );
+        assert_eq!(
+            sample_field(&samples[0], "has_enforcement_exemption").as_deref(),
+            expected_exemption,
+            "{decision:?} should log whether an exemption matched",
+        );
+    }
+    Ok(())
+}
+
+// What it tests: rows logged outside request enforcement carry no decision.
+// Expected: none of `enforcement_decision`, `access_enforcement_enabled` or
+// `has_enforcement_exemption` is emitted.
+#[mononoke::fbinit_test]
+async fn test_enforcement_decision_is_omitted_without_enforcement(fb: FacebookInit) -> Result<()> {
+    let samples = ShadowComparisonFieldFixture::new(
+        fb,
+        restricted_path_result(false, false, "config_acl", "config/restricted")?,
+        Some(restricted_path_result(
+            false,
+            false,
+            "config_acl",
+            "config/restricted",
+        )?),
+        full_path_access_data()?,
+    )?
+    .log_with(log_source_results_to_scuba)?;
+
+    assert_eq!(samples.len(), 1, "a restricted access should log one row");
+    assert_eq!(
+        sample_field(&samples[0], "enforcement_decision"),
+        None,
+        "rows logged outside request enforcement should not carry a decision",
+    );
+    assert_eq!(
+        sample_field(&samples[0], "access_enforcement_enabled"),
+        None,
+        "rows logged outside request enforcement should not carry access_enforcement_enabled",
+    );
+    assert_eq!(
+        sample_field(&samples[0], "has_enforcement_exemption"),
+        None,
+        "rows logged outside request enforcement should not carry has_enforcement_exemption",
+    );
+    Ok(())
+}
+
 // What it tests: the client User-Agent is recorded as `http_user_agent` on the
 // restricted-path access row when present in the request metadata.
 // Expected: the emitted row carries `http_user_agent` equal to the client UA.
@@ -616,6 +773,58 @@ async fn test_missing_user_agent_is_not_logged(fb: FacebookInit) -> Result<()> {
     Ok(())
 }
 
+#[mononoke::fbinit_test]
+async fn test_default_client_path_acl_compatibility_is_logged(fb: FacebookInit) -> Result<()> {
+    let samples = ShadowComparisonFieldFixture::new(
+        fb,
+        restricted_path_result(false, false, "config_acl", "config/restricted")?,
+        Some(restricted_path_result(
+            true,
+            true,
+            "acl_manifest_acl",
+            "acl_manifest/restricted",
+        )?),
+        full_path_access_data()?,
+    )?
+    .log_with(log_source_results_to_scuba)?;
+
+    assert_eq!(samples.len(), 1);
+    assert_eq!(
+        sample_field(&samples[0], "client_path_acl_compatibility"),
+        Some("absent".to_string()),
+    );
+    Ok(())
+}
+
+#[mononoke::fbinit_test]
+async fn test_non_default_client_path_acl_compatibility_is_logged(fb: FacebookInit) -> Result<()> {
+    for (state, expected) in [
+        (ClientPathAclCompatibility::ReadyV1, "ready_v1"),
+        (ClientPathAclCompatibility::Malformed, "malformed"),
+    ] {
+        let samples = ShadowComparisonFieldFixture::new(
+            fb,
+            restricted_path_result(false, false, "config_acl", "config/restricted")?,
+            Some(restricted_path_result(
+                true,
+                true,
+                "acl_manifest_acl",
+                "acl_manifest/restricted",
+            )?),
+            full_path_access_data()?,
+        )?
+        .with_client_path_acl_compatibility(state)
+        .log_with(log_source_results_to_scuba)?;
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(
+            sample_field(&samples[0], "client_path_acl_compatibility"),
+            Some(expected.to_string()),
+        );
+    }
+    Ok(())
+}
+
 /// Builds a test `CoreContext` whose request metadata carries `user_agent`, so
 /// tests can exercise the `http_user_agent` logging path.
 fn ctx_with_user_agent(fb: FacebookInit, user_agent: &str) -> CoreContext {
@@ -640,6 +849,7 @@ fn restricted_path_result(
                 restriction_root: NonRootMPath::new(restriction_path)?,
                 repo_region_acl: repo_region_acl.clone(),
                 permission_request_group: repo_region_identity.clone(),
+                rollout_allowlist_group: None,
             },
             authorization_result(has_authorization, has_acl_access),
             repo_region_identity,
@@ -661,6 +871,7 @@ fn restricted_manifest_result(
                 restriction_root: restriction_path.map(NonRootMPath::new).transpose()?,
                 repo_region_acl: repo_region_acl.clone(),
                 permission_request_group: repo_region_identity.clone(),
+                rollout_allowlist_group: None,
             },
             authorization_result(has_authorization, has_acl_access),
             repo_region_identity,

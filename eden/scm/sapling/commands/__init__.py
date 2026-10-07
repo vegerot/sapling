@@ -87,6 +87,7 @@ with hgdemandimport.deactivated():
         debugconflictcontext,
         debugdirs,
         debugdryup,
+        debugmergetext,
         debugmetalog,
         debugmutation,
         debugrebuildchangelog,
@@ -99,6 +100,7 @@ with hgdemandimport.deactivated():
         eden,
         fs,
         isl,
+        lint,
         subtree,
         uncommit,
     )
@@ -1734,9 +1736,10 @@ def commit(ui, repo, *pats, **opts):
     conflicts occur during :prog:`goto`, commit all pending changes.
     Do not specify files or use ``-I``, ``-X``, or ``-i``.
 
-    Specify the ``-m`` flag to include a free-form commit message. If you do
-    not specify ``-m``, @Product@ opens your configured editor where you can
-    enter a message based on a pre-loaded commit template.
+    Specify the ``-m`` flag to include a free-form commit message. Repeat
+    ``-m`` to concatenate multiple messages separated by blank lines. If you
+    do not specify ``-m``, @Product@ opens your configured editor where you
+    can enter a message based on a pre-loaded commit template.
 
     Returns 0 on success, 1 if nothing changed.
 
@@ -1769,6 +1772,15 @@ def commit(ui, repo, *pats, **opts):
 
 
 def _docommit(ui, repo, *pats, **opts):
+    subtree_copy_state = subtreeutil.read_subtree_copy_state(repo)
+    if subtree_copy_state and (
+        pats or opts.get("include") or opts.get("exclude") or opts.get("interactive")
+    ):
+        raise error.Abort(
+            _("cannot partially commit pending subtree copy changes"),
+            hint=_("run '@prog@ commit' to commit the subtree copy changes"),
+        )
+
     if opts.get(r"interactive"):
         opts.pop(r"interactive")
         ret = cmdutil.dorecord(
@@ -1778,11 +1790,13 @@ def _docommit(ui, repo, *pats, **opts):
         # commit(), 1 if nothing changed or None on success.
         return 1 if ret == 0 else ret
 
-    cmdutil.checkunfinished(repo, op="commit")
+    cmdutil.checkunfinished(repo, op="amend" if opts.get("amend") else "commit")
 
     extra = {}
+    predecessor = None
     if opts.get("amend"):
         old = repo["."]
+        predecessor = old
         rewriteutil.precheck(repo, [old.rev()], "amend")
 
         # Currently histedit gets confused if an amend happens while histedit
@@ -1807,11 +1821,27 @@ def _docommit(ui, repo, *pats, **opts):
         def commitfunc(ui, repo, message, match, opts):
             ms = mergemod.mergestate.read(repo)
             subtree_merges = ms.subtree_merges
-            extra.update(subtreeutil.gen_merge_info(repo, subtree_merges))
-            summaryfooter = subtreeutil.gen_merge_commit_msg(subtree_merges)
+            if subtree_copy_state and subtree_merges:
+                raise error.Abort(
+                    _("unexpected simultaneous subtree copy and merge state"),
+                    hint=_(
+                        "use '@prog@ goto . --clean' to recover; "
+                        "this will destroy uncommitted changes"
+                    ),
+                )
+            summaryfooter = ""
             if subtree_merges:
+                extra.update(subtreeutil.gen_merge_info(repo, subtree_merges))
+                summaryfooter = subtreeutil.gen_merge_commit_msg(subtree_merges)
                 parents = repo.working_parent_nodes()
                 repo.setparents(parents[0])
+            elif subtree_copy_state:
+                extra.update(
+                    subtreeutil.subtree_copy_state_to_extra(repo, subtree_copy_state)
+                )
+                summaryfooter = subtreeutil.gen_copy_commit_msg_from_subtree_copy_state(
+                    repo, subtree_copy_state
+                )
             # Block merge commits unless explicitly allowed. If repo state is not
             # maintained for commands like rebase, commit can end up creating a
             # merge commit, which is incorrect and has performance implications.
@@ -1839,6 +1869,8 @@ def _docommit(ui, repo, *pats, **opts):
             )
 
         node = cmdutil.commit(ui, repo, commitfunc, pats, opts)
+        if subtree_copy_state:
+            subtreeutil.clear_subtree_copy_state(repo)
 
         if not node:
             stat = cmdutil.postcommitstatus(repo, pats, opts)
@@ -1851,7 +1883,7 @@ def _docommit(ui, repo, *pats, **opts):
                 ui.status(_("nothing changed\n"))
             return 1
 
-    cmdutil.commitstatus(repo, node, opts=opts)
+    cmdutil.commitstatus(repo, node, opts=opts, predecessor=predecessor)
 
 
 @command(
@@ -2815,9 +2847,11 @@ def _dograft(ui, to_repo, *revs, from_repo=None, **opts):
 
         # commit
         editor = cmdutil.getcommiteditor(editform="graft", **opts)
-        message, _is_from_user = _makegraftmessage(
+        message, is_from_user = _makegraftmessage(
             to_repo, ctx, opts, from_paths, to_paths, from_repo
         )
+        if not is_from_user and to_repo[None].dirty():
+            message = rewriteutil.copycommitmessage(to_repo, message, "graft", ctx)
         node = to_repo.commit(
             text=message, user=user, date=date, extra=extra, editor=editor
         )
@@ -2870,52 +2904,6 @@ def _makegraftmessage(to_repo, ctx, opts, from_paths, to_paths, from_repo):
             message.append("(grafted from %s)" % ctx.hex())
     message = "\n".join(message)
     return cmdutil.add_summary_footer(ctx.repo().ui, description, message), is_from_user
-
-
-@command(
-    "grep|gre",
-    [
-        ("A", "after-context", "", "print NUM lines of trailing context", "NUM"),
-        ("B", "before-context", "", "print NUM lines of leading context", "NUM"),
-        ("C", "context", "", "print NUM lines of output context", "NUM"),
-        ("i", "ignore-case", None, "ignore case when matching"),
-        ("l", "files-with-matches", None, "print only filenames that match"),
-        ("n", "line-number", None, "print matching line numbers"),
-        ("V", "invert-match", None, "select non-matching lines"),
-        ("w", "word-regexp", None, "match whole words only"),
-        ("E", "extended-regexp", None, "use POSIX extended regexps"),
-        ("F", "fixed-strings", None, "interpret pattern as fixed string"),
-        ("P", "perl-regexp", None, "use Perl-compatible regexps"),
-        (
-            "I",
-            "include",
-            [],
-            _("include files matching the given patterns"),
-            _("PATTERN"),
-        ),
-        (
-            "X",
-            "exclude",
-            [],
-            _("exclude files matching the given patterns"),
-            _("PATTERN"),
-        ),
-    ],
-    inferrepo=True,
-)
-def grep(ui, repo, pattern, *pats, **opts):
-    # Copy match specific options
-    match_opts = {}
-    for k in ("include", "exclude"):
-        if k in opts:
-            match_opts[k] = opts.get(k)
-
-    # Search everything in the current directory, or using the specified
-    # patterns instead.
-    wctx = repo[None]
-    matcher = scmutil.match(wctx, pats or ["."], match_opts)
-
-    return cmdutil.grep(ui, repo, table, matcher, pattern, **opts)
 
 
 @command(
@@ -3003,6 +2991,10 @@ def help_(ui, *names, **opts):
     if names and names[0] == "agent":
         agent_instructions = agent.get_agent_instructions(ui, names)
         ui.write(agent_instructions)
+        # Static config values have trailing whitespace trimmed, so instructions
+        # coming from builtin_static lose their final newline.
+        if not agent_instructions.endswith("\n"):
+            ui.write("\n")
         return 0
 
     name = " ".join(names) if names and names != (None,) else None
@@ -3019,6 +3011,8 @@ def help_(ui, *names, **opts):
             keep.append(sys.platform.lower())
     if ui.verbose:
         keep.append("verbose")
+    if ui.agent():
+        keep.append("agent")
 
     commands = sys.modules[__name__]
     formatted = help.formattedhelp(ui, commands, name, keep=keep, **opts)
@@ -3942,8 +3936,10 @@ def log(ui, repo, *pats, **opts):
     Print the revision history of the specified files or the entire
     project.
 
-    If no revision range is specified, the default is the current commit
-    and all of its ancestors (``::.``).
+    If no revision range is specified, the default revision range is the
+    current commit and all of its ancestors (``::.``). The experimental
+    ``--mutation`` option changes this default to the current commit and its
+    mutation predecessors (``predecessors(.)``).
 
     File history is shown without following the rename or copy
     history of files. To follow file history across renames and
@@ -4077,6 +4073,8 @@ def log(ui, repo, *pats, **opts):
     if opts.get("follow") and opts.get("rev"):
         opts["rev"] = [revsetlang.formatspec("reverse(::%lr)", opts.get("rev"))]
         del opts["follow"]
+
+    scmutil.maybe_show_path_typo_hint(ui, repo, pats, rev=opts.get("rev"))
 
     if opts.get("graph"):
         if linerange:
@@ -4254,8 +4252,30 @@ def manifest(ui, repo, node=None, rev=None, **opts):
         ),
         ("r", "rev", "", _("revision to merge"), _("REV")),
         ("P", "preview", None, _("review revisions to merge (no merge is performed)")),
+        (
+            "",
+            "noconflict",
+            None,
+            _(
+                "commit a conflict-free merge directly, or abort without "
+                "touching the working copy if the merge would have conflicts "
+                "(EXPERIMENTAL)"
+            ),
+        ),
+        (
+            "",
+            "parent",
+            [],
+            _(
+                "parent of the conflict-free merge, given twice; the working "
+                "copy is not involved (with --noconflict, EXPERIMENTAL)"
+            ),
+            _("REV"),
+        ),
     ]
-    + mergetoolopts,
+    + mergetoolopts
+    + commitopts
+    + commitopts2,
     _("[OPTION].. [REV]"),
     legacyaliases=["mer", "merg"],
 )
@@ -4285,35 +4305,73 @@ def merge(ui, repo, node=None, **opts):
     will check out a clean copy of the original merge parent, losing
     all changes.
 
+    With ``--noconflict`` the merge is only performed if no file needs manual
+    resolution. It is then committed right away (use ``-m`` for the message)
+    and the working copy is moved to the new commit; the commit is marked as
+    conflict-free and cannot be amended. Otherwise the command aborts, listing
+    the conflicting files, and leaves the working copy untouched. Both commits
+    must be draft.
+
+    ``--parent REV --parent REV`` names both parents of a conflict-free merge
+    in order, instead of merging into the working copy parent. The working
+    copy is not involved: it may be dirty and it stays where it is. The new
+    commit is only printed.
+
     .. container:: verbose
 
-      The merge command can be entirely disabled by setting the
-      ``ui.allowmerge`` configuration setting to false.
+      Regular merges can be disabled by setting ``ui.allowmerge`` to false.
+      Conflict-free merges are controlled by ``experimental.noconflict-merge``,
+      which is enabled by default.
 
     Returns 0 on success, 1 if there are unresolved files.
     """
-    if not ui.configbool("ui", "allowmerge", default=True):
+    parents = opts.get("parent")
+    if parents:
+        if not opts.get("noconflict"):
+            raise error.Abort(_("--parent requires --noconflict"))
+        if node or opts.get("rev"):
+            raise error.Abort(_("--parent cannot be combined with REV or --rev"))
+        if len(parents) != 2:
+            raise error.Abort(_("--parent must be given exactly twice"))
+    if not opts.get("noconflict"):
+        for opt in ("message", "logfile", "date", "user"):
+            if opts.get(opt):
+                raise error.Abort(_("--%s requires --noconflict") % opt)
+    # Conflict-free merges only record that two draft commits can be merged
+    # automatically and are meant for stacks, so they are allowed where merges
+    # otherwise are not.
+    if not ui.configbool("ui", "allowmerge", default=True) and not opts.get(
+        "noconflict"
+    ):
         raise error.Abort(
             _("merging is not supported for this repository"),
-            hint=_("use rebase instead"),
+            hint=_(
+                "use rebase, or '@prog@ merge --noconflict' for a conflict-free merge"
+            ),
         )
     if opts.get("rev") and node:
         raise error.Abort(_("please specify just one revision"))
     if not node:
         node = opts.get("rev")
 
-    if node:
-        node = scmutil.revsingle(repo, node).node()
-
-    if not node:
-        node = repo[destutil.destmerge(repo)].node()
+    if parents:
+        p1node, node = (scmutil.revsingle(repo, p).node() for p in parents)
+    else:
+        p1node = repo["."].node()
+        if node:
+            node = scmutil.revsingle(repo, node).node()
+        if not node:
+            node = repo[destutil.destmerge(repo)].node()
 
     max_distance = ui.configint("merge", "max-distance")
     if max_distance:
         # merge distance is computed as the number of commit between the common ancestors and the merge
         distance = repo.dageval(
             lambda: len(
-                range(children(gcaall(dot() + lookup(node))), dot() + lookup(node))
+                range(
+                    children(gcaall(lookup(p1node) + lookup(node))),
+                    lookup(p1node) + lookup(node),
+                )
             )
         )
         if distance > max_distance:
@@ -4324,9 +4382,7 @@ def merge(ui, repo, node=None, **opts):
 
     if opts.get("preview"):
         # find nodes that are ancestors of p2 but not of p1
-        p1 = repo.lookup(".")
-        p2 = repo.lookup(node)
-        nodes = repo.changelog.findmissing(common=[p1], heads=[p2])
+        nodes = repo.changelog.findmissing(common=[p1node], heads=[node])
 
         displayer = cmdutil.show_changeset(ui, repo, opts)
         for node in nodes:
@@ -4338,7 +4394,58 @@ def merge(ui, repo, node=None, **opts):
     with ui.configoverride({("ui", "forcemerge"): opts.get("tool", "")}, "merge"):
         force = opts.get("force")
         labels = ["working copy", "merge rev"]
-        return hg.merge(repo, node, force=force, labels=labels)
+        if not opts.get("noconflict"):
+            return hg.merge(repo, node, force=force, labels=labels)
+        return _noconflictmerge(
+            ui, repo, repo[p1node], repo[node], labels, opts, update=not parents
+        )
+
+
+def _noconflictmerge(ui, repo, p1, p2, labels, opts, update):
+    """Merge `p2` into `p1` in memory and commit the result as a conflict-free
+    merge. With `update` the working copy, which must be clean, is moved to
+    the new commit; otherwise it is left alone."""
+    if not ui.configbool("experimental", "noconflict-merge", default=True):
+        raise error.Abort(
+            _("conflict-free merges are disabled by experimental.noconflict-merge"),
+            hint=_("set experimental.noconflict-merge=true to enable them"),
+        )
+    with repo.wlock(), repo.lock():
+        if update:
+            cmdutil.bailifchanged(repo)
+        if p1 == p2:
+            raise error.Abort(
+                _("cannot create a conflict-free merge of %s with itself") % p1
+            )
+        for ctx in (p1, p2):
+            if ctx.ispublic():
+                raise error.Abort(
+                    _("cannot create a conflict-free merge with public commit %s")
+                    % ctx,
+                    hint=_(
+                        "both parents must be draft; rebase onto the public "
+                        "commit instead"
+                    ),
+                )
+        wctx = mergemod.check_noconflict_merge(
+            repo, p2.node(), force=opts.get("force"), labels=labels, basectx=p1
+        )
+        message = cmdutil.logmessage(repo, opts) or _("Merge %s") % (
+            p2.description().split("\n", 1)[0] or p2
+        )
+        with repo.transaction("merge"):
+            memctx = wctx.tomemctx(
+                message,
+                parents=(p1, p2),
+                date=opts.get("date") or None,
+                user=opts.get("user") or None,
+                extra={mergemod.NOCONFLICT_MERGE_EXTRA: "1"},
+            )
+            newnode = repo.commitctx(memctx)
+        if update:
+            hg.updaterepo(repo, newnode, False)
+    ui.status(_("created conflict-free merge %s\n") % repo[newnode])
+    return 0
 
 
 @command(
@@ -5573,6 +5680,12 @@ def serve(ui, repo, **opts):
         ("g", "git", None, _("use git extended diff format")),
         ("U", "unified", 3, _("number of lines of diff context to show")),
         ("r", "rev", [], _("show the specified revision")),
+        (
+            "t",
+            "mutation",
+            False,
+            _("use mutation history for diffs (EXPERIMENTAL)"),
+        ),
     ]
     + diffwsopts
     + templateopts
@@ -6235,6 +6348,9 @@ def update(
             ),
         )
 
+    if not opts.get("continue"):
+        bookmarks.checkagentpreferredtarget(repo, rev, "goto")
+
     # Suggest `hg prev` as an alternative to 'hg update .^'.
     # internal config: ui.suggesthgprev
     if node == ".^" and ui.configbool("ui", "suggesthgprev", False):
@@ -6253,8 +6369,8 @@ def update(
         else:
             abort_or_reset_mergestate()
 
-        # Either we consumed this with "--continue" or we ignoring it with a
-        # different destination.
+        # Either we consumed this with "--continue" or are replacing it with
+        # a different destination.
         repo.localvfs.tryunlink("updatestate")
 
         cmdutil.checkunfinished(repo, op="goto_clean" if clean else None)
@@ -6267,6 +6383,8 @@ def update(
         else:
             brev = rev
         rev = scmutil.revsingle(repo, rev, rev).rev()
+        if not opts.get("continue"):
+            rewriteutil.gotocheck(repo, [repo[rev]])
 
         repo.ui.setconfig("ui", "forcemerge", tool, "update")
 
@@ -6278,6 +6396,15 @@ def update(
         result = hg.updatetotally(
             ui, repo, rev, brev, clean=clean, updatecheck=updatecheck
         )
+
+        if (
+            ui.configbool("checkout", "show-destination", True)
+            and not ui.plain()
+            and not ui.quiet
+        ):
+            destctx = repo[rev]
+            title = next(iter(destctx.description().splitlines()), "")
+            ui.write(_('checked out %s "%s"\n') % (short(destctx.node()), title))
 
         if merge:
             mergemod.try_conclude_merge_state(repo)

@@ -28,7 +28,6 @@ use manifest::Manifest;
 use maplit::btreeset;
 use metaconfig_types::SparseProfilesConfig;
 use mononoke_types::NonRootMPath;
-use mononoke_types::content_manifest::compat;
 use mononoke_types::path::MPath;
 use pathmatcher::DirectoryMatch;
 use pathmatcher::Matcher;
@@ -51,7 +50,7 @@ use crate::errors::MononokeError;
 // Clients can request analysis either for ALL profiles or Set of interested
 //  1. If client requests exact list of profiles, then `exact_profiles_matcher`
 //     will be used to check for the config changed and profiles will be
-//     located using `changeset::find_files()`
+//     located using `changeset::paths()`
 //  2. If client asks to analyse all profiles - we check the configuration:
 //     a. If list of monitored_profiles is set, then we use
 //        `monitoring_profiles_only_matcher`
@@ -160,21 +159,18 @@ impl SparseProfileMonitoring {
                     .await
             }
             MonitoringProfiles::Exact { profiles } => {
-                let prefixes = profiles
+                let paths = profiles
                     .iter()
-                    .map(|s| MPath::try_from(s.as_bytes()))
+                    .map(|s| NonRootMPath::try_from(s.as_bytes()))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| MononokeError::InvalidRequest(error.to_string()))?;
                 changeset
-                    .find_files(Some(prefixes), None, None, ChangesetFileOrdering::Unordered)
+                    .paths(paths.into_iter().map(MPath::from))
                     .await?
-                    .map(|p| {
-                        p.and_then(|path| {
-                            path.into_optional_non_root_path().ok_or_else(|| {
-                                MononokeError::from(anyhow!(
-                                    "Provided root directory as monitored profile."
-                                ))
-                            })
+                    .try_filter_map(|path| async move {
+                        Ok(match path.is_file().await? {
+                            true => path.path().clone().into_optional_non_root_path(),
+                            false => None,
                         })
                     })
                     .try_collect()
@@ -314,10 +310,9 @@ async fn calculate_size<'a, R: MononokeRepo>(
                     let repo_path = RepoPath::from_utf8(&path_vec)?;
                     match entry {
                         Entry::Leaf(file) => {
-                            let file: compat::ContentManifestFile = file.into();
                             for (source, matcher) in &matchers {
                                 if matcher.matches_file(repo_path)? {
-                                    *sizes.entry(source.to_string()).or_insert(0) += file.size();
+                                    *sizes.entry(source.to_string()).or_insert(0) += file.size;
                                 }
                             }
                         }
@@ -330,17 +325,11 @@ async fn calculate_size<'a, R: MononokeRepo>(
                                             Some(s) => s,
                                             None => {
                                                 let dir = dir_id.load(&ctx, blobstore).await?;
-                                                let s = match &dir {
-                                                    either::Either::Left(cm) => {
-                                                        cm.subentries
-                                                            .rollup_data()
-                                                            .descendant_counts
-                                                            .files_total_size
-                                                    }
-                                                    either::Either::Right(fsnode) => {
-                                                        fsnode.summary().descendant_files_total_size
-                                                    }
-                                                };
+                                                let s = dir
+                                                    .subentries
+                                                    .rollup_data()
+                                                    .descendant_counts
+                                                    .files_total_size;
                                                 total_size = Some(s);
                                                 s
                                             }
@@ -669,5 +658,8 @@ pub enum ProfileSizeChange {
 
 pub enum MonitoringProfiles {
     All,
-    Exact { profiles: Vec<String> },
+    /// Exact paths of the profile files to analyse.
+    Exact {
+        profiles: Vec<String>,
+    },
 }

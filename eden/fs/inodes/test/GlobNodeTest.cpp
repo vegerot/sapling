@@ -8,6 +8,7 @@
 #include "eden/fs/inodes/GlobNode.h"
 #include "eden/fs/utils/GlobResult.h"
 
+#include <algorithm>
 #include <atomic>
 #include <utility>
 
@@ -50,7 +51,7 @@ folly::coro::Task<std::vector<GlobResult>> evaluateGlob(
   auto objectStore = mount.getEdenMount()->getObjectStore();
   auto globResults =
       std::make_shared<folly::Synchronized<std::vector<GlobResult>>>();
-  co_await globRoot.co_evaluate(
+  co_await globRoot.evaluate(
       std::move(objectStore),
       ObjectFetchContext::getNullContext(),
       RelativePathPiece(),
@@ -126,6 +127,12 @@ class GlobNodeTest : public ::testing::TestWithParam<
       folly::StringPiece pattern,
       const RootId& commitId) {
     return doGlob(pattern, false, commitId);
+  }
+
+  void addDotDirectory() {
+    mount_.mkdir(".hidden");
+    mount_.addFile(".hidden/regular.txt", "regular");
+    mount_.addFile(".hidden/.dot", "dot");
   }
 
   bool shouldPrefetch() const {
@@ -208,6 +215,75 @@ TEST_P(GlobNodeTest, starStarRootExcludeDot) {
   auto matches = doGlobExcludeDotFiles("**/root", kZeroRootId);
 
   std::vector<GlobResult> expect;
+  EXPECT_EQ(expect, matches);
+}
+
+TEST_P(GlobNodeTest, starStarStarStarExcludeDot) {
+  addDotDirectory();
+  auto matches = doGlobExcludeDotFiles("**/**", kZeroRootId);
+
+  std::vector<GlobResult> expect{
+      GlobResult("dir"_relpath, dtype_t::Dir, kZeroRootId),
+      GlobResult("dir/a.txt"_relpath, dtype_t::Regular, kZeroRootId),
+      GlobResult("dir/sub"_relpath, dtype_t::Dir, kZeroRootId),
+      GlobResult("dir/sub/b.txt"_relpath, dtype_t::Regular, kZeroRootId),
+  };
+  std::sort(matches.begin(), matches.end());
+  EXPECT_EQ(expect, matches);
+}
+
+TEST_P(GlobNodeTest, qmarkExcludeDot) {
+  auto matches = doGlobExcludeDotFiles("?watchmanconfig", kZeroRootId);
+
+  std::vector<GlobResult> expect;
+  EXPECT_EQ(expect, matches);
+}
+
+TEST_P(GlobNodeTest, dotDirectoryStarExcludeDot) {
+  addDotDirectory();
+  auto matches = doGlobExcludeDotFiles(".hidden/*", kZeroRootId);
+
+  std::vector<GlobResult> expect{
+      GlobResult(".hidden/regular.txt"_relpath, dtype_t::Regular, kZeroRootId)};
+  EXPECT_EQ(expect, matches);
+}
+
+TEST_P(GlobNodeTest, dotDirectoryStarStarExcludeDot) {
+  addDotDirectory();
+  auto matches = doGlobExcludeDotFiles(".hidden/**", kZeroRootId);
+
+  std::vector<GlobResult> expect{
+      GlobResult(".hidden/regular.txt"_relpath, dtype_t::Regular, kZeroRootId)};
+  EXPECT_EQ(expect, matches);
+}
+
+TEST_P(GlobNodeTest, dotDirectoryQmarkExcludeDot) {
+  addDotDirectory();
+  auto matches = doGlobExcludeDotFiles(".hidden/?dot", kZeroRootId);
+
+  std::vector<GlobResult> expect;
+  EXPECT_EQ(expect, matches);
+}
+
+TEST_P(GlobNodeTest, dotDirectoryRecursiveTxtExcludeDot) {
+  addDotDirectory();
+  auto matches = doGlobExcludeDotFiles("**/*.txt", kZeroRootId);
+
+  std::vector<GlobResult> expect{
+      GlobResult("dir/a.txt"_relpath, dtype_t::Regular, kZeroRootId),
+      GlobResult("dir/sub/b.txt"_relpath, dtype_t::Regular, kZeroRootId),
+  };
+  EXPECT_EQ(expect, matches);
+}
+
+TEST_P(GlobNodeTest, dotDirectoryStarIncludeDot) {
+  addDotDirectory();
+  auto matches = doGlobIncludeDotFiles(".hidden/*", kZeroRootId);
+
+  std::vector<GlobResult> expect{
+      GlobResult(".hidden/.dot"_relpath, dtype_t::Regular, kZeroRootId),
+      GlobResult(".hidden/regular.txt"_relpath, dtype_t::Regular, kZeroRootId),
+  };
   EXPECT_EQ(expect, matches);
 }
 
@@ -376,7 +452,7 @@ folly::coro::Task<void> co_runGlobEvaluation(
     const RootId& commitId,
     folly::Try<folly::Unit>& evalResult,
     std::atomic<bool>& evalDone) {
-  evalResult = co_await folly::coro::co_awaitTry(globRoot.co_evaluate(
+  evalResult = co_await folly::coro::co_awaitTry(globRoot.evaluate(
       std::move(objectStore),
       ObjectFetchContext::getNullContext(),
       RelativePathPiece(),
@@ -445,8 +521,13 @@ CO_TEST(GlobNodeTest, treeLoadError) {
   builder.setReady("dir");
   builder.setReady("dir/a");
 
+  // Disable async rescheduling of the recursive descent: the fault-injection
+  // choreography below assumes subtree loads are requested synchronously, so
+  // that the dir/a/b load is already pending when the error is triggered.
   GlobNode globRoot(
-      /*includeDotfiles=*/false, mount.getConfig()->getCaseSensitive());
+      /*includeDotfiles=*/false,
+      mount.getConfig()->getCaseSensitive(),
+      /*recursiveAsyncDepth=*/0);
   globRoot.parse("dir/**/a.txt");
 
   auto rootInode = mount.getTreeInode(RelativePathPiece());

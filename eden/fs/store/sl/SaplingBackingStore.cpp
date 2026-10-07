@@ -59,6 +59,7 @@
 #endif
 #ifdef EDEN_HAVE_OBC
 #include "common/network/Hostname.h"
+#include "eden/fs/facebook/NormalizedHostname.h"
 #endif
 
 DEFINE_bool(
@@ -139,64 +140,6 @@ void reportPrefetchStats(
   }
 }
 
-/**
- * Aggregate per-origin blob counts/bytes from a completed prefetch and feed
- * them to the stats context. Shared by the futures and coroutine fallback
- * paths of prefetchBlobs so the two implementations cannot drift.
- *
- * Origin attribution here is best-effort: the import queue currently labels
- * every queued blob fetch FromNetworkFetch (per-request origin is not plumbed
- * through SaplingImportRequest), so warm-cache prefetches over-attribute to
- * network on this path. The prefetch-optimizations path reports accurate
- * local/remote splits via reportPrefetchStats instead.
- */
-void aggregatePrefetchBlobStats(
-    const ObjectFetchContextPtr& context,
-    const std::vector<BackingStore::GetBlobResult>& results) {
-  auto* statsCtx = dynamic_cast<StatsFetchContext*>(context.get());
-  if (!statsCtx || !statsCtx->shouldCollectStats()) {
-    return;
-  }
-
-  // Aggregate blob stats by origin for efficient batch reporting.
-  uint64_t counts[ObjectFetchContext::kOriginEnumMax] = {};
-  uint64_t bytes[ObjectFetchContext::kOriginEnumMax] = {};
-  size_t missingBlobCount = 0;
-
-  for (auto& blobResult : results) {
-    if (!blobResult.blob) {
-      ++missingBlobCount;
-      continue;
-    }
-    auto origin = blobResult.origin;
-    if (origin < ObjectFetchContext::kOriginEnumMax) {
-      counts[origin]++;
-      bytes[origin] += blobResult.blob->getSize();
-    }
-  }
-
-  if (missingBlobCount > 0) {
-    // Logged once for the whole batch rather than per-blob: a single
-    // problematic prefetch glob can otherwise flood the log with one line
-    // per missing blob.
-    XLOGF(
-        ERR,
-        "prefetch stats unavailable for {} of {} blobs: no blob in result",
-        missingBlobCount,
-        results.size());
-  }
-
-  for (unsigned o = 0; o < ObjectFetchContext::kOriginEnumMax; ++o) {
-    if (counts[o] > 0) {
-      statsCtx->didFetchBatch(
-          ObjectFetchContext::Blob,
-          static_cast<ObjectFetchContext::Origin>(o),
-          counts[o],
-          bytes[o]);
-    }
-  }
-}
-
 } // namespace
 
 HgImportTraceEvent::HgImportTraceEvent(
@@ -258,7 +201,8 @@ SaplingBackingStore::SaplingBackingStore(
               rust::Str{
                   clientDirectory.view().data(),
                   clientDirectory.view().size()},
-              config_->getEdenConfig()->backingstoreWalkMode.getValue())
+              config_->getEdenConfig()->backingstoreWalkMode.getValue(),
+              edenFsEventsLogger_)
               .into_raw(),
           [](sapling::BackingStore* backingStore) {
             auto box = rust::Box<sapling::BackingStore>::from_raw(backingStore);
@@ -335,7 +279,8 @@ SaplingBackingStore::SaplingBackingStore(
               rust::Str{
                   clientDirectory.view().data(),
                   clientDirectory.view().size()},
-              config_->getEdenConfig()->backingstoreWalkMode.getValue())
+              config_->getEdenConfig()->backingstoreWalkMode.getValue(),
+              edenFsEventsLogger_)
               .into_raw(),
           [](sapling::BackingStore* backingStore) {
             auto box = rust::Box<sapling::BackingStore>::from_raw(backingStore);
@@ -384,6 +329,9 @@ SaplingBackingStore::~SaplingBackingStore() {
 void SaplingBackingStore::initializeOBCCounters() {
   // Get the hostname without the ".facebook.com" suffix
   auto hostname = facebook::network::getLocalHost(/*stripFbDomain=*/true);
+  if (config_->getEdenConfig()->aggregateContainerOdsHostnames.getValue()) {
+    hostname = detail::getOdsHostname(hostname);
+  }
   getBlobPerRepoLatencies_ = monitoring::OBCP99P95P50(
       monitoring::OdsCategoryId::ODS_EDEN,
       fmt::format("eden.store.sapling.fetch_blob_{}_us", repoName_),
@@ -605,7 +553,7 @@ folly::Try<BlobPtr> SaplingBackingStore::getBlobFromBackingStore(
   }
 
   if (result.data != nullptr) {
-    if (context->getCause() != FetchCause::Prefetch) {
+    if (ObjectFetchContext::shouldTriggerWalkDetection(context->getCause())) {
       sapling_backingstore_witness_file_read(
           *store_.get(),
           rust::Str{path.view().data(), path.view().size()},
@@ -1598,7 +1546,8 @@ folly::Try<facebook::eden::TreePtr> SaplingBackingStore::getNativeTree(
 
     facebook::eden::TreePtr tree = tb.build();
 
-    if (tree && context->getCause() != FetchCause::Prefetch) {
+    if (tree &&
+        ObjectFetchContext::shouldTriggerWalkDetection(context->getCause())) {
       sapling_backingstore_witness_dir_read(
           *store_.get(),
           rust::Slice<const uint8_t>{
@@ -1787,39 +1736,6 @@ SaplingBackingStore::co_getBlobEnqueue(
   }
 }
 
-folly::SemiFuture<BackingStore::GetBlobAuxResult>
-SaplingBackingStore::getBlobAuxData(
-    const ObjectId& id,
-    const ObjectFetchContextPtr& context) {
-  // DEPRECATED: use co_getBlobAuxData directly. Kept only because
-  // ObjectStore::getBlobAuxDataImpl and FilteredBackingStore::getBlobAuxData
-  // still consume ImmediateFuture chains;
-  // delete once those paths are migrated to coroutines.
-  DurationScope<EdenStats> scope{
-      stats_, &SaplingBackingStoreStats::getBlobAuxData};
-
-  SlOidView slOid{id};
-
-  logBackingStoreFetch(
-      *context,
-      folly::Range{&slOid, 1},
-      ObjectFetchContext::ObjectType::BlobAuxData);
-
-  auto auxData = getLocalBlobAuxData(slOid);
-  if (auxData.hasValue() && auxData.value()) {
-    stats_->increment(&SaplingBackingStoreStats::fetchBlobAuxDataSuccess);
-    stats_->increment(&SaplingBackingStoreStats::fetchBlobAuxDataLocal);
-    return folly::makeSemiFuture(
-        GetBlobAuxResult{
-            std::move(auxData.value()),
-            ObjectFetchContext::Origin::FromDiskCache});
-  }
-
-  return getBlobAuxDataEnqueue(slOid, context)
-      .ensure([scope = std::move(scope)] {})
-      .semi();
-}
-
 folly::coro::now_task<BackingStore::GetBlobAuxResult>
 SaplingBackingStore::co_getBlobAuxData(
     const ObjectId& id,
@@ -1899,66 +1815,6 @@ SaplingBackingStore::co_getBlobAuxDataEnqueue(
       std::move(result).value(), ObjectFetchContext::Origin::FromNetworkFetch};
 }
 
-ImmediateFuture<BackingStore::GetBlobAuxResult>
-SaplingBackingStore::getBlobAuxDataEnqueue(
-    const SlOid& slOid,
-    const ObjectFetchContextPtr& context) {
-  // DEPRECATED: use co_getBlobAuxDataEnqueue directly. Kept only because
-  // SaplingBackingStore::getBlobAuxData and EdenServiceHandler
-  // still consume ImmediateFuture chains;
-  // delete once those paths are migrated to coroutines.
-  if (!config_->getEdenConfig()->fetchHgAuxMetadata.getValue()) {
-    return BackingStore::GetBlobAuxResult{
-        nullptr, ObjectFetchContext::Origin::NotFetched};
-  }
-
-  auto self = shared_from_this();
-  auto getBlobAuxFuture = makeImmediateFutureWith([&] {
-    XLOGF(DBG4, "making blob meta import request for {}", slOid);
-    auto requestContext = context.copy();
-    auto request =
-        SaplingImportRequest::makeBlobAuxImportRequest(slOid, requestContext);
-    auto unique = request->getUnique();
-
-    auto importTracker = std::make_unique<RequestMetricsScope>(
-        &self->pendingImportBlobAuxWatches_);
-    self->traceBus_->publish(
-        HgImportTraceEvent::queue(
-            unique,
-            HgImportTraceEvent::BLOB_AUX,
-            slOid,
-            context->getPriority().getClass(),
-            context->getCause(),
-            context->getClientPid()));
-
-    return self->queue_.enqueueBlobAux(std::move(request))
-        .ensure([self,
-                 unique,
-                 slOid,
-                 context = context.copy(),
-                 importTracker = std::move(importTracker)]() {
-          self->traceBus_->publish(
-              HgImportTraceEvent::finish(
-                  unique,
-                  HgImportTraceEvent::BLOB_AUX,
-                  slOid,
-                  context->getPriority().getClass(),
-                  context->getCause(),
-                  context->getClientPid(),
-                  context->getFetchedSource()));
-        });
-  });
-
-  return std::move(getBlobAuxFuture)
-      .thenTry([self, slOid](folly::Try<BlobAuxDataPtr>&& result) {
-        self->queue_.markImportAsFinished<BlobAuxDataPtr::element_type>(
-            slOid, result);
-        auto blobAux = std::move(result).value();
-        return GetBlobAuxResult{
-            std::move(blobAux), ObjectFetchContext::Origin::FromNetworkFetch};
-      });
-}
-
 folly::Try<BlobAuxDataPtr> SaplingBackingStore::getLocalBlobAuxData(
     SlOidView slOid) {
   auto node = slOid.node();
@@ -1984,25 +1840,6 @@ folly::Try<BlobAuxDataPtr> SaplingBackingStore::getLocalBlobAuxData(
   } else {
     return GetBlobAuxDataResult{nullptr};
   }
-}
-
-ImmediateFuture<BackingStore::GetRootTreeResult>
-SaplingBackingStore::getRootTree(
-    const RootId& rootId,
-    const ObjectFetchContextPtr& context) {
-  return ImmediateFuture{
-      // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
-      folly::coro::co_withExecutor(
-          folly::getKeepAliveToken(serverThreadPool_),
-          folly::coro::co_invoke(
-              [self = shared_from_this()](auto rootId, auto context)
-                  -> folly::coro::Task<GetRootTreeResult> {
-                co_return co_await self->co_getRootTree(
-                    std::move(rootId), std::move(context));
-              },
-              RootId{rootId},
-              context.copy()))
-          .start()};
 }
 
 folly::coro::now_task<BackingStore::GetRootTreeResult>
@@ -2225,9 +2062,6 @@ folly::SemiFuture<folly::Unit> SaplingBackingStore::prefetchBlobs(
 folly::coro::now_task<folly::Unit> SaplingBackingStore::co_prefetchBlobs(
     ObjectIdRange ids,
     const ObjectFetchContextPtr& context) {
-  bool prefetchOptimizations =
-      config_->getEdenConfig()->prefetchOptimizations.getValue();
-
   std::vector<SlOidView> slOids;
   slOids.reserve(ids.size());
   for (const auto& id : ids) {
@@ -2243,85 +2077,62 @@ folly::coro::now_task<folly::Unit> SaplingBackingStore::co_prefetchBlobs(
       folly::Range{slOids.data(), slOids.size()},
       ObjectFetchContext::ObjectType::Blob);
 
-  if (prefetchOptimizations &&
-      config_->getEdenConfig()->ignorePrefetchResult.getValue()) {
-    std::vector<sapling::SaplingRequest> requests;
-    requests.reserve(ids.size());
-    for (size_t i = 0; i < ids.size(); i++) {
-      requests.emplace_back(slOids[i], context->getCause(), context.copy());
-    }
-
-    co_await folly::coro::co_reschedule_on_current_executor;
-
-    auto importTracker = RequestMetricsScope{&pendingImportPrefetchWatches_};
-
-    auto unique = generateUniqueID();
-    traceBus_->publish(
-        HgImportTraceEvent::start(
-            unique,
-            HgImportTraceEvent::BLOB_BATCH,
-            slOids[0],
-            context->getPriority().getClass(),
-            context->getCause(),
-            context->getClientPid()));
-
-    folly::stop_watch<std::chrono::milliseconds> watch;
-    XLOGF(DBG4, "Batch fetching {} blobs from Sapling", requests.size());
-
-    size_t failureCount = 0;
-    auto fetchStats = nativeGetBlobBatch(
-        folly::range(requests),
-        sapling::FetchMode::AllowRemote,
-        true, // IGNORE_RESULT
-        [&](size_t index, folly::Try<std::unique_ptr<folly::IOBuf>> content) {
-          if (content.hasException()) {
-            failureCount++;
-            XLOGF(
-                ERR,
-                "Failed to batch import {} from Sapling: {}",
-                requests[index].oid,
-                content.exception().what().toStdString());
-          }
-        });
-    reportPrefetchStats(context, fetchStats, /*totalBytes=*/0, failureCount);
-
-    traceBus_->publish(
-        HgImportTraceEvent::finish(
-            unique,
-            HgImportTraceEvent::BLOB_BATCH,
-            slOids[0],
-            context->getPriority().getClass(),
-            context->getCause(),
-            context->getClientPid(),
-            context->getFetchedSource()));
-
-    stats_->increment(
-        &SaplingBackingStoreStats::prefetchBlobFailure, failureCount);
-    stats_->increment(
-        &SaplingBackingStoreStats::prefetchBlobSuccess,
-        requests.size() - failureCount);
-    stats_->addDuration(
-        &SaplingBackingStoreStats::prefetchBlob, watch.elapsed());
-  } else {
-    std::vector<folly::coro::Task<GetBlobResult>> tasks;
-    tasks.reserve(ids.size());
-
-    for (size_t i = 0; i < ids.size(); i++) {
-      tasks.emplace_back(
-          folly::coro::co_invoke(
-              [this](SlOid slOid, ObjectFetchContextPtr ctx)
-                  -> folly::coro::Task<GetBlobResult> {
-                co_return co_await co_getBlobEnqueue(
-                    slOid, ctx, SaplingImportRequest::FetchType::Prefetch);
-              },
-              SlOid{slOids[i]},
-              context.copy()));
-    }
-
-    auto results = co_await folly::coro::collectAllRange(std::move(tasks));
-    // Keep stats behavior identical to the futures fallback path above.
-    aggregatePrefetchBlobStats(context, results);
+  std::vector<sapling::SaplingRequest> requests;
+  requests.reserve(ids.size());
+  for (size_t i = 0; i < ids.size(); i++) {
+    requests.emplace_back(slOids[i], context->getCause(), context.copy());
   }
+
+  co_await folly::coro::co_reschedule_on_current_executor;
+
+  auto importTracker = RequestMetricsScope{&pendingImportPrefetchWatches_};
+
+  auto unique = generateUniqueID();
+  traceBus_->publish(
+      HgImportTraceEvent::start(
+          unique,
+          HgImportTraceEvent::BLOB_BATCH,
+          slOids[0],
+          context->getPriority().getClass(),
+          context->getCause(),
+          context->getClientPid()));
+
+  folly::stop_watch<std::chrono::milliseconds> watch;
+  XLOGF(DBG4, "Batch fetching {} blobs from Sapling", requests.size());
+
+  size_t failureCount = 0;
+  auto fetchStats = nativeGetBlobBatch(
+      folly::range(requests),
+      sapling::FetchMode::AllowRemote,
+      true, // IGNORE_RESULT
+      [&](size_t index, folly::Try<std::unique_ptr<folly::IOBuf>> content) {
+        if (content.hasException()) {
+          failureCount++;
+          XLOGF(
+              ERR,
+              "Failed to batch import {} from Sapling: {}",
+              requests[index].oid,
+              content.exception().what().toStdString());
+        }
+      });
+  reportPrefetchStats(context, fetchStats, /*totalBytes=*/0, failureCount);
+
+  traceBus_->publish(
+      HgImportTraceEvent::finish(
+          unique,
+          HgImportTraceEvent::BLOB_BATCH,
+          slOids[0],
+          context->getPriority().getClass(),
+          context->getCause(),
+          context->getClientPid(),
+          context->getFetchedSource()));
+
+  stats_->increment(
+      &SaplingBackingStoreStats::prefetchBlobFailure, failureCount);
+  stats_->increment(
+      &SaplingBackingStoreStats::prefetchBlobSuccess,
+      requests.size() - failureCount);
+  stats_->addDuration(&SaplingBackingStoreStats::prefetchBlob, watch.elapsed());
   co_return folly::unit;
 }
 
@@ -2355,7 +2166,7 @@ sapling::BatchFetchStats SaplingBackingStore::nativeGetBlobBatch(
             request.context->getClientPid().valueOrZero().get(),
         });
 
-    if (request.cause != FetchCause::Prefetch) {
+    if (ObjectFetchContext::shouldTriggerWalkDetection(request.cause)) {
       sapling_backingstore_witness_file_read(
           *store_.get(),
           rust::Str{
@@ -2373,91 +2184,6 @@ sapling::BatchFetchStats SaplingBackingStore::nativeGetBlobBatch(
       fetch_mode,
       allow_ignore_result,
       std::move(resolver));
-}
-
-ImmediateFuture<BackingStore::GetGlobFilesResult>
-SaplingBackingStore::getGlobFiles(
-    const RootId& id,
-    const std::vector<std::string>& suffixes,
-    const std::vector<std::string>& prefixes) {
-  folly::stop_watch<std::chrono::milliseconds> watch;
-  using GetGlobFilesResult = folly::Try<GetGlobFilesResult>;
-
-  rust::Vec<rust::String> rust_suffixes;
-  rust::Vec<rust::String> rust_prefixes;
-  std::copy(
-      suffixes.begin(), suffixes.end(), std::back_inserter(rust_suffixes));
-  std::copy(
-      prefixes.begin(), prefixes.end(), std::back_inserter(rust_prefixes));
-
-  auto br = folly::ByteRange(id.value());
-  auto result = sapling_backingstore_get_glob_files(
-      *store_.get(),
-      rust::Slice<const uint8_t>{br.data(), br.size()},
-      rust_suffixes,
-      rust_prefixes);
-
-  if (result.error != nullptr) {
-    stats_->increment(&SaplingBackingStoreStats::fetchGlobFilesFailure);
-    return GetGlobFilesResult{std::move(*result.error)};
-  }
-
-  XCHECK(
-      result.data.get(),
-      "sapling_backingstore_get_glob_files returned a nullptr as data result, but did not return an error.");
-
-  std::vector<std::string> files;
-  files.reserve(result.data->files.size());
-  for (auto& file : result.data->files) {
-    files.emplace_back(file);
-  }
-  stats_->addDuration(
-      &SaplingBackingStoreStats::fetchGlobFiles, watch.elapsed());
-  stats_->increment(&SaplingBackingStoreStats::fetchGlobFilesSuccess);
-
-  return GetGlobFilesResult{BackingStore::GetGlobFilesResult{files, id}};
-}
-
-folly::coro::now_task<BackingStore::GetGlobFilesResult>
-SaplingBackingStore::co_getGlobFiles(
-    const RootId& id,
-    const std::vector<std::string>& suffixes,
-    const std::vector<std::string>& prefixes) {
-  folly::stop_watch<std::chrono::milliseconds> watch;
-
-  rust::Vec<rust::String> rust_suffixes;
-  rust::Vec<rust::String> rust_prefixes;
-  std::copy(
-      suffixes.begin(), suffixes.end(), std::back_inserter(rust_suffixes));
-  std::copy(
-      prefixes.begin(), prefixes.end(), std::back_inserter(rust_prefixes));
-
-  auto br = folly::ByteRange(id.value());
-  auto result = sapling_backingstore_get_glob_files(
-      *store_.get(),
-      rust::Slice<const uint8_t>{br.data(), br.size()},
-      rust_suffixes,
-      rust_prefixes);
-
-  if (result.error != nullptr) {
-    stats_->increment(&SaplingBackingStoreStats::fetchGlobFilesFailure);
-    throw std::move(*result.error);
-  }
-
-  XCHECK(
-      result.data.get(),
-      "sapling_backingstore_get_glob_files returned a nullptr as data result, but did not return an error.");
-
-  std::vector<std::string> files;
-  files.reserve(result.data->files.size());
-  for (auto& file : result.data->files) {
-    files.emplace_back(file);
-  }
-  stats_->addDuration(
-      &SaplingBackingStoreStats::fetchGlobFiles, watch.elapsed());
-  stats_->increment(&SaplingBackingStoreStats::fetchGlobFilesSuccess);
-
-  co_return BackingStore::GetGlobFilesResult{std::move(files), id};
 }
 
 ImmediateFuture<bool> SaplingBackingStore::checkPermission(
@@ -2567,7 +2293,7 @@ void SaplingBackingStore::logBackingStoreFetch(
 
   if (type != ObjectFetchContext::ObjectType::Tree &&
       isRecordingFetch_.load(std::memory_order_relaxed) &&
-      context.getCause() != ObjectFetchContext::Cause::Prefetch) {
+      ObjectFetchContext::shouldTriggerWalkDetection(context.getCause())) {
     auto guard = fetchedFilePaths_.wlock();
     for (auto& slOid : slOids) {
       guard->emplace(slOid.path().view());
@@ -2788,6 +2514,21 @@ ObjectId SaplingBackingStore::stripObjectId(const ObjectId& id) const {
 void SaplingBackingStore::flush() {
   XLOG(DBG7, "Flushing backing store");
   sapling_backingstore_flush(*store_.get());
+}
+
+folly::Expected<sapling::HgCacheStats, std::string>
+SaplingBackingStore::getCacheStats() const {
+  auto result = sapling::sapling_backingstore_get_cache_stats(*store_.get());
+  if (result.error != nullptr) {
+    return folly::makeUnexpected(std::string(result.error->what()));
+  }
+  if (!result.data) {
+    // The FFI contract always pairs a null error with non-null data; this
+    // is defensive against that contract changing underneath us.
+    return folly::makeUnexpected(
+        std::string("cache stats lookup returned no data and no error"));
+  }
+  return *result.data;
 }
 
 bool SaplingBackingStore::dogfoodingHost() {

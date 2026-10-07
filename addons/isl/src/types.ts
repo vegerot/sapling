@@ -5,6 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {FailedOperationContext} from './failureInvestigation';
+
 import type {TypeaheadResult} from 'isl-components/Types';
 import type {TrackEventName} from 'isl-server/src/analytics/eventNames';
 import type {TrackDataWithEventName} from 'isl-server/src/analytics/types';
@@ -33,7 +35,9 @@ export type PlatformName =
   | 'chromelike_app'
   | 'visualStudio'
   | 'obsidian'
+  | 'vscode-agents'
   | 'agentHome'
+  | 'agentCloud'
   | 'tui';
 
 export type AbsolutePath = string;
@@ -71,6 +75,25 @@ export type DiffId = string;
  * Short info about a Diff fetched in bulk for all diffs to render an overview
  */
 export type DiffSummary = GitHubDiffSummary | InternalTypes['PhabricatorDiffSummary'];
+
+/**
+ * Summaries from a fetch, or the error that kept some from arriving.
+ *
+ * `diffIds`, when the provider knows it, is every diff the summaries answer for, including any the
+ * response left out. `failures`, from a provider that tracks failures per diff, is its complete
+ * current set of diffs whose newest fetch failed, grouped by error; it replaces whatever was known
+ * before. Without it, an error speaks for every diff until the next summaries arrive.
+ */
+export type DiffSummariesResult<S extends DiffSummary = DiffSummary> = (
+  | {value: Map<DiffId, S>; error?: undefined; diffIds?: Array<DiffId>}
+  | {value?: undefined; error: Error}
+) & {failures?: Array<DiffSummaryFailure>};
+
+/**
+ * Diffs that failed with the same error. Grouped because the serializer does not share references:
+ * a batch's error, repeated once per diff, would cross the wire once per diff, stack and all.
+ */
+export type DiffSummaryFailure = {error: Error; diffIds: Array<DiffId>};
 
 export type DiffCommentReaction = {
   name: string;
@@ -298,12 +321,15 @@ export type WorktreeEntry = {
   label?: string;
   /** Whether this is the main (original) worktree. */
   role: 'main' | 'linked';
+  /** Hash checked out (`.`) in this worktree, best-effort. Absent if it couldn't be read. */
+  node?: Hash;
 };
 
 export type ApplicationInfo = {
   platformName: string;
   version: string;
-  logFilePath: string;
+  logFilePath?: string;
+  isBasecamp?: boolean;
 };
 
 /**
@@ -375,9 +401,16 @@ export type StableInfo = {
   date: Date;
 };
 
+export type SlocDelta = {
+  /** Significant lines of code added */
+  insertions: number;
+  /** Significant lines of code removed */
+  deletions: number;
+};
+
 export type SlocInfo = {
   /** Significant lines of code for commit */
-  sloc: number | undefined;
+  sloc: SlocDelta | undefined;
 };
 
 export type CommitInfo = {
@@ -765,6 +798,7 @@ export type PlatformSpecificClientToServerMessages =
   | {type: 'platform/revealInExplorerView'; path: RepoRelativePath}
   | {type: 'platform/openDiff'; path: RepoRelativePath; comparison: Comparison}
   | {type: 'platform/openFileAtRevset'; path: RepoRelativePath; revset: string}
+  | {type: 'platform/openPreview'; path: RepoRelativePath}
   | {type: 'platform/openExternal'; url: string}
   | {type: 'platform/openInNewWindow'; path: AbsolutePath}
   | {type: 'platform/openFolder'; path: AbsolutePath}
@@ -787,6 +821,10 @@ export type PlatformSpecificClientToServerMessages =
       scope: 'workspace' | 'global';
     }
   | {type: 'platform/checkForDiagnostics'; paths: Array<RepoRelativePath>}
+  | {
+      type: 'platform/investigateFailure';
+      failure: FailedOperationContext;
+    }
   | {type: 'platform/executeVSCodeCommand'; command: string; args: Array<Json>}
   | {type: 'platform/subscribeToVSCodeConfig'; config: string}
   | {
@@ -934,6 +972,8 @@ export const allConfigNames = [
   'isl.hold-off-refresh-ms',
   'isl.sl-progress-enabled',
   'isl.use-sl-graphql',
+  'isl.use-in-process-graphql',
+  'isl.diff-summaries-batch-size',
   'github.preferred_submit_command',
   'isl.open-file-cmd',
   'isl.generated-files-regex',
@@ -942,9 +982,11 @@ export const allConfigNames = [
   'fbcodereview.code-browser-url',
   'extensions.commitcloud',
   'isl.show-authored-diffs',
+  'isl.show-ai-reviewing-badge',
   'isl.auto-detect-commit-schema',
   'isl.focus-dot-on-repo-change',
   'isl.keyboard-shortcut-overrides',
+  'isl.click-to-open-diff-view',
 ] as const;
 
 /** sl configs read by ISL */
@@ -977,9 +1019,11 @@ export const settableConfigNames = [
   'ui.merge',
   'amend.autorestack',
   'isl.show-authored-diffs',
+  'isl.show-ai-reviewing-badge',
   'worktree.enabled',
   // Pure data (a map of command name -> [modifiers, keyCode]); no code-execution risk.
   'isl.keyboard-shortcut-overrides',
+  'isl.click-to-open-diff-view',
 ] as const;
 
 /** sl configs written to by ISL */
@@ -1018,7 +1062,11 @@ export type LocalStorageName =
   | 'isl.smart-actions-order'
   | 'isl.ai-code-review-selected-option'
   | 'isl.focus-mode'
+  | 'isl.scroll-to-you-are-here-on-open'
+  | 'isl.disable-unsaved-files-warning'
+  | 'isl.show-worktree-labels'
   // The keys below are prefixes, with further dynamic keys appended afterwards
+  | 'isl.recommended-bookmarks:'
   | 'isl.edited-commit-messages:'
   | 'isl.first-pass-comments:';
 
@@ -1026,6 +1074,7 @@ export type ClientToServerMessage =
   | {type: 'heartbeat'; id: string}
   | {type: 'stress'; id: number; time: number; message: string}
   | {type: 'refresh'}
+  | {type: 'refreshWorktreeInfo'}
   | {type: 'clientReady'}
   | {type: 'getConfig'; name: ConfigName}
   | {type: 'setConfig'; name: SettableConfigName; value: string}
@@ -1054,7 +1103,12 @@ export type ClientToServerMessage =
   | {type: 'requestMissedOperationProgress'; operationId: string}
   | {type: 'fetchAvatars'; authors: Array<string>}
   | {type: 'fetchCommitCloudState'}
-  | {type: 'fetchDiffSummaries'; diffIds?: Array<DiffId>}
+  /**
+   * `partial` says `diffIds` names diffs of interest — the commit that just got selected, say —
+   * rather than describing every diff on screen. Leave it off if `diffIds` is the whole smartlog;
+   * a server that remembers what to refetch later reads the unqualified form as the smartlog.
+   */
+  | {type: 'fetchDiffSummaries'; diffIds?: Array<DiffId>; partial?: boolean}
   | {type: 'fetchDiffComments'; diffId: DiffId}
   | {type: 'fetchLandInfo'; topOfStack: DiffId}
   | {type: 'fetchAndSetStables'; additionalStables: Array<string>}
@@ -1224,13 +1278,17 @@ export type ServerToClientMessage =
   | {type: 'repoInfo'; info: RepoInfo; cwd?: string}
   | {type: 'repoError'; error: RepositoryError | undefined}
   | {type: 'fetchedAvatars'; avatars: Map<string, string>; authors: Array<string>}
-  | {type: 'fetchedDiffSummaries'; summaries: Result<Map<DiffId, DiffSummary>>}
+  | {type: 'fetchedDiffSummaries'; summaries: DiffSummariesResult}
   | {type: 'fetchedDiffComments'; diffId: DiffId; comments: Result<Array<DiffComment>>}
   | {type: 'fetchedLandInfo'; topOfStack: DiffId; landInfo: Result<LandInfo>}
   | {type: 'confirmedLand'; result: Result<undefined>}
   | {type: 'fetchedCommitCloudState'; state: Result<CommitCloudSyncState>}
   | {type: 'fetchedStables'; stables: StableLocationData}
-  | {type: 'fetchedRecommendedBookmarks'; bookmarks: Array<string>}
+  | {
+      type: 'fetchedRecommendedBookmarks';
+      repoRoot: AbsolutePath;
+      bookmarks: Array<string>;
+    }
   | {
       type: 'fetchedHiddenMasterBranchConfig';
       config: Record<string, Array<string>> | null;
@@ -1282,19 +1340,19 @@ export type ServerToClientMessage =
   | {
       type: 'fetchedSignificantLinesOfCode';
       hash: Hash;
-      result: Result<number>;
+      result: Result<SlocDelta>;
     }
   | {
       type: 'fetchedPendingSignificantLinesOfCode';
       requestId: number;
       hash: Hash;
-      result: Result<number>;
+      result: Result<SlocDelta>;
     }
   | {
       type: 'fetchedPendingAmendSignificantLinesOfCode';
       requestId: number;
       hash: Hash;
-      result: Result<number>;
+      result: Result<SlocDelta>;
     }
   | {
       type: 'fetchedGkDetails';

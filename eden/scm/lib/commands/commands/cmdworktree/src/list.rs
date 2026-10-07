@@ -13,12 +13,9 @@ use cmdutil::get_formatter;
 use formatter::FormatOptions;
 use formatter::Formattable;
 use formatter::StyleWrite;
-use fs_err as fs;
 use repo::repo::Repo;
 use serde::Serialize;
-use workingcopy::workingcopy::WorkingCopy;
-use worktree::dissolve_group;
-use worktree::with_registry_lock;
+use worktree::Worktrees;
 
 use crate::WorktreeOpts;
 
@@ -53,7 +50,7 @@ impl Formattable for ListOutputEntry {
     }
 }
 
-pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, _wc: &WorkingCopy) -> Result<u8> {
+pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, worktrees: &Worktrees) -> Result<u8> {
     let mut formatter = get_formatter(
         repo.config(),
         "worktree",
@@ -71,73 +68,22 @@ pub(crate) fn run(ctx: &ReqCtx<WorktreeOpts>, repo: &Repo, _wc: &WorkingCopy) ->
         Ok(())
     };
 
-    let shared_store_path = repo.store_path();
-    let current = util::path::strip_unc_prefix(fs::canonicalize(repo.path())?);
-
-    let entries = with_registry_lock(shared_store_path, |registry| {
-        let Some(group_id) = registry.find_group_for_path(&current) else {
-            return Ok(None);
-        };
-
-        let group = registry
-            .groups
-            .get(&group_id)
-            .expect("group must exist after find_group_for_path");
-
-        if !group.main.exists() {
-            dissolve_group(registry, &group_id);
-            return Ok(None);
-        }
-
-        let has_missing = group.worktrees.keys().any(|p| !p.exists());
-        if has_missing {
-            let group = registry
-                .groups
-                .get_mut(&group_id)
-                .expect("group must exist: not dissolved when main is present");
-            group.worktrees.retain(|path, _| path.exists());
-            let linked_count = group.worktrees.keys().filter(|p| **p != group.main).count();
-            if linked_count == 0 {
-                dissolve_group(registry, &group_id);
-                return Ok(None);
-            }
-        }
-
-        let group = registry
-            .groups
-            .get(&group_id)
-            .expect("group must exist: not dissolved when linked worktrees remain");
-        let entries: Vec<ListOutputEntry> = group
-            .worktrees
-            .iter()
-            .map(|(path, entry)| {
-                let role = if *path == group.main {
-                    "main"
-                } else {
-                    "linked"
-                };
-                ListOutputEntry {
-                    path: path.clone(),
-                    role,
-                    label: entry.label.clone(),
-                    current: *path == current,
-                }
-            })
-            .collect();
-
-        Ok(Some(entries))
-    })?;
-
-    match entries {
-        None => output_empty(&mut formatter)?,
-        Some(entries) => {
-            formatter.begin_list()?;
-            for entry in &entries {
-                formatter.format_item(entry)?;
-            }
-            formatter.end_list()?;
-        }
+    let entries = worktrees.list()?;
+    if entries.is_empty() {
+        output_empty(&mut formatter)?;
+        return Ok(0);
     }
+
+    formatter.begin_list()?;
+    for entry in entries {
+        formatter.format_item(&ListOutputEntry {
+            path: entry.path,
+            role: if entry.is_main { "main" } else { "linked" },
+            label: entry.label,
+            current: entry.current,
+        })?;
+    }
+    formatter.end_list()?;
 
     Ok(0)
 }

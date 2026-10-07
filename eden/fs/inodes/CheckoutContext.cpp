@@ -13,6 +13,7 @@
 
 #include "eden/fs/config/CheckoutConfig.h"
 #include "eden/fs/inodes/EdenMount.h"
+#include "eden/fs/inodes/Overlay.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/store/ObjectStore.h"
 
@@ -33,20 +34,32 @@ CheckoutContext::CheckoutContext(
       fetchContext_{makeRefPtr<StatsFetchContext>(
           clientPid,
           ObjectFetchContext::Cause::Thrift,
-          thriftMethodName,
+          // The caller may be backed by request or coroutine-local storage,
+          // while this context remains alive for the asynchronous checkout.
+          ObjectFetchContext::CauseDetail::fromOwnedString(
+              thriftMethodName.str()),
           requestInfo)},
       checkoutProgress_{std::move(checkoutProgress)} {
   if (mount_->getEdenConfig()->thriftCheckoutTimeTracing.getValue()) {
     fetchContext_->setTimeTracer(std::make_shared<MiniTracer>());
   }
   fetchContext_->setCancellationToken(std::move(cancellationToken));
+  mount_->getOverlay()->enterCheckoutDeferral();
 }
 
-CheckoutContext::~CheckoutContext() = default;
+CheckoutContext::~CheckoutContext() {
+  mount_->getOverlay()->exitCheckoutDeferral();
+}
+
+void CheckoutContext::inhibitInodeGC() {
+  XCHECK(!inodeGCLease_);
+  inodeGCLease_.emplace(mount_->stealInodeGCLease());
+}
 
 void CheckoutContext::start(
     RenameLock&& renameLock,
     EdenMount::ParentLock::LockedPtr&& parentLock,
+    const RootId& oldSnapshot,
     RootId newSnapshot,
     std::shared_ptr<const Tree> toTree) {
   renameLock_ = std::move(renameLock);
@@ -58,7 +71,7 @@ void CheckoutContext::start(
       XCHECK(
           std::holds_alternative<ParentCommitState::CheckoutInProgress>(
               parentLock->checkoutState));
-      oldParent = parentLock->workingCopyParentRootId;
+      oldParent = oldSnapshot;
       // Update the in-memory snapshot ID
       parentLock->checkedOutRootId = newSnapshot;
       parentLock->workingCopyParentRootId = newSnapshot;

@@ -112,6 +112,24 @@ Can continue interrupted checkout:
   [255]
 
 
+Continue checkout if its saved target became obsolete after checkout started:
+  $ newclientrepo obsolete_continue
+  $ drawdag <<'EOS'
+  > B A
+  > EOS
+
+  $ sl go -q null
+  $ FAILPOINTS=checkout-post-progress=return sl go $A
+  abort: checkout errors:
+   Error set by checkout-post-progress FAILPOINTS
+  [255]
+  $ sl debugobsolete $A $B 2>/dev/null
+  $ CODING_AGENT_METADATA=id=test_agent sl go --continue
+  1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  $ sl log -r . -T '{desc|firstline}\n'
+  A
+
+
 Don't fail with open files that can't be deleted:
   $ newclientrepo unlink_fail
   $ drawdag <<'EOS'
@@ -400,17 +418,20 @@ Bail on untracked file path conflict:
   $ rm foo
   $ mkdir -p foo/bar
   $ echo foo > foo/bar/baz
-TODO(sggutier): In this case EdenFS and non-EdenFS behavior differ, fix this later
   $ sl go $B
   abort: 1 conflicting file changes: (no-eden !)
    foo/bar/baz (no-eden !)
   (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them) (no-eden !)
-  [255] (no-eden !)
-  update complete (eden !)
+  abort: nonempty directories conflict with files in the destination commit: (eden !)
+   foo/bar (eden !)
+  (remove the local files or goto --clean to discard them) (eden !)
+  [255]
+#if no-eden
   $ sl go -q $B --config experimental.checkout.rust-path-conflicts=false
+#else
+  $ sl go -qC $B
+#endif
   $ sl st
-  ! foo/bar (eden !)
-  ? foo/bar/baz (eden !)
 
 Deleted file replaced by untracked directory:
   $ newclientrepo
@@ -427,9 +448,11 @@ Deleted file replaced by untracked directory:
   ! foo
   ? foo/bar
   $ sl go $B
-  abort: 1 conflicting file changes:
+  abort: 1 conflicting file changes: (no-eden !)
+  abort: nonempty directories conflict with files in the destination commit: (eden !)
    foo
-  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them) (no-eden !)
+  (remove the local files or goto --clean to discard them) (eden !)
   [255]
   $ sl rm foo --mark
   $ sl add foo/bar
@@ -437,15 +460,14 @@ Deleted file replaced by untracked directory:
   A foo/bar
   R foo
   $ sl go $B
-  abort: 1 conflicting file changes:
+  abort: 1 conflicting file changes: (no-eden !)
+  abort: nonempty directories conflict with files in the destination commit: (eden !)
    foo
-  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them) (no-eden !)
+  (remove the local files or goto --clean to discard them) (eden !)
   [255]
-TODO(sggutier): This is yet another case of differing behavior between Eden and non-Eden
   $ sl go -qC $B
   $ sl st
-  ! foo (eden !)
-  ? foo/bar (eden !)
 
 #if no-eden
 Don't output too many conflicts. This behavior only occurs on non-EdenFS (no need to fix):

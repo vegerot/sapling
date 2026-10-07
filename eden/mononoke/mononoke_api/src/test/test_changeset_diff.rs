@@ -23,10 +23,12 @@ use maplit::btreeset;
 use maplit::hashmap;
 use mononoke_macros::mononoke;
 use mononoke_types::ChangesetId;
+use mononoke_types::DerivableType;
 use mononoke_types::FileType;
 use mononoke_types::GitLfs;
 use mononoke_types::path::MPath;
 use pretty_assertions::assert_eq;
+use test_repo_factory::TestRepoFactory;
 use tests_utils::CreateCommitContext;
 use xdiff::CopyInfo;
 
@@ -1575,6 +1577,220 @@ async fn test_diff_ordered_renormalize_pagination_uses_supplement_cursor(
         )
         .await?;
     check_diff_paths(&page3, &["e"]);
+
+    Ok(())
+}
+
+/// Tiny deterministic xorshift RNG so any failure is reproducible by seed.
+struct DiffTestRng(u64);
+impl DiffTestRng {
+    fn new(seed: u64) -> Self {
+        DiffTestRng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
+    }
+}
+
+const DIFF_TEST_NAMES: &[&str] = &["a", "b", "c", "d"];
+
+fn diff_test_is_prefix(a: &[usize], b: &[usize]) -> bool {
+    a.len() <= b.len() && a.iter().zip(b).all(|(x, y)| x == y)
+}
+
+/// A prefix-free set of paths (no path is an ancestor of another), so each
+/// commit's file set is individually valid. Paths are index-vectors into
+/// `DIFF_TEST_NAMES`.
+fn diff_test_gen_paths(rng: &mut DiffTestRng, count: usize) -> Vec<Vec<usize>> {
+    let mut result: Vec<Vec<usize>> = Vec::new();
+    let mut attempts = 0;
+    while result.len() < count && attempts < count * 30 {
+        attempts += 1;
+        let depth = 2 + rng.below(3); // 2..=4
+        let candidate: Vec<usize> = (0..depth)
+            .map(|_| rng.below(DIFF_TEST_NAMES.len()))
+            .collect();
+        if result
+            .iter()
+            .any(|p| diff_test_is_prefix(p, &candidate) || diff_test_is_prefix(&candidate, p))
+        {
+            continue;
+        }
+        result.push(candidate);
+    }
+    result
+}
+
+fn diff_test_path_str(p: &[usize]) -> String {
+    p.iter()
+        .map(|c| DIFF_TEST_NAMES[*c])
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Build a parent and child commit from a seed, with a mix of modifications,
+/// removals, additions (including whole added/removed subdirectories) and a
+/// copy. Both commits draw from one prefix-free universe of paths, so the file
+/// sets never disagree on whether a path is a file or a directory -- bonsai
+/// forbids that combination in a single commit, and file<->dir transitions are
+/// exercised through the public diff separately by the manifest crate's tests.
+async fn diff_test_build_scenario(
+    ctx: &CoreContext,
+    repo: &Repo,
+    seed: u64,
+) -> Result<(ChangesetId, ChangesetId), Error> {
+    let mut rng = DiffTestRng::new(seed);
+    let universe_size = 16 + rng.below(10);
+    let universe = diff_test_gen_paths(&mut rng, universe_size);
+
+    // Partition the universe into parent/child membership.
+    let mut parent_paths: Vec<&Vec<usize>> = Vec::new();
+    let mut child_only: Vec<&Vec<usize>> = Vec::new();
+    let mut in_both: Vec<&Vec<usize>> = Vec::new();
+    for p in &universe {
+        let in_parent = rng.below(3) != 0; // ~2/3
+        let in_child = rng.below(3) != 0; // ~2/3
+        if in_parent {
+            parent_paths.push(p);
+        }
+        match (in_parent, in_child) {
+            (true, true) => in_both.push(p),
+            (false, true) => child_only.push(p),
+            _ => {}
+        }
+    }
+    if parent_paths.is_empty() {
+        parent_paths.push(&universe[0]);
+        in_both.push(&universe[0]);
+    }
+
+    let mut create = CreateCommitContext::new_root(ctx, repo);
+    for (i, p) in parent_paths.iter().enumerate() {
+        create = create.add_file(diff_test_path_str(p).as_str(), format!("v{i}"));
+    }
+    let parent = create.commit().await?;
+
+    let mut create = CreateCommitContext::new(ctx, repo, vec![parent]);
+    // Deletions: parent paths not in the child (all clean -- the universe is
+    // prefix-free, so no path is an ancestor of another).
+    for p in &parent_paths {
+        if !in_both.contains(p) {
+            create = create.delete_file(diff_test_path_str(p).as_str());
+        }
+    }
+    // Modifications.
+    for (i, p) in in_both.iter().enumerate() {
+        if rng.below(2) == 0 {
+            create = create.add_file(diff_test_path_str(p).as_str(), format!("mod{i}"));
+        }
+    }
+    // Additions, one of them as a copy from an existing parent path.
+    for (i, p) in child_only.iter().enumerate() {
+        if i == 0 {
+            let source = diff_test_path_str(parent_paths[i % parent_paths.len()]);
+            create = create.add_file_with_copy_info(
+                diff_test_path_str(p).as_str(),
+                format!("copy{i}"),
+                (parent, source.as_str()),
+            );
+        } else {
+            create = create.add_file(diff_test_path_str(p).as_str(), format!("new{i}"));
+        }
+    }
+    let child = create.commit().await?;
+    Ok((parent, child))
+}
+
+/// A stable, backend-independent key for a diff entry.
+fn diff_test_key<R: MononokeRepo>(diff: &ChangesetPathDiffContext<R>) -> String {
+    format!(
+        "{:?} tree={} copy={:?} new={:?} old={:?}",
+        diff.path(),
+        diff.is_tree(),
+        diff.copy_info(),
+        diff.get_new_content().map(|c| c.path().clone()),
+        diff.get_old_content().map(|c| c.path().clone()),
+    )
+}
+
+async fn diff_test_run(
+    ctx: &CoreContext,
+    repo: Arc<Repo>,
+    parent: ChangesetId,
+    child: ChangesetId,
+    ordering: ChangesetFileOrdering,
+) -> Result<Vec<String>, Error> {
+    let repo_ctx = RepoContext::new_test(ctx.clone(), repo).await?;
+    let child_ctx = repo_ctx
+        .changeset(child)
+        .await?
+        .ok_or_else(|| anyhow!("child changeset not found"))?;
+    let parent_ctx = repo_ctx
+        .changeset(parent)
+        .await?
+        .ok_or_else(|| anyhow!("parent changeset not found"))?;
+    let diff = child_ctx
+        .diff(
+            &parent_ctx,
+            true, /* include_copies_renames */
+            true, /* include_subtree_copies */
+            None, /* path_restrictions */
+            btreeset! { ChangesetDiffItem::TREES, ChangesetDiffItem::FILES },
+            ordering,
+            None, /* limit */
+        )
+        .await?;
+    Ok(diff.iter().map(diff_test_key).collect())
+}
+
+#[mononoke::fbinit_test]
+async fn test_content_manifest_diff_matches_across_orderings(
+    fb: FacebookInit,
+) -> Result<(), Error> {
+    let ctx = CoreContext::test_mock(fb);
+
+    for seed in 0..25u64 {
+        let repo: Repo = TestRepoFactory::new(fb)?
+            .with_config_override(|config| {
+                for types in config.derived_data_config.available_configs.values_mut() {
+                    types.types.remove(&DerivableType::Fsnodes);
+                }
+            })
+            .build()
+            .await?;
+        let (parent, child) = diff_test_build_scenario(&ctx, &repo, seed).await?;
+        let repo = Arc::new(repo);
+        let mut unordered = diff_test_run(
+            &ctx,
+            repo.clone(),
+            parent,
+            child,
+            ChangesetFileOrdering::Unordered,
+        )
+        .await?;
+        let mut ordered = diff_test_run(
+            &ctx,
+            repo,
+            parent,
+            child,
+            ChangesetFileOrdering::Ordered { after: None },
+        )
+        .await?;
+        unordered.sort();
+        ordered.sort();
+        assert_eq!(
+            ordered, unordered,
+            "seed {seed}: ordered and unordered diffs disagree"
+        );
+    }
 
     Ok(())
 }

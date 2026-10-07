@@ -54,6 +54,7 @@ const CONCURRENCY_LIMIT: usize = 100;
 
 mod create_commit;
 mod land_stack;
+mod rebase_stack;
 
 impl SourceControlServiceImpl {
     /// Detailed repo info.
@@ -451,6 +452,7 @@ impl SourceControlServiceImpl {
             &BookmarkKey::new(&params.bookmark).map_err(Into::<MononokeError>::into)?,
             changeset.id(),
             pushvars.as_ref(),
+            None,
         )
         .await?;
         Ok(thrift::RepoCreateBookmarkResponse {
@@ -490,6 +492,7 @@ impl SourceControlServiceImpl {
             old_changeset_id,
             params.allow_non_fast_forward_move,
             pushvars.as_ref(),
+            None,
         )
         .await?;
         Ok(thrift::RepoMoveBookmarkResponse {

@@ -5,7 +5,6 @@
  * GNU General Public License version 2.
  */
 
-include "fb303/thrift/fb303_core.thrift"
 include "thrift/annotation/thrift.thrift"
 include "eden/mononoke/megarepo_api/if/megarepo_configs.thrift"
 include "eden/mononoke/derived_data/if/derived_data_type.thrift"
@@ -132,7 +131,7 @@ struct CommitPathSpecifier {
 
 /// The type of manifest backing a tree ID.
 enum TreeIdType {
-  /// An FsnodeId (legacy default).
+  /// An FsnodeId. No longer supported; retained for wire compatibility.
   FSNODE = 0,
 
   /// A ContentManifestId.
@@ -147,8 +146,7 @@ struct TreeIdSpecifier {
   /// The ID of the tree, obtained from a previous call to the service.
   2: binary id;
 
-  /// The type of the tree ID. If absent, defaults to FSNODE for backward
-  /// compatibility with existing clients.
+  /// Must be CONTENT_MANIFEST. Requests with FSNODE or no type are rejected.
   3: optional TreeIdType id_type;
 }
 
@@ -157,7 +155,7 @@ union TreeSpecifier {
   /// Specify a tree by its path in a commit.
   1: CommitPathSpecifier by_commit_path;
 
-  /// Specify a tree by its id.
+  /// Deprecated: use `by_commit_path` instead.
   2: TreeIdSpecifier by_id;
 }
 
@@ -199,6 +197,10 @@ union FileSpecifier {
 /// This structure should be small and contain very basic repository info.
 struct Repo {
   1: string name;
+}
+
+struct RepoExistsResponse {
+  1: bool exists;
 }
 
 /// This structure can be bigger and contain more detailed repository info.
@@ -911,6 +913,11 @@ struct ListReposParams {
   1: optional set<CommitIdentityScheme> identity_schemes;
 }
 
+struct RepoExistsParams {
+  /// Plain name rather than a RepoSpecifier, to keep the method global.
+  1: string repo_name;
+}
+
 struct RepoResolveBookmarkParams {
   /// The bookmark name to look up.
   1: string bookmark_name;
@@ -1280,6 +1287,44 @@ struct RepoLandStackParams {
   9: BookmarkKindRestrictions bookmark_restrictions = BookmarkKindRestrictions.ANY_KIND;
 }
 
+enum RepoRebaseStackMergeResolution {
+  /// Follow the repo's `pushrebase_enable_merge_resolution` knob, the same
+  /// one that governs merge resolution at land time.
+  DEFAULT = 0,
+  /// Any path changed on both sides is a conflict; pure parent swap. This
+  /// includes a commit already present in `onto`, which is only dropped
+  /// when content merging is on.
+  DISABLED = 1,
+}
+
+struct RepoRebaseStackParams {
+  /// Top of the stack to rebase. Must be a draft.
+  1: CommitId head;
+
+  /// The commit the stack sits on; `base..head` is rebased. Must be an
+  /// ancestor of `head` and have derived manifests.
+  2: CommitId base;
+
+  /// Destination. Any ancestry relationship to `base` is allowed: it may be
+  /// a descendant, an ancestor, or unrelated. Must have derived manifests.
+  3: CommitId onto;
+
+  /// The set of commit identity schemes to return in the response.
+  4: set<CommitIdentityScheme> identity_schemes;
+
+  /// Identity schemes for the old commit ids in the response. Defaults to
+  /// `identity_schemes`.
+  5: optional set<CommitIdentityScheme> old_identity_schemes;
+
+  /// Whether paths changed on both sides may be content-merged.
+  6: RepoRebaseStackMergeResolution merge_resolution = RepoRebaseStackMergeResolution.DEFAULT;
+
+  /// Service identity to authorize as.
+  7: optional string service_identity;
+  // 8: reserved for dry_run
+  // 9: reserved for inferring base when absent
+}
+
 struct RepoPrepareCommitsParams {
   /// The list of commits for which data must be derived
   1: list<CommitId> commits;
@@ -1372,7 +1417,7 @@ enum CommitFingerprintVersion {
   /// where available.
   V1 = 1,
   /// V2: root ContentManifestId blake2 hash. Recommended long-term default.
-  /// Requires `derived_data_use_content_manifests` enabled for the repo;
+  /// Requires ContentManifests derived data enabled for the repo;
   /// otherwise the request fails with InvalidRequest (no auto-fallback).
   V2 = 2,
 }
@@ -1670,11 +1715,46 @@ struct CommitListDescendantBookmarksParams {
   5: set<CommitIdentityScheme> identity_schemes;
 }
 
+/// A single identity to run hooks as, identified by its type and data
+/// (e.g. id_type = "USER", id_data = "alice").
+struct RunAsIdentity {
+  1: string id_type;
+  2: string id_data;
+}
+
+/// The set of identities to run hooks as. See `CommitRunHooksParams.run_as`.
+@hack.MigrationBlockingLegacyJSONSerialization
+union RunAsIdentities {
+  /// A list of plain type/data identities. Sufficient for hooks that match
+  /// on identity type and data only.
+  1: list<RunAsIdentity> identities;
+  /// A Compact-thrift-encoded `access/if` `AuthenticatedIdentityList` (a bare
+  /// `list<AuthenticatedIdentity>`, not wrapped in a struct). Use this when
+  /// hooks need the full identity attributes. Meta-internal only.
+  2: binary encoded_authenticated_identities;
+}
+
 struct CommitRunHooksParams {
   /// Run the same hooks as when landing to bookmark
   1: string bookmark;
   /// Pushvars used on the push.
   2: optional map<string, binary> pushvars;
+  /// If set, run the hooks as if the push was performed by these identities
+  /// (instead of the calling client's identities). Does not affect
+  /// repository access control, which still uses the caller's identity.
+  3: optional RunAsIdentities run_as;
+  /// If set, hooks evaluate the commit as if it carried this message instead
+  /// of the stored one. Lets callers preview the outcome for a commit whose
+  /// message will be regenerated before landing (e.g. from live review
+  /// state). Only affects this dry run's reported verdicts; a real push
+  /// always evaluates the pushed commit.
+  4: optional string override_commit_message;
+  /// If set, the response includes rejections from hooks configured as
+  /// log-only instead of showing them as accepted. Lets callers preview what
+  /// a hook would do once enforcing while it is still being rolled out.
+  /// Does not make anything enforce: it only changes what this dry run
+  /// reports.
+  5: optional bool include_log_only_rejections;
 }
 
 /// Parameters for checking commit rate limits.
@@ -2009,6 +2089,15 @@ struct RepoCreationRequest {
   4: optional CustomAclParams custom_acl;
   /// Size bucket (allows for provisioning the right amount of resources for the new repo)
   5: RepoSizeBucket size_bucket;
+  /// Short branch name (e.g. "main", not a full ref like "refs/heads/main")
+  /// that the repo's HEAD symref points at from creation. When unset, no HEAD
+  /// symref is written; clones of the repo will have no default branch until
+  /// one is created manually (mononoke_admin git-symref).
+  6: optional string default_branch;
+  /// Create the repo read-only. Writers must hold `bypass_readonly` on the
+  /// repo's ACL; the GitHub mirror sync does, and passes gitimport
+  /// --bypass-readonly. Defaults to false (writable).
+  7: optional bool readonly;
 }
 
 struct CreateReposParams {
@@ -2372,6 +2461,33 @@ struct RepoDeleteBookmarkResponse {}
 
 struct RepoLandStackResponse {
   1: PushrebaseOutcome pushrebase_outcome;
+}
+
+struct RepoRebaseStackRebasedCommit {
+  1: map<CommitIdentityScheme, CommitId> old_ids;
+  /// Empty when `dropped`.
+  2: map<CommitIdentityScheme, CommitId> new_ids;
+  /// Paths whose content the server 3-way merged in this commit. Empty
+  /// means a pure parent swap, where a client merge driver would not have
+  /// run either.
+  3: list<Path> merged_paths;
+  /// Every change in this commit was already present in the new parent, so
+  /// no commit was created, as `sl rebase` would do. Nothing records a
+  /// successor for it.
+  4: bool dropped;
+}
+
+struct RepoRebaseStackResponse {
+  /// The new head. Equal to `onto` when every commit was dropped.
+  1: map<CommitIdentityScheme, CommitId> head;
+  /// Bottom to top, one entry per commit in `base..head`.
+  2: list<RepoRebaseStackRebasedCommit> rebased_commits;
+  /// Paths changed both in the stack and between `base` and `onto`. Always
+  /// 0 on a successful call with merging disabled, since any overlap is
+  /// then a conflict.
+  3: i64 overlapping_path_count;
+  /// Distinct paths the server content-merged.
+  4: i64 merged_path_count;
 }
 
 struct RepoPrepareCommitsResponse {}
@@ -3015,6 +3131,9 @@ struct DeriveBoundariesParams {
   5: bool use_predecessor_derivation;
   /// Optional config name to select an alternative derived data configuration.
   6: optional string config_name;
+  /// Optional mapping key prefix to derive under (forwarded from
+  /// DeriveBackfillParams; see that struct for semantics).
+  7: optional string mapping_key_prefix;
 }
 
 /// Result for derive_boundaries request
@@ -3047,6 +3166,9 @@ struct DeriveSliceParams {
   3: list<DeriveSliceSegment> segments;
   /// Optional config name to select an alternative derived data configuration.
   4: optional string config_name;
+  /// Optional mapping key prefix to derive under (forwarded from
+  /// DeriveBackfillParams; see that struct for semantics).
+  5: optional string mapping_key_prefix;
 }
 
 /// Result for derive_slice request
@@ -3098,6 +3220,17 @@ struct DeriveBackfillParams {
   /// Whether to enqueue a MarkTypeEnabled node per repo (cascade-dependent on the
   /// repo's backfill leaves) that records the type as enabled once backfill succeeds.
   10: optional bool auto_enable;
+  /// Optional mapping key prefix to derive under, overriding whatever the selected
+  /// config holds in `mapping_key_prefixes` for this type. Set it to backfill into a
+  /// fresh key namespace (e.g. "r5.") while production keeps serving from the old
+  /// one, then land the same prefix in config to cut over. Unset (the default)
+  /// derives under the config's own prefix, preserving the previous behavior.
+  ///
+  /// The prefix must match the one later written to the repo's config, otherwise the
+  /// backfilled data is unreachable and will be silently re-derived. Because of that
+  /// this is rejected together with `auto_enable`, whose enablement path cannot write
+  /// a prefix.
+  11: optional string mapping_key_prefix;
 }
 
 /// Result for derive_backfill request
@@ -3139,6 +3272,9 @@ struct DeriveBackfillRepoParams {
   /// Whether to enqueue a MarkTypeEnabled node (cascade-dependent on this repo's
   /// backfill leaves) that records the type as enabled once backfill succeeds.
   10: bool auto_enable;
+  /// Optional mapping key prefix to derive under (forwarded from
+  /// DeriveBackfillParams; see that struct for semantics).
+  11: optional string mapping_key_prefix;
 }
 
 /// Result for derive_backfill_repo request
@@ -3199,6 +3335,8 @@ enum RequestErrorKind {
   MERGE_CONFLICTS = 11,
   LARGE_REPO_NOT_FOUND = 12,
   REDACTED = 13,
+  /// A commit the request needs a derived manifest for has none yet.
+  MANIFEST_NOT_DERIVED = 14,
 }
 
 stateful client exception RequestError {
@@ -3277,6 +3415,7 @@ stateful client exception HookRejectionsException {
 
 /// Identifies the restricted resource that an authorization check denied:
 /// either a path, or a manifest id (as a hex string).
+@hack.MigrationBlockingLegacyJSONSerialization
 union RestrictedPathAccess {
   1: string path;
   2: string manifest_id;
@@ -3288,6 +3427,9 @@ stateful client exception RestrictedPathsAuthorizationError {
   2: RestrictedPathAccess access;
   /// Group name only, e.g. "gradient_source_control".
   3: string permission_request_group;
+  /// Repo-configured text appended to `reason`; exposed separately so clients
+  /// that format their own message can show it.
+  4: optional string denial_message;
 }
 
 /// Service Definition
@@ -3296,12 +3438,24 @@ stateful client exception RestrictedPathsAuthorizationError {
 @thrift.DeprecatedUnvalidatedAnnotations{
   items = {"sr.service_name": "mononoke-scs-server"},
 }
-service SourceControlService extends fb303_core.BaseService {
+service SourceControlService {
   /// Global methods
   /// ==============
 
   /// Get a list of all repositories.
   list<Repo> list_repos(1: ListReposParams params) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: OverloadError overload_error,
+  );
+
+  /// Check whether a repository exists.
+  ///
+  /// Deliberately global: callers ask this about repos that may not exist, and
+  /// a RepoSpecifier would make clients shard-route on the repo name, failing
+  /// in service routing before reaching a server. Answered from the tier-wide
+  /// repo list, so any task can answer for any repo.
+  RepoExistsResponse repo_exists(1: RepoExistsParams params) throws (
     1: RequestError request_error,
     2: InternalError internal_error,
     3: OverloadError overload_error,
@@ -3480,6 +3634,19 @@ service SourceControlService extends fb303_core.BaseService {
     3: PushrebaseConflictsException pushrebase_conflicts,
     4: HookRejectionsException hook_rejections,
     5: OverloadError overload_error,
+  );
+
+  /// Rebase a draft stack onto a commit without moving any bookmark. Runs
+  /// no hooks and never derives data for the inputs; see
+  /// `RepoRebaseStackParams`.
+  RepoRebaseStackResponse repo_rebase_stack(
+    1: RepoSpecifier repo,
+    2: RepoRebaseStackParams params,
+  ) throws (
+    1: RequestError request_error,
+    2: InternalError internal_error,
+    3: PushrebaseConflictsException pushrebase_conflicts,
+    4: OverloadError overload_error,
   );
 
   /// Derive data for commits in a repo
@@ -4042,6 +4209,10 @@ service SourceControlService extends fb303_core.BaseService {
   /// Repository management methods
   /// ==============================
 
+  /// Create the requested repos in Mononoke. For each request that sets
+  /// `default_branch`, the repo's HEAD symref is written to point at that
+  /// branch at creation time (and deleted again if the creation fails or is
+  /// aborted).
   CreateReposToken create_repos(1: CreateReposParams params) throws (
     1: RequestError request_error,
     2: InternalError internal_error,

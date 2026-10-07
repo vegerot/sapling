@@ -176,9 +176,6 @@ struct Adapter {
    */
   3: string underlyingName;
   4: string extraNamespace;
-
-  /** Must set to true when adapted type is not copyable. */
-  5: bool moveOnly;
 }
 
 /**
@@ -496,3 +493,20 @@ struct DeclareHashSpecialization {}
 @scope.Structured
 @scope.Typedef
 struct DeclareEqualToSpecialization {}
+
+/**
+ * Allows a field of a `cpp.allocator` struct to declare a custom default, and
+ * applies that default in the allocator-extended constructors.
+ *
+ * Those constructors value-initialize every field, so without this annotation
+ * a custom default would never reach them; declaring one is an error instead.
+ *
+ * `legacy_ignore_custom_default = true` keeps the older behavior, where the
+ * allocator-extended constructors value-initialize the field and drop the
+ * default. It exists for the structs written against that behavior, whose
+ * constructed values must not change; do not set it in new code.
+ */
+@scope.Field
+struct AllowCustomDefaultInAllocCtor {
+  1: bool legacy_ignore_custom_default;
+}

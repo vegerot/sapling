@@ -6,9 +6,11 @@
  */
 
 #include <folly/ScopeGuard.h>
+#include <folly/coro/BlockingWait.h>
 #include <folly/coro/Collect.h>
 #include <folly/coro/GtestHelpers.h>
 #include <folly/coro/Task.h>
+#include <folly/coro/Timeout.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/logging/xlog.h>
 #include <folly/testing/TestUtil.h>
@@ -18,8 +20,6 @@
 #include <memory>
 #include <optional>
 
-#include "eden/common/telemetry/NullStructuredLogger.h"
-#include "eden/common/telemetry/SessionInfo.h"
 #include "eden/common/utils/FaultInjector.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/ReloadableConfig.h"
@@ -32,7 +32,7 @@
 #include "eden/fs/telemetry/EdenFsEventsLogger.h"
 #include "eden/fs/telemetry/EdenStats.h"
 #include "eden/fs/telemetry/ErrorLogger.h"
-#include "eden/fs/telemetry/test/CapturingScribeLogger.h"
+#include "eden/fs/telemetry/test/CapturingXplatLogger.h"
 #include "eden/fs/testharness/HgRepo.h"
 #include "eden/fs/testharness/TestConfigSource.h"
 #include "eden/scm/lib/backingstore/include/SaplingBackingStoreError.h"
@@ -77,14 +77,8 @@ std::vector<PathComponent> getTreeNames(
   return names;
 }
 
-std::shared_ptr<EdenFsEventsLogger> makeTestEdenFsEventsLogger(
-    const std::shared_ptr<ReloadableConfig>& edenConfig,
-    const EdenStatsPtr& stats) {
-  return std::make_shared<EdenFsEventsLogger>(
-      std::make_shared<NullStructuredLogger>(),
-      /*xplatLogger=*/nullptr,
-      edenConfig,
-      stats.copy());
+std::shared_ptr<EdenFsEventsLogger> makeTestEdenFsEventsLogger() {
+  return std::make_shared<EdenFsEventsLogger>(nullptr);
 }
 
 RootId addRestrictedTreeCommit(TestRepo& testRepo) {
@@ -115,7 +109,7 @@ bool checkRestrictedTreePermission(std::optional<folly::StringPiece> mode) {
   // Use CPUThreadPoolExecutor — InlineExecutor is forbidden for coro::Task
   // (DCHECK on InlineExecutor at Task.h). getRootTree is now coroutine-backed.
   folly::CPUThreadPoolExecutor executor{1};
-  ErrorLogger noopErrorLogger{nullptr, {}, nullptr};
+  ErrorLogger noopErrorLogger{};
   auto backingStore = std::make_shared<SaplingBackingStore>(
       testRepo.repo.path(),
       testRepo.repo.path(),
@@ -125,7 +119,7 @@ bool checkRestrictedTreePermission(std::optional<folly::StringPiece> mode) {
       &executor,
       edenConfig,
       std::make_unique<SaplingBackingStoreOptions>(),
-      makeTestEdenFsEventsLogger(edenConfig, stats),
+      makeTestEdenFsEventsLogger(),
       /*errorLogger=*/noopErrorLogger,
       std::make_unique<BackingStoreLogger>(),
       &faultInjector);
@@ -168,7 +162,7 @@ struct SaplingBackingStoreNoFaultInjectorTest : SaplingBackingStoreTestBase {
   // Use a real executor so coroutine tests don't trip the coro::Task
   // DCHECK on InlineExecutor (Task.h:470). See D98178331.
   folly::CPUThreadPoolExecutor executor{1};
-  ErrorLogger noopErrorLogger{nullptr, {}, nullptr};
+  ErrorLogger noopErrorLogger{};
 
   std::shared_ptr<SaplingBackingStore> queuedBackingStore =
       std::make_shared<SaplingBackingStore>(
@@ -180,7 +174,7 @@ struct SaplingBackingStoreNoFaultInjectorTest : SaplingBackingStoreTestBase {
           &executor,
           edenConfig,
           std::make_unique<SaplingBackingStoreOptions>(),
-          makeTestEdenFsEventsLogger(edenConfig, stats),
+          makeTestEdenFsEventsLogger(),
           /*errorLogger=*/noopErrorLogger,
           std::make_unique<BackingStoreLogger>(),
           &faultInjector);
@@ -193,7 +187,7 @@ struct SaplingBackingStoreWithFaultInjectorTest : SaplingBackingStoreTestBase {
   // Use a real executor so coroutine tests don't trip the coro::Task
   // DCHECK on InlineExecutor (Task.h:470).
   folly::CPUThreadPoolExecutor executor{1};
-  ErrorLogger noopErrorLogger{nullptr, {}, nullptr};
+  ErrorLogger noopErrorLogger{};
 
   std::shared_ptr<SaplingBackingStore> queuedBackingStore =
       std::make_shared<SaplingBackingStore>(
@@ -205,7 +199,7 @@ struct SaplingBackingStoreWithFaultInjectorTest : SaplingBackingStoreTestBase {
           &executor,
           edenConfig,
           std::make_unique<SaplingBackingStoreOptions>(),
-          makeTestEdenFsEventsLogger(edenConfig, stats),
+          makeTestEdenFsEventsLogger(),
           /*errorLogger=*/noopErrorLogger,
           std::make_unique<BackingStoreLogger>(),
           &faultInjector);
@@ -219,7 +213,7 @@ struct SaplingBackingStoreWithFaultInjectorIgnoreConfigTest
   // Use CPUThreadPoolExecutor — InlineExecutor is forbidden for coro::Task
   // (DCHECK on InlineExecutor at Task.h:470). See D98178331.
   folly::CPUThreadPoolExecutor executor{1};
-  ErrorLogger noopErrorLogger{nullptr, {}, nullptr};
+  ErrorLogger noopErrorLogger{};
 
   std::shared_ptr<SaplingBackingStore> queuedBackingStore =
       std::make_shared<SaplingBackingStore>(
@@ -231,7 +225,7 @@ struct SaplingBackingStoreWithFaultInjectorIgnoreConfigTest
           &executor,
           edenConfig,
           std::make_unique<SaplingBackingStoreOptions>(),
-          makeTestEdenFsEventsLogger(edenConfig, stats),
+          makeTestEdenFsEventsLogger(),
           /*errorLogger=*/noopErrorLogger,
           std::make_unique<BackingStoreLogger>(),
           &faultInjector);
@@ -240,9 +234,11 @@ struct SaplingBackingStoreWithFaultInjectorIgnoreConfigTest
 } // namespace
 
 TEST_F(SaplingBackingStoreNoFaultInjectorTest, getTree) {
-  auto tree1 = queuedBackingStore
-                   ->getRootTree(commit1, ObjectFetchContext::getNullContext())
-                   .get(kTestTimeout);
+  auto tree1 = folly::coro::blockingWait(
+      folly::coro::timeout(
+          queuedBackingStore->co_getRootTree(
+              commit1, ObjectFetchContext::getNullContext()),
+          kTestTimeout));
 
   auto [tree2, origin2] =
       queuedBackingStore
@@ -306,9 +302,11 @@ TEST_F(
 }
 
 TEST_F(SaplingBackingStoreWithFaultInjectorTest, getTree) {
-  auto tree1 = queuedBackingStore
-                   ->getRootTree(commit1, ObjectFetchContext::getNullContext())
-                   .get(kTestTimeout);
+  auto tree1 = folly::coro::blockingWait(
+      folly::coro::timeout(
+          queuedBackingStore->co_getRootTree(
+              commit1, ObjectFetchContext::getNullContext()),
+          kTestTimeout));
 
   auto [tree2, origin2] =
       queuedBackingStore
@@ -319,9 +317,11 @@ TEST_F(SaplingBackingStoreWithFaultInjectorTest, getTree) {
 }
 
 TEST_F(SaplingBackingStoreNoFaultInjectorTest, getBlob) {
-  auto tree = queuedBackingStore
-                  ->getRootTree(commit1, ObjectFetchContext::getNullContext())
-                  .get(kTestTimeout);
+  auto tree = folly::coro::blockingWait(
+      folly::coro::timeout(
+          queuedBackingStore->co_getRootTree(
+              commit1, ObjectFetchContext::getNullContext()),
+          kTestTimeout));
 
   for (auto& [name, entry] : *tree.tree) {
     if (entry.isTree()) {
@@ -348,9 +348,11 @@ TEST_F(SaplingBackingStoreNoFaultInjectorTest, getBlob) {
 }
 
 TEST_F(SaplingBackingStoreWithFaultInjectorTest, getBlob) {
-  auto tree = queuedBackingStore
-                  ->getRootTree(commit1, ObjectFetchContext::getNullContext())
-                  .get(kTestTimeout);
+  auto tree = folly::coro::blockingWait(
+      folly::coro::timeout(
+          queuedBackingStore->co_getRootTree(
+              commit1, ObjectFetchContext::getNullContext()),
+          kTestTimeout));
 
   for (auto& [name, entry] : *tree.tree) {
     if (entry.isTree()) {
@@ -373,83 +375,6 @@ TEST_F(SaplingBackingStoreWithFaultInjectorTest, getBlob) {
 
       EXPECT_EQ(blob->getContents().cloneAsValue().moveToFbString(), "bar\n");
     }
-  }
-}
-
-TEST_F(SaplingBackingStoreNoFaultInjectorTest, getGlobFilesMultiple) {
-  auto suffixes = std::vector<std::string>{".txt"};
-  auto prefixes = std::vector<std::string>{};
-  auto globFiles = queuedBackingStore->getGlobFiles(commit1, suffixes, prefixes)
-                       .get(kTestTimeout);
-  auto paths = globFiles.globFiles;
-  auto commitId = queuedBackingStore->renderRootId(globFiles.rootId);
-
-  EXPECT_EQ(commitId, queuedBackingStore->renderRootId(commit1));
-
-  // TODO(T189729875) Make it check the files created during setup
-  // The globFiles SaplingRemoteAPI endpoint is currently mocked out so files
-  // returned are always the same dependent on the given suffix.
-  std::sort(paths.begin(), paths.end());
-  auto expected_result = std::vector<std::string>{"baz.txt", "foo.txt"};
-  EXPECT_EQ(paths.size(), 2);
-  for (int i = 0; i < 2; i++) {
-    EXPECT_EQ(paths[i], expected_result[i]);
-  }
-}
-
-TEST_F(SaplingBackingStoreNoFaultInjectorTest, getGlobFilesSingle) {
-  auto suffixes = std::vector<std::string>{".rs"};
-  auto prefixes = std::vector<std::string>{};
-  auto globFiles = queuedBackingStore->getGlobFiles(commit1, suffixes, prefixes)
-                       .get(kTestTimeout);
-  auto paths = globFiles.globFiles;
-  auto commitId = queuedBackingStore->renderRootId(globFiles.rootId);
-
-  EXPECT_EQ(commitId, queuedBackingStore->renderRootId(commit1));
-
-  // TODO(T189729875) Make it check the files created during setup
-  // The globFiles SaplingRemoteAPI endpoint is currently mocked out so files
-  // returned are always the same dependent on the given suffix.
-  std::sort(paths.begin(), paths.end());
-  auto expected_result = std::vector<std::string>{"bar.rs"};
-  EXPECT_EQ(paths.size(), 1);
-  EXPECT_EQ(paths[0], expected_result[0]);
-}
-TEST_F(SaplingBackingStoreNoFaultInjectorTest, getGlobFilesNone) {
-  auto suffixes = std::vector<std::string>{".bzl"};
-  auto prefixes = std::vector<std::string>{};
-  auto globFiles = queuedBackingStore->getGlobFiles(commit1, suffixes, prefixes)
-                       .get(kTestTimeout);
-  auto paths = globFiles.globFiles;
-  auto commitId = queuedBackingStore->renderRootId(globFiles.rootId);
-
-  EXPECT_EQ(commitId, queuedBackingStore->renderRootId(commit1));
-
-  // TODO(T189729875) Make it check the files created during setup
-  // The globFiles SaplingRemoteAPI endpoint is currently mocked out so files
-  // returned are always the same dependent on the given suffix.
-  EXPECT_EQ(paths.size(), 0);
-}
-
-TEST_F(SaplingBackingStoreNoFaultInjectorTest, getGlobFilesNested) {
-  auto suffixes = std::vector<std::string>{".cpp"};
-  auto prefixes = std::vector<std::string>{};
-  auto globFiles = queuedBackingStore->getGlobFiles(commit1, suffixes, prefixes)
-                       .get(kTestTimeout);
-  auto paths = globFiles.globFiles;
-  auto commitId = queuedBackingStore->renderRootId(globFiles.rootId);
-
-  EXPECT_EQ(commitId, queuedBackingStore->renderRootId(commit1));
-
-  // TODO(T189729875) Make it check the files created during setup
-  // The globFiles SaplingRemoteAPI endpoint is currently mocked out so files
-  // returned are always the same dependent on the given suffix.
-  std::sort(paths.begin(), paths.end());
-  auto expected_result =
-      std::vector<std::string>{"fuji/peak.cpp", "ranier.cpp"};
-  EXPECT_EQ(paths.size(), 2);
-  for (int i = 0; i < 2; i++) {
-    EXPECT_EQ(paths[i], expected_result[i]);
   }
 }
 
@@ -585,48 +510,12 @@ TEST_F(SaplingBackingStoreWithFaultInjectorTest, getTreeBatch) {
       ::testing::ElementsAre(PathComponent{"foo"}, PathComponent{"src"}));
 }
 
-TEST_F(
-    SaplingBackingStoreNoFaultInjectorTest,
-    prefetchBlobsWithDuplicatesNoOptimizations) {
-  testEdenConfig->ignorePrefetchResult.setValue(
-      false, ConfigSourceType::UserConfig);
-  testEdenConfig->prefetchOptimizations.setValue(
-      false, ConfigSourceType::UserConfig);
-
-  auto tree = queuedBackingStore
-                  ->getRootTree(commit1, ObjectFetchContext::getNullContext())
-                  .get(kTestTimeout);
-
-  std::vector<ObjectId> blobIds;
-  for (auto& [name, entry] : *tree.tree) {
-    if (!entry.isTree()) {
-      blobIds.push_back(entry.getObjectId());
-      blobIds.push_back(entry.getObjectId());
-    }
-  }
-
-  ASSERT_FALSE(blobIds.empty());
-
-  auto prefetchResult =
-      queuedBackingStore
-          ->prefetchBlobs(
-              folly::range(blobIds), ObjectFetchContext::getNullContext())
-          .get(kTestTimeout);
-
-  EXPECT_EQ(prefetchResult, folly::unit);
-}
-
-TEST_F(
-    SaplingBackingStoreNoFaultInjectorTest,
-    prefetchBlobsWithDuplicatesWithOptimizations) {
-  testEdenConfig->ignorePrefetchResult.setValue(
-      true, ConfigSourceType::UserConfig);
-  testEdenConfig->prefetchOptimizations.setValue(
-      true, ConfigSourceType::UserConfig);
-
-  auto tree = queuedBackingStore
-                  ->getRootTree(commit1, ObjectFetchContext::getNullContext())
-                  .get(kTestTimeout);
+TEST_F(SaplingBackingStoreNoFaultInjectorTest, prefetchBlobsWithDuplicates) {
+  auto tree = folly::coro::blockingWait(
+      folly::coro::timeout(
+          queuedBackingStore->co_getRootTree(
+              commit1, ObjectFetchContext::getNullContext()),
+          kTestTimeout));
 
   std::vector<ObjectId> blobIds;
   for (auto& [name, entry] : *tree.tree) {
@@ -650,9 +539,11 @@ TEST_F(
 TEST_F(
     SaplingBackingStoreNoFaultInjectorTest,
     prefetchBlobsWithDuplicatesResolvesAllCallbacks) {
-  auto tree = queuedBackingStore
-                  ->getRootTree(commit1, ObjectFetchContext::getNullContext())
-                  .get(kTestTimeout);
+  auto tree = folly::coro::blockingWait(
+      folly::coro::timeout(
+          queuedBackingStore->co_getRootTree(
+              commit1, ObjectFetchContext::getNullContext()),
+          kTestTimeout));
 
   ObjectId firstBlobId;
   for (auto& [name, entry] : *tree.tree) {
@@ -828,10 +719,11 @@ TEST_F(
   // someone reverts to raw `this`, the weak_ptr would expire after reset() and
   // the continuation would access freed memory.
 
-  auto rootTree =
-      queuedBackingStore
-          ->getRootTree(commit1, ObjectFetchContext::getNullContext())
-          .get(kTestTimeout);
+  auto rootTree = folly::coro::blockingWait(
+      folly::coro::timeout(
+          queuedBackingStore->co_getRootTree(
+              commit1, ObjectFetchContext::getNullContext()),
+          kTestTimeout));
   SlOid treeOid{rootTree.treeId};
 
   auto weak = std::weak_ptr<SaplingBackingStore>(queuedBackingStore);
@@ -866,10 +758,11 @@ TEST_F(
   // shared_from_this() capture would cause a use-after-free on resumption.
 
   // Get a valid tree ObjectId from the repo so we can construct a real SlOid.
-  auto rootTree =
-      queuedBackingStore
-          ->getRootTree(commit1, ObjectFetchContext::getNullContext())
-          .get(kTestTimeout);
+  auto rootTree = folly::coro::blockingWait(
+      folly::coro::timeout(
+          queuedBackingStore->co_getRootTree(
+              commit1, ObjectFetchContext::getNullContext()),
+          kTestTimeout));
   SlOid treeOid{rootTree.treeId};
 
   auto baselineUseCount = queuedBackingStore.use_count();
@@ -919,11 +812,10 @@ TEST_F(
 struct SaplingBackingStoreErrorLoggingTest : SaplingBackingStoreTestBase {
   FaultInjector faultInjector{/*enabled=*/false};
   folly::InlineExecutor executor = folly::InlineExecutor::instance();
-  std::shared_ptr<CapturingScribeLogger> scribe =
-      std::make_shared<CapturingScribeLogger>();
+  CapturingXplatLogger xplatLogger;
   std::shared_ptr<ReloadableConfig> errorLoggerConfig{
       std::make_shared<ReloadableConfig>(testEdenConfig)};
-  ErrorLogger errorLogger{scribe, SessionInfo{}, errorLoggerConfig};
+  ErrorLogger errorLogger{errorLoggerConfig, &xplatLogger};
 
   SaplingBackingStoreErrorLoggingTest() {
     testEdenConfig->enableErrorLogging.setValue(
@@ -940,7 +832,7 @@ struct SaplingBackingStoreErrorLoggingTest : SaplingBackingStoreTestBase {
           &executor,
           edenConfig,
           std::make_unique<SaplingBackingStoreOptions>(),
-          makeTestEdenFsEventsLogger(edenConfig, stats),
+          makeTestEdenFsEventsLogger(),
           /*errorLogger=*/errorLogger,
           std::make_unique<BackingStoreLogger>(),
           &faultInjector);
@@ -952,12 +844,10 @@ TEST_F(SaplingBackingStoreErrorLoggingTest, manifestResolutionFailureIsLogged) {
   auto result = queuedBackingStore->getManifestNode(bogusCommit);
   EXPECT_FALSE(result.has_value());
 
-  ASSERT_EQ(scribe->messages().size(), 1);
-  const auto& msg = scribe->messages()[0];
-  EXPECT_NE(msg.find("backing_store"), std::string::npos)
-      << "Should contain component, got: " << msg;
-  EXPECT_NE(msg.find("manifest_resolution_failure"), std::string::npos)
-      << "Should contain error_type, got: " << msg;
+  ASSERT_EQ(xplatLogger.events().size(), 1);
+  const auto& strings = xplatLogger.events()[0].event.getStringMap();
+  EXPECT_EQ(strings.at("component"), "backing_store");
+  EXPECT_EQ(strings.at("error_type"), "manifest_resolution_failure");
 }
 
 } // namespace facebook::eden

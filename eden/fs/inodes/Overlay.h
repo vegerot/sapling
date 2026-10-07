@@ -19,6 +19,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <unordered_map>
@@ -226,10 +227,36 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
   /*
    * Load content of the directory from overlay. If the directory does not
    * exist, this function will return an empty `DirContents`.
+   *
+   * A pending WAL is merged into the returned DirContents. The merged result is
+   * also flushed back to the base file and the WAL removed, unless checkout
+   * deferral is active (see enterCheckoutDeferral), in which case that rewrite
+   * is left to a later load or to saveOverlayPostCheckout.
    */
   DirContents loadOverlayDir(InodeNumber inodeNumber);
 
+  /**
+   * While checkout deferral is active, loadOverlayDir() skips its opportunistic
+   * read-side WAL flush; the WAL is instead cleared by saveOverlayPostCheckout
+   * or replayed idempotently on a later load. Reference-counted so concurrent
+   * checkout contexts (e.g. setPathObjectId, which does not serialize via
+   * beginCheckout) compose correctly.
+   */
+  void enterCheckoutDeferral() noexcept {
+    checkoutDeferralCount_.fetch_add(1, std::memory_order_release);
+  }
+
+  void exitCheckoutDeferral() noexcept {
+    checkoutDeferralCount_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
   void removeOverlayFile(InodeNumber inodeNumber);
+
+  /**
+   * Free the InodeMetadataTable record of an inode that has no overlay file,
+   * if there is one. A no-op on Windows, which has no metadata table.
+   */
+  void freeInodeMetadata(InodeNumber inodeNumber);
 
   void removeOverlayDir(InodeNumber inodeNumber);
 
@@ -246,6 +273,18 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
    * GC thread instead of blocking the caller.
    */
   void recursivelyRemoveOverlayDirBackground(InodeNumber inodeNumber);
+
+  /**
+   * Queue the removal of an unlinked inode's overlay data to the GC thread.
+   * openFile, if set, is released there before the removal. Returns false
+   * without queueing when overlay:background-inode-removal is off or the GC
+   * thread is too far behind, so the caller removes the data itself and the
+   * queue and its descriptors stay bounded.
+   */
+  bool removeOverlayDataInBackground(
+      InodeNumber inodeNumber,
+      bool isDir,
+      std::shared_ptr<void>&& openFile);
 
   /**
    * Returns a future that completes once all previously-issued async
@@ -301,6 +340,11 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
       const DirContents& content);
   void removeChildren(InodeNumber parent, const DirContents& content);
 
+  /**
+   * Persist a rename using post-rename directory contents. For snapshot-backed
+   * catalogs, dstContent must contain dstName; otherwise this reports a caller
+   * bug before writing either directory.
+   */
   void renameChild(
       InodeNumber src,
       InodeNumber dst,
@@ -417,8 +461,10 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
    * Inline compaction with a hard byte cap. On each call:
    *   - If `walFileSizeBytes >= walCompactionByteCap_`, compact
    *     unconditionally.
-   *   - Else roll 1-in-`walCompactionMultiplier_ * max(content.size(), 10)`
-   *     and compact on a hit.
+   *   - Else roll 1-in-max(`walMinCompactionThreshold_`,
+   *     `walCompactionMultiplier_ * content.size()`) and compact on a hit.
+   *     With no floor configured, roll
+   *     1-in-`walCompactionMultiplier_ * max(content.size(), 10)`.
    *
    * The hard byte cap is a real upper bound on the on-disk WAL size; the
    * probabilistic roll keeps the typical-case compaction rate
@@ -479,11 +525,24 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
      */
     explicit GCRequest(InodeNumber ino) : requestType{ino} {}
 
+    /**
+     * Request to remove the overlay data of one unlinked inode. openFile is
+     * the cached open overlay file, if any, released on the GC thread so the
+     * filesystem's inode eviction happens there too.
+     */
+    struct RemoveInodeRequest {
+      InodeNumber ino;
+      bool isDir;
+      std::shared_ptr<void> openFile;
+    };
+    explicit GCRequest(RemoveInodeRequest req) : requestType{std::move(req)} {}
+
     std::variant<
         MaintenanceRequest,
         overlay::OverlayDir,
         FlushRequest,
-        InodeNumber>
+        InodeNumber,
+        RemoveInodeRequest>
         requestType;
   };
 
@@ -524,6 +583,7 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
    * Returns true if the overlay should be rewritten.
    */
   bool buildDirEntries(
+      InodeNumber inodeNumber,
       OverlayEntrySource source,
       folly::fbvector<std::pair<PathComponent, DirEntry>>& entries);
 
@@ -531,15 +591,34 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
   void decOutstandingIORequests();
   void closeAndWaitForOutstandingIO();
 
+#ifndef _WIN32
+  void initializeInodeReservation(uint64_t nextInodeNumber);
+  void ensureInodeReservation(uint64_t allocatedEnd);
+  void saveInodeReservation(uint64_t reservation);
+#endif
+
   bool hadCleanStartup_{false};
 
   /**
    * The next inode number to allocate.  Zero indicates that neither
    * initializeFromTakeover nor getMaxRecordedInode have been called.
    *
+   * Persists on disk on clean exit.
+   *
    * This value will never be 1.
    */
   std::atomic<uint64_t> nextInodeNumber_{0};
+
+#ifndef _WIN32
+  /**
+   * Inode reservation state, like `(nextInodeNumber / N + 1) * N`.
+   *
+   * Persists (+fsync-ed) on disk in all cases.
+   * The on-disk state is designed to be always >= `nextInodeNumber`.
+   */
+  std::atomic<uint64_t> inodeReservation_{0};
+  folly::Synchronized<folly::Unit, std::mutex> inodeReservationUpdateLock_;
+#endif
 
   std::unique_ptr<FileContentStore> fileContentStore_;
   std::unique_ptr<InodeCatalog> inodeCatalog_;
@@ -600,6 +679,8 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
   // ServerState outlives all EdenMount instances.
   ErrorLogger& errorLogger_;
   EdenStatsPtr stats_;
+  // Retained so renameChild can read the rollback setting after config reloads.
+  std::shared_ptr<ReloadableConfig> reloadableConfig_;
 
   // Borrowed from EdenServer. Valid for Overlay's lifetime because
   // EdenServer::unmountAll() completes before semaphore destruction.
@@ -612,9 +693,68 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
 
   bool useDirectFileWrites_;
 
+  bool useInodeReservation_;
+
   bool useWal_{false};
+  bool backgroundInodeRemoval_{false};
   size_t walCompactionMultiplier_{3};
   uint64_t walCompactionByteCap_{5'000'000};
+
+  /**
+   * Floor on the WAL compaction probability denominator; 0 uses the
+   * previous formula. Gated by
+   * experimental:overlay-wal-min-compaction-threshold.
+   */
+  size_t walMinCompactionThreshold_{0};
+#ifndef _WIN32
+  // Deliberate platform-scoped visibility switch: the pool's public API
+  // and its private machinery both exist only on non-Windows builds.
+ public:
+  /**
+   * Claim a pre-created overlay file (with its already-reserved inode
+   * number) from the preallocation pool, writing `contents` into it if
+   * non-empty. Returns nullopt when the pool is disabled, empty, or not
+   * supported by the backing store; callers then fall back to
+   * allocateInodeNumber() + createOverlayFile().
+   */
+  std::optional<std::pair<InodeNumber, OverlayFile>> tryClaimPreparedFile(
+      folly::ByteRange contents);
+
+  /**
+   * Claim an inode number whose empty overlay directory record was already
+   * written by the preallocation thread, so mkdir needs no overlay write
+   * for the new child on the request path. Returns nullopt when the pool
+   * is disabled or empty; callers then fall back to allocateInodeNumber()
+   * + saveOverlayDir().
+   */
+  std::optional<InodeNumber> tryClaimPreparedDir();
+
+ private:
+  void preallocThreadLoop();
+  void stopPreallocThread();
+
+  struct PreparedFile {
+    InodeNumber number;
+    folly::File file;
+  };
+
+  /**
+   * Pre-created overlay files for future file inodes: each entry's inode
+   * number is already allocated (reserved exclusively for the pool) and its
+   * on-disk file exists containing the standard file header, with the fd
+   * positioned just past the header. Claiming one makes file creation free
+   * of filesystem syscalls on the request path.
+   */
+  size_t filePreallocPoolSize_{0};
+  size_t dirPreallocPoolSize_{0};
+  std::mutex preallocMutex_;
+  std::condition_variable preallocCondVar_;
+  std::vector<PreparedFile> preallocPool_;
+  std::vector<InodeNumber> preallocDirPool_;
+  bool preallocStop_{false};
+  bool preallocBroken_{false};
+  std::thread preallocThread_;
+#endif // !_WIN32
 
   /**
    * RNG used by `maybeCompactWal` to roll for inline compaction.
@@ -646,6 +786,14 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
    * mutates `dir`.
    */
   void mergeWalIntoOverlayDir(InodeNumber parent, overlay::OverlayDir& dir);
+
+  bool shouldDeferWalFlush() const noexcept {
+    return checkoutDeferralCount_.load(std::memory_order_acquire) != 0;
+  }
+
+  // Number of in-flight checkout contexts deferring read-side WAL flush. Set on
+  // checkout threads, read by parallel inode-load workers in loadOverlayDir().
+  std::atomic<uint32_t> checkoutDeferralCount_{0};
 };
 
 constexpr InodeCatalogType kDefaultInodeCatalogType =

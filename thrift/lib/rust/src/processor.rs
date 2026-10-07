@@ -44,8 +44,15 @@ use crate::ttype::TType;
 pub enum SerializedStreamElement<Payload> {
     /// A normal stream response, without any error. Contains the serialized response.
     Success(Payload),
-    /// Contains the serialized declared exception.
-    DeclaredException(Payload),
+    /// Contains the serialized declared exception, plus the declared thrift
+    /// exception type name and message (for stream error metadata `name_utf8`
+    /// and `what_utf8`; empty if unavailable). These let consumers avoid logging
+    /// an empty error reason, mirroring C++ `encode_stream_exception`.
+    DeclaredException {
+        payload: Payload,
+        ex_name: String,
+        ex_what: String,
+    },
     /// Contains the application exception.
     ApplicationException(ApplicationException),
 }
@@ -313,13 +320,11 @@ where
     /// Given a method index and the remains of the message input, get a future
     /// for the result of the method. This will only be called if the corresponding
     /// `method_idx()` returns an (index, ServiceProcessor) tuple.
-    /// `frame` is a reference to the frame containing the request.
     /// `request` is a deserializer instance set up to decode the request.
     async fn handle_method(
         &self,
         idx: usize,
-        //frame: &P::Frame,
-        d: &mut P::Deserializer,
+        d: P::Deserializer,
         req: ProtocolDecoded<P>,
         req_ctxt: &Self::RequestContext,
         reply_state: Arc<Self::ReplyState>,
@@ -396,8 +401,7 @@ where
     async fn handle_method(
         &self,
         _idx: usize,
-        //_frame: &P::Frame,
-        _d: &mut P::Deserializer,
+        _d: P::Deserializer,
         _req: ProtocolDecoded<P>,
         _req_ctxt: &R,
         _reply_state: Arc<RS>,

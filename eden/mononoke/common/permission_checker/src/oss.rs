@@ -56,10 +56,6 @@ impl MononokeIdentity {
         MononokeIdentitySet::new()
     }
 
-    pub fn try_from_ssh_encoded(_encoded: &str) -> Result<MononokeIdentitySet> {
-        bail!("Decoding from SSH Principals is not yet implemented for MononokeIdentity")
-    }
-
     pub fn try_from_json_encoded(_: &str) -> Result<MononokeIdentitySet> {
         bail!("Decoding from JSON is not yet implemented for MononokeIdentity")
     }
@@ -67,6 +63,12 @@ impl MononokeIdentity {
     pub fn try_from_legacy_encoded(_: &str) -> Result<MononokeIdentitySet> {
         bail!(
             "Decoding legacy scm_forwarded_identities is not yet implemented for MononokeIdentity"
+        )
+    }
+
+    pub fn try_from_thrift_compact_bytes(_: &[u8]) -> Result<MononokeIdentitySet> {
+        bail!(
+            "Decoding compact-encoded AuthenticatedIdentity is not supported for MononokeIdentity in OSS builds"
         )
     }
 
@@ -118,11 +120,19 @@ impl MononokeIdentitySetExt for MononokeIdentitySet {
         None
     }
 
+    fn sandcastle_job_id(&self) -> Option<&str> {
+        None
+    }
+
+    fn on_demand_type(&self) -> Option<&str> {
+        None
+    }
+
     fn main_client_identity(&self, _sandcastle_alias: Option<&str>) -> String {
         String::from("PLACEHOLDER_CLIENT_IDENTITY")
     }
 
-    fn client_category(&self) -> ClientCategory {
+    fn client_category(&self, _sandcastle_alias: Option<&str>) -> ClientCategory {
         ClientCategory::Unknown
     }
 

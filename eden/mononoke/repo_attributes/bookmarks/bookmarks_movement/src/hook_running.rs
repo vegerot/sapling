@@ -9,13 +9,16 @@ use std::collections::HashMap;
 
 use anyhow::Context;
 use anyhow::Result;
+use bookmarks_types::AnnotatedTags;
 use bookmarks_types::BookmarkKey;
 use bytes::Bytes;
 use context::CoreContext;
 use futures_stats::TimedFutureExt;
 use hooks::CrossRepoPushSource;
+use hooks::HookExecutionPurpose;
 use hooks::HookManager;
 use hooks::HookOutcome;
+use hooks::LogOnlyRejections;
 use hooks::PushAuthoredBy;
 use mononoke_types::BonsaiChangeset;
 use thiserror::Error;
@@ -89,6 +92,7 @@ pub async fn run_bookmark_hooks(
     pushvars: Option<&HashMap<String, Bytes>>,
     cross_repo_push_source: CrossRepoPushSource,
     push_authored_by: PushAuthoredBy,
+    annotated_tags: Option<&AnnotatedTags>,
 ) -> Result<(), BookmarkMovementError> {
     if cross_repo_push_source == CrossRepoPushSource::PushRedirected {
         let disable_running_hooks_in_pushredirected_repo = justknobs::eval(
@@ -145,6 +149,7 @@ pub async fn run_bookmark_hooks(
             pushvars,
             cross_repo_push_source,
             push_authored_by,
+            annotated_tags,
         )
         .timed()
         .await;
@@ -228,6 +233,9 @@ pub async fn run_changeset_hooks(
             pushvars,
             cross_repo_push_source,
             push_authored_by,
+            HookExecutionPurpose::LandAttempt,
+            None,
+            LogOnlyRejections::Suppress,
         )
         .timed()
         .await;

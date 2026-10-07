@@ -41,7 +41,7 @@ from typing import Optional
 
 from bindings import cats, clientinfo, zstd
 
-from . import error, httpconnection, progress, sslutil, stdiopeer, url, util
+from . import edenapi, error, httpconnection, progress, sslutil, stdiopeer, url, util
 from .i18n import _
 from .thirdparty.pysocks import socks
 
@@ -241,6 +241,7 @@ class mononokepeer(stdiopeer.stdiopeer):
         self._unix_socket_proxy = ui.config("auth_proxy", "unix_socket_path")
         self._auth_proxy_http = ui.config("auth_proxy", "http_proxy")
         self._confheaders = ui.config("http", "extra_headers_json")
+        self._direct_host = ui.config("mononoke", "direct-host")
         self._verbose = ui.configbool("http", "verbose")
 
         self._proxyhandler = url.proxyhandler(ui)
@@ -360,6 +361,16 @@ class mononokepeer(stdiopeer.stdiopeer):
             except IOError as ex:
                 self._connectionerror(ex, tlserror=True)
 
+    @util.propertycache
+    def nullableedenapi(self):
+        # A mono:// remote always serves SLAPI, so build a client from our own
+        # URL (cached). Return None on failure so callers fall back to wireproto.
+        try:
+            return edenapi.getclient(self._ui, path=self._url)
+        except Exception as e:
+            self._ui.debug("failed to build SLAPI client for %s: %s\n" % (self._url, e))
+            return None
+
     def _validaterepo(self):
         # cleanup up previous run
         self._cleanup()
@@ -397,9 +408,17 @@ class mononokepeer(stdiopeer.stdiopeer):
                 if os.getenv("CLIENT_DEBUG"):
                     headers["X-Client-Debug"] = "true"
 
+                # Pin the request to a specific Mononoke host behind Proxygen.
+                # The value is a "host:port" that a Proxygen
+                # server_selection_type=Direct rule reads off this header to
+                # route to that exact backend.
+                if self._direct_host:
+                    headers["x-mononoke-direct-host"] = self._direct_host
+
                 if self._confheaders:
                     headers.update(json.loads(self._confheaders))
 
+                headers.update(clientinfo.outgoing_trace(self._host.encode()))
                 headersstr = b"\r\n".join(
                     map(lambda x: (x[0] + ": " + x[1]).encode(), headers.items())
                 )

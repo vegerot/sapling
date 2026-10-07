@@ -8,6 +8,7 @@
 #ifndef _WIN32
 
 #include "eden/fs/privhelper/PrivHelperServer.h"
+#include "eden/fs/privhelper/PinScan.h"
 #include "eden/fs/privhelper/PrivHelperConn.h"
 #include "eden/fs/privhelper/PrivHelperRollback.h"
 
@@ -23,6 +24,7 @@
 #include <folly/init/Init.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
+#include <folly/io/async/AsyncSignalHandler.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/logging/LogConfigParser.h>
 #include <folly/logging/LoggerDB.h>
@@ -39,25 +41,20 @@
 #include <sys/syscall.h>
 #endif
 #include <sys/types.h>
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include "eden/common/utils/PathFuncs.h"
-#include "eden/common/utils/SysctlUtil.h"
 #include "eden/common/utils/Throw.h"
 #include "eden/fs/privhelper/NfsMountRpc.h"
+#include "eden/fs/privhelper/RestartSentinel.h"
 #include "eden/fs/privhelper/priority/ProcessPriority.h"
 #include "eden/fs/utils/MountInfoTable.h"
 
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h> // @manual
 #include <IOKit/kext/KextManager.h> // @manual
-#include <eden/common/utils/Pipe.h>
-#include <eden/common/utils/SpawnedProcess.h>
-#include <fuse_ioctl.h> // @manual
-#include <fuse_mount.h> // @manual
-#include <grp.h> // @manual
 #include <sys/ioccom.h> // @manual
-#include <sys/sysctl.h> // @manual
 #endif
 
 using folly::checkUnixError;
@@ -340,9 +337,77 @@ folly::File PrivHelperServer::openBindMountTarget(
 #endif
 }
 
-PrivHelperServer::PrivHelperServer() = default;
+namespace {
+uint64_t currentEpochSeconds() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
+/** Set key in env, replacing every entry already there for it. */
+void setEnv(
+    std::vector<std::pair<std::string, std::string>>& env,
+    folly::StringPiece key,
+    std::string value) {
+  // Every match goes, not just the first: spawnEdenFs() applies the pairs in
+  // order, so a duplicate left behind would overwrite what this sets.
+  const auto removed =
+      std::remove_if(env.begin(), env.end(), [key](const auto& entry) {
+        return entry.first == key;
+      });
+  env.erase(removed, env.end());
+  env.emplace_back(key.str(), std::move(value));
+}
+
+bool spawnEdenFs(
+    const AbsolutePath& binary,
+    const std::vector<std::string>& argv,
+    const std::vector<std::pair<std::string, std::string>>& env) {
+  SpawnedProcess::Options opts;
+  opts.executablePath(binary);
+  opts.nullStdin();
+  opts.resetIds();
+
+  auto& environment = opts.environment();
+  environment.clear();
+  for (const auto& [key, value] : env) {
+    environment.set(key, value);
+  }
+
+  try {
+    SpawnedProcess proc(argv, std::move(opts));
+    XLOGF(
+        INFO,
+        "relaunched edenfs as pid {}; waiting for startup to finish",
+        proc.pid());
+    const auto status = proc.waitOrTerminateOrKill(
+        kSupervisorStartupTimeout, kRestartTerminationTimeout);
+    if (status.state() != ProcessStatus::Exited || status.exitStatus() != 0) {
+      throw std::runtime_error(
+          folly::to<std::string>("relaunched edenfs process ", status.str()));
+    }
+    return true;
+  } catch (const std::exception& ex) {
+    XLOGF(ERR, "failed to relaunch edenfs: {}", folly::exceptionStr(ex));
+    return false;
+  }
+}
+} // namespace
+
+PrivHelperServer::PrivHelperServer()
+    : spawnEdenFs_{spawnEdenFs}, now_{currentEpochSeconds} {}
 
 PrivHelperServer::~PrivHelperServer() = default;
+
+void detachFromParentProcessGroup() {
+  if (setsid() == static_cast<pid_t>(-1)) {
+    XLOGF(
+        WARN,
+        "privhelper failed to detach into a new session: {}",
+        folly::errnoStr(errno));
+  }
+}
 
 void PrivHelperServer::init(folly::File socket, uid_t uid, gid_t gid) {
   initPartial(std::move(socket), uid, gid);
@@ -370,63 +435,13 @@ void PrivHelperServer::initPartial(folly::File socket, uid_t uid, gid_t gid) {
   conn_ = UnixSocket::makeUnique(eventBase_.get(), std::move(socket));
   uid_ = uid;
   gid_ = gid;
+  sentinel_.emplace(uid);
 
   folly::checkPosixError(chdir("/"), "privhelper failed to chdir(/)");
 }
 
 #ifdef __APPLE__
 namespace {
-
-std::pair<int, int> determineMacOsVersion() {
-  auto version = getSysCtlByName("kern.osproductversion", 64);
-
-  int major, minor, patch;
-  if (sscanf(version.c_str(), "%d.%d.%d", &major, &minor, &patch) < 2) {
-    folly::throwSystemErrorExplicit(
-        EINVAL, "failed to parse kern.osproductversion string ", version);
-  }
-
-  return std::make_pair(major, minor);
-}
-
-std::string computeOSXFuseKextPath() {
-  auto version = determineMacOsVersion();
-  // Starting from Big Sur (macOS 11), we no longer need to look for the second
-  // number since it is now a _real_ minor version number.
-  if (version.first >= 11) {
-    return folly::to<std::string>(
-        OSXFUSE_EXTENSIONS_PATH, "/", version.first, "/", OSXFUSE_KEXT_NAME);
-  }
-  return folly::to<std::string>(
-      OSXFUSE_EXTENSIONS_PATH,
-      "/",
-      version.first,
-      ".",
-      version.second,
-      "/",
-      OSXFUSE_KEXT_NAME);
-}
-
-std::string computeEdenFsKextPath() {
-  auto version = determineMacOsVersion();
-  return folly::to<std::string>(
-      "/Library/Filesystems/eden.fs/Contents/Extensions/",
-      version.first,
-      ".",
-      version.second,
-      "/edenfs.kext");
-}
-
-// Returns true if the system already knows about the fuse filesystem stuff
-bool shouldLoadOSXFuseKext() {
-  struct vfsconf vfc;
-  return getvfsbyname("osxfuse", &vfc) != 0;
-}
-
-bool shouldLoadEdenFsKext() {
-  struct vfsconf vfc;
-  return getvfsbyname("edenfs", &vfc) != 0;
-}
 
 constexpr folly::StringPiece kNfsExtensionPath =
     "/System/Library/Extensions/nfs.kext";
@@ -461,320 +476,14 @@ bool tryLoadKext(const std::string& kextPathString) {
 
   if (ret != kOSReturnSuccess) {
     XLOGF(ERR, "Failed to load {}: error code {}", kextPathString, ret);
-    // Soft error: we might be able to continue with MacFuse
     return false;
   }
 
   return true;
 }
 
-void updateOSXFuseAdminGroup() {
-  // libfuse uses a sysctl to update the kext's idea of the admin group,
-  // so we do too!
-  auto adminGroup = getgrnam(MACOSX_ADMIN_GROUP_NAME);
-  if (adminGroup) {
-    int gid = adminGroup->gr_gid;
-    sysctlbyname(OSXFUSE_SYSCTL_TUNABLES_ADMIN, NULL, NULL, &gid, sizeof(gid));
-  }
-}
-
 bool loadNfsKext() {
   return tryLoadKext(kNfsExtensionPath.str());
-}
-
-// The osxfuse kernel doesn't automatically assign a device, so we have
-// to loop through the different units and attempt to allocate them,
-// one by one.  Returns the fd and its unit number on success, throws
-// an exception on error.
-std::pair<folly::File, int> allocateFuseDevice(bool useDevEdenFs) {
-  if (useDevEdenFs) {
-    if (shouldLoadEdenFsKext()) {
-      tryLoadKext(computeEdenFsKextPath());
-      updateOSXFuseAdminGroup();
-    }
-  } else if (shouldLoadOSXFuseKext()) {
-    tryLoadKext(computeOSXFuseKextPath());
-    updateOSXFuseAdminGroup();
-  }
-
-  int fd = -1;
-  const int nDevices = OSXFUSE_NDEVICES;
-  int dindex;
-  for (dindex = 0; dindex < nDevices; dindex++) {
-    auto devName = folly::to<std::string>(
-        useDevEdenFs ? "/dev/edenfs" : "/dev/osxfuse", dindex);
-    fd = folly::openNoInt(devName.c_str(), O_RDWR | O_CLOEXEC);
-    if (fd >= 0) {
-      return std::make_pair(folly::File{fd, true}, dindex);
-    }
-
-    if (errno == EBUSY) {
-      continue;
-    }
-    if (errno == ENODEV || errno == ENOENT) {
-      throwSystemError(
-          "failed to open ",
-          devName,
-          ": make sure the osxfuse kernel module is loaded");
-    } else {
-      throwSystemError("failed to open ", devName);
-    }
-  }
-
-  throwSystemError(
-      "unable to allocate an osxfuse device, "
-      "either all instances are busy or the kernel module is not loaded");
-}
-
-template <typename T, std::size_t Size>
-void checkThenPlaceInBuffer(T (&buf)[Size], folly::StringPiece data) {
-  if (data.size() >= Size) {
-    throwf<std::runtime_error>(
-        "string exceeds buffer size in snprintf.  result was {}", data);
-  }
-
-  memcpy(buf, data.data(), data.size());
-  buf[data.size()] = '\0';
-}
-
-// Mount osxfuse (3.x)
-folly::File mountOSXFuse(
-    const char* mountPath,
-    bool readOnly,
-    std::chrono::nanoseconds fuseTimeout,
-    bool useDevEdenFs) {
-  auto [fuseDev, dindex] = allocateFuseDevice(useDevEdenFs);
-
-  fuse_mount_args args{};
-  auto canonicalPath = ::realpath(mountPath, NULL);
-  if (!canonicalPath) {
-    folly::throwSystemError("failed to realpath ", mountPath);
-  }
-  SCOPE_EXIT {
-    free(canonicalPath);
-  };
-  if (strlen(canonicalPath) >= sizeof(args.mntpath) - 1) {
-    folly::throwSystemErrorExplicit(
-        EINVAL, "mount path ", canonicalPath, " is too large for args.mntpath");
-  }
-  strcpy(args.mntpath, canonicalPath);
-
-  // The most important part of the osxfuse mount protocol is to prove
-  // to the mount() syscall that we own an opened unit.  We do this by
-  // copying the rdev from the fd and by performing a magic ioctl to
-  // get a magic cookie and putting both of those values into the
-  // fuse_mount_args struct.
-  struct stat st;
-  checkUnixError(fstat(fuseDev.fd(), &st));
-  args.rdev = st.st_rdev;
-
-  checkUnixError(
-      ioctl(fuseDev.fd(), FUSEDEVIOCGETRANDOM, &args.random),
-      "failed negotiation with ioctl FUSEDEVIOCGETRANDOM");
-
-  // We get to set some metadata for the mounted volume
-  checkThenPlaceInBuffer(
-      args.fsname,
-      fmt::format(
-          "eden@{}{}",
-          useDevEdenFs ? "edenfs" : OSXFUSE_DEVICE_BASENAME,
-          dindex));
-  args.altflags |= FUSE_MOPT_FSNAME;
-
-  auto mountPathBaseName = basename(canonicalPath);
-  checkThenPlaceInBuffer(args.volname, mountPathBaseName);
-  args.altflags |= FUSE_MOPT_VOLNAME;
-
-  checkThenPlaceInBuffer(args.fstypename, "eden");
-  args.altflags |= FUSE_MOPT_FSTYPENAME;
-
-  // And some misc other options...
-
-  args.blocksize = FUSE_DEFAULT_BLOCKSIZE;
-  args.altflags |= FUSE_MOPT_BLOCKSIZE;
-
-  // The daemon timeout is a hard timeout for fuse request processing.
-  // If the timeout is reached, the kernel will shut down the fuse
-  // connection.
-  auto daemon_timeout_seconds =
-      std::chrono::duration_cast<std::chrono::seconds>(fuseTimeout).count();
-  if (daemon_timeout_seconds > FUSE_MAX_DAEMON_TIMEOUT) {
-    args.daemon_timeout = FUSE_MAX_DAEMON_TIMEOUT;
-  } else {
-    args.daemon_timeout = daemon_timeout_seconds;
-  }
-  XLOGF(
-      ERR,
-      "Max daemon timeout ({}) exceeded. Setting daemon_timeout to {}",
-      FUSE_MAX_DAEMON_TIMEOUT,
-      args.daemon_timeout);
-  args.altflags |= FUSE_MOPT_DAEMON_TIMEOUT;
-
-  // maximum iosize for reading or writing.  We want to allow a much
-  // larger default than osxfuse normally provides so that clients
-  // can minimize the number of read(2)/write(2) calls needed to
-  // write a given chunk of data.
-  args.iosize = 1024 * 1024;
-  args.altflags |= FUSE_MOPT_IOSIZE;
-
-  // We want normal unix permissions semantics; do not blanket deny
-  // access to !owner.  Do not send access(2) calls to userspace.
-  args.altflags |= FUSE_MOPT_ALLOW_OTHER | FUSE_MOPT_DEFAULT_PERMISSIONS;
-
-  int mountFlags = MNT_NOSUID;
-  if (readOnly) {
-    mountFlags |= MNT_RDONLY;
-  }
-
-  // The mount() syscall can internally attempt to interrogate the filesystem
-  // before it returns to us here.  We can't respond to those requests
-  // until we have passed the device back to the dispatcher so we're forced
-  // to do a little asynchronous dance and run the mount in a separate
-  // thread.
-  // We'd like to be able to catch invalid parameters detected by mount;
-  // those are likely to be immediately returned to us, so we commit a
-  // minor crime here and allow the mount thread to set the errno into
-  // a shared value.
-  // Then we can wait for a short grace period to see if that got populated
-  // with an error and propagate that.
-  auto shared_errno = std::make_shared<std::atomic<int>>(0);
-
-  auto thr =
-      std::thread([args, mountFlags, useDevEdenFs, shared_errno]() mutable {
-        auto devName = useDevEdenFs ? "edenfs" : OSXFUSE_NAME;
-        auto res = mount(devName, args.mntpath, mountFlags, &args);
-        if (res != 0) {
-          *shared_errno = errno;
-          XLOGF(
-              ERR,
-              "failed to mount {} using {}: {}",
-              args.mntpath,
-              devName,
-              folly::errnoStr(*shared_errno));
-        }
-      });
-  thr.detach();
-
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  if (*shared_errno) {
-    folly::throwSystemErrorExplicit(
-        *shared_errno, "mount failed for ", args.mntpath);
-  }
-
-  return std::move(fuseDev);
-}
-
-// Mount MacFuse (4.x)
-// MacFuse is a closed-source fork of osxfuse.  In 4.x the mount procedure
-// became opaque behind a loader utility that performs the actual mount syscall
-// using an undocumented and backwards incompatible mount protocol to prior
-// versions. This function uses that utility to perform the mount procedure.
-folly::File mountMacFuse(
-    const char* mountPath,
-    bool readOnly,
-    std::chrono::nanoseconds fuseTimeout) {
-  if (readOnly) {
-    folly::throwSystemErrorExplicit(
-        EINVAL, "MacFUSE doesn't support read-only mounts");
-  }
-
-  // mount_macfuse will send the fuse device descriptor back to us
-  // over a unix domain socket; we create the connected pair here
-  // and pass the descriptor to mount_macfuse via the _FUSE_COMMFD
-  // environment variable below.
-  SocketPair socketPair;
-  SpawnedProcess::Options opts;
-
-  auto commFd = opts.inheritDescriptor(std::move(socketPair.write));
-  // mount_macfuse refuses to do anything unless this is set
-  opts.environment().set("_FUSE_CALL_BY_LIB", "1");
-  // Tell it which unix socket to use to pass back the device
-  opts.environment().set("_FUSE_COMMFD", folly::to<std::string>(commFd));
-  // Tell it to use version 2 of the mount protocol
-  opts.environment().set("_FUSE_COMMVERS", "2");
-  // It is unclear what purpose passing the daemon path serves, but
-  // libfuse does this, and thus we do also.
-  opts.environment().set("_FUSE_DAEMON_PATH", executablePath().asString());
-
-  AbsolutePath canonicalPath = realpath(mountPath);
-
-  // These options are equivalent to those that are explained in more
-  // detail in mountOSXFuse() above.
-  std::vector<std::string> args = {
-      "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse",
-      "-ofsname=eden",
-      fmt::format("-ovolname={}", canonicalPath.basename()),
-      "-ofstypename=eden",
-      fmt::format("-oblocksize={}", FUSE_DEFAULT_BLOCKSIZE),
-      fmt::format(
-          "-odaemon_timeout={}",
-          std::chrono::duration_cast<std::chrono::seconds>(fuseTimeout)
-              .count()),
-      fmt::format("-oiosize={}", 1024 * 1024),
-      "-oallow_other",
-      "-odefault_permissions",
-      canonicalPath.asString(),
-  };
-
-  // Start the helper...
-  SpawnedProcess mounter(args, std::move(opts));
-  // ... but wait for it in another thread.
-  // We MUST NOT try to wait for it directly here as the mount protocol
-  // requires FUSE_INIT to be replied to before the mount_macfuse can
-  // return, and attempting to disrupt that can effectively deadlock
-  // macOS to the point that you need to powercycle!
-  // We move the process wait into a separate thread so that it can
-  // take its time to wait on the child process.
-  auto thr =
-      std::thread([proc = std::move(mounter)]() mutable { proc.wait(); });
-  // we can't wait for the thread for the same reason, so detach it.
-  thr.detach();
-
-  // Now, prepare to receive the fuse device descriptor via our socketpair.
-  struct iovec iov;
-  char buf[1];
-  char ccmsg[CMSG_SPACE(sizeof(int))];
-
-  iov.iov_base = buf;
-  iov.iov_len = sizeof(buf);
-
-  struct msghdr msg{};
-  msg.msg_iov = &iov;
-  msg.msg_iovlen = 1;
-  msg.msg_control = ccmsg;
-  msg.msg_controllen = sizeof(ccmsg);
-
-  while (1) {
-    auto rv = recvmsg(socketPair.read.fd(), &msg, 0);
-    if (rv == -1 && errno == EINTR) {
-      continue;
-    }
-    if (rv == -1) {
-      folly::throwSystemErrorExplicit(
-          errno, "failed to recvmsg the fuse device descriptor from MacFUSE");
-    }
-    if (rv == 0) {
-      folly::throwSystemErrorExplicit(
-          ECONNRESET,
-          "failed to recvmsg the fuse device descriptor from MacFUSE");
-    }
-    break;
-  }
-
-  auto cmsg = CMSG_FIRSTHDR(&msg);
-  if (cmsg->cmsg_type != SCM_RIGHTS) {
-    folly::throwSystemErrorExplicit(
-        EINVAL,
-        "MacFUSE didn't send SCM_RIGHTS message while transferring fuse device descriptor");
-  }
-
-  // Got it; copy the bytes into something with the right type
-  int fuseDevice;
-  memcpy(&fuseDevice, CMSG_DATA(cmsg), sizeof(fuseDevice));
-
-  // and take ownership!
-  // The caller will complete the FUSE_INIT handshake.
-  return folly::File{fuseDevice, true};
 }
 
 } // namespace
@@ -833,7 +542,10 @@ std::string makeLinuxNfsMountOptions(const NFSMountOptions& options) {
  * Configure FUSE read-ahead by writing to
  * /sys/class/bdi/{major}:{minor}/read_ahead_kb
  */
-void configureFuseReadAhead(const char* mountPath, uint32_t readAheadKb) {
+void configureFuseReadAhead(
+    const char* mountPath,
+    std::optional<int> mountFd,
+    uint32_t readAheadKb) {
   auto result = getMountInfoForPath(mountPath);
   if (result.hasError()) {
     XLOGF(
@@ -848,6 +560,24 @@ void configureFuseReadAhead(const char* mountPath, uint32_t readAheadKb) {
     return;
   }
   const auto& info = result.value().value();
+  if (mountFd) {
+    if (info.fsType != "fuse" &&
+        !folly::StringPiece(info.fsType).startsWith("fuse.")) {
+      throwf<std::domain_error>("{} is not a FUSE mount", mountPath);
+    }
+
+    // Cached metadata avoids requiring a response from the FUSE daemon.
+    struct statx st{};
+    checkUnixError(
+        statx(*mountFd, "", AT_EMPTY_PATH | AT_STATX_DONT_SYNC, STATX_INO, &st),
+        "stat registered mount ",
+        mountPath);
+    if (st.stx_dev_major != info.devMajor ||
+        st.stx_dev_minor != info.devMinor) {
+      throwf<std::domain_error>(
+          "{} no longer matches the registered mount", mountPath);
+    }
+  }
 
   auto bdiPath = fmt::format(
       "/sys/class/bdi/{}:{}/read_ahead_kb", info.devMajor, info.devMinor);
@@ -873,19 +603,10 @@ folly::File PrivHelperServer::fuseMount(
     bool readOnly,
     [[maybe_unused]] const char* vfsType) {
 #ifdef __APPLE__
-  if (useDevEdenFs_) {
-    return mountOSXFuse(mountPath, readOnly, fuseTimeout_, useDevEdenFs_);
-  }
-
-  try {
-    return mountMacFuse(mountPath, readOnly, fuseTimeout_);
-  } catch (const std::exception& macFuseExc) {
-    XLOGF(
-        ERR,
-        "Failed to mount using MacFuse, trying OSXFuse ({})",
-        folly::exceptionStr(macFuseExc));
-    return mountOSXFuse(mountPath, readOnly, fuseTimeout_, useDevEdenFs_);
-  }
+  (void)mountPath;
+  (void)readOnly;
+  folly::throwSystemErrorExplicit(
+      ENOTSUP, "FUSE mounts are not supported on macOS");
 #else
   auto fuseDev = openLinuxFuseDevice();
 
@@ -910,9 +631,8 @@ folly::File PrivHelperServer::fuseMount(
   if (readOnly) {
     mountFlags |= MS_RDONLY;
   }
-  // The colon indicates to coreutils/gnulib that this is a remote
-  // mount so it will not be displayed by `df --local`.
-  int rc = mount("edenfs:", mountPath, vfsType, mountFlags, mountOpts.c_str());
+  int rc = mount(
+      kEdenFsMountSource, mountPath, vfsType, mountFlags, mountOpts.c_str());
   checkUnixError(rc, "failed to mount");
   return fuseDev;
 #endif
@@ -941,9 +661,20 @@ PrivHelperServer::FuseMountResult PrivHelperServer::fuseMountByFd(
       gid_,
       fuseDev.fd());
 
-  auto fsFd = fsOpen(vfsType);
-  // The colon preserves the old "remote" source name used by mount(2).
-  fsConfigString(fsFd.fd(), "source", "edenfs:");
+  // fsopen(2) resolves only the base filesystem type. Unlike mount(2), it does
+  // not turn a dotted type such as "fuse.edenfs" into a FUSE subtype, so pass
+  // the suffix explicitly to keep the advertised type identical on both paths.
+  folly::StringPiece fsType{vfsType};
+  folly::StringPiece subtype;
+  if (const auto dot = fsType.find('.'); dot != folly::StringPiece::npos) {
+    subtype = fsType.subpiece(dot + 1);
+    fsType = fsType.subpiece(0, dot);
+  }
+  auto fsFd = fsOpen(fsType);
+  fsConfigString(fsFd.fd(), "source", kEdenFsMountSource);
+  if (!subtype.empty()) {
+    fsConfigString(fsFd.fd(), "subtype", subtype);
+  }
   fsConfigCommaSeparatedOptions(fsFd.fd(), mountOpts);
   fsConfigSet(fsFd.fd(), FSCONFIG_CMD_CREATE, nullptr, nullptr);
 
@@ -956,6 +687,16 @@ PrivHelperServer::FuseMountResult PrivHelperServer::fuseMountByFd(
       RegisteredMount{std::move(mountFd)},
   };
 }
+#endif
+
+bool needsFstypeOverride(const NFSMountOptions& options) {
+  return options.nfsdAddr.getFamily() == AF_UNIX;
+}
+
+#ifdef __APPLE__
+typedef char fstypename_t[MFSTYPENAMELEN];
+#define FSIOC_SET_FSTYPENAME_OVERRIDE _IOW('A', 10, fstypename_t)
+#define FSCTL_SET_FSTYPENAME_OVERRIDE IOCBASECMD(FSIOC_SET_FSTYPENAME_OVERRIDE)
 #endif
 
 void PrivHelperServer::nfsMount(
@@ -1019,8 +760,9 @@ void PrivHelperServer::nfsMount(
    * Enables or disables rdirplus (readdirplus) based on EdenConfig value
    * Sets the mount type to soft/hard (but make it interruptible) based on an
    *   EdenConfig value. While in theory we would always want the mount to be
-   *   soft, macOS force a maximum timeout of 60s, which in some case is too
-   *   short for files to be fetched, thus make it configurable.
+   *   soft, the macOS kernel gives up on a soft-mount request at most 30s
+   *   (NFS_MAXTIMEO / 2) after EdenFS stops answering promptly, which in some
+   *   cases is too short for files to be fetched, thus make it configurable.
    * Possibly specifies dumbtimer behavior, iff an EdenConfig value is
    *   explicitly set.
    * Suppresses macOS kernel JUKEBOX retry logging (NFS_MFLAG_MUTEJUKEBOX),
@@ -1217,18 +959,20 @@ void PrivHelperServer::nfsMount(
   /*
    * The fsctl syscall is completely undocumented, but it does contain a way to
    * override the f_fstypename returned by statfs. This allows watchman to
-   * properly detects the filesystem as EdenFS and not NFS (watchman refuses to
+   * properly detect the filesystem as EdenFS and not NFS (watchman refuses to
    * watch an NFS filesystem).
+   *
+   * Only mounts that lose their "edenfs:" mount source need it, because macOS
+   * guards the syscall: a setuid-root privhelper leaves an EXC_GUARD crash
+   * report on every mount, and on macOS 27.2 a non-root privhelper gets EPERM.
    */
-  typedef char fstypename_t[MFSTYPENAMELEN];
-#define FSIOC_SET_FSTYPENAME_OVERRIDE _IOW('A', 10, fstypename_t)
-#define FSCTL_SET_FSTYPENAME_OVERRIDE IOCBASECMD(FSIOC_SET_FSTYPENAME_OVERRIDE)
-
-  rc = fsctl(
-      mountPath.c_str(), FSCTL_SET_FSTYPENAME_OVERRIDE, (void*)"edenfs:", 0);
-  if (rc != 0) {
-    unmount(mountPath.c_str(), {});
-    checkUnixError(rc, "failed to fsctl");
+  if (needsFstypeOverride(options)) {
+    rc = fsctl(
+        mountPath.c_str(), FSCTL_SET_FSTYPENAME_OVERRIDE, (void*)"edenfs:", 0);
+    if (rc != 0) {
+      unmount(mountPath.c_str(), {});
+      checkUnixError(rc, "failed to fsctl");
+    }
   }
 
 #else
@@ -1321,6 +1065,7 @@ void PrivHelperServer::bindMount(
   throw std::runtime_error("this system does not support bind mounts");
 #else
   auto targetFd = openBindMountTarget(mountRoot, mountPath);
+  auto sourceFd = openPathAsUser(clientPath, R_OK | X_OK);
   XLOGF(
       DBG2,
       "Moving detached bind mount from `{}` to `{}` by fd",
@@ -1331,9 +1076,9 @@ void PrivHelperServer::bindMount(
   // fd. The target path is not re-resolved by string during the attach.
   auto treeFdNum = static_cast<int>(syscall(
       SYS_open_tree,
-      AT_FDCWD,
-      clientPath,
-      OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC));
+      sourceFd.fd(),
+      "",
+      AT_EMPTY_PATH | OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC));
   checkUnixError(
       treeFdNum, "failed to clone bind mount source `", clientPath, "`");
   folly::File treeFd{treeFdNum, /*ownsFd=*/true};
@@ -1361,6 +1106,27 @@ bool PrivHelperServer::useModernMountApi() const {
 #else
   return !disablePrivHelperHardening();
 #endif
+}
+
+void PrivHelperServer::unmountStaleMount(
+    const std::string& mountPoint,
+    [[maybe_unused]] int mountFd) {
+#ifdef __linux__
+  if (mountFd >= 0) {
+    const auto procFdPath = fmt::format("/proc/self/fd/{}", mountFd);
+    // A disconnected filesystem can reject stat(), but its pinned mount can
+    // still be unmounted. Never fall back to the caller's mutable pathname.
+    checkUnixError(
+        umount2(procFdPath.c_str(), linuxUnmountFlags({}, false)),
+        "failed to unmount stale mount ",
+        mountPoint);
+  } else
+#endif
+  {
+    unmount(mountPoint.c_str(), {});
+  }
+  mountPoints_.erase(mountPoint);
+  XLOGF(INFO, "Successfully unmounted stale mount {}", mountPoint);
 }
 
 void PrivHelperServer::unmount(
@@ -1414,13 +1180,22 @@ UnixSocket::Message PrivHelperServer::processTakeoverStartupMsg(
   // Skip stale bind mount cleanup on takeover: the kernel preserves live
   // redirections (e.g. buck-out) across a graceful restart, so unmounting
   // them here would destroy legitimate user state.
-  auto sanityResult = sanityCheckMountPoint(
-      mountPath,
-      /*isNFS=*/false,
-      /*isHardMount=*/false,
-      /*performBindMountCleanup=*/false);
-
+  //
+  // Skip the stale mount check too: the daemon is already serving this mount
+  // when it sends the takeover startup request, so there is nothing stale to
+  // detect.
+#ifndef __APPLE__
+  auto checkedMount = openAndSanityCheckMountPoint(
+      mountPath, SanityCheckOptions::forTakeover());
+  auto sanityResult = checkedMount.sanityResult;
+  // Ancestors can change after validation, so retain the checked directory.
+  registerMountPoint(
+      mountPath, RegisteredMount{std::move(checkedMount.targetFd)});
+#else
+  auto sanityResult =
+      sanityCheckMountPoint(mountPath, SanityCheckOptions::forTakeover());
   registerMountPoint(mountPath);
+#endif
   auto response = makeResponse();
   response.data.unshare();
   folly::io::Appender appender(&response.data, 0);
@@ -1437,7 +1212,8 @@ UnixSocket::Message PrivHelperServer::processMountMsg(Cursor& cursor) {
 
 #ifndef __APPLE__
   if (useModernMountApi()) {
-    auto checkedMount = openAndSanityCheckMountPoint(mountPath);
+    auto checkedMount = openAndSanityCheckMountPoint(
+        mountPath, SanityCheckOptions::forFuseMount());
     auto mountResult = fuseMountByFd(
         std::move(checkedMount.targetFd),
         mountPath.c_str(),
@@ -1461,7 +1237,8 @@ UnixSocket::Message PrivHelperServer::processMountMsg(Cursor& cursor) {
   }
 #endif
 
-  auto sanityResult = sanityCheckMountPoint(mountPath);
+  auto sanityResult =
+      sanityCheckMountPoint(mountPath, SanityCheckOptions::forFuseMount());
   auto fuseDev = fuseMount(mountPath.c_str(), readOnly, vfsType.c_str());
   registerMountPoint(mountPath);
 
@@ -1481,7 +1258,8 @@ UnixSocket::Message PrivHelperServer::processMountNfsMsg(Cursor& cursor) {
 #ifndef __APPLE__
   if (useModernMountApi()) {
     auto checkedMount = openAndSanityCheckMountPoint(
-        mountPath, /*isNFS=*/true, !options.useSoftMount);
+        mountPath,
+        SanityCheckOptions::forNfsMount(/*isHardMount=*/!options.useSoftMount));
     registerMountPoint(
         mountPath,
         nfsMountByFd(std::move(checkedMount.targetFd), mountPath, options));
@@ -1502,8 +1280,9 @@ UnixSocket::Message PrivHelperServer::processMountNfsMsg(Cursor& cursor) {
   }
 #endif
 
-  auto sanityResult =
-      sanityCheckMountPoint(mountPath, /*isNFS=*/true, !options.useSoftMount);
+  auto sanityResult = sanityCheckMountPoint(
+      mountPath,
+      SanityCheckOptions::forNfsMount(/*isHardMount=*/!options.useSoftMount));
   nfsMount(mountPath, std::move(options));
   registerMountPoint(mountPath);
 
@@ -1651,28 +1430,10 @@ void PrivHelperServer::setLogFile(folly::File logFile) {
   folly::checkUnixError(dup2(logFile.fd(), STDERR_FILENO));
 }
 
-UnixSocket::Message PrivHelperServer::processSetDaemonTimeout(
-    folly::io::Cursor& cursor,
-    UnixSocket::Message& /* request */) {
-  XLOG(DBG3, "set daemon timeout");
-  std::chrono::nanoseconds duration;
-  PrivHelperConn::parseSetDaemonTimeoutRequest(cursor, duration);
-
-  setDaemonTimeout(duration);
-
-  return makeResponse();
-}
-
-void PrivHelperServer::setDaemonTimeout(std::chrono::nanoseconds duration) {
-  fuseTimeout_ = duration;
-}
-
-UnixSocket::Message PrivHelperServer::processSetUseEdenFs(
-    folly::io::Cursor& cursor,
-    UnixSocket::Message& /* request */) {
-  XLOG(DBG3, "set use /dev/edenfs");
-  PrivHelperConn::parseSetUseEdenFsRequest(cursor, useDevEdenFs_);
-
+UnixSocket::Message PrivHelperServer::processLegacyMacFuseConfigRequest(
+    folly::io::Cursor& cursor) {
+  XLOG(DBG3, "legacy macOS FUSE configuration request");
+  PrivHelperConn::parseLegacyMacFuseConfigRequest(cursor);
   return makeResponse();
 }
 
@@ -1724,8 +1485,13 @@ UnixSocket::Message PrivHelperServer::processGetNamespaceInfo(
   return response;
 }
 
+AbsolutePath PrivHelperServer::getFamBinaryPath() const {
+  return canonicalPath(kFamBinaryPath);
+}
+
 UnixSocket::Message PrivHelperServer::processStartFam(
-    folly::io::Cursor& cursor) {
+    folly::io::Cursor& cursor,
+    UnixSocket::Message& request) {
   std::vector<std::string> paths;
   string tmpOutputPath;
   string specifiedOutputPath;
@@ -1733,6 +1499,11 @@ UnixSocket::Message PrivHelperServer::processStartFam(
 
   PrivHelperConn::parseStartFamRequest(
       cursor, paths, tmpOutputPath, specifiedOutputPath, shouldUpload);
+  if (request.files.size() != 1) {
+    throwf<std::runtime_error>(
+        "expected 1 output file descriptor with startFam() request; received {}",
+        request.files.size());
+  }
 
   // sanity check to make sure we have at least one path
   if (paths.empty()) {
@@ -1749,12 +1520,11 @@ UnixSocket::Message PrivHelperServer::processStartFam(
   XLOGF(DBG3, "FAM output file will be moved to \"{}\"", specifiedOutputPath);
 
   auto opts = SpawnedProcess::Options();
-  opts.open(
-      STDOUT_FILENO,
-      canonicalPath(tmpOutputPath),
-      OpenFileHandleOptions::writeFile()); // TODO[lxw]: This can fail if the
-                                           // folder doesn't exist
-  opts.executablePath(canonicalPath(kFamBinaryPath));
+  opts.dup2(
+      FileDescriptor(
+          request.files[0].release(), FileDescriptor::FDType::Generic),
+      STDOUT_FILENO);
+  opts.executablePath(getFamBinaryPath());
   std::vector<std::string> argv = {
       "SCMFileAccessMonitor",
       "--path-prefix",
@@ -1834,7 +1604,21 @@ UnixSocket::Message PrivHelperServer::processSetFuseReadAhead(
   uint32_t readAheadKb;
   PrivHelperConn::parseSetFuseReadAheadRequest(cursor, mountPath, readAheadKb);
 #ifndef __APPLE__
-  configureFuseReadAhead(mountPath.c_str(), readAheadKb);
+  if (disablePrivHelperHardening()) {
+    XLOGF(
+        WARN,
+        "Using legacy read-ahead configuration for `{}` because privhelper hardening is disabled",
+        mountPath);
+    configureFuseReadAhead(mountPath.c_str(), std::nullopt, readAheadKb);
+    return makeResponse();
+  }
+
+  const auto it = mountPoints_.find(mountPath);
+  if (it == mountPoints_.end()) {
+    throwf<std::domain_error>("No FUSE mount found for {}", mountPath);
+  }
+  configureFuseReadAhead(
+      mountPath.c_str(), it->second.rootFd.fd(), readAheadKb);
 #else
   (void)mountPath;
   (void)readAheadKb;
@@ -1844,7 +1628,7 @@ UnixSocket::Message PrivHelperServer::processSetFuseReadAhead(
 }
 
 void PrivHelperServer::setMemoryPriorityForProcess(pid_t pid, int priority) {
-  auto processPriority = ProcessPriority{priority};
+  auto processPriority = ProcessPriority{priority, uid_};
 
   if (processPriority.setPrioritiesForProcess(pid)) {
     throwf<std::runtime_error>(
@@ -1982,25 +1766,185 @@ void PrivHelperServer::bindUnmount(
   insecureBindUnmount(mountPath);
 }
 
-void PrivHelperServer::run() {
-  // Ignore SIGINT and SIGTERM.
-  // We should only exit when our parent process does.
-  // (Normally if someone hits Ctrl-C in their terminal this will send SIGINT
-  // to both our parent process and to us.  The parent process should exit due
-  // to this signal.  We don't want to exit immediately--we want to wait until
-  // the parent exits and then umount all outstanding mount points before we
-  // exit.)
-  if (signal(SIGINT, SIG_IGN) == SIG_ERR) {
-    XLOGF(
-        FATAL,
-        "error setting SIGINT handler in privhelper process: {}",
-        folly::errnoStr(errno));
+UnixSocket::Message PrivHelperServer::processSetRestartArgsMsg(Cursor& cursor) {
+  EdenFsRestartArgs args;
+  PrivHelperConn::parseSetRestartArgsRequest(cursor, args);
+  XLOGF(
+      INFO,
+      "received edenfs restart configuration: enabled={}, sentinel={}, restartCount={}, maxRestarts={}, windowSeconds={}",
+      args.enabled,
+      args.sentinelPath,
+      args.restartCount,
+      args.maxRestarts,
+      args.windowSeconds);
+  sentinel_->setConfig(std::move(args));
+  return makeResponse();
+}
+
+UnixSocket::Message PrivHelperServer::processNotifyCleanShutdownMsg(
+    Cursor& cursor) {
+  std::string reason;
+  PrivHelperConn::parseNotifyCleanShutdownRequest(cursor, reason);
+  XLOGF(INFO, "edenfs reported a deliberate shutdown: {}", reason);
+  sentinel_->noteCleanShutdown();
+  // One-way request: processAndSendResponse() discards this.
+  return makeResponse();
+}
+
+std::optional<AbsolutePath> PrivHelperServer::findSiblingEdenFs(
+    AbsolutePathPiece dir) {
+  auto sibling = dir + "edenfs"_relpath;
+
+  struct stat st{};
+  if (lstat(sibling.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+    return std::nullopt;
   }
-  if (signal(SIGTERM, SIG_IGN) == SIG_ERR) {
+  // A searchable directory passes X_OK, so the regular-file check above cannot
+  // be dropped in favour of this one.
+  if (::access(sibling.c_str(), X_OK) != 0) {
+    return std::nullopt;
+  }
+  return sibling;
+}
+
+AbsolutePath PrivHelperServer::resolveEdenFsBinary(
+    const RestartSentinel::RelaunchCommand& command) const {
+  const auto executable = executablePath();
+  const auto dir = executable.dirname();
+  if (const auto sibling = findSiblingEdenFs(dir)) {
+    return *sibling;
+  }
+
+  // Dev and test installs have no sibling to find, so fall back to the command
+  // edenfsctl recorded.
+  if (!command.argv.empty()) {
     XLOGF(
-        FATAL,
-        "error setting SIGTERM handler in privhelper process: {}",
-        folly::errnoStr(errno));
+        WARN,
+        "no edenfs binary next to the privhelper in {}; falling back to {} from the recorded start command",
+        dir,
+        command.argv[0]);
+    return canonicalPath(command.argv[0]);
+  }
+
+  throwf<std::runtime_error>(
+      "no edenfs binary in {}, and no recorded start command to fall back to",
+      dir);
+}
+
+void PrivHelperServer::validateRestartOwner() const {
+  const auto realUid = getuid();
+  const auto realGid = getgid();
+  if (realUid == 0) {
+    throw std::runtime_error("real uid is root");
+  }
+  if (realUid != uid_ || realGid != gid_) {
+    throwf<std::runtime_error>(
+        "real uid/gid {}/{} do not match the privhelper owner {}/{}",
+        realUid,
+        realGid,
+        uid_,
+        gid_);
+  }
+}
+
+std::optional<PrivHelperServer::RestartPlan>
+PrivHelperServer::prepareRestart() {
+  if (!sentinel_.has_value() || !sentinel_->enabled()) {
+    return std::nullopt;
+  }
+  const auto state = sentinel_->disarmState();
+  // Defensive: the guard above already rules out the one case that is nullopt.
+  if (!state.has_value()) {
+    return std::nullopt;
+  }
+  switch (*state) {
+    case RestartSentinel::DisarmState::Armed:
+      break;
+    case RestartSentinel::DisarmState::ShutdownAnnounced:
+      XLOG(INFO, "edenfs shut down on purpose; not restarting");
+      return std::nullopt;
+    case RestartSentinel::DisarmState::Unknown:
+      XLOG(
+          WARN,
+          "cannot tell whether edenfs meant to shut down; not restarting");
+      return std::nullopt;
+  }
+
+  // Obtained before producing a plan so launchRestart() is unreachable without
+  // a command.
+  auto command = sentinel_->relaunchCommand();
+  if (!command.has_value()) {
+    return std::nullopt;
+  }
+
+  AbsolutePath binary;
+  try {
+    binary = resolveEdenFsBinary(*command);
+  } catch (const std::exception& ex) {
+    XLOGF(ERR, "refusing to restart edenfs: {}", folly::exceptionStr(ex));
+    return std::nullopt;
+  }
+
+  if (!sentinel_->admitRestartAttempt(now_())) {
+    return std::nullopt;
+  }
+  return RestartPlan{
+      std::move(binary),
+      std::move(*command),
+      sentinel_->restartCount(),
+      sentinel_->firstRestartEpochSec()};
+}
+
+bool PrivHelperServer::launchRestart(const RestartPlan& plan) const {
+  // The recorded environment can already carry these keys: edenfsctl preserves
+  // every EDEN-prefixed variable it was started with.
+  auto env = plan.command.env;
+  setEnv(
+      env, kEdenFsRestartCountEnv, folly::to<std::string>(plan.restartCount));
+  setEnv(
+      env,
+      kEdenFsFirstRestartAtEnv,
+      folly::to<std::string>(plan.firstRestartEpochSec));
+
+  try {
+    validateRestartOwner();
+  } catch (const std::exception& ex) {
+    XLOGF(
+        ERR,
+        "refusing to restart edenfs, resetting IDs would not select its owner: {}",
+        folly::exceptionStr(ex));
+    return false;
+  }
+
+  if (!spawnEdenFs_(plan.binary, plan.command.argv, env)) {
+    return false;
+  }
+  return true;
+}
+
+void PrivHelperServer::run() {
+  // Log and ignore signals that would otherwise terminate the process.
+  // We should only exit when the daemon's connection closes, so that we
+  // can umount all outstanding mount points before we exit. The privhelper
+  // binary detaches into its own session at startup, which keeps terminal
+  // signals (e.g. Ctrl-C) and process-group-wide kills away from us, but
+  // anything signaling this process directly must not terminate it either.
+  class LogAndIgnoreSignalHandler : public folly::AsyncSignalHandler {
+   public:
+    using AsyncSignalHandler::AsyncSignalHandler;
+
+    void signalReceived(int sig) noexcept override {
+      XLOGF(
+          WARN,
+          "privhelper received signal {} ({}); ignoring; the privhelper "
+          "exits only when the EdenFS daemon connection closes",
+          sig,
+          strsignal(sig));
+    }
+  };
+  LogAndIgnoreSignalHandler signalHandler{eventBase_.get()};
+  for (int sig : {SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2}) {
+    signalHandler.registerSignalHandler(sig);
   }
 
   conn_->setReceiveCallback(this);
@@ -2010,6 +1954,14 @@ void PrivHelperServer::run() {
   // This normally means the parent process exited, so we can clean up and exit
   // too.
   XLOG(DBG5, "privhelper process exiting");
+
+  if (peerExited_) {
+    if (const auto plan = prepareRestart()) {
+      if (launchRestart(*plan)) {
+        return;
+      }
+    }
+  }
 
   // Unmount all active mount points
   cleanupMountPoints();
@@ -2029,6 +1981,7 @@ void PrivHelperServer::messageReceived(UnixSocket::Message&& message) noexcept {
 void PrivHelperServer::processAndSendResponse(UnixSocket::Message&& message) {
   Cursor cursor{&message.data};
   PrivHelperConn::PrivHelperPacket packet = PrivHelperConn::parsePacket(cursor);
+  const PrivHelperConn::MsgType requestType{packet.metadata.msg_type};
 
   UnixSocket::Message response;
   try {
@@ -2042,6 +1995,13 @@ void PrivHelperServer::processAndSendResponse(UnixSocket::Message&& message) {
     response = makeResponse();
     Appender appender(&response.data, 1024);
     PrivHelperConn::serializeErrorResponse(appender, ex);
+  }
+
+  // The client sends a one-way request without registering a transaction ID,
+  // so any reply -- including an error reply -- would be unmatched and raise an
+  // EDEN_BUG on the client.
+  if (PrivHelperConn::isOneWayRequest(requestType)) {
+    return;
   }
 
   // Put the version, transaction ID, and message type in the response.
@@ -2123,21 +2083,30 @@ UnixSocket::Message PrivHelperServer::processMessage(
     case PrivHelperConn::REQ_UNMOUNT_BIND:
       return processBindUnMountMsg(cursor);
     case PrivHelperConn::REQ_SET_DAEMON_TIMEOUT:
-      return processSetDaemonTimeout(cursor, request);
     case PrivHelperConn::REQ_SET_USE_EDENFS:
-      return processSetUseEdenFs(cursor, request);
+      return processLegacyMacFuseConfigRequest(cursor);
     case PrivHelperConn::REQ_GET_PID:
       return processGetPid();
     case PrivHelperConn::REQ_GET_NAMESPACE_INFO:
       return processGetNamespaceInfo(cursor);
+#ifdef __APPLE__
     case PrivHelperConn::REQ_START_FAM:
-      return processStartFam(cursor);
+      return processStartFam(cursor, request);
     case PrivHelperConn::REQ_STOP_FAM:
       return processStopFam();
+#else
+    case PrivHelperConn::REQ_START_FAM:
+    case PrivHelperConn::REQ_STOP_FAM:
+      break;
+#endif
     case PrivHelperConn::REQ_SET_MEMORY_PRIORITY_FOR_PROCESS:
       return processSetMemoryPriorityForProcess(cursor);
     case PrivHelperConn::REQ_SET_FUSE_READ_AHEAD:
       return processSetFuseReadAhead(cursor);
+    case PrivHelperConn::REQ_SET_RESTART_ARGS:
+      return processSetRestartArgsMsg(cursor);
+    case PrivHelperConn::REQ_NOTIFY_CLEAN_SHUTDOWN:
+      return processNotifyCleanShutdownMsg(cursor);
     case PrivHelperConn::MSG_TYPE_NONE:
     case PrivHelperConn::RESP_ERROR:
       break;
@@ -2148,6 +2117,7 @@ UnixSocket::Message PrivHelperServer::processMessage(
 }
 
 void PrivHelperServer::eofReceived() noexcept {
+  peerExited_ = true;
   eventBase_->terminateLoopSoon();
 }
 

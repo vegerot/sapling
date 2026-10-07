@@ -8,6 +8,7 @@
 #pragma once
 
 #include <folly/Range.h>
+#include <folly/coro/Invoke.h>
 #include <folly/coro/Task.h>
 #include <folly/coro/safe/NowTask.h>
 #include <folly/futures/Future.h>
@@ -143,21 +144,6 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
     ObjectFetchContext::Origin origin;
   };
 
-  /**
-   * Return value of the getGlobFiles method.
-   */
-  struct GetGlobFilesResult {
-    /**
-     * The retrieved glob entries
-     * This command is unimplemented on some backing store impls
-     * and will return an error. This will trigger the client to fallback to
-     * looking up the globs locally.
-     */
-    std::vector<std::string> globFiles;
-    RootId rootId;
-    bool isLocal = false;
-  };
-
   virtual void periodicManagementTask() {}
 
   /**
@@ -243,13 +229,6 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
   /**
    * Return the root Tree corresponding to the passed in RootId.
    */
-  virtual ImmediateFuture<GetRootTreeResult> getRootTree(
-      const RootId& rootId,
-      const ObjectFetchContextPtr& context) = 0;
-
-  /**
-   * Coroutine version of getRootTree.
-   */
   virtual folly::coro::now_task<GetRootTreeResult> co_getRootTree(
       const RootId& rootId,
       const ObjectFetchContextPtr& context) = 0;
@@ -279,7 +258,17 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
    */
   virtual folly::SemiFuture<GetTreeAuxResult> getTreeAuxData(
       const ObjectId& id,
-      const ObjectFetchContextPtr& context) = 0;
+      const ObjectFetchContextPtr& context) {
+    // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
+    return folly::coro::co_invoke(
+               [this](ObjectId ownedId, ObjectFetchContextPtr ownedContext)
+                   -> folly::coro::Task<GetTreeAuxResult> {
+                 co_return co_await co_getTreeAuxData(ownedId, ownedContext);
+               },
+               ObjectId{id},
+               context.copy())
+        .semi();
+  }
 
   virtual folly::coro::now_task<GetTreeAuxResult> co_getTreeAuxData(
       const ObjectId& id,
@@ -303,34 +292,9 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
    *
    * Return the blob aux data and where it was found.
    */
-  virtual folly::SemiFuture<GetBlobAuxResult> getBlobAuxData(
-      const ObjectId& id,
-      const ObjectFetchContextPtr& context) = 0;
-
   virtual folly::coro::now_task<GetBlobAuxResult> co_getBlobAuxData(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) = 0;
-
-  /**
-   * Fetch file paths matching the given glob suffixes
-   *
-   * Return the Glob result containing the list of file paths, dtype, and commit
-   * If the implementing BackingStore does not impolement this method, it will
-   * return an error. The caller should fallback to resolving globFiles locally
-   * in this case.
-   */
-  virtual ImmediateFuture<GetGlobFilesResult> getGlobFiles(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes) = 0;
-
-  /**
-   * Coroutine version of getGlobFiles.
-   */
-  virtual folly::coro::now_task<GetGlobFilesResult> co_getGlobFiles(
-      const RootId& id,
-      const std::vector<std::string>& globs,
-      const std::vector<std::string>& prefixes) = 0;
 
   /**
    * Check whether the caller has access to the given manifest ID.

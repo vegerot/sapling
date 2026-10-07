@@ -7,7 +7,6 @@
 
 #include "eden/fs/store/git/GitBackingStore.h"
 
-#include <folly/coro/Invoke.h>
 #include <folly/coro/Task.h>
 #include <folly/futures/Future.h>
 #include <folly/logging/xlog.h>
@@ -142,22 +141,6 @@ BackingStore::GetRootTreeResult GitBackingStore::getRootTreeImpl(
 
   // Now get the specified tree.
   return GetRootTreeResult{getTreeImpl(treeID), treeID};
-}
-
-ImmediateFuture<BackingStore::GetRootTreeResult> GitBackingStore::getRootTree(
-    const RootId& rootId,
-    const ObjectFetchContextPtr& context) {
-  return ImmediateFuture{
-      // @lint-ignore CLANGTIDY facebook-folly-coro-return-captures-local-var
-      folly::coro::co_invoke(
-          [this](auto rootId, auto context)
-              -> folly::coro::Task<GetRootTreeResult> {
-            co_return co_await co_getRootTree(
-                std::move(rootId), std::move(context));
-          },
-          RootId{rootId},
-          context.copy())
-          .semi()};
 }
 
 folly::coro::now_task<BackingStore::GetRootTreeResult>
@@ -312,35 +295,12 @@ BlobPtr GitBackingStore::getBlobImpl(const ObjectId& id) {
   return std::make_shared<BlobPtr::element_type>(std::move(buf));
 }
 
-folly::SemiFuture<BackingStore::GetBlobAuxResult>
-GitBackingStore::getBlobAuxData(const ObjectId&, const ObjectFetchContextPtr&) {
-  return BackingStore::GetBlobAuxResult{
-      nullptr, ObjectFetchContext::Origin::NotFetched};
-}
-
 folly::coro::now_task<BackingStore::GetBlobAuxResult>
 GitBackingStore::co_getBlobAuxData(
     const ObjectId& id,
     const ObjectFetchContextPtr& context) {
   co_return BackingStore::GetBlobAuxResult{
       nullptr, ObjectFetchContext::Origin::NotFetched};
-}
-
-ImmediateFuture<BackingStore::GetGlobFilesResult> GitBackingStore::getGlobFiles(
-    const RootId& /* id */,
-    const std::vector<std::string>& /* globs */,
-    const std::vector<std::string>& /* prefixes */) {
-  return folly::makeFuture<GetGlobFilesResult>(
-      std::runtime_error("getGlobFiles() is not supported on git"));
-};
-
-folly::coro::now_task<BackingStore::GetGlobFilesResult>
-GitBackingStore::co_getGlobFiles(
-    const RootId& /* id */,
-    const std::vector<std::string>& /* globs */,
-    const std::vector<std::string>& /* prefixes */) {
-  co_yield folly::coro::co_error(
-      std::runtime_error("getGlobFiles() is not supported on git"));
 }
 
 git_oid GitBackingStore::root2Oid(const RootId& rootId) {

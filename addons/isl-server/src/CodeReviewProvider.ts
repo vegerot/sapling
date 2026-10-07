@@ -13,6 +13,7 @@ import type {
   CommandArg,
   DiffComment,
   DiffId,
+  DiffSummariesResult,
   DiffSummary,
   Disposable,
   LandConfirmationInfo,
@@ -27,9 +28,29 @@ export type DiffSummaries = Map<DiffId, DiffSummary>;
  * API to fetch data from Remote Code Review system, like GitHub and Phabricator.
  */
 export interface CodeReviewProvider {
-  triggerDiffSummariesFetch(diffs: Array<DiffId>): unknown;
+  /**
+   * For when something moved that the inputs don't show. Where it is honored, `force` skips
+   * whatever the provider would otherwise serve from its own state, such as debouncing.
+   *
+   * `partial` says `diffs` names particular diffs of interest rather than every diff on screen, so
+   * a provider that remembers what to refetch later does not mistake it for the whole set.
+   *
+   * The two together mean "this diff moved", which is not enough to discard state held about the
+   * others: the Phabricator provider skips the cache-wide invalidation it does for `force` alone,
+   * and since that cache has no per-diff eviction, the named diffs' cached counts survive too.
+   *
+   * Both are requests rather than guarantees: the GitHub provider takes no arguments at all and
+   * stays on its own debounce.
+   */
+  triggerDiffSummariesFetch(diffs: Array<DiffId>, force?: boolean, partial?: boolean): unknown;
 
-  onChangeDiffSummaries(callback: (result: Result<DiffSummaries>) => unknown): Disposable;
+  /**
+   * An emission may name only some diffs: a partial fetch names only the diffs asked about, and a
+   * large fetch can land in batches, each emitted as it arrives. Merge summaries into what is
+   * already known rather than replacing it, and act on a diff only when an emission covers it (see
+   * `summariesCoverDiff`). Which diffs are failing comes whole in `failures`, when provided.
+   */
+  onChangeDiffSummaries(callback: (result: DiffSummariesResult) => unknown): Disposable;
 
   /** Run a command not handled within sapling, such as a separate submit handler */
   runExternalCommand?(
@@ -86,4 +107,25 @@ export interface CodeReviewProvider {
     message: ClientToServerMessage,
     postMessage: (message: ServerToClientMessage) => void,
   ): message is CodeReviewProviderSpecificClientToServerMessages;
+}
+
+/**
+ * Whether `result` brings fresh summaries covering `diffId`: named in `diffIds` when the provider
+ * lists what the request covered, since a response can leave a requested diff out, and otherwise
+ * among the summaries returned.
+ *
+ * A result without `failures` comes from a fetch that went out whole, as before batching, and
+ * counts for every diff, errors included, as every emission did then.
+ */
+export function summariesCoverDiff(
+  result: DiffSummariesResult,
+  diffId: DiffId | undefined,
+): boolean {
+  if (result.failures == null) {
+    return true;
+  }
+  if (diffId == null || result.error) {
+    return false;
+  }
+  return result.diffIds?.includes(diffId) ?? result.value.has(diffId);
 }

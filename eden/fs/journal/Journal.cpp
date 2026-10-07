@@ -11,6 +11,18 @@
 
 namespace facebook::eden {
 
+namespace {
+
+bool isSaplingMetadataPath(const RelativePath& path) {
+  if (path.empty()) {
+    return true;
+  }
+  const auto firstComponent = path.paths().begin().piece();
+  return firstComponent == ".sl"_relpath || firstComponent == ".hg"_relpath;
+}
+
+} // namespace
+
 JournalDeltaPtr Journal::DeltaState::frontPtr() noexcept {
   bool isFileChangeEmpty = fileChangeDeltas.empty();
   bool isRootUpdateEmpty = rootUpdateDeltas.empty();
@@ -176,6 +188,7 @@ bool Journal::compact(FileChangeJournalDelta& delta, DeltaState& deltaState) {
     deltaState.stats->latestTimestamp = delta.time;
     deltaState.deltaMemoryUsage -= back->estimateMemoryUsage();
     deltaState.deltaMemoryUsage += delta.estimateMemoryUsage();
+    delta.earliestSequenceID = back->earliestSequenceID;
     *back = std::move(delta);
     return true;
   }
@@ -191,6 +204,7 @@ bool Journal::compact(
 template <typename T>
 bool Journal::addDeltaBeforeNotifying(T&& delta, DeltaState& deltaState) {
   delta.sequenceID = deltaState.nextSequence++;
+  delta.earliestSequenceID = delta.sequenceID;
   delta.time = std::chrono::steady_clock::now();
 
   truncateIfNecessary(deltaState);
@@ -335,20 +349,6 @@ std::optional<InternalJournalStats> Journal::getStats() {
   return stats;
 }
 
-namespace {
-folly::StringPiece eventCharacterizationFor(const PathChangeInfo& ci) {
-  if (ci.existedBefore && !ci.existedAfter) {
-    return "Removed";
-  } else if (!ci.existedBefore && ci.existedAfter) {
-    return "Created";
-  } else if (ci.existedBefore && ci.existedAfter) {
-    return "Changed";
-  } else {
-    return "Ghost";
-  }
-}
-} // namespace
-
 void Journal::setMemoryLimit(size_t limit) {
   auto deltaState = deltaState_.wlock();
   deltaState->memoryLimit = limit;
@@ -442,9 +442,9 @@ std::unique_ptr<JournalDeltaRange> Journal::accumulateRange(
 
           for (auto& entry : current.getChangedFilesInOverlay()) {
             auto& name = entry.first;
-            if (result->containsHgOnlyChanges && !name.empty() &&
-                name.paths().begin().piece() != ".hg"_relpath) {
-              result->containsHgOnlyChanges = false;
+            if (result->containsSaplingOnlyChanges &&
+                !isSaplingMetadataPath(name)) {
+              result->containsSaplingOnlyChanges = false;
             }
             auto& currentInfo = entry.second;
             auto* resultInfo =
@@ -452,17 +452,8 @@ std::unique_ptr<JournalDeltaRange> Journal::accumulateRange(
             if (!resultInfo) {
               result->changedFilesInOverlay.emplace(name, currentInfo);
             } else {
-              if (resultInfo->existedBefore != currentInfo.existedAfter) {
-                auto event1 = eventCharacterizationFor(currentInfo);
-                auto event2 = eventCharacterizationFor(*resultInfo);
-                XLOGF(
-                    ERR,
-                    "Journal for {} holds invalid {}, {} sequence",
-                    name,
-                    event1,
-                    event2);
-              }
-
+              // Directory renames can change a child's existence without
+              // recording a delta for that child.
               resultInfo->existedBefore = currentInfo.existedBefore;
             }
           }
@@ -508,6 +499,43 @@ std::unique_ptr<JournalDeltaRange> Journal::accumulateRange(
 
   deltaState->markObserved();
   return result;
+}
+
+bool Journal::containsOnlySaplingChanges(SequenceNumber limitSequence) {
+  XDCHECK(limitSequence > 0);
+
+  auto deltaState = deltaState_.rlock();
+  if (!deltaState->empty() &&
+      deltaState->getFrontSequenceID() > limitSequence) {
+    // The range was truncated: it may have contained anything.
+    // Mark the journal observed even on this early return, like
+    // accumulateRange does for its truncated result: this call counts as
+    // an observation, and skipping it would let the next addDelta swallow
+    // the subscriber notification.
+    deltaState->markObserved();
+    return false;
+  }
+
+  bool saplingOnly = true;
+  forEachDelta(
+      *deltaState,
+      limitSequence,
+      std::nullopt,
+      [&](const FileChangeJournalDelta& current) -> bool {
+        if ((current.isPath1Valid && !isSaplingMetadataPath(current.path1)) ||
+            (current.isPath2Valid && !isSaplingMetadataPath(current.path2))) {
+          saplingOnly = false;
+          return false;
+        }
+        return true;
+      },
+      [&](const RootUpdateJournalDelta&) -> bool {
+        saplingOnly = false;
+        return false;
+      });
+
+  deltaState->markObserved();
+  return saplingOnly;
 }
 
 bool Journal::forEachDelta(

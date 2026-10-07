@@ -13,12 +13,14 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 #include "eden/common/utils/ImmediateFuture.h"
 #include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/inodes/InodePtr.h"
+#include "eden/fs/inodes/InodeTimestamps.h"
 #include "eden/fs/inodes/Overlay.h"
 #include "eden/fs/model/ObjectId.h"
 #include "eden/fs/takeover/gen-cpp2/takeover_types.h"
@@ -248,9 +250,11 @@ class InodeMap {
 
   /**
    * Clear the FS refcount for an inode number.
-   * This is used when we are deleting an inode and want to clear the refcount
+   * This is used when we are deleting an inode and want to clear the refcount.
+   *
+   * Returns true if the inode had a non-zero FS refcount.
    */
-  void clearFsRefcount(InodeNumber number);
+  bool clearFsRefcount(InodeNumber number);
 
   /**
    * See EdenMount::forgetStaleInodes
@@ -334,18 +338,24 @@ class InodeMap {
    * TreeInode locks (since deleting it may cause its parent Inode to become
    * unreferenced, triggering another immediate call to onInodeUnreferenced(),
    * which will acquire these locks).
-   *
-   * If mustPersistInodeNumbers is true, directories will be persisted to the
-   * overlay if not already present. This is a "just-in-time" mechanism to
-   * persist their entries' inode numbers.
    */
   void unloadInode(
       InodeBase* inode,
       TreeInode* parent,
       PathComponentPiece name,
       bool isUnlinked,
-      bool mustPersistInodeNumbers,
       const InodeMapLock& lock);
+
+  /**
+   * Return whether unloading this tree would preserve it in unloadedInodes_.
+   *
+   * This reads the tree's contents without acquiring its lock, so the caller
+   * must guarantee that no other thread can acquire the inode: its pointer
+   * acquire count is zero and its parent's contents lock is held.
+   */
+  bool hasRememberedChildForUnload(
+      const TreeInode& inode,
+      const InodeMapLock& lock) const;
 
   /////////////////////////////////////////////////////////////////////////
   // The following public APIs should only be used by TreeInode
@@ -417,6 +427,8 @@ class InodeMap {
     size_t unloadedInodeCount = 0;
     size_t periodicUnlinkedUnloadInodeCount = 0;
     size_t periodicLinkedUnloadInodeCount = 0;
+    /** Cumulative remembered records removed when FS references reach zero. */
+    size_t forgottenInodeCount = 0;
   };
 
   /**
@@ -433,22 +445,28 @@ class InodeMap {
     return totalInodeCount_.load(std::memory_order_relaxed);
   }
 
-  /**
-   * Returns whether lazy inode persistence is enabled.
-   *
-   * Lazy inode persistence means we delay persisting inodes to the overlay
-   * until the inode must be unloaded.
-   */
-  bool lazyInodePersistence() const {
-    return lazyInodePersistence_;
-  }
-
   void recordPeriodicInodeUnload(size_t numInodesToUnload);
   /*
    * Return all referenced inodes (loaded and unloaded inodes whose
    * fs references is greater than zero).
    */
   std::vector<InodeNumber> getReferencedInodes() const;
+
+  struct UnloadedInodeGcCandidate {
+    InodeNumber inodeNumber;
+    PathComponent name;
+  };
+
+  struct UnloadedInodeGcEntry {
+    PathComponent name;
+    EdenTimestamp lastFsRequestTime;
+    uint32_t numFsReferences;
+  };
+
+  /** Return copies of unloaded child state for one inode GC scan batch. */
+  std::vector<UnloadedInodeGcEntry> getUnloadedChildrenForGc(
+      InodeNumber parent,
+      const std::vector<UnloadedInodeGcCandidate>& candidates) const;
 
  private:
   friend class InodeMapLock;
@@ -469,7 +487,8 @@ class InodeMap {
     UnloadedInode(
         InodeNumber parentNum,
         PathComponentPiece entryName,
-        mode_t mode);
+        mode_t mode,
+        EdenTimestamp lastFsRequestTime);
 
     UnloadedInode(
         InodeNumber parentNum,
@@ -477,13 +496,8 @@ class InodeMap {
         bool isUnlinked,
         mode_t mode,
         std::optional<ObjectId> id,
-        uint32_t fsRefcount);
-    UnloadedInode(
-        TreeInode* parent,
-        PathComponentPiece entryName,
-        bool isUnlinked,
-        std::optional<ObjectId> id,
-        uint32_t fsRefcount);
+        uint32_t fsRefcount,
+        EdenTimestamp lastFsRequestTime);
     UnloadedInode(
         FileInode* inode,
         TreeInode* parent,
@@ -519,6 +533,8 @@ class InodeMap {
      * If the entry is materialized, this field is not set.
      */
     std::optional<ObjectId> const id;
+
+    EdenTimestamp const lastFsRequestTime;
 
     /**
      * A list of promises waiting on this inode to be loaded.
@@ -621,6 +637,12 @@ class InodeMap {
     size_t numFileInodes_{0};
 
     /**
+     * Running total of inodes forgotten outright by clearFsRefcount() while
+     * unloaded, which the GC sweep therefore never counts as unloaded.
+     */
+    size_t numForgottenInodes_{0};
+
+    /**
      * A promise to fulfill once shutdown() completes.
      *
      * This is only initialized when shutdown() is called, and will be
@@ -701,7 +723,6 @@ class InodeMap {
       TreeInode* parent,
       PathComponentPiece name,
       bool isUnlinked,
-      bool mustPersistInodeNumbers,
       const folly::Synchronized<Members>::LockedPtr& lock);
 
   /**
@@ -710,18 +731,17 @@ class InodeMap {
    *
    * This returns an UnloadedInode if we need to remember this inode in the
    * unloadedInodes_ map, or std::nullopt if we can forget about it completely.
-   *
-   * If mustPersistInodeNumbers is true, directories will be persisted to the
-   * overlay if not already present. This is a "just-in-time" mechanism to
-   * persist their entries' inode numbers.
    */
   std::optional<UnloadedInode> updateOverlayForUnload(
       InodeBase* inode,
       TreeInode* parent,
       PathComponentPiece name,
       bool isUnlinked,
-      bool mustPersistInodeNumbers,
       const folly::Synchronized<Members>::LockedPtr& lock);
+
+  bool hasRememberedChildForUnload(
+      const TreeInode& inode,
+      const folly::Synchronized<Members>::LockedPtr& lock) const;
 
   void insertLoadedInode(
       const folly::Synchronized<Members>::LockedPtr& data,
@@ -830,10 +850,6 @@ class InodeMap {
    * This number will only increase for the life time of this inode map.
    */
   std::atomic<size_t> numPeriodicallyUnloadedLinkedInodes_{0};
-
-  // Snapshot of experimental:lazy-inode-persistence config (we don't want it to
-  // change while eden is running).
-  bool lazyInodePersistence_{false};
 };
 
 /**

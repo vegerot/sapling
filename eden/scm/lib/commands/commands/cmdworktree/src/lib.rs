@@ -11,6 +11,7 @@ mod list;
 mod remove;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clidispatch::ReqCtx;
 use clidispatch::abort;
@@ -21,6 +22,7 @@ use cmdutil::define_flags;
 use fs_err as fs;
 use repo::repo::Repo;
 use workingcopy::workingcopy::WorkingCopy;
+use worktree::Worktrees;
 
 define_flags! {
     pub struct WorktreeOpts {
@@ -30,6 +32,11 @@ define_flags! {
 
         /// create a snapshot of the current working copy, then restore it in the new worktree (for 'add')
         snapshot: bool,
+
+        /// revision to check out (for 'add')
+        #[short('r')]
+        #[argtype("REV")]
+        rev: String,
 
         /// remove all linked worktrees (for 'remove')
         all: bool,
@@ -45,13 +52,15 @@ define_flags! {
 }
 
 pub fn run(ctx: ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u8> {
-    if !repo.config().get_or("worktree", "enabled", || false)? {
-        abort!("worktree command requires --config worktree.enabled=true");
-    }
-
     let subcmd = ctx.opts.args.first().map(|s| s.as_str()).unwrap_or("");
+    if !ctx.opts.rev.is_empty() && subcmd != "add" {
+        abort!("--rev can only be used with 'worktree add'");
+    }
     let runner: fn(&ReqCtx<WorktreeOpts>, &Repo, &WorkingCopy) -> Result<u8> = match subcmd {
-        "list" | "ls" => list::run,
+        "list" | "ls" => {
+            let worktrees = Worktrees::open(repo, repo.config().as_ref())?;
+            return list::run(&ctx, repo, &worktrees);
+        }
         "add" => add::run,
         "remove" | "rm" => remove::run,
         "label" => label::run,
@@ -69,6 +78,17 @@ pub fn run(ctx: ReqCtx<WorktreeOpts>, repo: &Repo, wc: &WorkingCopy) -> Result<u
 pub(crate) struct CurrentGroup {
     pub(crate) shared_store_path: PathBuf,
     pub(crate) group_id: String,
+}
+
+/// Read the configured slot-reservation TTL in seconds. Reservations older than
+/// this are treated as orphaned by a crashed `worktree add` and pruned. Defaults
+/// to [`worktree::DEFAULT_RESERVATION_TTL_SECONDS`] (1 hour); override with the
+/// `worktree.reservation-ttl` config (accepts durations like `30m` or `2h`).
+pub(crate) fn reservation_ttl_seconds(repo: &Repo) -> Result<i64> {
+    let ttl: Duration = repo.config().get_or("worktree", "reservation-ttl", || {
+        Duration::from_secs(worktree::DEFAULT_RESERVATION_TTL_SECONDS as u64)
+    })?;
+    Ok(ttl.as_secs() as i64)
 }
 
 pub(crate) fn require_group(repo: &Repo) -> Result<CurrentGroup> {
@@ -98,15 +118,25 @@ pub fn doc() -> &'static str {
 
     Subcommands::
 
-      list [-Tjson]                            List all worktrees in the group
-      add [PATH] [--label TEXT] [--snapshot]   Create a new linked worktree
-      remove PATH [PATH...] [--all] [-y]        Remove linked worktree(s)
-      label [PATH] TEXT [--remove]             Set or remove a worktree label
+      list [-Tjson]                                     List all worktrees in the group
+      add [PATH] [-r REV] [--label TEXT] [--snapshot]   Create a new linked worktree
+      remove PATH [PATH...] [--all] [-y]                Remove linked worktree(s)
+      label [PATH] TEXT [--remove]                      Set or remove a worktree label
 
     If PATH is omitted from `add`, `worktree.path-generator` is used to
     choose the destination path.
 
-    Currently only EdenFS-backed repositories are supported."#
+    Config options::
+
+      worktree.max-count=N                     Hard limit on linked worktrees per repo group (0 = unlimited, the default)
+      worktree.reservation-ttl=DURATION        How long an in-flight add holds a slot before it is treated as stale (default 1h)
+      worktree.require-generated-path=true     Require path generator, disallow manual PATH
+      worktree.path-generator=CMD              Shell command to generate PATH when omitted
+      worktree.snapshot-direct-copy=true       Use direct copy for --snapshot
+      worktree.git-enabled=true                Enable worktree listing in native Git repositories
+
+    Git repositories currently support the `list` subcommand. Other subcommands
+    require an EdenFS-backed repository."#
 }
 
 pub fn synopsis() -> Option<&'static str> {

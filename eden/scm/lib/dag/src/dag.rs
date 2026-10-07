@@ -143,6 +143,12 @@ where
     /// disk.
     overlay_map_paths: Arc<Mutex<Vec<(AncestorPath, Vec<Vertex>)>>>,
 
+    /// How many vertexes from `overlay_map_paths` one flush may persist to
+    /// the on-disk IdMap. Bounds how much a command that resolves an unbounded
+    /// number of names, such as a scan of the whole history, can grow the
+    /// IdMap. 0 means no limit.
+    idmap_cache_flush_limit: usize,
+
     /// Defines how to communicate with a remote service.
     /// The actual logic probably involves networking like HTTP etc
     /// and is intended to be implemented outside the `dag` crate.
@@ -285,7 +291,7 @@ where
         if !self.pending_heads.is_empty() {
             return programming(format!(
                 "ProgrammingError: add_heads_and_flush called with pending heads ({:?})",
-                &self.pending_heads.vertexes(),
+                self.pending_heads.vertexes(),
             ));
         }
         tracing::debug!(target: "dag::add_heads_and_flush", lifecycle_id=?self.lifecycle_id, ?heads);
@@ -426,13 +432,40 @@ where
             return Ok(());
         }
 
-        let id_names = calculate_id_name_from_paths(
+        // Persisting is only a cache. Keep the first `limit` names in the
+        // order they were resolved, and drop the paths past that before
+        // resolving them, so a scan of the whole history does not spend its
+        // exit resolving millions of x~n paths.
+        let limit = self.idmap_cache_flush_limit;
+        if limit > 0 {
+            let total: usize = to_insert.iter().map(|(_, names)| names.len()).sum();
+            if total > limit {
+                tracing::info!(
+                    target: "dag::cache",
+                    "caching {} of {} remotely resolved vertexes in IdMap (limit {})",
+                    limit,
+                    total,
+                    limit,
+                );
+                let mut kept = 0;
+                to_insert.retain(|(_, names)| {
+                    let keep = kept < limit;
+                    kept += names.len();
+                    keep
+                });
+            }
+        }
+
+        let mut id_names = calculate_id_name_from_paths(
             &self.map,
             &*self.dag,
             &self.overlay_map_id_set,
             &to_insert,
         )
         .await?;
+        if limit > 0 {
+            id_names.truncate(limit);
+        }
 
         // For testing purpose, skip inserting certain vertexes.
         let mut skip_vertexes: Option<HashSet<Vertex>> = None;
@@ -506,11 +539,18 @@ where
         self.remote_protocol = protocol;
     }
 
+    /// Limit how many remotely resolved vertexes a single flush persists to
+    /// the on-disk IdMap. 0 means no limit.
+    pub fn set_idmap_cache_flush_limit(&mut self, limit: usize) {
+        self.idmap_cache_flush_limit = limit;
+    }
+
     /// Inherit configurations like `managed_virtual_group` from `original`.
     fn inherit_configurations_from(&mut self, original: &Self) {
         let seg_size = original.dag.get_new_segment_size();
         self.dag.set_new_segment_size(seg_size);
         self.set_remote_protocol(original.remote_protocol.clone());
+        self.idmap_cache_flush_limit = original.idmap_cache_flush_limit;
         self.managed_virtual_group = original.managed_virtual_group.clone();
         self.maybe_reuse_caches_from(original)
     }
@@ -647,7 +687,7 @@ where
         if !self.pending_heads.is_empty() {
             return programming(format!(
                 "strip does not support pending heads ({:?})",
-                &self.pending_heads.vertexes(),
+                self.pending_heads.vertexes(),
             ));
         }
         tracing::debug!(target: "dag::strip", lifecycle_id=?self.lifecycle_id, ?set);
@@ -680,7 +720,7 @@ where
         if !self.pending_heads.is_empty() {
             return programming(format!(
                 "strip does not support pending heads ({:?})",
-                &self.pending_heads.vertexes(),
+                self.pending_heads.vertexes(),
             ));
         }
 
@@ -842,7 +882,7 @@ where
         if !self.pending_heads.is_empty() {
             return programming(format!(
                 "import_pull_data called with pending heads ({:?})",
-                &self.pending_heads.vertexes(),
+                self.pending_heads.vertexes(),
             ));
         }
         if let Some(group) = heads.max_desired_group() {
@@ -1096,8 +1136,7 @@ where
                         // checked all "roots" are missing in the local graph. See `NeedSlowPath`
                         // above.
                         let e = NeedSlowPath(format!(
-                            "{:?} exists in local graph as {:?} - fast path requires MASTER group",
-                            &high_vertex, id
+                            "{high_vertex:?} exists in local graph as {id:?} - fast path requires MASTER group"
                         ));
                         return Err(e);
                     }
@@ -1123,8 +1162,7 @@ where
                         match res {
                             Ok(id) if id.group() != Group::MASTER => {
                                 return Err(NeedSlowPath(format!(
-                                    "{:?} exists id in local graph as {:?} - fast path requires MASTER group",
-                                    &parent_names, id
+                                    "{parent_names:?} exists id in local graph as {id:?} - fast path requires MASTER group"
                                 )));
                             }
                             Ok(id) => {
@@ -1351,6 +1389,7 @@ where
                     overlay_map: Arc::clone(&self.overlay_map),
                     overlay_map_id_set: self.overlay_map_id_set.clone(),
                     overlay_map_paths: Arc::clone(&self.overlay_map_paths),
+                    idmap_cache_flush_limit: self.idmap_cache_flush_limit,
                     remote_protocol: self.remote_protocol.clone(),
                     managed_virtual_group: self.managed_virtual_group.clone(),
                     missing_vertexes_confirmed_by_remote: Arc::clone(

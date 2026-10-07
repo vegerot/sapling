@@ -1,7 +1,10 @@
 ---
-oncalls: ['scm_client_infra']
-apply_to_regex: 'eden/fs/(fuse|nfs|inodes)/.*\.(cpp|h)$'
-apply_to_content: 'ENOSYS|FuseDispatcher|NfsDispatcher|fuse_entry_out|EOPNOTSUPP'
+name: ACR-fuse-handler-safety
+metadata:
+  oncalls: ['scm_client_infra']
+  strict: true
+  apply_to_path: 'eden/fs/(fuse|nfs|inodes)/.*\.(cpp|h)$'
+  apply_to_content: 'ENOSYS|FuseDispatcher|NfsDispatcher|fuse_entry_out|EOPNOTSUPP'
 ---
 
 # FUSE/NFS Handler Safety
@@ -23,6 +26,8 @@ apply_to_content: 'ENOSYS|FuseDispatcher|NfsDispatcher|fuse_entry_out|EOPNOTSUPP
 - Returning `EINVAL` from `lookup` when the entry doesn't exist — should be `ENOENT`
 - Returning `ENOENT` from `getattr` on a valid inode — should be `ESTALE` if the inode was unlinked
 - NFS mutating operations that return one of pre-op/post-op `struct stat` but not the other — returning mismatched pairs breaks NFS client cache coherence (returning `std::nullopt` for both is safe)
+- A new inode-creating FUSE handler that keeps setuid, setgid or sticky bits in the mode it stores — `create` and `mknod`
+  strip them from non-directory modes so the `FUSE_HANDLE_KILLPRIV_V2` invariant (no file carries them) keeps holding
 - Missing `FUSELL_NOT_IMPL()` fallback in base `FuseDispatcher` for new virtual methods
 
 ## Do NOT Flag

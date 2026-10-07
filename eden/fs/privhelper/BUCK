@@ -7,9 +7,11 @@ cpp_library(
     srcs = ["PrivHelper.cpp"],
     headers = ["PrivHelper.h"],
     deps = [
+        "//folly:conv",
         "//folly:file",
         "//folly/futures:core",
         "//folly/io/async:async_base",
+        "//folly/logging:logging",
     ],
     exported_deps = [
         "//folly:network_address",
@@ -70,17 +72,19 @@ cpp_library(
     srcs = [
         "PrivHelperServer.cpp",
         "PrivHelperServerSanityCheck.cpp",
+        "RestartSentinel.cpp",
     ],
     headers = [
         "PrivHelperServer.h",
+        "RestartSentinel.h",
     ],
     deps = [
         ":nfs_rpc",
+        ":pin_scan",
         ":rollback",
         "//eden/common/utils:errno_utils",
         "//eden/common/utils:fsdetect",
         "//eden/common/utils:path",
-        "//eden/common/utils:sysctl_util",
         "//eden/common/utils:throw",
         "//eden/fs/privhelper/priority:process_priority",
         "//eden/fs/utils:mount_info_table",
@@ -89,11 +93,14 @@ cpp_library(
         "//folly:expected",
         "//folly:file_util",
         "//folly:network_address",
+        "//folly:scope_guard",
         "//folly:string",
+        "//folly:unit",
         "//folly:utility",
         "//folly/init:init",
         "//folly/io:iobuf",
         "//folly/io/async:async_base",
+        "//folly/io/async:async_signal_handler",
         "//folly/logging:init",
         "//folly/logging:logging",
         "//folly/portability:unistd",
@@ -101,15 +108,16 @@ cpp_library(
     ] + select({
         "DEFAULT": [],
         "ovr_config//os:macos": [
-            "fbsource//third-party/osxfuse:osxfuse",
             "fbsource//third-party/toolchains/macos:CoreFoundation",
             "fbsource//third-party/toolchains/macos:IOKit",
         ],
     }),
     exported_deps = [
         ":conn",
+        ":interface",
         "//eden/common/utils:io",
         "//eden/common/utils:process",
+        "//folly:cpp_attributes",
         "//folly:file",
     ],
     external_deps = [
@@ -133,11 +141,11 @@ cpp_library(
         "//eden/common/utils:io",
         "//eden/common/utils:process",
         "//eden/common/utils:user_info",
+        "//eden/fs/config:config",
         "//eden/fs/telemetry:log_info",
         "//eden/fs/telemetry:structured_logger",
         "//eden/fs/utils:eden_error",
         "//folly:exception",
-        "//folly:expected",
         "//folly:file",
         "//folly:file_util",
         "//folly:network_address",
@@ -146,6 +154,7 @@ cpp_library(
         "//folly/io:iobuf",
         "//folly/io/async:async_base",
         "//folly/logging:logging",
+        "//folly/portability:fcntl",
         "//folly/portability:sys_types",
         "//folly/portability:unistd",
     ],
@@ -163,5 +172,22 @@ cpp_library(
     headers = ["NfsMountRpc.h"],
     exported_deps = [
         "//eden/fs/nfs/xdr:xdr",
+    ],
+)
+
+cpp_library(
+    name = "pin_scan",
+    srcs = ["PinScan.cpp"],
+    headers = ["PinScan.h"],
+    deps = [
+        "//eden/common/utils:fsdetect",
+        "//eden/fs/utils:mount_info_table",
+        "//folly:conv",
+        "//folly:string",
+    ],
+    exported_deps = [
+        "//folly:expected",
+        "//folly:function",
+        "//folly/container:f14_hash",
     ],
 )

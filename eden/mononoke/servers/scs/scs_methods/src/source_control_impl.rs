@@ -57,6 +57,7 @@ use login_objects_thrift::EnvironmentType;
 use megarepo_api::MegarepoApi;
 use memory::MemoryStats;
 use metaconfig_types::CommonConfig;
+use metadata::ClientPathAclCompatibility;
 use metadata::Metadata;
 use mononoke_api::ChangesetContext;
 use mononoke_api::ChangesetId;
@@ -71,7 +72,7 @@ use mononoke_api::SessionContainer;
 use mononoke_api::TreeContext;
 use mononoke_app::MononokeApp;
 use mononoke_configs::MononokeConfigs;
-use mononoke_types::content_manifest::compat;
+use mononoke_types::ContentManifestId;
 use mononoke_types::hash::Sha1;
 use mononoke_types::hash::Sha256;
 use permission_checker::AclProvider;
@@ -87,6 +88,7 @@ use scuba_ext::ScubaValue;
 use source_control as thrift;
 use source_control_services::SourceControlService;
 use source_control_services::errors::source_control_service as service;
+use sql_ext::facebook::MysqlOptions;
 use srserver::RequestContext;
 use stats::prelude::*;
 use time_ext::DurationExt;
@@ -104,7 +106,11 @@ const FORWARDED_CLIENT_IP_HEADER: &str = "scm_forwarded_client_ip";
 const FORWARDED_CLIENT_PORT_HEADER: &str = "scm_forwarded_client_port";
 const FORWARDED_CLIENT_DEBUG_HEADER: &str = "scm_forwarded_client_debug";
 const FORWARDED_OTHER_CATS_HEADER: &str = "scm_forwarded_other_cats";
+// Header names are fixed by the upstream proxy that forwards its caller's CATs.
+const FORWARDED_UNVERIFIED_CATS_HEADER: &str = "raw_customer_cats";
+const FORWARDED_UNVERIFIED_CATS_VERIFIER_HEADER: &str = "customer_cats_verifier_service_identity";
 const ALWAYS_LOG_HEADER: &str = "always_log";
+const SCS_PATH_ACL_COMPATIBLE_HEADER: &str = "scs_path_acl_compatible";
 const PER_REQUEST_READ_QPS: usize = 4000;
 const PER_REQUEST_WRITE_QPS: usize = 4000;
 
@@ -132,11 +138,23 @@ define_stats! {
     total_request_internal_failure_permille: timeseries(Average),
     total_request_invalid_permille: timeseries(Average),
 
-    // Duration per method
-    method_completion_time_ms: dynamic_histogram("method.{}.completion_time_ms", (method: String); 10, 0, 1_000, Average, Sum, Count; P 5; P 50 ; P 90),
     total_method_requests:  dynamic_timeseries("method.{}.total_method_requests", (method: String); Rate, Sum),
     total_method_internal_failure:  dynamic_timeseries("method.{}.total_method_internal_failure", (method: String); Rate, Sum),
+    malformed_path_acl_compatibility_header: timeseries(Rate, Sum),
 
+}
+
+fn classify_client_path_acl_compatibility(
+    header: anyhow::Result<Option<Vec<u8>>>,
+) -> ClientPathAclCompatibility {
+    match header {
+        Ok(None) => ClientPathAclCompatibility::Absent,
+        Ok(Some(value)) if value == b"1" => ClientPathAclCompatibility::ReadyV1,
+        Ok(Some(_)) | Err(_) => {
+            STATS::malformed_path_acl_compatibility_header.add_value(1);
+            ClientPathAclCompatibility::Malformed
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -153,6 +171,7 @@ pub struct SourceControlServiceImpl {
     pub(crate) acl_provider: Arc<dyn AclProvider>,
     #[allow(unused)]
     pub(crate) git_source_of_truth_config: Arc<dyn GitSourceOfTruthConfig>,
+    pub(crate) mysql_options: MysqlOptions,
     pub(crate) watchdog_max_poll: u64,
     pub(crate) remote_diff_options: RemoteDiffOptions,
     /// KCB request-primary identity types, loaded once from Configerator at
@@ -194,6 +213,7 @@ impl SourceControlServiceImpl {
             async_requests_queue,
             acl_provider: app.environment().acl_provider.clone(),
             git_source_of_truth_config,
+            mysql_options: app.mysql_options().clone(),
             watchdog_max_poll,
             remote_diff_options: app.environment().remote_diff_options.clone(),
             request_primary_identity_types: load_request_primary_identity_types(app),
@@ -212,8 +232,7 @@ impl SourceControlServiceImpl {
         params: &dyn AddScubaParams,
     ) -> Result<(CoreContext, String, Option<String>), scs_errors::ServiceError> {
         let session = self.create_session(req_ctxt).await?;
-        let identities = session.metadata().identities();
-        let mut scuba = self.create_scuba(name, req_ctxt, specifier, params, identities)?;
+        let mut scuba = self.create_scuba(name, req_ctxt, specifier, params, session.metadata())?;
         scuba.add("likely_agentic", session.metadata().likely_an_agent());
         if let Some(client_info) = session.metadata().client_request_info() {
             scuba.add_client_request_info(client_info);
@@ -249,13 +268,24 @@ impl SourceControlServiceImpl {
         req_ctxt: &RequestContext,
         specifier: Option<&dyn SpecifierExt>,
         params: &dyn AddScubaParams,
-        identities: &MononokeIdentitySet,
+        metadata: &Metadata,
     ) -> Result<MononokeScubaSampleBuilder, scs_errors::ServiceError> {
+        let identities = metadata.identities();
         let mut scuba = self.scuba_builder.clone().with_seq("seq");
         scuba.add("type", "thrift");
         scuba.add("method", name);
         if let Some(specifier) = specifier {
             if let Some(reponame) = specifier.scuba_reponame() {
+                // Per-repo config provenance; mutation id is always None until plumbed.
+                if let Some(repo_config) = self.configs.repo_configs().repos.get(reponame.as_str())
+                {
+                    if let Some(version) = repo_config.config_version.clone() {
+                        scuba.add("repo_config_version", version);
+                    }
+                    if let Some(mutation_id) = repo_config.config_mutation_id {
+                        scuba.add("repo_config_mutation_id", mutation_id);
+                    }
+                }
                 scuba.add("reponame", reponame);
             }
             if let Some(commit) = specifier.scuba_commit() {
@@ -267,11 +297,6 @@ impl SourceControlServiceImpl {
             if let Some(tree_specifier) = specifier.scuba_param_tree_specifier() {
                 scuba.add("param_tree_specifier", tree_specifier);
             }
-        }
-
-        if let Some(config_info) = self.configs.as_ref().config_info().as_ref() {
-            scuba.add("config_store_version", config_info.content_hash.clone());
-            scuba.add("config_store_last_updated_at", config_info.last_updated_at);
         }
 
         let sampling_rate = NonZeroU64::new(justknobs::get_as::<u64>(
@@ -316,11 +341,89 @@ impl SourceControlServiceImpl {
                 .map(|id| id.to_typed_string())
                 .collect::<ScubaValue>(),
         );
+        scuba.add(
+            "client_path_acl_compatibility",
+            metadata.client_path_acl_compatibility().as_str(),
+        );
+
+        if let Some(forwarded) = metadata.unverified_forwarded_identities() {
+            scuba.add(
+                "unverified_forwarded_identities",
+                forwarded
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<ScubaValue>(),
+            );
+        }
+        scuba.add_opt(
+            "forwarded_cats_verifier",
+            metadata.forwarded_cats_verifier(),
+        );
+        if let Some(verifiers) = metadata.forwarded_cats_token_verifiers() {
+            scuba.add(
+                "forwarded_cats_token_verifiers",
+                verifiers
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<ScubaValue>(),
+            );
+        }
 
         Ok(scuba)
     }
 
     async fn create_metadata(
+        &self,
+        req_ctxt: &RequestContext,
+    ) -> Result<Metadata, scs_errors::ServiceError> {
+        let header = |h: &str| req_ctxt.header(h).map_err(scs_errors::invalid_request);
+        let mut metadata = self.create_base_metadata(req_ctxt).await?;
+        metadata.add_client_path_acl_compatibility(classify_client_path_acl_compatibility(
+            req_ctxt.header_as_bytes(SCS_PATH_ACL_COMPATIBLE_HEADER),
+        ));
+
+        let client_info: Option<ClientInfo> = header(CLIENT_INFO_HEADER)?
+            .as_ref()
+            .and_then(|ci| serde_json::from_str(ci).ok());
+        metadata.add_client_info(
+            client_info.unwrap_or_else(|| {
+                ClientInfo::default_with_entry_point(ClientEntryPoint::ScsServer)
+            }),
+        );
+        if let Some(client_id) = header("client_id")? {
+            metadata.add_upstream_client_id(client_id);
+        }
+
+        // Forwarded caller CATs are parsed without verification and only logged;
+        // they never join `identities`.
+        if justknobs::eval(
+            "scm/mononoke:scs_log_unverified_forwarded_identities",
+            None,
+            None,
+        ) {
+            if let (Some(verifier), Some(raw_cats)) = (
+                header(FORWARDED_UNVERIFIED_CATS_VERIFIER_HEADER)?,
+                header(FORWARDED_UNVERIFIED_CATS_HEADER)?,
+            ) {
+                match cats::unverified_identities_from_serialized_list(&raw_cats) {
+                    Ok((identities, token_verifiers)) => {
+                        metadata.add_unverified_forwarded_identities(
+                            verifier,
+                            identities,
+                            token_verifiers,
+                        );
+                    }
+                    Err(e) => {
+                        debug!("Ignoring unparsable {FORWARDED_UNVERIFIED_CATS_HEADER}: {e:#}")
+                    }
+                }
+            }
+        }
+        Ok(metadata)
+    }
+
+    /// Resolve the request's identities and connection details into a `Metadata`.
+    async fn create_base_metadata(
         &self,
         req_ctxt: &RequestContext,
     ) -> Result<Metadata, scs_errors::ServiceError> {
@@ -348,12 +451,6 @@ impl SourceControlServiceImpl {
             .into_iter()
             .map(MononokeIdentity::from)
             .collect();
-
-        let client_info: Option<ClientInfo> = req_ctxt
-            .header(CLIENT_INFO_HEADER)
-            .map_err(scs_errors::invalid_request)?
-            .as_ref()
-            .and_then(|ci| serde_json::from_str(ci).ok());
 
         if let (
             Some(forwarded_authenticated_identities_thrift),
@@ -404,18 +501,11 @@ impl SourceControlServiceImpl {
                 if let Some(other_cats) = header(FORWARDED_OTHER_CATS_HEADER)? {
                     metadata.add_raw_encoded_cats(other_cats);
                 }
-                let client_info = client_info.unwrap_or_else(|| {
-                    ClientInfo::default_with_entry_point(ClientEntryPoint::ScsServer)
-                });
-                metadata.add_client_info(client_info);
-                if let Some(client_id) = header("client_id")? {
-                    metadata.add_upstream_client_id(client_id);
-                }
                 return Ok(metadata);
             }
         }
 
-        let mut metadata = Metadata::new(
+        Ok(Metadata::new(
             None,
             tls_identities.union(&cats_identities).cloned().collect(),
             false,
@@ -432,15 +522,7 @@ impl SourceControlServiceImpl {
                     .map_err(scs_errors::internal_error)?,
             ),
         )
-        .await;
-
-        let client_info = client_info
-            .unwrap_or_else(|| ClientInfo::default_with_entry_point(ClientEntryPoint::ScsServer));
-        metadata.add_client_info(client_info);
-        if let Some(client_id) = header("client_id")? {
-            metadata.add_upstream_client_id(client_id);
-        }
-        Ok(metadata)
+        .await)
     }
 
     /// Create and configure the session container for a request.
@@ -497,6 +579,8 @@ impl SourceControlServiceImpl {
         F: FnOnce(RepoEphemeralStore) -> R,
         R: Future<Output = anyhow::Result<Option<BubbleId>>>,
     {
+        ensure_repo_requests_allowed(&repo.name)?;
+
         let repo = self
             .mononoke
             .repo(ctx.clone(), &repo.name)
@@ -634,8 +718,9 @@ impl SourceControlServiceImpl {
                 (repo, path.tree().await?)
             }
             thrift::TreeSpecifier::by_id(tree_id) => {
+                ensure_tree_id_requests_allowed(&tree_id.repo.name)?;
                 let repo = self.repo(ctx, &tree_id.repo).await?;
-                let tree_id = compat::ContentManifestId::from_request(tree_id)?;
+                let tree_id = ContentManifestId::from_request(tree_id)?;
                 let tree = repo
                     .tree(tree_id)
                     .await?
@@ -715,6 +800,36 @@ impl SourceControlServiceImpl {
             remote_diff_config,
         }
     }
+}
+
+fn ensure_tree_id_requests_allowed(repo_name: &str) -> Result<(), scs_errors::ServiceError> {
+    if justknobs::eval(
+        "scm/mononoke:scs_reject_tree_id_requests",
+        None,
+        Some(repo_name),
+    ) {
+        return Err(scs_errors::invalid_request(
+            "tree ID access is disabled; specify the tree by commit and path",
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn ensure_repo_requests_allowed(repo_name: &str) -> Result<(), scs_errors::ServiceError> {
+    if justknobs::eval(
+        "scm/mononoke:scs_reject_repo_requests",
+        None,
+        Some(repo_name),
+    ) {
+        return Err(scs_errors::not_available(format!(
+            "SCS requests to repository '{repo_name}' are disabled"
+        ))
+        .into());
+    }
+
+    Ok(())
 }
 
 /// Configerator path of the runtime-updatable `ClientIdentifierPolicy`, mirrored
@@ -960,10 +1075,6 @@ fn log_result<T: AddScubaResponse>(
     STATS::total_request_internal_failure_permille.add_value(internal_failure * 1000);
     STATS::total_request_invalid_permille.add_value(invalid_request * 1000);
     STATS::total_request_overloaded.add_value(overloaded);
-    STATS::method_completion_time_ms.add_value(
-        stats.completion_time.as_millis_unchecked() as i64,
-        (method.to_string(),),
-    );
 
     ctx.perf_counters().insert_perf_counters(&mut scuba);
 
@@ -1130,11 +1241,6 @@ fn log_stream_complete(
     STATS::total_request_internal_failure_permille.add_value(internal_failure * 1000);
     STATS::total_request_invalid_permille.add_value(invalid_request * 1000);
     STATS::total_request_overloaded.add_value(overloaded);
-    // Only accounts for the time to start the stream, not the overall time.
-    STATS::method_completion_time_ms.add_value(
-        initial_future_stats.completion_time.as_millis_unchecked() as i64,
-        (method.to_string(),),
-    );
 
     ctx.perf_counters().insert_perf_counters(&mut scuba);
 
@@ -1456,6 +1562,10 @@ impl SourceControlService for SourceControlServiceThriftImpl {
             params: thrift::ListReposParams,
         ) -> Result<Vec<thrift::Repo>, service::ListReposExn>;
 
+        async fn repo_exists(
+            params: thrift::RepoExistsParams,
+        ) -> Result<thrift::RepoExistsResponse, service::RepoExistsExn>;
+
         async fn repo_info(
             repo: thrift::RepoSpecifier,
             params: thrift::RepoInfoParams,
@@ -1742,6 +1852,11 @@ impl SourceControlService for SourceControlServiceThriftImpl {
             params: thrift::RepoLandStackParams,
         ) -> Result<thrift::RepoLandStackResponse, service::RepoLandStackExn>;
 
+        async fn repo_rebase_stack(
+            repo: thrift::RepoSpecifier,
+            params: thrift::RepoRebaseStackParams,
+        ) -> Result<thrift::RepoRebaseStackResponse, service::RepoRebaseStackExn>;
+
         async fn repo_prepare_commits(
             repo: thrift::RepoSpecifier,
             params: thrift::RepoPrepareCommitsParams,
@@ -1888,6 +2003,39 @@ mod tests {
     use mononoke_macros::mononoke;
 
     use super::*;
+
+    #[mononoke::test]
+    fn test_classify_client_path_acl_compatibility() {
+        assert_eq!(
+            classify_client_path_acl_compatibility(Ok(None)),
+            ClientPathAclCompatibility::Absent,
+        );
+        assert_eq!(
+            classify_client_path_acl_compatibility(Ok(Some(b"1".to_vec()))),
+            ClientPathAclCompatibility::ReadyV1,
+        );
+
+        for malformed in [
+            Vec::new(),
+            b"0".to_vec(),
+            b"true".to_vec(),
+            b" 1".to_vec(),
+            b"1 ".to_vec(),
+            b"1,1".to_vec(),
+            vec![0xff],
+            vec![b'1'; 1024],
+        ] {
+            assert_eq!(
+                classify_client_path_acl_compatibility(Ok(Some(malformed))),
+                ClientPathAclCompatibility::Malformed,
+            );
+        }
+
+        assert_eq!(
+            classify_client_path_acl_compatibility(Err(anyhow::anyhow!("header read failed"))),
+            ClientPathAclCompatibility::Malformed,
+        );
+    }
 
     /// The compile-time-const KCB request-primary identity types used by the
     /// tests below (also the fail-secure fallback set).
@@ -2122,6 +2270,68 @@ mod tests {
                     &["SERVICE_IDENTITY".to_string()]
                 ));
                 assert!(!ctx.nocache_thriftcache());
+            },
+        );
+    }
+
+    #[mononoke::test]
+    fn test_tree_id_requests_allowed_when_jk_disabled() {
+        with_just_knobs(
+            JustKnobsInMemory::new(hashmap![
+                "scm/mononoke:scs_reject_tree_id_requests".to_string() => KnobVal::Bool(false)
+            ]),
+            || {
+                assert!(ensure_tree_id_requests_allowed("test_repo").is_ok());
+            },
+        );
+    }
+
+    #[mononoke::test]
+    fn test_tree_id_requests_rejected_when_jk_enabled() {
+        with_just_knobs(
+            JustKnobsInMemory::new(hashmap![
+                "scm/mononoke:scs_reject_tree_id_requests".to_string() => KnobVal::Bool(true)
+            ]),
+            || match ensure_tree_id_requests_allowed("test_repo") {
+                Err(scs_errors::ServiceError::Request(error)) => {
+                    assert_eq!(error.kind, thrift::RequestErrorKind::INVALID_REQUEST);
+                    assert_eq!(
+                        error.reason,
+                        "tree ID access is disabled; specify the tree by commit and path"
+                    );
+                }
+                result => panic!("expected INVALID_REQUEST error, got {result:?}"),
+            },
+        );
+    }
+
+    #[mononoke::test]
+    fn test_repo_requests_allowed_when_jk_disabled() {
+        with_just_knobs(
+            JustKnobsInMemory::new(hashmap![
+                "scm/mononoke:scs_reject_repo_requests".to_string() => KnobVal::Bool(false)
+            ]),
+            || {
+                assert!(ensure_repo_requests_allowed("test_repo").is_ok());
+            },
+        );
+    }
+
+    #[mononoke::test]
+    fn test_repo_requests_rejected_when_jk_enabled() {
+        with_just_knobs(
+            JustKnobsInMemory::new(hashmap![
+                "scm/mononoke:scs_reject_repo_requests".to_string() => KnobVal::Bool(true)
+            ]),
+            || match ensure_repo_requests_allowed("test_repo") {
+                Err(scs_errors::ServiceError::Request(error)) => {
+                    assert_eq!(error.kind, thrift::RequestErrorKind::NOT_AVAILABLE);
+                    assert_eq!(
+                        error.reason,
+                        "SCS requests to repository 'test_repo' are disabled"
+                    );
+                }
+                result => panic!("expected NOT_AVAILABLE request error, got {result:?}"),
             },
         );
     }

@@ -1,8 +1,9 @@
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_genrule", "buck_sh_binary")
-load("@fbsource//tools/build_defs:buckconfig.bzl", "read_bool")
+load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 load("@fbsource//tools/target_determinator/macros:ci_hint.bzl", "ci_hint")
+load("@prelude//utils:buckconfig.bzl", "read_bool")
 
 def _set_default(obj, *keys):
     for key in keys:
@@ -10,11 +11,149 @@ def _set_default(obj, *keys):
         obj = obj[key]
     return obj
 
+_RUST_DEP_OVERRIDES = {
+    "smallvec": {
+        "default-features": False,
+        "features": [],
+    },
+    "termwiz": {
+        "default-features": False,
+        "features": [],
+        "git": None,
+        "rev": None,
+    },
+}
+
+def cas_enabled():
+    return read_bool("sl", "cas", False) and not rust_oss.is_oss_build()
+
+def edenfs_cas_select(values):
+    if rust_oss.is_oss_build():
+        return []
+    return select({
+        "DEFAULT": [],
+        "fbcode//eden/scm/lib/backingstore:edenfs-cas[enabled]": select({
+            "DEFAULT": [],
+            "ovr_config//os:linux": values,
+        }),
+    })
+
+def _minimal_third_party_rust_overrides(deps):
+    deps_repr = repr(deps or [])
+    overrides = {}
+    for crate, override in _RUST_DEP_OVERRIDES.items():
+        if "fbsource//third-party/rust:" + crate in deps_repr:
+            overrides[crate] = dict(override)
+    return overrides
+
+def _autocargo_overrides(**kwargs):
+    """Avoid inheriting monorepo-wide features or git urls that are unnecessary in Sapling.
+
+    For examples, turns generated Cargo.toml:
+
+        smallvec = { version = "1.15.2", features = ["specialization", ...] }
+        termwiz = { git = "...", rev = "...", features = ["use_serde", "widgets"], default-features = false }
+
+    into:
+
+        smallvec = { version = "1.15.2", default-features = false }
+        termwiz = { version = "0.23.3", default-features = false }
+    """
+    autocargo = kwargs.get("autocargo")
+    if autocargo != None and autocargo.get("ignore_rule"):
+        return autocargo
+
+    dependencies = _minimal_third_party_rust_overrides([
+        kwargs.get("deps"),
+        kwargs.get("named_deps"),
+    ])
+    dev_dependencies = _minimal_third_party_rust_overrides([
+        kwargs.get("test_deps"),
+        kwargs.get("test_named_deps"),
+    ])
+    if not dependencies and not dev_dependencies:
+        return autocargo
+
+    result = dict(autocargo or {})
+    _apply_autocargo_dep_overrides(result, "dependencies", dependencies)
+    _apply_autocargo_dep_overrides(result, "dev-dependencies", dev_dependencies)
+    return result
+
+def _apply_autocargo_dep_overrides(autocargo, dep_kind, overrides):
+    for crate, override in overrides.items():
+        _set_autocargo_dep_override(autocargo, dep_kind, crate, override)
+
+    if "termwiz" in overrides:
+        # D105187099 switched fbsource termwiz to the wezterm git workspace.
+        # Buck's wezterm-dynamic target enables std, but autocargo does not inherit that:
+        #
+        #     error[E0599]: no associated function or constant named `from_dynamic`
+        #     found for struct `HashMap<K, V, S, A>` in the current scope
+        #     --> termwiz-0.23.3/src/hyperlink.rs:19:39
+        #
+        # The missing HashMap impl is gated behind wezterm-dynamic/std. The published
+        # wezterm-dynamic 0.2.1 does not have that feature, so disable it in OSS manifests.
+        _set_autocargo_dep_override(
+            autocargo,
+            dep_kind,
+            "wezterm-dynamic",
+            {
+                "default-features": False,
+                "features": ["std"],
+                "git": None,
+                "rev": None,
+            },
+        )
+        _set_autocargo_dep_override(
+            autocargo,
+            dep_kind,
+            "wezterm-dynamic",
+            {"features": []},
+            override_kind = "oss_dependencies_override",
+        )
+        _add_extra_buck_dependency(autocargo, dep_kind, "fbsource//third-party/rust:wezterm-dynamic")
+
+def _set_autocargo_dep_override(autocargo, dep_kind, crate, override, override_kind = "dependencies_override"):
+    dep = _set_default(
+        autocargo,
+        "cargo_toml_config",
+        override_kind,
+        dep_kind,
+        crate,
+    )
+    for key, value in override.items():
+        dep.setdefault(key, value)
+
+def _add_extra_buck_dependency(autocargo, dep_kind, dep):
+    extra = _set_default(autocargo, "cargo_toml_config", "extra_buck_dependencies")
+    deps = extra.get(dep_kind, [])
+    if dep not in deps:
+        extra[dep_kind] = deps + [dep]
+
 def sl_rust_library(**kwargs):
+    autocargo = _autocargo_overrides(**kwargs)
+    if autocargo != None:
+        kwargs["autocargo"] = autocargo
+    # avoid nightly features
+    kwargs["rustc_flags"] = (kwargs.get("rustc_flags") or []) + ["-Funstable-features"]
     return rust_library(**kwargs)
 
-def sl_rust_binary(**kwargs):
+def sl_rust_binary(embeds_python = False, **kwargs):
+    autocargo = _autocargo_overrides(**kwargs)
+    if autocargo != None:
+        kwargs["autocargo"] = autocargo
+    if embeds_python:
+        kwargs["deps"] = _with_libpython(kwargs.get("deps"))
     return rust_binary(**kwargs)
+
+# An embedder starts its own interpreter, so unlike an extension module it has no
+# host to borrow the Python C API from and needs the real libpython. The
+# `python3-sys` fixup deliberately supplies only `:python`, which on macOS resolves
+# the C API at extension-load time; embedders opt in to the real dylib here.
+# Concatenate rather than `list()`: `deps` may be a `select()`.
+def _with_libpython(deps):
+    libpython = ["fbsource//third-party/python:python-for-embedding"]
+    return libpython if deps == None else deps + libpython
 
 def exec_compatible_with_target():
     """Intended to be used by genrule's exec_compatible_with to force
@@ -53,7 +192,9 @@ def exec_compatible_with_target():
             choices[full_name] = [full_name]
         return select(choices)
 
-    return select_with("ovr_config//os/constraints:", os_list) + select_with("ovr_config//cpu/constraints:", cpu_list)
+    return select_with("ovr_config//os/constraints:", os_list) + select(
+        {"DEFAULT": select_with("ovr_config//cpu/constraints:", cpu_list), "ovr_config//os/constraints:macos": []}
+    )
 
 def rust_python_library(deps = None, include_python_sys = False, include_cpython = True, pyo3 = False, **kwargs):
     # Python 3 target
@@ -73,6 +214,13 @@ def rust_python_library(deps = None, include_python_sys = False, include_cpython
         deps3.append("fbsource//third-party/rust:python3-sys")
     if pyo3:
         deps3.append("fbsource//third-party/rust:pyo3")
+
+    # The generated `-unittest` binary runs standalone, with no interpreter to
+    # borrow the Python C API from, so it embeds CPython and needs the real
+    # libpython. Scoping this to `test_deps` keeps the library itself -- and the
+    # extensions built from it -- on the extension-safe `:python`.
+    if include_cpython or include_python_sys or pyo3:
+        kwargs3["test_deps"] = _with_libpython(kwargs3.get("test_deps"))
 
     kwargs3["name"] = kwargs["name"]
     kwargs3["crate"] = kwargs["name"].replace("-", "_")
@@ -104,8 +252,17 @@ def fetch_as_eden():
     return read_bool("sl", "fetch_as_eden", False)
 
 def sl_binary(name, extra_deps = [], extra_features = [], **kwargs):
+    kwargs.setdefault(
+        "allocator",
+        select({
+            "DEFAULT": "malloc",
+            "ovr_config//os:linux": "jemalloc",
+            "ovr_config//os:macos": "jemalloc",
+        }),
+    )
     sl_rust_binary(
         name = name,
+        embeds_python = True,
         srcs = glob(["exec/hgmain/src/**/*.rs"]),
         features = [
             "fb",
@@ -128,11 +285,19 @@ def sl_binary(name, extra_deps = [], extra_features = [], **kwargs):
             "//eden/scm/lib/commands:commands",
             "//eden/scm/lib/util/atexit:atexit",
         ]
+        + (
+            []
+            if rust_oss.is_oss_build()
+            else [
+                "//scm/telemetry/distributed-tracing-artillery:distributed-tracing-artillery",
+            ]
+        )
         + extra_deps
         + select({
             "DEFAULT": [],
             "ovr_config//os:linux": [
                 "fbsource//third-party/rust:libc",
+                "//eden/scm/lib/hg-http:hg-http",
             ],
             "ovr_config//os:macos": [
                 "fbsource//third-party/rust:libc",

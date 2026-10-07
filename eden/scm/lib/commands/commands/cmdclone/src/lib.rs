@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::anyhow;
-use async_runtime::block_unless_interrupted as block_on;
+use async_runtime::block_on;
 use clidispatch::ReqCtx;
 use clidispatch::TermLogger;
 use clidispatch::abort;
@@ -32,6 +32,9 @@ use configmodel::Text;
 use configmodel::ValueSource;
 use eagerepo::EagerRepo;
 use filters::util::filter_paths_from_config;
+use hgrc_parser::format::Error as ConfigFormatError;
+use hgrc_parser::format::format_config_include;
+use hgrc_parser::format::format_config_section;
 use migration::feature::deprecate;
 use regex::Regex;
 use repo::repo::Repo;
@@ -562,12 +565,11 @@ fn clone_metadata(
         }
     }
 
-    let mut repo_config_file_content = includes.into_iter().fold(String::new(), |mut out, file| {
-        use std::fmt::Write;
-
-        let _ = write!(out, "%include {file}\n");
-        out
-    });
+    let mut repo_config_file_content = includes
+        .into_iter()
+        .map(|file| format_config_include(&file))
+        .collect::<Result<Vec<String>, ConfigFormatError>>()?
+        .concat();
 
     if !repo_config_file_content.is_empty() {
         repo_config_file_content.push('\n');
@@ -583,8 +585,11 @@ fn clone_metadata(
         );
     }
 
-    repo_config_file_content
-        .push_str(format!("[paths]\ndefault = {}\n", source.clean_str()).as_str());
+    repo_config_file_content.push_str(&format_config_section(
+        "paths",
+        "default",
+        source.clean_str(),
+    )?);
 
     // Some config values are inherent to the repo and should be persisted if passed to clone.
     // This is analogous to persisting the --configfile args above.
@@ -596,7 +601,8 @@ fn clone_metadata(
         }) = config.get_sources(section, name).last()
         {
             if *source == "--config" || *source == "clone source" {
-                repo_config_file_content.push_str(&format!("\n[{section}]\n{name} = {value}\n"));
+                repo_config_file_content.push('\n');
+                repo_config_file_content.push_str(&format_config_section(section, name, value)?);
             }
         }
     }
@@ -627,7 +633,7 @@ fn clone_metadata(
         let edenapi = repo.eden_api().map_err(|err| err.tag_network())?;
 
         let mut capabilities: Vec<String> =
-            block_on(edenapi.capabilities())?.map_err(|e| e.tag_network())?;
+            block_on(edenapi.capabilities()).map_err(|e| e.tag_network())?;
         capabilities.sort_unstable();
         let has_capability = |name: &str| -> bool {
             capabilities

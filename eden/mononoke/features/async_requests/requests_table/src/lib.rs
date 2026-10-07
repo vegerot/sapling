@@ -20,6 +20,7 @@ mod types;
 pub use crate::backfill_progress::ChildCounts;
 pub use crate::backfill_progress::RepoStatus;
 pub use crate::store::SqlLongRunningRequestsQueue;
+pub use crate::types::AbandonedRequestAction;
 pub use crate::types::BlobstoreKey;
 pub use crate::types::ClaimedBy;
 pub use crate::types::LongRunningRequestEntry;
@@ -153,13 +154,15 @@ pub trait LongRunningRequestsQueue: Send + Sync {
     ) -> Result<Vec<RequestId>>;
 
     /// If `request_id` is still abandoned, then mark it as new so that
-    /// somebody else can pick it up
+    /// somebody else can pick it up, or fail it if `max_retry_allowed`
+    /// retries are already spent.
     async fn mark_abandoned_request_as_new(
         &self,
         ctx: &CoreContext,
         request_id: RequestId,
         abandoned_timestamp: Timestamp,
-    ) -> Result<bool>;
+        max_retry_allowed: u8,
+    ) -> Result<AbandonedRequestAction>;
 
     /// Mark request as ready
     async fn mark_ready(
@@ -218,11 +221,36 @@ pub trait LongRunningRequestsQueue: Send + Sync {
         limit: usize,
     ) -> Result<Vec<LongRunningRequestEntry>>;
 
+    /// List `ready` requests with `ready_at` older than `ready_before`,
+    /// ordered by `ready_at` ascending (oldest first), up to `limit` rows.
+    ///
+    /// These are the requests that drive the `queue.<repo>.age_s.ready`
+    /// worker stats: the stat reports `now - min(ready_at)`, so any row
+    /// returned here with `ready_at` older than `now - threshold` would trip
+    /// an alert thresholding on that stat. If `exclude_backfill` is true,
+    /// derived data backfill request types are excluded, matching the worker
+    /// stats loop which passes `exclude_backfill=true`.
+    async fn list_old_ready_requests(
+        &self,
+        ctx: &CoreContext,
+        repo_filter: &QueueRepoFilter,
+        ready_before: &Timestamp,
+        limit: usize,
+        exclude_backfill: bool,
+    ) -> Result<Vec<LongRunningRequestEntry>>;
+
     /// Mark the given requests as `failed`. Only rows still in the `ready`
     /// state are affected; the guard keeps this safe to run concurrently with
     /// other queue activity and idempotent on re-runs. Returns the number of
     /// rows actually updated.
     async fn mark_ready_requests_failed(&self, ctx: &CoreContext, ids: &[RowId]) -> Result<u64>;
+
+    /// Mark the given requests as `polled`, as if the client had collected
+    /// their results. Only rows still in the `ready` state *with a stored
+    /// result blob* are affected; the guards keep this safe to run
+    /// concurrently with other queue activity and idempotent on re-runs.
+    /// Returns the number of rows actually updated.
+    async fn mark_ready_requests_polled(&self, ctx: &CoreContext, ids: &[RowId]) -> Result<u64>;
 
     /// Retrieve stats on the queue, filtered by repo.
     /// If `exclude_backfill` is true, derived data backfill request types

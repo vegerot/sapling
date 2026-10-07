@@ -20,6 +20,7 @@
 #include <folly/futures/SharedPromise.h>
 #include <folly/logging/Logger.h>
 #include <folly/stop_watch.h>
+#include <folly/synchronization/CallOnce.h>
 #include <gflags/gflags.h>
 #include <chrono>
 #include <cstdint>
@@ -38,6 +39,7 @@
 #include "eden/fs/inodes/CacheHint.h"
 #include "eden/fs/inodes/FsChannel.h"
 #include "eden/fs/inodes/InodeNumber.h"
+#include "eden/fs/inodes/InodePathCache.h"
 #include "eden/fs/inodes/InodePressurePolicy.h"
 #include "eden/fs/inodes/InodePtrFwd.h"
 #include "eden/fs/inodes/InodeTimestamps.h"
@@ -105,6 +107,11 @@ class RenameLock;
 class SharedRenameLock;
 
 constexpr int kMaxSymlinkChainDepth = 40; // max depth of symlink chain
+
+// Checkout carries RenameLock across async continuations, so release may run
+// on a different worker thread from acquire. Use the same SharedMutex
+// implementation without TSan's thread-affine rwlock annotations.
+using RenameMutex = folly::SharedMutexSuppressTSAN;
 
 /**
  * Represents an inode state transition and the duration it took for the event
@@ -486,6 +493,11 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   void setTestFsChannel(FsChannelPtr channel);
 
   FuseChannel* FOLLY_NULLABLE getFuseChannel() const;
+#ifndef _WIN32
+  std::shared_ptr<FuseChannel> getFuseChannelShared() const;
+  std::shared_ptr<UnboundedQueueExecutor> getInodeGCInvalidationExecutor()
+      const;
+#endif
   Nfsd3* FOLLY_NULLABLE getNfsdChannel() const;
 
   /**
@@ -611,6 +623,10 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
     return inodeMap_;
   }
 
+  InodePathCache& getInodePathCache() {
+    return inodePathCache_;
+  }
+
   /**
    * Return the Overlay for this mount.
    */
@@ -661,6 +677,32 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    * Rebuild the InodePressurePolicy from the current EdenConfig.
    */
   void updateInodePressurePolicy();
+
+  /**
+   * Record the outcome of a completed pressure-based GC run, updating
+   * isPressureGcBackedOff(). numUnloaded is what the run reclaimed: what its
+   * own sweep unloaded plus the remembered inodes forgotten while it ran.
+   * pinScanFailed says the run wanted a pin set and got none, so it left
+   * every directory alone.
+   */
+  void recordPressureGcOutcome(
+      uint64_t numInvalidated,
+      uint64_t numUnloaded,
+      bool pinScanFailed);
+
+  /**
+   * Whether pressure-based GC should wait the regular GC period before
+   * running again, because the most recent pressure-based run reclaimed too
+   * few of the inodes it invalidated, its pin scan failed so it could not
+   * reclaim directories, or a run was cancelled for repeated tree-load
+   * failures. When EdenFS tracks FS refcounts the kernel no longer
+   * holds, GC invalidations fail (silently) with ENOENT and produce no
+   * FORGETs, so rerunning pressure GC just re-invalidates the same inodes to
+   * no effect. Cleared by the next pressure-based run that reclaims enough.
+   */
+  bool isPressureGcBackedOff() const {
+    return pressureGcBackoff_.load(std::memory_order_relaxed);
+  }
 
   const CheckoutConfig* getCheckoutConfig() const {
     return checkoutConfig_.get();
@@ -868,37 +910,6 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    */
   ImmediateFuture<folly::Unit> chown(uid_t uid, gid_t gid);
 
-  /**
-   * Compute differences between the current commit and the working directory
-   * state.
-   *
-   * @param listIgnored Whether or not to inform the callback of ignored files.
-   *     When listIgnored is set to false can speed up the diff computation, as
-   *     the code does not need to descend into ignored directories at all.
-   * @param enforceCurrentParent Whether or not to return an error if the
-   *     specified commitId does not match the actual current working
-   *     directory parent.  If this is false the code will still compute a diff
-   *     against the specified commitId even the working directory parent
-   *     points elsewhere, or when a checkout is currently in progress.
-   * @param request This ResponseChannelRequest is passed from the
-   *     ServiceHandler and is used to check if the request is still active,
-   *     because if the request is no longer active we will cancel this diff
-   *     operation.
-   * @param the rootInode of this mount. Used to prevent the mount from being
-   *     shut down.
-   *
-   * @return Returns a folly::Future that will be fulfilled when the diff
-   *     operation is complete.  This is marked [[nodiscard]] to
-   *     make sure callers do not forget to wait for the operation to complete.
-   */
-  [[nodiscard]] ImmediateFuture<std::unique_ptr<ScmStatus>> diff(
-      TreeInodePtr rootInode,
-      const RootId& commitId,
-      folly::CancellationToken cancellation,
-      const ObjectFetchContextPtr& fetchContext,
-      bool listIgnored = false,
-      bool enforceCurrentParent = true);
-
   [[nodiscard]] folly::coro::now_task<std::unique_ptr<ScmStatus>> co_diff(
       TreeInodePtr rootInode,
       const RootId& commitId,
@@ -906,17 +917,6 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
       const ObjectFetchContextPtr& fetchContext,
       bool listIgnored = false,
       bool enforceCurrentParent = true);
-
-  /**
-   * This version of diff is primarily intended for testing.
-   * Use diff(DiffCallback* callback, bool listIgnored) instead.
-   * The caller must ensure that the DiffContext object ctsPtr points to
-   * exists at least until the returned Future completes.
-   */
-  [[nodiscard]] ImmediateFuture<folly::Unit> diff(
-      TreeInodePtr rootInode,
-      DiffContext* ctxPtr,
-      const RootId& commitId) const;
 
   /**
    * Reset the state to point to the specified parent commit, without
@@ -1130,52 +1130,66 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
       TreeInodePtr treeInode,
       const ObjectFetchContext& context);
 
-  /**
-   * Lease to be held for the duration of a background GC.
-   *
-   * Only a single background GC can be running at a given time.
-   */
-  class WorkingCopyGCLease {
+  /** Holds GC admission for either a background GC or checkout. */
+  class InodeGCLease {
    public:
-    explicit WorkingCopyGCLease(
-        std::atomic<bool>* gcRunning,
-        TreeInodePtr inode)
-        : gcRunning_{gcRunning}, inode_{std::move(inode)} {}
+    ~InodeGCLease();
 
-    ~WorkingCopyGCLease() {
-      if (inode_) {
-        gcRunning_->store(false, std::memory_order_release);
-      }
+    const folly::CancellationToken& getCancellationToken() const {
+      return cancellationToken_;
     }
 
-    WorkingCopyGCLease(const WorkingCopyGCLease&) = delete;
-    WorkingCopyGCLease& operator=(const WorkingCopyGCLease&) = delete;
-    WorkingCopyGCLease(WorkingCopyGCLease&&) = default;
-    WorkingCopyGCLease& operator=(WorkingCopyGCLease&&) = default;
+    InodeGCLease(const InodeGCLease&) = delete;
+    InodeGCLease& operator=(const InodeGCLease&) = delete;
+    InodeGCLease(InodeGCLease&& other) noexcept;
+    InodeGCLease& operator=(InodeGCLease&&) = delete;
 
    private:
-    std::atomic<bool>* gcRunning_;
-    // Store the inode for the duration of the GC, this ensures that the mount
-    // cannot be unmounted and thus that gcRunning_ will live for at least as
-    // long as the lease.
-    TreeInodePtr inode_;
+    friend class EdenMount;
+
+    InodeGCLease(
+        std::shared_ptr<EdenMount> mount,
+        bool representsRunningGc,
+        folly::CancellationToken cancellationToken)
+        : mount_{std::move(mount)},
+          representsRunningGc_{representsRunningGc},
+          cancellationToken_{std::move(cancellationToken)} {}
+
+    void release() noexcept;
+
+    std::shared_ptr<EdenMount> mount_;
+    bool representsRunningGc_;
+    folly::CancellationToken cancellationToken_;
   };
 
   /**
-   * Attempt to start a background working copy GC.
+   * Attempt to start a background inode GC.
    *
    * The returned lease must be held for the duration of the GC to ensure that
    * no other concurrent background GC can be started.
    *
-   * This returns a std::nullopt if a background GC is already in progress.
+   * This returns a std::nullopt if a background GC is still running or
+   * checkout currently holds the GC lease.
    */
-  std::optional<WorkingCopyGCLease> tryStartWorkingCopyGC(TreeInodePtr inode);
+  std::optional<InodeGCLease> tryStartInodeGC();
+
+  /**
+   * Count a tree-load failure in the active GC run, cancelling it and backing
+   * off pressure-based GC when the configured failure limit is reached.
+   */
+  void recordInodeGCTreeLoadFailure();
+
+  /**
+   * Cancel the active GC and supersede its lease. The returned lease prevents
+   * new GCs from starting while the canceled GC finishes asynchronously.
+   */
+  InodeGCLease stealInodeGCLease();
 
   /**
    * Returns true if a GC is currently running. This is used to determine if
    * we should wait for a GC to complete before graceful restart.
    */
-  bool isWorkingCopyGCRunning() const;
+  bool isInodeGCRunning() const;
 
   /**
    * Get a weak_ptr to this EdenMount object. EdenMounts are stored as shared
@@ -1322,22 +1336,6 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
       bool listIgnored = false) const;
 
   /**
-   * This accepts a callback which will be invoked as differences are found.
-   * Note that the callback methods may be invoked simultaneously from multiple
-   * different threads, and the callback is responsible for performing
-   * synchronization (if it is needed). It will be packaged into a DiffContext
-   * and passed through the TreeInode diff() codepath
-   */
-  [[nodiscard]] ImmediateFuture<folly::Unit> diff(
-      TreeInodePtr rootInode,
-      ScmStatusDiffCallback* callback,
-      const RootId& commitId,
-      bool listIgnored,
-      bool enforceCurrentParent,
-      folly::CancellationToken cancellation,
-      const ObjectFetchContextPtr& fetchContext) const;
-
-  /**
    * Signal to unmount() that fsChannelMount() or takeoverFuse() has started.
    *
    * beginMount() returns a reference to
@@ -1381,6 +1379,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
 
   friend class TreePrefetchLease;
   void treePrefetchFinished() noexcept;
+  void releaseInodeGCLease(bool representsRunningGc) noexcept;
 
   const std::unique_ptr<const CheckoutConfig> checkoutConfig_;
 
@@ -1407,6 +1406,10 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    * On Windows, directory invalidation will run on this executor.
    */
   std::shared_ptr<UnboundedQueueExecutor> invalidationExecutor_;
+#else
+  /** Runs bounded FUSE GC submissions away from shared executors. */
+  mutable folly::once_flag inodeGCInvalidationExecutorOnce_;
+  mutable std::shared_ptr<UnboundedQueueExecutor> inodeGCInvalidationExecutor_;
 #endif
 
   /**
@@ -1417,6 +1420,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   std::optional<bool> shouldUseNFSMount_{std::nullopt};
 
   std::shared_ptr<InodeMap> inodeMap_;
+  InodePathCache inodePathCache_;
 
   std::shared_ptr<ObjectStore> objectStore_;
   std::shared_ptr<BlobCache> blobCache_;
@@ -1435,7 +1439,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    * Any operation that modifies an existing InodeBase's location_ data must
    * hold the rename lock.
    */
-  mutable folly::SharedMutex renameMutex_;
+  mutable RenameMutex renameMutex_;
 
   /**
    * The IDs of the parent commit of the working directory.
@@ -1540,10 +1544,14 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    */
   std::atomic<uint64_t> numPrefetchesInProgress_{0};
 
-  /**
-   * Whether a periodic working copy GC is ongoing for this mount.
-   */
-  std::atomic<bool> workingCopyGCInProgress_{false};
+  struct InodeGCState {
+    bool gcRunning{false};
+    uint64_t inhibitorCount{0};
+    uint64_t treeLoadFailureLimit{0};
+    uint64_t remainingTreeLoadFailures{0};
+    folly::CancellationSource cancellationSource;
+  };
+  folly::Synchronized<InodeGCState> inodeGCState_;
 
   /**
    * Fixed sized buffer containing recent inode events that have occurred within
@@ -1576,6 +1584,12 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    */
   folly::AtomicReadMostlyMainPtr<const InodePressurePolicy>
       cachedPressurePolicy_;
+
+  /**
+   * Whether pressure-based GC should wait the regular GC period before
+   * running again. See isPressureGcBackedOff().
+   */
+  std::atomic<bool> pressureGcBackoff_{false};
 };
 
 /**
@@ -1585,11 +1599,11 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
  * but it also provides a helper method to ensure that it is currently holding
  * a lock on the desired mount.
  */
-class RenameLock : public std::unique_lock<folly::SharedMutex> {
+class RenameLock : public std::unique_lock<RenameMutex> {
  public:
   RenameLock() {}
   explicit RenameLock(EdenMount* mount)
-      : std::unique_lock<folly::SharedMutex>{mount->renameMutex_} {}
+      : std::unique_lock<RenameMutex>{mount->renameMutex_} {}
 
   bool isHeld(EdenMount* mount) const {
     return owns_lock() && (mutex() == &mount->renameMutex_);
@@ -1599,10 +1613,10 @@ class RenameLock : public std::unique_lock<folly::SharedMutex> {
 /**
  * SharedRenameLock is a holder for an EdenMount's rename mutex in shared mode.
  */
-class SharedRenameLock : public std::shared_lock<folly::SharedMutex> {
+class SharedRenameLock : public std::shared_lock<RenameMutex> {
  public:
   explicit SharedRenameLock(EdenMount* mount)
-      : std::shared_lock<folly::SharedMutex>{mount->renameMutex_} {}
+      : std::shared_lock<RenameMutex>{mount->renameMutex_} {}
 
   bool isHeld(EdenMount* mount) const {
     return owns_lock() && (mutex() == &mount->renameMutex_);

@@ -11,24 +11,26 @@ use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use anyhow::Result;
+use cas_client::CasFetchManager;
 use commits_trait::DagCommits;
 use configloader::Config;
 use configloader::config::ConfigSet;
 use configloader::hg::PinnedConfig;
 use configloader::hg::RepoInfo;
+use configmodel::ConfigExt;
 use context::CoreContext;
 use eagerepo::EagerRepoStore;
 use edenapi::SaplingRemoteApi;
 use edenapi::SaplingRemoteApiError;
-use grepocompat::trees::synthesize_grepo_projects;
+use grepocompat::trees::synthesize_grepo_projects_batch;
 use identity::Identity;
-use manifest_tree::ReadTreeManifest;
 use manifest_tree::TreeManifest;
+use manifest_tree::TreeResolver;
 use metalog::MetaLog;
 use metalog::RefName;
+use mutationstore::MutationStore;
 use parking_lot::RwLock;
 use pathmatcher::DynMatcher;
 use repo_minimal_info::RepoMinimalInfo;
@@ -44,6 +46,7 @@ use storemodel::FileStore;
 use storemodel::StoreInfo;
 use storemodel::StoreOutput;
 use storemodel::TreeStore;
+use try_once_lock::OnceLock;
 use types::HgId;
 use types::hgid::NULL_ID;
 use types::hgid::WDIR_ID;
@@ -71,17 +74,19 @@ pub struct Repo {
     config: Arc<dyn Config>,
     repo_name: Option<String>,
     metalog: OnceLock<Arc<RwLock<MetaLog>>>,
+    mutation_store: OnceLock<Option<Arc<MutationStore>>>,
     eden_api: OnceLock<(LazyCapabilities, Arc<dyn SaplingRemoteApi>)>,
     dag_commits: OnceLock<Arc<RwLock<Box<dyn DagCommits + Send + 'static>>>>,
     file_store: OnceLock<Arc<dyn FileStore>>,
     file_scm_store: OnceLock<Arc<scmstore::FileStore>>,
     tree_store: OnceLock<Arc<dyn TreeStore>>,
     tree_scm_store: OnceLock<Arc<scmstore::TreeStore>>,
+    cas_manager: OnceLock<Option<Arc<CasFetchManager>>>,
     #[cfg(feature = "wdir")]
     working_copy: OnceLock<Arc<RwLock<WorkingCopy>>>,
     eager_store: Option<EagerRepoStore>,
     locker: Arc<RepoLocker>,
-    tree_resolver: OnceLock<Arc<dyn ReadTreeManifest>>,
+    tree_resolver: OnceLock<Arc<dyn TreeResolver>>,
     permission_denied_paths: Option<context::PermissionDeniedPaths>,
     // Working copy p1 at repo load time. This is normally what "." revset should resolve
     // to (i.e. we don't want to lazily load p1 since it can be changing).
@@ -138,6 +143,8 @@ impl Repo {
         config: Option<ConfigSet>,
     ) -> Result<Self> {
         let info = RepoMinimalInfo::from_repo_root(path)?;
+        let dot_dir = info.path.join(info.ident.sniff_dot_dir());
+        let _ = win32_8dot3::remove_short_name_at(&dot_dir);
         Self::build_with_info(info, pinned_config, config)
     }
 
@@ -172,7 +179,7 @@ impl Repo {
         let locker = Arc::new(RepoLocker::new(&config, info.store_path.clone())?);
 
         #[cfg(feature = "wdir")]
-        let p1 = workingcopy::fast_path_wdir_parents(&info.path, info.ident)
+        let p1 = workingcopy::fast_path_wdir_parents_with_config(&info.path, info.ident, &config)
             .ok()
             .map(|parents| parents.p1().copied().unwrap_or(NULL_ID));
 
@@ -184,12 +191,14 @@ impl Repo {
             config: Arc::new(config),
             repo_name,
             metalog: Default::default(),
+            mutation_store: Default::default(),
             eden_api: Default::default(),
             dag_commits: Default::default(),
             file_store: Default::default(),
             file_scm_store: Default::default(),
             tree_store: Default::default(),
             tree_scm_store: Default::default(),
+            cas_manager: Default::default(),
             #[cfg(feature = "wdir")]
             working_copy: Default::default(),
             eager_store: None,
@@ -284,6 +293,16 @@ impl Repo {
         self.store_path.join("metalog")
     }
 
+    #[cached_field]
+    pub fn mutation_store(&self) -> Result<Option<Arc<MutationStore>>> {
+        if !self.config.get_or("mutation", "enabled", || false)? {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(MutationStore::open(
+            self.store_path.join("mutation"),
+        )?)))
+    }
+
     /// Constructs the SaplingRemoteAPI client. Errors out if the SaplingRemoteAPI should not be
     /// constructed.
     ///
@@ -366,7 +385,7 @@ impl Repo {
             return Ok(store);
         }
 
-        let fs = build_scm_file_store(self)?;
+        let fs = build_scm_file_store(self, self.cas_manager())?;
         let _ = self.file_scm_store.set(fs.clone());
 
         let fs = Arc::new(ArcFileStore(fs));
@@ -398,11 +417,28 @@ impl Repo {
             self,
             self.file_scm_store(),
             self.permission_denied_paths.clone(),
+            self.cas_manager(),
         )?;
         let _ = self.tree_scm_store.set(ts.clone());
         let _ = self.tree_store.set(ts.clone());
 
         Ok(ts)
+    }
+
+    fn cas_manager(&self) -> Option<Arc<CasFetchManager>> {
+        self.cas_manager
+            .get_or_init(|| match cas_client::new(self.config.clone()) {
+                Ok(cas_manager) => cas_manager,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "cas_client",
+                        ?error,
+                        "failed to create CAS client; CAS fetching is disabled"
+                    );
+                    None
+                }
+            })
+            .clone()
     }
 
     pub fn set_permission_denied_paths(&mut self, paths: context::PermissionDeniedPaths) {
@@ -421,31 +457,30 @@ impl Repo {
         Some(store.clone())
     }
 
-    pub fn tree_resolver(&self) -> Result<Arc<dyn ReadTreeManifest + Send + Sync>> {
+    pub fn tree_resolver(&self) -> Result<Arc<dyn TreeResolver + Send + Sync>> {
         let tr = self.tree_resolver.get_or_try_init(|| {
             let tree_store = self.tree_store()?;
-            let local: Arc<dyn ReadTreeManifest + Send + Sync> = Arc::new(LocalTreeResolver::new(
+            let local: Arc<dyn TreeResolver + Send + Sync> = Arc::new(LocalTreeResolver::new(
                 self.dag_commits()?,
                 tree_store.clone(),
             ));
 
             // If SLAPI is available, also try resolving remotely to a tree. This works
             // even if we haven't pulled the commit into our local commit graph.
-            let mut resolver: Arc<dyn ReadTreeManifest + Send + Sync> =
-                match self.optional_eden_api() {
-                    Ok(Some(eden_api)) => {
-                        let slapi: Arc<dyn ReadTreeManifest + Send + Sync> =
-                            Arc::new(SlapiTreeResolver::new(eden_api, tree_store));
-                        Arc::new(UnionTreeResolver::new(vec![local, slapi]))
-                    }
-                    _ => local,
-                };
+            let mut resolver: Arc<dyn TreeResolver + Send + Sync> = match self.optional_eden_api() {
+                Ok(Some(eden_api)) => {
+                    let slapi: Arc<dyn TreeResolver + Send + Sync> =
+                        Arc::new(SlapiTreeResolver::new(eden_api, tree_store));
+                    Arc::new(UnionTreeResolver::new(vec![local, slapi]))
+                }
+                _ => local,
+            };
 
             if self.requirements.contains("grepo") {
                 let file_store = self.file_store()?;
                 let tree_store = self.tree_store()?;
-                let synthesize_fn = Arc::new(move |manifest: &TreeManifest| {
-                    synthesize_grepo_projects(&tree_store, &file_store, manifest)
+                let synthesize_fn = Arc::new(move |manifests: Vec<TreeManifest>| {
+                    synthesize_grepo_projects_batch(&tree_store, &file_store, manifests)
                 });
                 resolver = Arc::new(GrepoTreeResolver::new(resolver, synthesize_fn))
             }
@@ -529,10 +564,7 @@ impl Repo {
 
     pub fn add_commit(&self, new_commit: commits_trait::NewCommit) -> Result<HgId> {
         let dag = self.dag_commits()?;
-        async_runtime::try_block_unless_interrupted(commits::add_new_commit(
-            &mut **dag.write(),
-            new_commit,
-        ))
+        async_runtime::block_on(commits::add_new_commit(&mut **dag.write(), new_commit))
     }
 }
 

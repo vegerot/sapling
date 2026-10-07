@@ -9,10 +9,11 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::Context;
 use anyhow::Error;
+use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::format_err;
-use blobrepo_errors::ErrorKind;
 use blobstore::KeyedBlobstore;
 use blobstore::Loadable;
 use cloned::cloned;
@@ -45,10 +46,12 @@ use mononoke_types::SortedVectorTrieMap;
 use mononoke_types::TrackedFileChange;
 use mononoke_types::path::MPath;
 use restricted_paths_common::ArcRestrictedPathsConfigBased;
+use restricted_paths_common::ManifestIdStoreWriteCallsite;
 use restricted_paths_common::ManifestType;
 use restricted_paths_common::RestrictedPathManifestIdEntry;
+use restricted_paths_common::maybe_propagate_manifest_id_store_write_error;
 use sorted_vector_map::SortedVectorMap;
-use tracing::warn;
+use tracing::error;
 
 use crate::derive_hg_changeset::store_file_change;
 
@@ -417,13 +420,17 @@ async fn create_hg_manifest(
                     path.clone(),
                 )?;
 
-                // Track restricted path - log error but don't fail manifest derivation
                 if let Err(e) = restricted_paths
                     .manifest_id_store()
                     .add_entry(&ctx, entry)
                     .await
+                    .with_context(|| format!("Failed to track restricted path at {path}"))
                 {
-                    warn!("Failed to track restricted path: {e}");
+                    error!(path = %path, error = %e, "Failed to track restricted path");
+                    maybe_propagate_manifest_id_store_write_error(
+                        e,
+                        ManifestIdStoreWriteCallsite::CreateHgManifest,
+                    )?;
                 }
             }
         }
@@ -466,9 +473,10 @@ async fn resolve_conflict(
     parents: &[Traced<ParentIndex, (FileType, HgFileNodeId)>],
 ) -> Result<(FileType, HgFileNodeId), Error> {
     let make_err = || {
-        ErrorKind::UnresolvedConflicts(
-            path.clone(),
-            parents.iter().map(|p| *p.untraced()).collect::<Vec<_>>(),
+        anyhow!(
+            "Unresolved conflict at {} with parents: {:?}",
+            path,
+            parents.iter().map(|p| *p.untraced()).collect::<Vec<_>>()
         )
     };
 

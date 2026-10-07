@@ -31,6 +31,16 @@ PROD_SUBTREE_KEY = "subtree"
 
 SUBTREE_METADATA_VERSION = 1  # current version of subtree metadata
 SUPPORTED_SUBTREE_METADATA_VERSIONS = {1}
+SUBTREE_COPY_STATE_FILE = "subtree-copy-state"
+
+
+def validate_subtree_url(url: str) -> None:
+    """Validate a subtree URL before storing or using it."""
+    for char in url:
+        if ord(char) <= 0x1F or ord(char) == 0x7F:
+            raise error.Abort(
+                _("subtree URL %r contains control character %r") % (url, char)
+            )
 
 
 def get_subtree_key(ui) -> str:
@@ -125,14 +135,11 @@ def get_deprecated_subtree_metadata_keys(ui) -> Set[str]:
 
 class BranchType(Enum):
     DEEP_COPY = 1  # O(n) subtree copy
-    SHALLOW_COPY = 2  # O(1) subtree copy
 
     def to_key(self):
         # the `key` is used in subtree metadata
         if self == BranchType.DEEP_COPY:
             return "deepcopies"
-        elif self == BranchType.SHALLOW_COPY:
-            return "copies"
         else:
             # unreachable
             raise error.ProgrammingError("unknown branch type")
@@ -140,8 +147,6 @@ class BranchType(Enum):
     def to_str(self):
         if self == BranchType.DEEP_COPY:
             return "deepcopy"
-        elif self == BranchType.SHALLOW_COPY:
-            return "copy"
         else:
             raise error.ProgrammingError("unknown branch type")
 
@@ -293,11 +298,13 @@ def _branches_to_dict(branches: List[SubtreeBranch], version: int):
     return rs
 
 
-def _encode_subtree_metadata_list(ui, subtree_metadata):
+def _encode_subtree_metadata_list_val(subtree_metadata):
     subtree_metadata = sorted(subtree_metadata, key=lambda x: x["v"])
-    val_str = json.dumps(subtree_metadata, separators=(",", ":"), sort_keys=True)
-    subtree_key = get_subtree_key(ui)
-    return {subtree_key: val_str}
+    return json.dumps(subtree_metadata, separators=(",", ":"), sort_keys=True)
+
+
+def _encode_subtree_metadata_list(ui, subtree_metadata):
+    return {get_subtree_key(ui): _encode_subtree_metadata_list_val(subtree_metadata)}
 
 
 ### Generating metadata for imports
@@ -399,40 +406,35 @@ def get_subtree_metadata(extra):
 ### Getting subtree metadata: branches, imports, merges
 
 
-def get_subtree_branches(repo, node) -> List[SubtreeBranch]:
-    def detect_branch_type(repo, node):
-        # we have not enabled shallow copies yet, so we use
-        # a simple method here
-        if not repo[node].changeset().files:
-            return BranchType.SHALLOW_COPY
-        else:
-            return BranchType.DEEP_COPY
-
-    extra = repo[node].extra()
+def get_subtree_branches_from_metadata(metadata_list) -> List[SubtreeBranch]:
     result = []
-    if metadata_list := _get_subtree_metadata_by_subtree_keys(extra):
-        for metadata in metadata_list:
-            for branch_type in BranchType:
-                key = branch_type.to_key()
-                branches = metadata.get(key, [])
-                for b in branches:
-                    result.append(
-                        SubtreeBranch(
-                            version=metadata["v"],
-                            branch_type=branch_type,
-                            from_commit=b["from_commit"],
-                            from_path=b["from_path"],
-                            to_path=b["to_path"],
-                        )
+    for metadata in metadata_list:
+        for branch_type in BranchType:
+            key = branch_type.to_key()
+            for branch in metadata.get(key, []):
+                result.append(
+                    SubtreeBranch(
+                        version=metadata["v"],
+                        branch_type=branch_type,
+                        from_commit=branch["from_commit"],
+                        from_path=branch["from_path"],
+                        to_path=branch["to_path"],
                     )
+                )
+    return result
+
+
+def get_subtree_branches(repo, node) -> List[SubtreeBranch]:
+    extra = repo[node].extra()
+    metadata_list = _get_subtree_metadata_by_subtree_keys(extra) or []
+    result = get_subtree_branches_from_metadata(metadata_list)
 
     if branch_info := _get_subtree_metadata(extra, SUBTREE_BRANCH_KEY):
         for b in branch_info.get("branches", []):
-            branch_type = detect_branch_type(repo, node)
             result.append(
                 SubtreeBranch(
                     version=branch_info["v"],
-                    branch_type=branch_type,
+                    branch_type=BranchType.DEEP_COPY,
                     from_commit=b["from_commit"],
                     from_path=b["from_path"],
                     to_path=b["to_path"],
@@ -525,6 +527,88 @@ def _get_subtree_metadata_by_subtree_keys(extra):
     else:
         # backward compatibility with existing metadata
         return _get_subtree_metadata(extra, TEST_SUBTREE_KEY)
+
+
+### subtree copy state
+
+
+def subtree_copy_state_exists(repo) -> bool:
+    return repo.localvfs.exists(SUBTREE_COPY_STATE_FILE)
+
+
+def write_subtree_copy_state(repo, branch_info) -> bool:
+    metadata_list = _get_subtree_metadata_by_subtree_keys(branch_info)
+    if not metadata_list:
+        return False
+
+    data = _encode_subtree_metadata_list_val(metadata_list) + "\n"
+    with repo.localvfs(SUBTREE_COPY_STATE_FILE, "wb", atomictemp=True) as fp:
+        fp.write(data.encode("utf-8"))
+    return True
+
+
+def read_subtree_copy_state(repo):
+    if not subtree_copy_state_exists(repo):
+        return []
+    try:
+        data = repo.localvfs.readutf8(SUBTREE_COPY_STATE_FILE)
+        metadata_list = json.loads(data)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as ex:
+        _invalid_subtree_copy_state(repo, str(ex))
+    _validate_subtree_copy_metadata(repo, metadata_list)
+    return metadata_list
+
+
+def _invalid_subtree_copy_state(repo, detail):
+    raise error.Abort(
+        _("invalid subtree copy state: %s") % detail,
+        hint=_("use '@prog@ goto . --clean' to discard the pending changes"),
+    )
+
+
+def _validate_subtree_copy_metadata(repo, metadata_list):
+    if not isinstance(metadata_list, list) or len(metadata_list) != 1:
+        _invalid_subtree_copy_state(repo, _("expected one dict item"))
+
+    metadata = metadata_list[0]
+    if (
+        not isinstance(metadata, dict)
+        or set(metadata) != {"v", "deepcopies"}
+        or metadata.get("v") not in SUPPORTED_SUBTREE_METADATA_VERSIONS
+        or not isinstance(metadata.get("deepcopies"), list)
+        or not metadata["deepcopies"]
+    ):
+        _invalid_subtree_copy_state(repo, _("expected deepcopies"))
+
+    keys = {"from_commit", "from_path", "to_path"}
+    if any(
+        not isinstance(branch, dict)
+        or set(branch) != keys
+        or any(not isinstance(branch.get(key), str) for key in keys)
+        for branch in metadata["deepcopies"]
+    ):
+        _invalid_subtree_copy_state(repo, _("expected deep copy metadata"))
+
+    if len({branch["from_commit"] for branch in metadata["deepcopies"]}) != 1:
+        _invalid_subtree_copy_state(repo, _("expected one source commit"))
+
+
+def subtree_copy_state_to_extra(repo, state):
+    return _encode_subtree_metadata_list(repo.ui, state)
+
+
+def gen_copy_commit_msg_from_subtree_copy_state(repo, state):
+    branches = get_subtree_branches_from_metadata(state)
+    return gen_copy_commit_msg(
+        repo[branches[0].from_commit],
+        [branch.from_path for branch in branches],
+        [branch.to_path for branch in branches],
+    )
+
+
+def clear_subtree_copy_state(repo) -> None:
+    if subtree_copy_state_exists(repo):
+        repo.localvfs.unlinkpath(SUBTREE_COPY_STATE_FILE, ignoremissing=True)
 
 
 def merge_subtree_metadata(repo, ctxs):
@@ -759,28 +843,6 @@ def is_commit_graftable(repo, rev) -> bool:
     return True
 
 
-def contains_shallow_copy(repo, node):
-    branches = get_subtree_branches(repo, node)
-    for b in branches:
-        if b.branch_type == BranchType.SHALLOW_COPY:
-            return True
-    return False
-
-
-def extra_contains_shallow_copy(extra) -> bool:
-    """Check if the given commitctx extra contains any shallow copy metadata.
-
-    N.B. This function does not apply to "v0" subtree metadata because "v0" does
-    not have shallow copy type. It is used for newly incoming commits.
-    """
-    shallow_copy_key = BranchType.SHALLOW_COPY.to_key()
-    if metadata_list := _get_subtree_metadata_by_subtree_keys(extra):
-        for metadata in metadata_list:
-            if shallow_copy_key in metadata:
-                return True
-    return False
-
-
 def check_commit_splitability(repo, node):
     """Check if the given commit can be split into multiple commits.
 
@@ -815,6 +877,8 @@ def check_commit_backoutable(repo, node):
 
 
 def get_or_clone_git_repo(ui, url, from_rev=None):
+    validate_subtree_url(url)
+
     def try_reuse_git_repo(git_repo_dir):
         """try to reuse an existing git repo, otherwise return None"""
         if not os.path.exists(git_repo_dir):

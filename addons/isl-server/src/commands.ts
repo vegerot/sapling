@@ -11,10 +11,13 @@ import type {RepositoryContext} from './serverTypes';
 import {
   ConflictType,
   type AbsolutePath,
+  type Hash,
   type MergeConflicts,
+  type Submodule,
   type WorktreeEntry,
 } from 'isl/src/types';
 import os from 'node:os';
+import path from 'node:path';
 import {ejeca} from 'shared/ejeca';
 import {isEjecaError} from './utils';
 
@@ -131,6 +134,62 @@ export async function findRoots(ctx: RepositoryContext): Promise<AbsolutePath[] 
   }
 }
 
+/**
+ * The submodules `root` declares, or undefined if they could not be read.
+ */
+export async function findSubmodules(
+  ctx: RepositoryContext,
+  root: AbsolutePath,
+): Promise<Array<Submodule> | undefined> {
+  try {
+    const proc = await runCommand(ctx, ['debuggitmodules', '--json', '--repo', root]);
+    return JSON.parse(proc.stdout) as Array<Submodule>;
+  } catch (error) {
+    ctx.logger.error(`Failed to list submodules of ${root}`, error);
+    return undefined;
+  }
+}
+
+/**
+ * Narrow the roots reported by `debugroots` to the submodule chain that contains the cwd.
+ *
+ * `debugroots` walks all the way to the system root, so it also reports repos that merely contain
+ * this checkout somewhere in their directory tree. Cloning a project inside another project's
+ * working copy does not make it a submodule of that project, and treating it as one mislabels the
+ * repo and hides the superproject's real submodules. Keep only the innermost run of roots where
+ * each root is a submodule of the one above it, leaving the most local repo first in line.
+ *
+ * `roots` is ordered furthest-to-closest, so the chain is always a suffix of it.
+ */
+export async function narrowToSubmoduleChain(
+  ctx: RepositoryContext,
+  roots: ReadonlyArray<AbsolutePath>,
+): Promise<Array<AbsolutePath>> {
+  // Every root but the innermost is a candidate parent; chains are short, so ask them all at once.
+  const submodulesByParent = await Promise.all(
+    roots.slice(0, -1).map(parent => findSubmodules(ctx, parent)),
+  );
+  let outermost = roots.length - 1;
+  while (outermost > 0) {
+    const parent = roots[outermost - 1];
+    const child = roots[outermost];
+    const submodules = submodulesByParent[outermost - 1];
+    if (
+      submodules == null ||
+      !submodules.some(m => m.path === relativeSubmodulePath(parent, child))
+    ) {
+      break;
+    }
+    outermost--;
+  }
+  return roots.slice(outermost);
+}
+
+/** Submodule paths are always posix-style, even on Windows. */
+function relativeSubmodulePath(parent: AbsolutePath, child: AbsolutePath): string {
+  return path.relative(parent, child).split(path.sep).join('/');
+}
+
 export async function findDotDir(ctx: RepositoryContext): Promise<AbsolutePath | undefined> {
   try {
     return (await runCommand(ctx, ['root', '--dotdir'])).stdout;
@@ -170,6 +229,26 @@ export async function listWorktrees(ctx: RepositoryContext): Promise<WorktreeEnt
   } catch (error) {
     ctx.logger.error(`Failed to list worktrees for ${ctx.cwd}`, error);
     return [];
+  }
+}
+
+/**
+ * Find the hash checked out (`.`) in another worktree, via `sl whereami -R <path>`.
+ * During an unresolved merge, `whereami` prints both parents newline-separated;
+ * only the first (p1) is returned. Returns undefined if the command fails
+ * (e.g. the worktree is mid-checkout).
+ */
+export async function whereami(
+  ctx: RepositoryContext,
+  worktreePath: AbsolutePath,
+): Promise<Hash | undefined> {
+  try {
+    const stdout = (await runCommand(ctx, ['whereami', '-R', worktreePath])).stdout;
+    const hash = stdout.trim().split('\n')[0]?.trim();
+    return hash ? (hash as Hash) : undefined;
+  } catch (error) {
+    ctx.logger.error(`Failed to find checked-out hash for worktree ${worktreePath}`, error);
+    return undefined;
   }
 }
 

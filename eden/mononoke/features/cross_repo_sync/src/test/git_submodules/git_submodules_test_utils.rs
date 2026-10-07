@@ -30,7 +30,6 @@ use context::CoreContext;
 use derivation_queue_thrift::DerivationPriority;
 use fbinit::FacebookInit;
 use fn_error_context::context;
-use fsnodes::RootFsnodeId;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream;
@@ -56,7 +55,7 @@ use mononoke_types::FileChange;
 use mononoke_types::FileType;
 use mononoke_types::NonRootMPath;
 use mononoke_types::RepositoryId;
-use mononoke_types::content_manifest::compat;
+use mononoke_types::content_manifest::ContentManifestFile;
 use mononoke_types::hash::GitSha1;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedDataRef;
@@ -680,7 +679,7 @@ pub(crate) fn compare_expected_changesets(
     expected_changesets: &[ExpectedChangeset],
 ) -> Result<()> {
     // Print the actual changesets to debug test failures
-    println!("actual_changesets: {:#?}\n\n", &actual_changesets);
+    println!("actual_changesets: {actual_changesets:#?}\n\n");
 
     assert_eq!(
         actual_changesets.len(),
@@ -712,42 +711,24 @@ pub(crate) async fn check_submodule_metadata_file_in_large_repo<'a>(
     metadata_file_path: NonRootMPath,
     expected_git_hash: &'a GitSha1,
 ) -> Result<()> {
-    let use_content_manifests = justknobs::eval(
-        "scm/mononoke:derived_data_use_content_manifests",
-        None,
-        Some(large_repo.repo_identity().name()),
-    );
-
-    let root: compat::ContentManifestId = if use_content_manifests {
-        large_repo
-            .repo_derived_data()
-            .derive::<RootContentManifestId>(ctx, cs_id, DerivationPriority::LOW)
-            .await?
-            .into_content_manifest_id()
-            .into()
-    } else {
-        large_repo
-            .repo_derived_data()
-            .derive::<RootFsnodeId>(ctx, cs_id, DerivationPriority::LOW)
-            .await?
-            .into_fsnode_id()
-            .into()
-    };
+    let root = large_repo
+        .repo_derived_data()
+        .derive::<RootContentManifestId>(ctx, cs_id, DerivationPriority::LOW)
+        .await?
+        .into_content_manifest_id();
 
     let blobstore = large_repo.repo_blobstore().clone();
-    let manifest_file: compat::ContentManifestFile = root
+    let manifest_file: ContentManifestFile = root
         .find_entry(ctx.clone(), blobstore, metadata_file_path.clone().into())
         .await?
         .ok_or(anyhow!(
-            "No manifest entry for x-repo submodule metadata file in path {}",
-            &metadata_file_path
+            "No manifest entry for x-repo submodule metadata file in path {metadata_file_path}"
         ))?
         .into_leaf()
         .ok_or(anyhow!(
             "Expected metadata file manifest entry to be a leaf"
-        ))?
-        .into();
-    let content_id = manifest_file.content_id();
+        ))?;
+    let content_id = manifest_file.content_id;
     let file_bytes = filestore::fetch_concat(large_repo.repo_blobstore(), ctx, content_id).await?;
     let file_string = std::str::from_utf8(file_bytes.as_ref())?;
 
@@ -791,7 +772,7 @@ pub(crate) async fn derive_all_enabled_types_for_repo(
     Ok(())
 }
 
-/// Quickly check that working copy matches expectation by deriving fsnode
+/// Quickly check that working copy matches expectation by deriving a content manifest
 /// and getting the path of all leaves.
 pub(crate) async fn assert_working_copy_matches_expected(
     ctx: &CoreContext,
@@ -800,25 +781,12 @@ pub(crate) async fn assert_working_copy_matches_expected(
     expected_files: Vec<&str>,
 ) -> Result<()> {
     println!("Asserting working copy matches expectation");
-    let use_content_manifests = justknobs::eval(
-        "scm/mononoke:derived_data_use_content_manifests",
-        None,
-        Some(repo.repo_identity().name()),
-    );
 
-    let root: compat::ContentManifestId = if use_content_manifests {
-        repo.repo_derived_data()
-            .derive::<RootContentManifestId>(ctx, cs_id, DerivationPriority::LOW)
-            .await?
-            .into_content_manifest_id()
-            .into()
-    } else {
-        repo.repo_derived_data()
-            .derive::<RootFsnodeId>(ctx, cs_id, DerivationPriority::LOW)
-            .await?
-            .into_fsnode_id()
-            .into()
-    };
+    let root = repo
+        .repo_derived_data()
+        .derive::<RootContentManifestId>(ctx, cs_id, DerivationPriority::LOW)
+        .await?
+        .into_content_manifest_id();
 
     let blobstore = repo.repo_blobstore();
     let mut all_files: Vec<String> = root
@@ -873,10 +841,7 @@ pub(crate) async fn sync_changeset_and_derive_all_types(
     let target_repo_changesets = get_all_changeset_data_from_repo(&ctx, target_repo).await?;
 
     // Print all target repo changesets for debugging, if the test fails
-    println!(
-        "All target repo changesets: {0:#?}",
-        &target_repo_changesets
-    );
+    println!("All target repo changesets: {target_repo_changesets:#?}");
 
     derive_all_enabled_types_for_repo(&ctx, target_repo, &target_repo_changesets).await?;
 

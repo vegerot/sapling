@@ -21,26 +21,13 @@ class GlobTree : public GlobNodeImpl {
   explicit GlobTree(
       bool includeDotfiles,
       CaseSensitivity caseSensitive,
-      bool prefetchOptimizations = false,
-      uint32_t recursiveAsyncDepth = 3)
+      uint32_t recursiveAsyncDepth = 3,
+      GlobMatchOptions matchOptions = {})
       : GlobNodeImpl(
             includeDotfiles,
             caseSensitive,
-            prefetchOptimizations,
-            recursiveAsyncDepth) {}
-
-  GlobTree(
-      folly::StringPiece pattern,
-      bool includeDotfiles,
-      bool hasSpecials,
-      CaseSensitivity caseSensitive,
-      bool prefetchOptimizations = false)
-      : GlobNodeImpl(
-            pattern,
-            includeDotfiles,
-            hasSpecials,
-            caseSensitive,
-            prefetchOptimizations) {}
+            recursiveAsyncDepth,
+            std::move(matchOptions)) {}
 
   /**
    * Evaluate the compiled glob against the provided Tree.
@@ -53,16 +40,7 @@ class GlobTree : public GlobNodeImpl {
    * globbing
    * @param globResult nullable list where results will be appended if provided
    */
-  ImmediateFuture<folly::Unit> evaluate(
-      std::shared_ptr<ObjectStore> store,
-      const ObjectFetchContextPtr& context,
-      RelativePathPiece rootPath,
-      std::shared_ptr<const Tree> tree,
-      PrefetchList* fileBlobsToPrefetch,
-      ResultList* globResult,
-      const RootId& originRootId) const;
-
-  folly::coro::now_task<folly::Unit> co_evaluate(
+  folly::coro::now_task<folly::Unit> evaluate(
       std::shared_ptr<ObjectStore> store,
       const ObjectFetchContextPtr& context,
       RelativePathPiece rootPath,

@@ -601,15 +601,10 @@ class changectx(basectx):
 
     def files(self):
         files = self._changeset.files
-        if not files:
-            # The following cases does not provide "files" in commit message,
-            # run diff to get it:
-            # - git repo
-            # - subtree shallow copy
-            if git.isgitformat(self._repo) or subtreeutil.contains_shallow_copy(
-                self._repo, self.node()
-            ):
-                files = self.visiblefiles(force=True)
+        if not files and git.isgitformat(self._repo):
+            # git commits do not provide "files" in the commit message, run
+            # diff to get it
+            files = self.visiblefiles(force=True)
         return files
 
     def visiblefiles(self, force=False):
@@ -1529,7 +1524,7 @@ class committablectx(basectx):
         return str(self).encode()
 
     def __str__(self):
-        return str(self._parents[0]) + "+"
+        return (str(self._parents[0]) if self._parents else "<no parent>") + "+"
 
     def __nonzero__(self):
         return True
@@ -3421,90 +3416,6 @@ class metadataonlyctx(committablectx):
                 removed.append(f)
 
         return scmutil.status(modified, added, removed, [], [], [], [])
-
-
-class subtreecopyctx(committablectx):
-    def __new__(cls, repo, to_mctx, *args, **kwargs):
-        return super(subtreecopyctx, cls).__new__(cls, repo)
-
-    def __init__(
-        self,
-        repo,
-        from_ctx,
-        to_ctx,
-        from_paths,
-        to_paths,
-        text=None,
-        user=None,
-        date=None,
-        extra=None,
-        editor=False,
-        loginfo=None,
-        mutinfo=None,
-    ):
-        super(subtreecopyctx, self).__init__(
-            repo, text, user, date, extra, loginfo=loginfo, mutinfo=mutinfo
-        )
-        self._from_ctx = from_ctx
-        self._to_ctx = to_ctx
-        self._to_mctx = to_ctx.manifestctx().copy()
-        self._to_mf = self._to_mctx.read()
-        self._manifest = self._to_mf
-
-        self._from_paths = from_paths
-        self._to_paths = to_paths
-        self._parents = [to_ctx]
-
-        if editor:
-            self._text = editor(self._repo, self)
-            self._repo.savecommitmessage(self._text)
-
-    def write_manifest_and_compute_files(self, tr):
-        from_mf = self._from_ctx.manifest()
-        to_mf = self._to_mf
-
-        for from_path, to_path in zip(self._from_paths, self._to_paths):
-            to_mf.graft(to_path, from_mf, from_path)
-
-        # todo: handle git repo
-
-        linkrev = len(self._repo)
-        mn = self._to_mctx.write(
-            tr,
-            linkrev,
-            self.p1().manifestnode(),
-            nullid,
-            added=[],
-            removed=[],
-        )
-
-        return mn, self.files()
-
-    def filectx(self, path, filelog=None):
-        # todo: handle the case when the `path` is file one of `self._to_paths`
-        # currently, this is only used to read dirsync configs
-        return self._to_ctx.filectx(path, filelog=filelog)
-
-    def files(self):
-        return []
-
-    def commit(self):
-        """commit context to the repo"""
-        return self._repo.commitctx(self)
-
-    @propertycache
-    def _status(self):
-        # todo: may need to handle `subtree copy + modification` here
-        # set status files to empty to avoid files scan
-        return scmutil.status(
-            modified=[],
-            added=[],
-            removed=[],
-            deleted=[],
-            unknown=[],
-            ignored=[],
-            clean=[],
-        )
 
 
 class arbitraryfilectx:

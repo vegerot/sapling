@@ -6,9 +6,9 @@
  */
 
 use anyhow::Context;
-use corpmanifold::manifold::ManifoldClient;
-use corpmanifold::manifold::RequestContext;
 use cxxerror::Result;
+use manifold::manifold::ManifoldClient;
+use manifold::manifold::RequestContext;
 
 #[cxx::bridge(namespace = "facebook::eden")]
 mod ffi {
@@ -33,22 +33,35 @@ fn manifold_write(
     content: &[u8],
     timeout_msec: i32,
     expiration_secs: u32,
-    client_identity: &str,
+    _client_identity: &str,
 ) -> Result<()> {
-    let client = ManifoldClient::new(
-        unsafe { fbinit::assume_init() },
-        client_identity,
-        RequestContext {
-            bucket_name: bucket.to_owned(),
-            api_key: api_key.to_owned(),
-            timeout_msec,
-        },
-    )
-    .with_context(|| format!("Failed to create Manifold client for bucket {bucket}"))?;
+    let client = ManifoldClient::new(request_context(bucket, api_key, timeout_msec));
 
     client
         .write(key.to_owned(), content.to_vec(), expiration_secs)
         .with_context(|| format!("Failed to write key {key} to Manifold bucket {bucket}"))?;
 
     Ok(())
+}
+
+fn request_context(bucket: &str, api_key: &str, timeout_msec: i32) -> RequestContext {
+    RequestContext {
+        bucket_name: bucket.to_owned(),
+        api_key: api_key.to_owned(),
+        timeout_msec,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_context_preserves_connection_settings() {
+        let context = request_context("bucket", "api-key", 1234);
+
+        assert_eq!(context.bucket_name, "bucket");
+        assert_eq!(context.api_key, "api-key");
+        assert_eq!(context.timeout_msec, 1234);
+    }
 }

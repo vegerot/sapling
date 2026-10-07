@@ -13,7 +13,7 @@
 use anyhow::Result;
 use anyhow::bail;
 
-use crate::errors::ErrorKind;
+use crate::errors::HgProtoError;
 
 /// Unescape a batch-escaped argument key or value.
 pub fn unescape(bs: &[u8]) -> Result<Vec<u8>> {
@@ -22,7 +22,7 @@ pub fn unescape(bs: &[u8]) -> Result<Vec<u8>> {
         if idx > 0 {
             // "::" or ":<end of string>" are both illegal.
             if slice.is_empty() {
-                bail!(ErrorKind::BatchInvalid(
+                bail!(HgProtoError::BatchInvalid(
                     String::from_utf8_lossy(bs).into_owned(),
                 ));
             }
@@ -31,7 +31,7 @@ pub fn unescape(bs: &[u8]) -> Result<Vec<u8>> {
                 b'o' => b',',
                 b's' => b';',
                 b'e' => b'=',
-                ch => bail!(ErrorKind::BatchEscape(ch)),
+                ch => bail!(HgProtoError::BatchEscape(ch)),
             });
             out.extend_from_slice(&slice[1..]);
         } else {
@@ -65,8 +65,8 @@ mod test {
 
     use super::*;
 
-    const BAD_BYTES: [u8; 3] = [b',', b';', b'='];
-    const BYTES_TO_ESCAPE: [u8; 4] = [b':', b',', b';', b'='];
+    const BAD_BYTES: [u8; 3] = *b",;=";
+    const BYTES_TO_ESCAPE: [u8; 4] = *b":,;=";
 
     quickcheck! {
         fn test_roundtrip(input: Vec<u8>) -> bool {

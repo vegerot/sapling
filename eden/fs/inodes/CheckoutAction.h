@@ -28,11 +28,17 @@ class ObjectStore;
 
 struct CheckoutSubtreeResult {
   bool hadConflicts{false};
+  /**
+   * A dry run found local-only entries that would survive checkout to an
+   * empty tree, so the directory could not be replaced with a file.
+   */
+  bool localOnlyRemains{false};
 };
 
 struct CheckoutActionResult {
   InvalidationRequired invalidationRequired{InvalidationRequired::No};
   bool hadConflicts{false};
+  bool localOnlyRemains{false};
 };
 
 /**
@@ -64,8 +70,8 @@ class CheckoutAction : public std::enable_shared_from_this<CheckoutAction> {
 
   /**
    * Create a CheckoutAction for an entry that exists only in the local
-   * filesystem. Used when a restricted checkout makes local-only contents
-   * conflict with the destination placeholder.
+   * filesystem. Used for restriction conflicts and forced removal of
+   * directories that must be replaced with files.
    */
   CheckoutAction(
       CheckoutContext* ctx,
@@ -115,6 +121,15 @@ class CheckoutAction : public std::enable_shared_from_this<CheckoutAction> {
   PathComponentPiece getEntryName() const;
 
   /**
+   * Remove local-only contents when this action removes a directory. Set by
+   * a parent checkout that is emptying itself for a forced replacement with a
+   * file, so that tracked subdirectories do the same.
+   */
+  void setRemoveLocalOnly() {
+    removeLocalOnly_ = true;
+  }
+
+  /**
    * Run the CheckoutAction.
    *
    * If this completes successfully, the result returned via the
@@ -153,6 +168,15 @@ class CheckoutAction : public std::enable_shared_from_this<CheckoutAction> {
   void setInode(InodePtr inode);
   void error(folly::StringPiece msg, folly::exception_wrapper&& ew);
 
+  /**
+   * Reject a newly restricted old SCM tree before it can be mistaken for an
+   * empty source directory, throwing InodeError(EACCES). FORCE checkout
+   * instead mutates this action to treat the old side as opaque, dropping
+   * oldTree_ and oldScmEntry_ before continuing with the restricted
+   * destination.
+   */
+  void handleOldTreeRestriction();
+
   void allLoadsComplete() noexcept;
   bool ensureDataReady() noexcept;
   ImmediateFuture<bool> hasConflict();
@@ -173,6 +197,11 @@ class CheckoutAction : public std::enable_shared_from_this<CheckoutAction> {
    * context.
    */
   bool classifyFileContentConflict(bool isSame);
+
+  /**
+   * Classify the result of comparing a file with the checkout destination.
+   */
+  bool classifyFileDestinationConflict(bool isSameAsDestination);
 
   /**
    * Return whether the directory's contents have changed and the
@@ -242,6 +271,7 @@ class CheckoutAction : public std::enable_shared_from_this<CheckoutAction> {
   std::optional<Hash20> oldBlobSha1_;
   std::shared_ptr<const Tree> newTree_;
   bool newBlobMarker_ = false;
+  bool removeLocalOnly_ = false;
 
   /**
    * The errors vector keeps track of any errors that occurred while trying to

@@ -33,23 +33,9 @@ using ObjectFetchContextPtr = RefPtr<ObjectFetchContext>;
 class ThriftGlobImpl {
  public:
   explicit ThriftGlobImpl(const GlobParams& params);
-  explicit ThriftGlobImpl(
-      const PrefetchParams& params,
-      bool prefetchOptimizations);
+  explicit ThriftGlobImpl(const PrefetchParams& params);
 
-  // TODO: shared_ptr<EdenMount> is not sufficient to ensure an EdenMount is
-  // usable for the duration of this glob. Either pass EdenMountHandle or
-  // .ensure() the lifetime of EdenMountHandle outlives the call.
-  //
-  // DEPRECATED: use co_glob directly. Futures wrapper kept for non-coroutine
-  // callers; remove once all callers have migrated.
-  ImmediateFuture<std::unique_ptr<Glob>> glob(
-      std::shared_ptr<EdenMount> edenMount,
-      std::shared_ptr<ServerState> serverState,
-      std::vector<std::string> globs,
-      const ObjectFetchContextPtr& fetchContext);
-
-  folly::coro::now_task<std::unique_ptr<Glob>> co_glob(
+  folly::coro::now_task<std::unique_ptr<Glob>> glob(
       std::shared_ptr<EdenMount> edenMount,
       std::shared_ptr<ServerState> serverState,
       std::vector<std::string> globs,
@@ -67,28 +53,5 @@ class ThriftGlobImpl {
   std::vector<std::string> rootIds_;
   folly::StringPiece searchRootUser_;
 };
-
-// TODO: shared_ptr<EdenMount> is not sufficient to ensure an EdenMount is
-// usable for the duration of this glob. Either pass EdenMountHandle or
-// .ensure() the lifetime of EdenMountHandle outlives the call.
-ImmediateFuture<std::vector<BackingStore::GetGlobFilesResult>>
-getLocalGlobResults(
-    const std::shared_ptr<EdenMount>& edenMount,
-    const std::shared_ptr<ServerState>& serverState,
-    bool includeDotfiles,
-    const std::vector<std::string>& suffixGlobs,
-    const std::vector<std::string>& prefixes,
-    const TreeInodePtr& rootInode,
-    const ObjectFetchContextPtr& context);
-
-folly::coro::now_task<std::vector<BackingStore::GetGlobFilesResult>>
-co_getLocalGlobResults(
-    const std::shared_ptr<EdenMount>& edenMount,
-    const std::shared_ptr<ServerState>& serverState,
-    bool includeDotfiles,
-    const std::vector<std::string>& suffixGlobs,
-    const std::vector<std::string>& prefixes,
-    const TreeInodePtr& rootInode,
-    const ObjectFetchContextPtr& context);
 
 } // namespace facebook::eden
